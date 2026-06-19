@@ -281,22 +281,66 @@ impl Kompress {
     /// unavailable.
     pub fn from_cache(config: KompressConfig) -> Result<Option<Self>, KompressError> {
         let Some(tok_path) = hf_cache_file(&config.tokenizer_repo, &["tokenizer.json"]) else {
+            // Diagnostic: a `None` here is the #1 cause of a silent
+            // `kompress_ready=false`. Name the repo + the roots searched so
+            // operators don't have to guess between "not downloaded" and
+            // "present but unreadable" (e.g. HF symlinks over `\\wsl$`, which
+            // native Windows can't follow — `path.exists()` returns false on
+            // the unresolved symlink). Cache-only, so this is a defer, not an
+            // error: the caller passes plain text through.
+            tracing::warn!(
+                event = "kompress_cache_miss",
+                stage = "tokenizer",
+                tokenizer_repo = %config.tokenizer_repo,
+                searched_roots = ?hf_hub_roots(),
+                "Kompress deferred: tokenizer.json not found in HF cache \
+                 (not downloaded, or present but unreadable — e.g. HF symlinks \
+                 over \\\\wsl$ which native Windows cannot follow)"
+            );
             return Ok(None);
         };
         let tokenizer = load_tokenizer(&tok_path, &config.tokenizer_repo)?;
+        let mut found_onnx = false;
         for candidate in ONNX_CANDIDATES {
             let rel: Vec<&str> = candidate.split('/').collect();
             let Some(onnx_path) = hf_cache_file(&config.model_id, &rel) else {
                 continue;
             };
-            if let Ok(session) = build_session(&onnx_path) {
-                return Ok(Some(Self {
-                    config,
-                    tokenizer,
-                    session: Mutex::new(session),
-                }));
+            found_onnx = true;
+            match build_session(&onnx_path) {
+                Ok(session) => {
+                    return Ok(Some(Self {
+                        config,
+                        tokenizer,
+                        session: Mutex::new(session),
+                    }));
+                }
+                Err(e) => {
+                    // The ONNX file is present but the session would not
+                    // build — e.g. the active ORT execution provider rejects
+                    // the graph (OpenVINO/NPU cannot compile the int8
+                    // weight-only `MatMulNBits` op). Loudly surface it and try
+                    // the next candidate (fp32) rather than die silently.
+                    tracing::warn!(
+                        event = "kompress_session_build_failed",
+                        candidate = %candidate,
+                        onnx_path = %onnx_path.display(),
+                        error = %e,
+                        "Kompress: ONNX found but session build failed; trying next candidate"
+                    );
+                }
             }
         }
+        tracing::warn!(
+            event = "kompress_cache_miss",
+            stage = "onnx",
+            model_id = %config.model_id,
+            candidates = ?ONNX_CANDIDATES,
+            any_onnx_found = found_onnx,
+            searched_roots = ?hf_hub_roots(),
+            "Kompress deferred: no usable ONNX session \
+             (no candidate file in cache, or every candidate failed to build)"
+        );
         Ok(None)
     }
 
