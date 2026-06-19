@@ -55,7 +55,16 @@ pub fn init_ort_ep() {
         "openvino" => {
             let device = std::env::var("HEADROOM_ORT_OPENVINO_DEVICE")
                 .unwrap_or_else(|_| "NPU".to_string());
-            let mut builder = OpenVINO::default().with_device_type(&device);
+            // `with_dynamic_shapes(false)` => OVEP `disable_dynamic_shapes=true`,
+            // i.e. compile for a fixed input shape. REQUIRED for the NPU: the
+            // OVEP defaults to dynamic-shape compilation, which makes the NPU
+            // graph compiler hang for many minutes on our model. With static
+            // shapes the same model compiles in ~13s (verified via direct
+            // OpenVINO). Our inputs are already padded to a fixed [1, 512]
+            // (see kompress::score_chunk), so static compilation is exact.
+            let mut builder = OpenVINO::default()
+                .with_device_type(&device)
+                .with_dynamic_shapes(false);
             if let Ok(cache) = std::env::var("HEADROOM_ORT_OPENVINO_CACHE") {
                 builder = builder.with_cache_dir(&cache);
             }
