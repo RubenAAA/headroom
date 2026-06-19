@@ -89,9 +89,12 @@ pub const MAX_SEQ_LEN: usize = 512;
 /// ONNX artifact candidates, tried in order. The first is a fp32 model whose
 /// input shape is frozen to a static `[1, MAX_SEQ_LEN]` — required by the
 /// OpenVINO **NPU** EP, which cannot compile dynamic `seq` (it hangs during
-/// graph compilation on the dynamic-shape variants). Inputs are right-padded
-/// to `MAX_SEQ_LEN` in `score_chunk`, so the static model is fed correctly on
-/// every EP. The remaining dynamic variants are the fall-throughs for CPU/GPU:
+/// graph compilation on the dynamic-shape variants). When a static model is
+/// loaded, `score_chunk` right-pads each chunk to its fixed length (detected
+/// via [`detect_static_seq`]); dynamic models take the chunk's natural length
+/// and pay no padding cost. The static model is absent from a vanilla install
+/// (it is generated separately for NPU deployments), so this entry is simply
+/// skipped on CPU/GPU. The remaining variants are the dynamic fall-throughs:
 /// weight-only int8 (smallest; `MatMulNBits`, unsupported on NPU), then dynamic
 /// fp32 (lossless reference), then the v1-era dynamic int8. A candidate is
 /// skipped on download miss or on session-load failure.
@@ -191,6 +194,14 @@ pub struct Kompress {
     config: KompressConfig,
     tokenizer: Tokenizer,
     session: Mutex<Session>,
+    /// `Some(n)` when the loaded ONNX has a **fixed** sequence dimension (a
+    /// static `[1, n]` input), in which case `score_chunk` right-pads every
+    /// chunk to `n`. `None` for the usual dynamic-`seq` models, which take the
+    /// chunk's natural length. Detected from the session's `input_ids` shape
+    /// (see [`detect_static_seq`]). The static path exists for execution
+    /// providers that cannot compile dynamic shapes (OpenVINO NPU); masked
+    /// padding leaves the real-token scores unchanged, so output is identical.
+    static_seq: Option<usize>,
 }
 
 impl std::fmt::Debug for Kompress {
@@ -201,7 +212,29 @@ impl std::fmt::Debug for Kompress {
     }
 }
 
+/// Inspect a built session's `input_ids` input: return `Some(n)` if its
+/// sequence dimension is a fixed `n > 0` (a static-shape model), else `None`
+/// (dynamic `seq`). ONNX inputs are `[batch, seq]`; a dynamic dim is reported
+/// as `-1` by ONNX Runtime.
+fn detect_static_seq(session: &Session) -> Option<usize> {
+    let outlet = session.inputs().iter().find(|o| o.name() == "input_ids")?;
+    let seq = *outlet.dtype().tensor_shape()?.get(1)?;
+    (seq > 0).then_some(seq as usize)
+}
+
 impl Kompress {
+    /// Wrap built artifacts into a `Kompress`, detecting whether the loaded
+    /// model has a static sequence length (so `score_chunk` knows to pad).
+    fn assemble(config: KompressConfig, tokenizer: Tokenizer, session: Session) -> Self {
+        let static_seq = detect_static_seq(&session);
+        Self {
+            config,
+            tokenizer,
+            session: Mutex::new(session),
+            static_seq,
+        }
+    }
+
     /// Build from local artifact paths — no network. Used by tests and
     /// the parity harness against the on-disk HuggingFace cache.
     pub fn from_files(
@@ -215,11 +248,7 @@ impl Kompress {
             tried: vec![onnx_path.as_ref().display().to_string()],
             source: e,
         })?;
-        Ok(Self {
-            config,
-            tokenizer,
-            session: Mutex::new(session),
-        })
+        Ok(Self::assemble(config, tokenizer, session))
     }
 
     /// Build by resolving artifacts from the HuggingFace Hub (cache-first,
@@ -254,11 +283,7 @@ impl Kompress {
             };
             match build_session(&onnx_path) {
                 Ok(session) => {
-                    return Ok(Self {
-                        config,
-                        tokenizer,
-                        session: Mutex::new(session),
-                    });
+                    return Ok(Self::assemble(config, tokenizer, session));
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -269,8 +294,7 @@ impl Kompress {
         Err(KompressError::Onnx {
             model_id: config.model_id.clone(),
             tried,
-            source: last_err
-                .unwrap_or_else(|| "no ONNX candidates configured".to_string().into()),
+            source: last_err.unwrap_or_else(|| "no ONNX candidates configured".to_string().into()),
         })
     }
 
@@ -314,11 +338,7 @@ impl Kompress {
             found_onnx = true;
             match build_session(&onnx_path) {
                 Ok(session) => {
-                    return Ok(Some(Self {
-                        config,
-                        tokenizer,
-                        session: Mutex::new(session),
-                    }));
+                    return Ok(Some(Self::assemble(config, tokenizer, session)));
                 }
                 Err(e) => {
                     // The ONNX file is present but the session would not
@@ -430,26 +450,31 @@ impl Kompress {
             .map(|&x| x as i64)
             .collect();
         let word_ids = encoding.get_word_ids();
-        let real_seq = ids.len();
-
-        // Right-pad inputs to a FIXED sequence length so the ONNX session sees
-        // a static `[1, MAX_SEQ_LEN]` shape. This is required by the OpenVINO
-        // NPU execution provider (the NPU plugin cannot compile dynamic `seq`
-        // and hangs during graph compilation otherwise); it is harmless on the
-        // CPU EP. Real tokens occupy positions `0..real_seq`; the tail is pad.
-        // `attention_mask = 0` on the padding masks those positions out of
-        // self-attention, so the scores at real positions are identical to an
-        // unpadded run — keep/discard decisions (hence parity) are unchanged.
-        // The tokenizer already truncates to `MAX_SEQ_LEN`, so `real_seq` never
-        // exceeds the pad target. Pad id is irrelevant (masked out); use 0.
         let mut ids = ids;
         let mut attn = attn;
-        debug_assert!(real_seq <= MAX_SEQ_LEN);
-        ids.resize(MAX_SEQ_LEN, 0);
-        attn.resize(MAX_SEQ_LEN, 0);
 
-        let input_ids = Tensor::from_array(([1usize, MAX_SEQ_LEN], ids))?;
-        let attention_mask = Tensor::from_array(([1usize, MAX_SEQ_LEN], attn))?;
+        // Static-shape models (e.g. the OpenVINO NPU build, which cannot
+        // compile a dynamic `seq`) require a fixed `[1, static_seq]` input, so
+        // right-pad every chunk to that length. Real tokens occupy
+        // `0..real_seq`; the tail is padding with `attention_mask = 0`, which
+        // masks those positions out of self-attention — the scores at real
+        // positions are identical to an unpadded run, so keep/discard decisions
+        // (hence parity) are unchanged. The tokenizer truncates to
+        // `MAX_SEQ_LEN`, so the chunk never exceeds a `static_seq` of that size.
+        // Dynamic models (`static_seq == None`) take the chunk's natural length
+        // and pay no padding cost — the default for CPU/GPU.
+        let seq = match self.static_seq {
+            Some(n) => {
+                debug_assert!(ids.len() <= n);
+                ids.resize(n, 0);
+                attn.resize(n, 0);
+                n
+            }
+            None => ids.len(),
+        };
+
+        let input_ids = Tensor::from_array(([1usize, seq], ids))?;
+        let attention_mask = Tensor::from_array(([1usize, seq], attn))?;
 
         let scores: Vec<f32> = {
             let mut session = self
@@ -498,9 +523,7 @@ impl Kompress {
                 let mut ordered: Vec<(usize, f32)> =
                     word_scores.iter().map(|(&w, &s)| (w, s)).collect();
                 ordered.sort_by_key(|&(w, _)| w);
-                ordered.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let num_keep = ((ordered.len() as f64 * ratio) as usize).max(1);
                 for &(w, _) in ordered.iter().take(num_keep) {
                     kept_ids.insert(w + chunk_start);

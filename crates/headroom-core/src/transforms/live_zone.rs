@@ -624,7 +624,9 @@ pub fn warm_live_zone_compressors() -> bool {
             if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
                 return None;
             }
-            Kompress::from_cache(KompressConfig::default()).ok().flatten()
+            Kompress::from_cache(KompressConfig::default())
+                .ok()
+                .flatten()
         })
         .is_some()
 }
