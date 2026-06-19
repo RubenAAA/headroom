@@ -495,25 +495,52 @@ fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Sen
 
 /// Resolve `rel` (e.g. `["tokenizer.json"]` or `["onnx", "kompress-int8-wo.onnx"]`)
 /// inside the local HuggingFace cache for `repo` (`"owner/name"`), searching
-/// every snapshot. Returns `None` if not present — never touches the network.
-/// Mirrors the resolution the parity comparator uses.
+/// every snapshot under every candidate cache root. Returns `None` if not
+/// present — never touches the network.
 fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
     let repo_dir = format!("models--{}", repo.replace('/', "--"));
-    let snapshots = Path::new(&home)
-        .join(".cache/huggingface/hub")
-        .join(repo_dir)
-        .join("snapshots");
-    for snap in std::fs::read_dir(snapshots).ok()?.flatten() {
-        let mut cand = snap.path();
-        for part in rel {
-            cand = cand.join(part);
-        }
-        if cand.exists() {
-            return Some(cand);
+    for hub in hf_hub_roots() {
+        let snapshots = hub.join(&repo_dir).join("snapshots");
+        let Ok(entries) = std::fs::read_dir(&snapshots) else {
+            continue;
+        };
+        for snap in entries.flatten() {
+            let mut cand = snap.path();
+            for part in rel {
+                cand = cand.join(part);
+            }
+            if cand.exists() {
+                return Some(cand);
+            }
         }
     }
     None
+}
+
+/// HuggingFace hub cache roots in resolution precedence. Cross-platform so
+/// the cache-only loader works on Windows (native `headroom-proxy.exe`) as
+/// well as Linux: `HF_HUB_CACHE` (the hub dir directly) → `HF_HOME/hub` →
+/// `{HOME|USERPROFILE}/.cache/huggingface/hub`. `HOME` is the unix home; on
+/// Windows the process sees `USERPROFILE` (and often no `HOME`), so both are
+/// tried. Honoring `HF_HOME` also lets a Windows proxy point at a WSL cache.
+fn hf_hub_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let push_env = |roots: &mut Vec<PathBuf>, var: &str, suffix: &[&str]| {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                let mut p = PathBuf::from(v);
+                for s in suffix {
+                    p = p.join(s);
+                }
+                roots.push(p);
+            }
+        }
+    };
+    push_env(&mut roots, "HF_HUB_CACHE", &[]);
+    push_env(&mut roots, "HF_HOME", &["hub"]);
+    push_env(&mut roots, "HOME", &[".cache", "huggingface", "hub"]);
+    push_env(&mut roots, "USERPROFILE", &[".cache", "huggingface", "hub"]);
+    roots
 }
 
 #[cfg(test)]
