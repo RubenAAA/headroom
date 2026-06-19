@@ -43,7 +43,7 @@ pub fn hello() -> &'static str {
 /// - `HEADROOM_ORT_OPENVINO_CACHE` — directory for compiled NPU/GPU blobs;
 ///   first run compiles and saves, subsequent runs load instantly
 pub fn init_ort_ep() {
-    use ort::execution_providers::{CUDA, OpenVINO};
+    use ort::execution_providers::{OpenVINO, CUDA};
 
     let ep = std::env::var("HEADROOM_ORT_EP").unwrap_or_default();
     let ep = ep.trim().to_lowercase();
@@ -53,8 +53,8 @@ pub fn init_ort_ep() {
             tracing::debug!(ep = "cpu", "ORT execution provider: CPU (default)");
         }
         "openvino" => {
-            let device = std::env::var("HEADROOM_ORT_OPENVINO_DEVICE")
-                .unwrap_or_else(|_| "NPU".to_string());
+            let device =
+                std::env::var("HEADROOM_ORT_OPENVINO_DEVICE").unwrap_or_else(|_| "NPU".to_string());
             // `with_dynamic_shapes(false)` => OVEP `disable_dynamic_shapes=true`,
             // i.e. compile for a fixed input shape. REQUIRED for the NPU: the
             // OVEP defaults to dynamic-shape compilation, which makes the NPU
