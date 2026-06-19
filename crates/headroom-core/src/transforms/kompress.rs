@@ -86,12 +86,17 @@ pub const MIN_WORDS: usize = 10;
 /// Max ModernBERT sequence length per chunk (truncation bound).
 pub const MAX_SEQ_LEN: usize = 512;
 
-/// ONNX artifact candidates, tried in order: weight-only int8 (smallest,
-/// fp32-equivalent quality), then fp32 (lossless reference), then the
-/// v1-era dynamic int8. A candidate is skipped on download miss or on
-/// session-load failure (e.g. an onnxruntime build without the 8-bit
-/// `MatMulNBits` kernel falls through to fp32).
+/// ONNX artifact candidates, tried in order. The first is a fp32 model whose
+/// input shape is frozen to a static `[1, MAX_SEQ_LEN]` — required by the
+/// OpenVINO **NPU** EP, which cannot compile dynamic `seq` (it hangs during
+/// graph compilation on the dynamic-shape variants). Inputs are right-padded
+/// to `MAX_SEQ_LEN` in `score_chunk`, so the static model is fed correctly on
+/// every EP. The remaining dynamic variants are the fall-throughs for CPU/GPU:
+/// weight-only int8 (smallest; `MatMulNBits`, unsupported on NPU), then dynamic
+/// fp32 (lossless reference), then the v1-era dynamic int8. A candidate is
+/// skipped on download miss or on session-load failure.
 pub const ONNX_CANDIDATES: &[&str] = &[
+    "onnx/kompress-fp32-static512.onnx",
     "onnx/kompress-int8-wo.onnx",
     "onnx/kompress-fp32.onnx",
     "onnx/kompress-int8.onnx",
@@ -425,10 +430,26 @@ impl Kompress {
             .map(|&x| x as i64)
             .collect();
         let word_ids = encoding.get_word_ids();
-        let seq = ids.len();
+        let real_seq = ids.len();
 
-        let input_ids = Tensor::from_array(([1usize, seq], ids))?;
-        let attention_mask = Tensor::from_array(([1usize, seq], attn))?;
+        // Right-pad inputs to a FIXED sequence length so the ONNX session sees
+        // a static `[1, MAX_SEQ_LEN]` shape. This is required by the OpenVINO
+        // NPU execution provider (the NPU plugin cannot compile dynamic `seq`
+        // and hangs during graph compilation otherwise); it is harmless on the
+        // CPU EP. Real tokens occupy positions `0..real_seq`; the tail is pad.
+        // `attention_mask = 0` on the padding masks those positions out of
+        // self-attention, so the scores at real positions are identical to an
+        // unpadded run — keep/discard decisions (hence parity) are unchanged.
+        // The tokenizer already truncates to `MAX_SEQ_LEN`, so `real_seq` never
+        // exceeds the pad target. Pad id is irrelevant (masked out); use 0.
+        let mut ids = ids;
+        let mut attn = attn;
+        debug_assert!(real_seq <= MAX_SEQ_LEN);
+        ids.resize(MAX_SEQ_LEN, 0);
+        attn.resize(MAX_SEQ_LEN, 0);
+
+        let input_ids = Tensor::from_array(([1usize, MAX_SEQ_LEN], ids))?;
+        let attention_mask = Tensor::from_array(([1usize, MAX_SEQ_LEN], attn))?;
 
         let scores: Vec<f32> = {
             let mut session = self
