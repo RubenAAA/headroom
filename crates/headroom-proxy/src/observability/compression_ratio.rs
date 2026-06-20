@@ -39,7 +39,8 @@ use super::metric_names::{
     LABEL_CONTENT_TYPE, LABEL_STRATEGY, METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY,
     METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY_HELP,
     METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL,
-    METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL_HELP,
+    METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL_HELP, METRIC_PROXY_TOKENS_SAVED_TOTAL,
+    METRIC_PROXY_TOKENS_SAVED_TOTAL_HELP,
 };
 
 /// Histogram buckets in [0, 1). Tight at the aggressive end (≤0.25
@@ -84,6 +85,25 @@ pub fn rejected_counter(registry: &Registry) -> &'static IntCounterVec {
     })
 }
 
+/// `proxy_tokens_saved_total{strategy, content_type}` — cumulative
+/// tokens removed from the wire, the running counterpart to the
+/// per-block ratio histogram.
+pub fn tokens_saved_counter(registry: &Registry) -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_TOKENS_SAVED_TOTAL,
+            METRIC_PROXY_TOKENS_SAVED_TOTAL_HELP,
+        );
+        let counter = IntCounterVec::new(opts, &[LABEL_STRATEGY, LABEL_CONTENT_TYPE])
+            .expect("proxy_tokens_saved_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("proxy_tokens_saved_total registers exactly once");
+        counter
+    })
+}
+
 /// Observe one compression-ratio sample. `strategy` and `content_type`
 /// must be `&'static str` (bounded by compiler-known compressor +
 /// content-type enum sets).
@@ -111,6 +131,13 @@ pub fn observe_ratio(
     ratio_histogram(super::prometheus::registry())
         .with_label_values(&[strategy, content_type])
         .observe(ratio);
+    // Cumulative tokens-saved twin: the running "you saved X" total.
+    // saturating_sub guards the (shouldn't-happen, since callers only
+    // observe shrunk blocks) compressed >= original case.
+    let saved = original_tokens.saturating_sub(compressed_tokens) as u64;
+    tokens_saved_counter(super::prometheus::registry())
+        .with_label_values(&[strategy, content_type])
+        .inc_by(saved);
     tracing::debug!(
         event = "metric_recorded",
         metric = METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY,
@@ -154,5 +181,32 @@ mod tests {
         // exercise the path here, not the value (which is asserted
         // via integration tests).
         observe_ratio("test_strategy_50pct", "text", 200, 100);
+    }
+
+    #[test]
+    fn observe_ratio_increments_tokens_saved_by_delta() {
+        // tokens_saved = original - compressed, accumulated per block.
+        let c = tokens_saved_counter(super::super::prometheus::registry());
+        let before = c
+            .with_label_values(&["tok_saved_test", "text"])
+            .get();
+        observe_ratio("tok_saved_test", "text", 1000, 300);
+        observe_ratio("tok_saved_test", "text", 500, 200);
+        let after = c
+            .with_label_values(&["tok_saved_test", "text"])
+            .get();
+        // (1000-300) + (500-200) = 700 + 300 = 1000
+        assert_eq!(after - before, 1000);
+    }
+
+    #[test]
+    fn observe_ratio_zero_original_does_not_touch_tokens_saved() {
+        // A zero-denominator block is skipped entirely — it must not
+        // contribute a (possibly underflowing) tokens-saved increment.
+        let c = tokens_saved_counter(super::super::prometheus::registry());
+        let before = c.with_label_values(&["tok_saved_zero", "text"]).get();
+        observe_ratio("tok_saved_zero", "text", 0, 0);
+        let after = c.with_label_values(&["tok_saved_zero", "text"]).get();
+        assert_eq!(after, before);
     }
 }

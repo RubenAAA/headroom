@@ -1035,6 +1035,22 @@ pub(crate) async fn forward_http(
         );
     }
 
+    // Subscription / OAuth traffic carries the `anthropic-ratelimit-
+    // unified-*` family instead of `*-remaining` — the headers above
+    // stay None on a Claude-subscription plan, so the `*-remaining`
+    // gauges never populate. Parse + record the unified family too so
+    // subscription headroom (utilization per 5h/7d window) is visible.
+    // Provider-agnostic: the unified prefix is Anthropic-specific, so a
+    // non-empty snapshot is self-attributing.
+    let unified_snapshot =
+        crate::observability::extract_unified_rate_limit(upstream_resp.headers());
+    if !unified_snapshot.windows.is_empty()
+        || unified_snapshot.overall_status.is_some()
+        || unified_snapshot.fallback_percentage.is_some()
+    {
+        crate::observability::record_unified_rate_limit(&unified_snapshot, &request_id);
+    }
+
     // Stream response body back without buffering. Wrap errors so mid-stream
     // upstream failures are logged rather than silently truncating the client.
     //

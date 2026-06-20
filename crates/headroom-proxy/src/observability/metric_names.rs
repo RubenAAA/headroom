@@ -32,6 +32,15 @@ pub const METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY_HELP: &str =
      Labelled by strategy (smart_crusher/log_compressor/…) and \
      detected content_type.";
 
+// ---------- proxy_tokens_saved_total ----------
+
+pub const METRIC_PROXY_TOKENS_SAVED_TOTAL: &str = "proxy_tokens_saved_total";
+pub const METRIC_PROXY_TOKENS_SAVED_TOTAL_HELP: &str =
+    "Cumulative input tokens removed from the wire by the live-zone \
+     dispatcher (original_tokens - compressed_tokens, summed per shrunk \
+     block). The running 'you saved X tokens' total the per-block \
+     ratio histogram can't express. Labelled by strategy + content_type.";
+
 // ---------- proxy_compression_rejected_by_token_check_total ----------
 
 pub const METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL: &str =
@@ -77,6 +86,46 @@ pub const METRIC_PROXY_RATE_LIMIT_REMAINING_OUTPUT_TOKENS_HELP: &str =
     "Upstream-reported remaining OUTPUT tokens for the current window. \
      Anthropic-only header on present providers.";
 
+// ---------- proxy_ratelimit_unified_* (subscription / OAuth) ----------
+//
+// API-key traffic exposes the `*-remaining` family above. Claude
+// subscription / OAuth traffic instead returns
+// `anthropic-ratelimit-unified-*` (per-window utilization + status +
+// reset, plus overage / fallback). `utilization` is the consumed
+// fraction [0,1] of a window, so `1 - utilization` is the remaining
+// subscription headroom — the number a subscription operator wants.
+
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION: &str =
+    "proxy_ratelimit_unified_utilization";
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP: &str =
+    "Consumed fraction [0,1] of a Claude-subscription rate-limit window, \
+     from anthropic-ratelimit-unified-<window>-utilization. `1 - value` \
+     is the remaining headroom. Labelled by window (5h, 7d, per-model \
+     like 7d_sonnet).";
+
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS: &str =
+    "proxy_ratelimit_unified_reset_seconds";
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP: &str =
+    "Unix epoch (seconds) at which a subscription rate-limit window \
+     resets, from anthropic-ratelimit-unified-<window>-reset. Window \
+     `overall` carries the top-level anthropic-ratelimit-unified-reset.";
+
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED: &str =
+    "proxy_ratelimit_unified_throttled";
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP: &str =
+    "1 when a subscription window's status is anything other than \
+     'allowed' (rejected/queueing/blocked), else 0. Boolean alarm \
+     signal per window; the full status string is on the structured \
+     log line paired with each update. Window `overage` carries \
+     anthropic-ratelimit-unified-overage-status.";
+
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE: &str =
+    "proxy_ratelimit_unified_fallback_percentage";
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE_HELP: &str =
+    "anthropic-ratelimit-unified-fallback-percentage [0,1]: the share \
+     of traffic the upstream is steering to fallback capacity. \
+     Top-level (no window label).";
+
 // ---------- proxy_service_tier_count_total ----------
 
 pub const METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL: &str = "proxy_service_tier_count_total";
@@ -112,6 +161,7 @@ pub const LABEL_CONTENT_TYPE: &str = "content_type";
 pub const LABEL_PATH: &str = "path";
 pub const LABEL_TIER: &str = "tier";
 pub const LABEL_STATUS: &str = "status";
+pub const LABEL_WINDOW: &str = "window";
 
 // ---------- bounded label vocabularies ----------
 

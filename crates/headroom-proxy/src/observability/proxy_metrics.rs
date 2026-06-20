@@ -10,10 +10,15 @@
 
 use std::sync::OnceLock;
 
-use prometheus::{IntCounterVec, IntGaugeVec, Opts, Registry};
+use prometheus::{Gauge, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry};
 
 use super::metric_names::{
-    LABEL_PATH, LABEL_PROVIDER, LABEL_STATUS, LABEL_TIER,
+    LABEL_PATH, LABEL_PROVIDER, LABEL_STATUS, LABEL_TIER, LABEL_WINDOW,
+    METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE,
+    METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE_HELP,
+    METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS, METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP,
+    METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED, METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP,
+    METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION, METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL_HELP,
     METRIC_PROXY_RATE_LIMIT_REMAINING_INPUT_TOKENS,
@@ -208,6 +213,249 @@ pub fn record_rate_limit_snapshot(
     );
 }
 
+// ---------- proxy_ratelimit_unified_* (subscription/OAuth) ----------
+//
+// API-key traffic returns `anthropic-ratelimit-{requests,tokens,...}-
+// remaining` (parsed by `extract_rate_limit_snapshot` above).
+// Subscription / OAuth traffic returns a DIFFERENT header family the
+// API-key parser never matches, which is why the `*-remaining` gauges
+// stay empty on a Claude-subscription deployment:
+//
+//   anthropic-ratelimit-unified-5h-utilization: 0.2
+//   anthropic-ratelimit-unified-5h-status:      allowed
+//   anthropic-ratelimit-unified-5h-reset:       1781973000
+//   anthropic-ratelimit-unified-7d-utilization: 0.06
+//   anthropic-ratelimit-unified-7d_sonnet-utilization: 0.01   (per-model window)
+//   anthropic-ratelimit-unified-status:         allowed       (top-level)
+//   anthropic-ratelimit-unified-reset:          1781973000
+//   anthropic-ratelimit-unified-overage-status: rejected
+//   anthropic-ratelimit-unified-fallback-percentage: 0.5
+//   anthropic-ratelimit-unified-representative-claim: five_hour
+//
+// `utilization` is the fraction [0,1] of the window consumed, so
+// `1 - utilization` is the remaining subscription headroom — the
+// number an operator actually wants on a subscription plan.
+
+const UNIFIED_PREFIX: &str = "anthropic-ratelimit-unified-";
+
+/// One window's worth of unified rate-limit data. `window` is the
+/// dynamic key Anthropic emits (`5h`, `7d`, `7d_sonnet`, …).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnifiedWindow {
+    pub window: String,
+    pub utilization: Option<f64>,
+    pub status: Option<String>,
+    pub reset: Option<i64>,
+}
+
+/// Parsed `anthropic-ratelimit-unified-*` family. `windows` holds the
+/// per-window rows; the remaining fields are the top-level keys.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UnifiedRateLimitSnapshot {
+    pub windows: Vec<UnifiedWindow>,
+    pub overall_status: Option<String>,
+    pub overall_reset: Option<i64>,
+    pub overage_status: Option<String>,
+    pub overage_disabled_reason: Option<String>,
+    pub fallback_percentage: Option<f64>,
+    pub representative_claim: Option<String>,
+}
+
+/// Extract the unified (subscription/OAuth) rate-limit family. Returns
+/// an empty snapshot when no `anthropic-ratelimit-unified-*` headers
+/// are present (API-key traffic). Window rows are sorted by window key
+/// for deterministic output.
+pub fn extract_unified_rate_limit(headers: &http::HeaderMap) -> UnifiedRateLimitSnapshot {
+    use std::collections::BTreeMap;
+
+    let mut snap = UnifiedRateLimitSnapshot::default();
+    // BTreeMap → window rows come out sorted by key, deterministically.
+    let mut windows: BTreeMap<String, UnifiedWindow> = BTreeMap::new();
+
+    for (name, value) in headers.iter() {
+        let rest = match name.as_str().strip_prefix(UNIFIED_PREFIX) {
+            Some(r) => r,
+            None => continue,
+        };
+        let val = match value.to_str() {
+            Ok(v) => v.trim(),
+            // Non-UTF8 header value — per "no silent fallback" we skip
+            // rather than guess; absence is the signal.
+            Err(_) => continue,
+        };
+        match rest {
+            // Top-level keys first, so multi-dash keys like
+            // "overage-status" aren't mis-read as window "overage".
+            "status" => snap.overall_status = Some(val.to_string()),
+            "reset" => snap.overall_reset = val.parse::<i64>().ok(),
+            "overage-status" => snap.overage_status = Some(val.to_string()),
+            "overage-disabled-reason" => snap.overage_disabled_reason = Some(val.to_string()),
+            "fallback-percentage" => snap.fallback_percentage = val.parse::<f64>().ok(),
+            "representative-claim" => snap.representative_claim = Some(val.to_string()),
+            _ => {
+                // Window-scoped: "<window>-<field>", field ∈
+                // {utilization,status,reset}. Window keys use '_'
+                // (e.g. 7d_sonnet) so rsplit on '-' is unambiguous.
+                // Only recognised fields create a row — an unknown
+                // suffix must NOT spawn a junk all-None window.
+                let (window, field) = match rest.rsplit_once('-') {
+                    Some((w, f)) if matches!(f, "utilization" | "status" | "reset") => (w, f),
+                    _ => continue,
+                };
+                let entry = windows.entry(window.to_string()).or_insert_with(|| UnifiedWindow {
+                    window: window.to_string(),
+                    utilization: None,
+                    status: None,
+                    reset: None,
+                });
+                match field {
+                    "utilization" => entry.utilization = val.parse::<f64>().ok(),
+                    "status" => entry.status = Some(val.to_string()),
+                    "reset" => entry.reset = val.parse::<i64>().ok(),
+                    _ => unreachable!("field guarded by matches! above"),
+                }
+            }
+        }
+    }
+
+    snap.windows = windows.into_values().collect();
+    snap
+}
+
+/// Window key used for the top-level (cross-window) unified fields.
+pub const UNIFIED_OVERALL_WINDOW: &str = "overall";
+
+/// The non-throttled status: every other value flips `throttled` to 1.
+const UNIFIED_STATUS_ALLOWED: &str = "allowed";
+
+pub fn unified_utilization_gauge(registry: &Registry) -> &'static GaugeVec {
+    static G: OnceLock<GaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION,
+            METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP,
+        );
+        let g = GaugeVec::new(opts, &[LABEL_WINDOW])
+            .expect("proxy_ratelimit_unified_utilization descriptor is well-formed");
+        registry
+            .register(Box::new(g.clone()))
+            .expect("proxy_ratelimit_unified_utilization registers exactly once");
+        g
+    })
+}
+
+pub fn unified_reset_gauge(registry: &Registry) -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS,
+            METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP,
+        );
+        let g = IntGaugeVec::new(opts, &[LABEL_WINDOW])
+            .expect("proxy_ratelimit_unified_reset_seconds descriptor is well-formed");
+        registry
+            .register(Box::new(g.clone()))
+            .expect("proxy_ratelimit_unified_reset_seconds registers exactly once");
+        g
+    })
+}
+
+pub fn unified_throttled_gauge(registry: &Registry) -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED,
+            METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP,
+        );
+        let g = IntGaugeVec::new(opts, &[LABEL_WINDOW])
+            .expect("proxy_ratelimit_unified_throttled descriptor is well-formed");
+        registry
+            .register(Box::new(g.clone()))
+            .expect("proxy_ratelimit_unified_throttled registers exactly once");
+        g
+    })
+}
+
+pub fn unified_fallback_percentage_gauge(registry: &Registry) -> &'static Gauge {
+    static G: OnceLock<Gauge> = OnceLock::new();
+    G.get_or_init(|| {
+        let g = Gauge::new(
+            METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE,
+            METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE_HELP,
+        )
+        .expect("proxy_ratelimit_unified_fallback_percentage descriptor is well-formed");
+        registry
+            .register(Box::new(g.clone()))
+            .expect("proxy_ratelimit_unified_fallback_percentage registers exactly once");
+        g
+    })
+}
+
+/// Map a status string to the `throttled` gauge value: 0 when the
+/// upstream says `allowed`, 1 for any throttling/blocking state.
+fn throttled_value(status: &str) -> i64 {
+    if status == UNIFIED_STATUS_ALLOWED {
+        0
+    } else {
+        1
+    }
+}
+
+/// Record a parsed unified snapshot into the subscription rate-limit
+/// gauges. Numeric signals (utilization, reset, fallback) become
+/// gauges; the per-window status string collapses to a boolean
+/// `throttled` gauge (1 when status != "allowed") with the full
+/// string preserved on the structured log line. Overage/claim strings
+/// are log-only — they don't map cleanly to a numeric series.
+pub fn record_unified_rate_limit(snapshot: &UnifiedRateLimitSnapshot, request_id: &str) {
+    let registry = super::prometheus::registry();
+
+    for w in &snapshot.windows {
+        if let Some(u) = w.utilization {
+            unified_utilization_gauge(registry)
+                .with_label_values(&[&w.window])
+                .set(u);
+        }
+        if let Some(r) = w.reset {
+            unified_reset_gauge(registry)
+                .with_label_values(&[&w.window])
+                .set(r);
+        }
+        if let Some(status) = &w.status {
+            unified_throttled_gauge(registry)
+                .with_label_values(&[&w.window])
+                .set(throttled_value(status));
+        }
+    }
+
+    // Top-level (cross-window) signals under the `overall` window.
+    if let Some(status) = &snapshot.overall_status {
+        unified_throttled_gauge(registry)
+            .with_label_values(&[UNIFIED_OVERALL_WINDOW])
+            .set(throttled_value(status));
+    }
+    if let Some(r) = snapshot.overall_reset {
+        unified_reset_gauge(registry)
+            .with_label_values(&[UNIFIED_OVERALL_WINDOW])
+            .set(r);
+    }
+    if let Some(p) = snapshot.fallback_percentage {
+        unified_fallback_percentage_gauge(registry).set(p);
+    }
+
+    tracing::debug!(
+        event = "metric_recorded",
+        metric = "proxy_ratelimit_unified_*",
+        request_id = %request_id,
+        windows = snapshot.windows.len(),
+        overall_status = snapshot.overall_status.as_deref().unwrap_or(""),
+        overage_status = snapshot.overage_status.as_deref().unwrap_or(""),
+        overage_disabled_reason = snapshot.overage_disabled_reason.as_deref().unwrap_or(""),
+        representative_claim = snapshot.representative_claim.as_deref().unwrap_or(""),
+        "recorded proxy_ratelimit_unified_* subscription gauges"
+    );
+}
+
 // ---------- proxy_service_tier_count_total{tier} ----------
 
 pub fn service_tier_counter(registry: &Registry) -> &'static IntCounterVec {
@@ -364,5 +612,149 @@ mod tests {
         );
         let snap = extract_rate_limit_snapshot(&h);
         assert_eq!(snap.remaining_requests, None);
+    }
+
+    fn window<'a>(snap: &'a UnifiedRateLimitSnapshot, name: &str) -> &'a UnifiedWindow {
+        snap.windows
+            .iter()
+            .find(|w| w.window == name)
+            .unwrap_or_else(|| panic!("window {name} missing from {:?}", snap.windows))
+    }
+
+    #[test]
+    fn extract_unified_parses_subscription_headers() {
+        // Real header shape captured from a live Claude-subscription
+        // (OAuth) response through the proxy.
+        let mut h = HeaderMap::new();
+        for (k, v) in [
+            ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-reset", "1781973000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.06"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-reset", "1782414000"),
+            ("anthropic-ratelimit-unified-7d_sonnet-utilization", "0.01"),
+            ("anthropic-ratelimit-unified-7d_sonnet-status", "allowed"),
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-reset", "1781973000"),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+            ("anthropic-ratelimit-unified-representative-claim", "five_hour"),
+        ] {
+            h.insert(k, HeaderValue::from_str(v).unwrap());
+        }
+        let snap = extract_unified_rate_limit(&h);
+
+        // Per-window rows (incl. the dynamic per-model 7d_sonnet window).
+        assert_eq!(snap.windows.len(), 3, "windows: {:?}", snap.windows);
+        let w5h = window(&snap, "5h");
+        assert_eq!(w5h.utilization, Some(0.2));
+        assert_eq!(w5h.status.as_deref(), Some("allowed"));
+        assert_eq!(w5h.reset, Some(1781973000));
+        assert_eq!(window(&snap, "7d").utilization, Some(0.06));
+        assert_eq!(window(&snap, "7d_sonnet").utilization, Some(0.01));
+
+        // Top-level keys must NOT be mis-parsed as windows.
+        assert_eq!(snap.overall_status.as_deref(), Some("allowed"));
+        assert_eq!(snap.overall_reset, Some(1781973000));
+        assert_eq!(snap.overage_status.as_deref(), Some("rejected"));
+        assert_eq!(snap.overage_disabled_reason.as_deref(), Some("org_level_disabled"));
+        assert_eq!(snap.fallback_percentage, Some(0.5));
+        assert_eq!(snap.representative_claim.as_deref(), Some("five_hour"));
+    }
+
+    #[test]
+    fn extract_unified_empty_on_api_key_traffic() {
+        // API-key responses carry the *-remaining family, never unified-*.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "anthropic-ratelimit-requests-remaining",
+            HeaderValue::from_static("499"),
+        );
+        let snap = extract_unified_rate_limit(&h);
+        assert_eq!(snap, UnifiedRateLimitSnapshot::default());
+    }
+
+    fn scrape_registry() -> String {
+        use prometheus::Encoder;
+        let mf = super::super::prometheus::registry().gather();
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new().encode(&mf, &mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn record_unified_emits_subscription_gauges() {
+        // Unique window suffixes so this test's series don't collide
+        // with other tests sharing the global registry.
+        let snap = UnifiedRateLimitSnapshot {
+            windows: vec![
+                UnifiedWindow {
+                    window: "5h_rectest".into(),
+                    utilization: Some(0.2),
+                    status: Some("allowed".into()),
+                    reset: Some(1781973000),
+                },
+                UnifiedWindow {
+                    window: "7d_rectest".into(),
+                    utilization: Some(0.06),
+                    status: Some("rejected".into()),
+                    reset: Some(1782414000),
+                },
+            ],
+            overall_status: Some("allowed".into()),
+            overall_reset: Some(1781973000),
+            overage_status: Some("rejected".into()),
+            overage_disabled_reason: Some("org_level_disabled".into()),
+            fallback_percentage: Some(0.5),
+            representative_claim: Some("five_hour".into()),
+        };
+        record_unified_rate_limit(&snap, "req-rectest");
+        let body = scrape_registry();
+
+        // utilization (the headroom number) per window
+        assert!(
+            body.contains(r#"proxy_ratelimit_unified_utilization{window="5h_rectest"} 0.2"#),
+            "missing 5h utilization:\n{body}"
+        );
+        // throttled: allowed -> 0, rejected -> 1
+        assert!(
+            body.contains(r#"proxy_ratelimit_unified_throttled{window="5h_rectest"} 0"#),
+            "5h should not be throttled:\n{body}"
+        );
+        assert!(
+            body.contains(r#"proxy_ratelimit_unified_throttled{window="7d_rectest"} 1"#),
+            "7d rejected should be throttled:\n{body}"
+        );
+        // overall window carries top-level status + reset
+        assert!(body.contains(r#"proxy_ratelimit_unified_throttled{window="overall"} 0"#));
+        // reset epoch per window
+        assert!(body
+            .contains(r#"proxy_ratelimit_unified_reset_seconds{window="5h_rectest"} 1781973000"#));
+        // top-level fallback percentage (no window label)
+        assert!(
+            body.contains("proxy_ratelimit_unified_fallback_percentage 0.5"),
+            "missing fallback percentage:\n{body}"
+        );
+    }
+
+    #[test]
+    fn extract_unified_unparseable_utilization_is_none_but_window_kept() {
+        // A junk utilization must not panic and must not drop the
+        // window (its status/reset may still be useful).
+        let mut h = HeaderMap::new();
+        h.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("not-a-float"),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            HeaderValue::from_static("allowed"),
+        );
+        let snap = extract_unified_rate_limit(&h);
+        let w = window(&snap, "5h");
+        assert_eq!(w.utilization, None);
+        assert_eq!(w.status.as_deref(), Some("allowed"));
     }
 }

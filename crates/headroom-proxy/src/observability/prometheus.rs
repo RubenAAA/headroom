@@ -240,6 +240,7 @@ pub async fn handle_metrics() -> Response {
     let _ = super::cache_hit_rate::histogram(reg);
     let _ = super::compression_ratio::ratio_histogram(reg);
     let rejected_counter = super::compression_ratio::rejected_counter(reg);
+    let tokens_saved_counter = super::compression_ratio::tokens_saved_counter(reg);
     let passthrough_counter = super::proxy_metrics::passthrough_bytes_modified_counter(reg);
     let rl_requests_gauge = super::proxy_metrics::rate_limit_remaining_requests_gauge(reg);
     let rl_tokens_gauge = super::proxy_metrics::rate_limit_remaining_tokens_gauge(reg);
@@ -247,10 +248,19 @@ pub async fn handle_metrics() -> Response {
     let rl_output_gauge = super::proxy_metrics::rate_limit_remaining_output_tokens_gauge(reg);
     let tier_counter = super::proxy_metrics::service_tier_counter(reg);
     let status_counter = super::proxy_metrics::response_status_counter(reg);
+    let unified_util = super::proxy_metrics::unified_utilization_gauge(reg);
+    let unified_reset = super::proxy_metrics::unified_reset_gauge(reg);
+    let unified_throttled = super::proxy_metrics::unified_throttled_gauge(reg);
+    // Plain (label-less) Gauge: registering it is enough — `gather()`
+    // emits a single 0 sample without needing an `__init__` row.
+    let _unified_fallback = super::proxy_metrics::unified_fallback_percentage_gauge(reg);
 
     const INIT_SENTINEL: &str = "__init__";
     rejected_counter
         .with_label_values(&[INIT_SENTINEL])
+        .inc_by(0);
+    tokens_saved_counter
+        .with_label_values(&[INIT_SENTINEL, INIT_SENTINEL])
         .inc_by(0);
     passthrough_counter
         .with_label_values(&[INIT_SENTINEL])
@@ -261,6 +271,9 @@ pub async fn handle_metrics() -> Response {
     rl_output_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
     tier_counter.with_label_values(&[INIT_SENTINEL]).inc_by(0);
     status_counter.with_label_values(&[INIT_SENTINEL]).inc_by(0);
+    unified_util.with_label_values(&[INIT_SENTINEL]).set(0.0);
+    unified_reset.with_label_values(&[INIT_SENTINEL]).set(0);
+    unified_throttled.with_label_values(&[INIT_SENTINEL]).set(0);
 
     let metric_families = registry().gather();
     let mut buffer = Vec::with_capacity(2048);
