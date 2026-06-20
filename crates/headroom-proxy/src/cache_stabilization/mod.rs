@@ -55,6 +55,7 @@
 //! `mod.rs`'s `pub mod` list.
 
 pub mod anthropic_cache_control;
+pub mod capture;
 pub mod drift_detector;
 pub mod openai_cache_key;
 pub mod tool_def_normalize;

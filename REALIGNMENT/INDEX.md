@@ -19,6 +19,7 @@
    - [09-phase-G-rtk-observability.md](./09-phase-G-rtk-observability.md) — RTK breadth + metrics (3 PRs, ~1 week)
    - [10-phase-H-python-retirement.md](./10-phase-H-python-retirement.md) — delete Python proxy (3 PRs, ~2 weeks)
    - [11-phase-I-test-infra.md](./11-phase-I-test-infra.md) — test/CI gates (parallel)
+   - [13-phase-J-history-offload.md](./13-phase-J-history-offload.md) — **PROPOSED (fork)**: frozen-history CCR offload for long-session prefix shrink (6 PRs, ~2–3 weeks)
 5. [12-decisions-needed.md](./12-decisions-needed.md) — open questions
 
 ## Conventions

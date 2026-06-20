@@ -682,6 +682,22 @@ pub(crate) async fn forward_http(
                 let session_key = derive_session_key(headers, &client_addr);
                 let hash = compute_structural_hash(&parsed, kind);
                 observe_drift(&state.drift_state, &session_key, hash);
+
+                // PR-J0: env-gated request-body capture for the offload
+                // simulator. Pure observer (no body mutation); no-op unless
+                // HEADROOM_CAPTURE_DIR is set. Reuses the hashed session key
+                // so the simulator can group + order turns per session.
+                let endpoint_label = match endpoint {
+                    compression::CompressibleEndpoint::AnthropicMessages => "anthropic",
+                    compression::CompressibleEndpoint::OpenAiChatCompletions => "openai_chat",
+                    compression::CompressibleEndpoint::OpenAiResponses => "openai_responses",
+                };
+                cache_stabilization::capture::maybe_capture(
+                    &parsed,
+                    endpoint_label,
+                    &session_key,
+                    &request_id,
+                );
             }
         }
         // Mirror the enforcement-flag override already applied to
