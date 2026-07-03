@@ -612,9 +612,12 @@ pub struct ModelRoute {
     /// Whether this is a prefix match (model_prefix ends with `*`).
     pub prefix_match: bool,
     /// Upstream URL to route matching requests to.
-    pub upstream: Url,
+    pub upstream: Option<Url>,
     /// Whether to translate Anthropic format → OpenAI format.
     pub translate: bool,
+    /// When set, route through `mimo run` subprocess instead of HTTP.
+    /// The value is the model ID to pass to `mimo run -m`.
+    pub mimo_run: Option<String>,
 }
 
 impl ModelRoute {
@@ -627,13 +630,24 @@ impl ModelRoute {
     }
 }
 
-/// Parse `MODEL_NAME=UPSTREAM_URL[:translate]` into a `ModelRoute`.
+/// Parse `MODEL_NAME=UPSTREAM_URL[:translate]` or `MODEL_NAME=mimo:MODEL_ID` into a `ModelRoute`.
 fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
     let (model, rest) = spec
         .split_once('=')
-        .ok_or_else(|| format!("expected MODEL=URL[:translate], got: {spec}"))?;
+        .ok_or_else(|| format!("expected MODEL=URL[:translate] or MODEL=mimo:ID, got: {spec}"))?;
     let model = model.trim().to_string();
     let prefix_match = model.ends_with('*');
+
+    // Check for `mimo:MODEL_ID` special syntax
+    if let Some(mimo_model) = rest.strip_prefix("mimo:") {
+        return Ok(ModelRoute {
+            model_prefix: model,
+            prefix_match,
+            upstream: None,
+            translate: false,
+            mimo_run: Some(mimo_model.trim().to_string()),
+        });
+    }
 
     // Check if the URL ends with `:translate` (but not `://` from the scheme).
     let (url_str, translate) = if rest.ends_with(":translate") {
@@ -651,8 +665,9 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
     Ok(ModelRoute {
         model_prefix: model,
         prefix_match,
-        upstream,
+        upstream: Some(upstream),
         translate,
+        mimo_run: None,
     })
 }
 

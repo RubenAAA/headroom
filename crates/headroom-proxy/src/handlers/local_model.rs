@@ -65,12 +65,20 @@ pub async fn handle_messages(
 
     // Find a matching route: first check local_model (backward compat),
     // then check model_routes table.
-    let matched: Option<(&url::Url, bool)> = if let (Some(model), Some(upstream)) =
+    // Check for mimo_run route first (highest priority)
+    let mimo_run_model = state.config.model_routes.iter()
+        .find(|r| r.matches(body_model))
+        .and_then(|r| r.mimo_run.clone());
+
+    if let Some(ref mimo_model) = mimo_run_model {
+        return handle_mimo_run(state, &parsed, body_model, mimo_model).await;
+    }
+
+    let matched = if let (Some(model), Some(upstream)) =
         (&state.config.local_model, &state.config.local_upstream)
     {
         if body_model == model.as_str() {
-            // local_model always translates (legacy behavior).
-            Some((upstream, true))
+            Some((upstream.clone(), true))
         } else {
             None
         }
@@ -84,7 +92,8 @@ pub async fn handle_messages(
             .model_routes
             .iter()
             .find(|r| r.matches(body_model))
-            .map(|r| (&r.upstream, r.translate))
+            .filter(|r| r.mimo_run.is_none())
+            .and_then(|r| Some((r.upstream.clone()?, r.translate)))
     });
 
     let (upstream, translate) = match matched {
@@ -586,6 +595,230 @@ async fn handle_buffered_response(
         .header("content-type", "application/json")
         .body(Body::from(body_bytes))
         .expect("static response")
+}
+
+/// Extract a single text message from Anthropic request body for mimo run.
+fn extract_text_message(body: &Value) -> String {
+    let messages = match body.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return String::new(),
+    };
+
+    // Build context from system prompt
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(system) = body.get("system") {
+        match system {
+            Value::String(s) => parts.push(format!("[System: {s}]")),
+            Value::Array(arr) => {
+                let text: String = arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    parts.push(format!("[System: {text}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let content = match msg.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        b.get("text").and_then(|t| t.as_str()).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if !content.is_empty() {
+            parts.push(format!("[{role}]: {content}"));
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Handle a request by routing through `mimo run` subprocess.
+async fn handle_mimo_run(
+    state: AppState,
+    original: &Value,
+    model_name: &str,
+    mimo_model: &str,
+) -> Response {
+    let is_stream = original
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let message = extract_text_message(original);
+    if message.is_empty() {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("no message content to send"))
+            .expect("static response");
+    }
+
+    tracing::info!(
+        event = "mimo_run_route",
+        model = %model_name,
+        mimo_model = %mimo_model,
+        stream = is_stream,
+        message_len = message.len(),
+        "routing through mimo run"
+    );
+
+    let _max_tokens = original
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4096);
+
+    // Build mimo run command
+    let mut cmd = std::process::Command::new("mimo");
+    cmd.arg("run")
+        .arg("-m")
+        .arg(mimo_model)
+        .arg("--format")
+        .arg("json")
+        .arg(&message);
+
+    // Run in a blocking thread to avoid blocking the async runtime
+    let output = match tokio::task::spawn_blocking(move || cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                event = "mimo_run_error",
+                error = %e,
+                "failed to execute mimo run"
+            );
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("mimo run failed: {e}")))
+                .expect("static response");
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "mimo_run_error",
+                error = %e,
+                "mimo run task failed"
+            );
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("mimo run task failed"))
+                .expect("static response");
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            event = "mimo_run_error",
+            status = %output.status,
+            stderr = %stderr,
+            "mimo run exited with error"
+        );
+        return Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(format!("mimo run failed: {stderr}")))
+            .expect("static response");
+    }
+
+    // Parse JSON lines output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(line) {
+            match event.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(text) = event.get("part").and_then(|p| p.get("text")).and_then(|t| t.as_str()) {
+                        text_parts.push(text.to_string());
+                    }
+                }
+                Some("step_finish") => {
+                    if let Some(tokens) = event.get("part").and_then(|p| p.get("tokens")) {
+                        input_tokens = tokens.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
+                        output_tokens = tokens.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let response_text = text_parts.join("");
+
+    if is_stream {
+        // For streaming, emit a single SSE message with the full response
+        let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let msg_id = format!("msg_{}", &raw_id[..raw_id.len().min(24)]);
+
+        let events = format!(
+            "event: message_start\ndata: {}\n\n\
+             event: content_block_start\ndata: {}\n\n\
+             event: content_block_delta\ndata: {}\n\n\
+             event: content_block_stop\ndata: {}\n\n\
+             event: message_delta\ndata: {}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","content":[],"model":model_name,"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":input_tokens,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":response_text}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":output_tokens}}),
+        );
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(Body::from(events))
+            .expect("static response")
+    } else {
+        // Non-streaming: return full Anthropic response
+        let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let msg_id = format!("msg_{}", &raw_id[..raw_id.len().min(24)]);
+
+        let mut content: Vec<Value> = Vec::new();
+        if !response_text.is_empty() {
+            content.push(json!({"type":"text","text":response_text}));
+        }
+
+        let response = json!({
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": model_name,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens
+            }
+        });
+
+        let body_bytes = serde_json::to_vec(&response).unwrap_or_default();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(body_bytes))
+            .expect("static response")
+    }
 }
 
 fn openai_to_anthropic_response(openai: &Value, original: &Value) -> Value {
