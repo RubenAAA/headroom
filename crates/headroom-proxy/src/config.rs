@@ -560,6 +560,17 @@ pub struct CliArgs {
     ///   --extra-model-route "codex-*=https://api.openai.com/v1:translate"
     #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
     pub extra_model_routes: Vec<String>,
+
+    /// Path to a Codex auth JSON file (default: ~/.codex/auth.json).
+    /// When set and the file exists, the proxy reads the access_token
+    /// and uses it as a Bearer token for OpenAI upstream requests.
+    /// The token is re-read from disk on each request so Codex's
+    /// refresh cycle is picked up without proxy restarts.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_CODEX_AUTH_FILE` env var →
+    /// default (`~/.codex/auth.json` if it exists, None otherwise).
+    #[arg(long = "codex-auth-file", env = "HEADROOM_PROXY_CODEX_AUTH_FILE")]
+    pub codex_auth_file: Option<String>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -739,6 +750,10 @@ pub struct Config {
     /// Additional model routes from `--extra-model-route` flags.
     /// Evaluated after `local_model` (exact match takes priority).
     pub model_routes: Vec<ModelRoute>,
+    /// Path to Codex auth JSON file. When set, the proxy reads the
+    /// access_token from this file and uses it as a Bearer token for
+    /// OpenAI upstream requests. Re-read on each request for refresh.
+    pub codex_auth_file: Option<String>,
 }
 
 impl Config {
@@ -805,6 +820,15 @@ impl Config {
                     }
                 })
                 .collect(),
+            codex_auth_file: args.codex_auth_file.or_else(|| {
+                let home = std::env::var("HOME").ok()?;
+                let p = std::path::PathBuf::from(home).join(".codex/auth.json");
+                if p.exists() {
+                    Some(p.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            }),
         }
     }
 
@@ -871,6 +895,7 @@ impl Config {
             local_model: None,
             local_upstream: None,
             model_routes: Vec::new(),
+            codex_auth_file: None,
         }
     }
 }

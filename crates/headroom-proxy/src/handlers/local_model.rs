@@ -15,6 +15,19 @@ use std::net::SocketAddr;
 
 use crate::proxy::{forward_http, AppState};
 
+/// Read the Codex access token from the auth JSON file.
+/// Returns the token string, or None if the file doesn't exist or is invalid.
+/// Re-reads on every call so Codex's token refresh cycle is picked up.
+fn read_codex_access_token(path: &str) -> Option<String> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let parsed: Value = serde_json::from_str(&data).ok()?;
+    parsed
+        .get("tokens")?
+        .get("access_token")?
+        .as_str()
+        .map(String::from)
+}
+
 /// Handle POST `/v1/messages` with local model routing.
 ///
 /// 1. Buffer the body
@@ -127,8 +140,18 @@ pub async fn handle_messages(
                 .parse()
                 .expect("valid header"),
         );
-        // Forward the original Authorization header if present.
-        if let Some(auth) = headers.get(http::header::AUTHORIZATION) {
+        // For OpenAI upstreams, use the Codex access token if available.
+        // For other upstreams, forward the original Authorization header.
+        let is_openai_upstream = upstream.host_str() == Some("api.openai.com");
+        if is_openai_upstream {
+            if let Some(ref auth_file) = state.config.codex_auth_file {
+                if let Some(token) = read_codex_access_token(auth_file) {
+                    if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
+                        upstream_headers.insert(http::header::AUTHORIZATION, val);
+                    }
+                }
+            }
+        } else if let Some(auth) = headers.get(http::header::AUTHORIZATION) {
             upstream_headers.insert(http::header::AUTHORIZATION, auth.clone());
         }
 
