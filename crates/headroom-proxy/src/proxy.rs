@@ -290,6 +290,16 @@ pub fn build_app(state: AppState) -> Router {
         );
     }
 
+    // Local model routing: intercept /v1/messages only when a local
+    // model is configured. When disabled, /v1/messages falls through
+    // to the catch-all and streams normally (zero overhead).
+    if state.config.local_model.is_some() {
+        router = router.route(
+            "/v1/messages",
+            post(crate::handlers::local_model::handle_messages),
+        );
+    }
+
     router.fallback(any(catch_all)).with_state(state)
 }
 
@@ -346,6 +356,103 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
         })
         .unwrap_or(false);
     upgrade && connection
+}
+
+/// Parse an Anthropic `/v1/messages` body, inject `context_management`
+/// directives, and re-serialize. Forwards the body unchanged on any
+/// parse/serialize failure or when nothing new was injected.
+fn maybe_inject_context_management(
+    body: bytes::Bytes,
+    config: &crate::config::Config,
+    request_id: &str,
+) -> bytes::Bytes {
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let changed = crate::compression::context_editing::inject_context_management(
+        &mut value,
+        Some(config.context_edit_keep_tool_uses),
+        config.context_edit_trigger_tokens,
+        config.context_edit_keep_thinking,
+    );
+    if !changed {
+        return body;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::info!(
+                request_id = %request_id,
+                keep_tool_uses = config.context_edit_keep_tool_uses,
+                trigger_tokens = config.context_edit_trigger_tokens,
+                keep_thinking = ?config.context_edit_keep_thinking,
+                "injected context_management directives"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
+/// Prune the `tools[]` array per the operator-configured policy (A4).
+///
+/// Deterministic + cache-safe: the same policy always removes the same tools,
+/// so the emitted tools prefix stays byte-stable across turns. Reduces
+/// cache_creation — the only bucket that counts toward subscription usage
+/// (cache reads are free per Anthropic's rate-limit docs). No-op (returns the
+/// original bytes untouched) when the body has no tools array or nothing is
+/// removed, so a cache-stable request is never perturbed.
+fn maybe_prune_tools(
+    body: bytes::Bytes,
+    policy: &crate::cache_stabilization::tool_prune::PrunePolicy,
+    request_id: &str,
+) -> bytes::Bytes {
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return body;
+    };
+    let before = tools.len();
+    let removed = crate::cache_stabilization::tool_prune::prune_tools(tools, policy);
+    if removed == 0 {
+        return body;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::info!(
+                request_id = %request_id,
+                tools_before = before,
+                tools_removed = removed,
+                "pruned tools[] per policy"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
+/// Append a token to the `anthropic-beta` header, preserving existing tokens
+/// and skipping if already present.
+fn append_anthropic_beta(headers: &mut http::HeaderMap, beta: &str) {
+    const NAME: &str = "anthropic-beta";
+    let existing = headers
+        .get(NAME)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if existing.split(',').any(|t| t.trim() == beta) {
+        return;
+    }
+    let merged = if existing.is_empty() {
+        beta.to_string()
+    } else {
+        format!("{existing},{beta}")
+    };
+    if let Ok(val) = http::HeaderValue::from_str(&merged) {
+        headers.insert(NAME, val);
+    }
 }
 
 /// Build the upstream URL by joining the configured base with the incoming
@@ -918,8 +1025,30 @@ pub(crate) async fn forward_http(
                     &path_for_log,
                 )
             }
-            compression::CompressibleEndpoint::AnthropicMessages => body_to_send,
+            compression::CompressibleEndpoint::AnthropicMessages => {
+                let body_to_send = if state.config.tool_prune_policy.is_noop() {
+                    body_to_send
+                } else {
+                    maybe_prune_tools(body_to_send, &state.config.tool_prune_policy, &request_id)
+                };
+                if state.config.context_edit {
+                    maybe_inject_context_management(body_to_send, &state.config, &request_id)
+                } else {
+                    body_to_send
+                }
+            }
         };
+
+        // Context-editing: when injecting `context_management` directives we
+        // must also advertise the beta so the upstream honours them.
+        if state.config.context_edit
+            && matches!(endpoint, compression::CompressibleEndpoint::AnthropicMessages)
+        {
+            append_anthropic_beta(
+                &mut outgoing_headers,
+                crate::compression::context_editing::CONTEXT_MANAGEMENT_BETA,
+            );
+        }
 
         // Forward the (Phase A: identical) buffered bytes. reqwest
         // sets its own Content-Length from the body bytes — the
@@ -1647,6 +1776,59 @@ mod tests {
         let uri: Uri = "/v1/messages?stream=true".parse().unwrap();
         let out = build_upstream_url(&base, &uri).unwrap();
         assert_eq!(out.as_str(), "http://up:8080/v1/messages?stream=true");
+    }
+
+    #[test]
+    fn maybe_prune_tools_drops_and_reserializes() {
+        use crate::cache_stabilization::tool_prune::PrunePolicy;
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "m",
+                "tools": [
+                    {"name": "Read", "input_schema": {}},
+                    {"name": "mcp__chrome__click", "input_schema": {}}
+                ]
+            }))
+            .unwrap(),
+        );
+        let policy = PrunePolicy {
+            drop_mcp_servers: ["chrome"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let out = maybe_prune_tools(body, &policy, "req-test");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "Read");
+    }
+
+    #[test]
+    fn maybe_prune_tools_passthrough_when_no_tools_field() {
+        use crate::cache_stabilization::tool_prune::PrunePolicy;
+        let original = bytes::Bytes::from(br#"{"model":"m","messages":[]}"#.to_vec());
+        let policy = PrunePolicy {
+            drop_mcp_servers: ["chrome"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let out = maybe_prune_tools(original.clone(), &policy, "req-test");
+        assert_eq!(out, original, "no tools[] -> byte-identical passthrough");
+    }
+
+    #[test]
+    fn maybe_prune_tools_passthrough_when_nothing_removed() {
+        use crate::cache_stabilization::tool_prune::PrunePolicy;
+        let original = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "tools": [{"name": "Read", "input_schema": {}}]
+            }))
+            .unwrap(),
+        );
+        let policy = PrunePolicy {
+            drop_mcp_servers: ["chrome"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let out = maybe_prune_tools(original.clone(), &policy, "req-test");
+        assert_eq!(out, original, "nothing matched -> byte-identical passthrough");
     }
 
     #[test]

@@ -28,6 +28,13 @@ pub enum CompressionMode {
     /// in PR-A1 this falls through to passthrough behaviour with a
     /// loud warning. Phase B PR-B2 wires in the actual dispatcher.
     LiveZone,
+    /// Compress compressible blocks across ALL user messages, not just
+    /// the latest. Deterministic per-content compression keeps identical
+    /// content → identical bytes on every turn, so Anthropic's prompt
+    /// cache forms over the compressed history (stable, no cascade).
+    /// This is the subscription-savings mode (cuts cache_creation and
+    /// the per-turn cache_read of compressed history).
+    AllMessages,
 }
 
 /// Policy for stripping internal `x-headroom-*` headers from upstream-bound
@@ -177,6 +184,7 @@ impl CompressionMode {
         match self {
             CompressionMode::Off => "off",
             CompressionMode::LiveZone => "live_zone",
+            CompressionMode::AllMessages => "all_messages",
         }
     }
 }
@@ -267,6 +275,39 @@ pub struct CliArgs {
         default_value_t = CompressionMode::Off,
     )]
     pub compression_mode: CompressionMode,
+
+    /// Inject Anthropic-native context-editing (`context_management`) into
+    /// `/v1/messages` so subscription users get the server-side context GC
+    /// (`clear_tool_uses`) that Claude Code gates behind ant-only flags.
+    /// Adds the `context-management-2025-06-27` beta header. Off by default.
+    #[arg(long = "context-edit", env = "HEADROOM_PROXY_CONTEXT_EDIT")]
+    pub context_edit: bool,
+
+    /// `clear_tool_uses`: keep this many most-recent tool results uncleared.
+    #[arg(long = "context-edit-keep-tool-uses", default_value_t = 6)]
+    pub context_edit_keep_tool_uses: u64,
+
+    /// `clear_tool_uses`: fire once input tokens exceed this trigger.
+    #[arg(long = "context-edit-trigger-tokens", default_value_t = 60_000)]
+    pub context_edit_trigger_tokens: u64,
+
+    /// When set, also inject `clear_thinking` keeping this many thinking turns.
+    #[arg(long = "context-edit-keep-thinking")]
+    pub context_edit_keep_thinking: Option<u64>,
+
+    /// Tool pruning (A4): drop whole MCP servers by name (comma-separated).
+    /// A tool named `mcp__<server>__<fn>` is dropped when `<server>` is listed.
+    /// Deterministic + cache-safe; never touches built-in (non-MCP) tools.
+    /// Off by default. Reduces cache_creation — the only bucket that counts
+    /// toward subscription usage (cache reads are free per Anthropic docs).
+    #[arg(long = "prune-drop-mcp", env = "HEADROOM_PROXY_PRUNE_DROP_MCP")]
+    pub prune_drop_mcp: Option<String>,
+
+    /// Tool pruning (A4): keep ONLY these tool names (comma-separated
+    /// allowlist). When set, every tool not listed is dropped (most
+    /// aggressive); takes precedence over --prune-drop-mcp. Off by default.
+    #[arg(long = "prune-keep-tools", env = "HEADROOM_PROXY_PRUNE_KEEP_TOOLS")]
+    pub prune_keep_tools: Option<String>,
 
     /// Whether to derive `frozen_message_count` from customer
     /// `cache_control` markers in the request body (PR-A4).
@@ -486,6 +527,27 @@ pub struct CliArgs {
         default_value = "https://www.googleapis.com/auth/cloud-platform"
     )]
     pub vertex_adc_scope: String,
+
+    /// Route requests for a local model through a local upstream with
+    /// Anthropic↔OpenAI format translation. When set, any `/v1/messages`
+    /// request whose `model` field matches this value is translated to
+    /// OpenAI Chat Completions format and forwarded to `--local-upstream`.
+    /// All other requests pass through transparently.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_LOCAL_MODEL` env var →
+    /// default (None = disabled).
+    #[arg(long = "local-model", env = "HEADROOM_PROXY_LOCAL_MODEL")]
+    pub local_model: Option<String>,
+
+    /// Upstream URL for the local model (e.g. http://localhost:8080).
+    /// Required when `--local-model` is set; the proxy appends
+    /// `/v1/chat/completions` to this base. Ignored when `--local-model`
+    /// is unset.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_LOCAL_UPSTREAM` env var →
+    /// default (None).
+    #[arg(long = "local-upstream", env = "HEADROOM_PROXY_LOCAL_UPSTREAM")]
+    pub local_upstream: Option<Url>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -496,6 +558,27 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
     s.parse::<bytesize::ByteSize>()
         .map(|b| b.as_u64())
         .map_err(|e| format!("invalid byte size `{s}`: {e}"))
+}
+
+/// Build the tool-pruning policy from the two comma-separated CLI/env flags.
+/// Empty / whitespace-only entries are ignored; an absent flag is an empty set.
+/// When both are `None`, the resulting policy `is_noop()` (passthrough).
+fn parse_prune_policy(
+    keep_tools: Option<&str>,
+    drop_mcp: Option<&str>,
+) -> crate::cache_stabilization::tool_prune::PrunePolicy {
+    fn split(s: Option<&str>) -> std::collections::BTreeSet<String> {
+        s.into_iter()
+            .flat_map(|raw| raw.split(','))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+    crate::cache_stabilization::tool_prune::PrunePolicy {
+        keep_names: split(keep_tools),
+        drop_mcp_servers: split(drop_mcp),
+    }
 }
 
 /// Resolved configuration used by the running server.
@@ -522,6 +605,17 @@ pub struct Config {
     /// because the dispatcher isn't implemented yet (Phase B PR-B2
     /// fills this in).
     pub compression_mode: CompressionMode,
+    /// Inject Anthropic context-editing directives into `/v1/messages`.
+    pub context_edit: bool,
+    /// `clear_tool_uses`: keep this many most-recent tool results.
+    pub context_edit_keep_tool_uses: u64,
+    /// `clear_tool_uses`: input-token trigger threshold.
+    pub context_edit_trigger_tokens: u64,
+    /// When `Some(n)`, also inject `clear_thinking` keeping `n` thinking turns.
+    pub context_edit_keep_thinking: Option<u64>,
+    /// Tool-pruning (A4) policy, parsed once from `--prune-keep-tools` /
+    /// `--prune-drop-mcp`. `is_noop()` when neither flag is set (passthrough).
+    pub tool_prune_policy: crate::cache_stabilization::tool_prune::PrunePolicy,
     /// Whether the live-zone dispatcher derives `frozen_message_count`
     /// automatically from customer `cache_control` markers. PR-A4
     /// adds the derivation function (`compute_frozen_count`); Phase
@@ -572,6 +666,12 @@ pub struct Config {
     /// PR-D4: GCP ADC OAuth scope used when fetching the bearer
     /// token. Default `https://www.googleapis.com/auth/cloud-platform`.
     pub vertex_adc_scope: String,
+    /// Local model routing: when `Some`, requests whose `model` field
+    /// matches this string are translated to OpenAI format and forwarded
+    /// to `local_upstream`.
+    pub local_model: Option<String>,
+    /// Local model upstream URL. Required when `local_model` is `Some`.
+    pub local_upstream: Option<Url>,
 }
 
 impl Config {
@@ -596,6 +696,14 @@ impl Config {
             compression: args.compression,
             compression_max_body_bytes,
             compression_mode: args.compression_mode,
+            context_edit: args.context_edit,
+            context_edit_keep_tool_uses: args.context_edit_keep_tool_uses,
+            context_edit_trigger_tokens: args.context_edit_trigger_tokens,
+            context_edit_keep_thinking: args.context_edit_keep_thinking,
+            tool_prune_policy: parse_prune_policy(
+                args.prune_keep_tools.as_deref(),
+                args.prune_drop_mcp.as_deref(),
+            ),
             cache_control_auto_frozen: args.cache_control_auto_frozen,
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
@@ -609,6 +717,8 @@ impl Config {
             bedrock_validate_eventstream_crc: args.bedrock_validate_eventstream_crc,
             vertex_region: args.vertex_region,
             vertex_adc_scope: args.vertex_adc_scope,
+            local_model: args.local_model,
+            local_upstream: args.local_upstream,
         }
     }
 
@@ -627,6 +737,11 @@ impl Config {
             compression: false,
             compression_max_body_bytes: 100 * 1024 * 1024,
             compression_mode: CompressionMode::Off,
+            context_edit: false,
+            context_edit_keep_tool_uses: 6,
+            context_edit_trigger_tokens: 60_000,
+            context_edit_keep_thinking: None,
+            tool_prune_policy: Default::default(),
             // Match production default so the cache-control walker is
             // exercised under test without per-test opt-in.
             cache_control_auto_frozen: CacheControlAutoFrozen::Enabled,
@@ -667,6 +782,36 @@ impl Config {
             // only; the upstream URL is `upstream`).
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
+            local_model: None,
+            local_upstream: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod prune_policy_tests {
+    use super::parse_prune_policy;
+
+    #[test]
+    fn both_none_is_noop() {
+        let p = parse_prune_policy(None, None);
+        assert!(p.is_noop());
+    }
+
+    #[test]
+    fn parses_comma_list_trimming_and_dropping_empties() {
+        let p = parse_prune_policy(Some(" Read , Bash ,, "), None);
+        assert_eq!(p.keep_names.len(), 2);
+        assert!(p.keep_names.contains("Read"));
+        assert!(p.keep_names.contains("Bash"));
+        assert!(p.drop_mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn parses_drop_mcp_servers() {
+        let p = parse_prune_policy(None, Some("chrome,tmux"));
+        assert!(p.keep_names.is_empty());
+        assert_eq!(p.drop_mcp_servers.len(), 2);
+        assert!(p.drop_mcp_servers.contains("chrome"));
     }
 }

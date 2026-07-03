@@ -10,4 +10,5 @@
 
 pub mod chat_completions;
 pub mod conversations;
+pub mod local_model;
 pub mod responses;
