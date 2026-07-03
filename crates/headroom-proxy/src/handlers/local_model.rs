@@ -616,6 +616,13 @@ fn openai_to_anthropic_response(openai: &Value, original: &Value) -> Value {
     let mut content: Vec<Value> = Vec::new();
 
     if let Some(msg) = message {
+        // Handle reasoning_content (thinking tokens from models like Qwen).
+        if let Some(reasoning) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
+            if !reasoning.is_empty() {
+                content.push(json!({"type": "thinking", "thinking": reasoning}));
+            }
+        }
+
         if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
             if !text.is_empty() {
                 content.push(json!({"type": "text", "text": text}));
@@ -711,6 +718,7 @@ struct StreamTranslator {
     started: bool,
     in_text_block: bool,
     in_tool_block: bool,
+    in_thinking_block: bool,
     current_tool_id: String,
     current_tool_name: String,
     total_output_tokens: u64,
@@ -724,6 +732,7 @@ impl StreamTranslator {
             started: false,
             in_text_block: false,
             in_tool_block: false,
+            in_thinking_block: false,
             current_tool_id: String::new(),
             current_tool_name: String::new(),
             total_output_tokens: 0,
@@ -734,7 +743,13 @@ impl StreamTranslator {
         let mut events = Vec::new();
 
         if line.trim().is_empty() || line.trim() == "[DONE]" {
-            if line.trim() == "[DONE]" && (self.in_text_block || self.in_tool_block) {
+            if line.trim() == "[DONE]"
+                && (self.in_text_block || self.in_tool_block || self.in_thinking_block)
+            {
+                if self.in_thinking_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_thinking_block = false;
+                }
                 if self.in_text_block {
                     events.push(self.emit_content_block_stop());
                     self.in_text_block = false;
@@ -781,8 +796,36 @@ impl StreamTranslator {
         }
 
         if let Some(delta) = delta {
+            // Handle reasoning_content (thinking tokens from models like Qwen).
+            if let Some(thinking) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                if !self.in_thinking_block && !self.in_text_block && !self.in_tool_block {
+                    events.push(self.emit_content_block_start_thinking());
+                    self.in_thinking_block = true;
+                }
+                if self.in_text_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_text_block = false;
+                    self.content_block_index += 1;
+                    events.push(self.emit_content_block_start_thinking());
+                    self.in_thinking_block = true;
+                }
+                if self.in_tool_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_tool_block = false;
+                    self.content_block_index += 1;
+                    events.push(self.emit_content_block_start_thinking());
+                    self.in_thinking_block = true;
+                }
+                events.push(self.emit_thinking_delta(thinking));
+            }
+
             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                 if !self.in_text_block && !self.in_tool_block {
+                    if self.in_thinking_block {
+                        events.push(self.emit_content_block_stop());
+                        self.in_thinking_block = false;
+                        self.content_block_index += 1;
+                    }
                     events.push(self.emit_content_block_start_text());
                     self.in_text_block = true;
                 }
@@ -801,6 +844,11 @@ impl StreamTranslator {
             {
                 for tc in tool_calls {
                     if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        if self.in_thinking_block {
+                            events.push(self.emit_content_block_stop());
+                            self.in_thinking_block = false;
+                            self.content_block_index += 1;
+                        }
                         if self.in_text_block {
                             events.push(self.emit_content_block_stop());
                             self.in_text_block = false;
@@ -848,6 +896,10 @@ impl StreamTranslator {
         }
 
         if let Some(reason) = finish_reason {
+            if self.in_thinking_block {
+                events.push(self.emit_content_block_stop());
+                self.in_thinking_block = false;
+            }
             if self.in_text_block {
                 events.push(self.emit_content_block_stop());
                 self.in_text_block = false;
@@ -895,7 +947,15 @@ impl StreamTranslator {
             "index": self.content_block_index,
             "content_block": {"type": "text", "text": ""}
         });
-        let _ = &mut self.content_block_index; // suppress unused mut warning context
+        format!("event: content_block_start\ndata: {event}\n\n")
+    }
+
+    fn emit_content_block_start_thinking(&mut self) -> String {
+        let event = json!({
+            "type": "content_block_start",
+            "index": self.content_block_index,
+            "content_block": {"type": "thinking", "thinking": ""}
+        });
         format!("event: content_block_start\ndata: {event}\n\n")
     }
 
@@ -913,6 +973,15 @@ impl StreamTranslator {
             "type": "content_block_delta",
             "index": self.content_block_index,
             "delta": {"type": "text_delta", "text": text}
+        });
+        format!("event: content_block_delta\ndata: {event}\n\n")
+    }
+
+    fn emit_thinking_delta(&self, thinking: &str) -> String {
+        let event = json!({
+            "type": "content_block_delta",
+            "index": self.content_block_index,
+            "delta": {"type": "thinking_delta", "thinking": thinking}
         });
         format!("event: content_block_delta\ndata: {event}\n\n")
     }
