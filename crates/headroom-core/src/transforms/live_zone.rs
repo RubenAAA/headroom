@@ -1517,6 +1517,36 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
     }
 }
 
+/// CTX-3: run the content-type detection + compressor stack over a
+/// single block of text and return the structural digest.
+///
+/// This is the pure, provider-agnostic core the `ctx_offload` transform
+/// reuses so it hits the *exact same* detectors and compressors as the
+/// live-zone dispatcher (`dispatch_compressor`) rather than duplicating
+/// that routing. It is a deterministic pure function of `text` (invariant
+/// I1 in `docs/ctx-mode-in-headroom-plan.md`): `detect_content_type` is a
+/// pure classifier and every compressor is a pure transform.
+///
+/// Returns `(Some(strategy), compressed)` when a compressor rewrote the
+/// block, or `(None, text.to_owned())` when no compressor applied or the
+/// content was left unchanged.
+///
+/// NOTE: the `PlainText` arm routes through `kompress`, whose output
+/// depends on whether the local HF model is present in the on-disk cache.
+/// That state is stable for a given deployment (present or absent per
+/// machine) but is the one place offload determinism is environment- (not
+/// byte-) scoped — same caveat the live-zone dispatcher already carries.
+pub fn compress_block_for_offload(text: &str) -> (Option<&'static str>, String) {
+    let detection = detect_content_type(text);
+    match dispatch_compressor(text, detection.content_type) {
+        DispatchResult::Compressed {
+            strategy,
+            compressed,
+        } => (Some(strategy), compressed),
+        _ => (None, text.to_string()),
+    }
+}
+
 /// Fallback when byte-range planning fails: still record per-block
 /// outcomes so observability covers the request. Mirrors PR-B2's
 /// observation-only path.

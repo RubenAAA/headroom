@@ -83,6 +83,22 @@ pub struct AppState {
     /// sessions DB is opened. Pure observer — never mutates or delays a
     /// request; all work runs on its own background thread.
     pub ctx_observer: Option<Arc<crate::ctx::observer::CtxObserver>>,
+    /// CTX-3: tool_result offload runtime. `Some` only when
+    /// `config.ctx_offload` is set. Holds the static offload config (applied on
+    /// the request path, before the live-zone compressors) and the background
+    /// persistence sink for offloaded originals. The transform mutates wire
+    /// bytes but is a pure function of block bytes (cache-safe per I1/I2); the
+    /// sink never touches wire bytes.
+    pub ctx_offload: Option<CtxOffloadRuntime>,
+}
+
+/// CTX-3 offload runtime bundled into [`AppState`].
+#[derive(Clone)]
+pub struct CtxOffloadRuntime {
+    /// Static offload config (min-bytes threshold). Never changes mid-session.
+    pub config: crate::compression::ctx_offload::CtxOffloadConfig,
+    /// Background sink that persists offloaded originals to CCR + FTS.
+    pub store: Arc<crate::ctx::offload_store::OffloadStore>,
 }
 
 /// PR-E6: maximum number of sessions tracked by the drift detector
@@ -145,6 +161,50 @@ impl AppState {
             None
         };
 
+        // CTX-3: construct the offload runtime only when enabled. Independent
+        // of `ctx_capture` — offload is its own flag. A failure to open the CCR
+        // / content stores is logged loudly and disables offload (a broken sink
+        // must never take down the proxy). The store dir resolution mirrors the
+        // observer above.
+        let ctx_offload = if config.ctx_offload {
+            let base = config
+                .ctx_store_dir
+                .clone()
+                .or_else(headroom_core::ctx::default_base_dir);
+            match base {
+                Some(dir) => {
+                    match crate::ctx::offload_store::OffloadStore::start(
+                        &dir,
+                        config.ctx_offload_ttl_seconds,
+                    ) {
+                        Ok(store) => Some(CtxOffloadRuntime {
+                            config: crate::compression::ctx_offload::CtxOffloadConfig {
+                                min_bytes: config.ctx_offload_min_bytes,
+                            },
+                            store: Arc::new(store),
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                event = "ctx_offload_start_failed",
+                                error = %e,
+                                "CTX-3 offload disabled: could not open CCR/content stores"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        event = "ctx_offload_no_store_dir",
+                        "CTX-3 offload enabled but no store dir and $HOME unset; disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             client,
@@ -153,6 +213,7 @@ impl AppState {
             vertex_token_source,
             usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
             ctx_observer,
+            ctx_offload,
         })
     }
 
@@ -893,6 +954,55 @@ pub(crate) async fn forward_http(
         } else {
             AuthMode::Payg
         };
+
+        // CTX-3: tool_result offload. Runs BEFORE the live-zone compressors and
+        // is exempt from the frozen-count floor (it rewrites blocks in ALL
+        // messages) precisely because the replacement is a pure function of the
+        // block's own bytes — the client resends the raw block next turn and we
+        // re-produce byte-identical output, so the cached prefix never drifts
+        // (invariants I1/I2, `docs/ctx-mode-in-headroom-plan.md`). Anthropic
+        // only. When nothing qualifies we forward the original bytes untouched
+        // (no gratuitous re-cache). Persistence of the originals is handed to a
+        // detached worker; the wire bytes never depend on the store.
+        let buffered = if let (Some(runtime), compression::CompressibleEndpoint::AnthropicMessages) =
+            (state.ctx_offload.as_ref(), endpoint)
+        {
+            match serde_json::from_slice::<serde_json::Value>(&buffered) {
+                Ok(mut value) => {
+                    let out = crate::compression::ctx_offload::offload_anthropic_request(
+                        &mut value,
+                        &runtime.config,
+                    );
+                    if out.changed() {
+                        match serde_json::to_vec(&value) {
+                            Ok(bytes) => {
+                                tracing::debug!(
+                                    request_id = %request_id,
+                                    blocks_offloaded = out.blocks_offloaded,
+                                    "ctx_offload rewrote tool_result blocks"
+                                );
+                                runtime.store.persist(out.records);
+                                axum::body::Bytes::from(bytes)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    error = %e,
+                                    "ctx_offload re-serialization failed; forwarding original body"
+                                );
+                                buffered
+                            }
+                        }
+                    } else {
+                        buffered
+                    }
+                }
+                Err(_) => buffered,
+            }
+        } else {
+            buffered
+        };
+
         let outcome = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => {
                 // PR-E3: thread the F1-classified auth_mode into the

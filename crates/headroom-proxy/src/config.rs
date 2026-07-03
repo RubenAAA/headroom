@@ -465,6 +465,39 @@ pub struct CliArgs {
     #[arg(long = "ctx-store-dir", env = "HEADROOM_PROXY_CTX_STORE_DIR")]
     pub ctx_store_dir: Option<std::path::PathBuf>,
 
+    /// CTX-3: enable the tool_result offload transform. Replaces oversized
+    /// `tool_result` blocks with a deterministic structural digest before the
+    /// live-zone compressors run, and stashes the original in the CCR store for
+    /// retrieval. Pure function of block bytes (cache-safe). Default `false`.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_CTX_OFFLOAD` env → default.
+    #[arg(
+        long = "ctx-offload",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub ctx_offload: bool,
+
+    /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
+    /// to be offloaded. Static per invariant I3 (never changes mid-session).
+    /// Default `50_000` (mirrors context-mode's Read threshold).
+    #[arg(
+        long = "ctx-offload-min-bytes",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_MIN_BYTES",
+        default_value_t = 50_000,
+    )]
+    pub ctx_offload_min_bytes: usize,
+
+    /// CTX-3: TTL (seconds) for offloaded originals in the CCR store. Long by
+    /// design (retrieval outlives a session); default `604_800` (7 days).
+    #[arg(
+        long = "ctx-offload-ttl-seconds",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_TTL_SECONDS",
+        default_value_t = 604_800,
+    )]
+    pub ctx_offload_ttl_seconds: u64,
+
     /// AWS region to use when signing Bedrock requests. Default
     /// `us-east-1`. The Bedrock endpoint URL derived from this
     /// region is `https://bedrock-runtime.{region}.amazonaws.com`
@@ -764,6 +797,12 @@ pub struct Config {
     /// CTX-2: base dir for sessions/content DBs. `None` → default
     /// `~/.claude-personal/context-mode`. Only used when `ctx_capture`.
     pub ctx_store_dir: Option<std::path::PathBuf>,
+    /// CTX-3: tool_result offload transform on/off. Default `false`.
+    pub ctx_offload: bool,
+    /// CTX-3: min serialized byte length for a block to be offloaded.
+    pub ctx_offload_min_bytes: usize,
+    /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
+    pub ctx_offload_ttl_seconds: u64,
     /// PR-D1: AWS region used to sign Bedrock requests + (when no
     /// explicit endpoint is set) derive the Bedrock endpoint URL.
     pub bedrock_region: String,
@@ -838,6 +877,9 @@ impl Config {
             enable_kompress: args.enable_kompress,
             ctx_capture: args.ctx_capture,
             ctx_store_dir: args.ctx_store_dir,
+            ctx_offload: args.ctx_offload,
+            ctx_offload_min_bytes: args.ctx_offload_min_bytes,
+            ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -930,6 +972,9 @@ impl Config {
             // CTX-2 passive capture off by default (production + tests).
             ctx_capture: false,
             ctx_store_dir: None,
+            ctx_offload: false,
+            ctx_offload_min_bytes: 50_000,
+            ctx_offload_ttl_seconds: 604_800,
             bedrock_region: "us-east-1".to_string(),
             bedrock_endpoint: None,
             aws_profile: None,
