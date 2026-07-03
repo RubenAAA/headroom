@@ -31,6 +31,11 @@ pub fn hello() -> &'static str {
 /// ort 2.x uses dynamic loading — all EP types are always compiled in;
 /// the provider library is loaded from the system at runtime. If the EP
 /// library is absent ORT logs a warning and falls back to CPU automatically.
+/// For OpenVINO EP in particular: it requires an OpenVINO-enabled build
+/// (e.g. the `onnxruntime-openvino` distribution) plus a matching
+/// `openvino` runtime on the library path. Point `ORT_DYLIB_PATH` at an
+/// OpenVINO-enabled `onnxruntime.dll`, and put the matching `openvino`
+/// libs (version-matched to the provider) on `PATH`.
 ///
 /// Valid values for `HEADROOM_ORT_EP`:
 /// - unset / `cpu` — no-op; ORT defaults to CPU (always available)
