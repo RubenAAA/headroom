@@ -198,6 +198,30 @@ impl SessionsStore {
               PRIMARY KEY (conv_id, turn_n)
             );
             CREATE INDEX IF NOT EXISTS idx_conv_prefix_conv ON conv_prefix_chain(conv_id);
+
+            -- CTX-4 addition: session_key -> recent conversation ids, so a NEW
+            -- conv_id carrying a resume/compaction marker can be linked back to
+            -- the prior conversation under the same client session key. No TS
+            -- equivalent (the TS hooks key resume off the transcript file).
+            -- `seq` is a strictly-monotonic recency counter (clock-independent,
+            -- so ordering is deterministic even for touches within one second).
+            CREATE TABLE IF NOT EXISTS conv_by_session_key (
+              session_key TEXT NOT NULL,
+              conv_id     TEXT NOT NULL,
+              seq         INTEGER NOT NULL,
+              last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (session_key, conv_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conv_by_sk
+              ON conv_by_session_key(session_key, seq);
+
+            -- CTX-4 addition: the injection bytes decided once per conversation
+            -- and replayed verbatim every subsequent turn (invariant I4).
+            CREATE TABLE IF NOT EXISTS conv_injection (
+              conv_id       TEXT PRIMARY KEY,
+              injected_text TEXT NOT NULL,
+              created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             ",
         )
     }
@@ -334,6 +358,75 @@ impl SessionsStore {
         conn.query_row(
             "SELECT prefix_hash FROM conv_prefix_chain WHERE conv_id = ?1 AND turn_n = ?2",
             params![conv_id, turn_n as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+    }
+
+    // ── Resume-linking (CTX-4) ──
+
+    /// Record that `conv_id` was seen under `session_key`, refreshing its
+    /// recency. Upsert so a long-running conversation keeps floating to the top.
+    pub fn record_conversation(&self, session_key: &str, conv_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        conn.execute(
+            "INSERT INTO conv_by_session_key (session_key, conv_id, seq)
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM conv_by_session_key))
+             ON CONFLICT(session_key, conv_id) DO UPDATE SET
+                 seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM conv_by_session_key),
+                 last_seen = datetime('now')",
+            params![session_key, conv_id],
+        )?;
+        Ok(())
+    }
+
+    /// Conversations recently seen under `session_key`, newest first, excluding
+    /// `exclude` (the current conversation). Used to link a resume/compaction
+    /// request to the prior conversation it continues.
+    pub fn recent_conversations(
+        &self,
+        session_key: &str,
+        exclude: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT conv_id FROM conv_by_session_key
+             WHERE session_key = ?1 AND conv_id <> ?2
+             ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![session_key, exclude, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // ── Injection persistence (CTX-4, invariant I4) ──
+
+    /// Persist the injection bytes for a conversation. Decided ONCE: a second
+    /// call for the same `conv_id` is a no-op (never overwrites), so the
+    /// replayed prefix can never oscillate.
+    pub fn put_injection(&self, conv_id: &str, injected_text: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        conn.execute(
+            "INSERT INTO conv_injection (conv_id, injected_text)
+             VALUES (?1, ?2)
+             ON CONFLICT(conv_id) DO NOTHING",
+            params![conv_id, injected_text],
+        )?;
+        Ok(())
+    }
+
+    /// The injection bytes previously decided for a conversation, if any.
+    pub fn get_injection(&self, conv_id: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        conn.query_row(
+            "SELECT injected_text FROM conv_injection WHERE conv_id = ?1",
+            params![conv_id],
             |r| r.get::<_, String>(0),
         )
         .optional()

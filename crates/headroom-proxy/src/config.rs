@@ -498,6 +498,22 @@ pub struct CliArgs {
     )]
     pub ctx_offload_ttl_seconds: u64,
 
+    /// CTX-4: enable recall/resume injection. On the first request of a
+    /// conversation, prepends a recall block (fresh) or resume snapshot
+    /// (compaction/resume) into the first user message, then replays the same
+    /// bytes verbatim on every later turn (invariant I4). Requires
+    /// `ctx_capture` (the identity/sessions layer) — enforced loudly at
+    /// startup. Default `false`.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_CTX_INJECT` env → default.
+    #[arg(
+        long = "ctx-inject",
+        env = "HEADROOM_PROXY_CTX_INJECT",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub ctx_inject: bool,
+
     /// AWS region to use when signing Bedrock requests. Default
     /// `us-east-1`. The Bedrock endpoint URL derived from this
     /// region is `https://bedrock-runtime.{region}.amazonaws.com`
@@ -803,6 +819,8 @@ pub struct Config {
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
     pub ctx_offload_ttl_seconds: u64,
+    /// CTX-4: recall/resume injection on/off. Requires `ctx_capture`.
+    pub ctx_inject: bool,
     /// PR-D1: AWS region used to sign Bedrock requests + (when no
     /// explicit endpoint is set) derive the Bedrock endpoint URL.
     pub bedrock_region: String,
@@ -880,6 +898,7 @@ impl Config {
             ctx_offload: args.ctx_offload,
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
+            ctx_inject: args.ctx_inject,
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -975,6 +994,7 @@ impl Config {
             ctx_offload: false,
             ctx_offload_min_bytes: 50_000,
             ctx_offload_ttl_seconds: 604_800,
+            ctx_inject: false,
             bedrock_region: "us-east-1".to_string(),
             bedrock_endpoint: None,
             aws_profile: None,

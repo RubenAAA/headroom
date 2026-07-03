@@ -37,6 +37,13 @@ pub enum ProxyError {
     /// LLM request.
     #[error("compression engine startup failed: {0}")]
     CompressionStartup(String),
+
+    /// A startup configuration invariant was violated (e.g. a feature that
+    /// depends on another was enabled without it). Fatal at construction time
+    /// — the operator is told exactly what to fix rather than degrading
+    /// silently.
+    #[error("invalid configuration: {0}")]
+    Config(String),
 }
 
 impl IntoResponse for ProxyError {
@@ -62,6 +69,7 @@ impl IntoResponse for ProxyError {
             ProxyError::CompressionStartup(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
+            ProxyError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
         tracing::warn!(error = %msg, "proxy error");
         (status, msg).into_response()

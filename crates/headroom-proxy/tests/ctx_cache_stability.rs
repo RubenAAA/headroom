@@ -1,4 +1,5 @@
-//! CTX-3 acceptance harness — prefix-stability of the offload transform.
+//! CTX-3/CTX-4 acceptance harness — prefix-stability of the offload + injection
+//! transforms.
 //!
 //! This is the acceptance gate for the whole context-mode-in-headroom project
 //! (`docs/ctx-mode-in-headroom-plan.md`, invariants I1–I6). It simulates a
@@ -21,9 +22,13 @@ use headroom_proxy::cache_stabilization::volatile_detector::{
 use headroom_proxy::compression::ctx_offload::{offload_anthropic_request, CtxOffloadConfig};
 use headroom_proxy::compression::{compress_anthropic_request, Outcome};
 use headroom_proxy::config::{CacheControlAutoFrozen, CompressionMode};
+use headroom_proxy::ctx::inject::InjectEngine;
 
 use headroom_core::auth_mode::AuthMode;
+use headroom_core::ctx::{CtxStore, SessionsStore};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tempfile::TempDir;
 
 const MIN_BYTES: usize = 2_000;
 
@@ -126,6 +131,64 @@ fn growing_conversation(turns: usize) -> Vec<Vec<Value>> {
         snapshots.push(history.clone());
     }
     snapshots
+}
+
+/// Apply the FULL context-mode pipeline: CTX-4 injection, then CTX-3 offload,
+/// then the live-zone compressor — exactly the request-path order in proxy.rs.
+fn transform_all(engine: &InjectEngine, request: &Value, session_key: &str) -> Value {
+    let mut v = request.clone();
+    engine.maybe_inject(&mut v, session_key);
+    offload_anthropic_request(&mut v, &cfg());
+    let bytes = serde_json::to_vec(&v).unwrap();
+    let outcome = compress_anthropic_request(
+        &bytes.clone().into(),
+        CompressionMode::LiveZone,
+        CacheControlAutoFrozen::Enabled,
+        AuthMode::Payg,
+        "test-ctx-all",
+    );
+    let final_bytes = match outcome {
+        Outcome::Compressed { body, .. } => body.to_vec(),
+        _ => bytes,
+    };
+    serde_json::from_slice(&final_bytes).unwrap()
+}
+
+#[test]
+fn inject_offload_compression_all_on_prefix_is_stable() {
+    // The full stack: injection + offload + live-zone compression, replayed
+    // over a growing conversation. The injected block must appear from turn 1
+    // and be byte-stable, and every consecutive prefix must be byte-identical.
+    let dir = TempDir::new().unwrap();
+    let sessions = Arc::new(SessionsStore::open(dir.path().join("s.db")).unwrap());
+    let content = CtxStore::open(dir.path().join("content.db")).unwrap();
+    let engine = InjectEngine::new(sessions, content);
+
+    let turns = growing_conversation(6);
+    let transformed: Vec<Value> = turns
+        .iter()
+        .map(|msgs| transform_all(&engine, &body(msgs), "session-A"))
+        .collect();
+
+    // Injection present from turn 1.
+    let first_user = &transformed[0]["messages"][0];
+    let has_inject = serde_json::to_string(first_user)
+        .unwrap()
+        .contains("ctx:injected");
+    assert!(has_inject, "injection must be present from turn 1");
+
+    for n in 0..transformed.len() - 1 {
+        let prev = message_bytes(&transformed[n]);
+        let next = message_bytes(&transformed[n + 1]);
+        assert_prefix(&prev, &next, n);
+    }
+
+    // The injected first message is byte-identical across all turns.
+    let m0_first = serde_json::to_vec(&transformed[0]["messages"][0]).unwrap();
+    for (n, t) in transformed.iter().enumerate() {
+        let m0 = serde_json::to_vec(&t["messages"][0]).unwrap();
+        assert_eq!(m0, m0_first, "turn {n}: injected first message drifted");
+    }
 }
 
 #[test]

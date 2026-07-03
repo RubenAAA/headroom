@@ -193,3 +193,38 @@ fn opens_ts_created_sessions_db() {
     store.record_prefix("c", 1, "h").unwrap();
     assert_eq!(store.prefix_at("c", 1).unwrap().as_deref(), Some("h"));
 }
+
+#[test]
+fn resume_linking_recent_conversations_orders_by_recency() {
+    let (_d, store) = open_tmp();
+    store.record_conversation("skA", "conv1").unwrap();
+    store.record_conversation("skA", "conv2").unwrap();
+    // Re-touch conv1 so it is the most recent.
+    store.record_conversation("skA", "conv1").unwrap();
+    store.record_conversation("skB", "other").unwrap();
+
+    // Newest-first, excluding the current conv, scoped to the session key.
+    let recent = store.recent_conversations("skA", "conv_current", 10).unwrap();
+    assert_eq!(recent, vec!["conv1".to_string(), "conv2".to_string()]);
+
+    // Excluding the current conversation drops it from the list.
+    let recent = store.recent_conversations("skA", "conv1", 10).unwrap();
+    assert_eq!(recent, vec!["conv2".to_string()]);
+
+    // Different session key is isolated.
+    let recent = store.recent_conversations("skB", "", 10).unwrap();
+    assert_eq!(recent, vec!["other".to_string()]);
+}
+
+#[test]
+fn injection_is_decided_once_and_never_overwritten() {
+    let (_d, store) = open_tmp();
+    assert_eq!(store.get_injection("conv1").unwrap(), None);
+
+    store.put_injection("conv1", "FIRST").unwrap();
+    assert_eq!(store.get_injection("conv1").unwrap().as_deref(), Some("FIRST"));
+
+    // A second put for the same conv is a no-op (I4: decided once).
+    store.put_injection("conv1", "SECOND").unwrap();
+    assert_eq!(store.get_injection("conv1").unwrap().as_deref(), Some("FIRST"));
+}

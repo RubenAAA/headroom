@@ -11,6 +11,7 @@
 
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use headroom_core::ctx::{NewEvent, SessionsStore};
@@ -30,6 +31,9 @@ struct Job {
 /// thread exits.
 pub struct CtxObserver {
     tx: Sender<Job>,
+    /// The shared sessions store, so the CTX-4 injection engine can read the
+    /// events/prefixes this worker writes (one DB, one connection pool).
+    store: Arc<SessionsStore>,
 }
 
 impl CtxObserver {
@@ -44,19 +48,25 @@ impl CtxObserver {
         let sessions_dir = store_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
         let db_path = sessions_dir.join("proxy.db");
-        let store = SessionsStore::open(&db_path).map_err(std::io::Error::other)?;
+        let store = Arc::new(SessionsStore::open(&db_path).map_err(std::io::Error::other)?);
 
+        let worker_store = Arc::clone(&store);
         let (tx, rx) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("ctx-observer".to_string())
             .spawn(move || {
                 // Blocks until the channel closes (all senders dropped).
                 for job in rx {
-                    process(&store, &job.parsed, &job.session_key);
+                    process(&worker_store, &job.parsed, &job.session_key);
                 }
             })?;
 
-        Ok(Self { tx })
+        Ok(Self { tx, store })
+    }
+
+    /// The shared sessions store handle (for the CTX-4 injection engine).
+    pub fn sessions(&self) -> Arc<SessionsStore> {
+        Arc::clone(&self.store)
     }
 
     /// Hand a request body to the worker. Non-blocking: clones the body once
@@ -103,6 +113,12 @@ fn process(store: &SessionsStore, parsed: &Value, session_key: &str) {
     let hash = identity::prefix_hash(parsed, turn_n);
     if let Err(e) = store.record_prefix(&conv_id, turn_n, &hash) {
         tracing::warn!(event = "ctx_record_prefix_failed", conv = %conv_id, error = %e);
+    }
+
+    // CTX-4: index this conversation under its client session key so a later
+    // resume/compaction request can link back to it.
+    if let Err(e) = store.record_conversation(session_key, &conv_id) {
+        tracing::warn!(event = "ctx_record_conversation_failed", conv = %conv_id, error = %e);
     }
 
     tracing::debug!(

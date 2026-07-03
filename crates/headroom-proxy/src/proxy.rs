@@ -90,6 +90,10 @@ pub struct AppState {
     /// bytes but is a pure function of block bytes (cache-safe per I1/I2); the
     /// sink never touches wire bytes.
     pub ctx_offload: Option<CtxOffloadRuntime>,
+    /// CTX-4: recall/resume injection engine. `Some` only when `config.ctx_inject`
+    /// (which requires `ctx_capture`). Mutates wire bytes on the request path
+    /// but replays a once-decided, timestamp-free block verbatim (I1/I4).
+    pub ctx_inject: Option<Arc<crate::ctx::inject::InjectEngine>>,
 }
 
 /// CTX-3 offload runtime bundled into [`AppState`].
@@ -205,6 +209,71 @@ impl AppState {
             None
         };
 
+        // CTX-4: recall/resume injection. Requires ctx_capture (the identity +
+        // sessions layer) — enforce loudly, no silent dependency. Shares the
+        // observer's sessions store so it reads the events/prefixes the
+        // observer writes; opens its own content-store handle for BM25 recall.
+        let ctx_inject = if config.ctx_inject {
+            if !config.ctx_capture {
+                return Err(ProxyError::Config(
+                    "--ctx-inject requires --ctx-capture (the sessions/identity layer); \
+                     enable ctx_capture or disable ctx_inject"
+                        .to_string(),
+                ));
+            }
+            match ctx_observer.as_ref() {
+                Some(observer) => {
+                    let base = config
+                        .ctx_store_dir
+                        .clone()
+                        .or_else(headroom_core::ctx::default_base_dir);
+                    match base {
+                        Some(dir) => {
+                            let content_path =
+                                headroom_core::ctx::content_db_path(&dir, "");
+                            if let Some(parent) = content_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            match headroom_core::ctx::CtxStore::open(&content_path) {
+                                Ok(content) => Some(Arc::new(
+                                    crate::ctx::inject::InjectEngine::new(
+                                        observer.sessions(),
+                                        content,
+                                    ),
+                                )),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        event = "ctx_inject_start_failed",
+                                        error = %e,
+                                        "CTX-4 injection disabled: could not open content store"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                event = "ctx_inject_no_store_dir",
+                                "CTX-4 injection enabled but no store dir and $HOME unset; disabled"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    // ctx_capture was on but the observer failed to open; without
+                    // the sessions store injection cannot run. Log and disable.
+                    tracing::warn!(
+                        event = "ctx_inject_no_observer",
+                        "CTX-4 injection disabled: sessions observer unavailable"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             client,
@@ -214,6 +283,7 @@ impl AppState {
             usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
             ctx_observer,
             ctx_offload,
+            ctx_inject,
         })
     }
 
@@ -955,40 +1025,76 @@ pub(crate) async fn forward_http(
             AuthMode::Payg
         };
 
-        // CTX-3: tool_result offload. Runs BEFORE the live-zone compressors and
-        // is exempt from the frozen-count floor (it rewrites blocks in ALL
-        // messages) precisely because the replacement is a pure function of the
-        // block's own bytes — the client resends the raw block next turn and we
-        // re-produce byte-identical output, so the cached prefix never drifts
-        // (invariants I1/I2, `docs/ctx-mode-in-headroom-plan.md`). Anthropic
-        // only. When nothing qualifies we forward the original bytes untouched
-        // (no gratuitous re-cache). Persistence of the originals is handed to a
-        // detached worker; the wire bytes never depend on the store.
-        let buffered = if let (Some(runtime), compression::CompressibleEndpoint::AnthropicMessages) =
-            (state.ctx_offload.as_ref(), endpoint)
+        // CTX-3 + CTX-4: byte-mutating context-mode transforms, applied BEFORE
+        // the live-zone compressors, Anthropic only, in a single parse/serialize:
+        //
+        //   1. CTX-4 injection — prepends a once-decided, timestamp-free recall
+        //      or resume block into the first user message and replays it
+        //      verbatim every turn (I1/I4). Needs a synchronous sessions read;
+        //      an in-memory LRU keeps steady-state turns off the DB.
+        //   2. CTX-3 offload — replaces oversized tool_result blocks in ALL
+        //      messages with a pure digest of the block bytes; exempt from the
+        //      frozen-count floor precisely because the replacement is
+        //      recomputable from the resent raw block (I1/I2).
+        //
+        // Both are pure w.r.t. their inputs, so the cached prefix never drifts.
+        // Injection edits the first user message; offload edits tool_result
+        // blocks — disjoint, order-independent. When neither changes anything we
+        // forward the original bytes untouched (no gratuitous re-cache). Offload
+        // originals are persisted on a detached worker; wire bytes never depend
+        // on any store.
+        let buffered = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) && (state.ctx_inject.is_some() || state.ctx_offload.is_some())
         {
             match serde_json::from_slice::<serde_json::Value>(&buffered) {
                 Ok(mut value) => {
-                    let out = crate::compression::ctx_offload::offload_anthropic_request(
-                        &mut value,
-                        &runtime.config,
-                    );
-                    if out.changed() {
+                    let mut changed = false;
+
+                    if let Some(engine) = state.ctx_inject.as_ref() {
+                        let session_key = headers_snapshot
+                            .as_ref()
+                            .map(|h| derive_session_key(h, &client_addr))
+                            .unwrap_or_default();
+                        if engine.maybe_inject(&mut value, &session_key) {
+                            changed = true;
+                        }
+                    }
+
+                    let offload_records = if let Some(runtime) = state.ctx_offload.as_ref() {
+                        let out = crate::compression::ctx_offload::offload_anthropic_request(
+                            &mut value,
+                            &runtime.config,
+                        );
+                        if out.changed() {
+                            changed = true;
+                            tracing::debug!(
+                                request_id = %request_id,
+                                blocks_offloaded = out.blocks_offloaded,
+                                "ctx_offload rewrote tool_result blocks"
+                            );
+                            Some((runtime, out.records))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if changed {
                         match serde_json::to_vec(&value) {
                             Ok(bytes) => {
-                                tracing::debug!(
-                                    request_id = %request_id,
-                                    blocks_offloaded = out.blocks_offloaded,
-                                    "ctx_offload rewrote tool_result blocks"
-                                );
-                                runtime.store.persist(out.records);
+                                if let Some((runtime, records)) = offload_records {
+                                    runtime.store.persist(records);
+                                }
                                 axum::body::Bytes::from(bytes)
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     request_id = %request_id,
                                     error = %e,
-                                    "ctx_offload re-serialization failed; forwarding original body"
+                                    "ctx transform re-serialization failed; forwarding original body"
                                 );
                                 buffered
                             }
