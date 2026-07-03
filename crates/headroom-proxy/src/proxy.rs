@@ -290,10 +290,10 @@ pub fn build_app(state: AppState) -> Router {
         );
     }
 
-    // Local model routing: intercept /v1/messages only when a local
-    // model is configured. When disabled, /v1/messages falls through
-    // to the catch-all and streams normally (zero overhead).
-    if state.config.local_model.is_some() {
+    // Model routing: intercept /v1/messages only when a local model
+    // or extra model routes are configured. When disabled, /v1/messages
+    // falls through to the catch-all and streams normally (zero overhead).
+    if state.config.local_model.is_some() || !state.config.model_routes.is_empty() {
         router = router.route(
             "/v1/messages",
             post(crate::handlers::local_model::handle_messages),

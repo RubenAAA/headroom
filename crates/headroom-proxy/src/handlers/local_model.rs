@@ -29,62 +29,149 @@ pub async fn handle_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let should_route = match (&state.config.local_model, &state.config.local_upstream) {
-        (Some(model), Some(_upstream)) => {
-            if let Ok(parsed) = serde_json::from_slice::<Value>(&body) {
-                let body_model = parsed
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                body_model == model.as_str()
-            } else {
-                false
+    // Parse body to extract model name.
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            // Not JSON — can't be a model-routed request, delegate to forward_http.
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some(hs) = builder.headers_mut() {
+                *hs = headers;
             }
+            let req = builder.body(Body::from(body)).expect("valid request");
+            return forward_http(state, client_addr, req)
+                .await
+                .unwrap_or_else(|e| e.into_response());
         }
-        _ => false,
     };
 
-    if !should_route {
-        let mut builder = Request::builder().method(method).uri(uri);
-        if let Some(hs) = builder.headers_mut() {
-            *hs = headers;
+    let body_model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Find a matching route: first check local_model (backward compat),
+    // then check model_routes table.
+    let matched: Option<(&url::Url, bool)> = if let (Some(model), Some(upstream)) =
+        (&state.config.local_model, &state.config.local_upstream)
+    {
+        if body_model == model.as_str() {
+            // local_model always translates (legacy behavior).
+            Some((upstream, true))
+        } else {
+            None
         }
-        let req = match builder.body(Body::from(body)) {
+    } else {
+        None
+    };
+
+    let matched = matched.or_else(|| {
+        state
+            .config
+            .model_routes
+            .iter()
+            .find(|r| r.matches(body_model))
+            .map(|r| (&r.upstream, r.translate))
+    });
+
+    let (upstream, translate) = match matched {
+        Some((u, t)) => (u.clone(), t),
+        None => {
+            // No route matched — delegate to standard forwarder.
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some(hs) = builder.headers_mut() {
+                *hs = headers;
+            }
+            let req = match builder.body(Body::from(body)) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(
+                        event = "handler_error",
+                        handler = "messages_local_model",
+                        error = %e,
+                        "failed to reconstruct request"
+                    );
+                    return Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("internal handler error"))
+                        .expect("static response");
+                }
+            };
+            return forward_http(state, client_addr, req)
+                .await
+                .unwrap_or_else(|e| e.into_response());
+        }
+    };
+
+    if !translate {
+        // No translation needed — forward Anthropic format directly to the upstream.
+        let upstream_url = format!(
+            "{}{}",
+            upstream.as_str().trim_end_matches('/'),
+            uri.path()
+        );
+        let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+        let full_url = format!("{upstream_url}{query}");
+
+        tracing::info!(
+            event = "model_route_passthrough",
+            model = %body_model,
+            upstream = %full_url,
+            "routing to upstream without translation"
+        );
+
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/json"
+                .parse()
+                .expect("valid header"),
+        );
+        // Forward the original Authorization header if present.
+        if let Some(auth) = headers.get(http::header::AUTHORIZATION) {
+            upstream_headers.insert(http::header::AUTHORIZATION, auth.clone());
+        }
+
+        let resp = match state
+            .client
+            .post(&full_url)
+            .headers(upstream_headers)
+            .body(body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(
-                    event = "handler_error",
-                    handler = "messages_local_model",
+                tracing::warn!(
+                    event = "model_route_upstream_error",
                     error = %e,
-                    "failed to reconstruct request"
+                    upstream = %full_url,
+                    "failed to connect to upstream"
                 );
                 return Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from("internal handler error"))
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from(format!("upstream error: {e}")))
                     .expect("static response");
             }
         };
-        return forward_http(state, client_addr, req)
-            .await
-            .unwrap_or_else(|e| e.into_response());
+
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let resp_headers = resp.headers().clone();
+        let body_bytes = resp.bytes().await.unwrap_or_default();
+
+        let mut response = Response::builder().status(status);
+        for (name, value) in resp_headers.iter() {
+            if !crate::headers::is_response_drop(name) {
+                response = response.header(name.clone(), value.clone());
+            }
+        }
+        return response
+            .body(Body::from(body_bytes))
+            .expect("static response");
     }
 
-    // Local model path: translate and forward.
-    let parsed: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                event = "local_model_parse_error",
-                error = %e,
-                "failed to parse request body for local model translation"
-            );
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("invalid JSON body"))
-                .expect("static response");
-        }
-    };
-
+    // Translation path: Anthropic → OpenAI.
     let openai_body = match anthropic_to_openai_request(&parsed) {
         Ok(v) => v,
         Err(e) => {
@@ -107,21 +194,15 @@ pub async fn handle_messages(
 
     let upstream_url = format!(
         "{}/v1/chat/completions",
-        state
-            .config
-            .local_upstream
-            .as_ref()
-            .unwrap()
-            .as_str()
-            .trim_end_matches('/')
+        upstream.as_str().trim_end_matches('/')
     );
 
     tracing::info!(
-        event = "local_model_route",
-        model = %parsed.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+        event = "model_route_translate",
+        model = %body_model,
         upstream = %upstream_url,
         stream = is_stream,
-        "routing to local model with format translation"
+        "routing to upstream with format translation"
     );
 
     let mut upstream_headers = HeaderMap::new();

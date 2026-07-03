@@ -548,6 +548,18 @@ pub struct CliArgs {
     /// default (None).
     #[arg(long = "local-upstream", env = "HEADROOM_PROXY_LOCAL_UPSTREAM")]
     pub local_upstream: Option<Url>,
+
+    /// Additional model routes. Each value is `MODEL_NAME=UPSTREAM_URL[:translate]`
+    /// where `:translate` means "translate Anthropic format to OpenAI format".
+    /// Model names ending in `*` are prefix-matched. Can be specified multiple
+    /// times or set as a comma-separated list in
+    /// `HEADROOM_PROXY_EXTRA_MODEL_ROUTES`.
+    ///
+    /// Examples:
+    ///   --extra-model-route "MiMo-V2.5=https://api.xiaomimimo.com/anthropic"
+    ///   --extra-model-route "codex-*=https://api.openai.com/v1:translate"
+    #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
+    pub extra_model_routes: Vec<String>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -579,6 +591,58 @@ fn parse_prune_policy(
         keep_names: split(keep_tools),
         drop_mcp_servers: split(drop_mcp),
     }
+}
+
+/// A model-to-upstream routing rule.
+#[derive(Debug, Clone)]
+pub struct ModelRoute {
+    /// Model name prefix to match (exact match, or trailing `*` for prefix).
+    pub model_prefix: String,
+    /// Whether this is a prefix match (model_prefix ends with `*`).
+    pub prefix_match: bool,
+    /// Upstream URL to route matching requests to.
+    pub upstream: Url,
+    /// Whether to translate Anthropic format → OpenAI format.
+    pub translate: bool,
+}
+
+impl ModelRoute {
+    pub fn matches(&self, model: &str) -> bool {
+        if self.prefix_match {
+            model.starts_with(self.model_prefix.trim_end_matches('*'))
+        } else {
+            model == self.model_prefix
+        }
+    }
+}
+
+/// Parse `MODEL_NAME=UPSTREAM_URL[:translate]` into a `ModelRoute`.
+fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
+    let (model, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("expected MODEL=URL[:translate], got: {spec}"))?;
+    let model = model.trim().to_string();
+    let prefix_match = model.ends_with('*');
+
+    // Check if the URL ends with `:translate` (but not `://` from the scheme).
+    let (url_str, translate) = if rest.ends_with(":translate") {
+        let url_end = rest.len() - ":translate".len();
+        (&rest[..url_end], true)
+    } else {
+        (rest, false)
+    };
+
+    let url_str = url_str.trim();
+    let upstream: Url = url_str
+        .parse()
+        .map_err(|e| format!("invalid URL '{url_str}': {e}"))?;
+
+    Ok(ModelRoute {
+        model_prefix: model,
+        prefix_match,
+        upstream,
+        translate,
+    })
 }
 
 /// Resolved configuration used by the running server.
@@ -672,6 +736,9 @@ pub struct Config {
     pub local_model: Option<String>,
     /// Local model upstream URL. Required when `local_model` is `Some`.
     pub local_upstream: Option<Url>,
+    /// Additional model routes from `--extra-model-route` flags.
+    /// Evaluated after `local_model` (exact match takes priority).
+    pub model_routes: Vec<ModelRoute>,
 }
 
 impl Config {
@@ -719,6 +786,25 @@ impl Config {
             vertex_adc_scope: args.vertex_adc_scope,
             local_model: args.local_model,
             local_upstream: args.local_upstream,
+            model_routes: args
+                .extra_model_routes
+                .iter()
+                .flat_map(|s| s.split(','))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| match parse_model_route(s) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "invalid_model_route",
+                            spec = %s,
+                            error = %e,
+                            "skipping invalid --extra-model-route"
+                        );
+                        None
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -784,6 +870,7 @@ impl Config {
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
             local_model: None,
             local_upstream: None,
+            model_routes: Vec::new(),
         }
     }
 }
@@ -813,5 +900,49 @@ mod prune_policy_tests {
         assert!(p.keep_names.is_empty());
         assert_eq!(p.drop_mcp_servers.len(), 2);
         assert!(p.drop_mcp_servers.contains("chrome"));
+    }
+}
+
+#[cfg(test)]
+mod model_route_tests {
+    use super::*;
+
+    #[test]
+    fn parse_exact_match() {
+        let r = parse_model_route("MiMo-V2.5=https://api.xiaomimimo.com/anthropic").unwrap();
+        assert_eq!(r.model_prefix, "MiMo-V2.5");
+        assert!(!r.prefix_match);
+        assert!(!r.translate);
+        assert!(r.matches("MiMo-V2.5"));
+        assert!(!r.matches("MiMo-V2.5-extra"));
+    }
+
+    #[test]
+    fn parse_prefix_match_with_translate() {
+        let r = parse_model_route("codex-*=https://api.openai.com/v1:translate").unwrap();
+        assert_eq!(r.model_prefix, "codex-*");
+        assert!(r.prefix_match);
+        assert!(r.translate);
+        assert!(r.matches("codex-5.5"));
+        assert!(r.matches("codex-5.4"));
+        assert!(!r.matches("gpt-4o"));
+    }
+
+    #[test]
+    fn parse_comma_separated_routes() {
+        let input = "MiMo-V2.5=https://api.xiaomimimo.com/anthropic,codex-*=https://api.openai.com/v1:translate";
+        let routes: Vec<ModelRoute> = input
+            .split(',')
+            .map(|s| parse_model_route(s.trim()).unwrap())
+            .collect();
+        assert_eq!(routes.len(), 2);
+        assert!(routes[0].matches("MiMo-V2.5"));
+        assert!(routes[1].matches("codex-5.5"));
+    }
+
+    #[test]
+    fn parse_invalid_format() {
+        assert!(parse_model_route("no-equals-sign").is_err());
+        assert!(parse_model_route("model=not-a-url").is_err());
     }
 }
