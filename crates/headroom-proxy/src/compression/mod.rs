@@ -33,6 +33,7 @@
 //! original body being forwarded unchanged.
 
 pub mod anthropic;
+pub mod context_editing;
 pub mod live_zone_anthropic;
 pub mod live_zone_openai;
 pub mod live_zone_responses;

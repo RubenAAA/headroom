@@ -11,6 +11,7 @@ from fastapi import Request
 
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
+    _is_allowed_websocket_origin,
     _openai_responses_unit_cache_key,
     _resolve_codex_routing_headers,
 )
@@ -191,7 +192,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
     def _extract_tags(self, headers: dict[str, str]) -> dict[str, str]:
         return {}
 
-    async def _retry_request(self, method: str, url: str, headers: dict, body: dict):
+    async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):
         self.captured_request = (method, url, headers, body)
         return _ResponseStub()
 
@@ -285,6 +286,39 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"
     assert body["input"] == "hello"
     assert response.status_code == 200
+
+
+def test_handle_openai_responses_strips_codex_lite_header_upstream(monkeypatch):
+    # OpenAI rejects newer Codex models when the client-only lite header leaks
+    # upstream. The HTTP POST path must drop it like the WS handler does, while
+    # leaving adjacent headers intact.
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        }
+    )
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello"},
+        {
+            "Authorization": f"Bearer {token}",
+            "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+            "X-OpenAI-Debug": "keep-me",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _method, _url, headers, _body = handler.captured_request
+    lowered = {k.lower(): v for k, v in headers.items()}
+    assert "x-openai-internal-codex-responses-lite" not in lowered
+    assert lowered.get("x-openai-debug") == "keep-me"
 
 
 def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
@@ -443,9 +477,48 @@ class _DummyWebSocket:
     def __init__(self, headers: dict[str, str]):
         self.headers = headers
         self.accepted_subprotocol = None
+        self.closed = False
+        self.close_code = None
+        self.close_reason = None
 
-    async def accept(self, subprotocol=None):
+    async def accept(self, subprotocol=None, headers=None):
         self.accepted_subprotocol = subprotocol
+
+    async def close(self, code=1000, reason=None):
+        self.closed = True
+        self.close_code = code
+        self.close_reason = reason
+
+
+def test_websocket_origin_policy_allows_native_clients_without_origin(monkeypatch):
+    monkeypatch.delenv("HEADROOM_WS_ORIGINS", raising=False)
+    monkeypatch.delenv("HEADROOM_CORS_ORIGINS", raising=False)
+
+    assert _is_allowed_websocket_origin({"authorization": "Bearer token"}) is True
+
+
+def test_websocket_origin_policy_allows_loopback_origins_by_default(monkeypatch):
+    monkeypatch.delenv("HEADROOM_WS_ORIGINS", raising=False)
+    monkeypatch.delenv("HEADROOM_CORS_ORIGINS", raising=False)
+
+    assert _is_allowed_websocket_origin({"origin": "http://localhost:3000"}) is True
+    assert _is_allowed_websocket_origin({"origin": "https://127.0.0.1:8787"}) is True
+
+
+def test_websocket_origin_policy_requires_config_for_remote_origins(monkeypatch):
+    monkeypatch.delenv("HEADROOM_WS_ORIGINS", raising=False)
+    monkeypatch.delenv("HEADROOM_CORS_ORIGINS", raising=False)
+
+    assert _is_allowed_websocket_origin({"origin": "https://remote.example"}) is False
+    assert _is_allowed_websocket_origin({"origin": "http://"}) is False
+
+
+def test_websocket_origin_policy_can_be_pinned_with_env(monkeypatch):
+    monkeypatch.setenv("HEADROOM_WS_ORIGINS", "https://dash.example.com")
+    monkeypatch.delenv("HEADROOM_CORS_ORIGINS", raising=False)
+
+    assert _is_allowed_websocket_origin({"origin": "https://dash.example.com"}) is True
+    assert _is_allowed_websocket_origin({"origin": "http://localhost:3000"}) is False
 
 
 def test_handle_openai_responses_ws_resolves_codex_routing_headers():
@@ -462,3 +535,23 @@ def test_handle_openai_responses_ws_resolves_codex_routing_headers():
         ):
             with pytest.raises(SentinelError, match="resolved"):
                 anyio.run(handler.handle_openai_responses_ws, websocket)
+
+
+def test_handle_openai_responses_ws_closes_unconfigured_origin(monkeypatch):
+    handler = _DummyOpenAIHandler()
+    websocket = _DummyWebSocket({"origin": "https://remote.example"})
+
+    monkeypatch.delenv("HEADROOM_WS_ORIGINS", raising=False)
+    monkeypatch.delenv("HEADROOM_CORS_ORIGINS", raising=False)
+
+    with patch.dict(sys.modules, {"websockets": MagicMock()}):
+        with patch(
+            "headroom.proxy.handlers.openai._resolve_codex_routing_headers",
+            side_effect=AssertionError("routing should not run"),
+        ):
+            anyio.run(handler.handle_openai_responses_ws, websocket)
+
+    assert websocket.closed is True
+    assert websocket.close_code == 1008
+    assert websocket.close_reason == "origin not allowed"
+    assert websocket.accepted_subprotocol is None
