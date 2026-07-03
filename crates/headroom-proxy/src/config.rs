@@ -442,6 +442,29 @@ pub struct CliArgs {
     )]
     pub enable_kompress: bool,
 
+    /// CTX-2: enable passive session capture (conversation identity +
+    /// event extraction into the sessions DB). Pure observer — never mutates
+    /// or delays a request. Off by default; operators opt in.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_CTX_CAPTURE`
+    /// env var → default (`false`).
+    #[arg(
+        long = "ctx-capture",
+        env = "HEADROOM_PROXY_CTX_CAPTURE",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub ctx_capture: bool,
+
+    /// CTX-2: base directory for the sessions/content DBs. When unset, defaults
+    /// to `~/.claude-personal/context-mode` (matching the context-mode plugin
+    /// layout). Only consulted when `ctx_capture` is enabled.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_CTX_STORE_DIR` env var →
+    /// default.
+    #[arg(long = "ctx-store-dir", env = "HEADROOM_PROXY_CTX_STORE_DIR")]
+    pub ctx_store_dir: Option<std::path::PathBuf>,
+
     /// AWS region to use when signing Bedrock requests. Default
     /// `us-east-1`. The Bedrock endpoint URL derived from this
     /// region is `https://bedrock-runtime.{region}.amazonaws.com`
@@ -736,6 +759,11 @@ pub struct Config {
     /// blocks. Default `false` — it loads a ~261 MB cache-only model, so
     /// operators opt in. Mirrors the Python reference's `enable_kompress`.
     pub enable_kompress: bool,
+    /// CTX-2: passive session capture on/off. Pure observer; default `false`.
+    pub ctx_capture: bool,
+    /// CTX-2: base dir for sessions/content DBs. `None` → default
+    /// `~/.claude-personal/context-mode`. Only used when `ctx_capture`.
+    pub ctx_store_dir: Option<std::path::PathBuf>,
     /// PR-D1: AWS region used to sign Bedrock requests + (when no
     /// explicit endpoint is set) derive the Bedrock endpoint URL.
     pub bedrock_region: String,
@@ -808,6 +836,8 @@ impl Config {
             enable_conversations_passthrough: args.enable_conversations_passthrough,
             enable_bedrock_native: args.enable_bedrock_native,
             enable_kompress: args.enable_kompress,
+            ctx_capture: args.ctx_capture,
+            ctx_store_dir: args.ctx_store_dir,
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -897,6 +927,9 @@ impl Config {
             // opt in to the ~261 MB model. Tests that exercise the PlainText
             // path enable it explicitly via `set_kompress_enabled`.
             enable_kompress: false,
+            // CTX-2 passive capture off by default (production + tests).
+            ctx_capture: false,
+            ctx_store_dir: None,
             bedrock_region: "us-east-1".to_string(),
             bedrock_endpoint: None,
             aws_profile: None,

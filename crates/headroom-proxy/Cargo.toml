@@ -95,6 +95,9 @@ async-trait = "0.1"
 md-5 = "0.10"
 
 [dev-dependencies]
+# CTX-2: unit tests for the passive-capture observer open a throwaway
+# sessions DB in a temp dir.
+tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }

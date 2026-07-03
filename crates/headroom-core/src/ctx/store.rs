@@ -764,7 +764,7 @@ fn apply_proximity_reranking(results: &mut [SearchHit], query: &str) {
             .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    for (slot, (_, _, hit)) in results.iter_mut().zip(scored.into_iter()) {
+    for (slot, (_, _, hit)) in results.iter_mut().zip(scored) {
         *slot = hit;
     }
 }

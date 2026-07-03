@@ -5,6 +5,7 @@ pub mod bedrock;
 pub mod cache_stabilization;
 pub mod compression;
 pub mod config;
+pub mod ctx;
 pub mod error;
 pub mod handlers;
 pub mod headers;

@@ -54,7 +54,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 /// Anthropic prompt-cache TTL. A gap between turns longer than this
 /// makes a full cache re-write legitimate (TtlExpiry, not a bug).
@@ -76,28 +75,14 @@ const CONVERSATION_CAPACITY: usize = 512;
 /// statusline (`/cache-health`).
 const RECENT_SAMPLE_CAPACITY: usize = 50;
 
-/// Stable per-conversation key: SHA-256 over the auth-derived
-/// session key plus the two request fields that are constant across
-/// every turn of one conversation and different across concurrent
-/// conversations from the same client — `system` and the first
-/// message. 16-hex-char prefix, opaque, safe to log.
-pub fn conversation_key(parsed: &serde_json::Value, session_key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(session_key.as_bytes());
-    if let Some(system) = parsed.get("system") {
-        hasher.update(system.to_string().as_bytes());
-    }
-    if let Some(first) = parsed.get("messages").and_then(|m| m.get(0)) {
-        hasher.update(first.to_string().as_bytes());
-    }
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(16);
-    for b in &digest[..8] {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
+/// Stable per-conversation key — SHA-256 over the auth-derived
+/// session key plus `system` and the first message.
+///
+/// CTX-2: the single implementation now lives in
+/// [`crate::ctx::identity::conversation_key`]; this thin re-export keeps the
+/// CTX-7 call sites stable so the watchdog and the passive-capture classifier
+/// can never diverge on how a conversation is keyed.
+pub use crate::ctx::identity::conversation_key;
 
 /// The usage counters of one completed turn, as billed by Anthropic.
 #[derive(Debug, Clone, Copy)]

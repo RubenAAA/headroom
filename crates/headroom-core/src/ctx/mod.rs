@@ -13,8 +13,12 @@
 //! transform, recall injection, and the CLI/HTTP surface. This module owns
 //! only the storage + search primitives.
 
+mod sessions;
 mod store;
 
+pub use sessions::{
+    data_hash, session_db_path, NewEvent, PrefixTurn, SessionsStore, StoredEvent,
+};
 pub use store::{
     content_db_path, default_base_dir, hash_project_dir_canonical, sanitize_query,
     sanitize_trigram_query, ContentType, CtxStore, IndexOpts, IndexSummary, SearchHit, SearchOpts,

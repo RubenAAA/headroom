@@ -78,6 +78,11 @@ pub struct AppState {
     /// Pure observer — never mutates bytes; snapshot served at
     /// `GET /cache-health`.
     pub usage_observer: Arc<cache_stabilization::usage_observer::UsageObserver>,
+    /// CTX-2: passive session-capture observer. `Some` only when
+    /// `config.ctx_capture` is set; otherwise capture is a no-op and no
+    /// sessions DB is opened. Pure observer — never mutates or delays a
+    /// request; all work runs on its own background thread.
+    pub ctx_observer: Option<Arc<crate::ctx::observer::CtxObserver>>,
 }
 
 /// PR-E6: maximum number of sessions tracked by the drift detector
@@ -107,6 +112,39 @@ impl AppState {
         let vertex_token_source: Arc<dyn crate::vertex::TokenSource> =
             Arc::new(crate::vertex::adc::GcpAdcTokenSource::new());
 
+        // CTX-2: construct the passive-capture observer only when enabled.
+        // A failure to open the sessions DB is logged loudly and disables
+        // capture (a broken observer must never take down the proxy) — the
+        // request path is unaffected either way.
+        let ctx_observer = if config.ctx_capture {
+            let base = config
+                .ctx_store_dir
+                .clone()
+                .or_else(headroom_core::ctx::default_base_dir);
+            match base {
+                Some(dir) => match crate::ctx::observer::CtxObserver::start(&dir) {
+                    Ok(obs) => Some(Arc::new(obs)),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "ctx_observer_start_failed",
+                            error = %e,
+                            "CTX-2 capture disabled: could not open sessions DB"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        event = "ctx_observer_no_store_dir",
+                        "CTX-2 capture enabled but no store dir and $HOME unset; disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             client,
@@ -114,6 +152,7 @@ impl AppState {
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             vertex_token_source,
             usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
+            ctx_observer,
         })
     }
 
@@ -831,6 +870,14 @@ pub(crate) async fn forward_http(
                     &session_key,
                     &request_id,
                 );
+
+                // CTX-2: passive session capture. Same spot + inputs as
+                // maybe_capture; same never-block rule — `observe` clones the
+                // body once and hands it to a detached worker. No-op unless
+                // `ctx_capture` is enabled (then `ctx_observer` is `Some`).
+                if let Some(observer) = state.ctx_observer.as_ref() {
+                    observer.observe(&parsed, &session_key);
+                }
             }
         }
         // Mirror the enforcement-flag override already applied to

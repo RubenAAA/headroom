@@ -1017,6 +1017,7 @@ mod tests {
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
+            ctx_observer: None,
             // PR-D4: unit tests for the Bedrock URL builder don't
             // touch the Vertex route, but `AppState` is one struct
             // — supply a dummy token source so the test compiles.
@@ -1062,6 +1063,7 @@ mod tests {
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
+            ctx_observer: None,
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
