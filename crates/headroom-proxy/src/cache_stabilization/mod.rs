@@ -60,4 +60,5 @@ pub mod drift_detector;
 pub mod openai_cache_key;
 pub mod tool_def_normalize;
 pub mod tool_prune;
+pub mod usage_observer;
 pub mod volatile_detector;

@@ -72,6 +72,12 @@ pub struct AppState {
     /// route hits `bearer()`. Tests override via
     /// [`AppState::with_token_source`].
     pub vertex_token_source: Arc<dyn crate::vertex::TokenSource>,
+    /// CTX-7: re-cache watchdog. Correlates request-side conversation
+    /// identity (+ PR-E6 drift dims) with the response's billed
+    /// `usage` to flag prompt-cache re-writes inside the TTL window.
+    /// Pure observer — never mutates bytes; snapshot served at
+    /// `GET /cache-health`.
+    pub usage_observer: Arc<cache_stabilization::usage_observer::UsageObserver>,
 }
 
 /// PR-E6: maximum number of sessions tracked by the drift detector
@@ -107,6 +113,7 @@ impl AppState {
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             vertex_token_source,
+            usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
         })
     }
 
@@ -149,6 +156,10 @@ pub fn build_app(state: AppState) -> Router {
         // any feature flag; an operator who doesn't want it scraped
         // simply firewalls the path.
         .route("/metrics", get(crate::observability::handle_metrics))
+        // CTX-7: re-cache watchdog snapshot. Cheap (one in-memory
+        // snapshot, no I/O) so a statusline script can poll it every
+        // few seconds. See `cache_stabilization::usage_observer`.
+        .route("/cache-health", get(cache_health))
         // PR-C2: explicit POST route for /v1/chat/completions. The
         // handler buffers the body and re-injects it into
         // `forward_http`, which runs the OpenAI live-zone gate
@@ -328,6 +339,11 @@ async fn catch_all(
 /// parameters like `; charset=utf-8`). Compression only inspects JSON
 /// bodies — multipart uploads, form-encoded posts, and binary
 /// payloads stream through untouched.
+/// CTX-7: serve the re-cache watchdog snapshot as JSON.
+async fn cache_health(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.usage_observer.snapshot())
+}
+
 fn is_application_json(headers: &HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
@@ -788,7 +804,17 @@ pub(crate) async fn forward_http(
             if let (Some(kind), Some(headers)) = (drift_kind, headers_snapshot.as_ref()) {
                 let session_key = derive_session_key(headers, &client_addr);
                 let hash = compute_structural_hash(&parsed, kind);
-                observe_drift(&state.drift_state, &session_key, hash);
+                let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
+
+                // CTX-7: park conversation identity + drift dims under
+                // the request id so the response-side usage observer
+                // can classify this turn's billed usage against the
+                // conversation's previous turn.
+                state.usage_observer.begin_request(
+                    &request_id,
+                    cache_stabilization::usage_observer::conversation_key(&parsed, &session_key),
+                    drift_dims,
+                );
 
                 // PR-J0: env-gated request-body capture for the offload
                 // simulator. Pure observer (no body mutation); no-op unless
@@ -1209,7 +1235,12 @@ pub(crate) async fn forward_http(
     let parser_tx = if !matches!(sse_kind, SseStreamKind::None) {
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(SSE_PARSER_QUEUE_DEPTH);
         let rid_for_parser = request_id.clone();
-        tokio::spawn(run_sse_state_machine(sse_kind, rx, rid_for_parser));
+        tokio::spawn(run_sse_state_machine(
+            sse_kind,
+            rx,
+            rid_for_parser,
+            state.usage_observer.clone(),
+        ));
         Some(tx)
     } else {
         None
@@ -1439,6 +1470,7 @@ async fn run_sse_state_machine(
     kind: SseStreamKind,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     request_id: String,
+    usage_observer: Arc<cache_stabilization::usage_observer::UsageObserver>,
 ) {
     use crate::sse::framing::SseFramer;
 
@@ -1497,6 +1529,18 @@ async fn run_sse_state_machine(
                         "skipping proxy_cache_hit_rate_per_session: H2 gate or zero denominator"
                     );
                 }
+            }
+            // CTX-7: feed the re-cache watchdog with this turn's
+            // billed usage. Same H2 gate as the hit-rate metric: only
+            // a cleanly completed stream (`message_stop`) carries
+            // trustworthy final usage.
+            if state.status == crate::sse::anthropic::StreamStatus::MessageStop {
+                usage_observer.complete(
+                    &request_id,
+                    state.usage.input_tokens,
+                    state.usage.cache_read_input_tokens,
+                    state.usage.cache_creation_input_tokens,
+                );
             }
             tracing::info!(
                 request_id = %request_id,

@@ -242,7 +242,16 @@ impl std::fmt::Debug for DriftState {
 /// - Subsequent requests with any dimension differing →
 ///   `tracing::warn!(event = "cache_drift_observed", drift_dims =
 ///   "<comma-joined>", previous_hash_prefix, current_hash_prefix, …)`.
-pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralHash) {
+///
+/// CTX-7: returns the comma-joined drifted dimensions on the drift
+/// arm (`None` on first-sight/stable) so the usage observer can
+/// attach a "why" to a re-cache event it later confirms from the
+/// response's billed usage.
+pub fn observe_drift(
+    state: &DriftState,
+    session_key: &str,
+    current: StructuralHash,
+) -> Option<String> {
     let session_prefix = session_key_log_prefix(session_key);
     let mut cache = match state.cache.lock() {
         Ok(c) => c,
@@ -267,10 +276,12 @@ pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralH
                 "cache_drift detector observed a new session"
             );
             cache.put(session_key.to_string(), current);
+            None
         }
         Some(previous) if previous == current => {
             // Stable. No event. Update LRU recency by reinserting.
             cache.put(session_key.to_string(), current);
+            None
         }
         Some(previous) => {
             let dims = drift_dims(&previous, &current);
@@ -283,6 +294,7 @@ pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralH
                 "cache_drift detector observed structural change between turns of the same session"
             );
             cache.put(session_key.to_string(), current);
+            Some(dims)
         }
     }
 }

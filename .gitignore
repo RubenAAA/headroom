@@ -255,3 +255,9 @@ uv.lock
 /headroom/_core.*.so
 /headroom/_core.so
 .tokensave
+!scripts/statusline-cache-health.sh
+
+# Local planning-tool state (mimocode) and the vendored context-mode
+# working clone (nested git repo; never a gitlink).
+.mimocode/
+context-mode/

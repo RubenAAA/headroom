@@ -23,6 +23,24 @@ pub const METRIC_PROXY_CACHE_HIT_RATE_PER_SESSION_HELP: &str =
      usage.cache_read_input_tokens / (input + cache_read + cache_creation). \
      Phase H canary gate: parity with the Python proxy baseline.";
 
+// ---------- proxy_cache_recache_events_total ----------
+
+pub const METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL: &str = "proxy_cache_recache_events_total";
+pub const METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP: &str =
+    "CTX-7: count of re-cache events — turns where usage showed the \
+     prompt-cache prefix was re-written inside the TTL window instead \
+     of read back. Labelled by reason (drift axis from PR-E6, or \
+     'unknown' when the drift detector saw stable bytes).";
+
+// ---------- proxy_cache_recache_wasted_tokens_total ----------
+
+pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL: &str =
+    "proxy_cache_recache_wasted_tokens_total";
+pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP: &str =
+    "CTX-7: cumulative billed tokens wasted re-writing prompt-cache \
+     prefixes that should have been cache reads (summed wasted_tokens \
+     across recache events).";
+
 // ---------- proxy_compression_ratio_by_strategy ----------
 
 pub const METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY: &str = "proxy_compression_ratio_by_strategy";
@@ -162,6 +180,7 @@ pub const LABEL_PATH: &str = "path";
 pub const LABEL_TIER: &str = "tier";
 pub const LABEL_STATUS: &str = "status";
 pub const LABEL_WINDOW: &str = "window";
+pub const LABEL_REASON: &str = "reason";
 
 // ---------- bounded label vocabularies ----------
 
