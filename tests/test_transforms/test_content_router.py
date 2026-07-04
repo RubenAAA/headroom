@@ -8,6 +8,7 @@ Comprehensive tests covering:
 - Transform interface: apply(), should_apply() methods
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ from headroom.transforms.content_router import (
     RouterCompressionResult,
     RoutingDecision,
 )
+from headroom.transforms.lossless_compaction import search_unheading
 
 # =============================================================================
 # Test Fixtures
@@ -734,9 +736,10 @@ class TestExcludeTools:
 
         result = router.apply(messages, tokenizer)
 
-        # Content should be unchanged
-        assert result.messages[1]["content"] == messages[1]["content"]
-        assert "router:excluded:tool" in result.transforms_applied
+        # Excluded from *lossy* compression, but JSON still gets a data-lossless
+        # minify (same object, fewer tokens). Assert recovery, not byte-identity.
+        assert json.loads(result.messages[1]["content"]) == json.loads(messages[1]["content"])
+        assert "router:excluded:lossless_json" in result.transforms_applied
 
     def test_glob_exclude_tools(self, tokenizer):
         """Glob patterns in exclude_tools match by prefix (issue #870)."""
@@ -770,9 +773,10 @@ class TestExcludeTools:
 
         result = router.apply(messages, tokenizer)
 
-        # The MCP tool result matched the glob and was left unchanged.
-        assert result.messages[1]["content"] == messages[1]["content"]
-        assert "router:excluded:tool" in result.transforms_applied
+        # The MCP tool result matched the glob → excluded from lossy compression.
+        # Its JSON still gets a data-lossless minify; assert recovery.
+        assert json.loads(result.messages[1]["content"]) == json.loads(messages[1]["content"])
+        assert "router:excluded:lossless_json" in result.transforms_applied
 
     def test_is_tool_excluded_helper(self):
         """is_tool_excluded: exact (case-insensitive) and glob matching."""
@@ -896,9 +900,11 @@ class TestExcludeTools:
             (b for b in user_msg["content"] if b.get("type") == "tool_result"), None
         )
         assert tool_result_block is not None
-        assert tool_result_block["content"] == messages[1]["content"][0]["content"]
-        # Verify exclusion was tracked (consistent with OpenAI format)
-        assert "router:excluded:tool" in result.transforms_applied
+        # Excluded from lossy compression; search results get a byte-lossless
+        # heading fold. Verify byte-exact recovery (Anthropic block format).
+        original = messages[1]["content"][0]["content"]
+        assert search_unheading(tool_result_block["content"]) == original
+        assert "router:excluded:lossless_search" in result.transforms_applied
 
     def test_anthropic_tool_result_runtime_window_allows_old_excluded_tools(self, tokenizer):
         """Agent profiles can shrink the protected window for Claude tool results."""

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- Non-finite values (`NaN`, `Infinity`) in `proxy_savings.json` or in upstream
+  cost/token metadata no longer crash the proxy or corrupt the savings
+  dashboard. `SavingsTracker`'s numeric coercion caught only `TypeError` and
+  `ValueError`, so `int(float('inf'))` raised an uncaught `OverflowError` while
+  loading persisted state (`SavingsTracker.__init__` failed and the proxy would
+  not start), and `float('nan')`/`float('inf')` passed straight through, then
+  serialized to `NaN`/`Infinity` literals that the dashboard's `JSON.parse`
+  rejects. `json.loads` accepts those literals, so one bad write poisoned every
+  later start. Both coercion helpers now also catch `OverflowError` and reject
+  non-finite floats, failing open to safe defaults.
 - `headroom learn` now honors `CLAUDE_CONFIG_DIR`. It resolved the Claude
   config directory as `~/.claude` and wrote global memory to
   `~/.claude/CLAUDE.md`, so users who relocate their Claude config via that

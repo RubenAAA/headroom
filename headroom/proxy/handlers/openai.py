@@ -973,6 +973,10 @@ class OpenAIHandlerMixin:
 
         extraction_started = time.perf_counter()
         candidates: list[tuple[int, tuple[str, int | None], str]] = []
+        # Excluded-tool outputs that are losslessly foldable (grep/log/json):
+        # (item_index, slot_ref, folded_text, original_text). Spliced after the
+        # normal candidate compression — no ML, byte/data-lossless only.
+        lossless_excluded: list[tuple[int, tuple[str, int | None], str, str]] = []
         extraction_debug: list[dict[str, Any]] = []
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
@@ -1004,12 +1008,27 @@ class OpenAIHandlerMixin:
                         )
                     continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
+                    # Protected from lossy compression — but grep/log/json output
+                    # can still be losslessly compacted. Reuse the router helper
+                    # so the Responses path matches the chat/Anthropic behavior.
+                    excl_out = item.get("output")
+                    fold = (
+                        router._lossless_compact_excluded(excl_out)
+                        if isinstance(excl_out, str)
+                        else None
+                    )
+                    if fold is not None:
+                        lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
                             {
                                 "index": idx,
                                 "eligible": False,
-                                "reason": "exclude_tools_protected",
+                                "reason": (
+                                    "exclude_tools_lossless_fold"
+                                    if fold is not None
+                                    else "exclude_tools_protected"
+                                ),
                                 "item_type": item_type,
                                 "call_id": call_id,
                                 "tool_name": function_name_by_call_id.get(call_id),
@@ -1068,7 +1087,7 @@ class OpenAIHandlerMixin:
             payload=payload,
             extraction=extraction_debug,
         )
-        if not candidates:
+        if not candidates and not lossless_excluded:
             _log(
                 "codex_compression_payload_result",
                 modified=False,
@@ -1344,6 +1363,23 @@ class OpenAIHandlerMixin:
                 if transform not in transforms:
                     transforms.append(transform)
         _add_timing("compression_unit_apply_results", apply_started)
+
+        # Splice byte/data-lossless folds of excluded tool outputs (grep/log/
+        # json). These skip the ML compressor entirely — the fold is already
+        # information-preserving — so "excluded = no lossy" still holds.
+        for e_idx, e_slot, e_folded, e_orig in lossless_excluded:
+            e_target = updated_items[e_idx] if e_idx < len(updated_items) else None
+            if not isinstance(e_target, dict):
+                continue
+            _set_slot_text(e_target, e_slot, e_folded)
+            modified = True
+            e_before = tokenizer.count_text(e_orig)
+            e_saved = e_before - tokenizer.count_text(e_folded)
+            if e_saved > 0:
+                tokens_saved_total += e_saved
+            attempted_input_tokens += e_before
+            if "router:excluded:lossless" not in transforms:
+                transforms.append("router:excluded:lossless")
 
         _log(
             "codex_compression_payload_result",

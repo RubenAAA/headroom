@@ -340,6 +340,12 @@ pipx install --python python3.13 "headroom-ai[all]"
 
 → [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
 
+> **CPU requirement (x86/x86_64):** the ONNX-backed features — Magika content
+> detection and embedding relevance — use a precompiled ONNX Runtime that needs
+> **AVX2**. On x86 hosts without AVX2 (some Docker/QEMU setups and older cloud
+> VMs) Headroom automatically falls back to its non-ONNX paths (BM25 relevance,
+> heuristic detection) rather than crashing. `arm64`/Apple Silicon needs no AVX2.
+
 ### Updating
 
 ```bash
