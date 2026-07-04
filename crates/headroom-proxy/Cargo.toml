@@ -11,6 +11,10 @@ description = "Headroom transparent reverse proxy (Rust, axum). Phase 1: drop-in
 name = "headroom-proxy"
 path = "src/main.rs"
 
+[[bin]]
+name = "headroom"
+path = "src/bin/headroom_cli.rs"
+
 [lib]
 name = "headroom_proxy"
 path = "src/lib.rs"
@@ -22,7 +26,7 @@ tower = { workspace = true }
 tower-http = { version = "0.6", features = ["trace", "request-id", "util"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "blocking", "json", "rustls-tls", "http2"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
@@ -93,6 +97,13 @@ async-trait = "0.1"
 # the core uses for the CCR cache_key, so no additional hash backend
 # enters the dep tree.
 md-5 = "0.10"
+# headroom CLI: URL-encoding for query params.
+urlencoding = "2"
+# CTX-5: HTML→markdown conversion for ctx fetch (port of Turndown used by
+# the TS context-mode's ctx_fetch_and_index).
+htmd = "0.1"
+# CTX-2: lightweight regex for env-command sanitization in extract.rs.
+regex-lite = "0.1"
 
 [dev-dependencies]
 # CTX-2: unit tests for the passive-capture observer open a throwaway

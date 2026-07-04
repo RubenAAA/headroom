@@ -40,8 +40,11 @@ pub use backends::{from_config, CcrBackendConfig, CcrBackendInitError, InMemoryC
 pub trait CcrStore: Send + Sync {
     /// Stash `payload` under `hash`. If the hash already exists, the
     /// new payload overwrites — same hash should mean same content, so
-    /// re-storing is idempotent.
-    fn put(&self, hash: &str, payload: &str);
+    /// re-storing is idempotent. Returns `true` if the payload is now
+    /// durably stored and retrievable via `get`, `false` if the write
+    /// failed (backend-specific error, already logged by the impl) —
+    /// callers that report "offloaded" metrics should gate on this.
+    fn put(&self, hash: &str, payload: &str) -> bool;
 
     /// Look up `hash`. Returns `None` if missing or expired.
     fn get(&self, hash: &str) -> Option<String>;

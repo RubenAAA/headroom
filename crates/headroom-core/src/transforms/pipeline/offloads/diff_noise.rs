@@ -174,7 +174,13 @@ impl OffloadTransform for DiffNoise {
 
         // CCR: hash original, stash, append marker.
         let key = md5_hex_24(content);
-        store.put(&key, content);
+        if !store.put(&key, content) {
+            tracing::warn!(
+                target = "ccr.diff_noise",
+                hash = %key,
+                "ccr_put_failed; marker will point at an unretrievable hash"
+            );
+        }
         output.push_str(&format!("\n[diff_noise CCR: hash={key}]"));
 
         Ok(OffloadOutput::from_lengths(content.len(), output, key))

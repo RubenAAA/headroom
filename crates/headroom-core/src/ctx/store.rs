@@ -137,6 +137,13 @@ pub struct IndexSummary {
     pub code_chunks: usize,
 }
 
+/// Metadata for a source row — used by CTX-5 fetch cache freshness checks.
+#[derive(Debug, Clone)]
+pub struct SourceMeta {
+    pub chunk_count: usize,
+    pub indexed_at: String,
+}
+
 /// A single search result row, shaped like `SearchResult` in store.ts.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -199,6 +206,41 @@ impl CtxStore {
     /// Path the connection was opened against.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Delete all data from every table. Returns the total number of chunks
+    /// removed (from the porter FTS table). Used by the CTX-6 `/ctx/purge`
+    /// endpoint.
+    pub fn purge_all(&self) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().expect("ctx store mutex poisoned");
+        let chunks_deleted: usize = conn
+            .execute("DELETE FROM chunks", [])
+            .unwrap_or(0);
+        conn.execute("DELETE FROM chunks_trigram", [])?;
+        conn.execute("DELETE FROM sources", [])?;
+        conn.execute("DELETE FROM vocabulary", [])?;
+        Ok(chunks_deleted)
+    }
+
+    /// Look up metadata for a source by label. Returns the chunk count and
+    /// indexed_at timestamp, or `None` if the source doesn't exist. Used by
+    /// CTX-5 fetch to check disk-cache freshness.
+    pub fn source_meta(&self, label: &str) -> rusqlite::Result<Option<SourceMeta>> {
+        let conn = self.conn.lock().expect("ctx store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT chunk_count, indexed_at FROM sources WHERE label = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![label], |row| {
+            Ok(SourceMeta {
+                chunk_count: row.get(0)?,
+                indexed_at: row.get(1)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(meta)) => Ok(Some(meta)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// Create the schema. Byte-identical to `ContentStore.#initSchema`

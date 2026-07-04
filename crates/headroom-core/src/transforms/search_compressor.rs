@@ -306,7 +306,13 @@ impl SearchCompressor {
                 stats.ccr_skip_reason = Some("compression ratio too high");
             } else if let Some(store) = store {
                 let key = md5_hex_24(content);
-                store.put(&key, content);
+                if !store.put(&key, content) {
+                    tracing::warn!(
+                        target = "ccr.search_compressor",
+                        hash = %key,
+                        "ccr_put_failed; marker will point at an unretrievable hash"
+                    );
+                }
                 let marker = format!(
                     "\n[{} matches compressed to {}. Retrieve more: hash={}]",
                     original_count, compressed_count, key

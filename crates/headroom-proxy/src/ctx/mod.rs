@@ -21,7 +21,9 @@
 //! With the exception of `inject`, everything here is a pure observer: no
 //! request/response byte is mutated and no latency is added to the request path.
 
+pub mod endpoints;
 pub mod extract;
+pub mod fetch;
 pub mod identity;
 pub mod inject;
 pub mod observer;

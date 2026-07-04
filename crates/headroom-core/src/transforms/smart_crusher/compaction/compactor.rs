@@ -267,7 +267,13 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
             // marker points at a key that was never stored and retrieval
             // 404s (issue #1083).
             if let Some(store) = store {
-                store.put(&ccr_hash, s);
+                if !store.put(&ccr_hash, s) {
+                    tracing::warn!(
+                        target = "ccr.compactor",
+                        hash = %ccr_hash,
+                        "ccr_put_failed; marker will point at an unretrievable hash"
+                    );
+                }
             }
             CellValue::OpaqueRef {
                 ccr_hash,

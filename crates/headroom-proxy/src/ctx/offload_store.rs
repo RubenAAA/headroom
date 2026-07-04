@@ -18,6 +18,7 @@
 
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use headroom_core::ccr::{from_config, CcrBackendConfig, CcrStore};
@@ -30,6 +31,11 @@ use crate::compression::ctx_offload::OffloadRecord;
 /// worker exits.
 pub struct OffloadStore {
     tx: Sender<Vec<OffloadRecord>>,
+    /// Shared reference to the CCR store — used by CTX-5 `/ctx/get`.
+    ccr: Arc<dyn CcrStore>,
+    /// Shared reference to the FTS content store — used by CTX-5 `/ctx/search`
+    /// and `/ctx/index`.
+    content: Arc<CtxStore>,
 }
 
 impl OffloadStore {
@@ -42,30 +48,51 @@ impl OffloadStore {
     pub fn start(store_dir: &Path, ttl_seconds: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(store_dir)?;
 
-        let ccr = from_config(&CcrBackendConfig::Sqlite {
-            path: store_dir.join("ccr.db"),
-            ttl_seconds,
-        })
-        .map_err(std::io::Error::other)?;
+        let ccr: Arc<dyn CcrStore> = Arc::from(
+            from_config(&CcrBackendConfig::Sqlite {
+                path: store_dir.join("ccr.db"),
+                ttl_seconds,
+            })
+            .map_err(std::io::Error::other)?,
+        );
 
         let content_path = content_db_path(store_dir, "");
         if let Some(parent) = content_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = CtxStore::open(&content_path).map_err(std::io::Error::other)?;
+        let content = Arc::new(CtxStore::open(&content_path).map_err(std::io::Error::other)?);
 
         let (tx, rx) = mpsc::channel::<Vec<OffloadRecord>>();
+        // Clone Arcs for the background thread — cheap (atomic refcount).
+        let ccr_bg = Arc::clone(&ccr);
+        let content_bg = Arc::clone(&content);
         thread::Builder::new()
             .name("ctx-offload-store".to_string())
             .spawn(move || {
                 for batch in rx {
                     for record in batch {
-                        persist_one(ccr.as_ref(), &content, &record);
+                        let bytes = record.original.len() as u64;
+                        if persist_one(ccr_bg.as_ref(), &content_bg, &record) {
+                            crate::observability::ctx_metrics::observe_offloaded(bytes);
+                        }
                     }
                 }
             })?;
 
-        Ok(Self { tx })
+        Ok(Self { tx, ccr, content })
+    }
+
+    /// CCR store handle — used by CTX-5 `/ctx/get` to retrieve offloaded
+    /// originals by hash. Returns an `Arc` clone so the caller can move it
+    /// into `tokio::task::spawn_blocking` without lifetime issues.
+    pub fn ccr(&self) -> Arc<dyn CcrStore> {
+        Arc::clone(&self.ccr)
+    }
+
+    /// FTS content store handle — used by CTX-5 `/ctx/search` and `/ctx/index`.
+    /// Returns an `Arc` clone for the same reason as [`Self::ccr`].
+    pub fn content(&self) -> Arc<CtxStore> {
+        Arc::clone(&self.content)
     }
 
     /// Enqueue offloaded originals for persistence. Non-blocking: hands the
@@ -85,10 +112,16 @@ impl OffloadStore {
 }
 
 /// Store one record in both backends. Off the request path; failures are
-/// logged and swallowed so persistence never crashes the worker.
-fn persist_one(ccr: &dyn CcrStore, content: &CtxStore, record: &OffloadRecord) {
+/// logged and swallowed so persistence never crashes the worker. Returns
+/// `true` only if the record is durably recoverable via `/ctx/get` and
+/// `/ctx/search` — the offload metrics (CTX-6) count on this, not on the
+/// request-path transform, so `ctx_offloaded_bytes_total` reflects bytes
+/// actually persisted rather than bytes merely enqueued.
+fn persist_one(ccr: &dyn CcrStore, content: &CtxStore, record: &OffloadRecord) -> bool {
     // CCR: idempotent put keyed by the hash embedded in the wire digest.
-    ccr.put(&record.hash, &record.original);
+    // `headroom ctx get` reads only from here, so a failed put means the
+    // record isn't retrievable even if the FTS index write below succeeds.
+    let ccr_ok = ccr.put(&record.hash, &record.original);
 
     // FTS index: title = paired tool_use command (deterministic); tie the
     // source to the hash via `content_hash` so re-indexing the same block is a
@@ -111,7 +144,9 @@ fn persist_one(ccr: &dyn CcrStore, content: &CtxStore, record: &OffloadRecord) {
             error = %e,
             "CTX-3 offload FTS index failed"
         );
+        return false;
     }
+    ccr_ok
 }
 
 #[cfg(test)]

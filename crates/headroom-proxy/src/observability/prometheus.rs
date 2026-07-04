@@ -74,7 +74,7 @@ const LATENCY_BUCKETS_SECONDS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 1
 /// registry directly; they go through the per-metric `record_*`
 /// helpers, which keeps registration centralised and emit sites
 /// uniform.
-pub(super) fn registry() -> &'static Registry {
+pub(crate) fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(Registry::new)
 }
@@ -274,6 +274,13 @@ pub async fn handle_metrics() -> Response {
     unified_util.with_label_values(&[INIT_SENTINEL]).set(0.0);
     unified_reset.with_label_values(&[INIT_SENTINEL]).set(0);
     unified_throttled.with_label_values(&[INIT_SENTINEL]).set(0);
+
+    // CTX-5/6: force-touch plain IntCounter families so HELP/TYPE
+    // appears in the scrape even before any ctx activity.
+    super::ctx_metrics::offloaded_bytes_get(reg);
+    super::ctx_metrics::offloaded_blocks_get(reg);
+    super::ctx_metrics::recall_injections_get(reg);
+    super::ctx_metrics::search_queries_get(reg);
 
     let metric_families = registry().gather();
     let mut buffer = Vec::with_capacity(2048);

@@ -84,14 +84,14 @@ impl Default for InMemoryCcrStore {
 }
 
 impl CcrStore for InMemoryCcrStore {
-    fn put(&self, hash: &str, payload: &str) {
+    fn put(&self, hash: &str, payload: &str) -> bool {
         // Idempotent re-store fast-path: same hash → overwrite payload
         // in place, leave the order queue alone. Common when the same
         // tool output flows through multiple times in a session.
         if let Some(mut existing) = self.map.get_mut(hash) {
             existing.payload = payload.to_string();
             existing.inserted = Instant::now();
-            return;
+            return true;
         }
 
         // New entry. Cap-bound first (may sweep a few stale order
@@ -114,6 +114,7 @@ impl CcrStore for InMemoryCcrStore {
                 .expect("ccr order mutex poisoned")
                 .push_back(hash.to_string());
         }
+        true
     }
 
     fn get(&self, hash: &str) -> Option<String> {

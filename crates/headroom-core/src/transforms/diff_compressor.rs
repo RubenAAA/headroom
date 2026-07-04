@@ -485,7 +485,13 @@ impl DiffCompressor {
             // (typically the Python shim) is responsible — see the
             // method-level docs.
             if let Some(s) = store {
-                s.put(&key, content);
+                if !s.put(&key, content) {
+                    tracing::warn!(
+                        target = "ccr.diff_compressor",
+                        hash = %key,
+                        "ccr_put_failed; marker will point at an unretrievable hash"
+                    );
+                }
             }
             cache_key = Some(key);
             stats.cache_key_emitted = true;

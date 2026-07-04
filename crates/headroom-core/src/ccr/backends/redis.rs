@@ -77,7 +77,7 @@ impl RedisCcrStore {
 }
 
 impl CcrStore for RedisCcrStore {
-    fn put(&self, hash: &str, payload: &str) {
+    fn put(&self, hash: &str, payload: &str) -> bool {
         let key = self.key_for(hash);
         let mut conn = match self.client.get_connection() {
             Ok(c) => c,
@@ -88,14 +88,14 @@ impl CcrStore for RedisCcrStore {
                     error = %err,
                     "ccr_redis_connect_failed_on_put"
                 );
-                return;
+                return false;
             }
         };
         // SETEX is one network round-trip; payload is bytes-faithful via
         // `set_ex` which serializes the slice as a Redis bulk string.
         let res: redis::RedisResult<()> =
             conn.set_ex(&key, payload.as_bytes(), self.default_ttl_seconds);
-        if let Err(err) = res {
+        if let Err(err) = &res {
             tracing::warn!(
                 target = "ccr.redis",
                 hash = %hash,
@@ -103,6 +103,7 @@ impl CcrStore for RedisCcrStore {
                 "ccr_redis_put_failed"
             );
         }
+        res.is_ok()
     }
 
     fn get(&self, hash: &str) -> Option<String> {

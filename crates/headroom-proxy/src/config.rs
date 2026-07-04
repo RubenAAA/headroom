@@ -866,6 +866,14 @@ impl Config {
         let compression_max_body_bytes = args
             .compression_max_body_bytes
             .unwrap_or(args.max_body_bytes);
+        // CTX features live inside the interception (body-buffering) path,
+        // which `compression` gates. Enabling any `--ctx-*` flag without
+        // `--compression` would otherwise be a silent no-op, so the ctx
+        // flags imply interception. With `--compression-mode` still `off`
+        // this buffers and observes but mutates nothing beyond the ctx
+        // transforms themselves.
+        let compression =
+            args.compression || args.ctx_capture || args.ctx_offload || args.ctx_inject;
         Self {
             listen: args.listen,
             upstream: args.upstream,
@@ -875,7 +883,7 @@ impl Config {
             log_level: args.log_level,
             rewrite_host,
             graceful_shutdown_timeout: args.graceful_shutdown_timeout,
-            compression: args.compression,
+            compression,
             compression_max_body_bytes,
             compression_mode: args.compression_mode,
             context_edit: args.context_edit,
@@ -1082,5 +1090,33 @@ mod model_route_tests {
     fn parse_invalid_format() {
         assert!(parse_model_route("no-equals-sign").is_err());
         assert!(parse_model_route("model=not-a-url").is_err());
+    }
+}
+
+#[cfg(test)]
+mod ctx_implies_interception_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cfg(extra: &[&str]) -> Config {
+        let mut argv = vec!["headroom-proxy", "--upstream", "https://api.anthropic.com"];
+        argv.extend_from_slice(extra);
+        Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+    }
+
+    #[test]
+    fn ctx_flags_force_interception_on() {
+        for flag in ["--ctx-capture=true", "--ctx-offload=true", "--ctx-inject=true"] {
+            let c = cfg(&[flag]);
+            assert!(c.compression, "{flag} must imply interception");
+            // The imply flips buffering only, never a byte-mutating mode.
+            assert!(matches!(c.compression_mode, CompressionMode::Off));
+        }
+    }
+
+    #[test]
+    fn no_ctx_flags_keeps_interception_off() {
+        assert!(!cfg(&[]).compression);
+        assert!(!cfg(&["--ctx-capture=false"]).compression);
     }
 }

@@ -24,5 +24,5 @@ pub use snapshot::{build_recall, build_resume_snapshot, INJECT_SENTINEL};
 pub use store::{
     content_db_path, default_base_dir, hash_project_dir_canonical, sanitize_query,
     sanitize_trigram_query, ContentType, CtxStore, IndexOpts, IndexSummary, SearchHit, SearchOpts,
-    SortMode,
+    SortMode, SourceMeta,
 };

@@ -200,6 +200,7 @@ async fn oauth_body_passes_through_byte_equal() {
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 
@@ -256,6 +257,7 @@ async fn subscription_body_passes_through_byte_equal() {
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 

@@ -171,6 +171,34 @@ pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str =
 // invocation tracking lives in the wrap CLI, both Python-side
 // surfaces. See `docs/observability.md`.
 
+// ---------- ctx_offloaded_bytes_total ----------
+
+pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL: &str = "ctx_offloaded_bytes_total";
+pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL_HELP: &str =
+    "CTX-5/6: cumulative bytes offloaded from tool_result blocks into the \
+     CCR store. Incremented on the request path when ctx_offload replaces \
+     a block with a digest.";
+
+// ---------- ctx_offloaded_blocks_total ----------
+
+pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL: &str = "ctx_offloaded_blocks_total";
+pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL_HELP: &str =
+    "CTX-5/6: count of tool_result blocks offloaded (replaced with a \
+     deterministic digest) across all requests.";
+
+// ---------- ctx_recall_injections_total ----------
+
+pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL: &str = "ctx_recall_injections_total";
+pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL_HELP: &str =
+    "CTX-5/6: count of recall/resume blocks injected into the first user \
+     message of a conversation (CTX-4 injection engine).";
+
+// ---------- ctx_search_queries_total ----------
+
+pub const METRIC_CTX_SEARCH_QUERIES_TOTAL: &str = "ctx_search_queries_total";
+pub const METRIC_CTX_SEARCH_QUERIES_TOTAL_HELP: &str =
+    "CTX-5: count of search queries served via the /ctx/search endpoint.";
+
 // ---------- shared label keys ----------
 
 pub const LABEL_PROVIDER: &str = "provider";

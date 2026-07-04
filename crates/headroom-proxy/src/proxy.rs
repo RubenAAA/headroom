@@ -132,6 +132,20 @@ impl AppState {
         let vertex_token_source: Arc<dyn crate::vertex::TokenSource> =
             Arc::new(crate::vertex::adc::GcpAdcTokenSource::new());
 
+        // CTX flags imply interception (Config::from_cli forces `compression`
+        // on when any is set); say so once at startup so operators see why
+        // bodies are being buffered.
+        if config.compression && (config.ctx_capture || config.ctx_offload || config.ctx_inject) {
+            tracing::info!(
+                event = "ctx_interception_active",
+                ctx_capture = config.ctx_capture,
+                ctx_offload = config.ctx_offload,
+                ctx_inject = config.ctx_inject,
+                compression_mode = config.compression_mode.as_str(),
+                "ctx features enabled; request interception (body buffering) active"
+            );
+        }
+
         // CTX-2: construct the passive-capture observer only when enabled.
         // A failure to open the sessions DB is logged loudly and disables
         // capture (a broken observer must never take down the proxy) — the
@@ -308,6 +322,12 @@ impl AppState {
         s.vertex_token_source = token_source;
         Ok(s)
     }
+
+    /// CTX-5/6: access the offload store (CCR + content DB) when available.
+    /// Returns `None` when `ctx_offload` is disabled.
+    pub fn ctx_store(&self) -> Option<&crate::ctx::offload_store::OffloadStore> {
+        self.ctx_offload.as_ref().map(|r| r.store.as_ref())
+    }
 }
 
 /// Build the axum app. `/healthz` and `/healthz/upstream` are intercepted;
@@ -479,6 +499,12 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/messages",
             post(crate::handlers::local_model::handle_messages),
         );
+    }
+
+    // CTX-5/6: mount /ctx/* endpoints when the offload store is available.
+    // The endpoints share the proxy's listener — no separate bind.
+    if state.config.ctx_offload {
+        router = router.nest("/ctx", crate::ctx::endpoints::router());
     }
 
     router.fallback(any(catch_all)).with_state(state)
@@ -844,6 +870,21 @@ pub(crate) async fn forward_http(
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
 
+    // Intercepted requests tee the response into the SSE state machine
+    // (usage observer, hit-rate metrics, re-cache watchdog). Those parsers
+    // read the raw byte stream, so a gzip/br-encoded upstream response is
+    // opaque to them — Claude Code sends `accept-encoding: gzip, deflate,
+    // br, zstd` and Anthropic gzips SSE, which silently blinds all
+    // response-side telemetry. Force identity upstream for intercepted
+    // requests; the client receives the same uncompressed bytes (we never
+    // re-encode), which HTTP permits regardless of what it advertised.
+    if should_intercept {
+        outgoing_headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("identity"),
+        );
+    }
+
     // PR-E6: capture a header snapshot BEFORE the body is consumed so
     // the drift detector can derive a per-session key from
     // `Authorization`/`x-api-key`/`User-Agent`. `req` will be moved
@@ -1069,6 +1110,10 @@ pub(crate) async fn forward_http(
                         );
                         if out.changed() {
                             changed = true;
+                            // CTX-6: offload metrics are recorded by the
+                            // offload-store worker after persist_one confirms
+                            // the record is durably recoverable, not here —
+                            // see ctx/offload_store.rs.
                             tracing::debug!(
                                 request_id = %request_id,
                                 blocks_offloaded = out.blocks_offloaded,

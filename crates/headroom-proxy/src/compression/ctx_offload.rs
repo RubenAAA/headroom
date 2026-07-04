@@ -37,11 +37,13 @@
 //! - **Float formatting.** The footer contains only integers; body floats are
 //!   handled by `arbitrary_precision` above.
 //! - **Compressor nondeterminism.** [`compress_block_for_offload`] reuses the
-//!   live-zone compressors, all pure. The single caveat is the `PlainText` →
-//!   `kompress` arm, whose output depends on whether the local HF model is in
-//!   the on-disk cache; that state is stable per machine (and when the model
-//!   is absent the digest is larger, so the tokenizer gate keeps the original
-//!   anyway). Documented on [`compress_block_for_offload`].
+//!   live-zone compressors, all pure. When no compressor rewrites the block
+//!   (e.g. `PlainText` without the kompress model on disk), the digest falls
+//!   back to a deterministic preview cut ([`preview`]) — the context-mode
+//!   behaviour — so plaintext tool output still offloads. The one
+//!   environment-scoped caveat: whether the kompress arm or the preview arm
+//!   runs depends on the HF model being in the on-disk cache, which is stable
+//!   per machine. Documented on [`compress_block_for_offload`].
 //!
 //! # Composition with `context_editing`
 //!
@@ -95,6 +97,25 @@ impl OffloadOutcome {
 /// Fixed marker prefix. A block whose text already contains this is a digest
 /// (idempotency fast path).
 const MARKER_PREFIX: &str = "<<ctx:";
+
+/// Preview budget for the no-compressor fallback, in bytes. Matches
+/// context-mode's `FETCH_PREVIEW_LIMIT` (3072): enough to orient the model,
+/// small enough that offload always shrinks a qualifying (>50KB) block.
+const PREVIEW_BYTES: usize = 3072;
+
+/// Longest prefix of `text` whose UTF-8 encoding is at most `max_bytes`,
+/// cut on a char boundary, with a truncation notice. Pure function of
+/// `text` (I1) — the context-mode preview cut, ported.
+fn preview(text: &str, max_bytes: usize) -> String {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n…[truncated — retrieval pointer below]",
+        &text[..end]
+    )
+}
 
 /// Build the deterministic footer appended to a digest. Pure function of
 /// `hash` and `orig_len` — no volatile fields (I1).
@@ -168,8 +189,18 @@ fn offload_tool_result(
     }
 
     let hash = compute_key(original.as_bytes());
-    let (_strategy, compressed) = compress_block_for_offload(&original);
-    let digest = format!("{compressed}{}", footer(&hash, original.len()));
+    // Structural compressor when one applies; otherwise a plain preview cut,
+    // mirroring context-mode's behaviour (charSafePrefix + pointer). The
+    // original is always retrievable by hash, so the digest only needs to
+    // orient the model, not preserve information. Both arms are pure
+    // functions of the block bytes (I1/I2).
+    let (strategy, compressed) = compress_block_for_offload(&original);
+    let body = if strategy.is_some() {
+        compressed
+    } else {
+        preview(&original, PREVIEW_BYTES)
+    };
+    let digest = format!("{body}{}", footer(&hash, original.len()));
 
     // Tokenizer gate (I6): keep the original unless the digest is strictly
     // smaller in tokens. Deterministic — pure function of the two strings.
@@ -304,6 +335,40 @@ mod tests {
         assert_eq!(out.records[0].title, "cat big.log");
         assert_eq!(out.records[0].original, body);
         assert_eq!(out.records[0].hash.len(), 24);
+    }
+
+    #[test]
+    fn plaintext_read_output_offloads_via_preview_fallback() {
+        // Simulates a Claude Code `Read` result: line-number prefixes make the
+        // content classify as PlainText, where no structural compressor
+        // applies (kompress is off by default). The preview fallback must
+        // still offload it — this was silently a no-op before.
+        let mut body = String::new();
+        for i in 1..=1900 {
+            body.push_str(&format!(
+                "{i}\t[[package]]\nname = \"crate-{i}\"\nchecksum = \"abc{i}\"\n"
+            ));
+        }
+        assert!(body.len() > 50_000);
+        let mut parsed = req(&body);
+        let out = offload_anthropic_request(&mut parsed, &cfg(50_000));
+        assert_eq!(out.blocks_offloaded, 1);
+        let text = first_tool_result_text(&parsed);
+        assert!(text.len() < 4096, "digest must be small, got {}", text.len());
+        assert!(text.starts_with("1\t[[package]]"), "preview keeps the head");
+        assert!(text.contains("truncated"));
+        assert!(text.contains(&format!("retrieve: headroom ctx get {}", out.records[0].hash)));
+        assert_eq!(out.records[0].original, body);
+    }
+
+    #[test]
+    fn preview_cuts_on_char_boundary() {
+        // A multi-byte char straddling the budget must not split.
+        let body = format!("{}é{}", "x".repeat(3071), "y".repeat(60_000));
+        let cut = preview(&body, PREVIEW_BYTES);
+        assert!(cut.starts_with(&"x".repeat(3071)));
+        assert!(!cut.contains('\u{FFFD}'));
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
     }
 
     #[test]

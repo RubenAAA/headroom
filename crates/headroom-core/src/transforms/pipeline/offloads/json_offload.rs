@@ -138,7 +138,13 @@ impl OffloadTransform for JsonOffload {
         // markers in `result.compressed` stay informational — the LLM
         // retrieves the full original via this outer hash.
         let key = md5_hex_24(content);
-        store.put(&key, content);
+        if !store.put(&key, content) {
+            tracing::warn!(
+                target = "ccr.json_offload",
+                hash = %key,
+                "ccr_put_failed; marker will point at an unretrievable hash"
+            );
+        }
         let mut output = result.compressed;
         output.push_str("\n[json_offload CCR: hash=");
         output.push_str(&key);

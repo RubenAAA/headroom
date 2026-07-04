@@ -792,7 +792,13 @@ impl SmartCrusher {
             let h = hash_canonical(&canonical);
             let marker = format!("<<ccr:{h} {dropped_count}_rows_offloaded>>");
             if let Some(store) = &self.ccr_store {
-                store.put(&h, &canonical);
+                if !store.put(&h, &canonical) {
+                    tracing::warn!(
+                        target = "ccr.crusher",
+                        hash = %h,
+                        "ccr_put_failed; marker will point at an unretrievable hash"
+                    );
+                }
             }
             (Some(h), marker)
         } else {

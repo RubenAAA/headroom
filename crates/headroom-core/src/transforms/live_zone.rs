@@ -988,7 +988,13 @@ fn compress_one_block(
                 // never reach the wire (still correct, but wastes
                 // storage capacity).
                 if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref()) {
-                    store.put(hash, content_text);
+                    if !store.put(hash, content_text) {
+                        tracing::warn!(
+                            target = "ccr.live_zone",
+                            hash = %hash,
+                            "ccr_put_failed; marker will point at an unretrievable hash"
+                        );
+                    }
                 }
                 let replacement_bytes = serde_json::to_vec(&compressed_for_replacement)
                     .expect("string is always JSON-encodable");

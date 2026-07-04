@@ -182,7 +182,13 @@ pub fn emit_opaque_ccr_marker(
         .map(|b| format!("{b:02x}"))
         .collect();
     if let Some(s) = store {
-        s.put(&hash, payload);
+        if !s.put(&hash, payload) {
+            tracing::warn!(
+                target = "ccr.walker",
+                hash = %hash,
+                "ccr_put_failed; marker will point at an unretrievable hash"
+            );
+        }
     }
     let kind_str = match kind {
         OpaqueKind::Base64Blob => "base64",

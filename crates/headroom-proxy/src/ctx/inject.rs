@@ -83,12 +83,20 @@ impl InjectEngine {
 
         // Hot path: cached decision.
         if let Some(decision) = self.cache_get(&conv_id) {
-            return apply(parsed, &decision);
+            let applied = apply(parsed, &decision);
+            if applied {
+                crate::observability::ctx_metrics::observe_recall_injection();
+            }
+            return applied;
         }
 
         let decision = self.decide(&conv_id, parsed, session_key);
         self.cache_put(&conv_id, decision.clone());
-        apply(parsed, &decision)
+        let applied = apply(parsed, &decision);
+        if applied {
+            crate::observability::ctx_metrics::observe_recall_injection();
+        }
+        applied
     }
 
     fn cache_get(&self, conv_id: &str) -> Option<Decision> {
