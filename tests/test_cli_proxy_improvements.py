@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import argparse
 from unittest.mock import patch
 
 import pytest
@@ -329,6 +330,48 @@ class TestNewEnvVarWiring:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].connect_timeout_seconds == 30
 
+    def test_headroom_anthropic_buffered_timeout_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS": "900"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].anthropic_buffered_request_timeout_seconds == 900
+
+    def test_anthropic_buffered_timeout_cli_flag(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--anthropic-buffered-request-timeout-seconds", "901"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].anthropic_buffered_request_timeout_seconds == 901
+
+    def test_direct_server_env_timeout_zero_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.server as server_mod
+
+        monkeypatch.delenv(server_mod._MULTI_WORKER_CONFIG_ENV, raising=False)
+        monkeypatch.setenv("HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS", "0")
+
+        config = server_mod._proxy_config_from_env()
+        assert config.anthropic_buffered_request_timeout_seconds == 600
+
+    def test_direct_server_timeout_parser_rejects_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.server as server_mod
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            server_mod._positive_int_arg("0")
+
     def test_headroom_backend_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
         result = runner.invoke(
             main,
@@ -405,3 +448,34 @@ class TestHelpTextCompleteness:
         result = runner.invoke(main, ["proxy", "--mode", "bogus_mode_xyz"])
         assert result.exit_code != 0
         assert "invalid" in result.output.lower() or "choice" in result.output.lower()
+
+
+class TestCompressionMaxWorkers:
+    """--compression-max-workers / HEADROOM_COMPRESSION_MAX_WORKERS must reach ProxyConfig.
+
+    Regression: the field was documented in ProxyConfig and consumed by the
+    server, but the CLI never defined the option or passed it through, so it
+    was permanently None (always resolving to the min(32, cpu*4) default).
+    """
+
+    def test_flag_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main, ["proxy", "--compression-max-workers", "3"], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 3
+
+    def test_env_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_COMPRESSION_MAX_WORKERS": "5"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 5
+
+    def test_default_is_none(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers is None
