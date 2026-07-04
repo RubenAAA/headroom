@@ -75,14 +75,31 @@ const CONVERSATION_CAPACITY: usize = 512;
 /// statusline (`/cache-health`).
 const RECENT_SAMPLE_CAPACITY: usize = 50;
 
-/// Stable per-conversation key — SHA-256 over the auth-derived
-/// session key plus `system` and the first message.
+/// Watchdog conversation key — SHA-256 over the auth-derived session key
+/// plus the FIRST MESSAGE ONLY, deliberately excluding `system`.
 ///
-/// CTX-2: the single implementation now lives in
-/// [`crate::ctx::identity::conversation_key`]; this thin re-export keeps the
-/// CTX-7 call sites stable so the watchdog and the passive-capture classifier
-/// can never diverge on how a conversation is keyed.
-pub use crate::ctx::identity::conversation_key;
+/// This differs from [`crate::ctx::identity::conversation_key`] (which also
+/// hashes `system`) on purpose: a mutated system prompt IS a cache bust, and
+/// the watchdog can only classify it as one if the conversation identity
+/// survives the mutation. Keying on `system` made the watchdog blind to
+/// exactly that failure — the busted turn hashed to a fresh key and was
+/// classified `FirstTurn` instead of `Recache` (proven live, 2026-07-04).
+/// The CTX capture/injection stores keep the system-inclusive key; only the
+/// watchdog needs bust-surviving identity.
+pub fn conversation_key(parsed: &serde_json::Value, session_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(session_key.as_bytes());
+    if let Some(first) = parsed.get("messages").and_then(|m| m.get(0)) {
+        hasher.update(first.to_string().as_bytes());
+    }
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(16);
+    for b in &out[..8] {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
 
 /// The usage counters of one completed turn, as billed by Anthropic.
 #[derive(Debug, Clone, Copy)]
@@ -513,6 +530,38 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_bust_is_classified_as_recache() {
+        // The live scenario the watchdog originally missed: three turns of
+        // one conversation, the third with a mutated system prompt. The
+        // conversation key must survive the mutation so the collapsed
+        // cache_read on turn 3 classifies as Recache, not FirstTurn.
+        let body1 = serde_json::json!({
+            "system": "stable system",
+            "messages": [{"role":"user","content":"say ok"}]
+        });
+        let mut body3 = body1.clone();
+        body3["system"] = serde_json::json!("MUTATED system");
+
+        let obs = UsageObserver::new();
+        let k = conversation_key(&body1, "sess");
+        // Turn 1: cold cache — all creation.
+        obs.begin_request("r1", k.clone(), None);
+        obs.complete("r1", 10, 0, 8400);
+        // Turn 2: healthy — reads what turn 1 created.
+        obs.begin_request("r2", conversation_key(&body1, "sess"), None);
+        obs.complete("r2", 10, 8400, 0);
+        // Turn 3: mutated system → cache busted upstream (read 0, big creation).
+        obs.begin_request("r3", conversation_key(&body3, "sess"), None);
+        obs.complete("r3", 10, 0, 8410);
+
+        let snap = obs.snapshot();
+        assert_eq!(snap.recache_events_total, 1, "bust must be classified");
+        let ev = snap.last_event.expect("last_event populated");
+        assert_eq!(ev.conversation_key, k);
+        assert!(ev.wasted_tokens > 8000);
+    }
+
+    #[test]
     fn conversation_key_stable_and_discriminating() {
         let body_a = serde_json::json!({
             "system": "you are helpful",
@@ -536,6 +585,14 @@ mod tests {
         assert_ne!(
             conversation_key(&body_a, "sess"),
             conversation_key(&body_b, "sess")
+        );
+        // Mutated system prompt → SAME key: a system-prompt change is a
+        // cache bust the watchdog must classify, so identity survives it.
+        let mut body_a3 = body_a.clone();
+        body_a3["system"] = serde_json::json!("MUTATED");
+        assert_eq!(
+            conversation_key(&body_a, "sess"),
+            conversation_key(&body_a3, "sess")
         );
         // Different client → different key.
         assert_ne!(
