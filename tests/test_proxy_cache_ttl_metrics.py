@@ -9,6 +9,7 @@ import pytest
 from headroom.observability import reset_headroom_tracing, reset_otel_metrics
 from headroom.proxy.cost import CostTracker, build_prefix_cache_stats
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.savings_tracker import SavingsTracker
 
 
 def test_prometheus_metrics_tracks_observed_ttl_buckets() -> None:
@@ -79,8 +80,10 @@ def test_prefix_cache_stats_include_observed_ttl_mix() -> None:
     assert stats["totals"]["observed_ttl_buckets"]["1h"]["tokens"] == 45
 
 
-def test_prometheus_metrics_export_includes_extended_fields() -> None:
-    metrics = PrometheusMetrics()
+def test_prometheus_metrics_export_includes_extended_fields(tmp_path) -> None:
+    metrics = PrometheusMetrics(
+        savings_tracker=SavingsTracker(path=str(tmp_path / "proxy_savings.json"))
+    )
 
     asyncio.run(
         metrics.record_request(
@@ -105,12 +108,42 @@ def test_prometheus_metrics_export_includes_extended_fields() -> None:
 
     exported = asyncio.run(metrics.export())
 
+    assert "headroom_requests_total 1" in exported
+    assert "headroom_tokens_saved_total 5" in exported
+    assert "headroom_persistent_savings_requests_total 1" in exported
+    assert "headroom_persistent_savings_tokens_saved_total 5" in exported
+    assert "headroom_persistent_savings_input_tokens_total 100" in exported
     assert "headroom_latency_ms_count 1" in exported
     assert 'headroom_transform_timing_ms_sum{transform="router"} 4.5' in exported
     assert 'headroom_waste_signal_tokens_total{signal="json_bloat"} 7' in exported
     assert 'headroom_cache_write_ttl_tokens_total{provider="anthropic",ttl="5m"} 10' in exported
     assert 'headroom_provider_cache_hit_requests_total{provider="anthropic"} 1' in exported
     assert "headroom_cache_bust_tokens_lost_total 11" in exported
+
+
+def test_prometheus_export_includes_persistent_savings_after_restart(tmp_path) -> None:
+    savings_path = tmp_path / "proxy_savings.json"
+    metrics = PrometheusMetrics(savings_tracker=SavingsTracker(path=str(savings_path)))
+
+    asyncio.run(
+        metrics.record_request(
+            provider="openai",
+            model="gpt-4o",
+            input_tokens=120,
+            output_tokens=20,
+            tokens_saved=40,
+            latency_ms=12.5,
+        )
+    )
+
+    reloaded = PrometheusMetrics(savings_tracker=SavingsTracker(path=str(savings_path)))
+    exported = asyncio.run(reloaded.export())
+
+    assert "headroom_tokens_saved_total 0" in exported
+    assert "headroom_requests_total 0" in exported
+    assert "headroom_persistent_savings_requests_total 1" in exported
+    assert "headroom_persistent_savings_tokens_saved_total 40" in exported
+    assert "headroom_persistent_savings_input_tokens_total 120" in exported
 
 
 def test_streaming_parser_extracts_anthropic_ttl_bucket_usage() -> None:
@@ -250,3 +283,72 @@ def test_stats_endpoint_reports_langfuse_configuration(monkeypatch: pytest.Monke
     assert langfuse["enabled"] is True
     assert langfuse["service_name"] == "headroom-proxy"
     assert langfuse["endpoint"] == "https://cloud.langfuse.com/api/public/otel/v1/traces"
+
+
+# --- Cache-miss attribution (#1313) ---
+
+
+def test_record_cache_miss_attribution_buckets_by_provider_and_reason() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "prefix_change"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "unknown"))
+
+    buckets = metrics.cache_miss_attribution_by_provider["anthropic"]
+    assert buckets["ttl_expiry"] == 2
+    assert buckets["prefix_change"] == 1
+    assert buckets["unknown"] == 1
+
+
+def test_prefix_cache_stats_include_miss_attribution() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "prefix_change"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "unknown"))
+
+    stats = build_prefix_cache_stats(metrics, None)
+    ma = stats["miss_attribution"]
+
+    assert ma["totals"]["ttl_expiry"] == 2
+    assert ma["totals"]["prefix_change"] == 1
+    assert ma["totals"]["unknown"] == 1
+    assert ma["totals"]["total"] == 4
+    # Percentages are over attributed (non-unknown) misses: 2 / 3, 1 / 3.
+    assert ma["totals"]["ttl_expiry_pct"] == 66.7
+    assert ma["totals"]["prefix_change_pct"] == 33.3
+    assert ma["by_provider"]["anthropic"]["total"] == 4
+
+
+def test_prefix_cache_stats_miss_attribution_empty_when_no_misses() -> None:
+    metrics = PrometheusMetrics()
+    stats = build_prefix_cache_stats(metrics, None)
+    ma = stats["miss_attribution"]
+    assert ma["totals"]["total"] == 0
+    assert ma["totals"]["ttl_expiry_pct"] == 0.0
+    assert ma["by_provider"] == {}
+
+
+def test_prometheus_export_includes_miss_attribution() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "prefix_change"))
+
+    exported = asyncio.run(metrics.export())
+
+    assert (
+        'headroom_cache_miss_attribution_total{provider="anthropic",reason="ttl_expiry"} 1'
+        in exported
+    )
+    assert (
+        'headroom_cache_miss_attribution_total{provider="anthropic",reason="prefix_change"} 1'
+        in exported
+    )
+
+
+def test_reset_runtime_clears_miss_attribution() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.reset_runtime())
+    assert dict(metrics.cache_miss_attribution_by_provider) == {}
