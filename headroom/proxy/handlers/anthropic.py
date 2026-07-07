@@ -1348,7 +1348,10 @@ class AnthropicHandlerMixin:
             # previously-forwarded prefix keeps it byte-identical → cache hits.
             # Append-only-guarded and idempotent (cache mode already replays), so
             # it is safe to run unconditionally here.
-            from headroom.cache.prefix_tracker import overlay_cached_prefix
+            from headroom.cache.prefix_tracker import (
+                normalize_message_cache_control,
+                overlay_cached_prefix,
+            )
 
             _ov = overlay_cached_prefix(
                 optimized_messages,
@@ -1359,6 +1362,16 @@ class AnthropicHandlerMixin:
             if _ov != optimized_messages:
                 optimized_messages = _ov
                 optimized_tokens = tokenizer.count_messages(optimized_messages)
+
+            # Own cache_control placement: the client moves the breakpoint each
+            # turn and the overlay replays past markers, so they accumulate ~1/turn
+            # and Anthropic hard-errors at >4. Strip message-level markers and keep
+            # a single breakpoint on the last block (caches the whole prefix;
+            # content-keyed cache so re-placing never busts). Applied last so the
+            # forwarded AND recorded (next_forwarded) messages stay bounded.
+            _norm = normalize_message_cache_control(optimized_messages)
+            if _norm is not optimized_messages:
+                optimized_messages = _norm
 
             # Guard: if "optimization" inflated tokens, revert to originals.
             # Skip in cache mode where prefix-stability may legitimately shift counts.

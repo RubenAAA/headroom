@@ -700,6 +700,7 @@ class HeadroomProxy(
         profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
+            prefer_code_aware_for_code=_get_env_bool("HEADROOM_PREFER_CODE_AWARE_FOR_CODE", True),
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
             smart_crusher_max_items_after_crush=cast(
@@ -1875,7 +1876,12 @@ class HeadroomProxy(
 
                     return response
 
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            # httpx.TransportError covers ConnectError, the timeout family, and —
+            # crucially — the protocol errors (Local/RemoteProtocolError, e.g. an
+            # HTTP/2 `StreamReset`) that a poisoned shared h2 connection raises on
+            # every in-flight request. Retrying drops the bad connection and
+            # re-sends on a fresh one instead of collapsing to a 502. (#1639)
+            except (httpx.TransportError, httpx.HTTPStatusError) as e:
                 last_error = e
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
