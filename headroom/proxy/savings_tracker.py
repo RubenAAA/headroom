@@ -438,6 +438,7 @@ class SavingsTracker:
         max_response_history_points: int = DEFAULT_MAX_RESPONSE_HISTORY_POINTS,
         display_session_inactivity_minutes: int = (DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES),
         stateless: bool = False,
+        save_flush_every: int = 1,
     ) -> None:
         # In stateless mode the tracker keeps live counters in memory but never
         # writes proxy_savings.json (honors HeadroomConfig.stateless, which
@@ -460,6 +461,13 @@ class SavingsTracker:
             ),
             1,
         )
+        # ponytail: per-record save throttle. Default 1 = persist every call
+        # (the durable default that direct/CLI callers rely on). The async proxy
+        # opts into a higher value so it doesn't json.dumps + fsync the whole
+        # history on every request. Lossless because _save_locked always writes
+        # the FULL state — a skipped save just means the next one is complete.
+        self._save_flush_every = max(_coerce_int(save_flush_every, 1), 1)
+        self._since_save = 0
         self._lock = threading.Lock()
         self._state = self._load_state()
 
@@ -527,7 +535,7 @@ class SavingsTracker:
                 }
             )
             self._trim_history_locked(reference_time=timestamp_dt)
-            self._save_locked()
+            self._maybe_save_locked()
             return True
 
     def record_request(
@@ -661,7 +669,7 @@ class SavingsTracker:
                 )
                 self._trim_history_locked(reference_time=timestamp_dt)
 
-            self._save_locked()
+            self._maybe_save_locked()
             return True
 
     def _record_project_locked(
@@ -1003,9 +1011,29 @@ class SavingsTracker:
 
         return compacted
 
+    def flush(self) -> None:
+        """Persist any records held back by the save throttle.
+
+        Call on graceful shutdown so a batched proxy doesn't drop the tail of
+        recent requests. No-op when nothing is buffered.
+        """
+        with self._lock:
+            if self._since_save > 0:
+                self._save_locked()
+
+    def _maybe_save_locked(self) -> None:
+        """Throttled persist: write only every ``_save_flush_every`` records.
+
+        Caller must hold ``self._lock``. Lossless by design — see ``__init__``.
+        """
+        self._since_save += 1
+        if self._since_save >= self._save_flush_every:
+            self._save_locked()
+
     def _save_locked(self) -> None:
         if self._stateless:
             # Stateless mode: live counters stay in memory; nothing is persisted.
+            self._since_save = 0
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -1035,6 +1063,9 @@ class SavingsTracker:
                 except OSError:
                     pass
                 raise
+            # Reset only after a durable write. A failed save leaves the counter
+            # untouched so the next record retries instead of waiting a full window.
+            self._since_save = 0
         except OSError as e:
             logger.warning("Failed to save savings history to %s: %s", self._path, e)
 

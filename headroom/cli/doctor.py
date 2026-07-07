@@ -33,6 +33,7 @@ from headroom.providers.claude import (
 )
 
 from .main import get_version, main
+from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
 WARN = "warn"
@@ -186,6 +187,34 @@ def check_claude_remote_control_gate(
             hint=remote_message,
         )
     return None
+
+
+def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
+    """Flag a project-local ANTHROPIC_BASE_URL left by a crashed wrap session.
+
+    A crashed ``headroom wrap claude`` (SIGKILL, OOM, reboot) can leave
+    ``.claude/settings.local.json`` pointing at a dead proxy port, hanging
+    every subsequent bare ``claude`` invocation in the project (issue #1768).
+    This checks the project-local settings file — separate from the global
+    ``~/.claude/settings.json`` :func:`check_claude_routing` inspects.
+    """
+    name = "wrap_marker"
+    marker = _read_wrap_marker(settings_path)
+    if marker is None:
+        return CheckResult(name=name, status=SKIP, summary="no wrap marker found")
+    if not _wrap_marker_is_stale(marker):
+        return CheckResult(
+            name=name, status=PASS, summary=f"live wrap session (pid {marker.get('pid')})"
+        )
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary=(
+            f"stale ANTHROPIC_BASE_URL from crashed wrap session "
+            f"(pid {marker.get('pid')}, port {marker.get('port')}) — "
+            "run `headroom unwrap claude` to clean it up"
+        ),
+    )
 
 
 def check_codex_routing(config_path: Path, port: int) -> CheckResult:
@@ -419,6 +448,7 @@ def doctor(port: int, emit_json: bool) -> None:
         check_proxy_liveness(livez, base_url),
         check_version_drift(livez, installed),
         check_claude_routing(claude_settings_path(), port),
+        check_wrap_marker_staleness(Path.cwd() / ".claude" / "settings.local.json"),
         check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
         check_savings(stats, savings_path()),

@@ -9,6 +9,7 @@ Comprehensive tests covering:
 """
 
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -471,6 +472,23 @@ class TestContentRouter:
         assert isinstance(result, RouterCompressionResult)
         assert result.original == content
         assert result.strategy_used is not None
+
+    def test_compress_diff_accepts_none_context_with_debug(self, router, caplog):
+        """None context is normalized before debug logging and compressor dispatch."""
+
+        class FakeDiffCompressor:
+            def compress(self, content, context):
+                assert context == ""
+                return SimpleNamespace(compressed="diff summary")
+
+        diff = "diff --git a/file.py b/file.py\n@@ -1 +1 @@\n-old\n+new\n"
+        router._diff_compressor = FakeDiffCompressor()
+
+        caplog.set_level(logging.DEBUG, logger="headroom.transforms.content_router")
+        result = router.compress(diff, context=None)
+
+        assert result.compressed == "diff summary"
+        assert result.strategy_used == CompressionStrategy.DIFF
 
     def test_name_property(self, router):
         """Router has correct name."""

@@ -846,12 +846,94 @@ def _claude_wrap_base_url_env_key(*, foundry_mode: bool = False, vertex_mode: bo
     return "ANTHROPIC_BASE_URL"
 
 
+def _wrap_marker_path(settings_path: Path) -> Path:
+    """Sidecar marker path for a given settings.local.json path.
+
+    Kept out of settings.local.json itself so Headroom's own bookkeeping never
+    shows up as a stray key inside a file Claude Code's config loader parses.
+    """
+    return settings_path.parent / ".headroom_wrap_marker.json"
+
+
+def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: str | None) -> None:
+    """Best-effort record of which (pid, port, key) wrote the base_url entry.
+
+    Lets a later wrap/doctor/unwrap invocation tell a stale leftover (writer
+    process is dead or its PID was recycled) from a still-live wrap session,
+    and recover the true prior value (issue #1768) instead of guessing.
+    """
+    try:
+        ident = _proc_identity(os.getpid())
+        payload = {
+            "pid": os.getpid(),
+            "start_src": ident[0] if ident else None,
+            "start_time": ident[1] if ident else None,
+            "port": port,
+            "key": key,
+            "previous": previous,
+        }
+        _write_text(_wrap_marker_path(settings_path), json.dumps(payload))
+    except OSError:
+        pass
+
+
+def _read_wrap_marker(settings_path: Path) -> dict[str, Any] | None:
+    marker = _wrap_marker_path(settings_path)
+    try:
+        rec = json.loads(_read_text(marker))
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _wrap_marker_is_stale(marker: dict[str, Any]) -> bool:
+    """True if ``marker`` describes a writer that is provably gone.
+
+    Missing/invalid pid, a dead pid, or a live pid whose recorded identity no
+    longer matches (PID reuse) all count as stale — the entry it describes was
+    left behind by a wrap session that no longer exists.
+    """
+    pid = marker.get("pid")
+    if not isinstance(pid, int):
+        return True
+    if not _pid_alive(pid):
+        return True
+    return _identity_mismatch(marker.get("start_src"), marker.get("start_time"), pid)
+
+
+def _clear_wrap_marker(settings_path: Path, *, key: str) -> None:
+    marker = _read_wrap_marker(settings_path)
+    if marker is not None and marker.get("key") == key:
+        _wrap_marker_path(settings_path).unlink(missing_ok=True)
+
+
+def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str | None:
+    """If a stale wrap marker for ``key`` exists, restore its recorded prior
+    value and clear the marker. Returns the restored value, or None if there
+    was nothing stale to clean up.
+
+    Called before writing a fresh base_url entry so a crashed wrap session's
+    leftover doesn't get treated as this session's own state to restore later.
+    """
+    marker = _read_wrap_marker(settings_path)
+    if marker is None or marker.get("key") != key or not _wrap_marker_is_stale(marker):
+        return None
+    previous = marker.get("previous")
+    click.echo(
+        f"headroom: clearing stale {key} left by crashed wrap session (pid {marker.get('pid')})",
+        err=True,
+    )
+    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
+    return previous
+
+
 def _write_claude_wrap_base_url(
     proxy_url: str,
     *,
     foundry_mode: bool = False,
     vertex_mode: bool = False,
     settings_path: Path | None = None,
+    port: int | None = None,
 ) -> str | None:
     """Persist proxy URL into project-local settings env key for daemon child inheritance.
 
@@ -863,6 +945,10 @@ def _write_claude_wrap_base_url(
     initial launch — routes through the Headroom proxy without touching the
     global user settings file or affecting sessions in other projects. Returns
     the previous value so the caller can restore it on exit (issue #951).
+
+    When ``port`` is given, also stamps a sidecar marker recording this
+    process's identity and the previous value, so a later crash can be
+    detected and self-healed (issue #1768).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     payload: dict[str, Any] = {}
@@ -880,6 +966,8 @@ def _write_claude_wrap_base_url(
     payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_text(path, json.dumps(payload, indent=2) + "\n")
+    if port is not None:
+        _write_wrap_marker(path, port=port, key=key, previous=previous)
     return previous
 
 
@@ -889,16 +977,22 @@ def _restore_claude_wrap_base_url(
     foundry_mode: bool = False,
     vertex_mode: bool = False,
     settings_path: Path | None = None,
+    _key_override: str | None = None,
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
     Called in both the wrap-session finally block and unwrap_claude so the
     project-local settings entry is never left pointing at a dead proxy.  When
     ``previous`` is None the key is removed; when it has a value it is
-    restored — preserving any URL the project already had set.
+    restored — preserving any URL the project already had set. Also clears
+    this key's sidecar wrap marker, if any (issue #1768).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    key = _key_override or _claude_wrap_base_url_env_key(
+        foundry_mode=foundry_mode, vertex_mode=vertex_mode
+    )
     if not path.exists():
+        _clear_wrap_marker(path, key=key)
         return
     try:
         payload = json.loads(_read_text(path))
@@ -909,9 +1003,9 @@ def _restore_claude_wrap_base_url(
     env_map = payload.get("env")
     if not isinstance(env_map, dict):
         return
-    key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
     if previous is None:
         if key not in env_map:
+            _clear_wrap_marker(path, key=key)
             return
         del env_map[key]
         if env_map:
@@ -925,6 +1019,7 @@ def _restore_claude_wrap_base_url(
         _write_text(path, json.dumps(payload, indent=2) + "\n")
     else:
         path.unlink(missing_ok=True)
+    _clear_wrap_marker(path, key=key)
 
 
 def _setup_headroom_mcp(
@@ -3072,26 +3167,33 @@ def _pid_alive(pid: int) -> bool:
     return pid_alive(pid)
 
 
+def _identity_mismatch(src: Any, recorded: Any, pid: int) -> bool:
+    """True only if ``pid``'s current identity *provably* differs from the
+    recorded ``(src, recorded)`` identity (i.e. the PID was recycled).
+
+    Conservative by design: any uncertainty (unknown/legacy identity, unknown
+    start time, mismatched source) returns ``False`` — never claim a mismatch
+    without proof, since the caller uses this to decide whether to trust or
+    discard state tied to a live PID.
+    """
+    if not isinstance(src, str) or not isinstance(recorded, int | float):
+        return False  # legacy / identity-less record — can't tell
+    ident = _proc_identity(pid)
+    if ident is None or ident[0] != src:
+        return False  # can't compare like-for-like — don't claim mismatch
+    # Start times are stable per process; >1s apart means a different process.
+    return abs(ident[1] - float(recorded)) > 1.0
+
+
 def _marker_pid_reused(marker: Path, pid: int) -> bool:
     """True only if the live ``pid`` is *provably* a different process than the
     one that wrote ``marker`` (i.e. the PID was recycled after a crash).
-
-    Conservative by design: any uncertainty (legacy marker, unknown start time,
-    mismatched source) returns ``False`` so a real client is never pruned.
     """
     try:
         rec = json.loads(_read_text(marker))
     except (OSError, ValueError):
         return False
-    src = rec.get("start_src")
-    recorded = rec.get("start_time")
-    if not isinstance(src, str) or not isinstance(recorded, int | float):
-        return False  # legacy / identity-less marker — can't tell
-    ident = _proc_identity(pid)
-    if ident is None or ident[0] != src:
-        return False  # can't compare like-for-like — don't prune
-    # Start times are stable per process; >1s apart means a different process.
-    return abs(ident[1] - float(recorded)) > 1.0
+    return _identity_mismatch(rec.get("start_src"), rec.get("start_time"), pid)
 
 
 def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
@@ -3600,6 +3702,10 @@ def claude(
     _register_proxy_client(port)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
+    if hasattr(signal, "SIGHUP"):
+        # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM — without
+        # this, the finally block's base_url restore never runs (issue #1768).
+        signal.signal(signal.SIGHUP, cleanup)
 
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
@@ -3764,6 +3870,13 @@ def claude(
         # daemon's environment) also route through Headroom.
         _settings_vertex[0] = bool(use_vertex)
         _settings_foundry[0] = bool(foundry_upstream) and not _settings_vertex[0]
+        _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
+        _check_and_clear_stale_wrap_marker(
+            _wrap_settings_path,
+            key=_claude_wrap_base_url_env_key(
+                foundry_mode=_settings_foundry[0], vertex_mode=_settings_vertex[0]
+            ),
+        )
         _saved_base_url[0] = _write_claude_wrap_base_url(
             (
                 _foundry_proxy_url(proxy_url)
@@ -3774,6 +3887,8 @@ def claude(
             ),
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
+            settings_path=_wrap_settings_path,
+            port=port,
         )
 
         # Per-project savings attribution: tag every request with the launch
@@ -3817,6 +3932,7 @@ def claude(
             _saved_base_url[0],
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
+            settings_path=_wrap_settings_path,
         )
         cleanup()
 
@@ -3884,9 +4000,19 @@ def unwrap_claude(
     else:
         click.echo("  Kept rtk Claude hooks (--keep-rtk).")
 
-    _restore_claude_wrap_base_url(None)
-    _restore_claude_wrap_base_url(None, foundry_mode=True)
-    _restore_claude_wrap_base_url(None, vertex_mode=True)
+    _unwrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    for _foundry, _vertex in ((False, False), (True, False), (False, True)):
+        _key = _claude_wrap_base_url_env_key(foundry_mode=_foundry, vertex_mode=_vertex)
+        _marker = _read_wrap_marker(_unwrap_settings_path)
+        _prior = (
+            _marker.get("previous") if _marker is not None and _marker.get("key") == _key else None
+        )
+        _restore_claude_wrap_base_url(
+            _prior,
+            foundry_mode=_foundry,
+            vertex_mode=_vertex,
+            settings_path=_unwrap_settings_path,
+        )
 
     click.echo()
     click.echo("✓ Claude is no longer durably wrapped by Headroom.")

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- `headroom wrap claude` no longer leaves a dead `ANTHROPIC_BASE_URL` in a
+  project's `.claude/settings.local.json` after an unclean exit (`SIGKILL`,
+  OOM, reboot, or terminal/tmux close via `SIGHUP`, which was not caught).
+  `_write_claude_wrap_base_url`/`_restore_claude_wrap_base_url` only removed
+  or restored the entry from the wrap process's own `finally` block, so a
+  crash skipped it and every later bare `claude` invocation in that project
+  inherited the stale proxy URL and hung indefinitely retrying a dead port.
+  A wrap session now stamps a sidecar marker (pid, port, prior value); the
+  next `wrap`, `unwrap`, or `headroom doctor` run detects a marker whose pid
+  is dead or reused and restores the recorded prior value automatically.
+  `claude()` also now catches `SIGHUP` alongside the existing `SIGTERM`
+  handler ([#1768](https://github.com/headroomlabs-ai/headroom/issues/1768)).
 - Non-finite values (`NaN`, `Infinity`) in `proxy_savings.json` or in upstream
   cost/token metadata no longer crash the proxy or corrupt the savings
   dashboard. `SavingsTracker`'s numeric coercion caught only `TypeError` and
@@ -60,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `min(4, cpu)` × 1). The ONNX embedder already capped its threads; this brings
   the torch path to parity
   ([#198](https://github.com/headroomlabs-ai/headroom/issues/198)).
+- Buffered passthrough routes (e.g. `GET /v1/models`) no longer return an
+  opaque HTTP 502 when an OpenAI-compatible upstream closes a pooled
+  keep-alive connection mid-response (`httpx.RemoteProtocolError` /
+  "incomplete chunked read"). Headroom now retries the request once on a
+  fresh connection — mirroring a direct `curl` — and only returns a clear
+  `upstream_protocol_error` 502 if the upstream is genuinely sending an
+  incomplete response
+  ([#1112](https://github.com/chopratejas/headroom/issues/1112)).
 
 ### Changed
 
@@ -69,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 * **proxy:** add `HEADROOM_ORT_EP` env var to select the ONNX Runtime execution provider at startup — `openvino` for Intel CPU/GPU/NPU via OpenVINO runtime, `cuda` for NVIDIA GPU, or unset/`cpu` for the default CPU path. Both the fastembed embedding scorer and the magika content classifier share the ORT singleton, so a single env var covers both. Set `HEADROOM_ORT_OPENVINO_DEVICE` (default `NPU`) to pick the OpenVINO target device and `HEADROOM_ORT_OPENVINO_CACHE` to a directory for caching compiled NPU/GPU blobs across restarts; first run compiles and saves, subsequent runs load instantly.
+* **proxy:** add provider-only HTTP proxy routing via `--http-proxy` and
+  `HEADROOM_HTTP_PROXY`. Upstream LLM provider calls can now use an HTTP proxy
+  without setting process-wide `HTTP_PROXY`/`HTTPS_PROXY` variables that are
+  inherited by tool executions; proxied provider clients use HTTP/1.1 so HTTPS
+  provider APIs can tunnel through CONNECT.
+* **proxy:** add output shaping for OpenAI Responses traffic on `/v1/responses` HTTP requests and Codex WebSocket `response.create` frames, with stable output-savings holdout keys and counted WS token strata for the experiment.
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).
 * **learn:** weight loops in `headroom learn`. A new loop detector (`headroom/learn/loops.py`) recognizes repeated tool-call patterns — including RTK re-fetch loops, where RTK's output truncation makes the agent re-run larger-limit variants of a *successful* command — collapses output-limit variants to one signature, measures the wasted tokens, surfaces loops as a highest-priority digest section, and weights loop guardrails above one-off rules by their measured waste. Previously loops had no special weight and a no-failure re-fetch loop was skipped entirely. Adds an RTK-loop eval (`benchmarks/rtk_loop_learn_eval.py`) that reproduces a loop, runs it through Learn, and asserts the generated guardrail ranks first and prevents re-triggering.
 * **learn:** write per-project learnings to the personal, gitignored `CLAUDE.local.md` by default instead of the team-shared `CLAUDE.md`, matching Claude Code's memory convention so machine-specific paths and tool-discovery byproducts no longer pollute the shared file. Adds a `--target` flag to override the destination (e.g. `--target CLAUDE.md` to opt back into the shared file, or any custom path), and auto-migrates a stale learned-patterns block out of an existing `CLAUDE.md` into `CLAUDE.local.md` with a warning ([#1072](https://github.com/chopratejas/headroom/issues/1072)).
@@ -84,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 * **proxy:** Phase E byte-mutating passes (E1 tool-array sort, E2 schema-key sort, E3 `cache_control` auto-placement) were unconditionally skipped for non-PAYG auth modes even when `--auth-mode-policy-enforcement disabled` was set. Token reduction matters for subscription users too — rate limits are token-based, context windows are finite, and smaller payloads transfer faster. `effective_auth_mode` now mirrors the enforcement-flag override already applied to `CompressionPolicy` at request entry, so the Phase E passes fire as expected when the flag is present.
+* **proxy:** forward Codex Desktop `/v1/responses` posts byte-faithfully so they stop returning upstream `400 {"detail":"Bad Request"}`. `handle_openai_responses` decoded the inbound body to inspect it but always re-serialized a canonical body on the way out, and it never stripped the inbound `content-encoding` header — so a `content-encoding: zstd` Codex Desktop request was forwarded as already-decoded JSON still advertising `zstd`, and the upstream ChatGPT Codex endpoint rejected it. The handler now keeps the original decoded bytes and forwards them verbatim whenever nothing (compression or memory injection) mutated the request, and drops the stale `content-encoding` header, mirroring the byte-faithful passthrough the chat and Anthropic paths already use ([#1542](https://github.com/headroomlabs-ai/headroom/issues/1542)).
 * **wrap/codex:** `headroom unwrap codex` now removes the Headroom rtk instruction block from the Codex global `AGENTS.md`. `wrap codex` injects it there, but unwrap only restored `config.toml` and MCP state, so a plain `codex` launch kept following the "prefix shell commands with `rtk`" guidance and failed once the managed rtk binary was off PATH. Unwrap now strips the marker-fenced block (preserving the rest of the file), mirroring `unwrap copilot` ([#1421](https://github.com/headroomlabs-ai/headroom/issues/1421)).
 * **proxy/auth:** classify real Anthropic OAuth tokens correctly. `classify_auth_mode` matched OAuth on the `sk-ant-oat-` prefix, but real access tokens are `sk-ant-oat01-...` (a version number, no dash after `oat`), so every real subscription/OAuth token fell through to the `sk-` branch and was tagged `PAYG` — enabling aggressive lossy compression, auto `cache_control`, and `prompt_cache_key` injection on subscription-bound requests the classifier is meant to route to the passthrough-prefer path. The prefix is now the dash-less `sk-ant-oat` (still matches the legacy dashed shape). The existing parity tests only passed because they used a synthetic `sk-ant-oat-01-` fixture; a regression test now covers the real `sk-ant-oat01-` format.
 * **install:** stop leaking a file descriptor on every `headroom install start`. `start_detached_agent()` opened the agent log file and handed it to `subprocess.Popen` but never closed the parent's copy, so each call leaked one fd (and pinned the log file open against rotation). The parent now closes its copy in a `try/finally` once the child has inherited it — the close also runs if `Popen` raises ([#1554](https://github.com/headroomlabs-ai/headroom/issues/1554)).
@@ -97,6 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **rtk:** stop `rtk` hook registration from spuriously timing out during `headroom wrap`. Output is captured to a temp file instead of pipes, and `stdin` is closed, so a background process forked by `rtk init` can no longer hold the pipe open and block `subprocess.run` past its 10s timeout after the hooks were already registered.
 * **ccr:** stop re-compressing `headroom_retrieve` output, which created an infinite retrieval loop, and stop emitting retrieval markers when the `headroom_retrieve` tool is not injected, which silently dropped data ([#1077](https://github.com/chopratejas/headroom/issues/1077), [#1006](https://github.com/chopratejas/headroom/issues/1006)).
 * **dashboard:** include RTK stats in the Historical tab; `/stats-history` now attaches live RTK/CLI-filtering stats the same way the Session tab does, so they survive a proxy restart ([#1177](https://github.com/chopratejas/headroom/issues/1177)).
+* **opencode:** write Headroom MCP config as a local stdio server instead of a remote `/mcp` URL, keep provider-only installs from adding MCP config, and allow `install apply --target opencode` ([#1380](https://github.com/headroomlabs-ai/headroom/issues/1380)).
 * **proxy:** stop discarding a finished compression on very large requests. After the transform pipeline completed, a telemetry-only waste-signal re-parse of the *original* messages ran on the critical path; on huge Claude Code transcripts (~400k tokens) that parse could exceed the Anthropic compression timeout, so the proxy failed open and forwarded the uncompressed request despite "Pipeline complete" logging real savings (`tokens_saved: 0`, `transforms_applied: []`, ~31s latency). Waste-signal detection is now skipped above `MAX_WASTE_SIGNAL_DETECTION_TOKENS` (100k) so the compression result stays on the critical path ([#296](https://github.com/chopratejas/headroom/issues/296)).
 * **codex:** retag existing Codex threads when `headroom init` injects the `headroom` provider, so Codex Desktop history stays visible. Codex filters its sidebar/search by the active `model_provider`; the init path set `model_provider = "headroom"` without retagging, so existing native `openai` threads disappeared from the menu (data was never deleted, only hidden). `_ensure_codex_provider` now reconciles thread tags openai→headroom, matching what the install and `wrap` paths already do; `headroom unwrap codex` handles the revert direction ([#961](https://github.com/chopratejas/headroom/issues/961)).
 * **install:** stop duplicating the container ENTRYPOINT in the `persistent-docker` runtime command. The published image already runs `headroom proxy` as its ENTRYPOINT, but `build_runtime_command` re-added `headroom proxy` after the image name, so the container ran `headroom proxy headroom proxy --host 0.0.0.0 …` and Click aborted with "Got unexpected extra arguments (headroom proxy)" — the deployment never became ready and rollback left nothing running. The runtime command now appends only the proxy flags ([#833](https://github.com/chopratejas/headroom/issues/833)).

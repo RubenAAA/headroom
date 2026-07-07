@@ -960,6 +960,50 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
 RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
 
 
+async def request_with_transient_retry(
+    client: httpx.AsyncClient,
+    *,
+    request_id: str | None = None,
+    max_retries: int = 1,
+    **request_kwargs: Any,
+) -> httpx.Response:
+    """Issue a buffered httpx request, retrying once on a transient close.
+
+    ``httpx.RemoteProtocolError`` ("peer closed connection without sending
+    complete message body (incomplete chunked read)") is raised when an
+    upstream closes a pooled keep-alive connection that httpx then reuses for
+    the next request. A direct ``curl`` never hits this because it opens a
+    fresh connection per call; Headroom reuses pooled connections, so the
+    first request issued on a stale connection fails even though the upstream
+    is healthy (it answers a fresh connection with 200). Retrying opens a new
+    connection and succeeds, mirroring curl's behaviour. See GH #1112.
+
+    Only ``httpx.RemoteProtocolError`` is retried — the specific stale
+    keep-alive symptom; every other exception (``ConnectError``, timeouts,
+    HTTP status errors) propagates immediately so existing handling is
+    unchanged. Use this for buffered (non-streaming) requests only: a streamed
+    response cannot be safely replayed once bytes have reached the client.
+    """
+    import httpx
+
+    attempt = 0
+    while True:
+        try:
+            return await client.request(**request_kwargs)
+        except httpx.RemoteProtocolError as exc:
+            if attempt >= max_retries:
+                raise
+            attempt += 1
+            logger.warning(
+                "Upstream closed connection mid-response (%s); retrying on a "
+                "fresh connection (attempt %d/%d)%s",
+                exc,
+                attempt,
+                max_retries,
+                f" [{request_id}]" if request_id else "",
+            )
+
+
 # Image compression availability (do not retain a global compressor instance)
 _image_compressor_available: bool | None = None
 
@@ -2564,6 +2608,43 @@ def _reset_session_ccr_tracker_for_test() -> None:
     global _session_ccr_tracker
     with _session_ccr_tracker_lock:
         _session_ccr_tracker = None
+
+
+def has_new_ccr_markers(
+    *,
+    current_detected_hashes: list[str],
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+    provider: Literal["anthropic", "openai", "google"],
+) -> bool:
+    """Whether the about-to-forward content carries CCR markers NOT already forwarded.
+
+    ``overlay_cached_prefix`` (#1850) replays the previously-forwarded (compressed)
+    prefix byte-identical to keep the prompt cache warm — which reintroduces the
+    ``hash=…`` markers that prefix already carried. Those markers are *historical*:
+    the agent saw them last turn and the retrieve-tool state was already settled
+    for them. Only markers that are genuinely NEW this turn justify overriding the
+    tool-injection deferral (#1006); counting the replayed ones would re-inject the
+    tool on every frozen turn and bust the *tools* cache segment (undoing the very
+    cache-safety the overlay provides).
+
+    Returns True iff ``current_detected_hashes`` contains a hash that is not present
+    in ``previous_forwarded_messages``.
+    """
+    current = set(current_detected_hashes)
+    if not current:
+        return False
+    if not previous_forwarded_messages:
+        # No prior forward → every marker is new (genuine first CCR turn).
+        return True
+    from headroom.ccr.tool_injection import CCRToolInjector
+
+    prev = CCRToolInjector(
+        provider=provider,
+        inject_tool=False,
+        inject_system_instructions=False,
+    )
+    prev.scan_for_markers(previous_forwarded_messages)
+    return bool(current - set(prev.detected_hashes))
 
 
 def should_inject_ccr_tool(
