@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, replace
 from typing import Protocol
 
+logger = logging.getLogger(__name__)
+
 AGENT_90_PROFILE = "agent-90"
+FALLBACK_PROFILE = "balanced"
 
 
 class CompressConfigLike(Protocol):
@@ -150,14 +155,29 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
 
 
 def get_agent_savings_profile(name: str | None = None) -> AgentSavingsProfile:
-    """Return a named agent savings profile."""
+    """Return a named agent savings profile.
+
+    An unrecognized name falls back to the ``balanced`` profile with a warning
+    instead of raising. The savings profile is a soft config knob, but it is
+    resolved during proxy startup (``proxy_pipeline_kwargs`` -> ``create_app``),
+    so raising here takes the whole proxy down before it can open its port. That
+    happens on desktop/runtime version skew: a newer client requests a profile
+    (e.g. ``coding``) that an older pinned or fallback runtime predates. Degrade
+    to ``balanced`` rather than leaving the user with no proxy at all.
+    """
 
     key = (name or AGENT_90_PROFILE).strip().lower()
-    try:
-        return _PROFILES[key]
-    except KeyError as exc:
-        valid = ", ".join(sorted(_PROFILES))
-        raise ValueError(f"unknown savings profile {name!r}; expected one of: {valid}") from exc
+    profile = _PROFILES.get(key)
+    if profile is not None:
+        return profile
+    valid = ", ".join(sorted(_PROFILES))
+    logger.warning(
+        "unknown savings profile %r; falling back to %r (known: %s)",
+        name,
+        FALLBACK_PROFILE,
+        valid,
+    )
+    return _PROFILES[FALLBACK_PROFILE]
 
 
 def apply_agent_savings_env_defaults(
@@ -258,6 +278,19 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
     )
     if smart_crusher_with_compaction is not None:
         kwargs["smart_crusher_with_compaction"] = bool(smart_crusher_with_compaction)
+
+    # Lower the block-compression char floor (default 500) so modest tool outputs
+    # are eligible for the LOSSY path too. Matters in cache mode, where the only
+    # compressible content each turn is a single (often small) delta observation;
+    # a 500-char floor buckets most of them as "small" (skipped). Env-gated so it
+    # only changes behavior when explicitly set; lossless folding has no floor and
+    # is unaffected.
+    _min_chars_block = os.environ.get("HEADROOM_MIN_CHARS_FOR_BLOCK")
+    if _min_chars_block:
+        try:
+            kwargs["min_chars_for_block_compression"] = int(_min_chars_block)
+        except ValueError:
+            pass
 
     return kwargs
 

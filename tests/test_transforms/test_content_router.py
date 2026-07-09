@@ -9,6 +9,7 @@ Comprehensive tests covering:
 """
 
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -472,6 +473,23 @@ class TestContentRouter:
         assert result.original == content
         assert result.strategy_used is not None
 
+    def test_compress_diff_accepts_none_context_with_debug(self, router, caplog):
+        """None context is normalized before debug logging and compressor dispatch."""
+
+        class FakeDiffCompressor:
+            def compress(self, content, context):
+                assert context == ""
+                return SimpleNamespace(compressed="diff summary")
+
+        diff = "diff --git a/file.py b/file.py\n@@ -1 +1 @@\n-old\n+new\n"
+        router._diff_compressor = FakeDiffCompressor()
+
+        caplog.set_level(logging.DEBUG, logger="headroom.transforms.content_router")
+        result = router.compress(diff, context=None)
+
+        assert result.compressed == "diff summary"
+        assert result.strategy_used == CompressionStrategy.DIFF
+
     def test_name_property(self, router):
         """Router has correct name."""
         assert router.name == "content_router"
@@ -778,16 +796,100 @@ class TestExcludeTools:
         assert json.loads(result.messages[1]["content"]) == json.loads(messages[1]["content"])
         assert "router:excluded:lossless_json" in result.transforms_applied
 
+    def test_anthropic_mcp_alias_exclude_tools(self, tokenizer):
+        """Single-underscore MCP names from custom agents honor documented MCP globs."""
+        config = ContentRouterConfig(
+            min_section_tokens=10,
+            exclude_tools={"mcp__*"},
+        )
+        router = ContentRouter(config)
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_mcp_1",
+                        "name": "mcp_CursorTaskRegistry_cursor_list_tasks",
+                        "input": {"project": "headroom"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_mcp_1",
+                        "content": generate_json_data(50),
+                    }
+                ],
+            },
+        ]
+
+        result = router.apply(messages, tokenizer)
+
+        tool_result_block = result.messages[1]["content"][0]
+        assert json.loads(tool_result_block["content"]) == json.loads(
+            messages[1]["content"][0]["content"]
+        )
+        assert "router:excluded:lossless_json" in result.transforms_applied
+
+    def test_anthropic_mcp_bare_tool_alias_exclude_tools(self, tokenizer):
+        """Bare tool exclusions match custom-agent MCP wrappers (#1822)."""
+        config = ContentRouterConfig(
+            min_section_tokens=10,
+            exclude_tools={"headroom_retrieve"},
+        )
+        router = ContentRouter(config)
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_retrieve_1",
+                        "name": "mcp_HeadroomZai_headroom_retrieve",
+                        "input": {"key": "abc123"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_retrieve_1",
+                        "content": generate_json_data(50),
+                    }
+                ],
+            },
+        ]
+
+        result = router.apply(messages, tokenizer)
+
+        tool_result_block = result.messages[1]["content"][0]
+        assert json.loads(tool_result_block["content"]) == json.loads(
+            messages[1]["content"][0]["content"]
+        )
+        assert "router:excluded:lossless_json" in result.transforms_applied
+
     def test_is_tool_excluded_helper(self):
         """is_tool_excluded: exact (case-insensitive) and glob matching."""
         from headroom.config import is_tool_excluded
 
         # Glob entry covers a whole MCP server; unrelated tools are untouched.
         assert is_tool_excluded("mcp__build123d__measure", {"mcp__*"})
+        assert is_tool_excluded("mcp_CursorTaskRegistry_cursor_list_tasks", {"mcp__*"})
         assert not is_tool_excluded("Bash", {"mcp__*"})
         # Plain entries keep exact, case-insensitive membership.
         assert is_tool_excluded("Read", {"read"})
         assert is_tool_excluded("MCP__X", {"mcp__*"})
+        # MCP wrapper aliases can still be excluded by their bare tool name.
+        assert is_tool_excluded("mcp_HeadroomZai_headroom_retrieve", {"headroom_retrieve"})
+        assert is_tool_excluded("mcp__Headroom__headroom_retrieve", {"headroom_retrieve"})
         # Empty set never excludes.
         assert not is_tool_excluded("Read", set())
 
