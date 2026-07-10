@@ -9,11 +9,252 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
 use crate::proxy::{forward_http, AppState};
+
+/// Values mirrored from the Codex CLI source (codex-rs/login/src/auth):
+/// the codex backend gates and buckets traffic by originator/user-agent,
+/// and token refresh uses the CLI's public OAuth client id.
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+/// Resolve a file that lives alongside auth.json in the codex home dir.
+fn codex_home_sibling(auth_file: Option<&str>, name: &str) -> Option<std::path::PathBuf> {
+    Some(std::path::Path::new(auth_file?).parent()?.join(name))
+}
+
+/// The installed Codex CLI version, read from version.json next to the auth
+/// file, so our user-agent tracks whatever CLI release the user actually has.
+fn codex_cli_version(auth_file: Option<&str>) -> String {
+    codex_home_sibling(auth_file, "version.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| {
+            v.get("latest_version")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "0.144.1".to_string())
+}
+
+/// The CLI's persistent installation id (a UUID codex writes on first run).
+fn codex_installation_id(auth_file: Option<&str>) -> Option<String> {
+    let content =
+        std::fs::read_to_string(codex_home_sibling(auth_file, "installation_id")?).ok()?;
+    let id = content.trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// User-agent matching the Codex CLI's format:
+/// `{originator}/{version} ({os} {version}; {arch}) {terminal}`.
+fn codex_user_agent(auth_file: Option<&str>) -> String {
+    format!(
+        "{CODEX_ORIGINATOR}/{} (Ubuntu 24.04; {}) WindowsTerminal",
+        codex_cli_version(auth_file),
+        std::env::consts::ARCH,
+    )
+}
+
+/// W3C trace context header with random trace/span ids, as sent per-request
+/// by the Codex CLI's instrumented HTTP client.
+fn generate_traceparent() -> String {
+    let trace = uuid::Uuid::new_v4().simple().to_string();
+    let span = &uuid::Uuid::new_v4().simple().to_string()[..16];
+    format!("00-{trace}-{span}-01")
+}
+
+/// Last `x-codex-turn-state` value per session key. The codex backend uses
+/// this for sticky routing within a turn; the real CLI echoes it back on
+/// follow-up requests, so we do the same across our stateless proxy calls.
+static CODEX_TURN_STATE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn turn_state_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    CODEX_TURN_STATE.get_or_init(Default::default)
+}
+
+/// Encrypted reasoning items captured from codex responses, keyed by session
+/// then by the call_id of the function call that followed them. The real CLI
+/// replays these in the next request's `input` so the model resumes its chain
+/// of thought across tool calls; Claude Code's history can't carry them, so
+/// we cache proxy-side and re-inject during translation.
+type ReasoningCache = std::collections::HashMap<String, std::collections::HashMap<String, Vec<Value>>>;
+
+static CODEX_REASONING_CACHE: std::sync::OnceLock<std::sync::Mutex<ReasoningCache>> =
+    std::sync::OnceLock::new();
+
+const REASONING_CACHE_MAX_SESSIONS: usize = 64;
+const REASONING_CACHE_MAX_ANCHORS: usize = 512;
+
+fn reasoning_cache() -> &'static std::sync::Mutex<ReasoningCache> {
+    CODEX_REASONING_CACHE.get_or_init(Default::default)
+}
+
+fn store_reasoning_items(session_key: &str, call_id: &str, items: Vec<Value>) {
+    if items.is_empty() || call_id.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = reasoning_cache().lock() {
+        // Session-level cap: evict one *other* session rather than clearing
+        // all, so an unrelated codex conversation keeps its replay intact.
+        if cache.len() >= REASONING_CACHE_MAX_SESSIONS && !cache.contains_key(session_key) {
+            if let Some(victim) = cache.keys().find(|k| *k != session_key).cloned() {
+                cache.remove(&victim);
+            }
+        }
+        let session = cache.entry(session_key.to_string()).or_default();
+        // Anchor-level cap: once full, STOP caching new anchors instead of
+        // clearing. Clearing would drop items we still replay mid-history,
+        // changing already-cached prefix bytes and busting the codex prompt
+        // cache. Skipping keeps every existing anchor byte-stable; the only
+        // cost is no reasoning replay for brand-new calls in a very long
+        // session, which is cache-neutral.
+        if session.len() >= REASONING_CACHE_MAX_ANCHORS && !session.contains_key(call_id) {
+            return;
+        }
+        let item_count = items.len();
+        session.insert(call_id.to_string(), items);
+        tracing::debug!(
+            event = "codex_reasoning_capture",
+            session = %session_key,
+            call_id = %call_id,
+            items = item_count,
+            cached_anchors = session.len(),
+            "cached encrypted reasoning items for replay"
+        );
+    }
+}
+
+/// Insert cached reasoning items ahead of the function_call entries they
+/// preceded in the original response, restoring the CLI's input shape.
+fn reinject_reasoning_items(session_key: &str, input: Vec<Value>) -> Vec<Value> {
+    let Ok(cache) = reasoning_cache().lock() else {
+        return input;
+    };
+    let Some(session) = cache.get(session_key) else {
+        return input;
+    };
+    let mut out = Vec::with_capacity(input.len());
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+    let mut replayed_items = 0usize;
+    for item in input {
+        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+            if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
+                match session.get(call_id) {
+                    Some(items) => {
+                        hits += 1;
+                        replayed_items += items.len();
+                        out.extend(items.iter().cloned());
+                    }
+                    None => misses += 1,
+                }
+            }
+        }
+        out.push(item);
+    }
+    tracing::debug!(
+        event = "codex_reasoning_replay",
+        session = %session_key,
+        anchor_hits = hits,
+        anchor_misses = misses,
+        replayed_items,
+        cached_anchors = session.len(),
+        "replaying cached encrypted reasoning items into codex request"
+    );
+    out
+}
+
+/// Derive a stable UUID-shaped session id from Claude Code's metadata.user_id
+/// so `session-id`/`thread-id` headers stay constant within a session.
+fn derive_session_uuid(user_id: &str) -> String {
+    // FNV-1a over the input, expanded to 128 bits via two passes with
+    // different offsets; shape the result like a UUID.
+    fn fnv1a(data: &[u8], mut hash: u64) -> u64 {
+        for b in data {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+    let h1 = fnv1a(user_id.as_bytes(), 0xcbf29ce484222325);
+    let h2 = fnv1a(user_id.as_bytes(), h1 | 1);
+    let bytes = [h1.to_be_bytes(), h2.to_be_bytes()].concat();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-8{:01x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6] & 0x0f, bytes[7],
+        bytes[8] & 0x0f, bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
+/// Refresh the Codex OAuth token using the refresh_token in the auth file,
+/// mirroring codex-rs/login/src/auth/manager.rs. Persists the new tokens back
+/// to the auth file and returns the fresh access token.
+async fn refresh_codex_token(client: &reqwest::Client, auth_file: &str) -> Option<String> {
+    let data = std::fs::read_to_string(auth_file).ok()?;
+    let mut parsed: Value = serde_json::from_str(&data).ok()?;
+    let refresh_token = parsed
+        .get("tokens")?
+        .get("refresh_token")?
+        .as_str()?
+        .to_string();
+
+    let resp = client
+        .post(CODEX_REFRESH_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        tracing::warn!(
+            event = "codex_token_refresh_failed",
+            status = resp.status().as_u16(),
+            "codex OAuth token refresh rejected"
+        );
+        return None;
+    }
+
+    let refreshed: Value = resp.json().await.ok()?;
+    let access_token = refreshed.get("access_token")?.as_str()?.to_string();
+
+    let tokens = parsed.get_mut("tokens")?;
+    tokens["access_token"] = json!(access_token.clone());
+    if let Some(rt) = refreshed.get("refresh_token").and_then(|v| v.as_str()) {
+        tokens["refresh_token"] = json!(rt);
+    }
+    if let Some(idt) = refreshed.get("id_token").and_then(|v| v.as_str()) {
+        tokens["id_token"] = json!(idt);
+    }
+    parsed["last_refresh"] = json!(chrono::Utc::now().to_rfc3339());
+    if let Ok(serialized) = serde_json::to_string_pretty(&parsed) {
+        if let Err(e) = std::fs::write(auth_file, serialized) {
+            tracing::warn!(
+                event = "codex_token_persist_failed",
+                error = %e,
+                "refreshed codex token could not be written back to auth file"
+            );
+        }
+    }
+    tracing::info!(
+        event = "codex_token_refreshed",
+        "codex OAuth access token refreshed"
+    );
+    Some(access_token)
+}
 
 /// Read the Codex access token from the auth JSON file.
 /// Returns the token string, or None if the file doesn't exist or is invalid.
@@ -26,6 +267,220 @@ fn read_codex_access_token(path: &str) -> Option<String> {
         .get("access_token")?
         .as_str()
         .map(String::from)
+}
+
+fn decode_openai_bearer_payload(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let payload = URL_SAFE_NO_PAD.decode(payload.as_bytes()).ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+fn resolve_codex_routing_headers(
+    headers: &HeaderMap,
+    auth_file: Option<&str>,
+) -> (HeaderMap, bool) {
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/json".parse().expect("valid header"),
+    );
+    // Identify as a Codex client; the backend gates/buckets by these.
+    upstream_headers.insert(
+        "originator",
+        CODEX_ORIGINATOR.parse().expect("valid header"),
+    );
+    if let Ok(ua) = codex_user_agent(auth_file).parse() {
+        upstream_headers.insert(http::header::USER_AGENT, ua);
+    }
+    if let Some(id) = codex_installation_id(auth_file) {
+        if let Ok(val) = http::HeaderValue::from_str(&id) {
+            upstream_headers.insert("x-codex-installation-id", val);
+        }
+    }
+    if let Ok(tp) = generate_traceparent().parse() {
+        upstream_headers.insert("traceparent", tp);
+    }
+
+    // Prefer an explicit ChatGPT account id if the caller supplied one.
+    if let Some(account_id) = headers.get("ChatGPT-Account-ID") {
+        upstream_headers.insert("ChatGPT-Account-ID", account_id.clone());
+        if let Some(auth) = headers.get(http::header::AUTHORIZATION) {
+            upstream_headers.insert(http::header::AUTHORIZATION, auth.clone());
+        }
+        return (upstream_headers, true);
+    }
+
+    if let Some(auth_file) = auth_file {
+        if let Some(token) = read_codex_access_token(auth_file) {
+            if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
+                upstream_headers.insert(http::header::AUTHORIZATION, val);
+            }
+
+            if let Some(payload) = decode_openai_bearer_payload(&token) {
+                if let Some(account_id) = payload
+                    .get("https://api.openai.com/auth")
+                    .and_then(|auth| auth.get("chatgpt_account_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Ok(val) = http::HeaderValue::from_str(account_id) {
+                        upstream_headers.insert("ChatGPT-Account-ID", val);
+                        return (upstream_headers, true);
+                    }
+                }
+            }
+
+            return (upstream_headers, false);
+        }
+    }
+
+    if let Some(auth) = headers.get(http::header::AUTHORIZATION) {
+        upstream_headers.insert(http::header::AUTHORIZATION, auth.clone());
+    }
+
+    (upstream_headers, false)
+}
+
+/// Apply headroom's CTX request-side transforms to a routed model's parsed
+/// Anthropic body, reusing the same flags/state as the Claude passthrough path
+/// (`forward_http`). Runs the passive session capture (read-only) and, when
+/// `ctx_offload` is enabled, the tool_result offload — which both feeds
+/// `headroom ctx search` and shrinks the request. Mutates `parsed` in place.
+///
+/// Note: offload rewrites frozen history only on rebuild boundaries (the gate
+/// prevents cache thrash), exactly as the Claude path does.
+fn apply_ctx_request_transforms(
+    state: &AppState,
+    parsed: &mut Value,
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+) {
+    use crate::cache_stabilization::drift_detector::{
+        compute_structural_hash, derive_session_key, observe_drift, ApiKind,
+    };
+
+    let session_key = derive_session_key(headers, client_addr);
+
+    // Observe cache-prefix drift on the incoming body (before any transform),
+    // matching the Claude path's ordering. Runs unconditionally so the
+    // `cache_drift_observed` signal (which axis of system/tools/early_messages
+    // changed turn-to-turn) is available regardless of which CTX flags are on.
+    // A drift means the codex prompt-cache prefix moved this turn.
+    let hash = compute_structural_hash(parsed, ApiKind::Anthropic);
+    let rebuild_boundary = observe_drift(&state.drift_state, &session_key, hash).is_some();
+
+    // CTX-2: passive session capture. Read-only — clones the body onto a
+    // detached worker; never mutates and never blocks.
+    if let Some(observer) = state.ctx_observer.as_ref() {
+        observer.observe(parsed, &session_key);
+    }
+
+    // CTX-4: recall/resume injection. Runs BEFORE offload (matching the
+    // Claude path order). Cache-safe by construction — the engine decides
+    // once per conversation and replays the exact same bytes into the first
+    // user message on every later turn (nothing volatile), so the codex
+    // prompt-cache prefix stays byte-stable after the one-time introduction.
+    // It never touches `system`/`tools`.
+    if let Some(engine) = state.ctx_inject.as_ref() {
+        if engine.maybe_inject(parsed, &session_key) {
+            tracing::debug!(
+                event = "codex_ctx_inject",
+                "injected recall/resume block into routed-model request"
+            );
+        }
+    }
+
+    // CTX-3: tool_result offload. Feeds the FTS search store and shrinks the
+    // body. Gated on the same `ctx_offload` flag as the Claude path.
+    if let Some(runtime) = state.ctx_offload.as_ref() {
+        let policy = crate::compression::ctx_offload::OffloadPolicy {
+            gate: &runtime.gate,
+            session_key: &session_key,
+            rebuild_boundary,
+        };
+        let out = crate::compression::ctx_offload::offload_anthropic_request(
+            parsed,
+            &runtime.config,
+            Some(&policy),
+        );
+        if out.changed() {
+            tracing::debug!(
+                event = "codex_ctx_offload",
+                blocks_offloaded = out.blocks_offloaded,
+                blocks_deferred = out.blocks_deferred,
+                rebuild_boundary,
+                "offloaded tool_result blocks on routed-model request"
+            );
+            runtime.store.persist(out.records);
+        }
+    }
+}
+
+fn apply_target_model_override(
+    mut body: Value,
+    target_model: Option<&str>,
+    force_store_false: bool,
+    force_stream_true: bool,
+) -> Value {
+    if let Some(target) = target_model {
+        body["model"] = Value::String(target.to_string());
+    }
+    if force_store_false {
+        body["store"] = Value::Bool(false);
+    }
+    if force_stream_true {
+        body["stream"] = Value::Bool(true);
+    }
+    body
+}
+
+/// Handle GET `/v1/models` for Claude Code's gateway model-discovery feature
+/// (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`).
+///
+/// Claude Code reads `id`/`display_name` from `data[]` and drops any entry
+/// whose `id` doesn't start with `claude` or `anthropic`, so only exact-match
+/// routes (never `*`-suffixed prefix routes, which aren't a single
+/// selectable model) with a qualifying `model_prefix` are listed. Operators
+/// who want a routed model (MiMo, Codex, ...) to show up in `/model` name
+/// its route with a `claude-`/`anthropic-` prefix, e.g.
+/// `--extra-model-route "claude-mimo-v2.5=mimo:MiMo-V2.5"`.
+pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
+    fn discoverable(id: &str) -> bool {
+        id.starts_with("claude") || id.starts_with("anthropic")
+    }
+
+    let mut data: Vec<Value> = Vec::new();
+
+    if let Some(local_model) = &state.config.local_model {
+        if discoverable(local_model) {
+            data.push(json!({
+                "id": local_model,
+                "display_name": format!("{local_model} (headroom local model)"),
+            }));
+        }
+    }
+
+    for route in &state.config.model_routes {
+        if route.prefix_match || !discoverable(&route.model_prefix) {
+            continue;
+        }
+        let display_name = if let Some(mimo_model) = &route.mimo_run {
+            format!("{} (via mimo)", mimo_model)
+        } else if let Some(upstream) = &route.upstream {
+            format!("{} (via {})", route.model_prefix, upstream.authority())
+        } else {
+            route.model_prefix.clone()
+        };
+        data.push(json!({
+            "id": route.model_prefix,
+            "display_name": display_name,
+        }));
+    }
+
+    axum::Json(json!({ "data": data }))
 }
 
 /// Handle POST `/v1/messages` with local model routing.
@@ -43,7 +498,7 @@ pub async fn handle_messages(
     body: Bytes,
 ) -> Response {
     // Parse body to extract model name.
-    let parsed: Value = match serde_json::from_slice(&body) {
+    let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
             // Not JSON — can't be a model-routed request, delegate to forward_http.
@@ -61,12 +516,17 @@ pub async fn handle_messages(
     let body_model = parsed
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
+    let body_model = body_model.as_str();
 
     // Find a matching route: first check local_model (backward compat),
     // then check model_routes table.
     // Check for mimo_run route first (highest priority)
-    let mimo_run_model = state.config.model_routes.iter()
+    let mimo_run_model = state
+        .config
+        .model_routes
+        .iter()
         .find(|r| r.matches(body_model))
         .and_then(|r| r.mimo_run.clone());
 
@@ -78,7 +538,7 @@ pub async fn handle_messages(
         (&state.config.local_model, &state.config.local_upstream)
     {
         if body_model == model.as_str() {
-            Some((upstream.clone(), true))
+            Some((upstream.clone(), true, None))
         } else {
             None
         }
@@ -93,11 +553,11 @@ pub async fn handle_messages(
             .iter()
             .find(|r| r.matches(body_model))
             .filter(|r| r.mimo_run.is_none())
-            .and_then(|r| Some((r.upstream.clone()?, r.translate)))
+            .and_then(|r| Some((r.upstream.clone()?, r.translate, r.target_model.clone())))
     });
 
-    let (upstream, translate) = match matched {
-        Some((u, t)) => (u.clone(), t),
+    let (upstream, translate, target_model) = match matched {
+        Some((u, t, tm)) => (u.clone(), t, tm),
         None => {
             // No route matched — delegate to standard forwarder.
             let mut builder = Request::builder().method(method).uri(uri);
@@ -125,13 +585,12 @@ pub async fn handle_messages(
         }
     };
 
+    let (upstream_headers, is_chatgpt_auth) =
+        resolve_codex_routing_headers(&headers, state.config.codex_auth_file.as_deref());
+
     if !translate {
         // No translation needed — forward Anthropic format directly to the upstream.
-        let upstream_url = format!(
-            "{}{}",
-            upstream.as_str().trim_end_matches('/'),
-            uri.path()
-        );
+        let upstream_url = format!("{}{}", upstream.as_str().trim_end_matches('/'), uri.path());
         let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
         let full_url = format!("{upstream_url}{query}");
 
@@ -141,28 +600,6 @@ pub async fn handle_messages(
             upstream = %full_url,
             "routing to upstream without translation"
         );
-
-        let mut upstream_headers = HeaderMap::new();
-        upstream_headers.insert(
-            http::header::CONTENT_TYPE,
-            "application/json"
-                .parse()
-                .expect("valid header"),
-        );
-        // For OpenAI upstreams, use the Codex access token if available.
-        // For other upstreams, forward the original Authorization header.
-        let is_openai_upstream = upstream.host_str() == Some("api.openai.com");
-        if is_openai_upstream {
-            if let Some(ref auth_file) = state.config.codex_auth_file {
-                if let Some(token) = read_codex_access_token(auth_file) {
-                    if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
-                        upstream_headers.insert(http::header::AUTHORIZATION, val);
-                    }
-                }
-            }
-        } else if let Some(auth) = headers.get(http::header::AUTHORIZATION) {
-            upstream_headers.insert(http::header::AUTHORIZATION, auth.clone());
-        }
 
         let resp = match state
             .client
@@ -203,9 +640,24 @@ pub async fn handle_messages(
             .expect("static response");
     }
 
+    // Apply headroom's CTX request-side transforms (session capture +
+    // tool_result offload) so routed models get the same optimizations and
+    // searchable archive as the Claude passthrough path, gated on the same
+    // flags. Mutates `parsed` before translation.
+    apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr);
+
     // Translation path: Anthropic → OpenAI.
-    let openai_body = match anthropic_to_openai_request(&parsed) {
-        Ok(v) => v,
+    let openai_body = match if target_model.is_some() {
+        anthropic_to_openai_responses_request(&parsed, false)
+    } else {
+        anthropic_to_openai_request(&parsed, true, true)
+    } {
+        Ok(v) => apply_target_model_override(
+            v,
+            target_model.as_deref(),
+            target_model.is_some(),
+            target_model.is_some(),
+        ),
         Err(e) => {
             tracing::warn!(
                 event = "local_model_translate_error",
@@ -223,26 +675,33 @@ pub async fn handle_messages(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let upstream_is_stream = is_stream || target_model.is_some();
+    let downstream_is_stream = is_stream;
 
-    let upstream_url = format!(
-        "{}/v1/chat/completions",
-        upstream.as_str().trim_end_matches('/')
-    );
+    // Upstream may be configured either as the API root (e.g.
+    // `https://api.openai.com`) or already including `/v1` (e.g.
+    // `https://api.openai.com/v1`, per the --extra-model-route example in
+    // config.rs) — strip a trailing `/v1` so we don't double it up into
+    // `.../v1/v1/chat/completions`, which OpenAI 404s on.
+    let upstream_base = upstream.as_str().trim_end_matches('/');
+    let upstream_url = if target_model.is_some() {
+        if is_chatgpt_auth && upstream.host_str() == Some("api.openai.com") {
+            "https://chatgpt.com/backend-api/codex/responses".to_string()
+        } else {
+            let base = upstream_base.trim_end_matches("/v1");
+            format!("{base}/v1/responses")
+        }
+    } else {
+        let base = upstream_base.trim_end_matches("/v1");
+        format!("{base}/v1/chat/completions")
+    };
 
     tracing::info!(
         event = "model_route_translate",
         model = %body_model,
         upstream = %upstream_url,
-        stream = is_stream,
+        stream = upstream_is_stream,
         "routing to upstream with format translation"
-    );
-
-    let mut upstream_headers = HeaderMap::new();
-    upstream_headers.insert(
-        http::header::CONTENT_TYPE,
-        "application/json"
-            .parse()
-            .expect("valid header"),
     );
 
     let openai_body_bytes = match serde_json::to_vec(&openai_body) {
@@ -260,33 +719,138 @@ pub async fn handle_messages(
         }
     };
 
-    let upstream_resp = match state
-        .client
-        .post(&upstream_url)
-        .headers(upstream_headers)
-        .body(openai_body_bytes)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                event = "local_model_upstream_error",
-                error = %e,
-                upstream = %upstream_url,
-                "failed to connect to local model upstream"
-            );
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("local upstream error: {e}")))
-                .expect("static response");
+    let mut upstream_headers = upstream_headers;
+
+    // Session correlation headers and turn-state echo, mirroring the real
+    // Codex client (codex-api/src/requests/headers.rs, client.rs).
+    let session_key = parsed
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if is_chatgpt_auth {
+        if let Some(key) = &session_key {
+            let session_uuid = derive_session_uuid(key);
+            if let Ok(val) = http::HeaderValue::from_str(&session_uuid) {
+                upstream_headers.insert("session-id", val.clone());
+                upstream_headers.insert("thread-id", val);
+            }
+            let stored = turn_state_map()
+                .lock()
+                .ok()
+                .and_then(|m| m.get(key).cloned());
+            if let Some(ts) = stored {
+                if let Ok(val) = http::HeaderValue::from_str(&ts) {
+                    upstream_headers.insert("x-codex-turn-state", val);
+                }
+            }
+        }
+    }
+
+    // Send with retry: refresh the OAuth token once on 401, back off on
+    // 429/5xx/transport errors (honoring Retry-After), like the Codex CLI.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut refreshed = false;
+    let mut attempt: u32 = 0;
+    let upstream_resp = loop {
+        attempt += 1;
+        let result = state
+            .client
+            .post(&upstream_url)
+            .headers(upstream_headers.clone())
+            .body(openai_body_bytes.clone())
+            .send()
+            .await;
+
+        match result {
+            Ok(r) => {
+                let status = r.status();
+                if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed && is_chatgpt_auth {
+                    if let Some(auth_file) = state.config.codex_auth_file.as_deref() {
+                        if let Some(token) = refresh_codex_token(&state.client, auth_file).await {
+                            if let Ok(val) =
+                                http::HeaderValue::from_str(&format!("Bearer {token}"))
+                            {
+                                upstream_headers.insert(http::header::AUTHORIZATION, val);
+                            }
+                            refreshed = true;
+                            continue;
+                        }
+                    }
+                    break r;
+                }
+                if (status.as_u16() == 429 || status.is_server_error())
+                    && attempt < MAX_ATTEMPTS
+                {
+                    let retry_after = r
+                        .headers()
+                        .get(http::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let backoff = retry_after
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or_else(|| {
+                            std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1))
+                        });
+                    tracing::warn!(
+                        event = "local_model_upstream_retry",
+                        status = status.as_u16(),
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "retrying transient upstream error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                break r;
+            }
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    let backoff =
+                        std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1));
+                    tracing::warn!(
+                        event = "local_model_upstream_retry",
+                        error = %e,
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "retrying failed upstream connection"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                tracing::warn!(
+                    event = "local_model_upstream_error",
+                    error = %e,
+                    upstream = %upstream_url,
+                    "failed to connect to local model upstream"
+                );
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from(format!("local upstream error: {e}")))
+                    .expect("static response");
+            }
         }
     };
 
+    // Capture the turn-state token for sticky routing on follow-up requests.
+    if let Some(key) = &session_key {
+        if let Some(ts) = upstream_resp
+            .headers()
+            .get("x-codex-turn-state")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Ok(mut map) = turn_state_map().lock() {
+                map.insert(key.clone(), ts.to_string());
+            }
+        }
+    }
+
     let upstream_status = upstream_resp.status();
 
-    if is_stream {
+    if downstream_is_stream {
         handle_streaming_response(upstream_resp, &parsed).await
+    } else if target_model.is_some() {
+        handle_buffered_responses_response(upstream_resp, &parsed, upstream_status).await
     } else {
         handle_buffered_response(upstream_resp, &parsed, upstream_status).await
     }
@@ -296,7 +860,11 @@ pub async fn handle_messages(
 // Request translation: Anthropic → OpenAI
 // ---------------------------------------------------------------------------
 
-fn anthropic_to_openai_request(anthropic: &Value) -> Result<Value, String> {
+fn anthropic_to_openai_request(
+    anthropic: &Value,
+    include_max_output_tokens: bool,
+    include_tool_calls: bool,
+) -> Result<Value, String> {
     let model = anthropic
         .get("model")
         .and_then(|v| v.as_str())
@@ -336,7 +904,7 @@ fn anthropic_to_openai_request(anthropic: &Value) -> Result<Value, String> {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             match role {
                 "user" => translate_user_message(msg, &mut messages),
-                "assistant" => translate_assistant_message(msg, &mut messages),
+                "assistant" => translate_assistant_message(msg, &mut messages, include_tool_calls),
                 _ => {}
             }
         }
@@ -372,8 +940,12 @@ fn anthropic_to_openai_request(anthropic: &Value) -> Result<Value, String> {
         "stream": stream,
     });
 
-    if let Some(mt) = max_tokens {
-        openai["max_tokens"] = json!(mt);
+    if include_max_output_tokens {
+        if let Some(mt) = max_tokens {
+            // Chat Completions uses `max_tokens`; `max_output_tokens` is a
+            // Responses-API field and would be silently ignored here.
+            openai["max_tokens"] = json!(mt);
+        }
     }
     if let Some(t) = temperature {
         openai["temperature"] = t.clone();
@@ -385,6 +957,323 @@ fn anthropic_to_openai_request(anthropic: &Value) -> Result<Value, String> {
     }
 
     Ok(openai)
+}
+
+fn anthropic_to_openai_responses_request(
+    anthropic: &Value,
+    include_max_output_tokens: bool,
+) -> Result<Value, String> {
+    let model = anthropic
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or("missing model field")?;
+
+    let max_tokens = anthropic.get("max_tokens").and_then(|v| v.as_u64());
+    let stream = anthropic
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut input: Vec<Value> = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
+
+    if let Some(system) = anthropic.get("system") {
+        match system {
+            Value::String(s) => {
+                if !s.is_empty() {
+                    instructions.push(s.clone());
+                }
+            }
+            Value::Array(arr) => {
+                let text = arr
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    instructions.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(msgs) = anthropic.get("messages").and_then(|v| v.as_array()) {
+        for msg in msgs {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            match role {
+                "user" => translate_user_message_to_responses(msg, &mut input),
+                "assistant" => translate_assistant_message_to_responses(msg, &mut input),
+                "system" | "developer" => {
+                    let text = plain_message_text(msg);
+                    if !text.is_empty() {
+                        instructions.push(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Replay cached encrypted reasoning items ahead of their function calls,
+    // restoring the reasoning continuity the real Codex CLI maintains.
+    let session_key = anthropic
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|v| v.as_str());
+    let input = match session_key {
+        Some(key) => reinject_reasoning_items(key, input),
+        None => input,
+    };
+
+    // Responses API uses a flat tool shape, unlike Chat Completions where
+    // the fields are nested under `function`.
+    let tools = anthropic
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|anthropic_tools| {
+            anthropic_tools
+                .iter()
+                .filter_map(|tool| {
+                    let name = tool.get("name")?.as_str()?;
+                    let description = tool.get("description").and_then(|d| d.as_str());
+                    let input_schema = tool.get("input_schema");
+                    let default_schema = json!({});
+                    let mut params = input_schema.unwrap_or(&default_schema).clone();
+                    // Non-Claude models tend to fill every optional field.
+                    // Strip the Agent tool's `mode` so spawned subagents
+                    // inherit the session's permission mode instead of
+                    // getting an explicit override.
+                    if name == "Agent" {
+                        if let Some(props) = params
+                            .get_mut("properties")
+                            .and_then(|p| p.as_object_mut())
+                        {
+                            props.remove("mode");
+                        }
+                    }
+                    Some(json!({
+                        "type": "function",
+                        "name": name,
+                        "description": description.unwrap_or(""),
+                        "parameters": params
+                    }))
+                })
+                .collect::<Vec<_>>()
+        });
+
+    let mut openai = json!({
+        "model": model,
+        "input": input,
+        "stream": stream,
+    });
+
+    let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+    if let Some(tools) = tools {
+        if !tools.is_empty() {
+            openai["tools"] = json!(tools);
+        }
+    }
+    if let Some(tool_choice) = anthropic.get("tool_choice") {
+        let translated = match tool_choice.get("type").and_then(|t| t.as_str()) {
+            Some("auto") => Some(json!("auto")),
+            Some("any") => Some(json!("required")),
+            Some("none") => Some(json!("none")),
+            Some("tool") => tool_choice
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| json!({"type": "function", "name": n})),
+            _ => None,
+        };
+        if let Some(tc) = translated {
+            openai["tool_choice"] = tc;
+        }
+    }
+    // The Codex client always sends these explicitly rather than relying on
+    // server defaults (codex-api/src/common.rs: ResponsesApiRequest).
+    if has_tools && openai.get("tool_choice").is_none() {
+        openai["tool_choice"] = json!("auto");
+    }
+    openai["parallel_tool_calls"] = json!(false);
+    openai["include"] = json!(["reasoning.encrypted_content"]);
+    if !instructions.is_empty() {
+        openai["instructions"] = json!(instructions.join("\n\n"));
+    }
+    if include_max_output_tokens {
+        if let Some(mt) = max_tokens {
+            openai["max_output_tokens"] = json!(mt);
+        }
+    }
+    // Note: `temperature` is deliberately NOT forwarded — the Codex
+    // ResponsesApiRequest has no such field and the real CLI never sends it.
+    // Map Anthropic's thinking budget onto Responses reasoning effort so the
+    // client's thinking setting isn't silently upgraded to the backend default.
+    if let Some(thinking) = anthropic.get("thinking") {
+        if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
+            let effort = match thinking.get("budget_tokens").and_then(|v| v.as_u64()) {
+                Some(b) if b <= 4096 => "low",
+                Some(b) if b <= 16384 => "medium",
+                Some(_) => "high",
+                None => "medium",
+            };
+            // `summary: auto` + sequential delivery makes the backend stream
+            // reasoning summaries, which we translate into thinking blocks.
+            openai["reasoning"] = json!({"effort": effort, "summary": "auto"});
+            openai["stream_options"] =
+                json!({"reasoning_summary_delivery": "sequential_cutoff"});
+        }
+    }
+    // Stable per-session cache key enables upstream prompt caching; Claude
+    // Code's metadata.user_id includes the session id.
+    if let Some(user_id) = anthropic
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|v| v.as_str())
+    {
+        openai["prompt_cache_key"] = json!(user_id);
+    }
+
+    Ok(openai)
+}
+
+fn plain_message_text(msg: &Value) -> String {
+    match msg.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
+    let content = match msg.get("content") {
+        Some(Value::String(s)) => {
+            out.push(json!({"type": "message", "role": "user", "content": s}));
+            return;
+        }
+        Some(Value::Array(blocks)) => blocks,
+        Some(Value::Null) | None => {
+            out.push(json!({"type": "message", "role": "user", "content": ""}));
+            return;
+        }
+        Some(other) => {
+            out.push(json!({"type": "message", "role": "user", "content": other.to_string()}));
+            return;
+        }
+    };
+
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut emitted_message = false;
+    let mut emitted_tool_result = false;
+
+    for block in content {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                    text_parts.push(t.to_string());
+                }
+            }
+            Some("tool_result") => {
+                if !text_parts.is_empty() {
+                    out.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": text_parts.join("\n")
+                    }));
+                    text_parts.clear();
+                    emitted_message = true;
+                }
+                emitted_tool_result = true;
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let result_content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let is_error = block
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                out.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": if is_error { format!("Error: {result_content}") } else { result_content.to_string() }
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    if !text_parts.is_empty() || (!emitted_message && !emitted_tool_result) {
+        out.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": text_parts.join("\n")
+        }));
+    }
+}
+
+fn translate_assistant_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
+    let content = match msg.get("content") {
+        Some(Value::String(s)) => {
+            out.push(json!({"type": "message", "role": "assistant", "content": s}));
+            return;
+        }
+        Some(Value::Null) => {
+            out.push(json!({"type": "message", "role": "assistant", "content": ""}));
+            return;
+        }
+        Some(Value::Array(blocks)) => blocks,
+        _ => {
+            out.push(json!({"type": "message", "role": "assistant", "content": ""}));
+            return;
+        }
+    };
+
+    let mut text_parts: Vec<String> = Vec::new();
+
+    for block in content {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                    text_parts.push(t.to_string());
+                }
+            }
+            Some("tool_use") => {
+                if !text_parts.is_empty() {
+                    out.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": text_parts.join("\n")
+                    }));
+                    text_parts.clear();
+                }
+                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let default_input = json!({});
+                let input = block.get("input").unwrap_or(&default_input);
+                let arguments = serde_json::to_string(input).unwrap_or_default();
+                out.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": arguments
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    if !text_parts.is_empty() {
+        out.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": text_parts.join("\n")
+        }));
+    }
 }
 
 fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
@@ -408,10 +1297,7 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
                     .get("tool_use_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let result_content = block
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let result_content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let is_error = block
                     .get("is_error")
                     .and_then(|v| v.as_bool())
@@ -454,7 +1340,10 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
     for tr in tool_results {
         let tool_use_id = tr.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
         let result_content = tr.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let is_error = tr.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_error = tr
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         out.push(json!({
             "role": "tool",
             "tool_call_id": tool_use_id,
@@ -463,15 +1352,19 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
     }
 }
 
-fn translate_assistant_message(msg: &Value, out: &mut Vec<Value>) {
+fn translate_assistant_message(msg: &Value, out: &mut Vec<Value>, include_tool_calls: bool) {
     let content = match msg.get("content") {
         Some(Value::String(s)) => {
             out.push(json!({"role": "assistant", "content": s}));
             return;
         }
+        Some(Value::Null) => {
+            out.push(json!({"role": "assistant", "content": ""}));
+            return;
+        }
         Some(Value::Array(blocks)) => blocks,
         _ => {
-            out.push(json!({"role": "assistant", "content": null}));
+            out.push(json!({"role": "assistant", "content": ""}));
             return;
         }
     };
@@ -507,11 +1400,11 @@ fn translate_assistant_message(msg: &Value, out: &mut Vec<Value>) {
 
     let mut assistant_msg = json!({"role": "assistant"});
     if text_parts.is_empty() {
-        assistant_msg["content"] = json!(null);
+        assistant_msg["content"] = json!("");
     } else {
         assistant_msg["content"] = json!(text_parts.join("\n"));
     }
-    if !tool_calls.is_empty() {
+    if include_tool_calls && !tool_calls.is_empty() {
         assistant_msg["tool_calls"] = json!(tool_calls);
     }
 
@@ -527,8 +1420,7 @@ async fn handle_buffered_response(
     original: &Value,
     upstream_status: StatusCode,
 ) -> Response {
-    let status = StatusCode::from_u16(upstream_status.as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     if status != StatusCode::OK {
         let body_text = upstream_resp.text().await.unwrap_or_default();
@@ -582,6 +1474,152 @@ async fn handle_buffered_response(
                 event = "local_model_serialize_error",
                 error = %e,
                 "failed to serialize Anthropic response"
+            );
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("serialization error"))
+                .expect("static response");
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body_bytes))
+        .expect("static response")
+}
+
+async fn handle_buffered_responses_response(
+    upstream_resp: reqwest::Response,
+    original: &Value,
+    upstream_status: StatusCode,
+) -> Response {
+    let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    if status != StatusCode::OK {
+        let body_text = upstream_resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            event = "local_model_upstream_error",
+            status = status.as_u16(),
+            body = %body_text,
+            "local model upstream returned error"
+        );
+        return Response::builder()
+            .status(status)
+            .body(Body::from(body_text))
+            .expect("static response");
+    }
+
+    let responses_text = match upstream_resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                event = "local_model_response_parse_error",
+                error = %e,
+                "failed to read upstream responses stream"
+            );
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("failed to read upstream response"))
+                .expect("static response");
+        }
+    };
+
+    let mut current_event: Option<String> = None;
+    let mut current_data: Vec<String> = Vec::new();
+    let mut assistant_text = String::new();
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+
+    let mut flush_frame = |event_name: Option<&str>, data: &str| {
+        if data.trim().is_empty() {
+            return;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        match event_name {
+            Some("response.output_text.delta") | Some("output_text.delta") => {
+                if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
+                    assistant_text.push_str(delta);
+                }
+            }
+            Some("response.output_text.done") | Some("output_text.done") => {
+                if let Some(text) = chunk
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| chunk.get("delta").and_then(|v| v.as_str()))
+                {
+                    if assistant_text.is_empty() {
+                        assistant_text.push_str(text);
+                    }
+                }
+            }
+            Some("response.completed") => {
+                if let Some(usage) = chunk.get("response").and_then(|v| v.get("usage")) {
+                    if let Some(tokens) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                        input_tokens = tokens;
+                    }
+                    if let Some(tokens) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        output_tokens = tokens;
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+
+    for line in responses_text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            let data = current_data.join("\n");
+            flush_frame(current_event.as_deref(), &data);
+            current_event = None;
+            current_data.clear();
+            continue;
+        }
+
+        if let Some(event) = line.strip_prefix("event:") {
+            current_event = Some(event.trim().to_string());
+            continue;
+        }
+
+        if let Some(data) = line.strip_prefix("data:") {
+            current_data.push(data.trim_start().to_string());
+            continue;
+        }
+    }
+    let data = current_data.join("\n");
+    flush_frame(current_event.as_deref(), &data);
+
+    let model_name = original
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let anthropic_response = json!({
+        "type": "message",
+        "role": "assistant",
+        "model": model_name,
+        "content": [{
+            "type": "text",
+            "text": assistant_text
+        }],
+        "stop_reason": "end_turn",
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+
+    let body_bytes = match serde_json::to_vec(&anthropic_response) {
+        Ok(b) => Bytes::from(b),
+        Err(e) => {
+            tracing::warn!(
+                event = "local_model_serialize_error",
+                error = %e,
+                "failed to serialize Anthropic responses translation"
             );
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -746,7 +1784,11 @@ async fn handle_mimo_run(
         if let Ok(event) = serde_json::from_str::<Value>(line) {
             match event.get("type").and_then(|t| t.as_str()) {
                 Some("text") => {
-                    if let Some(text) = event.get("part").and_then(|p| p.get("text")).and_then(|t| t.as_str()) {
+                    if let Some(text) = event
+                        .get("part")
+                        .and_then(|p| p.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
                         text_parts.push(text.to_string());
                     }
                 }
@@ -875,8 +1917,7 @@ fn openai_to_anthropic_response(openai: &Value, original: &Value) -> Value {
                     .and_then(|f| f.get("arguments"))
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}");
-                let input: Value =
-                    serde_json::from_str(arguments).unwrap_or(json!({}));
+                let input: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
                 content.push(json!({
                     "type": "tool_use",
                     "id": id,
@@ -920,19 +1961,21 @@ fn openai_to_anthropic_response(openai: &Value, original: &Value) -> Value {
 // Streaming response translation: OpenAI SSE → Anthropic SSE
 // ---------------------------------------------------------------------------
 
-async fn handle_streaming_response(
-    upstream_resp: reqwest::Response,
-    original: &Value,
-) -> Response {
+async fn handle_streaming_response(upstream_resp: reqwest::Response, original: &Value) -> Response {
     let original_model = original
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
 
+    let session_key = original
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     let stream = upstream_resp.bytes_stream();
-    let translated_stream =
-        translate_openai_stream_to_anthropic(stream, original_model);
+    let translated_stream = translate_openai_stream_to_anthropic(stream, original_model, session_key);
 
     let body = axum::body::Body::from_stream(translated_stream);
 
@@ -955,6 +1998,11 @@ struct StreamTranslator {
     current_tool_id: String,
     current_tool_name: String,
     total_output_tokens: u64,
+    saw_tool_use: bool,
+    session_key: Option<String>,
+    /// Completed encrypted reasoning items awaiting their anchor (the next
+    /// function_call item in the stream).
+    pending_reasoning: Vec<Value>,
 }
 
 impl StreamTranslator {
@@ -969,14 +2017,27 @@ impl StreamTranslator {
             current_tool_id: String::new(),
             current_tool_name: String::new(),
             total_output_tokens: 0,
+            saw_tool_use: false,
+            session_key: None,
+            pending_reasoning: Vec::new(),
         }
     }
 
+    fn with_session_key(mut self, session_key: Option<String>) -> Self {
+        self.session_key = session_key;
+        self
+    }
+
+    #[cfg(test)]
     fn process_line(&mut self, line: &str) -> Vec<String> {
+        self.process_frame(None, line)
+    }
+
+    fn process_frame(&mut self, event_name: Option<&str>, data: &str) -> Vec<String> {
         let mut events = Vec::new();
 
-        if line.trim().is_empty() || line.trim() == "[DONE]" {
-            if line.trim() == "[DONE]"
+        if data.trim().is_empty() || data.trim() == "[DONE]" {
+            if data.trim() == "[DONE]"
                 && (self.in_text_block || self.in_tool_block || self.in_thinking_block)
             {
                 if self.in_thinking_block {
@@ -997,10 +2058,22 @@ impl StreamTranslator {
             return events;
         }
 
-        let chunk: Value = match serde_json::from_str(line) {
+        if let Some(name) = event_name {
+            if name.starts_with("response.") || name.starts_with("output_") {
+                return self.process_responses_frame(name, data);
+            }
+        }
+
+        let chunk: Value = match serde_json::from_str(data) {
             Ok(v) => v,
             Err(_) => return events,
         };
+
+        self.process_chat_chunk(chunk)
+    }
+
+    fn process_chat_chunk(&mut self, chunk: Value) -> Vec<String> {
+        let mut events = Vec::new();
 
         if !self.started {
             events.push(self.emit_message_start());
@@ -1021,9 +2094,7 @@ impl StreamTranslator {
             .and_then(|r| r.as_str());
 
         if let Some(usage) = chunk.get("usage") {
-            if let Some(tokens) =
-                usage.get("completion_tokens").and_then(|v| v.as_u64())
-            {
+            if let Some(tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
                 self.total_output_tokens = tokens;
             }
         }
@@ -1072,9 +2143,7 @@ impl StreamTranslator {
                 events.push(self.emit_text_delta(text));
             }
 
-            if let Some(tool_calls) =
-                delta.get("tool_calls").and_then(|v| v.as_array())
-            {
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tool_calls {
                     if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                         if self.in_thinking_block {
@@ -1150,6 +2219,259 @@ impl StreamTranslator {
             };
             events.push(self.emit_message_delta(stop_reason));
             events.push(self.emit_message_stop());
+        }
+
+        events
+    }
+
+    fn process_responses_frame(&mut self, event_name: &str, data: &str) -> Vec<String> {
+        let mut events = Vec::new();
+
+        let chunk: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return events,
+        };
+
+        if !self.started && event_name == "response.created" {
+            if let Some(model) = chunk
+                .get("response")
+                .and_then(|resp| resp.get("model"))
+                .and_then(|v| v.as_str())
+            {
+                self.model = model.to_string();
+            }
+        }
+
+        if !self.started {
+            events.push(self.emit_message_start());
+            self.started = true;
+        }
+
+        match event_name {
+            "response.output_text.delta" | "output_text.delta" => {
+                let delta = chunk.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                if !delta.is_empty() {
+                    if !self.in_text_block && !self.in_tool_block {
+                        if self.in_thinking_block {
+                            events.push(self.emit_content_block_stop());
+                            self.in_thinking_block = false;
+                            self.content_block_index += 1;
+                        }
+                        events.push(self.emit_content_block_start_text());
+                        self.in_text_block = true;
+                    }
+                    events.push(self.emit_text_delta(delta));
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
+                    if !delta.is_empty() {
+                        if !self.in_thinking_block {
+                            if self.in_text_block {
+                                events.push(self.emit_content_block_stop());
+                                self.in_text_block = false;
+                                self.content_block_index += 1;
+                            }
+                            if self.in_tool_block {
+                                events.push(self.emit_content_block_stop());
+                                self.in_tool_block = false;
+                                self.content_block_index += 1;
+                            }
+                            events.push(self.emit_content_block_start_thinking());
+                            self.in_thinking_block = true;
+                        }
+                        events.push(self.emit_thinking_delta(delta));
+                    }
+                }
+            }
+            "response.reasoning_summary_part.added" => {
+                // Part boundary: close the current thinking block so the next
+                // summary part starts a fresh one.
+                if self.in_thinking_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_thinking_block = false;
+                    self.content_block_index += 1;
+                }
+            }
+            "response.output_item.added" => {
+                let item = chunk.get("item");
+                let item_type = item
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str());
+                if item_type == Some("function_call") {
+                    if self.in_thinking_block {
+                        events.push(self.emit_content_block_stop());
+                        self.in_thinking_block = false;
+                        self.content_block_index += 1;
+                    }
+                    if self.in_text_block {
+                        events.push(self.emit_content_block_stop());
+                        self.in_text_block = false;
+                        self.content_block_index += 1;
+                    }
+                    if self.in_tool_block {
+                        events.push(self.emit_content_block_stop());
+                        self.in_tool_block = false;
+                        self.content_block_index += 1;
+                    }
+                    // `call_id` is what must round-trip back as
+                    // function_call_output; fall back to `id` if absent.
+                    self.current_tool_id = item
+                        .and_then(|i| i.get("call_id").or_else(|| i.get("id")))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.current_tool_name = item
+                        .and_then(|i| i.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    events.push(self.emit_content_block_start_tool(
+                        &self.current_tool_id.clone(),
+                        &self.current_tool_name.clone(),
+                    ));
+                    self.in_tool_block = true;
+                    self.saw_tool_use = true;
+
+                    // Anchor any reasoning items that streamed just before
+                    // this call so they can be replayed on the next turn.
+                    if !self.pending_reasoning.is_empty() {
+                        if let Some(key) = &self.session_key {
+                            store_reasoning_items(
+                                key,
+                                &self.current_tool_id.clone(),
+                                std::mem::take(&mut self.pending_reasoning),
+                            );
+                        } else {
+                            self.pending_reasoning.clear();
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if self.in_tool_block {
+                    if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
+                        if !delta.is_empty() {
+                            events.push(self.emit_input_json_delta(delta));
+                        }
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                let item_type = chunk
+                    .get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str());
+                if item_type == Some("function_call") && self.in_tool_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_tool_block = false;
+                    self.content_block_index += 1;
+                }
+                // Buffer completed encrypted reasoning items until the next
+                // function_call anchors them (they always precede it).
+                if item_type == Some("reasoning") {
+                    if let Some(item) = chunk.get("item") {
+                        if item
+                            .get("encrypted_content")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.is_empty())
+                        {
+                            self.pending_reasoning.push(item.clone());
+                        }
+                    }
+                }
+            }
+            "response.completed" => {
+                if let Some(usage) = chunk.get("response").and_then(|v| v.get("usage")) {
+                    if let Some(tokens) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        self.total_output_tokens = tokens;
+                    }
+                    // Ground-truth cache effectiveness: how many input tokens
+                    // the codex backend served from its prompt cache this turn.
+                    let input_tokens =
+                        usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cached = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let hit_pct = if input_tokens > 0 {
+                        (cached as f64 / input_tokens as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    tracing::debug!(
+                        event = "codex_cache_usage",
+                        input_tokens,
+                        cached_tokens = cached,
+                        fresh_tokens = input_tokens.saturating_sub(cached),
+                        cache_hit_pct = format!("{hit_pct:.1}"),
+                        "codex prompt-cache effectiveness for this turn"
+                    );
+                }
+                if self.in_thinking_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_thinking_block = false;
+                }
+                if self.in_text_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_text_block = false;
+                }
+                if self.in_tool_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_tool_block = false;
+                }
+                let stop_reason = if self.saw_tool_use {
+                    "tool_use"
+                } else {
+                    "end_turn"
+                };
+                events.push(self.emit_message_delta(stop_reason));
+                events.push(self.emit_message_stop());
+            }
+            "response.failed" => {
+                if self.in_thinking_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_thinking_block = false;
+                }
+                if self.in_text_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_text_block = false;
+                }
+                if self.in_tool_block {
+                    events.push(self.emit_content_block_stop());
+                    self.in_tool_block = false;
+                }
+            }
+            "response.incomplete" => {
+                if let Some(reason) = chunk
+                    .get("response")
+                    .and_then(|v| v.get("incomplete_details"))
+                    .and_then(|v| v.get("reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    self.total_output_tokens = self.total_output_tokens.max(0);
+                    if self.in_thinking_block {
+                        events.push(self.emit_content_block_stop());
+                        self.in_thinking_block = false;
+                    }
+                    if self.in_text_block {
+                        events.push(self.emit_content_block_stop());
+                        self.in_text_block = false;
+                    }
+                    if self.in_tool_block {
+                        events.push(self.emit_content_block_stop());
+                        self.in_tool_block = false;
+                    }
+                    let stop_reason = match reason {
+                        "max_output_tokens" => "max_tokens",
+                        _ => "end_turn",
+                    };
+                    events.push(self.emit_message_delta(stop_reason));
+                    events.push(self.emit_message_stop());
+                }
+            }
+            _ => {}
         }
 
         events
@@ -1251,14 +2573,16 @@ impl StreamTranslator {
 }
 
 fn translate_openai_stream_to_anthropic(
-    stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-        + Unpin,
+    stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
+    session_key: Option<String>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::StreamExt;
 
-    let mut translator = StreamTranslator::new(model);
+    let mut translator = StreamTranslator::new(model).with_session_key(session_key);
     let mut buffer = String::new();
+    let mut current_event: Option<String> = None;
+    let mut current_data: Vec<String> = Vec::new();
 
     stream.filter_map(move |chunk| {
         let translated = match chunk {
@@ -1268,14 +2592,28 @@ fn translate_openai_stream_to_anthropic(
 
                 let mut output = Vec::new();
                 while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim().to_string();
+                    let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
                     buffer = buffer[newline_pos + 1..].to_string();
 
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        let events = translator.process_line(data);
+                    if line.is_empty() {
+                        let data = current_data.join("\n");
+                        let events = translator.process_frame(current_event.as_deref(), &data);
                         for event in events {
                             output.extend_from_slice(event.as_bytes());
                         }
+                        current_event = None;
+                        current_data.clear();
+                        continue;
+                    }
+
+                    if let Some(event) = line.strip_prefix("event:") {
+                        current_event = Some(event.trim().to_string());
+                        continue;
+                    }
+
+                    if let Some(data) = line.strip_prefix("data:") {
+                        current_data.push(data.trim_start().to_string());
+                        continue;
                     }
                 }
 
@@ -1301,7 +2639,435 @@ fn translate_openai_stream_to_anthropic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;
+
+    #[test]
+    fn apply_target_model_override_rewrites_model() {
+        let body = json!({"model": "claude-codex-5.5", "input": "hi"});
+        let output = apply_target_model_override(body, Some("gpt-5.5"), false, false);
+        assert_eq!(output["model"], "gpt-5.5");
+        assert_eq!(output["input"], "hi");
+    }
+
+    #[test]
+    fn apply_target_model_override_leaves_model_when_absent() {
+        let body = json!({"model": "claude-codex-5.5", "input": "hi"});
+        let output = apply_target_model_override(body, None, false, false);
+        assert_eq!(output["model"], "claude-codex-5.5");
+        assert_eq!(output["input"], "hi");
+    }
+
+    #[test]
+    fn apply_target_model_override_forces_store_false_when_requested() {
+        let body = json!({"model": "claude-codex-5.5", "input": "hi", "store": true});
+        let output = apply_target_model_override(body, Some("gpt-5.5"), true, false);
+        assert_eq!(output["model"], "gpt-5.5");
+        assert_eq!(output["store"], false);
+    }
+
+    #[test]
+    fn apply_target_model_override_forces_stream_true_when_requested() {
+        let body = json!({"model": "claude-codex-5.5", "input": "hi", "stream": false});
+        let output = apply_target_model_override(body, Some("gpt-5.5"), false, true);
+        assert_eq!(output["stream"], true);
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_serializes_tool_turns() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "stream": false,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "ls"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "file1\nfile2"}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        assert_eq!(output["instructions"], "You are helpful.");
+        assert_eq!(output["input"][0]["type"], "message");
+        assert_eq!(output["input"][0]["role"], "user");
+        assert_eq!(output["input"][1]["type"], "function_call");
+        assert_eq!(output["input"][1]["call_id"], "call_1");
+        assert_eq!(output["input"][1]["name"], "bash");
+        assert_eq!(output["input"][2]["type"], "function_call_output");
+        assert_eq!(output["input"][2]["call_id"], "call_1");
+        assert_eq!(output["input"][2]["output"], "file1\nfile2");
+        assert_eq!(output["max_output_tokens"], 100);
+        assert!(!output["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["role"] == "tool"));
+        assert!(!output["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["role"] == "system"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_forwards_tools() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "max_tokens": 100,
+            "stream": false,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [
+                {"name": "Bash", "description": "Run a command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}},
+                {"name": "Read", "input_schema": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "auto"}
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        let tools = output["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "Bash");
+        assert_eq!(tools[0]["description"], "Run a command");
+        assert_eq!(
+            tools[0]["parameters"]["properties"]["command"]["type"],
+            "string"
+        );
+        // Flat Responses-API shape, not nested under `function`.
+        assert!(tools[0].get("function").is_none());
+        assert_eq!(tools[1]["name"], "Read");
+        assert_eq!(output["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_sends_codex_defaults() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}]
+        });
+        let output = anthropic_to_openai_responses_request(&input, false).unwrap();
+        assert_eq!(output["tool_choice"], "auto");
+        assert_eq!(output["parallel_tool_calls"], false);
+        assert_eq!(output["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn stream_translator_translates_reasoning_summary_to_thinking() {
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        let mut all = String::new();
+        for (event, data) in [
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"delta":"Consider the"}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"delta":" edge cases"}"#,
+            ),
+            ("response.reasoning_summary_part.added", r#"{}"#),
+            ("response.output_text.delta", r#"{"delta":"Answer"}"#),
+            (
+                "response.completed",
+                r#"{"response":{"usage":{"output_tokens":5}}}"#,
+            ),
+        ] {
+            for e in t.process_frame(Some(event), data) {
+                all.push_str(&e);
+            }
+        }
+        assert!(all.contains(r#""type":"thinking","thinking":"""#));
+        assert!(all.contains(r#""thinking":"Consider the""#));
+        assert!(all.contains(r#""text":"Answer""#));
+        assert!(all.contains(r#""stop_reason":"end_turn""#));
+    }
+
+    #[test]
+    fn reasoning_items_round_trip_through_cache() {
+        let session = "test-reasoning-session";
+        let mut t =
+            StreamTranslator::new("claude-codex-5.6".to_string()).with_session_key(Some(session.to_string()));
+        for (event, data) in [
+            (
+                "response.output_item.done",
+                r#"{"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENC_BLOB"}}"#,
+            ),
+            (
+                "response.output_item.added",
+                r#"{"item":{"type":"function_call","call_id":"call_r1","name":"Bash","arguments":""}}"#,
+            ),
+        ] {
+            t.process_frame(Some(event), data);
+        }
+
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": [{"type":"input_text","text":"hi"}]}),
+            json!({"type": "function_call", "call_id": "call_r1", "name": "Bash", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call_r1", "output": "ok"}),
+        ];
+        let out = reinject_reasoning_items(session, input);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1]["type"], "reasoning");
+        assert_eq!(out[1]["encrypted_content"], "ENC_BLOB");
+        assert_eq!(out[2]["type"], "function_call");
+
+        // Unknown session leaves input untouched.
+        let untouched = reinject_reasoning_items(
+            "other-session",
+            vec![json!({"type": "function_call", "call_id": "call_r1"})],
+        );
+        assert_eq!(untouched.len(), 1);
+    }
+
+    #[test]
+    fn injected_recall_block_keeps_front_position_through_translation() {
+        // Mimics what the inject engine produces: a recall text block
+        // prepended to the first user message. It must stay at the very
+        // front of the translated Responses input so the codex prompt-cache
+        // prefix is byte-stable across turns.
+        let parsed = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<<<RECALL>>> prior context digest"},
+                    {"type": "text", "text": "build a parser"}
+                ]
+            }]
+        });
+        let out = anthropic_to_openai_responses_request(&parsed, false).unwrap();
+        let first = &out["input"][0];
+        assert_eq!(first["type"], "message");
+        assert_eq!(first["role"], "user");
+        let text = serde_json::to_string(&first["content"]).unwrap();
+        let recall_pos = text.find("<<<RECALL>>>").expect("recall block present");
+        let query_pos = text.find("build a parser").expect("query present");
+        assert!(recall_pos < query_pos, "recall must precede the user query");
+    }
+
+    #[test]
+    fn offload_transform_shrinks_large_tool_result_before_translation() {
+        // A large tool_result should be offloaded to a digest, and the
+        // digest must survive translation into the Responses input.
+        let big = "X".repeat(80_000);
+        let mut parsed = json!({
+            "model": "claude-codex-5.6",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_big", "name": "Bash", "input": {"command": "cat huge.log"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_big", "content": big.clone()}
+                ]},
+                {"role": "user", "content": "done?"}
+            ]
+        });
+        let cfg = crate::compression::ctx_offload::CtxOffloadConfig { min_bytes: 50_000 };
+        let out = crate::compression::ctx_offload::offload_anthropic_request(&mut parsed, &cfg, None);
+        assert!(out.changed(), "expected a large tool_result to offload");
+        let translated = anthropic_to_openai_responses_request(&parsed, false).unwrap();
+        let serialized = serde_json::to_string(&translated).unwrap();
+        assert!(!serialized.contains(&big), "raw payload must not survive");
+        assert!(serialized.contains("headroom ctx get"), "digest pointer expected");
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_drops_temperature() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "temperature": 1.0,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let output = anthropic_to_openai_responses_request(&input, false).unwrap();
+        assert!(output.get("temperature").is_none());
+    }
+
+    #[test]
+    fn codex_user_agent_matches_cli_format() {
+        let ua = codex_user_agent(None);
+        assert!(ua.starts_with("codex_cli_rs/"));
+        assert!(ua.contains('('));
+        let tp = generate_traceparent();
+        assert_eq!(tp.len(), 55);
+        assert!(tp.starts_with("00-"));
+        assert!(tp.ends_with("-01"));
+    }
+
+    #[test]
+    fn derive_session_uuid_is_stable_and_uuid_shaped() {
+        let a = derive_session_uuid("user_abc_session_123");
+        let b = derive_session_uuid("user_abc_session_123");
+        let c = derive_session_uuid("user_abc_session_456");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 36);
+        assert_eq!(a.chars().filter(|&ch| ch == '-').count(), 4);
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_maps_thinking_and_cache_key() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "metadata": {"user_id": "user_abc_session_123"}
+        });
+        let output = anthropic_to_openai_responses_request(&input, false).unwrap();
+        assert_eq!(output["reasoning"]["effort"], "medium");
+        assert_eq!(output["prompt_cache_key"], "user_abc_session_123");
+
+        let low = json!({
+            "model": "m", "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        });
+        let output = anthropic_to_openai_responses_request(&low, false).unwrap();
+        assert_eq!(output["reasoning"]["effort"], "low");
+
+        let high = json!({
+            "model": "m", "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 32000}
+        });
+        let output = anthropic_to_openai_responses_request(&high, false).unwrap();
+        assert_eq!(output["reasoning"]["effort"], "high");
+
+        let disabled = json!({
+            "model": "m", "messages": [],
+            "thinking": {"type": "disabled"}
+        });
+        let output = anthropic_to_openai_responses_request(&disabled, false).unwrap();
+        assert!(output.get("reasoning").is_none());
+        assert!(output.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_strips_agent_mode_param() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{
+                "name": "Agent",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["default", "plan"]}
+                    },
+                    "required": ["prompt"]
+                }
+            }]
+        });
+        let output = anthropic_to_openai_responses_request(&input, false).unwrap();
+        let props = &output["tools"][0]["parameters"]["properties"];
+        assert!(props.get("mode").is_none());
+        assert!(props.get("prompt").is_some());
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_translates_forced_tool_choice() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "Bash"}
+        });
+        let output = anthropic_to_openai_responses_request(&input, false).unwrap();
+        assert_eq!(output["tool_choice"]["type"], "function");
+        assert_eq!(output["tool_choice"]["name"], "Bash");
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_omits_tools_when_absent() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let output = anthropic_to_openai_responses_request(&input, false).unwrap();
+        assert!(output.get("tools").is_none());
+        assert!(output.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn stream_translator_translates_responses_function_call_frames() {
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        let mut all = String::new();
+        for (event, data) in [
+            ("response.created", r#"{"response":{"model":"gpt-5.6-terra"}}"#),
+            (
+                "response.output_item.added",
+                r#"{"item":{"type":"function_call","call_id":"call_1","name":"Bash","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"delta":"{\"command\":"}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"delta":"\"ls\"}"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"item":{"type":"function_call","call_id":"call_1","name":"Bash"}}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"response":{"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            ),
+        ] {
+            for e in t.process_frame(Some(event), data) {
+                all.push_str(&e);
+            }
+        }
+        assert!(all.contains(r#""type":"tool_use","id":"call_1","name":"Bash""#));
+        assert!(all.contains(r#""type":"input_json_delta""#));
+        assert!(all.contains(r#"\"command\":"#));
+        assert!(all.contains(r#""stop_reason":"tool_use""#));
+        assert!(all.contains("message_stop"));
+    }
+
+    #[test]
+    fn resolve_codex_routing_headers_detects_chatgpt_jwt_auth() {
+        let payload = json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        });
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let auth_file = temp_dir.path().join("auth.json");
+        std::fs::write(
+            &auth_file,
+            json!({
+                "tokens": {
+                    "access_token": token,
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let headers = HeaderMap::new();
+        let (upstream_headers, is_chatgpt_auth) =
+            resolve_codex_routing_headers(&headers, auth_file.to_str());
+
+        assert!(is_chatgpt_auth);
+        assert_eq!(
+            upstream_headers.get(http::header::AUTHORIZATION),
+            Some(&HeaderValue::from_str(&format!("Bearer {}", token)).unwrap())
+        );
+        assert_eq!(
+            upstream_headers
+                .get("ChatGPT-Account-ID")
+                .and_then(|v| v.to_str().ok()),
+            Some("acct-from-jwt")
+        );
+    }
 
     #[test]
     fn anthropic_to_openai_simple_text() {
@@ -1314,13 +3080,50 @@ mod tests {
                 {"role": "user", "content": "Hello"}
             ]
         });
-        let output = anthropic_to_openai_request(&input).unwrap();
+        let output = anthropic_to_openai_request(&input, true, true).unwrap();
         assert_eq!(output["messages"][0]["role"], "system");
         assert_eq!(output["messages"][0]["content"], "You are helpful.");
         assert_eq!(output["messages"][1]["role"], "user");
         assert_eq!(output["messages"][1]["content"], "Hello");
         assert_eq!(output["max_tokens"], 1024);
+        assert!(output.get("max_output_tokens").is_none());
         assert_eq!(output["stream"], false);
+    }
+
+    #[test]
+    fn anthropic_to_openai_codex_route_omits_max_output_tokens() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 1024,
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+        let output = anthropic_to_openai_request(&input, false, false).unwrap();
+        assert!(output.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_openai_codex_route_strips_tool_calls() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "ls"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "file1\nfile2"}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_request(&input, false, false).unwrap();
+        assert_eq!(output["messages"][1]["role"], "assistant");
+        assert_eq!(output["messages"][1]["content"], "");
+        assert!(output["messages"][1].get("tool_calls").is_none());
+        assert_eq!(output["messages"][2]["role"], "tool");
+        assert_eq!(output["messages"][2]["tool_call_id"], "call_1");
     }
 
     #[test]
@@ -1341,7 +3144,7 @@ mod tests {
                 {"name": "bash", "description": "Run bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}
             ]
         });
-        let output = anthropic_to_openai_request(&input).unwrap();
+        let output = anthropic_to_openai_request(&input, true, true).unwrap();
         let assistant = &output["messages"][1];
         assert_eq!(assistant["role"], "assistant");
         assert!(assistant["tool_calls"].is_array());
@@ -1350,6 +3153,42 @@ mod tests {
         assert_eq!(tool_msg["role"], "tool");
         assert_eq!(tool_msg["tool_call_id"], "call_1");
         assert_eq!(tool_msg["content"], "file1\nfile2");
+    }
+
+    #[test]
+    fn anthropic_to_openai_assistant_empty_content_uses_empty_string() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": null}
+            ]
+        });
+        let output = anthropic_to_openai_request(&input, true, true).unwrap();
+        assert_eq!(output["messages"][1]["role"], "assistant");
+        assert_eq!(output["messages"][1]["content"], "");
+        assert!(output["messages"][1].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_openai_assistant_tool_calls_with_null_content_uses_empty_string() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "ls"}}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_request(&input, true, true).unwrap();
+        assert_eq!(output["messages"][1]["role"], "assistant");
+        assert_eq!(output["messages"][1]["content"], "");
+        assert!(output["messages"][1]["tool_calls"].is_array());
+        assert_eq!(
+            output["messages"][1]["tool_calls"][0]["function"]["name"],
+            "bash"
+        );
     }
 
     #[test]
@@ -1404,11 +3243,9 @@ mod tests {
         let mut translator = StreamTranslator::new("test-model".to_string());
 
         let chunk1 = r#"{"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#;
-        let chunk2 =
-            r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
+        let chunk2 = r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
         let chunk3 = r#"{"choices":[{"delta":{"content":" world"},"finish_reason":null}]}"#;
-        let chunk4 =
-            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+        let chunk4 = r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
 
         let mut all_events = Vec::new();
         all_events.extend(translator.process_line(chunk1));
@@ -1435,8 +3272,7 @@ mod tests {
         let chunk2 = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#;
         let chunk3 = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"co"}}]},"finish_reason":null}]}"#;
         let chunk4 = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mmand\"}"}}]},"finish_reason":null}]}"#;
-        let chunk5 =
-            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let chunk5 = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
 
         let mut all_events = Vec::new();
         all_events.extend(translator.process_line(chunk1));
