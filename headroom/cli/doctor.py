@@ -22,6 +22,7 @@ from typing import Any
 
 import click
 
+from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
 from headroom.install.paths import claude_settings_path, codex_config_path
 from headroom.install.state import list_manifests
@@ -97,7 +98,7 @@ def check_proxy_liveness(livez: dict[str, Any] | None, base_url: str) -> CheckRe
     return CheckResult(
         name="proxy",
         status=PASS,
-        summary=f"running at {base_url} ({uptime_text}, v{version})",
+        summary=f"running at {base_url} ({uptime_text}, {format_version_label(version)})",
     )
 
 
@@ -112,14 +113,26 @@ def check_version_drift(livez: dict[str, Any] | None, installed: str) -> CheckRe
             status=WARN,
             summary=f"cannot compare versions (proxy {running}, installed {installed})",
         )
-    if running != installed:
+    running_release = normalize_release_version(running)
+    installed_release = normalize_release_version(installed)
+    if running_release is None or installed_release is None:
+        return CheckResult(
+            name="version",
+            status=SKIP,
+            summary=f"source/non-release version label (proxy {running}, installed {installed})",
+        )
+    if running_release != installed_release:
         return CheckResult(
             name="version",
             status=WARN,
             summary=f"version drift: proxy {running}, installed {installed}",
             hint="restart the proxy to pick up new code: headroom proxy",
         )
-    return CheckResult(name="version", status=PASS, summary=f"proxy matches installed v{installed}")
+    return CheckResult(
+        name="version",
+        status=PASS,
+        summary=f"proxy matches installed {format_version_label(installed)}",
+    )
 
 
 def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
@@ -398,7 +411,9 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     from rich.table import Table
 
     console = Console()
-    console.print(f"[bold]Headroom Doctor[/bold] [dim]v{installed} · port {port}[/dim]\n")
+    console.print(
+        f"[bold]Headroom Doctor[/bold] [dim]{format_version_label(installed)} · port {port}[/dim]\n"
+    )
     table = Table(show_header=True, header_style="bold")
     table.add_column("check")
     table.add_column("status")

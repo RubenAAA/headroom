@@ -30,13 +30,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from headroom.pipeline import PipelineStage
-from headroom.proxy.helpers import (
+from headroom.proxy.body_forwarding import (
     BodyMutationTracker,
-    append_text_to_latest_user_chat_message,
+    OutboundBody,
     get_python_forwarder_mode,
-    log_outbound_request,
     prepare_outbound_body_bytes,
+    select_outbound_body,
     serialize_body_canonical,
+)
+from headroom.proxy.helpers import (
+    _reset_session_beta_tracker_for_test,
+    append_text_to_latest_user_chat_message,
+    get_session_beta_tracker,
+    log_outbound_request,
 )
 from headroom.proxy.server import ProxyConfig, create_app
 
@@ -125,6 +131,26 @@ def test_prepare_outbound_unmutated_returns_passthrough_bytes() -> None:
     )
     assert out == original
     assert source == "passthrough"
+
+
+def test_select_outbound_body_returns_value_object() -> None:
+    original = b'{"a":1}'
+    outbound = select_outbound_body(
+        body={"a": 1},
+        original_body_bytes=original,
+        body_mutated=False,
+        forwarder_mode="byte_faithful",
+    )
+    assert outbound == OutboundBody(content=original, source="passthrough")
+
+
+def test_helpers_preserve_body_forwarding_compatibility_exports() -> None:
+    from headroom.proxy import helpers
+
+    assert helpers.BodyMutationTracker is BodyMutationTracker
+    assert helpers.get_python_forwarder_mode is get_python_forwarder_mode
+    assert helpers.prepare_outbound_body_bytes is prepare_outbound_body_bytes
+    assert helpers.serialize_body_canonical is serialize_body_canonical
 
 
 def test_prepare_outbound_mutated_uses_canonical() -> None:
@@ -928,15 +954,17 @@ class _StreamingCapturingTransport(httpx.AsyncBaseTransport):
         self.captured_body = body
         self.captured_headers = dict(request.headers.items())
 
-        async def _empty_sse():  # pragma: no cover - generator
-            yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n'
-            yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
-
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=httpx.AsyncByteStream(_empty_sse()),  # type: ignore[arg-type]
+            stream=_SSEByteStream(),
         )
+
+
+class _SSEByteStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n'
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
 def test_streaming_forwarder_byte_faithful() -> None:
@@ -990,6 +1018,147 @@ def test_streaming_forwarder_byte_faithful() -> None:
         f"Streaming byte-faithfulness broken: inbound {inbound_sha} vs "
         f"upstream {upstream_sha}; upstream={upstream!r}"
     )
+
+
+def test_vertex_stream_rawpredict_preserves_client_beta_header_on_passthrough() -> None:
+    _reset_session_beta_tracker_for_test()
+    try:
+        client, transport = _make_anthropic_app(optimize=False)
+        get_session_beta_tracker().record_and_get_sticky_betas(
+            provider="anthropic",
+            session_id="s1",
+            client_value="sticky-beta-2024-01-01",
+        )
+
+        inbound_bytes = (
+            b'{"model":"claude-sonnet-4-6","stream":true,'
+            b'"messages":[{"role":"user","content":"hi"}]}'
+        )
+        client_beta = "claude-code-20250219"
+
+        with client.stream(
+            "POST",
+            "/projects/p/locations/us-central1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:streamRawPredict",
+            headers={
+                "x-api-key": "test-key",
+                "x-headroom-session-id": "vertex-stream-beta-1",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": client_beta,
+                "content-type": "application/json",
+            },
+            content=inbound_bytes,
+        ) as resp:
+            response_body = b"".join(resp.iter_bytes())
+            assert resp.status_code == 200, response_body
+
+        assert transport.captured_body == inbound_bytes
+        assert transport.captured_headers is not None
+        captured_headers = {key.lower(): value for key, value in transport.captured_headers.items()}
+        assert captured_headers["anthropic-beta"] == client_beta
+    finally:
+        _reset_session_beta_tracker_for_test()
+
+
+def test_messages_custom_upstream_stream_preserves_client_beta_header() -> None:
+    _reset_session_beta_tracker_for_test()
+    old_anthropic_url = None
+    try:
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+        app = create_app(config)
+        proxy = app.state.proxy
+        old_anthropic_url = type(proxy).ANTHROPIC_API_URL
+        type(proxy).ANTHROPIC_API_URL = "https://custom.example"
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "custom-stream-beta-1"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        transport = _StreamingCapturingTransport()
+        proxy.http_client = httpx.AsyncClient(transport=transport)
+        client = TestClient(app)
+
+        get_session_beta_tracker().record_and_get_sticky_betas(
+            provider="anthropic",
+            session_id="custom-stream-beta-1",
+            client_value="sticky-beta-2024-01-01",
+        )
+
+        inbound_bytes = (
+            b'{"model":"claude-sonnet-4-6","max_tokens":16,"stream":true,'
+            b'"messages":[{"role":"user","content":"hi"}]}'
+        )
+        client_beta = "claude-code-20250219"
+
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "x-headroom-session-id": "custom-stream-beta-1",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": client_beta,
+                "content-type": "application/json",
+            },
+            content=inbound_bytes,
+        ) as resp:
+            response_body = b"".join(resp.iter_bytes())
+            assert resp.status_code == 200, response_body
+
+        assert transport.captured_body == inbound_bytes
+        assert transport.captured_headers is not None
+        captured_headers = {key.lower(): value for key, value in transport.captured_headers.items()}
+        assert captured_headers["anthropic-beta"] == client_beta
+    finally:
+        if old_anthropic_url is not None:
+            type(proxy).ANTHROPIC_API_URL = old_anthropic_url
+        _reset_session_beta_tracker_for_test()
+
+
+def test_vertex_rawpredict_keeps_sticky_beta_union_on_non_stream_passthrough() -> None:
+    _reset_session_beta_tracker_for_test()
+    try:
+        client, transport = _make_anthropic_app(optimize=False)
+        get_session_beta_tracker().record_and_get_sticky_betas(
+            provider="anthropic",
+            session_id="s1",
+            client_value="sticky-beta-2024-01-01",
+        )
+
+        inbound_bytes = b'{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}'
+        client_beta = "claude-code-20250219"
+
+        response = client.post(
+            "/projects/p/locations/us-central1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:rawPredict",
+            headers={
+                "x-api-key": "test-key",
+                "x-headroom-session-id": "vertex-raw-beta-1",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": client_beta,
+                "content-type": "application/json",
+            },
+            content=inbound_bytes,
+        )
+
+        assert response.status_code == 200
+        assert transport.captured_body == inbound_bytes
+        assert transport.captured_headers is not None
+        captured_headers = {key.lower(): value for key, value in transport.captured_headers.items()}
+        assert captured_headers["anthropic-beta"] == "sticky-beta-2024-01-01,claude-code-20250219"
+    finally:
+        _reset_session_beta_tracker_for_test()
 
 
 def test_openai_responses_gzip_nonstream_passthrough_strips_content_encoding() -> None:

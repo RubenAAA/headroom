@@ -753,7 +753,7 @@ class TestTreeSitterIntegration:
         assert result.language == CodeLanguage.JAVASCRIPT
 
     def test_actual_go_compression(self):
-        """Test Go code is processed (compression may fall back due to nested structures)."""
+        """Test actual compression of Go code."""
         config = CodeCompressorConfig(
             min_tokens_for_compression=10,
             enable_ccr=False,
@@ -763,12 +763,9 @@ class TestTreeSitterIntegration:
 
         result = compressor.compress(code, language="go")
 
-        # Go code is processed and returns valid output
-        # Note: compression_ratio may be 1.0 if compression produces invalid syntax
-        # and falls back to original (Go has complex nested brace handling)
+        assert result.compression_ratio < 1.0
         assert result.syntax_valid is True
         assert result.language == CodeLanguage.GO
-        assert result.compressed  # Some output is produced
 
     @pytest.mark.parametrize(
         (

@@ -128,6 +128,134 @@ def _strip_cache_control(obj: Any) -> Any:
     return obj
 
 
+# Keys that carry NO semantic payload for the model — transport / caching-directive
+# / telemetry / client-routing annotations that clients attach and vary turn-to-turn.
+# Grounded in provider API docs (Anthropic Messages, OpenAI Chat+Responses, Bedrock
+# Converse) + client-library field inventories (litellm, Vercel AI SDK, opencode,
+# Claude Code, Cline). Dropped from the cross-turn prefix-equality key ONLY.
+#
+# NOTE ON SAFETY: this projection is a COMPARISON KEY, never a source to rebuild
+# forwarded bytes — the cache-stable-delta path always forwards the previously
+# forwarded bytes + the raw appended delta. So dropping these can't deprive the
+# model. What we must NOT do is drop a *semantic* field (that would mask a real
+# divergence and replay a stale prefix), which is why: (1) reasoning SIGNATURES are
+# NOT in this set (Anthropic 400s if a thinking block is altered/missing, and a
+# present/absent flip is a real divergence we want to detect); (2) tool inputs /
+# arguments / json payloads are treated as OPAQUE and compared verbatim (see
+# _OPAQUE_PAYLOAD_KEYS) so a user key that happens to be named "index"/"state" is
+# never stripped from inside a tool call.
+_NON_SEMANTIC_KEYS = frozenset(
+    {
+        # cache-breakpoint markers (moved to the newest block every turn)
+        "cache_control",  # Anthropic (per-block)
+        "cachePoint",  # Bedrock (per-block content block)
+        # litellm unified-message / tool annotations
+        "caller",  # litellm programmatic-tool tag on tool_use
+        "provider_specific_fields",
+        "reasoning_content",  # litellm display echo (the paired signature is separate)
+        "reasoning_items",
+        "annotations",  # citation/display metadata
+        # OpenAI response echoes that can ride on assistant messages
+        "system_fingerprint",
+        "service_tier",
+        # Vercel AI SDK / opencode part transport
+        "providerMetadata",
+        "providerOptions",
+        "callProviderMetadata",
+        "state",
+        "providerExecuted",
+        "synthetic",
+        "ignored",
+        # streaming-assembly artifact
+        "index",
+    }
+)
+
+# Values under these keys are opaque semantic payloads (tool-call input, OpenAI
+# stringified arguments, Bedrock tool_result json). They are compared VERBATIM — we
+# never recurse into them to strip "noise" keys, because arbitrary user data there
+# may legitimately contain keys that collide with _NON_SEMANTIC_KEYS (e.g. an
+# `input` of {"state": "CA", "index": 3}). Recursing would corrupt the comparison.
+_OPAQUE_PAYLOAD_KEYS = frozenset({"input", "arguments", "json"})
+
+
+def _canonicalize_for_prefix_compare(obj: Any) -> Any:
+    """Representation-agnostic canonical form for cross-turn prefix equality.
+
+    Providers accept several *equivalent* encodings for the same message, and real
+    clients vary them turn-to-turn; a raw-dict prefix compare then fails spuriously
+    and drops cache mode to raw (uncompressed) forwarding. This normalizes ONLY
+    representation:
+      * drops non-semantic annotation / cache-directive / telemetry keys
+        (_NON_SEMANTIC_KEYS) at any message/block level;
+      * wraps a bare string ``content`` into ``[{"type": "text", "text": ...}]``
+        (Anthropic's string sugar, which litellm flips per turn);
+      * leaves tool ``input`` / ``arguments`` / ``json`` payloads verbatim
+        (_OPAQUE_PAYLOAD_KEYS) so user data is never corrupted;
+      * KEEPS all real content (text, tool name/input, tool_result content, reasoning
+        signatures, ids) so two messages canonicalize-equal iff they are semantically
+        identical.
+
+    Used ONLY as a comparison key for the cache-stable delta path; the original,
+    unmodified messages are always what gets forwarded.
+    """
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for key, value in obj.items():
+            if key in _NON_SEMANTIC_KEYS:
+                continue
+            if key in _OPAQUE_PAYLOAD_KEYS:
+                out[key] = value  # verbatim — do not recurse into user payloads
+            elif key == "content" and isinstance(value, str):
+                out[key] = [{"type": "text", "text": value}]
+            else:
+                out[key] = _canonicalize_for_prefix_compare(value)
+        return out
+    if isinstance(obj, list):
+        canon = [_canonicalize_for_prefix_compare(value) for value in obj]
+        # Drop blocks that projected to {} — a pure cache-directive content block
+        # (e.g. Bedrock {"cachePoint": {...}}) whose only key was non-semantic. Left
+        # in place it would be an empty-dict entry, so a directive block moving
+        # position across turns would spuriously fail the length/order compare.
+        return [value for value in canon if value != {}]
+    return obj
+
+
+def extract_cache_stable_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Return ``(stable_forwarded_prefix, appended_delta_messages)`` when the current
+    request append-only-extends the previous one, else ``None``.
+
+    Provider-agnostic delta engine for cache mode. "Append-only" is decided by comparing
+    the *canonicalized* prefix (:func:`_canonicalize_for_prefix_compare`, which ignores
+    per-turn transport / cache-directive / client-annotation noise across
+    Anthropic / OpenAI / Bedrock and the common clients), so a moved cache marker or
+    shape churn does not spuriously collapse cache mode to raw forwarding. On a match the
+    caller replays the byte-identical previously-forwarded prefix and compresses ONLY the
+    appended delta.
+
+    This is a COMPARISON + slice only: the returned prefix is the previously-forwarded
+    bytes verbatim and the delta is the raw appended messages — never a rebuild from the
+    canonical projection — so the projection dropping non-semantic fields is safe.
+    """
+    if not previous_original_messages or previous_forwarded_messages is None:
+        return None
+    prefix_len = len(previous_original_messages)
+    if len(current_messages) < prefix_len:
+        return None
+    if _canonicalize_for_prefix_compare(
+        current_messages[:prefix_len]
+    ) != _canonicalize_for_prefix_compare(previous_original_messages):
+        return None
+    return (
+        copy.deepcopy(previous_forwarded_messages),
+        copy.deepcopy(current_messages[prefix_len:]),
+    )
+
+
 def overlay_cached_prefix(
     optimized_messages: list[dict[str, Any]],
     current_original_messages: list[dict[str, Any]],
@@ -161,22 +289,66 @@ def overlay_cached_prefix(
     if not prev_orig or not prev_fwd:
         return optimized_messages
     n = len(prev_orig)
-    # One forwarded message per original, and the frozen prefix must fit within
-    # both the current originals and this turn's optimized output.
+    # Positional 1:1 correspondence between prev_orig[i] and prev_fwd[i] holds
+    # only when last turn forwarded exactly one message per original (the
+    # append-only, no-injection shape update_from_response records). If the
+    # counts differ, an injected / dropped / merged message shifted the
+    # mapping, so replaying prev_fwd[i] at position i could forward the wrong
+    # content — bail (leave this turn's output untouched) rather than risk it.
     if len(prev_fwd) != n:
+        logger.debug(
+            "overlay: forwarded/original count mismatch (prev_fwd=%d, prev_orig=%d) "
+            "— skipping cached-prefix replay (possible bust)",
+            len(prev_fwd),
+            n,
+        )
         return optimized_messages
-    if len(current_original_messages) < n or len(optimized_messages) < n:
+    # Append-only guard on CONTENT ONLY, message-by-message. Replay the
+    # previously-forwarded (cached, compressed) bytes for the longest LEADING
+    # run of messages that is byte-for-byte (content-canonical) identical to
+    # what we forwarded last turn, and stop at the first divergence.
+    #
+    # This is the cache-safety centerpiece for token mode (which relies solely
+    # on this replay; cache mode is already byte-stable by construction). The
+    # prior all-or-nothing guard busted the ENTIRE cached prefix the moment any
+    # single leading message failed to canonicalize-equal last turn — most
+    # commonly the just-added assistant turn, whose client-resent form can
+    # differ trivially from the copy we reconstructed and recorded. Stopping at
+    # the first divergence instead keeps the (much larger) cache-hit region
+    # up to that point and only re-forwards from the changed message onward.
+    #
+    # Comparison uses the shared canonicalizer (not just cache_control
+    # stripping) so it is robust to ALL per-turn transport / annotation churn —
+    # cache_control movement (Anthropic), litellm `caller`,
+    # provider_specific_fields, streaming `index`, string<->block content shape,
+    # etc. Content stability is what the provider's prefix cache actually keys
+    # on. Safe by construction: we only replay prev_fwd[k] where
+    # current_original[k] canonicalize-equals prev_orig[k], and prev_fwd[k]
+    # positionally corresponds to prev_orig[k] (guaranteed by the count check
+    # above), so no wrong bytes are ever forwarded.
+    limit = min(n, len(current_original_messages), len(optimized_messages))
+    k = 0
+    while k < limit and _canonicalize_for_prefix_compare(
+        current_original_messages[k]
+    ) == _canonicalize_for_prefix_compare(prev_orig[k]):
+        k += 1
+    if k == 0:
+        logger.debug(
+            "overlay: prefix diverged at message 0 — no cached-prefix replay "
+            "(cold prefix or client rewrote history head)"
+        )
         return optimized_messages
-    # Append-only guard on CONTENT ONLY: the frozen region must be the same
-    # messages we cached. Compare with cache_control stripped — clients move that
-    # breakpoint to the newest message each turn, so a raw dict compare would
-    # spuriously fail whenever a marker lands in the frozen prefix, skip the
-    # replay, and bust the cache (the residual busts observed after the first
-    # fix). Content stability is what the provider's prefix cache actually keys on.
-    if _strip_cache_control(current_original_messages[:n]) != _strip_cache_control(prev_orig):
-        return optimized_messages
-    # Replay the cached (compressed) prefix byte-identical; keep this turn's tail.
-    return list(prev_fwd) + list(optimized_messages[n:])
+    if k < n:
+        logger.debug(
+            "overlay: cached-prefix replay for %d/%d leading messages "
+            "(diverged at %d — re-forwarding tail fresh)",
+            k,
+            n,
+            k,
+        )
+    # Replay the cached (compressed) prefix byte-identical up to the first
+    # divergence; keep this turn's freshly-produced output for the rest.
+    return list(prev_fwd[:k]) + list(optimized_messages[k:])
 
 
 def normalize_message_cache_control(
@@ -257,6 +429,13 @@ class PrefixCacheTracker:
         self._last_activity: float = time.time()
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
+        # Idle gap (seconds) since the PREVIOUS turn's response, captured by
+        # SessionTrackerStore.get_or_create at fetch time — BEFORE it refreshes
+        # _last_activity. Without this snapshot, seconds_since_activity() reads
+        # ~0 on every request (the fetch itself bumps the clock), so the
+        # net-cost/TTL P_alive gate could never see idle time. The handler reads
+        # this and forwards it to the pipeline as `idle_seconds`.
+        self._idle_seconds_at_fetch: float = 0.0
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -563,6 +742,22 @@ class PrefixCacheTracker:
                             chars += len(text)
             else:
                 chars = 0
+            # OpenAI function-calling: the assistant's command lives in the
+            # top-level `tool_calls` (or legacy `function_call`) field, NOT in
+            # `content` (which is empty/None on a tool-call turn). Anthropic puts
+            # the equivalent in a `tool_use` content BLOCK (counted above), but
+            # the OpenAI shape was never counted here. That under-counted every
+            # tool-based assistant turn to ~0, so the frozen-prefix estimate
+            # overshot the real cache boundary and froze the NEWEST delta — which
+            # is why OpenAI/Kimi (fireworks) tool harnesses got ~zero compression
+            # while text/back-tick harnesses (command in `content`) compressed.
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    chars += len(str(fn.get("name", ""))) + len(str(fn.get("arguments", "")))
+            fc = msg.get("function_call")
+            if isinstance(fc, dict):
+                chars += len(str(fc.get("name", ""))) + len(str(fc.get("arguments", "")))
             # Add overhead for role, block structure, etc.
             chars += 20
             counts.append(max(1, int(chars / 3.5)))
@@ -588,10 +783,15 @@ class SessionTrackerStore:
 
         if session_id in self._trackers:
             tracker = self._trackers[session_id]
+            # Snapshot idle-since-last-response BEFORE bumping the access clock,
+            # so the net-cost/TTL gate sees the true gap (see the attribute's
+            # docstring in PrefixCacheTracker.__init__).
+            tracker._idle_seconds_at_fetch = max(0.0, time.time() - tracker._last_activity)
             tracker._last_activity = time.time()
             return tracker
 
         tracker = PrefixCacheTracker(provider, self._default_config)
+        tracker._idle_seconds_at_fetch = 0.0  # cold start: nothing cached to lapse
         self._trackers[session_id] = tracker
         return tracker
 
@@ -613,20 +813,19 @@ class SessionTrackerStore:
             if session_header:
                 return str(session_header)
 
-        # Fall back to hashing model + system prompt
-        system_content = ""
+        # Fall back to hashing model + all system-text content.
+        system_parts: list[str] = []
         for msg in messages:
             if msg.get("role") == "system":
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    system_content = content[:500]  # First 500 chars is enough
+                    system_parts.append(content)
                 elif isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
-                            system_content = block.get("text", "")[:500]
-                            break
-                break
+                            system_parts.append(block.get("text", ""))
 
+        system_content = json.dumps(system_parts, ensure_ascii=False, separators=(",", ":"))
         key = f"{model}:{system_content}"
         return hashlib.md5(key.encode()).hexdigest()[:16]  # nosec B324
 

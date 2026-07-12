@@ -290,6 +290,22 @@ def test_ensure_proxy_restarts_idle_stale_ephemeral_proxy(monkeypatch) -> None:
     assert calls[1][0] == "start"
 
 
+def test_proxy_version_restart_ignores_non_release_source_labels(monkeypatch) -> None:
+    monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.29.0")
+    assert wrap_cli._proxy_needs_version_restart({"version": "source-build+g6266a1d774b5"}) is False
+    assert (
+        wrap_cli._proxy_needs_version_restart({"version": "source-build+sha.abcdef123456"}) is False
+    )
+    assert wrap_cli._proxy_needs_version_restart({"version": "6266a1d"}) is False
+    assert wrap_cli._proxy_needs_version_restart({"version": "0.29.0+gabcdef0"}) is False
+
+    monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "source-build+sha.abcdef123456")
+    assert wrap_cli._proxy_needs_version_restart({"version": "0.29.0"}) is False
+
+    monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.29.1")
+    assert wrap_cli._proxy_needs_version_restart({"version": "0.29.0"}) is True
+
+
 def test_ensure_proxy_restarts_ephemeral_proxy_for_openai_api_url_mismatch(monkeypatch) -> None:
     calls: list[object] = []
     health = {
