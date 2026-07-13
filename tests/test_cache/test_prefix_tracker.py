@@ -5,6 +5,10 @@ import time
 import pytest
 
 from headroom.cache.prefix_tracker import (
+    MISS_COLD_START,
+    MISS_PREFIX_CHANGE,
+    MISS_TTL_EXPIRY,
+    MISS_UNKNOWN,
     FreezeStats,
     PrefixCacheTracker,
     PrefixFreezeConfig,
@@ -366,6 +370,79 @@ class TestSessionTrackerStore:
         id3 = store.compute_session_id(MockRequest(), "gpt-4", messages)
         assert id3 != id1
 
+    def test_compute_session_id_uses_all_system_messages(self, store):
+        """Different dynamic system messages should not collide."""
+
+        class MockRequest:
+            headers = {}
+
+        static_prompt = "framework prompt " * 80
+        conv_a = [
+            {"role": "system", "content": [{"type": "text", "text": static_prompt}]},
+            {"role": "system", "content": [{"type": "text", "text": "context: session A"}]},
+            {"role": "user", "content": "hello"},
+        ]
+        conv_b = [
+            {"role": "system", "content": [{"type": "text", "text": static_prompt}]},
+            {"role": "system", "content": [{"type": "text", "text": "context: session B"}]},
+            {"role": "user", "content": "hello"},
+        ]
+
+        id_a = store.compute_session_id(MockRequest(), "claude-3", conv_a)
+        id_b = store.compute_session_id(MockRequest(), "claude-3", conv_b)
+
+        assert id_a != id_b
+
+    def test_compute_session_id_distinguishes_top_level_system(self, store):
+        """Anthropic carries the system prompt as a top-level field (not a
+        role:'system' message). The handler folds it in as a synthetic system
+        message so two conversations with the same model and turns but different
+        system prompts get distinct ids — otherwise they share one tracker and
+        their sticky state cross-contaminates. This exercises that mechanism."""
+
+        class MockRequest:
+            headers = {}
+
+        turns = [{"role": "user", "content": "hello"}]
+
+        def with_system(system):
+            # Mirror what handlers/anthropic.py does for the top-level system.
+            return [{"role": "system", "content": system}, *turns]
+
+        id_a = store.compute_session_id(
+            MockRequest(), "claude-3", with_system("You are a Python expert.")
+        )
+        id_b = store.compute_session_id(
+            MockRequest(), "claude-3", with_system("You are a Rust expert.")
+        )
+        assert id_a != id_b
+
+        # A list-of-text-blocks system folds the same text as the string form.
+        id_a_list = store.compute_session_id(
+            MockRequest(),
+            "claude-3",
+            with_system([{"type": "text", "text": "You are a Python expert."}]),
+        )
+        assert id_a_list == id_a
+
+    def test_compute_session_id_is_stable_when_only_non_system_turns_change(self, store):
+        """Appending non-system turns should keep the same fallback session id."""
+
+        class MockRequest:
+            headers = {}
+
+        base_messages = [
+            {"role": "system", "content": [{"type": "text", "text": "framework prompt"}]},
+            {"role": "system", "content": [{"type": "text", "text": "context: session A"}]},
+            {"role": "user", "content": "hello"},
+        ]
+        extended_messages = base_messages + [{"role": "assistant", "content": "hi there"}]
+
+        id1 = store.compute_session_id(MockRequest(), "claude-3", base_messages)
+        id2 = store.compute_session_id(MockRequest(), "claude-3", extended_messages)
+
+        assert id1 == id2
+
     def test_compute_session_id_no_system(self, store):
         """Should work without system messages."""
 
@@ -466,3 +543,103 @@ class TestMultiTurnScenario:
 
         # After a bust with 0 total, freeze should reset
         assert tracker.get_frozen_message_count() == 0
+
+
+class TestClassifyCacheMiss:
+    """Cache-miss attribution (#1313): TTL lapse vs prefix change vs unknown."""
+
+    BASE = [
+        {"role": "system", "content": "x" * 4000},
+        {"role": "user", "content": "hello"},
+    ]
+    CHANGED = [
+        {"role": "system", "content": "DIFFERENT" * 400},
+        {"role": "user", "content": "hello"},
+    ]
+
+    def _warm(self, tracker, messages, read=500, write=500):
+        """Simulate a turn that left `messages` cached."""
+        tracker.update_from_response(
+            cache_read_tokens=read, cache_write_tokens=write, messages=messages
+        )
+
+    def test_cold_start_is_not_a_miss(self):
+        """No prior cached prefix → cold start, is_miss False."""
+        tracker = PrefixCacheTracker("anthropic")
+        result = tracker.classify_cache_miss(0, self.BASE)
+        assert result.is_miss is False
+        assert result.reason == MISS_COLD_START
+
+    def test_cache_read_is_a_hit(self):
+        """A non-zero read on an expected-cached prefix is a hit, not a miss."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(800, self.BASE)
+        assert result.is_miss is False
+        assert result.reason == "hit"
+
+    def test_ttl_expiry_when_idle_exceeds_ttl(self):
+        """Idle longer than the cache TTL → ttl_expiry."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=400)
+        assert result.is_miss is True
+        assert result.reason == MISS_TTL_EXPIRY
+        assert result.ttl_exceeded is True
+        assert result.cache_ttl_seconds == 300
+
+    def test_ttl_wins_tie_when_prefix_also_changed(self):
+        """When idle past TTL AND prefix changed, TTL expiry wins (docstring)."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.CHANGED, idle_seconds=400)
+        assert result.reason == MISS_TTL_EXPIRY
+        assert result.ttl_exceeded is True
+        assert result.prefix_changed is True
+
+    def test_prefix_change_within_ttl(self):
+        """Within TTL but the forwarded prefix differs → prefix_change."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.CHANGED, idle_seconds=10)
+        assert result.is_miss is True
+        assert result.reason == MISS_PREFIX_CHANGE
+        assert result.prefix_changed is True
+        assert result.ttl_exceeded is False
+
+    def test_unknown_when_stable_prefix_within_ttl(self):
+        """Within TTL, prefix unchanged, but still no read → unknown."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=10)
+        assert result.is_miss is True
+        assert result.reason == MISS_UNKNOWN
+
+    def test_growing_prefix_is_stable(self):
+        """A turn that appends to last turn's forwarded prefix is not a change."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        grown = self.BASE + [{"role": "assistant", "content": "hi back"}]
+        result = tracker.classify_cache_miss(0, grown, idle_seconds=10)
+        # Prefix preserved (only appended) → not a prefix_change.
+        assert result.prefix_changed is False
+        assert result.reason == MISS_UNKNOWN
+
+    def test_one_hour_ttl_override(self):
+        """cache_ttl_seconds override widens the TTL window (1h breakpoint)."""
+        tracker = PrefixCacheTracker("anthropic", PrefixFreezeConfig(cache_ttl_seconds=3600))
+        self._warm(tracker, self.BASE)
+        # 400s idle is past the 300s default but within 3600s → not TTL expiry.
+        result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=400)
+        assert result.cache_ttl_seconds == 3600
+        assert result.ttl_exceeded is False
+        assert result.reason == MISS_UNKNOWN
+
+    def test_resolved_ttl_falls_back_to_provider_default(self):
+        assert PrefixCacheTracker("anthropic").resolved_cache_ttl_seconds() == 300
+        assert (
+            PrefixCacheTracker(
+                "anthropic", PrefixFreezeConfig(cache_ttl_seconds=3600)
+            ).resolved_cache_ttl_seconds()
+            == 3600
+        )

@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom import savings_ledger
+from headroom.cache.compression_store import format_retrieval_miss_detail
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -86,10 +88,14 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
 
-def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]) -> str:
+def _format_session_summary(
+    summary: dict[str, Any],
+    local_stats: dict[str, Any],
+    persistent_lifetime: dict[str, Any] | None = None,
+) -> str:
     """Format the proxy summary + local MCP stats into clean readable text."""
     lines: list[str] = []
-    lines.append("Headroom Session Summary")
+    lines.append("Headroom Window-Scoped Session Summary")
     lines.append("=" * 40)
 
     mode = summary.get("mode", "token")
@@ -154,6 +160,20 @@ def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]
     local_saved = local_stats.get("total_tokens_saved", 0)
     if local_compressions > 0:
         lines.append(f"MCP Tool: {local_compressions} compressions, {local_saved:,} tokens saved")
+        lines.append("")
+
+    # Lifetime proxy savings (cross-session)
+    if isinstance(persistent_lifetime, dict):
+        lifetime_tokens = persistent_lifetime.get("tokens_saved", 0) or 0
+        lifetime_usd = persistent_lifetime.get("compression_savings_usd", 0.0) or 0.0
+        lifetime_cache_reads = persistent_lifetime.get("cache_read_tokens", 0) or 0
+        lifetime_cache_usd = persistent_lifetime.get("cache_savings_usd", 0.0) or 0.0
+        lines.append("Lifetime Savings:")
+        lines.append(f"  Tokens saved: {lifetime_tokens:,}")
+        lines.append(f"  Compression savings: ${lifetime_usd:.2f}")
+        if lifetime_cache_reads:
+            lines.append(f"  Cache-read tokens: {lifetime_cache_reads:,}")
+            lines.append(f"  Cache savings: ${lifetime_cache_usd:.2f}")
         lines.append("")
 
     # Tip
@@ -231,6 +251,23 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
     except Exception:
         pass
     return events
+
+
+def _build_proxy_unreachable_payload(
+    *,
+    proxy_url: str,
+    error: str,
+    http_status: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "url": proxy_url,
+        "status": "unreachable",
+        "error": error,
+        "warning": f"Configured proxy {proxy_url} is unreachable ({error}).",
+    }
+    if http_status is not None:
+        payload["http_status"] = http_status
+    return payload
 
 
 @dataclass
@@ -390,9 +427,15 @@ class HeadroomMCPServer:
         )
         self._stats.record_compression(input_tokens, output_tokens, strategy)
 
-        savings_pct = (
-            round((1 - result.compression_ratio) * 100, 1) if result.compression_ratio < 1.0 else 0
-        )
+        # Percentage of tokens removed. Derive from the same token counts used
+        # for ``tokens_saved`` so all three fields agree — this mirrors the
+        # convention in ``_Stats.record_compression`` above. The previous
+        # ``(1 - result.compression_ratio)`` inverted the value: since
+        # ``compression_ratio`` is already the *saved* fraction (see
+        # ``CompressResult`` in headroom/compress.py — "0.0 = no savings, 1.0 =
+        # 100% removed"), the old expression reported the *retained* percentage,
+        # e.g. a no-op (0% saved) was reported as 100%.
+        savings_pct = round((1 - output_tokens / input_tokens) * 100, 1) if input_tokens > 0 else 0
 
         return {
             "compressed": compressed_content,
@@ -408,45 +451,70 @@ class HeadroomMCPServer:
     async def _retrieve_content(
         self,
         hash_key: str,
-        query: str | None,
     ) -> dict[str, Any]:
-        """Retrieve content. Checks local store first, then proxy."""
+        """Retrieve content by hash. Checks local store first, then proxy.
+
+        Retrieval is by hash and always returns the full original content.
+        """
         # Check local store first
         store = self._get_local_store()
-        if query:
-            results = store.search(hash_key, query)
-            if results:
-                self._stats.record_retrieval(hash_key)
-                return {
-                    "hash": hash_key,
-                    "source": "local",
-                    "query": query,
-                    "results": results,
-                    "count": len(results),
-                }
-        else:
-            entry = store.retrieve(hash_key)
-            if entry:
-                self._stats.record_retrieval(hash_key)
-                return {
-                    "hash": hash_key,
-                    "source": "local",
-                    "original_content": entry.original_content,
-                    "original_item_count": entry.original_item_count,
-                    "compressed_item_count": entry.compressed_item_count,
-                    "retrieval_count": entry.retrieval_count,
-                }
+        entry_status = store.get_entry_status(hash_key, clean_expired=False)
+        entry = store.retrieve(hash_key)
+        expired_entry_status = None
+        if entry:
+            self._stats.record_retrieval(hash_key)
+            return {
+                "hash": hash_key,
+                "source": "local",
+                "original_content": entry.original_content,
+                "original_item_count": entry.original_item_count,
+                "compressed_item_count": entry.compressed_item_count,
+                "retrieval_count": entry.retrieval_count,
+            }
+        if entry_status.get("status") == "expired":
+            expired_entry_status = entry_status
+        elif entry_status.get("status") == "available":
+            created_at = entry_status.get("created_at")
+            ttl_seconds = entry_status.get("ttl_seconds")
+            if isinstance(created_at, (int, float)) and isinstance(ttl_seconds, (int, float)):
+                age_seconds = time.time() - created_at
+                if age_seconds > ttl_seconds:
+                    expired_entry_status = {
+                        **entry_status,
+                        "status": "expired",
+                        "age_seconds": age_seconds,
+                    }
 
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
             try:
-                result = await self._retrieve_via_proxy(hash_key, query)
+                result = await self._retrieve_via_proxy(hash_key)
                 if "error" not in result:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
                     return result
             except Exception:
                 pass  # Proxy unavailable, that's fine
+
+        if expired_entry_status:
+            ttl_seconds = expired_entry_status.get(
+                "ttl_seconds",
+                expired_entry_status["default_ttl_seconds"],
+            )
+            return {
+                "error": (
+                    f"{format_retrieval_miss_detail(expired_entry_status)}. "
+                    "Do not retry the same hash. Re-run the source command or re-read the source file."
+                ),
+                "hash": hash_key,
+                "status": "expired",
+                "ttl_seconds": ttl_seconds,
+                "age_seconds": expired_entry_status.get("age_seconds"),
+                "hint": (
+                    "Use the source of truth to regenerate fresh content. "
+                    "Re-run the command or re-read the file."
+                ),
+            }
 
         return {
             "error": "Content not found. It may have expired or the hash may be incorrect.",
@@ -461,16 +529,13 @@ class HeadroomMCPServer:
     async def _retrieve_via_proxy(
         self,
         hash_key: str,
-        query: str | None,
     ) -> dict[str, Any]:
-        """Retrieve content via proxy's HTTP endpoint."""
+        """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=15.0)
 
         url = f"{self.proxy_url}/v1/retrieve"
         payload: dict[str, str] = {"hash": hash_key}
-        if query:
-            payload["query"] = query
 
         response = await self._http_client.post(url, json=payload)
 
@@ -480,6 +545,58 @@ class HeadroomMCPServer:
         response.raise_for_status()
         result: dict[str, Any] = response.json()
         return result
+
+    async def _probe_proxy_unreachable(self) -> dict[str, Any] | None:
+        """Return explicit proxy-unreachable state when the configured proxy is down."""
+        if not self.check_proxy or not HTTPX_AVAILABLE:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self.proxy_url}/livez")
+        except Exception as exc:
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        if response.status_code != 200:
+            detail = None
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                detail = payload.get("status")
+            if detail is None:
+                detail = response.text.strip() or None
+            error = f"HTTP {response.status_code}"
+            if detail:
+                error = f"{error} ({detail})"
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=error,
+                http_status=response.status_code,
+            )
+        try:
+            payload = response.json()
+        except Exception as exc:
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=f"invalid /livez payload: {type(exc).__name__}: {exc}",
+                http_status=response.status_code,
+            )
+        if not isinstance(payload, dict):
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error="invalid /livez payload",
+                http_status=response.status_code,
+            )
+        if payload.get("status") != "healthy" or payload.get("alive") is not True:
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=f"proxy reported {payload.get('status', 'unhealthy')}",
+                http_status=response.status_code,
+            )
+        return None
 
     def _setup_handlers(self) -> None:
         """Register all MCP tool handlers."""
@@ -524,13 +641,6 @@ class HeadroomMCPServer:
                             "hash": {
                                 "type": "string",
                                 "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
-                            },
-                            "query": {
-                                "type": "string",
-                                "description": (
-                                    "Optional search query to filter results. "
-                                    "If provided, returns only items matching the query."
-                                ),
                             },
                         },
                         "required": ["hash"],
@@ -645,7 +755,53 @@ class HeadroomMCPServer:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, self._compress_content, content)
 
+        # Record durably so `headroom savings` reflects this compression across
+        # restarts. Best-effort: never let savings bookkeeping break the tool.
+        try:
+            self._record_savings(result)
+        except Exception:
+            logger.debug("durable savings recording failed", exc_info=True)
+
+        proxy_status = await self._probe_proxy_unreachable()
+        if proxy_status:
+            result["proxy"] = proxy_status
+            result["warning"] = proxy_status["warning"]
+
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    def _record_savings(self, result: dict[str, Any]) -> None:
+        """Append a durable savings event for a completed compression."""
+        try:
+            before = int(result.get("original_tokens", 0) or 0)
+            after = int(result.get("compressed_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if before <= after:
+            return
+        savings_ledger.record_savings_event(
+            tokens_before=before,
+            tokens_after=after,
+            # The MCP tool doesn't know the agent's upstream model; an optional
+            # hint lets a host attribute it, otherwise it records as "unknown".
+            model=os.environ.get("HEADROOM_MCP_MODEL"),
+            client=self._current_client(),
+            source="mcp",
+        )
+
+    def _current_client(self) -> str:
+        """Name of the MCP client driving this session (best-effort)."""
+        override = os.environ.get("HEADROOM_MCP_CLIENT")
+        if override:
+            return override
+        try:
+            params = self.server.request_context.session.client_params
+            info = getattr(params, "clientInfo", None) if params else None
+            name = getattr(info, "name", None)
+            if name:
+                return str(name)
+        except Exception:
+            pass
+        return "unknown"
 
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_retrieve tool call."""
@@ -658,17 +814,11 @@ class HeadroomMCPServer:
                 )
             ]
 
-        query = arguments.get("query")
+        logger.info("event=mcp_retrieve_started hash=%s", hash_key)
+        result = await self._retrieve_content(hash_key)
         logger.info(
-            "event=mcp_retrieve_started hash=%s query=%s",
+            "event=mcp_retrieve_completed hash=%s result=%s",
             hash_key,
-            json.dumps(query, ensure_ascii=False, default=str),
-        )
-        result = await self._retrieve_content(hash_key, query)
-        logger.info(
-            "event=mcp_retrieve_completed hash=%s query=%s result=%s",
-            hash_key,
-            json.dumps(query, ensure_ascii=False, default=str),
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
@@ -718,13 +868,24 @@ class HeadroomMCPServer:
             if proxy_data:
                 summary = proxy_data.get("summary")
                 if summary:
+                    lifetime = None
+                    persistent_savings = proxy_data.get("persistent_savings")
+                    if isinstance(persistent_savings, dict):
+                        lifetime_block = persistent_savings.get("lifetime")
+                        if isinstance(lifetime_block, dict):
+                            lifetime = lifetime_block
                     # Return clean formatted summary instead of raw JSON
-                    formatted = _format_session_summary(summary, stats)
+                    formatted = _format_session_summary(summary, stats, lifetime)
                     return [TextContent(type="text", text=formatted)]
                 # Fallback: add proxy stats to local stats
                 proxy_stats = self._extract_proxy_stats(proxy_data)
                 if proxy_stats:
                     stats["proxy"] = proxy_stats
+            else:
+                proxy_status = await self._probe_proxy_unreachable()
+                if proxy_status:
+                    stats["proxy"] = proxy_status
+                    stats["warning"] = proxy_status["warning"]
 
         return [TextContent(type="text", text=json.dumps(stats, indent=2))]
 

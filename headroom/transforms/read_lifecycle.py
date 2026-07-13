@@ -177,7 +177,7 @@ class ReadLifecycleManager:
                 continue
 
             # OpenAI format: tool_calls array
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:  # coalesce None (OpenAI tool_calls:null)
                 if not isinstance(tc, dict):
                     continue
                 tc_id = tc.get("id", "")
@@ -272,7 +272,7 @@ class ReadLifecycleManager:
                 continue
 
             # OpenAI format
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:  # coalesce None (OpenAI tool_calls:null)
                 if isinstance(tc, dict) and tc.get("id") == tool_call_id:
                     return i
 
@@ -474,21 +474,25 @@ class ReadLifecycleManager:
         if content_bytes < self.config.min_size_bytes:
             return False, content, None
 
-        # Store original in CCR if available
-        ccr_hash = None
+        # Best-effort CCR persistence (mirrors read_maturation.py): a store
+        # failure must not break compress().
+        ccr_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
         if self.store is not None:
-            ccr_hash = self.store.store(
-                original=content,
-                compressed="",
-                tool_name="Read",
-                tool_call_id=classification.tool_call_id,
-                compression_strategy=f"read_lifecycle:{classification.state.value}",
-            )
-
-        # Generate marker
-        if ccr_hash is None:
-            # No CCR store — generate a content hash for reference
-            ccr_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
+            try:
+                ccr_hash = self.store.store(
+                    original=content,
+                    compressed="",
+                    tool_name="Read",
+                    tool_call_id=classification.tool_call_id,
+                    compression_strategy=f"read_lifecycle:{classification.state.value}",
+                    explicit_hash=ccr_hash,
+                )
+            except Exception as e:  # noqa: BLE001 - storage failure must not break the request
+                logger.warning(
+                    "read_lifecycle: CCR store failed for %s: %s",
+                    classification.tool_call_id,
+                    e,
+                )
 
         file_display = classification.file_path or "unknown"
 

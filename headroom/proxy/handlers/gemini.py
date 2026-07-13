@@ -16,10 +16,11 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -423,6 +424,7 @@ class GeminiHandlerMixin:
                         request_id=request_id,
                         provider=provider_name,
                         model=model,
+                        status_code=response.status_code,
                         original_tokens=total_input_tokens,
                         optimized_tokens=total_input_tokens,
                         output_tokens=output_tokens,
@@ -482,12 +484,16 @@ class GeminiHandlerMixin:
                 waste_messages, _ = self._gemini_contents_to_messages(
                     contents, system_instruction, include_function_responses=True
                 )
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
-                    waste_messages=waste_messages,
+                result = await self._run_compression_in_executor(
+                    lambda: self.openai_pipeline.apply(
+                        messages=messages,
+                        model=model,
+                        model_limit=context_limit,
+                        context=extract_user_query(messages),
+                        waste_messages=waste_messages,
+                        **proxy_pipeline_kwargs(self.config),
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -673,6 +679,7 @@ class GeminiHandlerMixin:
                     request_id=request_id,
                     provider=provider_name,
                     model=model,
+                    status_code=response.status_code,
                     original_tokens=original_tokens,
                     optimized_tokens=total_input_tokens,
                     output_tokens=output_tokens,
@@ -834,12 +841,16 @@ class GeminiHandlerMixin:
                 waste_messages, _ = self._gemini_contents_to_messages(
                     contents, system_instruction, include_function_responses=True
                 )
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
-                    waste_messages=waste_messages,
+                result = await self._run_compression_in_executor(
+                    lambda: self.openai_pipeline.apply(
+                        messages=messages,
+                        model=model,
+                        model_limit=context_limit,
+                        context=extract_user_query(messages),
+                        waste_messages=waste_messages,
+                        **proxy_pipeline_kwargs(self.config),
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -1092,11 +1103,15 @@ class GeminiHandlerMixin:
         if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
+                result = await self._run_compression_in_executor(
+                    lambda: self.openai_pipeline.apply(
+                        messages=messages,
+                        model=model,
+                        model_limit=context_limit,
+                        context=extract_user_query(messages),
+                        **proxy_pipeline_kwargs(self.config),
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -1158,6 +1173,7 @@ class GeminiHandlerMixin:
                     request_id=request_id,
                     provider=provider_name,
                     model=model,
+                    status_code=response.status_code,
                     original_tokens=original_tokens,
                     optimized_tokens=compressed_tokens,
                     output_tokens=0,

@@ -250,6 +250,57 @@ def test_resolve_subscription_exchange_uses_cloud_enterprise_advertised_api(
     assert copilot_auth._token_exchange_url() == "https://api.github.com/copilot_internal/v2/token"
 
 
+def test_api_url_from_exchange_payload_rejects_non_copilot_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_fetch_copilot_user_info",
+        lambda _token: {"endpoints": {"api": "https://api.business.githubcopilot.com"}},
+    )
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.openai.com/v1"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == "https://api.business.githubcopilot.com"
+
+
+def test_api_url_from_exchange_payload_normalizes_individual_public_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.individual.githubcopilot.com"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == copilot_auth.DEFAULT_API_URL
+
+
+def test_api_url_from_exchange_payload_rejects_non_copilot_host_without_user_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+    monkeypatch.setattr(copilot_auth, "_fetch_copilot_user_info", lambda _token: None)
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.openai.com/v1"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == copilot_auth.DEFAULT_API_URL
+
+
 def test_enterprise_domain_routes_token_exchange_and_user_info_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -446,7 +497,7 @@ def test_read_gh_cli_oauth_token_uses_hostname(monkeypatch: pytest.MonkeyPatch) 
         return CompletedProcess()
 
     monkeypatch.setenv("GITHUB_COPILOT_HOST", "example.ghe.com")
-    monkeypatch.setattr(copilot_auth.subprocess, "run", fake_run)
+    monkeypatch.setattr(copilot_auth, "run", fake_run)
 
     assert copilot_auth._read_gh_cli_oauth_token() == "gho-gh-cli"
     assert calls == [["gh", "auth", "token", "--hostname", "example.ghe.com"]]
@@ -458,7 +509,7 @@ def test_read_gh_cli_oauth_token_returns_none_when_invocation_fails(
     def fake_run(*args: object, **kwargs: object) -> None:  # noqa: ANN002, ANN003
         raise OSError("gh missing")
 
-    monkeypatch.setattr(copilot_auth.subprocess, "run", fake_run)
+    monkeypatch.setattr(copilot_auth, "run", fake_run)
 
     assert copilot_auth._read_gh_cli_oauth_token() is None
 
@@ -467,7 +518,7 @@ def test_read_gh_cli_oauth_token_returns_none_for_nonzero_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        copilot_auth.subprocess,
+        copilot_auth,
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="ignored"),
     )
@@ -479,7 +530,7 @@ def test_read_gh_cli_oauth_token_returns_none_for_blank_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        copilot_auth.subprocess,
+        copilot_auth,
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=" \n"),
     )
@@ -626,31 +677,44 @@ def test_apply_copilot_api_auth_passes_through_existing_api_token(
     assert "x-api-key" not in headers
 
 
-def test_apply_copilot_api_auth_replaces_github_oauth_bearer(
+def test_apply_copilot_api_auth_passes_through_github_oauth_bearer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
-        return copilot_auth.CopilotAPIToken(
-            token="copilot-session",
-            expires_at=time.time() + 3600,
-            api_url=copilot_auth.DEFAULT_API_URL,
+    """A caller-supplied GitHub OAuth (gho_/ghs_/ghp_/github_pat_) bearer
+    token must be forwarded unchanged, not replaced.
+
+    Regression test for headroomlabs-ai/headroom#1813: this function used
+    to treat any gho_-prefixed token as "not a suitable Copilot API
+    token" and silently replace it with Headroom's own independently
+    fetched/exchanged credential. That broke both:
+    - a live Copilot CLI session (its own gho_ token worked directly for
+      model "claude-sonnet-5", but got 400 model_not_supported once
+      Headroom substituted a differently-entitled token), and
+    - OpenCode's native GitHub Copilot integration (#1813): replacing its
+      gho_ token changed the effective client/integrator lane Copilot's
+      backend sees, breaking model discovery/inference parity with
+      native (non-proxied) behavior.
+    """
+
+    async def fail_if_called() -> copilot_auth.CopilotAPIToken:
+        raise AssertionError(
+            "get_api_token() must not be called for a forwardable gho_ bearer token"
         )
 
     monkeypatch.setattr(
         copilot_auth.get_copilot_token_provider(),
         "get_api_token",
-        fake_get_api_token,
+        fail_if_called,
     )
 
     headers = asyncio.run(
         copilot_auth.apply_copilot_api_auth(
-            {"authorization": "Bearer gho_downstream_oauth"},
+            {"authorization": "Bearer gho_liveClientToken123"},
             url="https://api.githubcopilot.com/v1/chat/completions",
         )
     )
 
-    assert headers["Authorization"] == "Bearer copilot-session"
-    assert "authorization" not in headers
+    assert headers["authorization"] == "Bearer gho_liveClientToken123"
 
 
 def test_apply_copilot_api_auth_replaces_non_bearer_auth(
@@ -687,6 +751,25 @@ def test_is_copilot_api_token_matches_expected_prefixes() -> None:
     assert copilot_auth._is_copilot_api_token("ghp_oauth") is False
     assert copilot_auth._is_copilot_api_token("github_pat_example") is False
     assert copilot_auth._is_copilot_api_token("Bearer maybe") is False
+
+
+def test_is_forwardable_copilot_bearer_token_matches_expected_prefixes() -> None:
+    """The inference-path helper (unlike _is_copilot_api_token, which is
+    scoped only to subscription/user-info resolution) accepts BOTH
+    short-lived Copilot API tokens (tid_) AND GitHub OAuth tokens
+    (gho_/ghs_/ghp_/github_pat_) as forwardable -- see
+    _is_forwardable_copilot_bearer_token()'s docstring and
+    headroomlabs-ai/headroom#1813 for why GitHub OAuth tokens must be
+    forwardable for chat-completion/inference requests.
+    """
+    assert copilot_auth._is_forwardable_copilot_bearer_token("tid_session_token") is True
+    assert copilot_auth._is_forwardable_copilot_bearer_token("gho_oauth") is True
+    assert copilot_auth._is_forwardable_copilot_bearer_token("ghs_oauth") is True
+    assert copilot_auth._is_forwardable_copilot_bearer_token("ghp_oauth") is True
+    assert copilot_auth._is_forwardable_copilot_bearer_token("github_pat_example") is True
+    assert copilot_auth._is_forwardable_copilot_bearer_token("sk-unrelated-anthropic-key") is False
+    assert copilot_auth._is_forwardable_copilot_bearer_token("") is False
+    assert copilot_auth._is_forwardable_copilot_bearer_token("   ") is False
 
 
 def test_apply_copilot_api_auth_injects_required_headers(

@@ -1,17 +1,16 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import numpy as np
-import pytest
 
-pytest.importorskip("mcp")
-
-from headroom.memory.mcp_server import _warm_up_backend
 from headroom.memory.models import Memory
+from tests._mcp_stub import import_module_with_mcp_stub
+
+mcp_server_mod = import_module_with_mcp_stub("headroom.memory.mcp_server")
 
 
-@pytest.mark.asyncio
-async def test_warm_up_backend_batches_embedding_and_indexing() -> None:
+def test_warm_up_backend_batches_embedding_and_indexing() -> None:
     """Warm-up should batch missing embeddings and vector indexing."""
     warmup_embedding = np.ones(384, dtype=np.float32)
     batch_embeddings = [
@@ -49,7 +48,7 @@ async def test_warm_up_backend_batches_embedding_and_indexing() -> None:
         get_user_memories=AsyncMock(return_value=memories),
     )
 
-    await _warm_up_backend(backend, "alice")
+    asyncio.run(mcp_server_mod._warm_up_backend(backend, "alice"))
 
     backend._ensure_initialized.assert_awaited_once()
     backend.get_user_memories.assert_awaited_once_with("alice", limit=500)
@@ -61,3 +60,171 @@ async def test_warm_up_backend_batches_embedding_and_indexing() -> None:
     vector_index.index_batch.assert_awaited_once_with(memories)
     assert np.array_equal(memory_without_embedding_a.embedding, batch_embeddings[0])
     assert np.array_equal(memory_without_embedding_b.embedding, batch_embeddings[1])
+
+
+def test_memory_mcp_startup_context_reports_dynamic_project_db(tmp_path) -> None:
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    configured_db = str(project_dir / ".headroom" / "memory.db")
+
+    context = mcp_server_mod._memory_mcp_startup_context(
+        configured_db,
+        project_dir,
+        db_flag_present=False,
+    )
+
+    assert context == {
+        "configured_db": configured_db,
+        "resolved_db": configured_db,
+        "config_source": "cwd-default",
+        "cwd": str(project_dir),
+        "project_root": str(project_dir),
+        "storage_scope": "active-project",
+        "path_exists": False,
+        "path_readable": False,
+        "resolution": "dynamic-cwd",
+    }
+
+
+def test_memory_mcp_startup_context_reports_static_external_db(tmp_path) -> None:
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    external_db = tmp_path / "shared-memory" / "memory.db"
+    external_db.parent.mkdir()
+    external_db.write_text("sqlite placeholder")
+
+    context = mcp_server_mod._memory_mcp_startup_context(
+        str(external_db),
+        project_dir,
+        db_flag_present=True,
+    )
+
+    assert context == {
+        "configured_db": str(external_db),
+        "resolved_db": str(external_db.resolve(strict=False)),
+        "config_source": "cli-flag",
+        "cwd": str(project_dir),
+        "project_root": str(project_dir),
+        "storage_scope": "external-memory-db",
+        "path_exists": True,
+        "path_readable": True,
+        "resolution": "static-cli",
+    }
+
+
+def test_memory_mcp_startup_context_reports_custom_db_path(tmp_path) -> None:
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    custom_db = tmp_path / "queries.db"
+
+    context = mcp_server_mod._memory_mcp_startup_context(
+        str(custom_db),
+        project_dir,
+        db_flag_present=True,
+    )
+
+    assert context["storage_scope"] == "custom-db-path"
+    assert context["config_source"] == "cli-flag"
+    assert context["path_exists"] is False
+    assert context["path_readable"] is False
+
+
+def test_main_logs_memory_mcp_startup_context(monkeypatch, tmp_path, caplog) -> None:
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+    monkeypatch.setenv("USER", "codex-user")
+    monkeypatch.setattr(mcp_server_mod.logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(mcp_server_mod.sys, "argv", ["memory-mcp"])
+
+    captured_run_payloads: list[object] = []
+    monkeypatch.setattr(
+        mcp_server_mod,
+        "_run",
+        lambda db_path, user_id: ("run", db_path, user_id),
+    )
+    monkeypatch.setattr(
+        mcp_server_mod.asyncio,
+        "run",
+        lambda payload: captured_run_payloads.append(payload),
+    )
+
+    caplog.set_level("INFO", logger="headroom.memory.mcp")
+
+    mcp_server_mod.main()
+
+    assert captured_run_payloads == [
+        ("run", str(project_dir / ".headroom" / "memory.db"), "codex-user")
+    ]
+    assert any(
+        "Memory MCP startup: configured_db=" in record.message
+        and "config_source=cwd-default" in record.message
+        and "storage_scope=active-project" in record.message
+        and "resolution=dynamic-cwd" in record.message
+        for record in caplog.records
+    )
+
+
+def test_search_records_access_only_for_returned_memories() -> None:
+    active = Memory(content="Active preference", user_id="alice")
+    extra = Memory(content="Lower-ranked preference", user_id="alice")
+    backend = SimpleNamespace(
+        search_memories=AsyncMock(
+            return_value=[
+                SimpleNamespace(memory=active, score=0.9, related_entities=[]),
+                SimpleNamespace(memory=extra, score=0.8, related_entities=[]),
+            ]
+        ),
+        get_memory=AsyncMock(
+            side_effect=lambda memory_id: {
+                active.id: active,
+                extra.id: extra,
+            }[memory_id]
+        ),
+        record_access=AsyncMock(return_value=1),
+    )
+
+    result = asyncio.run(
+        mcp_server_mod._handle_search(
+            backend,
+            {"query": "preference", "top_k": 1},
+            "alice",
+        )
+    )
+
+    backend.record_access.assert_awaited_once_with([active.id])
+    assert "Active preference" in result[0].kwargs["text"]
+    assert "Lower-ranked preference" not in result[0].kwargs["text"]
+
+
+def test_search_does_not_record_superseded_memories() -> None:
+    superseded = Memory(content="Old preference", user_id="alice")
+    replacement = Memory(content="Current preference", user_id="alice")
+    superseded.superseded_by = replacement.id
+    backend = SimpleNamespace(
+        search_memories=AsyncMock(
+            return_value=[SimpleNamespace(memory=superseded, score=0.9, related_entities=[])]
+        ),
+        get_memory=AsyncMock(return_value=superseded),
+        record_access=AsyncMock(),
+    )
+
+    result = asyncio.run(mcp_server_mod._handle_search(backend, {"query": "preference"}, "alice"))
+
+    backend.record_access.assert_not_awaited()
+    assert result[0].kwargs["text"] == "No memories found."
+
+
+def test_search_fails_open_when_access_tracking_fails() -> None:
+    memory = Memory(content="Useful preference", user_id="alice")
+    backend = SimpleNamespace(
+        search_memories=AsyncMock(
+            return_value=[SimpleNamespace(memory=memory, score=0.9, related_entities=[])]
+        ),
+        get_memory=AsyncMock(return_value=memory),
+        record_access=AsyncMock(side_effect=RuntimeError("write failed")),
+    )
+
+    result = asyncio.run(mcp_server_mod._handle_search(backend, {"query": "preference"}, "alice"))
+
+    assert "Useful preference" in result[0].kwargs["text"]

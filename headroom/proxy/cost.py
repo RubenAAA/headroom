@@ -159,9 +159,8 @@ def build_prefix_cache_stats(
 
         # Calculate savings:
         # Cache reads save (1.0 - read_mult) per token vs uncached input price.
-        # Cache write premium is NOT deducted — it's baseline cost that the
-        # client (e.g. Claude Code) pays regardless of Headroom. We track it
-        # for observability but don't penalise our savings number.
+        # Cache write premium stays visible as its own gross field, and net
+        # savings subtract it so the dashboard reflects billed cache impact.
         read_tokens: int = pc["cache_read_tokens"]  # type: ignore[assignment]
         write_tokens: int = pc["cache_write_tokens"]  # type: ignore[assignment]
         write_5m_tokens: int = pc["cache_write_5m_tokens"]  # type: ignore[assignment]
@@ -174,7 +173,7 @@ def build_prefix_cache_stats(
         if input_price_per_token:
             # Savings from reads: tokens * price * (1.0 - read_multiplier)
             savings_usd = read_tokens * input_price_per_token * (1.0 - read_mult)
-            # Write premium (observability only — not subtracted from savings)
+            # Write premium is reported separately and subtracted from net savings.
             if write_mult > 1.0:
                 write_premium_usd = write_tokens * input_price_per_token * (write_mult - 1.0)
 
@@ -205,7 +204,7 @@ def build_prefix_cache_stats(
             "write_premium": f"{(write_mult - 1.0) * 100:.0f}%" if write_mult > 1.0 else "none",
             "savings_usd": round(savings_usd, 4),
             "write_premium_usd": round(write_premium_usd, 4),
-            "net_savings_usd": round(savings_usd, 4),
+            "net_savings_usd": round(savings_usd - write_premium_usd, 4),
             "label": str(econ["label"]),
             "observed_ttl_buckets": {
                 "5m": {
@@ -246,7 +245,7 @@ def build_prefix_cache_stats(
         totals["savings_usd"] += savings_usd
         totals["write_premium_usd"] += write_premium_usd
 
-    totals["net_savings_usd"] = round(totals["savings_usd"], 4)
+    totals["net_savings_usd"] = round(totals["savings_usd"] - totals["write_premium_usd"], 4)
     totals["savings_usd"] = round(totals["savings_usd"], 4)
     totals["write_premium_usd"] = round(totals["write_premium_usd"], 4)
     # Token-level hit rate across all providers
@@ -287,9 +286,50 @@ def build_prefix_cache_stats(
         ],
     }
 
+    # Cache-miss attribution (#1313): why turns that expected a prompt-cache
+    # hit missed instead. Per-provider reason buckets plus an aggregate total,
+    # so the dashboard can show "of N expected-cache misses, X were TTL lapses
+    # vs Y prefix changes" — the signal a user needs to decide 5m vs 1h TTL.
+    _miss_by_provider: dict[str, dict[str, int]] = {}
+    # Holds integer counts AND float percentages (ttl_expiry_pct etc.), so the
+    # value type is float — ints coerce cleanly and the counts stay whole.
+    _miss_totals: dict[str, float] = {
+        "ttl_expiry": 0,
+        "prefix_change": 0,
+        "unknown": 0,
+        "total": 0,
+    }
+    for _provider, _reasons in metrics.cache_miss_attribution_by_provider.items():
+        provider_reasons = {reason: int(count) for reason, count in _reasons.items()}
+        provider_total = sum(provider_reasons.values())
+        if provider_total == 0:
+            continue
+        provider_reasons["total"] = provider_total
+        _miss_by_provider[_provider] = provider_reasons
+        for reason, count in provider_reasons.items():
+            if reason == "total":
+                continue
+            _miss_totals[reason] = _miss_totals.get(reason, 0) + count
+        _miss_totals["total"] += provider_total
+
+    # Share of misses attributable to TTL lapse vs prefix change — the headline
+    # the dashboard renders. Computed against attributed (non-unknown) misses
+    # so an "unknown" bucket doesn't dilute the actionable split.
+    _attributed = _miss_totals["ttl_expiry"] + _miss_totals["prefix_change"]
+    _miss_totals["ttl_expiry_pct"] = (
+        round(_miss_totals["ttl_expiry"] / _attributed * 100, 1) if _attributed > 0 else 0.0
+    )
+    _miss_totals["prefix_change_pct"] = (
+        round(_miss_totals["prefix_change"] / _attributed * 100, 1) if _attributed > 0 else 0.0
+    )
+
     return {
         "by_provider": by_provider,
         "totals": totals,
+        "miss_attribution": {
+            "totals": _miss_totals,
+            "by_provider": _miss_by_provider,
+        },
         "prefix_freeze": {
             "busts_avoided": metrics.prefix_freeze_busts_avoided,
             "tokens_preserved": metrics.prefix_freeze_tokens_preserved,
@@ -534,6 +574,21 @@ def build_session_summary(
     # dropping info the model actually needs).
     summary["mcp"] = _aggregate_mcp_events()
 
+    # Codex WS sessions compress per-unit on the long-lived /responses socket,
+    # but turn-level records (which feed tokens_saved_total above) only land
+    # when a response.completed frame carries usage. Surface the live per-unit
+    # counters so a WS-only session doesn't read as "no activity" mid-turn.
+    # Kept as a separate block rather than summed into the compression totals:
+    # turns that DID record already contributed the same savings there, so
+    # adding the unit sums on top would double-count.
+    ws_units = getattr(metrics, "codex_ws_units_total", 0)
+    if ws_units:
+        summary["codex_ws"] = {
+            "units_total": ws_units,
+            "units_modified": getattr(metrics, "codex_ws_units_modified_total", 0),
+            "tokens_saved": getattr(metrics, "codex_ws_unit_tokens_saved_sum", 0),
+        }
+
     # Add tip if token mode would help
     if proxy.config.mode == PROXY_MODE_CACHE and uncompressed_reasons["prefix_frozen"] > 10:
         summary["tip"] = (
@@ -683,6 +738,19 @@ class CostTracker:
             uncached_tokens: Non-cached input tokens from API response usage.
             output_tokens: Output tokens from API response usage.
         """
+        # Post-guard invariant (all providers): Headroom never forwards a request
+        # larger than the original (handlers revert any inflation before sending),
+        # so compression savings are >= 0 by construction. A negative here is an
+        # intermediate/hook token-count artifact that never reached the model;
+        # clamp it so `total_tokens_removed` reflects actually-forwarded bytes
+        # instead of surfacing spurious negatives (verified clean on the wire).
+        if tokens_saved < 0:
+            logger.debug(
+                "record_tokens: clamping negative tokens_saved=%d to 0 for %s (artifact; wire not inflated)",
+                tokens_saved,
+                model,
+            )
+            tokens_saved = 0
         self._tokens_saved_by_model[model] = (
             self._tokens_saved_by_model.get(model, 0) + tokens_saved
         )

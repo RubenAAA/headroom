@@ -1,9 +1,12 @@
 """Tests for code structure handler."""
 
+from unittest.mock import patch
+
 import pytest
 
 from headroom.compression.handlers.code_handler import (
     CodeStructureHandler,
+    _check_tree_sitter,
     is_tree_sitter_available,
 )
 
@@ -70,6 +73,10 @@ class TestLanguageDetection:
         code = "use std::io;\n\npub fn main() {\n    let mut x = 1;\n}\n"
         assert handler._detect_language(code) == "rust"
 
+    def test_detects_perl(self, handler):
+        code = "use strict;\npackage Foo;\n\nsub greet {\n    my $name = shift;\n    return $name;\n}\n"
+        assert handler._detect_language(code) == "perl"
+
     def test_falls_back_to_default(self):
         handler = CodeStructureHandler(default_language="javascript")
         assert handler._detect_language("plain words only here") == "javascript"
@@ -110,9 +117,64 @@ class TestRegexFallbackLanguages:
         start = code.index(sig)
         assert all(result.mask.mask[i] for i in range(start, start + len(sig)))
 
+    def test_perl_sub_signature_preserved(self, handler):
+        code = "sub add {\n    my ($a, $b) = @_;\n    return $a + $b;\n}\n"
+        result = handler.get_mask(code, language="perl")
+        sig = "sub add"
+        start = code.index(sig)
+        assert all(result.mask.mask[i] for i in range(start, start + len(sig)))
+
+    def test_perl_use_import_preserved(self, handler):
+        code = "use strict;\nuse warnings;\n\nmy $x = 1;\n"
+        result = handler.get_mask(code, language="perl")
+        assert all(result.mask.mask[i] for i in range(len("use strict")))
+
     def test_regex_confidence_lower_than_tree_sitter(self, handler):
         result = handler.get_mask("def f():\n    pass\n", language="python")
         assert result.confidence == 0.7
+
+
+class TestAvailabilityProbe:
+    """_check_tree_sitter must exercise a real parse, not just an import."""
+
+    def test_abi_mismatch_returns_false(self):
+        import types
+
+        import headroom.compression.handlers.code_handler as mod
+
+        mod._tree_sitter_available = None
+
+        fake_ts = types.ModuleType("tree_sitter")
+
+        class FakeParser:
+            def __setattr__(self, name, value):
+                if name == "language":
+                    raise RuntimeError("ABI mismatch")
+                super().__setattr__(name, value)
+
+        fake_ts.Parser = FakeParser
+
+        fake_pack = types.ModuleType("tree_sitter_language_pack")
+        fake_pack.get_language = lambda name: object()
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "tree_sitter": fake_ts,
+                "tree_sitter_language_pack": fake_pack,
+            },
+        ):
+            result = _check_tree_sitter()
+        assert result is False
+        mod._tree_sitter_available = None
+
+    @requires_tree_sitter
+    def test_healthy_install_returns_true(self):
+        import headroom.compression.handlers.code_handler as mod
+
+        mod._tree_sitter_available = None
+        assert _check_tree_sitter() is True
+        mod._tree_sitter_available = None
 
 
 class TestEdgeCases:

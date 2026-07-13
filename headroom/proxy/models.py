@@ -133,8 +133,8 @@ class ProxyConfig:
     ccr_inject_tool: bool = True
     ccr_inject_system_instructions: bool = False
     # Proxy-level mirror of ContentRouterConfig.ccr_inject_marker, so retrieval
-    # markers can be toggled from the CLI (--no-ccr-marker). Threaded into the
-    # router in server.py; default preserves current behavior.
+    # markers can be toggled from the CLI (--no-ccr, which also drops the retrieve
+    # tool). Threaded into the router in server.py; default preserves current behavior.
     ccr_inject_marker: bool = True
 
     # CCR Response Handling
@@ -153,6 +153,34 @@ class ProxyConfig:
     # such as SmartCrusher, log/search/diff, and schema compaction enabled.
     # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
     disable_kompress: bool = False
+
+    # With disable_kompress, route fall-through content to PASSTHROUGH instead
+    # of the default KOMPRESS fallback strategy. Restores the legacy
+    # --disable-kompress behaviour for callers that relied on it. No effect
+    # unless disable_kompress is also set.
+    # CLI: --disable-kompress-fallback; env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1.
+    disable_kompress_fallback: bool = False
+
+    # Per-provider overrides for `disable_kompress`. None inherits the global
+    # value above; True/False force-disable/enable Kompress for that provider's
+    # pipeline only (other compressors and all routing/exclusion are unaffected).
+    # Lets e.g. Anthropic run without lossy text compression while OpenAI/Codex
+    # keeps it. CLI: --disable-kompress-anthropic / --enable-kompress-anthropic
+    # (and -openai); env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC / _OPENAI
+    # (1 = disable, 0 = enable).
+    disable_kompress_anthropic: bool | None = None
+    disable_kompress_openai: bool | None = None
+
+    # Force ALL compressible content through Kompress (kompress-v2-base),
+    # bypassing per-type compressor selection (SmartCrusher/CodeAware/log/
+    # diff/html/tabular/search). Tool ground truth stays protected: excluded
+    # tools (Read/Glob/Grep/...) and reversibility-gated tool output are never
+    # touched. Off by default; opt-in for systems that want one uniform
+    # compressor at the cost of per-type structural fidelity.
+    # CLI: --force-kompress-all; env: HEADROOM_FORCE_KOMPRESS_ALL=1.
+    force_kompress_all: bool = False
+
+    lossless: bool = False  # CLI: --lossless; env: HEADROOM_LOSSLESS=1. No-CCR mode: compress without any retrieval marker.
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
@@ -181,8 +209,26 @@ class ProxyConfig:
     # CLI: --exclude-tools <name1,name2>; env: HEADROOM_EXCLUDE_TOOLS=<name1,name2>
     exclude_tools: set[str] | None = None
 
+    # Tool names whose results must never be lossy-compressed (e.g. Bash, WebFetch).
+    # Merged into exclude_tools before ContentRouter processes the conversation.
+    # CLI: --protect-tool-results <name1,name2>; env: HEADROOM_PROTECT_TOOL_RESULTS=<name1,name2>
+    protect_tool_results: frozenset[str] = field(default_factory=frozenset)
+
     # Read lifecycle management
     read_lifecycle: bool = True
+
+    # Mechanism B: activity-based read maturation (hold fresh Reads out of
+    # the provider prefix cache; compress once their file quiesces).
+    # Experimental — default off. CLI: --read-maturation;
+    # env: HEADROOM_READ_MATURATION=1
+    read_maturation: bool = False
+    # Read-maturation tuning (only meaningful when read_maturation=True).
+    # Defaults mirror ReadMaturationConfig. CLI: --read-maturation-quiesce-turns,
+    # --read-maturation-max-hold-turns, --read-maturation-min-size-bytes;
+    # env: HEADROOM_READ_MATURATION_QUIESCE_TURNS / _MAX_HOLD_TURNS / _MIN_SIZE_BYTES.
+    read_maturation_quiesce_turns: int = 5
+    read_maturation_max_hold_turns: int = 25
+    read_maturation_min_size_bytes: int = 2048
 
     # Deprecated compatibility argument. ContentRouter is always active in
     # the Python proxy; accepting this avoids breaking old config constructors
@@ -232,11 +278,16 @@ class ProxyConfig:
     # Timeouts
     request_timeout_seconds: int = 300
     connect_timeout_seconds: int = 10
+    # Anthropic buffered reads can legitimately run longer than the generic
+    # proxy request cap. Keep the generic timeout unchanged elsewhere.
+    anthropic_buffered_request_timeout_seconds: int = 600
 
     # Connection pool
     max_connections: int = 500
     max_keepalive_connections: int = 100
+    keepalive_expiry: float = 90.0
     http2: bool = True
+    http_proxy: str | None = None
 
     # Memory System
     memory_enabled: bool = False
@@ -294,8 +345,26 @@ class ProxyConfig:
     subscription_poll_interval_s: int = 300
     subscription_active_window_s: int = 60
 
+    # Periodic TOIN stats logging. Enabled by default for observability, but
+    # operators of long-lived proxies can disable it if TOIN stats collection
+    # causes avoidable memory pressure on their platform.
+    # Env: HEADROOM_PERIODIC_TOIN_STATS=0.
+    periodic_toin_stats_enabled: bool = True
+
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
+
+    # Optional inbound auth. When set, non-loopback requests to the data-plane
+    # routes must present this token (``Authorization: Bearer <token>`` or the
+    # ``X-Headroom-Proxy-Token`` header). Loopback callers are exempt. Closes the
+    # gap where a container bound to 0.0.0.0 exposes unauthenticated /v1/* routes
+    # to the pod network. Env: HEADROOM_PROXY_TOKEN.
+    proxy_token: str | None = None
+
+    # Air-gap master switch — hard-disable ALL outbound network egress
+    # (telemetry beacon, update check, license/usage reporter, HuggingFace model
+    # downloads) for fully offline / regulated deployments. Env: HEADROOM_OFFLINE=1.
+    offline: bool = False
 
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
     #
@@ -316,7 +385,7 @@ class ProxyConfig:
     # Precedence: CLI > env > auto-compute.
     anthropic_pre_upstream_concurrency: int | None = None
     # Upper bound for waiting on the Anthropic pre-upstream semaphore
-    # before failing fast with a 503 + Retry-After. Keeps the queue bounded
+    # before failing open to passthrough compression. Keeps the queue bounded
     # when all pre-upstream slots are occupied by slow/hung work.
     anthropic_pre_upstream_acquire_timeout_seconds: float = 15.0
     # Fail-open timeout for Anthropic memory-context lookup while the request
@@ -327,9 +396,9 @@ class ProxyConfig:
     # Bound the dedicated compression threadpool. CPU-bound Rust work runs
     # here; the pool is separate from asyncio's default executor so other
     # ``asyncio.to_thread`` callers (file IO, etc.) are not contended by
-    # compression bursts. ``None`` resolves to ``min(32, (cpu_count or 1) * 4)``,
-    # matching asyncio's default executor sizing today. Lower the cap to
-    # tighten resource use on multi-tenant hosts; raise it to handle larger
+    # compression bursts. ``None`` resolves to ``cpu_count or 1`` so CPU-bound
+    # compression work does not oversubscribe hosts by default. Lower the cap
+    # to tighten resource use on multi-tenant hosts; raise it to handle larger
     # bursts. CLI: ``--compression-max-workers``. Env:
     # ``HEADROOM_COMPRESSION_MAX_WORKERS``.
     #

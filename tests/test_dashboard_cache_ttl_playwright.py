@@ -22,7 +22,7 @@ def _sample_stats() -> dict:
         "cost": {
             "savings_usd": 12.34,
             "compression_savings_usd": 12.34,
-            "cache_savings_usd": 5.67,
+            "cache_savings_usd": 5.25,
             "cli_tokens_avoided": 0,
         },
         "requests": {
@@ -76,7 +76,7 @@ def _sample_stats() -> dict:
                     "write_premium": "25%",
                     "savings_usd": 5.67,
                     "write_premium_usd": 0.42,
-                    "net_savings_usd": 5.67,
+                    "net_savings_usd": 5.25,
                     "label": "Explicit breakpoints, 5-min TTL",
                     "observed_ttl_buckets": {
                         "5m": {"tokens": 185_000, "requests": 18},
@@ -102,7 +102,7 @@ def _sample_stats() -> dict:
                 "bust_write_tokens": 0,
                 "savings_usd": 5.67,
                 "write_premium_usd": 0.42,
-                "net_savings_usd": 5.67,
+                "net_savings_usd": 5.25,
                 "hit_rate": 75.0,
                 "observed_ttl_buckets": {
                     "5m": {"tokens": 185_000, "requests": 18},
@@ -185,6 +185,39 @@ def _install_dashboard_routes(page: Page) -> None:
         route.continue_()
 
     page.route("**/*", handler)
+
+
+def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 1720, "height": 1400}, color_scheme="dark")
+        _install_dashboard_routes(page)
+
+        page.goto("http://127.0.0.1:8788/dashboard", wait_until="load")
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8788/p/<project-name>", exact=True
+            )
+        ).to_be_visible()
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/<project-name>", exact=True
+            )
+        ).to_have_count(0)
+
+        page.goto("http://headroom.local:9393/dashboard", wait_until="load")
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://headroom.local:9393/p/<project-name>", exact=True
+            )
+        ).to_be_visible()
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/<project-name>", exact=True
+            )
+        ).to_have_count(0)
+
+        browser.close()
 
 
 def test_dashboard_renders_observed_ttl_metrics_and_can_capture_screenshot() -> None:

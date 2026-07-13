@@ -30,6 +30,7 @@ class ContentType(Enum):
     BUILD_OUTPUT = "build"  # Compiler, test, lint logs
     GIT_DIFF = "diff"  # Unified diff format
     HTML = "html"  # Web pages (needs content extraction, not compression)
+    TABULAR = "tabular"  # CSV/TSV, markdown tables, fixed-width tables
     PLAIN_TEXT = "text"  # Fallback
 
 
@@ -46,6 +47,10 @@ class DetectionResult:
 _SEARCH_RESULT_PATTERN = re.compile(
     r"^[^\s:]+:\d+:"  # file:line: format (grep -n style)
 )
+
+# A markdown table separator row, e.g. "| --- | :--: |" or "---|---".
+# Every cell must be dashes with optional alignment colons.
+_MD_SEP_CELL = re.compile(r"^:?-{2,}:?$")
 
 # Bug-fix (2026-04-25): extended to recognize merge-commit headers
 # (`diff --combined <path>`, `diff --cc <path>`) and combined-diff hunk
@@ -94,6 +99,15 @@ _CODE_PATTERNS = {
         re.compile(r"^\s*(public|private|protected)\s+(class|interface|enum)"),
         re.compile(r"^\s*@\w+"),  # annotations
         re.compile(r"^\s*package\s+[\w.]+;"),
+    ],
+    "csharp": [
+        re.compile(r"^\s*using\s+[\w.]+\s*;"),  # using directive (not C++ `using namespace x;`)
+        re.compile(r"^\s*namespace\s+[\w.]+"),
+        re.compile(
+            r"^\s*(public|private|protected|internal|sealed|static|abstract|partial)\s+"
+            r"(class|struct|record|interface|enum)\b"
+        ),
+        re.compile(r"^.*\b(get|set|init);"),  # auto-property accessors
     ],
 }
 
@@ -159,43 +173,134 @@ def detect_content_type(content: str) -> DetectionResult:
     if log_result and log_result.confidence >= 0.5:
         return log_result
 
-    # 6. Check for source code
+    # 6. Check for tabular data (CSV/TSV, markdown tables). Runs after
+    #    search/log so colon-delimited search output and freeform logs claim
+    #    their content first; tabular requires a consistent multi-column
+    #    delimiter or a markdown header+separator pair.
+    tabular_result = _try_detect_tabular(content)
+    if tabular_result and tabular_result.confidence >= 0.6:
+        return tabular_result
+
+    # 7. Check for source code
     code_result = _try_detect_code(content)
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 7. Fallback to plain text
+    # 8. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
 
 
-def _try_detect_json(content: str) -> DetectionResult | None:
-    """Try to detect JSON array content."""
-    content = content.strip()
+_JSON_DECODER = json.JSONDecoder()
+# The decoded JSON value must be at least this fraction of the content for a
+# WRAPPED payload to still count as JSON: a small structural wrapper (a harness
+# observation shell, an ``Exit code:`` prefix) around a JSON body passes, but a
+# prose/code blob that merely contains a JSON fragment does not. Fraction-based
+# so it is size-correct — a large JSON with a proportionally small wrapper passes,
+# a short mostly-prose string does not. (Pure JSON never reaches this check.)
+_JSON_MIN_BULK_FRACTION = 0.6
 
-    # Quick check: must start with [ for array
-    if not content.startswith("["):
+
+def _decode_concatenated_json(content: str) -> list | None:
+    """Decode a run of whitespace-separated top-level JSON values.
+
+    Web search tools (SerpAPI, Tavily, custom backends) commonly emit
+    back-to-back JSON objects separated only by whitespace rather than a real
+    array: ``{"title": ...} {"title": ...} {"title": ...}``. Returns the list
+    of decoded values, or None if the text isn't a clean run of JSON values
+    separated only by whitespace.
+    """
+    decoder = json.JSONDecoder()
+    idx, length = 0, len(content)
+    items: list = []
+    while idx < length:
+        while idx < length and content[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+        try:
+            value, idx = decoder.raw_decode(content, idx)
+        except ValueError:
+            return None
+        items.append(value)
+    return items or None
+
+
+def normalize_concatenated_json(content: str) -> str | None:
+    """Convert whitespace-separated JSON objects into a canonical JSON array.
+
+    SmartCrusher only compresses JSON arrays, so this rewrites the
+    space-separated web_search shape (``{...} {...} {...}``) into
+    ``[{...}, {...}, {...}]``. Returns None unless the content is two or more
+    whitespace-separated JSON objects.
+    """
+    stripped = content.strip()
+    if not stripped.startswith("{"):
+        return None
+    items = _decode_concatenated_json(stripped)
+    if items and len(items) >= 2 and all(isinstance(item, dict) for item in items):
+        return json.dumps(items)
+    return None
+
+
+def _try_detect_json(content: str) -> DetectionResult | None:
+    """Detect JSON by PARSING, not by surface patterns.
+
+    JSON is whatever parses as JSON — objects, arrays, and any nesting are all
+    equally JSON, so a leading-``[`` check misses every ``{…}`` config/data file.
+    Tool output is often a JSON value wrapped in a little surrounding text (a
+    harness observation shell, an ``Exit code:`` prefix); we decode one JSON value
+    out of the payload and accept it when it is the bulk of the content, which
+    tolerates ANY wrapper without hard-coding a harness's tags. The whitespace-
+    separated web_search shape (``{...} {...}``, #1741) is detected too and
+    normalized to a real array before crushing (see normalize_concatenated_json).
+    """
+    stripped = content.strip()
+    if not stripped:
         return None
 
     try:
-        parsed = json.loads(content)
-        if isinstance(parsed, list):
-            # Check if it's a list of dicts (SmartCrusher compatible)
-            if parsed and all(isinstance(item, dict) for item in parsed):
+        value = json.loads(stripped)
+    except ValueError:
+        # Not pure JSON. First: a run of whitespace-separated top-level JSON
+        # objects (web_search output, #1741) -> JSON_ARRAY.
+        if stripped.startswith("{"):
+            items = _decode_concatenated_json(stripped)
+            if items and len(items) >= 2 and all(isinstance(item, dict) for item in items):
                 return DetectionResult(
                     ContentType.JSON_ARRAY,
                     1.0,
-                    {"item_count": len(parsed), "is_dict_array": True},
+                    {"item_count": len(items), "is_dict_array": True, "concatenated": True},
                 )
-            # It's a list but not of dicts
-            return DetectionResult(
-                ContentType.JSON_ARRAY,
-                0.8,
-                {"item_count": len(parsed), "is_dict_array": False},
-            )
-    except json.JSONDecodeError:
-        pass
+        # Otherwise decode one JSON value out of a small wrapped payload.
+        start = min((i for i in (stripped.find("{"), stripped.find("[")) if i >= 0), default=-1)
+        if start < 0:
+            return None
+        try:
+            value, end = _JSON_DECODER.raw_decode(stripped, start)
+        except ValueError:
+            return None
+        # Accept only when the decoded JSON is the BULK of the content (see
+        # _JSON_MIN_BULK_FRACTION) — a small structural wrapper around a JSON body,
+        # not a prose/code blob that merely contains a JSON fragment.
+        if (end - start) < len(stripped) * _JSON_MIN_BULK_FRACTION:
+            return None
 
-    return None
+    # A bare scalar (42, "s", true) is not structured data worth routing as JSON.
+    if not isinstance(value, (dict, list)):
+        return None
+
+    if isinstance(value, list):
+        is_dict_array = bool(value) and all(isinstance(item, dict) for item in value)
+        return DetectionResult(
+            ContentType.JSON_ARRAY,
+            1.0 if is_dict_array else 0.8,
+            {"item_count": len(value), "is_dict_array": is_dict_array},
+        )
+    return DetectionResult(
+        ContentType.JSON_ARRAY,
+        0.9,
+        {"is_dict_array": False, "is_object": True},
+    )
 
 
 def _try_detect_diff(content: str) -> DetectionResult | None:
@@ -378,6 +483,102 @@ def _try_detect_log(content: str) -> DetectionResult | None:
             "total_lines": non_empty_lines,
         },
     )
+
+
+def _md_cell_count(row: str) -> int:
+    """Count cells in a markdown table row, ignoring the outer pipes."""
+    return len(row.strip().strip("|").split("|"))
+
+
+def _is_md_separator(row: str) -> bool:
+    """True if `row` is a markdown table separator (e.g. ``| --- | :--: |``)."""
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    cells = [c for c in cells if c != ""]
+    if len(cells) < 2:
+        return False
+    return all(_MD_SEP_CELL.match(c) for c in cells)
+
+
+def _try_detect_markdown_table(lines: list[str]) -> DetectionResult | None:
+    """Detect a markdown table: a piped header row followed by a separator."""
+    for i in range(len(lines) - 1):
+        header, sep = lines[i], lines[i + 1]
+        if "|" in header and _is_md_separator(sep):
+            cols = _md_cell_count(header)
+            if cols >= 2:
+                return DetectionResult(
+                    ContentType.TABULAR,
+                    0.95,
+                    {"format": "markdown", "columns": cols},
+                )
+    return None
+
+
+def _try_detect_delimited(lines: list[str]) -> DetectionResult | None:
+    """Detect CSV/TSV by a delimiter with a consistent per-line column count.
+
+    A stable column count is what separates real tabular data from prose that
+    merely contains commas, and from ``file:line:content`` search output (which
+    has a variable number of colons). Tabs are a stronger signal than commas
+    (they rarely occur in prose), so they need less consistency.
+    """
+    from collections import Counter
+
+    sample = lines[:20]
+    if len(sample) < 3:
+        return None
+
+    best: DetectionResult | None = None
+    for delim, min_consistency in ((",", 0.85), ("\t", 0.7), (";", 0.85), ("|", 0.85)):
+        counts = [row.count(delim) for row in sample]
+        if counts[0] == 0:  # header row must contain the delimiter
+            continue
+        common_count, freq = Counter(counts).most_common(1)[0]
+        if common_count == 0:
+            continue
+        consistency = freq / len(sample)
+        ncols = common_count + 1
+        if ncols < 2 or consistency < min_consistency:
+            continue
+        # Prose guard: prose that merely contains commas ("Hello, friend.")
+        # reads like sentences. Real table rows are short field tuples.
+        if _looks_like_prose(sample, delim):
+            continue
+        confidence = min(0.95, 0.5 + consistency * 0.3 + min(ncols, 5) * 0.03)
+        if best is None or confidence > best.confidence:
+            best = DetectionResult(
+                ContentType.TABULAR,
+                confidence,
+                {"format": "csv", "delimiter": delim, "columns": ncols},
+            )
+    return best
+
+
+def _looks_like_prose(sample: list[str], delim: str) -> bool:
+    """Heuristic: distinguish comma-bearing prose from real CSV rows.
+
+    Prose reads like sentences (ends with ``.!?``) and has wordy cells; CSV
+    rows are short field tuples. Either signal rejects the candidate.
+    """
+    enders = sum(1 for r in sample if r.rstrip().endswith((".", "!", "?")))
+    if enders / len(sample) >= 0.5:
+        return True
+    cells = [c.strip() for r in sample for c in r.split(delim)]
+    avg_words = sum(len(c.split()) for c in cells) / len(cells)
+    return avg_words > 3
+
+
+def _try_detect_tabular(content: str) -> DetectionResult | None:
+    """Detect tabular text: markdown tables first, then delimited CSV/TSV."""
+    lines = [ln for ln in content.split("\n") if ln.strip()][:50]
+    if len(lines) < 3:
+        return None
+
+    md_result = _try_detect_markdown_table(lines)
+    if md_result:
+        return md_result
+
+    return _try_detect_delimited(lines)
 
 
 def _try_detect_code(content: str) -> DetectionResult | None:

@@ -13,7 +13,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import jitter_delay_ms
+from headroom.proxy.helpers import (
+    RETRYABLE_OVERLOAD_STATUSES,
+    jitter_delay_ms,
+    retry_after_ms,
+)
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -58,6 +62,51 @@ def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
 
 class StreamingMixin:
     """Mixin providing streaming response methods for HeadroomProxy."""
+
+    _mid_turn_queues: dict[str, asyncio.Queue] = {}
+    _active_streams: set[str] = set()
+
+    @staticmethod
+    def _get_session_key(body: dict, session_header: str | None = None) -> str:
+        """Return session identity from an explicit header or a body-derived hash.
+
+        Fallback mirrors prefix_tracker.compute_session_id: md5(model:system[:500]).
+        """
+        if session_header:
+            return session_header
+        import hashlib
+
+        system = body.get("system", "")
+        if isinstance(system, list):
+            for block in system:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    system = block.get("text", "")
+                    break
+            else:
+                system = ""
+        system_content = str(system)[:500]
+        key = f"{body.get('model', '')}:{system_content}"
+        return hashlib.md5(key.encode()).hexdigest()[:16]
+
+    def _queue_mid_turn_message(self, session_key: str, body: dict) -> dict:
+        """Queue a mid-turn message and return a 202 response."""
+        if session_key not in self._mid_turn_queues:
+            self._mid_turn_queues[session_key] = asyncio.Queue()
+        self._mid_turn_queues[session_key].put_nowait(body)
+        return {"status": 202, "event": "headroom_queued"}
+
+    def _cleanup_mid_turn_stream(
+        self, session_key: str, *, drain_pending_messages: bool = False
+    ) -> list[dict]:
+        """Clear active mid-turn state, optionally returning queued messages."""
+        self._active_streams.discard(session_key)
+        queue = self._mid_turn_queues.pop(session_key, None)
+        if not drain_pending_messages or queue is None or queue.empty():
+            return []
+        pending_messages: list[dict] = []
+        while not queue.empty():
+            pending_messages.append(queue.get_nowait())
+        return pending_messages
 
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
@@ -301,6 +350,19 @@ class StreamingMixin:
         # sequentially, but the index map is the source of truth.
         blocks_by_index: dict[int, dict[str, Any]] = {}
         current_block: dict[str, Any] | None = None
+        # Track which block indices have already been appended to
+        # `response["content"]`. Dedup used to be `target not in
+        # response["content"]` — plain dict-equality. Two distinct blocks
+        # that happen to accumulate identical values (most commonly two
+        # separate empty `thinking` blocks, e.g. from a retried HTTP/2
+        # stream reset redelivering a truncated segment) either got
+        # wrongly collapsed into one, or — when their partial content
+        # happened to differ (same index, unequal dict) — both slipped
+        # through as duplicates. Indexing by `index` (falling back to
+        # object identity for the legacy no-index path) makes dedup exact
+        # regardless of what the accumulated content looks like: one
+        # entry per block index, first `content_block_stop` wins.
+        appended_block_keys: set[int] = set()
 
         for line in sse_data.split("\n"):
             if not line.startswith("data: "):
@@ -322,6 +384,8 @@ class StreamingMixin:
                 response["model"] = msg.get("model")
                 response["role"] = msg.get("role", "assistant")
                 response["stop_reason"] = msg.get("stop_reason")
+                if "stop_details" in msg:
+                    response["stop_details"] = msg["stop_details"]
                 if msg.get("usage"):
                     response["usage"].update(msg["usage"])
 
@@ -407,18 +471,23 @@ class StreamingMixin:
                     # Anthropic API.
                     if target.get("type") == "thinking" and "thinking_buffer" in target:
                         target["thinking"] = target.pop("thinking_buffer")
-                    # Append the block exactly once. `current_block`
-                    # may not match the indexed target if the stream
-                    # interleaved multiple blocks; index-keyed map is
-                    # authoritative.
-                    if target not in response["content"]:
+                    # Append the block exactly once, keyed by its block
+                    # index (or object identity when no index was ever
+                    # assigned). `current_block` may not match the
+                    # indexed target if the stream interleaved multiple
+                    # blocks; index-keyed map is authoritative.
+                    block_key = idx if idx is not None else id(target)
+                    if block_key not in appended_block_keys:
                         response["content"].append(target)
+                        appended_block_keys.add(block_key)
                     current_block = None
 
             elif event_type == "message_delta":
                 delta = data.get("delta", {})
-                if delta.get("stop_reason"):
+                if "stop_reason" in delta:
                     response["stop_reason"] = delta["stop_reason"]
+                if "stop_details" in delta:
+                    response["stop_details"] = delta["stop_details"]
                 if data.get("usage"):
                     response["usage"].update(data["usage"])
 
@@ -474,8 +543,39 @@ class StreamingMixin:
                         "input": {},
                     },
                 }
+            elif block.get("type") == "thinking":
+                content_block = {
+                    "type": "thinking",
+                    "thinking": "",
+                }
+                if "signature" in block:
+                    content_block["signature"] = block["signature"]
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": content_block,
+                }
+            elif block.get("type") == "redacted_thinking":
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "redacted_thinking",
+                        "data": block.get("data", ""),
+                    },
+                }
+            elif block.get("type") == "server_tool_use":
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": block,
+                }
             else:
-                continue
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": block,
+                }
 
             events.append(
                 f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
@@ -489,6 +589,15 @@ class StreamingMixin:
                     "delta": {"type": "text_delta", "text": block["text"]},
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+                for citation in block.get("citations", []) or []:
+                    citation_delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "citations_delta", "citation": citation},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(citation_delta)}\n\n".encode()
+                    )
             elif block.get("type") == "tool_use" and block.get("input"):
                 delta = {
                     "type": "content_block_delta",
@@ -499,15 +608,39 @@ class StreamingMixin:
                     },
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+            elif block.get("type") == "thinking":
+                if block.get("thinking"):
+                    delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "thinking_delta", "thinking": block["thinking"]},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
+                    )
+                if block.get("signature"):
+                    delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "signature_delta", "signature": block["signature"]},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
+                    )
 
             # content_block_stop
             block_stop = {"type": "content_block_stop", "index": idx}
             events.append(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
 
         # message_delta
+        msg_delta_payload: dict[str, Any] = {}
+        if "stop_reason" in response:
+            msg_delta_payload["stop_reason"] = response["stop_reason"]
+        if "stop_details" in response:
+            msg_delta_payload["stop_details"] = response["stop_details"]
         msg_delta = {
             "type": "message_delta",
-            "delta": {"stop_reason": response.get("stop_reason", "end_turn")},
+            "delta": msg_delta_payload,
             "usage": {"output_tokens": response.get("usage", {}).get("output_tokens", 0)},
         }
         events.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
@@ -543,24 +676,17 @@ class StreamingMixin:
 
             input_data = block.get("input", {})
             hash_key = input_data.get("hash")
-            query = input_data.get("query")
 
             if not hash_key:
                 continue
 
-            logger.info(
-                f"[{request_id}] CCR Feedback: Recording retrieval "
-                f"hash={hash_key[:8]}... query={query!r}"
-            )
+            logger.info(f"[{request_id}] CCR Feedback: Recording retrieval hash={hash_key[:8]}...")
 
-            # Call store.retrieve()/search() for the side effect of triggering
-            # the feedback chain: _log_retrieval -> process_pending_feedback
+            # Call store.retrieve() for the side effect of triggering the
+            # feedback chain: _log_retrieval -> process_pending_feedback
             # -> toin.record_retrieval(). We discard the returned content.
             try:
-                if query:
-                    store.search(hash_key, query)
-                else:
-                    store.retrieve(hash_key, query=None)
+                store.retrieve(hash_key)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback recording failed: {e}")
 
@@ -625,19 +751,15 @@ class StreamingMixin:
             if not isinstance(input_data, dict):
                 continue
             hash_key = input_data.get("hash")
-            query = input_data.get("query")
             if not hash_key:
                 continue
 
             logger.info(
                 f"[{request_id}] CCR Feedback (openai stream): Recording retrieval "
-                f"hash={hash_key[:8]}... query={query!r}"
+                f"hash={hash_key[:8]}..."
             )
             try:
-                if query:
-                    store.search(hash_key, query)
-                else:
-                    store.retrieve(hash_key, query=None)
+                store.retrieve(hash_key)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback (openai stream) failed: {e}")
 
@@ -750,6 +872,27 @@ class StreamingMixin:
                         next_forwarded.append(_copy.deepcopy(asst_msg))
                         next_original.append(_copy.deepcopy(asst_msg))
 
+            # Cache-miss attribution (#1313), streaming Anthropic path. Mirror
+            # the non-streaming handler: classify BEFORE update_from_response
+            # overwrites the last-turn state the classifier reads. Compare the
+            # prefix we forwarded this turn (`forwarded_messages`, pre-assistant
+            # append) against last turn's.
+            # `hasattr` guard: stub trackers in tests may implement only the
+            # freeze API, not the full PrefixCacheTracker surface.
+            if provider == "anthropic" and hasattr(prefix_tracker, "classify_cache_miss"):
+                miss = prefix_tracker.classify_cache_miss(
+                    cache_read_tokens=cache_read_tokens,
+                    current_forwarded_messages=forwarded_messages,
+                )
+                if miss.is_miss:
+                    logger.info(
+                        f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                        f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                        f"expected_cached={miss.expected_cached_tokens:,} "
+                        f"prefix_changed={miss.prefix_changed} ttl_exceeded={miss.ttl_exceeded}"
+                    )
+                    await self.metrics.record_cache_miss_attribution(provider, miss.reason)
+
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
@@ -816,6 +959,7 @@ class StreamingMixin:
         memory_request_ctx: Any | None = None,
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
+        session_key: str | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -828,6 +972,71 @@ class StreamingMixin:
         3. Makes continuation requests until no memory tools remain
         4. Streams the final response to the client
         """
+        session_key = session_key or self._get_session_key(body)
+        self._active_streams.add(session_key)
+
+        # Guard everything up to the generator's own try/finally (which owns
+        # cleanup once streaming starts): any exception here — including
+        # asyncio.CancelledError from a client disconnect mid-setup — must
+        # still release session_key, or it wedges in _active_streams forever
+        # and every later request on this session gets stuck 202-queued.
+        try:
+            return await self._stream_response_inner(
+                url=url,
+                headers=headers,
+                body=body,
+                provider=provider,
+                model=model,
+                request_id=request_id,
+                original_tokens=original_tokens,
+                optimized_tokens=optimized_tokens,
+                tokens_saved=tokens_saved,
+                transforms_applied=transforms_applied,
+                tags=tags,
+                optimization_latency=optimization_latency,
+                memory_user_id=memory_user_id,
+                pipeline_timing=pipeline_timing,
+                prefix_tracker=prefix_tracker,
+                original_messages=original_messages,
+                original_body_bytes=original_body_bytes,
+                body_mutated=body_mutated,
+                mutation_reasons=mutation_reasons,
+                memory_request_ctx=memory_request_ctx,
+                outcome_provider=outcome_provider,
+                waste_signals=waste_signals,
+                session_key=session_key,
+            )
+        except (Exception, asyncio.CancelledError):
+            self._cleanup_mid_turn_stream(session_key)
+            raise
+
+    async def _stream_response_inner(
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        provider: str,
+        model: str,
+        request_id: str,
+        original_tokens: int,
+        optimized_tokens: int,
+        tokens_saved: int,
+        transforms_applied: list[str],
+        tags: dict[str, str],
+        optimization_latency: float,
+        memory_user_id: str | None,
+        pipeline_timing: dict[str, float] | None,
+        prefix_tracker: Any | None,
+        original_messages: list[dict] | None,
+        original_body_bytes: bytes | None,
+        body_mutated: bool,
+        mutation_reasons: list[str] | None,
+        memory_request_ctx: Any | None,
+        outcome_provider: str | None,
+        waste_signals: dict[str, int] | None,
+        session_key: str,
+    ) -> Response | StreamingResponse:
+        """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
@@ -843,11 +1052,11 @@ class StreamingMixin:
         # bytes once before entering the connection-retry loop. When a
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
+        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
         from headroom.proxy.helpers import (
             capture_codex_wire_debug,
             codex_wire_debug_enabled,
             log_outbound_request,
-            prepare_outbound_body_bytes,
         )
 
         outbound_bytes, outbound_source = prepare_outbound_body_bytes(
@@ -938,8 +1147,37 @@ class StreamingMixin:
                             headers=dict(upstream_response.headers),
                             status_code=upstream_response.status_code,
                         )
+                    # Retry transient overloads (429 rate-limit, 529 overloaded)
+                    # honoring Retry-After — the streaming sibling of the
+                    # _retry_request path (#1221); on exhaustion, fall through to
+                    # forward the status to the client.
+                    if (
+                        upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
+                        and self.config.retry_enabled
+                        and attempt < retry_attempts - 1
+                    ):
+                        delay_with_jitter = retry_after_ms(
+                            upstream_response, self.config.retry_max_delay_ms
+                        ) or jitter_delay_ms(
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms,
+                            attempt,
+                        )
+                        await upstream_response.aclose()
+                        logger.warning(
+                            f"[{request_id}] Upstream {upstream_response.status_code} "
+                            f"(attempt {attempt + 1}/{retry_attempts}), "
+                            f"retrying in {delay_with_jitter:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_with_jitter / 1000)
+                        continue
                     break
-                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                # Retry any transport-level failure while opening the upstream
+                # stream — including HTTP/2 protocol errors (Local/RemoteProtocol
+                # `StreamReset`) from a poisoned shared h2 connection. This runs
+                # before any body byte is forwarded to the client, so re-sending
+                # on a fresh connection is safe and avoids a 502. (#1639)
+                except httpx.TransportError as e:
                     last_connect_error = e
                     if attempt >= retry_attempts - 1:
                         raise
@@ -958,7 +1196,10 @@ class StreamingMixin:
 
             if upstream_response is None:
                 raise last_connect_error or RuntimeError("upstream connection did not start")
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        # Retries exhausted (or a transport failure escaped the loop): emit a
+        # clean SSE error instead of letting an h2 StreamReset bubble up as a
+        # 502. Covers ConnectError/timeouts and Local/RemoteProtocolError. (#1639)
+        except httpx.TransportError as e:
             error_msg = str(e) or repr(e)
             logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
 
@@ -972,6 +1213,7 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
+            self._cleanup_mid_turn_stream(session_key)
             return StreamingResponse(_error_gen(), media_type="text/event-stream")
 
         # Capture Codex rate-limit window data from the upstream response
@@ -1069,6 +1311,7 @@ class StreamingMixin:
                 client=client,
                 waste_signals=waste_signals,
             )
+            self._cleanup_mid_turn_stream(session_key)
             return Response(
                 content=error_content,
                 status_code=upstream_response.status_code,
@@ -1080,10 +1323,16 @@ class StreamingMixin:
         # window/credit headers — the latter do not contain the ``ratelimit``
         # substring, so without the second clause the Codex CLI's own
         # session/weekly display would stop updating on the streaming path.
+        # We also forward the ``request-id`` family: clients such as Claude Code
+        # record it per transcript turn, and downstream usage/cost tools dedup by
+        # message id + request id. The buffered (non-streaming) path already
+        # forwards every upstream header, so this keeps the two paths symmetric.
         forwarded_headers = {
             k: v
             for k, v in upstream_response.headers.items()
-            if "ratelimit" in k.lower() or k.lower().startswith("x-codex")
+            if "ratelimit" in k.lower()
+            or k.lower().startswith("x-codex")
+            or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
 
         async def generate():
@@ -1098,6 +1347,8 @@ class StreamingMixin:
             # corrupted strings.
             full_sse_bytes = bytearray()
             parsed_response = None  # Set by memory block; used by CCR + prefix tracker
+            completed_normally = False
+            pending_messages: list[dict] = []
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
@@ -1268,6 +1519,7 @@ class StreamingMixin:
                         status_code=upstream_response.status_code,
                         metadata={"total_bytes": stream_state["total_bytes"]},
                     )
+                completed_normally = True
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
@@ -1291,6 +1543,10 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
+                pending_messages = self._cleanup_mid_turn_stream(
+                    session_key,
+                    drain_pending_messages=completed_normally,
+                )
                 # PR-A8 / P1-8: best-effort decode for downstream
                 # finalization. This runs in `finally` so it must not
                 # raise — if the upstream sent invalid bytes mid-stream
@@ -1334,6 +1590,11 @@ class StreamingMixin:
                     client=client,
                     waste_signals=waste_signals,
                 )
+                if pending_messages:
+                    pending_event = json.dumps(
+                        {"type": "headroom_pending_messages", "messages": pending_messages}
+                    )
+                    yield f"event: headroom_pending_messages\ndata: {pending_event}\n\n".encode()
 
         return StreamingResponse(
             generate(),
@@ -1390,6 +1651,21 @@ class StreamingMixin:
                     # Record TTFB on first event
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
+
+                    # Backfill input_tokens on message_start (issue #1132).
+                    # LiteLLM/Bedrock streaming never surfaces prompt tokens
+                    # (only output_tokens, at the end), so the backend emits
+                    # message_start with usage.input_tokens=0. Anthropic clients
+                    # (e.g. Claude Code) read input_tokens from message_start and
+                    # would otherwise report ~0 input for every request. Inject
+                    # the token count Headroom actually sent upstream
+                    # (optimized_tokens) when the backend left it unset/zero, so
+                    # downstream metrics reflect real usage. A non-zero value
+                    # already reported by the backend is preserved untouched.
+                    if event.event_type == "message_start" and not event.raw_sse:
+                        msg_usage = event.data.setdefault("message", {}).setdefault("usage", {})
+                        if not msg_usage.get("input_tokens") and optimized_tokens > 0:
+                            msg_usage["input_tokens"] = optimized_tokens
 
                     # Format as SSE
                     if event.raw_sse:

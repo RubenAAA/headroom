@@ -32,7 +32,7 @@ def test_wrap_claude_prepare_only_skips_host_binary_lookup() -> None:
 
     with patch("headroom.cli.wrap._prepare_wrap_rtk") as prepare_rtk:
         with patch("headroom.cli.wrap.shutil.which") as which_mock:
-            result = runner.invoke(main, ["wrap", "claude", "--prepare-only"])
+            result = runner.invoke(main, ["wrap", "claude", "--prepare-only", "--context-tool"])
 
     assert result.exit_code == 0, result.output
     prepare_rtk.assert_called_once()
@@ -48,7 +48,7 @@ def test_wrap_claude_prepare_only_uses_lean_ctx_when_configured(monkeypatch) -> 
             "headroom.cli.wrap._setup_lean_ctx_agent",
             return_value=Path("lean-ctx"),
         ) as setup:
-            result = runner.invoke(main, ["wrap", "claude", "--prepare-only"])
+            result = runner.invoke(main, ["wrap", "claude", "--prepare-only", "--context-tool"])
 
     assert result.exit_code == 0, result.output
     prepare_rtk.assert_not_called()
@@ -89,8 +89,9 @@ def test_wrap_codex_prepare_only_updates_config(monkeypatch, tmp_path: Path) -> 
     assert result.exit_code == 0, result.output
     config_file = tmp_path / ".codex" / "config.toml"
     assert config_file.exists()
-    assert 'model_provider = "headroom"' in config_file.read_text()
-    assert 'base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text()
+    content = config_file.read_text(encoding="utf-8")
+    assert 'model_provider = "headroom"' in content
+    assert 'base_url = "http://127.0.0.1:8787/v1"' in content
 
 
 def test_wrap_codex_prepare_only_uses_lean_ctx_when_configured(monkeypatch, tmp_path: Path) -> None:
@@ -151,21 +152,52 @@ def test_wrap_aider_prepare_only_injects_conventions(monkeypatch, tmp_path: Path
         assert result.exit_code == 0, result.output
         conventions = Path("CONVENTIONS.md")
         assert conventions.exists()
-        assert "headroom:rtk-instructions" in conventions.read_text()
+        assert "headroom:rtk-instructions" in conventions.read_text(encoding="utf-8")
 
 
-def test_wrap_cursor_prepare_only_injects_cursorrules(monkeypatch, tmp_path: Path) -> None:
+def test_wrap_cursor_prepare_only_registers_native_hook(monkeypatch, tmp_path: Path) -> None:
+    # GH #756: when rtk's own `--agent cursor` hook registers successfully,
+    # headroom must not also inject RTK_INSTRUCTIONS_BLOCK into .cursorrules.
+    _set_test_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    # headroom trusts the on-disk hook, not rtk's exit code, so simulate rtk
+    # actually writing ~/.cursor/hooks.json when registration succeeds.
+    def _register(_rtk_path, *, agent):
+        hooks = tmp_path / ".cursor" / "hooks.json"
+        hooks.parent.mkdir(parents=True, exist_ok=True)
+        hooks.write_text('{"hooks": {"preToolUse": [{"command": "rtk hook cursor"}]}}')
+        return True
+
+    with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+        with (
+            patch("headroom.cli.wrap._ensure_rtk_binary", return_value=Path("rtk")),
+            patch("headroom.rtk.installer.register_agent_hooks", side_effect=_register) as register,
+        ):
+            result = runner.invoke(main, ["wrap", "cursor", "--prepare-only"])
+
+        assert result.exit_code == 0, result.output
+        register.assert_called_once_with(Path("rtk"), agent="cursor")
+        assert not Path(".cursorrules").exists()
+
+
+def test_wrap_cursor_prepare_only_falls_back_to_cursorrules_when_hook_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
     _set_test_home(monkeypatch, tmp_path)
     runner = CliRunner()
 
     with runner.isolated_filesystem(temp_dir=str(tmp_path)):
-        with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=Path("rtk")):
+        with (
+            patch("headroom.cli.wrap._ensure_rtk_binary", return_value=Path("rtk")),
+            patch("headroom.rtk.installer.register_agent_hooks", return_value=False),
+        ):
             result = runner.invoke(main, ["wrap", "cursor", "--prepare-only"])
 
         assert result.exit_code == 0, result.output
         cursorrules = Path(".cursorrules")
         assert cursorrules.exists()
-        assert "headroom:rtk-instructions" in cursorrules.read_text()
+        assert "headroom:rtk-instructions" in cursorrules.read_text(encoding="utf-8")
 
 
 def test_wrap_cursor_prepare_only_uses_lean_ctx_when_configured(

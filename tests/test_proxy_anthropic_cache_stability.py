@@ -86,10 +86,32 @@ def _make_proxy_client() -> TestClient:
     return TestClient(app)
 
 
-def test_anthropic_tools_sorted_deterministically_before_forward() -> None:
+@pytest.mark.parametrize(
+    ("optimize", "expected_names"),
+    [
+        (False, ["zeta", "alpha", "mu"]),
+        (True, ["alpha", "mu", "zeta"]),
+    ],
+)
+def test_anthropic_tools_forwarding_order_matches_optimization_mode(
+    optimize: bool,
+    expected_names: list[str],
+) -> None:
     captured = {}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
+        proxy.config.optimize = optimize
+        proxy.config.mode = "token"
+
+        if optimize:
+            proxy.anthropic_pipeline.apply = lambda **kwargs: SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=[],
+                timing={},
+                tokens_before=100,
+                tokens_after=100,
+                waste_signals=None,
+            )
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured["body"] = body
@@ -128,7 +150,7 @@ def test_anthropic_tools_sorted_deterministically_before_forward() -> None:
 
         assert response.status_code == 200
         sent_tools = captured["body"]["tools"]
-        assert [t["name"] for t in sent_tools] == ["alpha", "mu", "zeta"]
+        assert [t["name"] for t in sent_tools] == expected_names
 
 
 def test_image_compression_only_applies_to_latest_non_frozen_user_turn() -> None:
@@ -186,10 +208,20 @@ def test_image_compression_does_not_touch_previous_turns_if_last_message_not_use
     assert result[0]["content"][0]["source"]["data"] == "OLD_IMAGE_BYTES"
 
 
-def test_anthropic_batch_tools_sorted_deterministically_before_forward() -> None:
+@pytest.mark.parametrize(
+    ("optimize", "expected_names"),
+    [
+        (False, ["zeta", "alpha", "mu"]),
+        (True, ["alpha", "mu", "zeta"]),
+    ],
+)
+def test_anthropic_batch_tools_forwarding_order_matches_optimization_mode(
+    optimize: bool,
+    expected_names: list[str],
+) -> None:
     captured = {}
     config = ProxyConfig(
-        optimize=False,
+        optimize=optimize,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -203,6 +235,17 @@ def test_anthropic_batch_tools_sorted_deterministically_before_forward() -> None
 
     with TestClient(app) as client:
         proxy = client.app.state.proxy
+        proxy.config.mode = "token"
+
+        if optimize:
+            proxy.anthropic_pipeline.apply = lambda **kwargs: SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=[],
+                timing={},
+                tokens_before=100,
+                tokens_after=100,
+                waste_signals=None,
+            )
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured["body"] = body
@@ -259,7 +302,7 @@ def test_anthropic_batch_tools_sorted_deterministically_before_forward() -> None
 
         assert response.status_code == 200
         sent_tools = captured["body"]["requests"][0]["params"]["tools"]
-        assert [t["name"] for t in sent_tools] == ["alpha", "mu", "zeta"]
+        assert [t["name"] for t in sent_tools] == expected_names
 
 
 def test_append_context_targets_latest_non_frozen_user_turn() -> None:
@@ -685,6 +728,71 @@ def test_batch_optimization_freezes_previous_turns_only() -> None:
         ]
 
 
+def test_batch_optimization_passes_savings_profile_kwargs() -> None:
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "token"
+        proxy.config.savings_profile = "agent-90"
+        proxy.config.ccr_inject_tool = False
+
+        def _fake_apply(**kwargs):
+            captured["pipeline_kwargs"] = kwargs
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=[],
+                timing={},
+                tokens_before=100,
+                tokens_after=80,
+                waste_signals=None,
+            )
+
+        proxy.anthropic_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msgbatch_profile",
+                    "type": "message_batch",
+                    "processing_status": "in_progress",
+                    "request_counts": {
+                        "processing": 1,
+                        "succeeded": 0,
+                        "errored": 0,
+                        "canceled": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages/batches",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "requests": [
+                    {
+                        "custom_id": "req-1",
+                        "params": {
+                            "model": "claude-sonnet-4-6",
+                            "max_tokens": 128,
+                            "messages": [{"role": "user", "content": "compress me"}],
+                        },
+                    }
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        pipeline_kwargs = captured["pipeline_kwargs"]
+        assert pipeline_kwargs["force_kompress"] is True
+        assert pipeline_kwargs["target_ratio"] == 0.10
+        assert pipeline_kwargs["compress_user_messages"] is True
+
+
 def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
     captured = {}
     with _make_proxy_client() as client:
@@ -938,8 +1046,16 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
 
         def _fake_apply(**kwargs):
             captured["calls"].append(kwargs["messages"])
+            captured["frozen_message_count"] = kwargs.get("frozen_message_count")
+            # fix-6 contract: the compressor is handed the frozen forwarded prefix
+            # + the new delta and only compresses indices >= frozen_message_count
+            # (so a lone tool_result can resolve its tool_name from the prefix).
+            # Mirror the real router: pass the frozen prefix through verbatim and
+            # compress only the tail — the handler splices result.messages[prefix_n:].
+            fz = kwargs.get("frozen_message_count") or 0
+            msgs = kwargs["messages"]
             return SimpleNamespace(
-                messages=[{"role": "user", "content": "COMPRESSED_TURN3"}],
+                messages=list(msgs[:fz]) + [{"role": "user", "content": "COMPRESSED_TURN3"}],
                 transforms_applied=["fake:delta"],
                 timing={},
                 tokens_before=40,
@@ -986,7 +1102,22 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
         )
 
         assert response.status_code == 200
-        assert captured["calls"] == [[{"role": "user", "content": "turn3"}]]
+        # fix-6 contract: the compressor receives the frozen FORWARDED prefix
+        # (with COMPRESSED_TURN2, the byte-stable cached form) + the raw new
+        # delta (turn3), so tool_name resolution / dedup stay consistent with
+        # what is actually cached. frozen_message_count = prefix length pins
+        # compression to the delta ONLY — the prefix is never re-compressed.
+        assert captured["calls"] == [
+            [
+                {"role": "user", "content": "turn1"},
+                {"role": "assistant", "content": "turn1-assistant"},
+                {"role": "user", "content": "COMPRESSED_TURN2"},
+                {"role": "assistant", "content": "turn2-assistant"},
+                {"role": "user", "content": "turn3"},
+            ]
+        ]
+        assert captured["frozen_message_count"] == 4  # only the delta (turn3) is compressed
+        # Forwarded body = byte-identical cached prefix + the compressed delta.
         assert captured["body"]["messages"] == [
             {"role": "user", "content": "turn1"},
             {"role": "assistant", "content": "turn1-assistant"},

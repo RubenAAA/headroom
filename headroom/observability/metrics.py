@@ -5,13 +5,13 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as package_version
 from threading import Lock
 from typing import Any, Literal
 
 from opentelemetry import metrics
 from opentelemetry.metrics import CallbackOptions, Observation
+
+from headroom._version import get_version
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +28,7 @@ _owned_metrics_config: OTelMetricsConfig | None = None
 
 
 def _headroom_version() -> str:
-    try:
-        return package_version("headroom-ai")
-    except PackageNotFoundError:
-        return "unknown"
+    return get_version()
 
 
 def _parse_bool(raw: str | None, default: bool = False) -> bool:
@@ -549,16 +546,9 @@ def configure_otel_metrics(config: OTelMetricsConfig | None = None) -> HeadroomO
 
 def get_otel_metrics_status() -> dict[str, Any]:
     with _metrics_lock:
-        if _owned_metrics_config is None:
-            return {
-                "configured": False,
-                "enabled": False,
-                "service_name": None,
-                "exporter": None,
-                "endpoint": None,
-                "resource_attributes": {},
-            }
-        return _owned_metrics_config.status()
+        if _owned_metrics_config is not None:
+            return _owned_metrics_config.status()
+    return OTelMetricsConfig.from_env(default_service_name="headroom-proxy").status()
 
 
 def shutdown_otel_metrics() -> None:

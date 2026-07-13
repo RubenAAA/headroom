@@ -35,6 +35,7 @@ CLINE_PORT = 28892
 CONTINUE_PORT = 28893
 GOOSE_PORT = 28894
 OPENHANDS_PORT = 28895
+OPENCODE_PORT = 28896
 
 
 def log(message: str) -> None:
@@ -225,7 +226,13 @@ def create_shims(shim_dir: Path) -> None:
             "cwd": os.getcwd(),
             "env": {
                 key: os.environ.get(key)
-                for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL")
+                for key in (
+                    "OPENAI_BASE_URL",
+                    "OPENAI_API_BASE",
+                    "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
+                    "OPENCODE_CONFIG_CONTENT",
+                )
                 if os.environ.get(key) is not None
             },
         }
@@ -276,7 +283,13 @@ def create_shims(shim_dir: Path) -> None:
             "cwd": os.getcwd(),
             "env": {
                 key: os.environ.get(key)
-                for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL")
+                for key in (
+                    "OPENAI_BASE_URL",
+                    "OPENAI_API_BASE",
+                    "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
+                    "OPENCODE_CONFIG_CONTENT",
+                )
                 if os.environ.get(key) is not None
             },
         }
@@ -340,6 +353,13 @@ def create_shims(shim_dir: Path) -> None:
                 by_model.get(model_name) if isinstance(by_model, dict) else None
             )
 
+        codex_home = os.environ.get("CODEX_HOME")
+        if codex_home:
+            session_config = Path(codex_home) / "config.toml"
+            record["session_config"] = (
+                session_config.read_text(encoding="utf-8") if session_config.exists() else None
+            )
+
         record["probes"] = probes
 
         with (log_dir / f"{tool}.jsonl").open("a", encoding="utf-8") as handle:
@@ -365,6 +385,7 @@ def create_shims(shim_dir: Path) -> None:
     write_executable(shim_dir / "claude", generic_shim)
     write_executable(shim_dir / "codex", codex_shim)
     write_executable(shim_dir / "aider", generic_shim)
+    write_executable(shim_dir / "opencode", generic_shim)
     write_executable(shim_dir / "rtk", rtk_shim)
 
 
@@ -548,42 +569,61 @@ def verify_codex_wrap(
         cwd=project_dir,
         timeout=120,
     )
-    project_agents = project_dir / "AGENTS.md"
+    # RTK guidance for Codex is global-only (#1240): it is injected into
+    # ~/.codex/AGENTS.md, never a project-level AGENTS.md. A project AGENTS.md is
+    # written only when `wrap codex --memory` is used (for memory guidance), which
+    # this scenario does not exercise.
     global_agents = Path(base_env["HOME"]) / ".codex" / "AGENTS.md"
-    assert_true(project_agents.exists(), "Codex wrap should create project AGENTS.md")
     assert_true(global_agents.exists(), "Codex wrap should create ~/.codex/AGENTS.md")
-    assert_true(RTK_MARKER in project_agents.read_text(encoding="utf-8"), "Missing RTK marker")
     assert_true(
         RTK_MARKER in global_agents.read_text(encoding="utf-8"), "Missing global RTK marker"
     )
 
     config_path = Path(base_env["HOME"]) / ".codex" / "config.toml"
-    assert_true(config_path.exists(), "Codex wrap should create ~/.codex/config.toml")
-    config = config_path.read_text(encoding="utf-8")
     assert_true(
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject openai_base_url for subscription routing",
-    )
-    assert_true(
-        f'base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject the headroom provider base_url",
-    )
-    assert_true(
-        'env_key = "OPENAI_API_KEY"' not in config,
-        "Codex wrap should preserve OAuth and never inject env_key",
-    )
-    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
-    assert_true(
-        "requires_openai_auth" not in config,
-        "Codex wrap must NOT inject requires_openai_auth into the headroom provider block",
-    )
-    assert_true(
-        "supports_websockets = true" in config, "Codex wrap missing 'supports_websockets = true'"
+        not config_path.exists(),
+        "Codex wrap should leave ~/.codex/config.toml untouched during normal launch",
     )
 
     entries = read_jsonl(log_dir / "codex.jsonl")
     assert_true(len(entries) > 0, "Codex shim should have been invoked")
     env_vars = entries[-1]["env"]
+    session_home = env_vars.get("CODEX_HOME")
+    assert_true(
+        isinstance(session_home, str) and session_home,
+        "Codex wrap should launch the child with a session-scoped CODEX_HOME",
+    )
+    assert_true(
+        Path(session_home) != config_path.parent,
+        "Codex wrap should not point the child at the real ~/.codex home",
+    )
+    config = entries[-1].get("session_config")
+    assert_true(
+        isinstance(config, str) and config,
+        "Codex wrap should capture the session-scoped config during launch",
+    )
+    assert_true(
+        f'openai_base_url = "http://127.0.0.1:{port}/v1"' in config,
+        "Codex wrap should inject openai_base_url into the session config",
+    )
+    assert_true(
+        f'base_url = "http://127.0.0.1:{port}/v1"' in config,
+        "Codex wrap should inject the headroom provider base_url into the session config",
+    )
+    assert_true(
+        'env_key = "OPENAI_API_KEY"' not in config,
+        "Codex wrap should preserve OAuth and never inject env_key into the session config",
+    )
+    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
+    assert_true(
+        "requires_openai_auth" not in config,
+        "Codex wrap must NOT inject requires_openai_auth into the session headroom provider block",
+    )
+    assert_true(
+        "supports_websockets = true" in config,
+        "Codex wrap missing 'supports_websockets = true' in the session config",
+    )
+
     assert_true(
         env_vars.get("OPENAI_BASE_URL") == f"http://127.0.0.1:{port}/v1",
         "Codex wrap should set OPENAI_BASE_URL",
@@ -702,12 +742,24 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             "Cursor wrap should print the Anthropic base URL override",
         )
         wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15)
+        # rtk registers a native Cursor hook (rtk init --agent cursor) when it
+        # can (~/.cursor exists); headroom only falls back to injecting
+        # .cursorrules text if that registration fails (GH #756). Accept
+        # either outcome rather than assuming the fallback path.
         cursorrules = project_dir / ".cursorrules"
-        assert_true(cursorrules.exists(), "Cursor wrap should create .cursorrules")
-        assert_true(
-            RTK_MARKER in cursorrules.read_text(encoding="utf-8"),
-            "Cursor wrap should inject RTK instructions",
+        cursor_hooks_json = Path(base_env["HOME"]) / ".cursor" / "hooks.json"
+        native_hook_registered = (
+            cursor_hooks_json.exists() and "rtk" in cursor_hooks_json.read_text(encoding="utf-8")
         )
+        if not native_hook_registered:
+            assert_true(
+                cursorrules.exists(),
+                "Cursor wrap should create .cursorrules when the native rtk hook is unavailable",
+            )
+            assert_true(
+                RTK_MARKER in cursorrules.read_text(encoding="utf-8"),
+                "Cursor wrap should inject RTK instructions",
+            )
     finally:
         stop_process(proc)
 
@@ -911,6 +963,7 @@ def main() -> None:
             verify_continue_wrap(base_env, project_dir)
             verify_goose_wrap(base_env, project_dir)
             verify_openhands_wrap(base_env, project_dir)
+            verify_opencode_wrap(base_env, project_dir, log_dir)
             local_plugin_dir = prepare_local_openclaw_plugin(base_env, tmp_dir)
             verify_openclaw_wrap(base_env, project_dir, local_plugin_dir)
         finally:
@@ -918,6 +971,55 @@ def main() -> None:
             mock_thread.join(timeout=5)
 
     log("All Docker wrap e2e checks passed.")
+
+
+def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
+    port = OPENCODE_PORT
+    run(
+        ["headroom", "wrap", "opencode", "--port", str(port), "--", "--help"],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
+    global_agents = Path(base_env["HOME"]) / ".config" / "opencode" / "AGENTS.md"
+    project_agents = project_dir / "AGENTS.md"
+    assert_true(global_agents.exists(), "Opencode wrap should create ~/.config/opencode/AGENTS.md")
+    assert_true(project_agents.exists(), "Opencode wrap should create project AGENTS.md")
+    assert_true(
+        RTK_MARKER in global_agents.read_text(encoding="utf-8"),
+        "Missing RTK marker in global AGENTS.md",
+    )
+    assert_true(
+        RTK_MARKER in project_agents.read_text(encoding="utf-8"),
+        "Missing RTK marker in project AGENTS.md",
+    )
+
+    entries = read_jsonl(log_dir / "opencode.jsonl")
+    assert_true(len(entries) > 0, "Opencode shim should have been invoked")
+    env_vars = entries[-1]["env"]
+    assert_true(
+        env_vars.get("OPENCODE_CONFIG_CONTENT") is not None,
+        "Opencode wrap should set OPENCODE_CONFIG_CONTENT",
+    )
+    config = json.loads(env_vars["OPENCODE_CONFIG_CONTENT"])
+    assert_true(
+        config["provider"]["headroom"]["options"]["baseURL"] == f"http://127.0.0.1:{port}/v1",
+        "Opencode wrap should inject headroom provider baseURL",
+    )
+
+    run(
+        ["headroom", "unwrap", "opencode", "--port", str(port)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
+    config_path = Path(base_env["HOME"]) / ".config" / "opencode" / "opencode.json"
+    if config_path.exists():
+        content = config_path.read_text(encoding="utf-8")
+        assert_true(
+            "headroom" not in content,
+            "Opencode unwrap should remove headroom provider from config",
+        )
 
 
 if __name__ == "__main__":
