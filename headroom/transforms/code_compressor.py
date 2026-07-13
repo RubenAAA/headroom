@@ -161,7 +161,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, perl. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, perl. "
                 f"Error: {e}"
             ) from e
 
@@ -216,6 +216,7 @@ class CodeLanguage(Enum):
     C = "c"
     CPP = "cpp"
     PERL = "perl"
+    CSHARP = "csharp"
     UNKNOWN = "unknown"
 
 
@@ -302,6 +303,15 @@ class LangConfig:
     detection_hints: tuple[str, ...] = ()
     # Optional override for node types that contain class/impl members.
     class_body_node_types: frozenset[str] | None = None
+    # Optional container nodes (e.g. C# block-scoped namespaces) that wrap
+    # type declarations in a member list. Routed through class compression so
+    # their members compress and the wrapper isn't re-emitted verbatim.
+    container_node_types: frozenset[str] | None = None
+    # Optional opaque nodes (e.g. C# `#if`/`#endif` conditionals) preserved
+    # verbatim without recursing into them. Recursing would capture their
+    # descendants individually while the top-level pass re-emits the whole
+    # wrapper verbatim, duplicating content. Prefer the false negative.
+    opaque_node_types: frozenset[str] | None = None
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
@@ -416,6 +426,35 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         package_node="package_statement",
         detection_hints=("sub ", "my ", "our ", "use ", "package "),
     ),
+    CodeLanguage.CSHARP: LangConfig(
+        import_nodes=frozenset({"using_directive", "file_scoped_namespace_declaration"}),
+        function_nodes=frozenset(
+            {
+                "method_declaration",
+                "constructor_declaration",
+                "destructor_declaration",
+                "operator_declaration",
+                "local_function_statement",
+            }
+        ),
+        class_nodes=frozenset(
+            {
+                "class_declaration",
+                "struct_declaration",
+                "record_declaration",
+                "interface_declaration",
+            }
+        ),
+        type_nodes=frozenset({"enum_declaration", "delegate_declaration"}),
+        body_node_types=frozenset({"block"}),
+        decorator_node=None,
+        comment_prefix="//",
+        uses_colon_after_signature=False,
+        detection_hints=("using ", "namespace ", "public ", "private ", "void "),
+        class_body_node_types=frozenset({"declaration_list"}),
+        container_node_types=frozenset({"namespace_declaration"}),
+        opaque_node_types=frozenset({"preproc_if"}),
+    ),
 }
 
 
@@ -423,6 +462,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
 class CodeStructure:
     """Extracted structure from parsed code."""
 
+    header_code: list[str] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
     type_definitions: list[str] = field(default_factory=list)
     class_definitions: list[str] = field(default_factory=list)
@@ -609,6 +649,16 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         re.compile(r"^\s*(sub|package|use|require)\s+[\w:]+", re.MULTILINE),
         re.compile(r"^\s*(my|our|local)\s+[\$@%]", re.MULTILINE),
         re.compile(r"[\$@%]\w+", re.MULTILINE),
+    ],
+    CodeLanguage.CSHARP: [
+        re.compile(r"^\s*using\s+[\w.]+\s*;", re.MULTILINE),
+        re.compile(r"^\s*namespace\s+[\w.]+", re.MULTILINE),
+        re.compile(
+            r"^\s*(public|private|protected|internal|sealed|static|abstract|partial)\s+"
+            r"(class|struct|record|interface|enum)\b",
+            re.MULTILINE,
+        ),
+        re.compile(r"\bget;\s*set;", re.MULTILINE),
     ],
 }
 
@@ -1366,6 +1416,14 @@ class CodeAwareCompressor(Transform):
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
+            if lang_config.container_node_types and node_type in lang_config.container_node_types:
+                compressed = self._compress_class_ast(
+                    node, code, language, lang_config, body_limits, analysis
+                )
+                structure.class_definitions.append(compressed)
+                captured_byte_ranges.append((node.start_byte, node.end_byte))
+                return
+
             # Class definitions — compress each method individually
             if node_type in lang_config.class_nodes:
                 leading = _get_leading_comment_text(node, code, captured_byte_ranges)
@@ -1388,6 +1446,31 @@ class CodeAwareCompressor(Transform):
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
+            # Opaque regions (e.g. C# preprocessor conditionals) — preserved
+            # verbatim, never recursed into. Recursing captures descendants
+            # individually while the top-level pass re-emits the uncaptured
+            # wrapper verbatim, duplicating its whole content in the output.
+            # Blocks wrapping only import directives (`#if NET6_0\nusing X;`)
+            # are emitted with the imports: usings must precede type
+            # declarations, so appending them as trailing top-level code would
+            # produce invalid output (and fall back to no compression).
+            if lang_config.opaque_node_types and node_type in lang_config.opaque_node_types:
+                child_types = [child.type for child in node.named_children]
+                has_import = any(t in lang_config.import_nodes for t in child_types)
+                has_declaration = any(
+                    t in lang_config.class_nodes
+                    or t in lang_config.type_nodes
+                    or t in lang_config.function_nodes
+                    or (lang_config.container_node_types and t in lang_config.container_node_types)
+                    for t in child_types
+                )
+                if has_import and not has_declaration:
+                    structure.imports.append(_get_node_text(node, code))
+                else:
+                    structure.top_level_code.append(_get_node_text(node, code))
+                captured_byte_ranges.append((node.start_byte, node.end_byte))
+                return
+
             # Recurse into children
             for child in node.children:
                 visit(child)
@@ -1396,13 +1479,22 @@ class CodeAwareCompressor(Transform):
 
         # Capture top-level code that wasn't handled by any of the above.
         # This preserves global variables, constants, if __name__ blocks,
-        # module-level assignments, etc.
+        # module-level assignments, etc. Uncaptured nodes that precede the
+        # first captured node are file headers (license banners, C# `#region
+        # License` blocks, module comments): they are emitted first, in
+        # original order, rather than relocated to the end of the output —
+        # e.g. tree-sitter-c-sharp rejects top-level `#region` after a type
+        # declaration, which would fail validation and forfeit compression.
+        first_captured = min((r[0] for r in captured_byte_ranges), default=None)
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
             if child_range not in captured_byte_ranges:
                 text = _get_node_text(child, code).strip()
                 if text:
-                    structure.top_level_code.append(text)
+                    if first_captured is not None and child.end_byte <= first_captured:
+                        structure.header_code.append(text)
+                    else:
+                        structure.top_level_code.append(text)
 
         return structure
 
@@ -1717,7 +1809,13 @@ class CodeAwareCompressor(Transform):
         node_start_line = node.start_point[0]
         body_start_line = body_node.start_point[0]
         sig_end = body_start_line - node_start_line
-        header_lines = node_lines[:sig_end] if sig_end > 0 else [node_lines[0]]
+        if sig_end > 0:
+            header_lines = node_lines[:sig_end]
+            brace_line = node_lines[sig_end]
+            if brace_line.strip().startswith("{"):
+                header_lines = [*header_lines, brace_line]
+        else:
+            header_lines = [node_lines[0]]
 
         # Process each child of the class body individually
         body_parts: list[str] = []
@@ -1730,6 +1828,8 @@ class CodeAwareCompressor(Transform):
             # Use line-based extraction for children too
             child_start = child.start_point[0]
             child_end = child.end_point[0]
+            if child.end_point[1] == 0 and child_end > child_start:
+                child_end -= 1
             child_text = "\n".join(code_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually
@@ -1759,8 +1859,10 @@ class CodeAwareCompressor(Transform):
                 else:
                     body_parts.append(child_text)
                 processed_ranges.append((child.start_byte, child.end_byte))
-            # Nested classes — recurse
-            elif child.type in lang_config.class_nodes:
+            # Nested classes / containers (e.g. nested namespaces) — recurse
+            elif child.type in lang_config.class_nodes or (
+                lang_config.container_node_types and child.type in lang_config.container_node_types
+            ):
                 compressed = self._compress_class_ast(
                     child, code, language, lang_config, body_limits, analysis
                 )
@@ -1815,6 +1917,11 @@ class CodeAwareCompressor(Transform):
     ) -> str:
         """Assemble compressed code from structure."""
         parts: list[str] = []
+
+        # File header (license banners, top-of-file comments) stays on top
+        if structure.header_code:
+            parts.extend(structure.header_code)
+            parts.append("")
 
         # Imports first
         if structure.imports:

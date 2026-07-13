@@ -8,6 +8,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+- The dashboard's per-request metadata (the `recent_requests` / `request_logs`
+  tail and the `config` block with upstream URLs) is gated to loopback callers
+  via `_request_is_loopback`. When Headroom runs in a bridge-network container
+  (Docker/podman, or Apple Containerization / mocker), a browser on the host
+  reaches the proxy through the container gateway, so `request.client.host` is
+  the gateway IP rather than `127.0.0.1` — the sensitive block was stripped and
+  the "Recent Requests" table rendered empty even though the operator is local.
+  A peer inside an operator-configured trusted-gateway CIDR
+  (`HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS`, already used to sanitize
+  `X-Forwarded-*`) is now treated as loopback-equivalent, while the loopback
+  `Host`-header gate is retained as the DNS-rebinding defence. Opt-in and empty
+  by default, so there is no behavior change unless the gateway CIDR is
+  allow-listed.
+- Non-finite values (`NaN`, `Infinity`) in `proxy_savings.json` or in upstream
+  cost/token metadata no longer crash the proxy or corrupt the savings
+  dashboard. `SavingsTracker`'s numeric coercion caught only `TypeError` and
+  `ValueError`, so `int(float('inf'))` raised an uncaught `OverflowError` while
+  loading persisted state (`SavingsTracker.__init__` failed and the proxy would
+  not start), and `float('nan')`/`float('inf')` passed straight through, then
+  serialized to `NaN`/`Infinity` literals that the dashboard's `JSON.parse`
+  rejects. `json.loads` accepts those literals, so one bad write poisoned every
+  later start. Both coercion helpers now also catch `OverflowError` and reject
+  non-finite floats, failing open to safe defaults.
+- `headroom learn` now honors `CLAUDE_CONFIG_DIR`. It resolved the Claude
+  config directory as `~/.claude` and wrote global memory to
+  `~/.claude/CLAUDE.md`, so users who relocate their Claude config via that
+  env var had `learn` scan the wrong directory and detect no projects. The
+  scanner and memory writer now read/write the configured directory
+  ([#1630](https://github.com/headroomlabs-ai/headroom/issues/1630)).
+- `--backend bedrock` now fails fast with an actionable error when temporary
+  AWS credentials (`AWS_SESSION_TOKEN`) are used but botocore is not installed
+  (e.g. the slim default Docker image). litellm's session-token auth path
+  imports botocore, so the missing dependency previously surfaced only at
+  request time as a misleading `authentication_error: No module named
+  'botocore'`. The proxy now tells the user to install the `bedrock` extra up
+  front ([#1551](https://github.com/headroomlabs-ai/headroom/issues/1551)).
+- Content detection no longer crashes the proxy on text containing an
+  orphaned `+++ ` target line with no preceding `--- ` source line (common in
+  `set -x` xtrace output and partial diffs). The bundled `unidiff` 0.4.0 parser
+  panics on that input instead of returning an error; the Rust diff detector now
+  contains the panic and treats the fragment as plain text, so the request is
+  compressed and forwarded normally instead of returning HTTP 500
+  ([#1547](https://github.com/headroomlabs-ai/headroom/issues/1547)).
+- Proactive expansion blocks injected into user turns are now wrapped in
+  `<headroom_proactive_expansion>` XML tags, giving downstream consumers
+  (LLMs, loggers, attribution parsers) a machine-readable provenance
+  boundary and preventing misattribution in multi-agent threads.
+- **cli:** the startup banner no longer advertises
+  `HEADROOM_COMPRESSION_STABLE_AFTER_TURN` and
+  `HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS` as tuning knobs. Both were read
+  only to render the `Performance Tuning` banner section and were never wired
+  into the compression path, so setting them changed the banner but had no
+  effect on behavior. The banner now surfaces only the embedding sidecar,
+  which is a real, consumed setting.
+- **memory/embedder:** cap CPU thread oversubscription in the local
+  torch/sentence-transformers embedder. Concurrent encodes previously each
+  fanned out to ~`os.cpu_count()` BLAS/OpenMP threads, so under load the memory
+  path starved the asyncio event loop and spiked `/livez` latency to several
+  seconds. CPU encodes now run on a dedicated, size-limited executor whose
+  workers each pin their thread pool, bounding total embedding threads to
+  `HEADROOM_EMBED_CONCURRENCY` × `HEADROOM_EMBED_NUM_THREADS` (defaults
+  `min(4, cpu)` × 1). The ONNX embedder already capped its threads; this brings
+  the torch path to parity
+  ([#198](https://github.com/headroomlabs-ai/headroom/issues/198)).
+
 ### Changed
 
 * **telemetry:** anonymous usage telemetry is now **opt-in** (off by default) instead of opt-out. Nothing is collected or sent unless you set `HEADROOM_TELEMETRY=on` or pass `--telemetry` to `headroom proxy` / `headroom install apply`. `is_telemetry_enabled()` is fail-closed — only explicit on-values (`on`/`true`/`1`/`yes`/`enable`/`enabled`) enable it; unset, empty, or unrecognized values stay disabled. The existing `--no-telemetry` flag and `HEADROOM_TELEMETRY=off` remain accepted for back-compat, and install manifests now write the `HEADROOM_TELEMETRY` value explicitly so generated deployments are unambiguous.
@@ -16,6 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 * **proxy:** add `HEADROOM_ORT_EP` env var to select the ONNX Runtime execution provider at startup — `openvino` for Intel CPU/GPU/NPU via OpenVINO runtime, `cuda` for NVIDIA GPU, or unset/`cpu` for the default CPU path. Both the fastembed embedding scorer and the magika content classifier share the ORT singleton, so a single env var covers both. Set `HEADROOM_ORT_OPENVINO_DEVICE` (default `NPU`) to pick the OpenVINO target device and `HEADROOM_ORT_OPENVINO_CACHE` to a directory for caching compiled NPU/GPU blobs across restarts; first run compiles and saves, subsequent runs load instantly.
+* **proxy:** report a new-content-relative input savings rate in `/stats`: `tokens.new_input_tokens` (provider-billed non-cache-read input: uncached + cache-write tokens, from response usage) and `tokens.new_input_savings_percent` (savings as a fraction of new input plus the tokens compression removed before they could be billed). The existing whole-request ratios recount the full transcript on every turn, so a 200-turn session counts its history 200x into the denominator and long-running cached sessions (especially 1M-context models, which never compact) dilute toward ~0% regardless of how well compression performs on content newly entering context. Purely additive; existing fields unchanged. Reports 0 when no cache usage data exists (e.g. providers without cache metrics) rather than dividing savings by themselves.
+* **transforms:** first-class C# support in `CodeAwareCompressor` via the tree-sitter `csharp` grammar already shipped in the pinned `tree-sitter-language-pack` — no new dependencies ([#1664](https://github.com/headroomlabs-ai/headroom/issues/1664)). Parity with Java/C++/Rust: signatures preserved verbatim, method/constructor/destructor/operator/local-function bodies compressed; block-scoped and file-scoped namespaces, records, structs, interfaces, and enums handled; C#-distinctive auto-detection. Preprocessor conditionals (`#if`…`#endif`) are preserved verbatim as opaque regions (blocks wrapping only `using` directives stay with the imports), `#region` markers no longer swallow the following line during class-member extraction, and top-of-file license banners / `#region License` headers stay on top instead of being relocated below the code. Real-repo runs: 16.1% tokens saved on Newtonsoft.Json (945 files), 37.8% on Polly (797 files), output syntax-valid for 1742/1742 files.
 * **proxy:** add provider-only HTTP proxy routing via `--http-proxy` and `HEADROOM_HTTP_PROXY`. Upstream LLM provider calls can now use an HTTP proxy without setting process-wide `HTTP_PROXY`/`HTTPS_PROXY` variables that are inherited by tool executions; proxied provider clients use HTTP/1.1 so HTTPS provider APIs can tunnel through CONNECT.
 * **proxy:** add output shaping for OpenAI Responses traffic on `/v1/responses` HTTP requests and Codex WebSocket `response.create` frames, with stable output-savings holdout keys and counted WS token strata for the experiment.
 * **observability:** the `headroom.compression.pipeline` span now also carries the OpenTelemetry GenAI semantic-convention attribute `gen_ai.request.model` alongside the existing `headroom.*` attributes, so Headroom's traces group and filter by the standard `gen_ai.*` schema in any OTel-native backend (Grafana, Datadog, etc.). Purely additive; no existing attribute changed. `gen_ai.operation.name`, `gen_ai.provider.name`, and `gen_ai.usage.*` are deliberately deferred (they need per-caller operation threading, reliable upstream-provider resolution, and response-path usage respectively).
@@ -36,9 +104,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * **proxy:** Phase E byte-mutating passes (E1 tool-array sort, E2 schema-key sort, E3 `cache_control` auto-placement) were unconditionally skipped for non-PAYG auth modes even when `--auth-mode-policy-enforcement disabled` was set. Token reduction matters for subscription users too — rate limits are token-based, context windows are finite, and smaller payloads transfer faster. `effective_auth_mode` now mirrors the enforcement-flag override already applied to `CompressionPolicy` at request entry, so the Phase E passes fire as expected when the flag is present.
 * **ccr:** don't crash `parse_tool_call` on a CCR tool call whose arguments aren't an object. For the OpenAI/`openai_responses` shape the arguments are `json.loads`-decoded and only `JSONDecodeError` was caught, so a model that emitted `arguments='[]'`/`'"abc"'`/`'123'` (decoding to a list/str/number) — or a non-dict Anthropic `input` — reached `input_data.get("hash")` and raised `AttributeError`; a null `arguments` raised an uncaught `TypeError` from `json.loads(None)`. Both are now handled: the decode also catches `TypeError`, and a non-dict `input_data` returns `None` (not a valid CCR call) instead of crashing CCR response processing.
+* **proxy/anthropic:** give each Anthropic conversation its own session id. `SessionTrackerStore.compute_session_id` derived its fallback id from `model` + system text harvested only from `role:"system"` entries inside `messages` — but Anthropic carries the system prompt as a top-level `body["system"]` field, so genuine Anthropic requests (which never carry `x-headroom-session-id`) collapsed to `md5(model:[])` and every conversation on the same model shared one `PrefixCacheTracker`. That let session-sticky state cross-contaminate: conversation A's sticky `headroom_retrieve`/memory tools and `anthropic-beta` headers were injected into conversation B, and frozen-prefix/compression-cache state mixed across conversations. The Anthropic handler now folds the top-level `system` into the session-id inputs (prepending a synthetic `role:"system"` message used only to derive the id), giving distinct conversations distinct ids.
 * **cache/semantic:** key entries by the full-context hash, not the trailing query text. `SemanticCache.put` stored each response under `sha256(query)[:16]` where `query` is only the last user message, and the exact-match branch of `get` returned the slot without checking the stored entry's `messages_hash`. Two requests that share a trailing message ("continue", "yes", "run the tests") but differ in earlier context therefore collided on one slot — the second overwrote the first, and the first's hash then resolved to the second's cached response (wrong data served). Entries are now keyed by `messages_hash` when present, and `get` verifies `entry.messages_hash` before returning.
 * **proxy/openai:** stop PRE_SEND from reintroducing `tools: []` after the direct #728 fix. The OpenAI request handler now mirrors the existing `tools or _original_tools is not None` body-write guard during PRE_SEND write-back, so providers that reject empty tool arrays no longer see a tools field when the client omitted it, while explicit client `tools: []` remains preserved ([#1983](https://github.com/headroomlabs-ai/headroom/issues/1983)).
 * **proxy/openai:** keep the exact Responses function name `terminal` resident during OpenAI tool-search deferral so cache-mode optimization stops forwarding `terminal.terminal` and triggering the reserved-namespace 400 on Codex Responses ([#1946](https://github.com/headroomlabs-ai/headroom/issues/1946)).
+* **subscription/copilot:** show a fully-consumed Copilot quota as 100% used instead of unknown. `parse_copilot_quota` read `remaining = raw.get("remaining") or raw.get("quota_remaining")`, so a category reporting `remaining: 0` (quota fully spent) had that legitimate `0` treated as falsy and — with no `quota_remaining` alias in the real payload — collapsed to `None`. `CopilotQuotaCategory.used`/`used_percent` then returned `None`, so the dashboard rendered the exhausted category as `used: -` / 0% (green gauge) rather than `300/300` / 100%. Now uses an explicit `is None` check.
+* **proxy/gemini:** thread the savings-profile kwargs into the native Gemini/Vertex compression paths. `handle_gemini_generate_content`, `handle_google_cloudcode_stream`, and `handle_gemini_count_tokens` called `openai_pipeline.apply()` without `proxy_pipeline_kwargs(self.config)`, so `HEADROOM_SAVINGS_PROFILE` and the ProxyConfig knobs (`target_ratio`/`min_tokens_to_compress`/`protect_recent`/`max_items_after_crush`/...) were silently dropped on the Gemini path — those requests compressed with router defaults instead of the configured profile, diverging from the Claude/Codex/Cursor paths. This is the same fix #1534 made for the OpenAI chat path; it now covers Gemini too.
 * **wrap:** `headroom wrap claude` no longer installs RTK or lean-ctx by default. Claude context-tool setup is now explicit via `--context-tool`, `--no-context-tool` remains accepted, and other wrap commands keep their current defaults ([#1915](https://github.com/headroomlabs-ai/headroom/issues/1915)).
 * **proxy/openai:** thread the savings-profile kwargs into the live `/v1/chat/completions` compression path. The chat handler called `openai_pipeline.apply()` without `proxy_pipeline_kwargs(config)`, so `HEADROOM_SAVINGS_PROFILE=agent-90` (and the individual `compress_user_messages`/`target_ratio`/`min_tokens_to_compress`/... knobs) were silently dropped — OpenAI-compatible clients like OpenCode kept protecting user messages and missed the configured profile. Both the token-mode and non-token chat branches now pass the profile kwargs, matching `handlers/anthropic.py` and the dedicated OpenAI compress endpoint ([#1534](https://github.com/headroomlabs-ai/headroom/issues/1534)).
 * **proxy:** forward Codex Desktop `/v1/responses` posts byte-faithfully so they stop returning upstream `400 {"detail":"Bad Request"}`. `handle_openai_responses` decoded the inbound body to inspect it but always re-serialized a canonical body on the way out, and it never stripped the inbound `content-encoding` header — so a `content-encoding: zstd` Codex Desktop request was forwarded as already-decoded JSON still advertising `zstd`, and the upstream ChatGPT Codex endpoint rejected it. The handler now keeps the original decoded bytes and forwards them verbatim whenever nothing (compression or memory injection) mutated the request, and drops the stale `content-encoding` header, mirroring the byte-faithful passthrough the chat and Anthropic paths already use ([#1542](https://github.com/headroomlabs-ai/headroom/issues/1542)).
@@ -51,6 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **cli/proxy:** honor `HEADROOM_MIN_TOKENS=0` / `HEADROOM_MAX_ITEMS=0`. The Click `proxy` command built these with `_get_env_int_optional(name) or 500`/`or 50`, so an explicit `0` — a legitimate value (`min_tokens_to_crush=0` means "crush every item") — was treated as falsy and silently replaced with the default. The `headroom proxy` argparse path already preserved `0` via `_get_env_int`, so the two entry points disagreed. The Click path now uses the same None-checking helper.
 * **proxy:** strip the inbound `Content-Encoding`/`Transfer-Encoding` request headers on the Anthropic `/v1/messages` and OpenAI `/v1/chat/completions` paths before forwarding upstream. `read_request_json_with_bytes` already decompresses the inbound body (zstd/gzip/deflate/br), so the bytes forwarded upstream are plain JSON — but these two handlers left the original `content-encoding` header in place, so a client (or an edge proxy like a Cloudflare Worker) that sent a compressed body got its request rejected with upstream HTTP 400 because the provider tried to decompress already-decoded JSON. The `/v1/responses` handler already carried this fix (#1542); it is now applied to the messages and chat paths too.
 * **models:** fix the model registry's prefix fallback silently returning the wrong context window. `ModelRegistry.get` accepted any registered name as a `str.startswith` prefix and returned the *first* match, so `gpt-4-32k-0613` resolved to `gpt-4` (8192) instead of `gpt-4-32k` (32768), and unregistered ids like `gpt-4.1`/`gpt-4.5` inherited `gpt-4`'s 8192-token window — making the proxy think a nearly-empty context was almost full and compress far too aggressively. The fallback now requires the registered name to end at a version boundary in the query (so `gpt-4.1` no longer matches `gpt-4`) and picks the longest qualifying name (so `gpt-4-32k-0613` → `gpt-4-32k`).
+* **install:** stop `resolve_targets` from rejecting valid `--providers all`/`auto` installs under provider scope. The provider-scope "unsupported targets" validation ran before the mode dispatch, so `headroom install apply --scope provider --providers all --target cursor` raised `ClickException` even though `all`/`auto` ignore the requested target list entirely (user scope silently ignores the same input). The check now runs only on the manual path that actually consults the requested list.
 * **mcp/opencode:** stop the OpenCode MCP registrar from destroying an existing but unparseable `opencode.json`. `_write_entry` read the config via a helper that returns `{}` on `JSONDecodeError`, then rewrote the whole file with only `{"mcp": {...}}` — wiping the user's `theme`/`model`/`provider` and any other MCP servers (OpenCode configs are commonly JSONC / hand-edited). The write path now refuses to overwrite a present-but-invalid config and returns a `FAILED` result; absent/empty files still register fresh and valid files still merge with all other keys preserved. (Same class of fix as the Claude registrar.)
 * **proxy:** include the system prompt, tools, and the response-shaping request fields in the SemanticCache key. `_compute_key` hashed only `{model, messages}`, so two non-streaming requests with identical messages but a different top-level `system` prompt, tool set, sampling config, or output-shaping field collided on one key and the second caller was served the first's cached response — generated under different request semantics, in the default config (`cache_enabled` defaults on). The key now folds the request fields that shape generation — `temperature`/`top_p`/`top_k`/`max_tokens`/`stop`, plus OpenAI `tool_choice`/`response_format`/`parallel_tool_calls`/`seed`/`presence_penalty`/`frequency_penalty`/`logit_bias`/`n`/`logprobs`/`top_logprobs`/`reasoning_effort`/`verbosity`/`modalities` and Anthropic `thinking`/`tool_choice`/`output_config` — canonicalizing `system`/`tools` so a moved `cache_control` breakpoint does not fragment it, and the handlers snapshot the fields once at the cache read and reuse them at write so a body mutated by the pipeline cannot diverge the key. Non-streaming path only.
 * **learn (verbosity):** `--verbosity --apply --all` now aggregates the savings baseline across every project instead of overwriting it per project (last-project-wins), which previously left the output shaper with a tiny, unrepresentative baseline. The applied verbosity level comes from the project with the most samples ([#1288](https://github.com/headroomlabs-ai/headroom/pull/1288)).

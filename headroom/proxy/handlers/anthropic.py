@@ -1048,8 +1048,22 @@ class AnthropicHandlerMixin:
             optimized_messages = messages
             optimized_tokens = original_tokens
 
-            # Get prefix cache tracker for this session
-            session_id = self.session_tracker_store.compute_session_id(request, model, messages)
+            # Get prefix cache tracker for this session. Anthropic carries the
+            # system prompt as a top-level field, not a role:"system" message, so
+            # fold it into the session-id inputs as a synthetic system message —
+            # otherwise every conversation on the same model would share one
+            # session id (and its sticky CCR/memory tools, beta headers, and
+            # frozen-prefix state). This synthetic message only derives the id; it
+            # is never forwarded.
+            system_prompt = body.get("system")
+            session_messages = (
+                [{"role": "system", "content": system_prompt}, *messages]
+                if system_prompt is not None
+                else messages
+            )
+            session_id = self.session_tracker_store.compute_session_id(
+                request, model, session_messages
+            )
             prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             # Idle gap since the previous turn's response, snapshotted at fetch
@@ -3434,10 +3448,7 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages,
-                        model=model,
-                        context_limit=context_limit,
-                        frozen_message_count=frozen_message_count: (
+                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,

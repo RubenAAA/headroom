@@ -806,6 +806,14 @@ class SessionTrackerStore:
         Priority:
         1. x-headroom-session-id header (explicit)
         2. Hash of (model + system prompt) — stable per conversation
+
+        The system prompt is harvested from ``role:"system"`` entries in
+        ``messages``. Anthropic carries the system prompt as a top-level
+        ``body["system"]`` field instead, so its handler prepends that as a
+        synthetic ``role:"system"`` message before calling this — otherwise every
+        Anthropic conversation on the same model would collapse to one session id
+        and their session-sticky state (CCR/memory tools, beta headers, frozen
+        prefix) would cross-contaminate.
         """
         # Check for explicit session header
         if hasattr(request, "headers"):
