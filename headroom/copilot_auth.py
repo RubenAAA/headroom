@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from ctypes import wintypes
@@ -41,6 +42,8 @@ _API_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_API_TOKEN",
     "COPILOT_PROVIDER_BEARER_TOKEN",
 )
+_REFRESH_OAUTH_TOKEN_ENV_VAR = "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN"
+_API_TOKEN_EXPIRES_AT_ENV_VAR = "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT"
 _COPILOT_OAUTH_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_GITHUB_TOKEN",
     "GITHUB_COPILOT_TOKEN",
@@ -94,6 +97,8 @@ class CopilotSubscriptionTokenResolution:
     confidence: str
     api_url: str
     token_fingerprint: str
+    refresh_oauth_token: str | None = None
+    api_token_expires_at: float | None = None
 
 
 def token_fingerprint(token: str) -> str:
@@ -164,6 +169,12 @@ def _configured_enterprise_domain() -> str | None:
     if not enterprise_url:
         return None
     return _copilot_subdomain_enterprise_host(enterprise_url)
+
+
+def default_oauth_domain() -> str:
+    """Return the OAuth domain from GITHUB_COPILOT_ENTERPRISE_URL, or github.com."""
+    domain = _configured_enterprise_domain()
+    return domain if domain else DEFAULT_GITHUB_HOST
 
 
 def _configured_api_url() -> str:
@@ -369,6 +380,8 @@ def _parse_expiry(value: Any) -> float | None:
 
     if isinstance(value, int | float):
         number = float(value)
+        if not math.isfinite(number):
+            return None
         if number > 10_000_000_000:
             return number / 1000.0
         return number
@@ -379,6 +392,10 @@ def _parse_expiry(value: Any) -> float | None:
             return None
         if raw.isdigit():
             return _parse_expiry(int(raw))
+        try:
+            return _parse_expiry(float(raw))
+        except ValueError:
+            pass
         try:
             normalized = raw.replace("Z", "+00:00")
             return datetime.fromisoformat(normalized).timestamp()
@@ -795,6 +812,8 @@ def _subscription_resolution(
     source: str,
     confidence: str,
     api_url: str,
+    refresh_oauth_token: str | None = None,
+    api_token_expires_at: float | None = None,
 ) -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token=token,
@@ -802,6 +821,8 @@ def _subscription_resolution(
         confidence=confidence,
         api_url=api_url,
         token_fingerprint=token_fingerprint(token),
+        refresh_oauth_token=refresh_oauth_token,
+        api_token_expires_at=api_token_expires_at,
     )
 
 
@@ -833,6 +854,8 @@ def _subscription_resolution_from_token_exchange(
         source=f"{candidate.source}:token-exchange",
         confidence="copilot-token-exchange",
         api_url=_api_url_from_exchange_payload(payload, oauth_token=candidate.token),
+        refresh_oauth_token=candidate.token,
+        api_token_expires_at=_parse_expiry(payload.get("expires_at")),
     )
 
 
@@ -990,7 +1013,8 @@ class CopilotTokenProvider:
 
     async def get_api_token(self) -> CopilotAPIToken:
         explicit_api_token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "").strip()
-        if explicit_api_token:
+        refresh_oauth_token = os.environ.get(_REFRESH_OAUTH_TOKEN_ENV_VAR, "").strip()
+        if explicit_api_token and not refresh_oauth_token:
             return CopilotAPIToken(
                 token=explicit_api_token,
                 expires_at=time.time() + 3600,
@@ -1005,6 +1029,21 @@ class CopilotTokenProvider:
             cached = self._cached
             if cached is not None and cached.is_valid:
                 return cached
+
+            if explicit_api_token and refresh_oauth_token:
+                if cached is None:
+                    seeded_expires_at = _parse_expiry(os.environ.get(_API_TOKEN_EXPIRES_AT_ENV_VAR))
+                    seeded = CopilotAPIToken(
+                        token=explicit_api_token,
+                        expires_at=seeded_expires_at if seeded_expires_at is not None else 0.0,
+                        api_url=_configured_api_url(),
+                    )
+                    self._cached = seeded
+                    if seeded.is_valid:
+                        return seeded
+                exchanged = await self._exchange_token(refresh_oauth_token)
+                self._cached = exchanged
+                return exchanged
 
             oauth_token = read_cached_oauth_token()
             if not oauth_token:
@@ -1077,7 +1116,13 @@ def _is_copilot_api_token(token: str) -> bool:
 
     Copilot API tokens currently use the "tid_" prefix.
     GitHub OAuth tokens (for example "gho_", "ghs_", "ghp_", "github_pat_")
-    should be exchanged and must not be forwarded directly.
+    should be exchanged and must not be forwarded directly to the Copilot
+    *subscription/user-info* APIs (see resolve_subscription_bearer_token_details()),
+    which is the only caller of this helper. It intentionally stays narrow:
+    broadening it here would also change subscription-resolution behavior,
+    which is a separate concern from forwarding a bearer token for
+    chat-completion/inference requests -- see _is_forwardable_copilot_bearer_token()
+    for that case.
     """
     normalized = token.strip()
     if not normalized:
@@ -1094,6 +1139,39 @@ def _is_copilot_api_token(token: str) -> bool:
     return normalized.startswith("tid_")
 
 
+def _is_forwardable_copilot_bearer_token(token: str) -> bool:
+    """Return True when a bearer token should be forwarded as-is for Copilot inference.
+
+    Unlike _is_copilot_api_token() (used only for subscription/user-info
+    resolution), this accepts both short-lived Copilot API tokens (`tid_`)
+    AND GitHub OAuth tokens (`gho_`, `ghs_`, `ghp_`, `github_pat_`) as valid,
+    forwardable Copilot bearer credentials for chat-completion/inference
+    requests.
+
+    Verified live in two independent reports that a caller-supplied `gho_`
+    token is already valid and correctly entitled when sent directly to
+    the real Copilot inference API, and that replacing it with Headroom's
+    own independently-fetched/exchanged token is actively harmful:
+
+    - A live Copilot CLI session's own `gho_`-prefixed token worked
+      end-to-end for model "claude-sonnet-5" when forwarded unchanged, but
+      got `400 model_not_supported` once Headroom swapped in a different,
+      less-entitled re-exchanged token for the exact same request.
+    - headroomlabs-ai/headroom#1813: OpenCode's native Copilot integration
+      sends its own `gho_` token directly; replacing it changes the
+      effective client/integrator lane Copilot's backend sees, breaking
+      model discovery/inference parity with native (non-proxied) behavior.
+
+    Only genuinely non-Copilot-shaped or blank/whitespace-only tokens fall
+    through to replacement.
+    """
+    normalized = token.strip()
+    if not normalized:
+        return False
+
+    return normalized.startswith(("tid_", "gho_", "ghs_", "ghp_", "github_pat_"))
+
+
 def _token_kind(token: str) -> str:
     """Return a non-sensitive label for the token type, safe to log."""
     t = token.strip()
@@ -1101,6 +1179,20 @@ def _token_kind(token: str) -> str:
         if t.startswith(prefix):
             return prefix + "***"
     return "unknown" if t else "empty"
+
+
+def _is_managed_copilot_seeded_bearer(token: str) -> bool:
+    """Return True when the incoming bearer is the proxy's seeded wrapper token."""
+
+    refresh_oauth_token = os.environ.get(_REFRESH_OAUTH_TOKEN_ENV_VAR, "").strip()
+    explicit_api_token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "").strip()
+    normalized = token.strip()
+    return bool(
+        refresh_oauth_token
+        and explicit_api_token
+        and normalized
+        and normalized == explicit_api_token
+    )
 
 
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
@@ -1115,15 +1207,25 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
     incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
     if incoming_auth:
         scheme, _, raw_token = incoming_auth.partition(" ")
-        if scheme.lower() == "bearer" and raw_token and _is_copilot_api_token(raw_token):
-            logger.info(
-                "apply_copilot_api_auth: passing through client token kind=%s",
-                _token_kind(raw_token),
-            )
-            for key in list(resolved):
-                if key.lower() == "x-api-key":
-                    resolved.pop(key)
-            return resolved
+        if (
+            scheme.lower() == "bearer"
+            and raw_token
+            and _is_forwardable_copilot_bearer_token(raw_token)
+        ):
+            if _is_managed_copilot_seeded_bearer(raw_token):
+                logger.info(
+                    "apply_copilot_api_auth: managed seed token kind=%s, will replace",
+                    _token_kind(raw_token),
+                )
+            else:
+                logger.info(
+                    "apply_copilot_api_auth: passing through client token kind=%s",
+                    _token_kind(raw_token),
+                )
+                for key in list(resolved):
+                    if key.lower() == "x-api-key":
+                        resolved.pop(key)
+                return resolved
         logger.info(
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
             _token_kind(raw_token) if raw_token else "none",

@@ -16,6 +16,20 @@ import pytest
 
 from tests._skip_helpers import external_model_skip_reason
 
+
+# A live `headroom` dev session exports HEADROOM_* into the shell (and the
+# Claude wrap adds ANTHROPIC_CUSTOM_HEADERS). Click `envvar=` options pick
+# those up inside CliRunner, so assertions would see the developer's proxy
+# config instead of the test's. Scrub them so local runs match CI; tests
+# that need a value set it explicitly via monkeypatch or CliRunner env.
+@pytest.fixture(autouse=True)
+def _scrub_developer_headroom_env(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("HEADROOM_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+
+
 # =============================================================================
 # Global test hooks
 # =============================================================================
@@ -67,6 +81,11 @@ def _reset_headroom_logger_propagation():
         if _name == "headroom" or _name.startswith("headroom."):
             logger = _logging.getLogger(_name)
             logger.disabled = False
+            # The benchmark also raises the level to CRITICAL; children
+            # inherit it (effective level), so a WARNING would be filtered
+            # at the logger before it can propagate to caplog. Reset to
+            # NOTSET so the subtree inherits root's level deterministically.
+            logger.setLevel(_logging.NOTSET)
             logger.propagate = True
     yield
 

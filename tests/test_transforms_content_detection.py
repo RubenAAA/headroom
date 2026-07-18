@@ -56,7 +56,12 @@ def test_json_detection_distinguishes_dict_arrays_and_other_lists() -> None:
     assert empty_result is not None
     assert empty_result.metadata == {"item_count": 0, "is_dict_array": False}
 
-    assert _try_detect_json('{"id": 1}') is None
+    # JSON OBJECTS are recognized too (config/data files are ``{…}``, not arrays).
+    object_result = _try_detect_json('{"id": 1}')
+    assert object_result is not None
+    assert object_result.content_type is ContentType.JSON_ARRAY
+    assert object_result.metadata == {"is_dict_array": False, "is_object": True}
+
     assert _try_detect_json("[not valid json") is None
     assert is_json_array_of_dicts('[{"id": 1}]') is True
     assert is_json_array_of_dicts('["value"]') is False
@@ -82,12 +87,14 @@ def test_space_separated_json_objects_detected_as_array() -> None:
     assert _try_detect_json(newline_sep).content_type is ContentType.JSON_ARRAY
 
 
-def test_space_separated_json_detection_is_conservative() -> None:
-    # A single object is not an array — must not be claimed.
-    assert _try_detect_json('{"id": 1}') is None
-    # Objects interleaved with prose are not clean concatenated JSON.
+def test_json_detection_is_liberal_but_bulk_gated() -> None:
+    # Liberal (parse-based): a lone JSON object IS structured data worth routing —
+    # config/data files are ``{...}`` (chosen over the earlier conservative stance
+    # when this PR merged with the concatenated-JSON detector, #1742).
+    assert _try_detect_json('{"id": 1}').content_type is ContentType.JSON_ARRAY
+    # But a JSON fragment that is only a minority of the content (prose or a loose
+    # scalar around it) is NOT claimed — the decoded value must be the bulk.
     assert _try_detect_json('{"id": 1} then some prose {"id": 2}') is None
-    # Scalars/strings between objects disqualify the run of dicts.
     assert _try_detect_json('{"id": 1} "loose string"') is None
 
 

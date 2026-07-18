@@ -87,6 +87,12 @@ class RequestOutcome:
     # Prometheus ``cached`` counter and dashboard "response cache" row.
     from_response_cache: bool = False
 
+    # Upstream HTTP status for this request (200 on success or response-cache
+    # hit). When >= 500 (e.g. a 529 Overloaded returned after retry
+    # exhaustion) the funnel records a failed request instead of feeding the
+    # savings/cost stats, so an upstream failure can't inflate save-rate.
+    status_code: int = 200
+
     # ── Timing ────────────────────────────────────────────────────────
     # total_latency_ms: wall-clock end-to-end for this request
     # overhead_ms: time spent in compression dispatch only (subset of total)
@@ -317,6 +323,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
          (skipped when logger is None, i.e. ``--no-request-logging``)
       4. structured PERF log line — consumed by ``headroom perf``
 
+    A failure outcome (``status_code >= 500``, e.g. a 529 surfaced after retry
+    exhaustion) short-circuits before these four effects: it records a failed
+    request and returns, so an upstream failure cannot feed the success stats.
+
     Takes the handler as a free argument rather than ``self`` so this
     function is callable from:
     * ``HeadroomProxy._record_request_outcome`` (production)
@@ -333,15 +343,30 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
 
+    # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
+    # exhaustion) must not feed the savings/cost/log success stats; that would
+    # let a failed request inflate the save-rate. Record it as failed and stop,
+    # mirroring the pre-passthrough behaviour where an exhausted 5xx raised and
+    # was counted via record_failed. 4xx stay on the normal funnel: they are
+    # client errors the proxy still served.
+    if outcome.status_code >= 500:
+        await handler.metrics.record_failed(provider=outcome.provider)
+        return
+
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
     # observed output tokens to the recorder so it can produce an honest
     # reduction estimate. Best-effort: never let bookkeeping break a response.
+    output_tokens_saved_est = 0
     if any(str(t).startswith("output_shaper:") for t in outcome.transforms_applied):
         try:
             from headroom.proxy.output_savings import get_recorder
 
-            get_recorder().record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+            _rec = get_recorder()
+            _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+            output_tokens_saved_est = _rec.estimate_request_savings(
+                outcome.transforms_applied, outcome.output_tokens
+            )
         except Exception:  # pragma: no cover - defensive
             pass
 
@@ -368,6 +393,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cache_write_1h_tokens=outcome.cache_write_1h_tokens,
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
+        output_tokens_saved=output_tokens_saved_est,
         project=project,
         client=outcome.client,
     )
