@@ -9,7 +9,11 @@ from typing import Any, Literal, cast
 import click
 
 from headroom import paths as _paths
-from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
+from headroom.providers.registry import (
+    resolve_api_overrides,
+    resolve_api_targets,
+    resolve_extra_headers,
+)
 from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 
 from .main import main
@@ -247,7 +251,7 @@ def dashboard(port: int, no_open: bool) -> None:
         case_sensitive=False,
     ),
     help=(
-        "Optimization mode (default: token).\n"
+        "Optimization mode (default: cache).\n"
         "  token  — prioritize compression; prior turns may be rewritten for max savings.\n"
         "  cache  — freeze prior turns to maximise provider prefix-cache hit rate.\n"
         "Legacy aliases (token_mode, token_savings, token_headroom, cache_mode, "
@@ -285,6 +289,10 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Comma-separated tool names whose results are never lossy-compressed, "
         "merged with the built-in defaults (e.g. Bash,WebFetch). "
+        "In token mode, this also resets protect_recent_reads_fraction "
+        "from 0.3 (only recent ~30% of results protected) to 0.0 (all "
+        "results protected indefinitely), which prevents older Read/Glob/"
+        "Grep/Write/Edit tool results from being silently compressed. "
         "Env: HEADROOM_PROTECT_TOOL_RESULTS."
     ),
 )
@@ -371,6 +379,26 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Maximum upstream retry attempts for connect/read/5xx failures (1–10, default: 3). "
         "Env: HEADROOM_RETRY_MAX_ATTEMPTS."
+    ),
+)
+@click.option(
+    "--retry-base-delay-ms",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_RETRY_BASE_DELAY_MS",
+    help=(
+        "Initial upstream retry delay in milliseconds (minimum: 0, default: 1000). "
+        "Env: HEADROOM_RETRY_BASE_DELAY_MS."
+    ),
+)
+@click.option(
+    "--retry-max-delay-ms",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_RETRY_MAX_DELAY_MS",
+    help=(
+        "Maximum upstream retry delay in milliseconds (minimum: 0, default: 30000). "
+        "Env: HEADROOM_RETRY_MAX_DELAY_MS."
     ),
 )
 @click.option(
@@ -776,6 +804,15 @@ def dashboard(port: int, no_open: bool) -> None:
     help="Custom OpenAI API URL for passthrough endpoints (env: OPENAI_TARGET_API_URL)",
 )
 @click.option(
+    "--provider-name",
+    default=None,
+    help=(
+        "Display name for the OpenAI-compatible upstream shown on the dashboard "
+        "(e.g. 'OpenRouter'). Overrides hostname detection from --openai-api-url. "
+        "Internal routing and pricing are unaffected."
+    ),
+)
+@click.option(
     "--gemini-api-url",
     default=None,
     help="Custom Gemini API URL for passthrough endpoints (env: GEMINI_TARGET_API_URL)",
@@ -848,6 +885,22 @@ def dashboard(port: int, no_open: bool) -> None:
     "Default: /tmp/headroom-embed-{port}.sock. "
     "(env: HEADROOM_EMBEDDING_SERVER_SOCKET)",
 )
+@click.option(
+    "--anthropic-extra-headers",
+    default=None,
+    help=(
+        "JSON object of extra headers merged into (and overriding) headers forwarded to "
+        'the Anthropic endpoint, e.g. \'{"Api-Key": "..."}\' (env: ANTHROPIC_TARGET_API_HEADERS)'
+    ),
+)
+@click.option(
+    "--openai-extra-headers",
+    default=None,
+    help=(
+        "JSON object of extra headers merged into (and overriding) headers forwarded to "
+        "the OpenAI endpoint (env: OPENAI_TARGET_API_HEADERS)"
+    ),
+)
 @click.pass_context
 def proxy(
     ctx: click.Context,
@@ -876,6 +929,8 @@ def proxy(
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
+    retry_base_delay_ms: int | None,
+    retry_max_delay_ms: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
@@ -917,7 +972,10 @@ def proxy(
     backend: str,
     anyllm_provider: str,
     anthropic_api_url: str | None,
+    anthropic_extra_headers: str | None,
+    openai_extra_headers: str | None,
     openai_api_url: str | None,
+    provider_name: str | None,
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None,
@@ -1021,6 +1079,17 @@ def proxy(
             sys.exit(1)
         os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
 
+    try:
+        resolved_anthropic_extra_headers = resolve_extra_headers(
+            anthropic_extra_headers, "ANTHROPIC_TARGET_API_HEADERS"
+        )
+        resolved_openai_extra_headers = resolve_extra_headers(
+            openai_extra_headers, "OPENAI_TARGET_API_HEADERS"
+        )
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red", err=True)
+        sys.exit(1)
+
     provider_api_overrides = resolve_api_overrides(
         anthropic_api_url=anthropic_api_url,
         openai_api_url=openai_api_url,
@@ -1030,8 +1099,15 @@ def proxy(
         environ=os.environ,
     )
 
-    # Resolve anyllm provider: env var takes precedence over CLI default (matches argparse path)
-    effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
+    # Resolve anyllm provider. An explicit --anyllm-provider flag always wins;
+    # otherwise honor HEADROOM_ANYLLM_PROVIDER, which the settings store may
+    # have exported into os.environ after Click parsed the option (so the
+    # already-parsed param can't see it).
+    _anyllm_source = click.get_current_context().get_parameter_source("anyllm_provider")
+    if _anyllm_source is click.core.ParameterSource.COMMANDLINE:
+        effective_anyllm_provider = anyllm_provider
+    else:
+        effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
 
     # Resolve mode: CLI flag > env var > default. Default is CACHE (Headroom's
     # coding posture): delta-only compression at ~0 prefix-cache busts.
@@ -1084,7 +1160,10 @@ def proxy(
         host=host,
         port=port,
         anthropic_api_url=provider_api_overrides.anthropic,
+        anthropic_extra_headers=resolved_anthropic_extra_headers,
+        openai_extra_headers=resolved_openai_extra_headers,
         openai_api_url=provider_api_overrides.openai,
+        provider_name=provider_name,
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
@@ -1129,6 +1208,8 @@ def proxy(
             subscription_poll_interval if subscription_poll_interval is not None else 300
         ),
         retry_max_attempts=retry_max_attempts if retry_max_attempts is not None else 3,
+        retry_base_delay_ms=retry_base_delay_ms if retry_base_delay_ms is not None else 1000,
+        retry_max_delay_ms=retry_max_delay_ms if retry_max_delay_ms is not None else 30000,
         request_timeout_seconds=request_timeout_seconds
         if request_timeout_seconds is not None and request_timeout_seconds > 0
         else 300,

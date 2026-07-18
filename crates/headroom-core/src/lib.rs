@@ -4,6 +4,7 @@ pub mod auth_mode;
 pub mod cache_control;
 pub mod ccr;
 pub mod compression_policy;
+#[cfg(feature = "ml")]
 mod onnx_cpu;
 pub mod relevance;
 pub mod signals;
@@ -49,6 +50,7 @@ pub fn hello() -> &'static str {
 ///   (default: `NPU`; also accepts `CPU`, `GPU`, `GPU.0`, `HETERO:NPU,GPU`)
 /// - `HEADROOM_ORT_OPENVINO_CACHE` — directory for compiled NPU/GPU blobs;
 ///   first run compiles and saves, subsequent runs load instantly
+#[cfg(feature = "ml")]
 pub fn init_ort_ep() {
     use ort::execution_providers::{OpenVINO, CUDA};
 
@@ -105,6 +107,13 @@ pub fn init_ort_ep() {
             ep = other,
             "Unknown HEADROOM_ORT_EP — valid: cpu, openvino, cuda. Falling back to CPU"
         ),
+    }
+}
+
+#[cfg(not(feature = "ml"))]
+pub fn init_ort_ep() {
+    if std::env::var_os("HEADROOM_ORT_EP").is_some() {
+        tracing::warn!("HEADROOM_ORT_EP ignored because headroom-core was built without ml");
     }
 }
 

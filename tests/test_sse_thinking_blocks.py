@@ -79,6 +79,36 @@ def test_thinking_delta_accumulated() -> None:
     assert block["thinking"] == "Let me consider the question carefully."
 
 
+def test_non_standard_block_fields_preserved() -> None:
+    # A block whose type isn't text/tool_use/thinking/redacted_thinking (e.g.
+    # server_tool_use, web_search_tool_result) must keep its fields on
+    # reconstruction, not collapse to a bare {type, index}. The sibling
+    # _reconstruct_anthropic_response already does this via dict(block).
+    parser = _Parser()
+    events = [
+        {"type": "message_start", "message": {"id": "msg_1", "model": "claude-opus-4"}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {"query": "headroom proxy"},
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+    ]
+    sse = _build_sse(events)
+    response = parser._parse_sse_to_response(sse, "anthropic")
+    assert response is not None
+    block = response["content"][0]
+    assert block["type"] == "server_tool_use"
+    assert block["id"] == "srvtoolu_1"
+    assert block["name"] == "web_search"
+    assert block["input"] == {"query": "headroom proxy"}
+
+
 def test_signature_delta_preserved() -> None:
     parser = _Parser()
     events = [

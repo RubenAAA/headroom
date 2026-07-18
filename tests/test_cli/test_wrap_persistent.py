@@ -163,6 +163,32 @@ def test_ensure_proxy_restarts_idle_stale_persistent_deployment(monkeypatch) -> 
     assert calls == ["restart:default:8787"]
 
 
+def test_ensure_proxy_restarts_stale_proxy_from_dev_build(monkeypatch) -> None:
+    """A source (-dev) CLI still restarts a stale proxy: the -dev marker is
+    display-only and must not disable a real version-mismatch restart."""
+    calls: list[str] = []
+    health = {
+        "version": "0.0.1",
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": 12345},
+    }
+    monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.32.0-dev")
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda manifest, port: calls.append(f"restart:{manifest.profile}:{port}") or True,
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False)
+
+    assert proc is None
+    assert actual_port == 8787
+    assert calls == ["restart:default:8787"]
+
+
 def test_ensure_proxy_leaves_active_stale_persistent_deployment_running(monkeypatch) -> None:
     health = {
         "version": "0.0.1",
@@ -346,6 +372,97 @@ def test_ensure_proxy_restarts_ephemeral_proxy_for_openai_api_url_mismatch(monke
     assert calls[0] == ("kill", 12345, 8787)
     assert calls[1][0] == "start"
     assert calls[1][2]["openai_api_url"] == "https://api.individual.githubcopilot.com"
+
+
+def test_ensure_proxy_starts_isolated_ephemeral_proxy_for_copilot_subscription_seed(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8788,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("subscription-seeded session should not restart the shared proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        copilot_api_token="tid-session-token",
+        copilot_refresh_oauth_token="gho-refresh",
+        copilot_api_token_expires_at=456.5,
+    )
+
+    assert proc is None
+    assert actual_port == 8788
+    assert calls[0] == ("find_port", 8788)
+    assert calls[1][0] == "start"
+    assert calls[1][1][0] == 8788
+    assert calls[1][2]["copilot_api_token"] == "tid-session-token"
+    assert calls[1][2]["copilot_refresh_oauth_token"] == "gho-refresh"
+    assert calls[1][2]["copilot_api_token_expires_at"] == 456.5
+
+
+def test_ensure_proxy_starts_isolated_ephemeral_proxy_when_subscription_seed_targets_persistent_port(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr(
+        "headroom.install.health.probe_ready",
+        lambda url: (_ for _ in ()).throw(
+            AssertionError("subscription-seeded session should skip persistent probing")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("subscription-seeded session should not restart the persistent proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8788,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        copilot_api_token="tid-session-token",
+        copilot_refresh_oauth_token="gho-refresh",
+        copilot_api_token_expires_at=456.5,
+    )
+
+    assert proc is None
+    assert actual_port == 8788
+    assert calls[0] == ("find_port", 8788)
+    assert calls[1][0] == "start"
+    assert calls[1][1][0] == 8788
+    assert calls[1][2]["copilot_api_token"] == "tid-session-token"
+    assert calls[1][2]["copilot_refresh_oauth_token"] == "gho-refresh"
+    assert calls[1][2]["copilot_api_token_expires_at"] == 456.5
 
 
 def test_ensure_proxy_reuses_agent_proxy_without_savings_profile(monkeypatch) -> None:
@@ -682,6 +799,7 @@ def test_ensure_proxy_restarts_persistent_deployment_for_memory_mismatch(monkeyp
     # Proxy should be killed and restarted due to memory mismatch
     assert calls[0] == ("kill", 12345, 8787)
     assert calls[1][0] == "start"
+    assert calls[1][2]["memory"] is True
 
 
 def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(

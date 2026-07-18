@@ -4,62 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-# Sentinel prefix marks the steering block so application is idempotent and
-# the block is recognizable in logs/diffs.
-_STEERING_SENTINEL = "<headroom_output_shaping>"
-_STEERING_SUFFIX = "</headroom_output_shaping>"
-
-# Levels are cumulative: each includes everything above it. Text must stay
-# byte-stable across releases for prefix-cache friendliness; treat edits to
-# these strings as cache-busting changes.
-_VERBOSITY_LEVELS = {
-    1: (
-        "Skip preamble and postamble. Do not announce what you are about to "
-        "do or recap what you just did; start with the substance."
-    ),
-    2: (
-        "Skip preamble and postamble; start with the substance. Never restate "
-        "code, file contents, diffs, or tool output that already appear in "
-        "this conversation — reference them by path and line instead. After a "
-        "tool call succeeds, continue without narrating the result."
-    ),
-    3: (
-        "Skip preamble and postamble. Never restate code, file contents, "
-        "diffs, or tool output already in this conversation — reference by "
-        "path and line. Give conclusions only; omit rationale unless the user "
-        "asks why. Prefer the smallest edit over rewriting whole files. Keep "
-        "prose to the minimum needed to be unambiguous."
-    ),
-    4: (
-        "Minimum tokens. Fragments fine. No preamble, no postamble, no "
-        "restating context, no rationale. Answer, smallest-possible edits, "
-        "nothing else."
-    ),
-}
-
-
-def steering_text(level: int) -> str | None:
-    """The full steering block for a verbosity level, or None for level 0."""
-    text = _VERBOSITY_LEVELS.get(level)
-    if text is None:
-        return None
-    return f"{_STEERING_SENTINEL}\n{text}\n{_STEERING_SUFFIX}"
-
-
-def replace_or_append_steering_block(existing: str, block: str) -> tuple[str, bool]:
-    """Replace an existing steering block in text, or append one at the tail."""
-    start = existing.find(_STEERING_SENTINEL)
-    if start >= 0:
-        end = existing.find(_STEERING_SUFFIX, start)
-        end = len(existing) if end < 0 else end + len(_STEERING_SUFFIX)
-        prefix = existing[:start].rstrip()
-        suffix = existing[end:].lstrip("\n")
-        parts = [part for part in (prefix, block, suffix) if part]
-        updated = "\n\n".join(parts)
-        return updated, updated != existing
-
-    updated = f"{existing.rstrip()}\n\n{block}" if existing.strip() else block
-    return updated, updated != existing
+from headroom.proxy.output_verbosity_policy import (
+    STEERING_SENTINEL as _STEERING_SENTINEL,
+)
+from headroom.proxy.output_verbosity_policy import (
+    replace_or_append_steering_block,
+    steering_text,
+)
 
 
 def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
@@ -91,6 +42,68 @@ def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
                 block["text"] = text
                 return True
         system.append({"type": "text", "text": text})
+        return True
+    return False
+
+
+def apply_openai_chat_verbosity_steering(
+    body: dict[str, Any],
+    level: int,
+) -> bool:
+    """Append or replace the steering block in an OpenAI chat/completions body.
+
+    OpenAI ``/v1/chat/completions`` carries the system prompt as a
+    ``role: "system"`` (or ``"developer"``) message inside ``messages`` rather
+    than a top-level field, so it needs its own injector (the Anthropic
+    ``system`` and Responses ``instructions`` variants do not reach it — the
+    root cause of GitHub Copilot CLI seeing zero output savings, #2302).
+
+    The block is appended to the tail of the last system/developer message so a
+    treatment conversation's steering stays byte-stable across turns (and
+    re-applies idempotently via the sentinel). When the request carries no
+    system message at all, one is inserted at the front. Returns True only when
+    the body actually changed.
+    """
+    text = steering_text(level)
+    if text is None:
+        return False
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    target: dict[str, Any] | None = None
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") in ("system", "developer"):
+            target = message
+    if target is None:
+        # No system prompt to append to — insert one carrying just the block.
+        messages.insert(0, {"role": "system", "content": text})
+        return True
+
+    content = target.get("content")
+    if content is None:
+        target["content"] = text
+        return True
+    if isinstance(content, str):
+        updated, changed = replace_or_append_steering_block(content, text)
+        if changed:
+            target["content"] = updated
+        return changed
+    if isinstance(content, list):
+        # OpenAI also accepts a content-part list ([{"type": "text", ...}]).
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                and part["text"].startswith(_STEERING_SENTINEL)
+            ):
+                if part["text"] == text:
+                    return False
+                part["text"] = text
+                return True
+        content.append({"type": "text", "text": text})
         return True
     return False
 
