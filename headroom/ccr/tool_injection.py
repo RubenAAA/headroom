@@ -199,6 +199,14 @@ class CCRToolInjector:
             # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
             # space, comma, or the closing `>>`.
             re.compile(r"<<ccr:([a-f0-9]{12,24})\b"),
+            # read_lifecycle STALE/SUPERSEDED markers:
+            # `[Read content stale/superseded: ... Retrieve original: hash=xxx]`.
+            # These carry a retrievable CCR hash but never contain the word
+            # "compressed", so the patterns above miss them -- and the retrieve
+            # tool is then not injected, leaving the model a marker it cannot
+            # redeem (silent data loss, #1006). Match the load-bearing
+            # "Retrieve original: hash=" phrase directly.
+            re.compile(r"Retrieve original: hash=([a-f0-9]{12,24})"),
         ]
     )
 
@@ -459,25 +467,47 @@ def parse_tool_call(
         name = tool_call.get("name")
         input_data = tool_call.get("input", {})
     elif provider == "openai":
-        function = tool_call.get("function", {})
+        # `get("function", {})` returns None for an explicit {"function": null}
+        # (the default only applies to a missing key), so `.get` below would
+        # raise AttributeError on a malformed/partial tool call. Coalesce to {}.
+        function = tool_call.get("function") or {}
         name = function.get("name")
         # OpenAI passes args as JSON string
         args_str = function.get("arguments", "{}")
         try:
             input_data = json.loads(args_str)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
             input_data = {}
     elif provider == "google":
         # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
-        function_call = tool_call.get("functionCall", {})
+        # Coalesce to {} so an explicit {"functionCall": null} does not crash.
+        function_call = tool_call.get("functionCall") or {}
         name = function_call.get("name")
         input_data = function_call.get("args", {})
+    elif provider == "openai_responses":
+        # Responses API: flat `function_call` item — name and arguments
+        # live directly on it, not nested under "function" like chat
+        # completions tool_calls.
+        name = tool_call.get("name")
+        args_str = tool_call.get("arguments", "{}")
+        try:
+            input_data = json.loads(args_str)
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
+            input_data = {}
     else:
         # Generic fallback
         name = tool_call.get("name")
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
     if name != CCR_TOOL_NAME:
+        return None
+
+    # A CCR-named tool call whose decoded arguments/input are not an object
+    # (a JSON array/string/number, or a non-dict Anthropic `input`) is simply
+    # not a valid CCR call — return None instead of crashing on `.get`.
+    if not isinstance(input_data, dict):
         return None
 
     hash_key = input_data.get("hash")
@@ -493,4 +523,10 @@ def parse_tool_call(
     if not all(c in "0123456789abcdef" for c in hash_key.lower()):
         return None
 
-    return hash_key
+    # Normalise to lowercase. The compression store always keys entries by a
+    # lowercase hash (sha256 hexdigest, and `explicit_hash.lower()` on store),
+    # and `retrieve` / `get_entry_status` look up the key verbatim. The hex
+    # validation above is already case-insensitive, so a model that echoes the
+    # marker hash uppercase passed validation but then missed the store lookup,
+    # failing an otherwise-valid retrieval. Return the canonical lowercase form.
+    return hash_key.lower()

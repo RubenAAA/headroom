@@ -26,6 +26,8 @@ SUPPORTED_TARGETS = [
     ToolTarget.CODEX,
     ToolTarget.AIDER,
     ToolTarget.CURSOR,
+    ToolTarget.GROK_BUILD,
+    ToolTarget.GROK,
     ToolTarget.OPENCLAW,
     ToolTarget.OPENCODE,
 ]
@@ -54,6 +56,9 @@ def detect_targets() -> list[str]:
             continue
         if target == ToolTarget.CURSOR and shutil.which("cursor"):
             detected.append(target.value)
+            continue
+        if target == ToolTarget.GROK_BUILD and shutil.which("grok"):
+            detected.append(target.value)
     return detected
 
 
@@ -69,15 +74,6 @@ def resolve_targets(
     valid = {target.value for target in valid_targets}
     requested = [target.strip().lower() for target in requested_targets]
 
-    if scope == ConfigScope.PROVIDER.value:
-        unsupported = [target for target in requested if target and target not in valid]
-        if unsupported:
-            unsupported_list = ", ".join(sorted(set(unsupported)))
-            raise click.ClickException(
-                "Provider scope supports only claude, codex, openclaw, and opencode; "
-                f"unsupported targets: {unsupported_list}"
-            )
-
     if provider_mode == ProviderSelectionMode.ALL.value:
         return [target.value for target in valid_targets]
 
@@ -88,6 +84,20 @@ def resolve_targets(
             ToolTarget.CODEX.value,
             *([] if scope == ConfigScope.PROVIDER.value else [ToolTarget.COPILOT.value]),
         ]
+
+    # Manual selection is the only mode that consults `requested`, so the
+    # provider-scope validation belongs here. Running it earlier rejected
+    # unsupported entries that `all`/`auto` ignore entirely — e.g.
+    # `install apply --scope provider --providers all --target cursor` raised
+    # instead of returning the provider target set.
+    if scope == ConfigScope.PROVIDER.value:
+        unsupported = [target for target in requested if target and target not in valid]
+        if unsupported:
+            unsupported_list = ", ".join(sorted(set(unsupported)))
+            raise click.ClickException(
+                "Provider scope supports only claude, codex, openclaw, and opencode; "
+                f"unsupported targets: {unsupported_list}"
+            )
 
     normalized = []
     seen: set[str] = set()
@@ -119,6 +129,12 @@ def build_manifest(
     memory_enabled: bool,
     telemetry_enabled: bool,
     image: str,
+    no_http2: bool = False,
+    code_aware: bool | None = None,
+    intercept_tool_results: bool = False,
+    protect_tool_results: str | None = None,
+    bedrock_profile: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> DeploymentManifest:
     """Create a normalized deployment manifest."""
 
@@ -148,6 +164,10 @@ def build_manifest(
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
+    # Applied last so explicit --env overrides win over the auto-derived
+    # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
+    if extra_env:
+        base_env.update(extra_env)
 
     proxy_args = [
         "--host",
@@ -166,6 +186,16 @@ def build_manifest(
         proxy_args.extend(["--anyllm-provider", anyllm_provider])
     if region:
         proxy_args.extend(["--region", region])
+    if no_http2:
+        proxy_args.append("--no-http2")
+    if code_aware is not None:
+        proxy_args.append("--code-aware" if code_aware else "--no-code-aware")
+    if intercept_tool_results:
+        proxy_args.append("--intercept-tool-results")
+    if protect_tool_results:
+        proxy_args.extend(["--protect-tool-results", protect_tool_results])
+    if bedrock_profile:
+        proxy_args.extend(["--bedrock-profile", bedrock_profile])
 
     container_name = f"headroom-{normalized_profile}"
     return DeploymentManifest(

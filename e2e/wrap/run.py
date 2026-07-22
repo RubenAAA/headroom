@@ -230,6 +230,7 @@ def create_shims(shim_dir: Path) -> None:
                     "OPENAI_BASE_URL",
                     "OPENAI_API_BASE",
                     "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
                     "OPENCODE_CONFIG_CONTENT",
                 )
                 if os.environ.get(key) is not None
@@ -286,6 +287,7 @@ def create_shims(shim_dir: Path) -> None:
                     "OPENAI_BASE_URL",
                     "OPENAI_API_BASE",
                     "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
                     "OPENCODE_CONFIG_CONTENT",
                 )
                 if os.environ.get(key) is not None
@@ -349,6 +351,13 @@ def create_shims(shim_dir: Path) -> None:
             )
             record["headroom_model_count"] = (
                 by_model.get(model_name) if isinstance(by_model, dict) else None
+            )
+
+        codex_home = os.environ.get("CODEX_HOME")
+        if codex_home:
+            session_config = Path(codex_home) / "config.toml"
+            record["session_config"] = (
+                session_config.read_text(encoding="utf-8") if session_config.exists() else None
             )
 
         record["probes"] = probes
@@ -571,42 +580,63 @@ def verify_codex_wrap(
     )
 
     config_path = Path(base_env["HOME"]) / ".codex" / "config.toml"
-    assert_true(config_path.exists(), "Codex wrap should create ~/.codex/config.toml")
-    config = config_path.read_text(encoding="utf-8")
     assert_true(
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject openai_base_url for subscription routing",
+        config_path.exists(),
+        "Codex wrap should persist its MCP setup in the durable Codex home",
+    )
+    durable_config = config_path.read_text(encoding="utf-8")
+    assert_true(
+        "[mcp_servers.headroom]" in durable_config,
+        "Codex wrap should persist the Headroom MCP server",
     )
     assert_true(
-        f'base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject the headroom provider base_url",
-    )
-    assert_true(
-        'env_key = "OPENAI_API_KEY"' not in config,
-        "Codex wrap should preserve OAuth and never inject env_key",
-    )
-    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
-    assert_true(
-        "requires_openai_auth" not in config,
-        "Codex wrap must NOT inject requires_openai_auth into the headroom provider block",
-    )
-    assert_true(
-        "supports_websockets = true" in config, "Codex wrap missing 'supports_websockets = true'"
+        'model_provider = "headroom"' not in durable_config
+        and "[model_providers.headroom]" not in durable_config
+        and "openai_base_url" not in durable_config,
+        "Codex wrap should keep proxy routing out of the durable config",
     )
 
     entries = read_jsonl(log_dir / "codex.jsonl")
     assert_true(len(entries) > 0, "Codex shim should have been invoked")
     env_vars = entries[-1]["env"]
+    session_home = env_vars.get("CODEX_HOME")
     assert_true(
-        env_vars.get("OPENAI_BASE_URL") == f"http://127.0.0.1:{port}/v1",
+        isinstance(session_home, str) and session_home,
+        "Codex wrap should launch the child with CODEX_HOME",
+    )
+    assert_true(
+        Path(session_home) == config_path.parent,
+        "Codex wrap should point the child at the durable ~/.codex home",
+    )
+    config = entries[-1].get("session_config")
+    assert_true(
+        isinstance(config, str) and config,
+        "Codex wrap should capture the durable config during launch",
+    )
+    project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+    expected_base_url = f"http://127.0.0.1:{port}{project_prefix}/v1"
+    argv = entries[-1].get("argv")
+    assert_true(
+        isinstance(argv, list) and f'openai_base_url="{expected_base_url}"' in argv,
+        "Codex wrap should pass openai_base_url as a process-local override",
+    )
+    assert_true(
+        'env_key = "OPENAI_API_KEY"' not in config,
+        "Codex wrap should preserve OAuth and never inject env_key into the session config",
+    )
+    assert_true(
+        env_vars.get("OPENAI_BASE_URL") == expected_base_url,
         "Codex wrap should set OPENAI_BASE_URL",
     )
     assert_true(
         entries[-1]["probes"]
         == [
-            {"url": f"http://127.0.0.1:{port}/v1/models", "status": 200},
-            {"url": f"http://127.0.0.1:{port}/v1/chat/completions", "status": 200},
-            {"url": f"http://127.0.0.1:{port}/stats", "status": 200},
+            {"url": f"{expected_base_url}/models", "status": 200},
+            {"url": f"{expected_base_url}/chat/completions", "status": 200},
+            {
+                "url": f"http://127.0.0.1:{port}{project_prefix}/stats",
+                "status": 200,
+            },
         ],
         "Codex shim should prove OPENAI_BASE_URL points at a live proxy and that Headroom logged the wrapped message",
     )
@@ -715,12 +745,24 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             "Cursor wrap should print the Anthropic base URL override",
         )
         wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15)
+        # rtk registers a native Cursor hook (rtk init --agent cursor) when it
+        # can (~/.cursor exists); headroom only falls back to injecting
+        # .cursorrules text if that registration fails (GH #756). Accept
+        # either outcome rather than assuming the fallback path.
         cursorrules = project_dir / ".cursorrules"
-        assert_true(cursorrules.exists(), "Cursor wrap should create .cursorrules")
-        assert_true(
-            RTK_MARKER in cursorrules.read_text(encoding="utf-8"),
-            "Cursor wrap should inject RTK instructions",
+        cursor_hooks_json = Path(base_env["HOME"]) / ".cursor" / "hooks.json"
+        native_hook_registered = (
+            cursor_hooks_json.exists() and "rtk" in cursor_hooks_json.read_text(encoding="utf-8")
         )
+        if not native_hook_registered:
+            assert_true(
+                cursorrules.exists(),
+                "Cursor wrap should create .cursorrules when the native rtk hook is unavailable",
+            )
+            assert_true(
+                RTK_MARKER in cursorrules.read_text(encoding="utf-8"),
+                "Cursor wrap should inject RTK instructions",
+            )
     finally:
         stop_process(proc)
 
@@ -911,6 +953,9 @@ def main() -> None:
                 "PATH": f"{shim_dir}{os.pathsep}{base_env['PATH']}",
                 "HEADROOM_E2E_LOG_DIR": str(log_dir),
                 "OPENAI_TARGET_API_URL": "http://127.0.0.1:19001/v1",
+                # RTK is opt-in (off by default). These wrap smoke tests assert
+                # RTK-instruction injection, so exercise the RTK-on path.
+                "HEADROOM_RTK": "1",
             }
         )
 

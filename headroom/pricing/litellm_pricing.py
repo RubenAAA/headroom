@@ -8,8 +8,16 @@ See: https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_windo
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
 from typing import Any
+
+from headroom.pricing.litellm_model_resolution import (
+    pricing_lookup_candidates,
+    resolve_litellm_model_name,
+)
 
 # litellm calls `dotenv.load_dotenv()` during its own import, which loads
 # the project `.env` into `os.environ`. We don't want that side effect —
@@ -33,27 +41,67 @@ except ImportError:
     litellm = None  # type: ignore[assignment]
     LITELLM_AVAILABLE = False
 
-# Aliases for models removed from LiteLLM's cost database (retired/renamed).
-# Maps old model name -> current LiteLLM key that has equivalent pricing.
-_MODEL_ALIASES: dict[str, str] = {
-    # Claude 3.5 Sonnet retired Feb 2026, pricing same as claude-sonnet-4-20250514
-    "claude-3-5-sonnet-20241022": "claude-sonnet-4-20250514",
-    "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
-    # Claude 3 Sonnet retired
-    "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
-}
-
 _resolved_model_cache: dict[str, str] = {}
+
+logger = logging.getLogger("headroom.pricing")
+
+# --- Gateway model-name resolution ---------------------------------------
+# When Headroom sits behind a gateway (Kong, LiteLLM, ...) that aliases model
+# names, the raw client name it sees (e.g. "claude-opus") is not a priced key
+# in litellm.model_cost, so dollar savings read $0. HEADROOM_MODEL_ALIAS_MAP is
+# an optional, gateway-agnostic, fail-soft static JSON map {client_name: target}
+# that reduces that name to a priced model_cost key (trying the target as-is and
+# with a bedrock/ or vertex_ai/ provider prefix stripped). Unset -> behavior is
+# identical to today's bare-prefix resolution; pricing never breaks.
+_GATEWAY_PROVIDER_PREFIXES = ("bedrock/", "vertex_ai/")
+
+
+def _static_alias_map() -> dict[str, str]:
+    raw = os.environ.get("HEADROOM_MODEL_ALIAS_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.debug("invalid HEADROOM_MODEL_ALIAS_MAP JSON", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k and v}
+
+
+def _reduce_to_priced_key(target: str) -> str | None:
+    """Reduce a gateway target to a priced litellm.model_cost key, or None."""
+    if not LITELLM_AVAILABLE or litellm is None:
+        return None
+    candidates = [target]
+    for prefix in _GATEWAY_PROVIDER_PREFIXES:
+        if target.startswith(prefix):
+            candidates.append(target[len(prefix) :])
+    for candidate in candidates:
+        info = litellm.model_cost.get(candidate)
+        if info and info.get("input_cost_per_token") is not None:
+            return candidate
+    return None
 
 
 def resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes, adding provider prefix if needed.
     Results are cached per model name to avoid blocking the event loop
     with repeated synchronous litellm lookups.
+
+    When HEADROOM_MODEL_ALIAS_MAP is configured, a raw client name / group alias
+    is first reduced to a priced model_cost key; otherwise this falls through to
+    the bare-prefix rules. Shared by the live (cost.py) and persisted
+    (savings_tracker) pricing paths so both figures price identically.
     """
     if model in _resolved_model_cache:
         return _resolved_model_cache[model]
-    resolved = _resolve_litellm_model_uncached(model)
+    priced: str | None = None
+    alias = _static_alias_map()
+    if alias:
+        priced = _reduce_to_priced_key(alias.get(model, model))
+    resolved = priced if priced is not None else _resolve_litellm_model_uncached(model)
     _resolved_model_cache[model] = resolved
     return resolved
 
@@ -62,36 +110,15 @@ def _resolve_litellm_model_uncached(model: str) -> str:
     """Uncached resolution — called once per unique model name."""
     if not LITELLM_AVAILABLE:
         return model
-    # Try as-is first
-    try:
-        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
-        return model
-    except Exception:
-        pass
-    # Try with provider prefix
-    prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
-        "minimax-": "minimax/",
-        "deepseek-": "deepseek/",
-    }
-    # Case-insensitive prefix match: MiniMax uses mixed-case model
-    # names like "MiniMax-M3" (capital M's); we shouldn't require the
-    # user to lower-case their config to match.
-    model_lower = model.lower()
-    for pattern, prefix in prefixes.items():
-        if model_lower.startswith(pattern):
-            prefixed = f"{prefix}{model}"
-            try:
-                litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
-                return prefixed
-            except Exception:
-                break
-    return model
+
+    def is_known_model(candidate: str) -> bool:
+        try:
+            litellm.cost_per_token(model=candidate, prompt_tokens=1, completion_tokens=0)
+            return True
+        except Exception:
+            return False
+
+    return resolve_litellm_model_name(model, is_known_model)
 
 
 def _register_minimax_pricing() -> None:
@@ -160,21 +187,11 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
         return None
     cost_data = litellm.model_cost
 
-    # Try exact match first
-    info = cost_data.get(model)
-
-    # Try common provider prefixes if not found
-    if info is None:
-        for prefix in ["openai/", "anthropic/", "google/", "mistral/", "deepseek/"]:
-            if f"{prefix}{model}" in cost_data:
-                info = cost_data[f"{prefix}{model}"]
-                break
-
-    # Try retired/renamed model aliases (LiteLLM removes old model keys over time)
-    if info is None:
-        alias = _MODEL_ALIASES.get(model)
-        if alias:
-            info = cost_data.get(alias)
+    info = None
+    for candidate in pricing_lookup_candidates(model):
+        info = cost_data.get(candidate)
+        if info is not None:
+            break
 
     if info is None:
         return None

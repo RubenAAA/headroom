@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -63,18 +64,58 @@ def test_agent_90_profile_exports_cross_agent_proxy_env() -> None:
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
 
 
-def test_coding_persona_protects_working_set_and_stays_visible() -> None:
+def test_coding_persona_compresses_recent_delta_and_stays_visible() -> None:
     profile = get_agent_savings_profile("coding")
 
     env = profile.proxy_env()
 
     assert env["HEADROOM_SAVINGS_PROFILE"] == "coding"
-    assert env["HEADROOM_PROTECT_RECENT"] == "2"  # keep the active code working set verbatim
-    assert env["HEADROOM_MIN_TOKENS"] == "25"  # low → compression is actually visible
-    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "0"  # no prompt mutation / cache bust
-    assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"
+    assert env["HEADROOM_MODE"] == "cache"  # delta-only compression at ~0 prefix-cache busts
+    assert env["HEADROOM_PROTECT_RECENT"] == "0"  # reads guarded by type, not position
+    assert env["HEADROOM_MIN_TOKENS"] == "10"  # low → even modest deltas are eligible
+    # Cache mode compresses the newest observation delta → compress_user must be ON.
+    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "1"
+    assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"  # system prompt is the hottest cache
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
     assert "HEADROOM_TARGET_RATIO" not in env  # unset → Kompress / ambient default decides
+    # Coding posture toggles seeded through the profile.
+    assert env["HEADROOM_TOOL_SEARCH"] == "1"
+    assert env["HEADROOM_DEDUPE"] == "1"
+    assert env["HEADROOM_LOSSLESS_THEN_LOSSY"] == "1"
+    assert env["HEADROOM_PROTECT_READS"] == "1"
+    assert env["HEADROOM_CODE_AWARE_ENABLED"] == "1"
+    assert env["HEADROOM_EFFORT_ROUTER"] == "0"
+    assert env["HEADROOM_LOSSLESS"] == "0"  # lossy enabled (CCR keeps it recoverable)
+    assert env["HEADROOM_MIN_CHARS_FOR_BLOCK"] == "25"
+
+
+def test_coding_profile_couples_zero_protect_recent_with_type_read_guard() -> None:
+    """Fidelity invariant behind #2145's protect_recent 2->0.
+
+    Dropping positional protection (protect_recent=0) is only safe because the
+    code working set stays byte-exact via the TYPE-based read guard
+    (protect_reads=True), and any *other* recent delta that does get compressed
+    stays losslessly recoverable via CCR (lossless=0 means lossy-with-CCR, not
+    silent loss) while the frozen prefix is left untouched (cache mode). This is
+    the honest boundary: recent file reads are verbatim, recent non-read deltas
+    are recoverable — not "nothing is ever touched". If a future edit drops the
+    read guard while keeping protect_recent=0, recent reads would silently
+    degrade, so this test fails closed on that pairing.
+    """
+    profile = get_agent_savings_profile("coding")
+
+    # Positional protection is off ...
+    assert profile.protect_recent == 0
+    # ... so the byte-exact guarantee for reads MUST come from the type guard.
+    assert profile.protect_reads is True
+
+    env = profile.proxy_env()
+    assert env["HEADROOM_PROTECT_RECENT"] == "0"
+    assert env["HEADROOM_PROTECT_READS"] == "1"
+    # Lossy compression is on, but CCR keeps compressed deltas recoverable, and
+    # cache mode compresses only the newest delta (frozen prefix stays byte-stable).
+    assert env["HEADROOM_LOSSLESS"] == "0"
+    assert env["HEADROOM_MODE"] == "cache"
 
 
 def test_general_persona_has_no_positional_code_protection() -> None:
@@ -88,13 +129,18 @@ def test_general_persona_has_no_positional_code_protection() -> None:
 
 
 def test_personas_omit_target_ratio_in_pipeline_kwargs() -> None:
-    for name, expected_protect in (("coding", 2), ("general", 0)):
+    # coding compresses the delta observation (cache mode) → compress_user True;
+    # general has no positional code working set and leaves user turns intact.
+    for name, expected_protect, expected_compress_user, expected_min_tokens in (
+        ("coding", 0, True, 10),
+        ("general", 0, False, 25),
+    ):
         kwargs = proxy_pipeline_kwargs(ProxyConfig(savings_profile=name))
 
         assert kwargs["protect_recent"] == expected_protect
         assert kwargs["read_protection_window"] == expected_protect
-        assert kwargs["min_tokens_to_compress"] == 25
-        assert kwargs["compress_user_messages"] is False
+        assert kwargs["min_tokens_to_compress"] == expected_min_tokens
+        assert kwargs["compress_user_messages"] is expected_compress_user
         assert kwargs["compress_system_messages"] is False
         assert kwargs["force_kompress"] is False
         assert "target_ratio" not in kwargs  # persona never pins a keep-ratio
@@ -105,8 +151,8 @@ def test_persona_apply_profile_leaves_target_ratio_untouched() -> None:
 
     apply_agent_savings_profile(cfg, "coding")
 
-    assert cfg.protect_recent == 2
-    assert cfg.min_tokens_to_compress == 25
+    assert cfg.protect_recent == 0
+    assert cfg.min_tokens_to_compress == 10
     assert cfg.target_ratio == 0.42  # persona did not override an explicit ratio
 
 
@@ -124,9 +170,17 @@ def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
 
 
-def test_unknown_agent_savings_profile_lists_valid_profiles() -> None:
-    with pytest.raises(ValueError, match="agent-90"):
-        get_agent_savings_profile("missing")
+def test_unknown_agent_savings_profile_falls_back_to_balanced(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An unknown profile must NOT raise: it's resolved during proxy startup, so
+    # raising takes the whole proxy down before it opens its port (desktop asked
+    # for a profile a fallback runtime predates). Degrade to "balanced" instead.
+    with caplog.at_level(logging.WARNING):
+        profile = get_agent_savings_profile("missing")
+    assert profile is get_agent_savings_profile("balanced")
+    assert "unknown savings profile" in caplog.text
+    assert "missing" in caplog.text
 
 
 def test_with_target_savings_recomputes_target_ratio() -> None:

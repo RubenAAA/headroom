@@ -89,6 +89,38 @@ class TestLearnNoLearnConflict:
         assert cfg.traffic_learning_enabled is False
 
 
+class TestHttpProxyOption:
+    """--http-proxy should configure only the provider HTTPX clients."""
+
+    def test_http_proxy_cli_flag(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--http-proxy", "http://proxy.local:8080"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].http_proxy == "http://proxy.local:8080"
+
+    def test_http_proxy_env_var(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_HTTP_PROXY": "http://proxy.local:8080"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].http_proxy == "http://proxy.local:8080"
+
+    def test_direct_server_env_http_proxy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import headroom.proxy.server as server_mod
+
+        monkeypatch.delenv(server_mod._MULTI_WORKER_CONFIG_ENV, raising=False)
+        monkeypatch.setenv("HEADROOM_HTTP_PROXY", "http://proxy.local:8080")
+
+        config = server_mod._proxy_config_from_env()
+        assert config.http_proxy == "http://proxy.local:8080"
+
+
 class TestSubscriptionPollIntervalValidation:
     """--subscription-poll-interval should reject values outside 1-3600."""
 
@@ -158,6 +190,23 @@ class TestRetryMaxAttemptsValidation:
 
     def test_above_max_is_rejected(self, runner: CliRunner) -> None:
         result = runner.invoke(main, ["proxy", "--retry-max-attempts", "11"])
+        assert result.exit_code != 0
+
+
+class TestRetryDelayValidation:
+    def test_retry_delays_are_forwarded(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--retry-base-delay-ms", "250", "--retry-max-delay-ms", "5000"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_base_delay_ms == 250
+        assert mock_run_server["config"].retry_max_delay_ms == 5000
+
+    @pytest.mark.parametrize("option", ["--retry-base-delay-ms", "--retry-max-delay-ms"])
+    def test_negative_delay_is_rejected(self, runner: CliRunner, option: str) -> None:
+        result = runner.invoke(main, ["proxy", option, "-1"])
         assert result.exit_code != 0
 
 
@@ -318,6 +367,20 @@ class TestNewEnvVarWiring:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].retry_max_attempts == 5
 
+    def test_headroom_retry_delays_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={
+                "HEADROOM_RETRY_BASE_DELAY_MS": "125",
+                "HEADROOM_RETRY_MAX_DELAY_MS": "8000",
+            },
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_base_delay_ms == 125
+        assert mock_run_server["config"].retry_max_delay_ms == 8000
+
     def test_headroom_connect_timeout_from_env(
         self, runner: CliRunner, mock_run_server: dict
     ) -> None:
@@ -415,6 +478,11 @@ class TestHelpTextCompleteness:
     def test_help_contains_mode_option(self, runner: CliRunner) -> None:
         assert "--mode" in self._help(runner)
 
+    def test_help_reports_cache_as_default_mode(self, runner: CliRunner) -> None:
+        out = self._help(runner)
+        assert "Optimization mode (default: cache)" in out
+        assert "Optimization mode (default: token)" not in out
+
     def test_help_contains_workers_option(self, runner: CliRunner) -> None:
         assert "--workers" in self._help(runner)
 
@@ -455,7 +523,7 @@ class TestCompressionMaxWorkers:
 
     Regression: the field was documented in ProxyConfig and consumed by the
     server, but the CLI never defined the option or passed it through, so it
-    was permanently None (always resolving to the min(32, cpu*4) default).
+    was permanently None (always resolving to the automatic server default).
     """
 
     def test_flag_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
