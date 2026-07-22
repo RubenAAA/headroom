@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install stable toolchain
         # Pin action code to @stable (latest fixes), toolchain version
         # via input. The @1.95.0 ref shipped action code that errors on
@@ -54,12 +54,44 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Provide ONNX Runtime dylib
+        # headroom-core is built with `ort-load-dynamic` (see its
+        # Cargo.toml): the ONNX Runtime shared library is dlopen'd at
+        # runtime instead of statically linked, so the magika/detection
+        # tests need a real libonnxruntime.so and ORT_DYLIB_PATH pointing
+        # at it — same contract `headroom/_ort.py` fulfills for Python
+        # users via the pip `onnxruntime` package.
+        run: |
+          pip install 'onnxruntime>=1.16.0'
+          echo "ORT_DYLIB_PATH=$(python -c "import onnxruntime, pathlib; p = pathlib.Path(onnxruntime.__file__).parent / 'capi'; print(next(iter(sorted(p.glob('libonnxruntime.so*')))))")" >> "$GITHUB_ENV"
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+
+  simulator-e2e:
+    name: simulator e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test simulator-backed proxy e2e
+        run: cargo test -p headroom-proxy --test e2e_simulators
 
   wheels:
     name: wheels (${{ matrix.target }})
@@ -75,16 +107,13 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             maturin-target: aarch64-apple-darwin
-        # macOS x86_64 (Intel) is NOT in this matrix.
-        # `fastembed` → `ort` → `ort-sys` does not publish prebuilt ONNX
-        # Runtime binaries for `x86_64-apple-darwin`; building from source
-        # in CI is a multi-hour cmake job. Apple Silicon has been the
-        # default macOS target since 2020 and is sufficient for the wheels
-        # we ship. If a customer needs Intel macOS, build from source
-        # locally (the toolchain works; only prebuilt distribution skips
-        # this target).
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            maturin-target: x86_64-apple-darwin
+        # Intel macOS uses `ort-load-dynamic` (no prebuilt ORT from ort-sys);
+        # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -109,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -131,7 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0

@@ -209,6 +209,7 @@ class AnchorConfig:
 # Tool outputs that are reference data and must NOT be compressed.
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
+# WebSearch/WebFetch results are large reference payloads that must remain verbatim.
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
 # To protect Bash or other non-excluded tools from lossy compression, use
 # HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
@@ -219,14 +220,50 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Grep",
         "Write",
         "Edit",
+        "WebSearch",
+        "WebFetch",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
         "grep",
         "write",
         "edit",
+        "web_search",
+        "web_fetch",
     }
 )
+
+# These excluded web-tool results must remain byte-faithful. Even the
+# excluded-tool lossless fold rewrites formatted JSON.
+DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "WebSearch",
+        "WebFetch",
+        "web_search",
+        "web_fetch",
+    }
+)
+
+
+def _tool_name_aliases(name: str) -> tuple[str, ...]:
+    """Return equivalent spellings for tool exclusion matching."""
+    aliases = [name]
+    lname = name.lower()
+
+    if lname.startswith("mcp__"):
+        # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that
+        # speak Anthropic sometimes emit the same wrapper as mcp_Server_tool.
+        parts = name.split("__", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            aliases.append(f"mcp_{parts[1]}_{parts[2]}")
+            aliases.append(parts[2])
+    elif lname.startswith("mcp_"):
+        parts = name.split("_", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            aliases.append(f"mcp__{parts[1]}__{parts[2]}")
+            aliases.append(parts[2])
+
+    return tuple(dict.fromkeys(aliases))
 
 
 def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
@@ -237,15 +274,28 @@ def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
     ``[``) are matched with :func:`fnmatch.fnmatchcase`, letting a single pattern
     such as ``mcp__*`` cover every tool an MCP server exposes without listing
     each name (issue #870).
+
+    MCP tool wrappers are also matched through their common aliases. For example,
+    ``mcp__Headroom__headroom_retrieve`` and
+    ``mcp_Headroom_headroom_retrieve`` both match ``mcp__*`` and the bare
+    ``headroom_retrieve`` entry.
     """
     if not exclude_tools:
         return False
-    if name in exclude_tools or name.lower() in exclude_tools:
+
+    patterns = tuple(exclude_tools)
+    if not patterns:
+        return False
+    aliases = _tool_name_aliases(name)
+    exact_patterns = set(patterns)
+    lower_exact_patterns = {pat.lower() for pat in exact_patterns}
+    if any(alias in exact_patterns or alias.lower() in lower_exact_patterns for alias in aliases):
         return True
-    lname = name.lower()
+
     return any(
-        fnmatch.fnmatchcase(lname, pat.lower())
-        for pat in exclude_tools
+        fnmatch.fnmatchcase(alias.lower(), pat.lower())
+        for alias in aliases
+        for pat in patterns
         if "*" in pat or "?" in pat or "[" in pat
     )
 

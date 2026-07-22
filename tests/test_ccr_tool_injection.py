@@ -66,6 +66,28 @@ class TestCCRToolInjector:
         assert "abc123def456abc123def456" in hashes
         assert injector.has_compressed_content
 
+    def test_scan_detects_read_lifecycle_stale_marker(self):
+        """A read_lifecycle STALE marker carries a retrievable CCR hash via the
+        'Retrieve original: hash=' phrase but never says 'compressed', so the
+        other patterns miss it. The injector must still detect it, or the
+        retrieve tool is not offered and the marker is unredeemable (#1006)."""
+        ccr_hash = "a1b2c3d4e5f6a1b2c3d4e5f6"  # 24 hex chars (SHA-256[:24])
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    "[Read content stale: app.py was modified after this read — "
+                    f"re-read the file for current content. Retrieve original: hash={ccr_hash}]"
+                ),
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert ccr_hash in hashes
+        assert injector.has_compressed_content
+
     def test_scan_for_markers_multiple_hashes(self):
         """Scanner finds multiple distinct hashes."""
         messages = [
@@ -288,6 +310,25 @@ class TestParseToolCall:
 
         assert hash_key == "def456abc123def456abc123"
 
+    def test_parse_null_function_returns_none_without_crashing(self):
+        """A tool call with an explicit {"function": null} / {"functionCall": null}
+        must return None, not raise AttributeError."""
+        assert parse_tool_call({"id": "c1", "function": None}, "openai") is None
+        assert parse_tool_call({"functionCall": None}, "google") is None
+
+    def test_parse_normalises_uppercase_hash_to_lowercase(self):
+        """An uppercase hash echoed by the model must be lowercased so it
+        matches the store (which keys entries by a lowercase hash)."""
+        tool_call = {
+            "id": "toolu_123",
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "ABC123DEF456ABC123DEF456"},
+        }
+
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "abc123def456abc123def456"
+
     def test_parse_non_ccr_tool(self):
         """Returns None for non-CCR tool calls."""
         tool_call = {
@@ -312,6 +353,23 @@ class TestParseToolCall:
         hash_key = parse_tool_call(tool_call, "openai")
 
         assert hash_key is None
+
+    def test_parse_openai_non_object_arguments_returns_none(self):
+        """OpenAI arguments that decode to a non-object (array/string/number)
+        must return None, not crash on `.get`."""
+        for args in ("[]", '"abc"', "123"):
+            tool_call = {"function": {"name": CCR_TOOL_NAME, "arguments": args}}
+            assert parse_tool_call(tool_call, "openai") is None
+
+    def test_parse_openai_null_arguments_returns_none(self):
+        """A null `arguments` value (json.loads(None) -> TypeError) is handled."""
+        tool_call = {"function": {"name": CCR_TOOL_NAME, "arguments": None}}
+        assert parse_tool_call(tool_call, "openai") is None
+
+    def test_parse_anthropic_non_dict_input_returns_none(self):
+        """A non-dict Anthropic `input` must return None, not crash."""
+        tool_call = {"name": CCR_TOOL_NAME, "input": ["not", "a", "dict"]}
+        assert parse_tool_call(tool_call, "anthropic") is None
 
 
 class TestHashSecurityValidation:
@@ -371,7 +429,7 @@ class TestHashSecurityValidation:
 
         hash_key = parse_tool_call(tool_call, "anthropic")
         # Note: validation accepts uppercase since we use .lower() for hex check
-        assert hash_key == "ABC123DEF456ABC123DEF456"
+        assert hash_key == "abc123def456abc123def456"
 
 
 class TestSmartCrusherCcrMarkers:
