@@ -137,16 +137,6 @@ redis = { version = "0.27", optional = true, default-features = false }
 # classifier live with the other Phase B/F policy primitives without
 # cycling through the proxy crate. Tiny crate (no I/O, just types).
 http = "1"
-# `ort` (ONNX Runtime) — direct dependency for the Kompress transform's
-# inference session (`ort::session::Session` / `ort::value::Tensor`).
-# Pinned to the exact lock entry so Cargo unifies to the single ORT
-# instance already in the tree via fastembed/magika (no second runtime,
-# no extra binary download). `default-features = false` keeps ort from
-# re-triggering its own binary-download logic — fastembed already vendors
-# the runtime. EP selection (CPU/OpenVINO/CUDA) is libloading-based at
-# runtime; there are no compile-time EP feature flags.
-ort = { version = "=2.0.0-rc.12", default-features = false }
-
 # Load ONNX Runtime dynamically on every platform. The alternative,
 # `ort-download-binaries-*`, statically links Microsoft's prebuilt ORT:
 # on Windows it emits DirectML link libs (`DXCORE`, `DXGI`, `D3D12`,
@@ -162,7 +152,10 @@ fastembed = { version = "5", default-features = false, optional = true, features
     "ort-load-dynamic",
     "image-models",
 ] }
-ort = { version = "2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
+# Direct dependency for Kompress inference (`ort::session::Session` /
+# `ort::value::Tensor`). Keep this pinned to the lock entry and optional so
+# `default-features = false` consumers can still build without ONNX Runtime.
+ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
 
 [features]
 # `ml` is ON by default, so a stock build is byte-for-byte what it was before:
