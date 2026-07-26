@@ -1,6 +1,6 @@
 services:
   cli:
-    image: ${HEADROOM_IMAGE:-ghcr.io/chopratejas/headroom:latest}
+    image: ${HEADROOM_IMAGE:-ghcr.io/headroomlabs-ai/headroom:latest}
     entrypoint: ["headroom"]
     working_dir: /workspace
     stdin_open: true
@@ -13,6 +13,8 @@ services:
       # the Docker bind-mount source and is intentionally different.
       HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom
       HEADROOM_CONFIG_DIR: /tmp/headroom-home/.headroom/config
+      # CLI-filtering dashboard figures require the `rtk` binary inside this
+      # container; it is not installed by this image. See docs/content/docs/docker-install.mdx.
     volumes:
       - ${HEADROOM_WORKSPACE:-.}:/workspace
       - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.headroom:/tmp/headroom-home/.headroom
@@ -22,7 +24,7 @@ services:
     command: ["--help"]
 
   proxy:
-    image: ${HEADROOM_IMAGE:-ghcr.io/chopratejas/headroom:latest}
+    image: ${HEADROOM_IMAGE:-ghcr.io/headroomlabs-ai/headroom:latest}
     entrypoint: ["headroom", "proxy"]
     working_dir: /workspace
     restart: unless-stopped
@@ -33,6 +35,8 @@ services:
       # above for rationale.
       HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom
       HEADROOM_CONFIG_DIR: /tmp/headroom-home/.headroom/config
+      # CLI-filtering dashboard figures require the `rtk` binary inside this
+      # container; it is not installed by this image. See docs/content/docs/docker-install.mdx.
     ports:
       - "${HEADROOM_PORT:-8787}:${HEADROOM_PORT:-8787}"
     volumes:

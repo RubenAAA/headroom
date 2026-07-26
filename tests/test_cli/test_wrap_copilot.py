@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import os
 import sys
 import types
 from pathlib import Path
@@ -22,6 +21,12 @@ def _expected_project_prefix() -> str:
     return f"/p/{quote(Path.cwd().name, safe='')}"
 
 
+@pytest.fixture(autouse=True)
+def _enable_rtk(monkeypatch: pytest.MonkeyPatch) -> None:
+    # RTK is opt-in (off by default); these tests exercise the RTK-on injection path.
+    monkeypatch.setenv("HEADROOM_RTK", "1")
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -33,6 +38,8 @@ def _subscription_resolution(
     api_url: str = DEFAULT_API_URL,
     source: str = "headroom-copilot-auth:/tmp/copilot_auth.json:token-exchange",
     confidence: str = "copilot-token-exchange",
+    refresh_oauth_token: str | None = None,
+    api_token_expires_at: float | None = None,
 ) -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token=token,
@@ -40,6 +47,8 @@ def _subscription_resolution(
         confidence=confidence,
         api_url=api_url,
         token_fingerprint="sha256:0123456789ab",
+        refresh_oauth_token=refresh_oauth_token,
+        api_token_expires_at=api_token_expires_at,
     )
 
 
@@ -287,6 +296,9 @@ def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
     _wrap_cli, main = wrap_modules
     for var in ("COPILOT_PROVIDER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "stale-parent-token")
+    monkeypatch.setenv("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "stale-parent-refresh")
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "1")
     captured: dict[str, object] = {}
 
     def fake_launch_tool(**kwargs):  # noqa: ANN003
@@ -463,12 +475,25 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch(
             "headroom.cli.wrap.resolve_subscription_bearer_token_details",
-            return_value=_subscription_resolution("gho-validated", api_url=business_api),
+            return_value=_subscription_resolution(
+                "gho-validated",
+                api_url=business_api,
+                refresh_oauth_token="gho-refresh",
+                api_token_expires_at=1234567890.0,
+            ),
         ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
-        result = runner.invoke(main, ["wrap", "copilot", "--subscription", "--no-rtk"])
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--no-rtk"],
+            env={
+                "GITHUB_COPILOT_API_TOKEN": "stale-parent-token",
+                "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN": "stale-parent-refresh",
+                "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT": "1",
+            },
+        )
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -476,8 +501,11 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
     # The validated token is handed to the proxy as an explicit launch
     # argument — not via the child env, not via the parent's os.environ.
     assert captured["copilot_api_token"] == "gho-validated"
+    assert captured["copilot_refresh_oauth_token"] == "gho-refresh"
+    assert captured["copilot_api_token_expires_at"] == 1234567890.0
     assert "GITHUB_COPILOT_API_TOKEN" not in env
-    assert os.environ.get("GITHUB_COPILOT_API_TOKEN") is None
+    assert "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN" not in env
+    assert "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT" not in env
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-validated"
     assert env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] == "false"
@@ -803,9 +831,12 @@ def _clear_copilot_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "COPILOT_PROVIDER_BEARER_TOKEN",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "GITHUB_COPILOT_API_TOKEN",
         "GITHUB_COPILOT_API_URL",
+        "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT",
         "GITHUB_COPILOT_ENTERPRISE_URL",
         "GITHUB_COPILOT_ENTERPRISE_DOMAIN",
+        "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
         "GITHUB_COPILOT_TOKEN",
         "GITHUB_COPILOT_GITHUB_TOKEN",
         "COPILOT_MODEL",
@@ -956,7 +987,7 @@ def test_wrap_copilot_subscription_uses_resolved_subscription_endpoint(
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "copilot-api"
 
 
-def test_wrap_copilot_subscription_normalizes_individual_public_endpoint(
+def test_wrap_copilot_subscription_normalizes_enterprise_host(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
@@ -988,7 +1019,7 @@ def test_wrap_copilot_subscription_normalizes_individual_public_endpoint(
                 lambda _headers: {
                     "token": "copilot-api",
                     "expires_at": 9999999999,
-                    "endpoints": {"api": "https://api.individual.githubcopilot.com"},
+                    "endpoints": {"api": "https://api.enterprise.githubcopilot.com"},
                 }
             ),
         ),

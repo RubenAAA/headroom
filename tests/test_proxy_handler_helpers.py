@@ -223,6 +223,27 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     )
     assert (
         OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "tool", "content": "observation"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "tool", "content": "obs"}],
+            3,
+        )
+        == 2
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "function", "content": "legacy observation"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
             [{"role": "user"}, {"role": "assistant"}],
             0,
         )
@@ -256,6 +277,17 @@ def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert _headroom_bypass_enabled({}) is False
     assert _headroom_bypass_enabled(None) is False
     assert OpenAIHandlerMixin._headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
+
+
+def test_openai_passthrough_without_config_preserves_generic_request() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    request = _PassthroughRequest()
+
+    response = asyncio.run(handler.handle_passthrough(request, "https://api.openai.com"))
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
 
 
 def test_openai_passthrough_connect_timeout_returns_502() -> None:
@@ -689,10 +721,13 @@ def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn()
     ) == [compressed]
 
 
-def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
+def test_proxy_helper_reuses_a_singleton_image_compressor(monkeypatch) -> None:
+    # #2513: the compressor caches heavyweight models, so it must be a
+    # process-wide singleton rather than a fresh instance per request.
     from headroom.proxy import helpers
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     _FreshCompressor.instances = 0
 
     with patch("headroom.image.ImageCompressor", _FreshCompressor):
@@ -700,9 +735,9 @@ def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
         second = helpers._get_image_compressor()
 
     assert isinstance(first, _FreshCompressor)
-    assert isinstance(second, _FreshCompressor)
-    assert first is not second
-    assert _FreshCompressor.instances == 2
+    assert first is second
+    assert first._is_singleton is True
+    assert _FreshCompressor.instances == 1
 
 
 def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
@@ -719,6 +754,7 @@ def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
     assert helpers._get_image_compressor() is None
@@ -985,3 +1021,55 @@ def test_strict_frozen_count_tool_and_function_tail_are_mutable():
         )
         == 3
     )
+
+
+class _ClientDisconnectRequest:
+    """Mock request whose body() raises ClientDisconnect to simulate mid-stream cancel."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(path="/v1/chat/completions", query="")
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+class _ClientDisconnectStreamRequest:
+    """Mock request for streaming passthrough with ClientDisconnect."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+        query="alt=sse",
+    )
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+def test_handle_passthrough_client_disconnect():
+    """ClientDisconnect during body read returns 204 instead of crashing TaskGroup."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(_ClientDisconnectRequest(), "https://api.openai.com")
+    )
+    assert response.status_code == 204
+
+
+def test_handle_streaming_passthrough_client_disconnect():
+    """ClientDisconnect during streaming body read returns 204."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _ClientDisconnectStreamRequest(),
+            "https://us-central1-aiplatform.googleapis.com",
+            endpoint_name="streamRawPredict",
+            provider="vertex:google",
+        )
+    )
+    assert response.status_code == 204

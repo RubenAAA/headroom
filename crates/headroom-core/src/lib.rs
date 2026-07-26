@@ -5,6 +5,7 @@ pub mod cache_control;
 pub mod ccr;
 pub mod compression_policy;
 pub mod ctx;
+#[cfg(feature = "ml")]
 mod onnx_cpu;
 pub mod relevance;
 pub mod signals;

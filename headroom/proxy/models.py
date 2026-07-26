@@ -6,12 +6,38 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
+from headroom.proxy.model_router import ModelRouterConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _qdrant_env_port_or_default() -> int:
+    """Resolve ``HEADROOM_QDRANT_PORT``, falling back to the default on a bad value.
+
+    ``qdrant_env.qdrant_env_port`` raises on an invalid port (intended for
+    explicit qdrant setup). As a ``ProxyConfig`` field ``default_factory`` it
+    runs on EVERY ``ProxyConfig()`` construction, regardless of whether
+    memory/qdrant is enabled (both off by default), so a stray or typo'd
+    ``HEADROOM_QDRANT_PORT`` would crash proxy startup for an unrelated,
+    off-by-default subsystem. Fail soft here so config construction never raises.
+    """
+    try:
+        return qdrant_env.qdrant_env_port()
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid HEADROOM_QDRANT_PORT; using default %d. "
+            "Set a valid 1-65535 port to override.",
+            qdrant_env.DEFAULT_QDRANT_PORT,
+        )
+        return qdrant_env.DEFAULT_QDRANT_PORT
+
 
 # =============================================================================
 # Data Models
@@ -42,6 +68,16 @@ class RequestLog:
     tags: dict[str, str]
     cache_hit: bool
     transforms_applied: list[str]
+
+    # Provider-side cache economics (Anthropic prompt caching, #2438).
+    # ``cache_hit`` alone is ambiguous: a call billed cache-*creation* (write)
+    # cannot be told apart from a real cache-*read* hit. These raw deltas —
+    # already carried on RequestOutcome from the upstream response usage —
+    # let the JSONL telemetry reflect true economics (uncached input +
+    # cache_creation), not just the proxy's boolean.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    uncached_input_tokens: int = 0
 
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
@@ -99,9 +135,18 @@ class ProxyConfig:
     port: int = 8787
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
     openai_api_url: str | None = None  # Custom OpenAI API URL override
+    # Display label for the OpenAI-compatible upstream (dashboard/stats only).
+    # Overrides hostname detection from ``openai_api_url``; the internal
+    # provider stays ``openai`` so pricing/format keys are unaffected.
+    provider_name: str | None = None
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
+    # JSON-object config knobs; see settings_store's anthropic_extra_headers/
+    # openai_extra_headers and providers.registry.resolve_extra_headers.
+    anthropic_extra_headers: dict[str, str] | None = None
+    openai_extra_headers: dict[str, str] | None = None
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
@@ -128,6 +173,11 @@ class ProxyConfig:
     max_items_after_crush: int = 50
     smart_crusher_with_compaction: bool | None = None
     keep_last_turns: int = 4
+
+    # Cost-aware model routing (issue #1706). Opt-in and disabled by default;
+    # when configured, an ordered rule set can rewrite the outgoing model based
+    # on request size / tool presence. None keeps behavior unchanged.
+    model_router: ModelRouterConfig | None = None
 
     # CCR Tool Injection
     ccr_inject_tool: bool = True
@@ -181,6 +231,16 @@ class ProxyConfig:
     force_kompress_all: bool = False
 
     lossless: bool = False  # CLI: --lossless; env: HEADROOM_LOSSLESS=1. No-CCR mode: compress without any retrieval marker.
+
+    # Compress requests that fall through to the catch-all passthrough handler
+    # (custom proxy paths that don't match a built-in API route, e.g.
+    # `/api/codex-proxy/<key>/v1/responses` fronted by another proxy). Off by
+    # default because passthrough targets are unknown upstreams; opt-in for
+    # wrapper-proxy architectures that need coding-agent traffic compressed.
+    # Currently applies to OpenAI Responses-shaped bodies (paths ending in
+    # `/responses`). CLI: --compress-passthrough; env:
+    # HEADROOM_COMPRESS_PASSTHROUGH=1.
+    compress_passthrough: bool = False
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
@@ -271,6 +331,17 @@ class ProxyConfig:
     # CLI: --proxy-extension <name1,name2>; env: HEADROOM_PROXY_EXTENSIONS.
     proxy_extensions: list[str] | None = None
 
+    # Compressor selection (opt-in narrowing of the built-in compressor set).
+    # None (the default) leaves EVERY built-in compressor enabled — byte-
+    # identical to today. When a set is given, only the named recognized
+    # built-ins {smart_crusher, kompress, code_aware, search, log, tabular,
+    # config, html, image} stay enabled and the rest are disabled at the
+    # ContentRouterConfig `enable_*` seam; `"*"` enables all. Names that are
+    # not recognized built-ins are ignored here (reserved for the
+    # `headroom.compressor` registry). CLI: --compressor <name1,name2>
+    # (repeatable); env: HEADROOM_COMPRESSORS.
+    compressors: set[str] | None = None
+
     # Fallback
     fallback_enabled: bool = False
     fallback_provider: str | None = None
@@ -319,7 +390,7 @@ class ProxyConfig:
     # Qdrant connection (defaults resolve from HEADROOM_QDRANT_* env vars)
     memory_qdrant_url: str | None = field(default_factory=qdrant_env.qdrant_env_url)
     memory_qdrant_host: str = field(default_factory=qdrant_env.qdrant_env_host)
-    memory_qdrant_port: int = field(default_factory=qdrant_env.qdrant_env_port)
+    memory_qdrant_port: int = field(default_factory=_qdrant_env_port_or_default)
     memory_qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     memory_neo4j_uri: str = "neo4j://localhost:7687"
     memory_neo4j_user: str = "neo4j"
@@ -415,6 +486,15 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
+        # A 0 (or negative) requests-per-minute limit divides by zero in the
+        # token-bucket wait computation (rate_limit_policy.consume_from_bucket),
+        # 500-ing every request. The CLI already guards this with IntRange(min=1);
+        # fail fast here too so the JSON/programmatic config paths can't produce a
+        # limiter that crashes at request time. Only matters when limiting is on.
+        if self.rate_limit_enabled and self.rate_limit_requests_per_minute < 1:
+            raise ValueError(
+                "rate_limit_requests_per_minute must be >= 1 when rate_limit_enabled=True"
+            )
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:

@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +72,12 @@ class PrefixFreezeConfig:
     # default in `_PROVIDER_CACHE_TTL_SECONDS`. Set to 3600 for a session that
     # uses Anthropic's 1h cache breakpoint so idle-gap attribution stays honest.
     cache_ttl_seconds: int | None = None
+    # Cap on concurrent conversation lineages tracked per session id (#2085).
+    # A fan-out storm (many parallel subagents sharing one fallback id) evicts
+    # the shortest-chain lineage instead of growing without bound. Raise it
+    # for workspaces that genuinely run more concurrent conversations on one
+    # model + system prompt.
+    max_lineages_per_session: int = 32
 
 
 @dataclass
@@ -289,27 +297,66 @@ def overlay_cached_prefix(
     if not prev_orig or not prev_fwd:
         return optimized_messages
     n = len(prev_orig)
-    # One forwarded message per original, and the frozen prefix must fit within
-    # both the current originals and this turn's optimized output.
+    # Positional 1:1 correspondence between prev_orig[i] and prev_fwd[i] holds
+    # only when last turn forwarded exactly one message per original (the
+    # append-only, no-injection shape update_from_response records). If the
+    # counts differ, an injected / dropped / merged message shifted the
+    # mapping, so replaying prev_fwd[i] at position i could forward the wrong
+    # content — bail (leave this turn's output untouched) rather than risk it.
     if len(prev_fwd) != n:
+        logger.debug(
+            "overlay: forwarded/original count mismatch (prev_fwd=%d, prev_orig=%d) "
+            "— skipping cached-prefix replay (possible bust)",
+            len(prev_fwd),
+            n,
+        )
         return optimized_messages
-    if len(current_original_messages) < n or len(optimized_messages) < n:
-        return optimized_messages
-    # Append-only guard on CONTENT ONLY: the frozen region must be the same
-    # messages we cached. Compare with the shared canonicalizer (not just
-    # cache_control-stripping) so the guard is robust to ALL per-turn transport /
-    # annotation churn — cache_control movement (Anthropic), litellm `caller`,
+    # Append-only guard on CONTENT ONLY, message-by-message. Replay the
+    # previously-forwarded (cached, compressed) bytes for the longest LEADING
+    # run of messages that is byte-for-byte (content-canonical) identical to
+    # what we forwarded last turn, and stop at the first divergence.
+    #
+    # This is the cache-safety centerpiece for token mode (which relies solely
+    # on this replay; cache mode is already byte-stable by construction). The
+    # prior all-or-nothing guard busted the ENTIRE cached prefix the moment any
+    # single leading message failed to canonicalize-equal last turn — most
+    # commonly the just-added assistant turn, whose client-resent form can
+    # differ trivially from the copy we reconstructed and recorded. Stopping at
+    # the first divergence instead keeps the (much larger) cache-hit region
+    # up to that point and only re-forwards from the changed message onward.
+    #
+    # Comparison uses the shared canonicalizer (not just cache_control
+    # stripping) so it is robust to ALL per-turn transport / annotation churn —
+    # cache_control movement (Anthropic), litellm `caller`,
     # provider_specific_fields, streaming `index`, string<->block content shape,
-    # etc. — across providers/clients. Content stability is what the provider's
-    # prefix cache actually keys on; a coarser cache_control-only strip let other
-    # clients' noise spuriously fail the guard, skip the replay, and bust. This
-    # helps every handler that shares overlay_cached_prefix (Anthropic + OpenAI).
-    if _canonicalize_for_prefix_compare(
-        current_original_messages[:n]
-    ) != _canonicalize_for_prefix_compare(prev_orig):
+    # etc. Content stability is what the provider's prefix cache actually keys
+    # on. Safe by construction: we only replay prev_fwd[k] where
+    # current_original[k] canonicalize-equals prev_orig[k], and prev_fwd[k]
+    # positionally corresponds to prev_orig[k] (guaranteed by the count check
+    # above), so no wrong bytes are ever forwarded.
+    limit = min(n, len(current_original_messages), len(optimized_messages))
+    k = 0
+    while k < limit and _canonicalize_for_prefix_compare(
+        current_original_messages[k]
+    ) == _canonicalize_for_prefix_compare(prev_orig[k]):
+        k += 1
+    if k == 0:
+        logger.debug(
+            "overlay: prefix diverged at message 0 — no cached-prefix replay "
+            "(cold prefix or client rewrote history head)"
+        )
         return optimized_messages
-    # Replay the cached (compressed) prefix byte-identical; keep this turn's tail.
-    return list(prev_fwd) + list(optimized_messages[n:])
+    if k < n:
+        logger.debug(
+            "overlay: cached-prefix replay for %d/%d leading messages "
+            "(diverged at %d — re-forwarding tail fresh)",
+            k,
+            n,
+            k,
+        )
+    # Replay the cached (compressed) prefix byte-identical up to the first
+    # divergence; keep this turn's freshly-produced output for the rest.
+    return list(prev_fwd[:k]) + list(optimized_messages[k:])
 
 
 def normalize_message_cache_control(
@@ -332,16 +379,29 @@ def normalize_message_cache_control(
     ``messages`` and are left untouched (they still count toward the 4 limit, so
     holding messages to one breakpoint leaves room for them).
 
+    Headroom owns WHERE the breakpoint goes; the client still owns WHAT it says:
+    the re-placed marker reuses the newest client marker verbatim, so an explicit
+    ``ttl`` (e.g. ``"1h"``) survives consolidation instead of silently
+    downgrading to the 5-minute default (#2375).
+
     Only block-style (list) content can carry cache_control; string content is
     left as-is. Returns the input unchanged when there is nothing to normalize.
     """
     changed = False
     out: list[dict[str, Any]] = []
     last_block_idx = -1
+    last_marker: dict[str, Any] | None = None
     for i, msg in enumerate(messages):
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list):
-            had = any(isinstance(b, dict) and "cache_control" in b for b in content)
+            had = False
+            for b in content:
+                if isinstance(b, dict) and "cache_control" in b:
+                    had = True
+                    # The newest marker in message order is the client's current
+                    # intent (older ones are replay leftovers) — keep it.
+                    if isinstance(b["cache_control"], dict):
+                        last_marker = b["cache_control"]
             stripped = [
                 {k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b
                 for b in content
@@ -356,7 +416,8 @@ def normalize_message_cache_control(
     if last_block_idx >= 0:
         msg = out[last_block_idx]
         content = list(msg["content"])
-        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+        marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
+        content[-1] = {**content[-1], "cache_control": marker}
         out[last_block_idx] = {**msg, "content": content}
         changed = True
     return out if changed else messages
@@ -390,6 +451,13 @@ class PrefixCacheTracker:
         self._last_activity: float = time.time()
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
+        # Idle gap (seconds) since the PREVIOUS turn's response, captured by
+        # SessionTrackerStore.get_or_create at fetch time — BEFORE it refreshes
+        # _last_activity. Without this snapshot, seconds_since_activity() reads
+        # ~0 on every request (the fetch itself bumps the clock), so the
+        # net-cost/TTL P_alive gate could never see idle time. The handler reads
+        # this and forwards it to the pipeline as `idle_seconds`.
+        self._idle_seconds_at_fetch: float = 0.0
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -718,10 +786,33 @@ class PrefixCacheTracker:
         return counts
 
 
+def _lineage_snapshot(obj: Any) -> Any:
+    """Structural copy of a canonical projection for lineage-chain storage.
+
+    Copies dict/list structure (immutable leaves are shared, so this costs
+    structure, not bytes) to isolate the stored chain from downstream in-place
+    mutation of the request, and normalizes NaN to a sentinel — ``json.loads``
+    accepts bare ``NaN`` and ``NaN != NaN``, so a byte-identical resend would
+    otherwise read as a rewritten history on every turn. Values inside opaque
+    tool payloads are walked for copying only; no keys are dropped (see
+    ``_OPAQUE_PAYLOAD_KEYS``).
+    """
+    if isinstance(obj, dict):
+        return {k: _lineage_snapshot(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_lineage_snapshot(v) for v in obj]
+    if isinstance(obj, float) and obj != obj:
+        return "\x00nan"
+    return obj
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
     Keyed by session ID (from x-headroom-session-id header or computed hash).
+    Within one session id, ``resolve_tracker`` keys trackers by conversation
+    lineage so concurrent conversations sharing a fallback id do not thrash
+    one tracker's frozen-prefix state (#2085).
     Automatically cleans up expired sessions.
     """
 
@@ -730,6 +821,15 @@ class SessionTrackerStore:
         self._default_config = default_config or PrefixFreezeConfig()
         self._last_cleanup: float = time.time()
         self._cleanup_interval: float = 60.0  # Cleanup every 60s
+        # Conversation lineages per session id: tracker key -> snapshot of the
+        # canonicalized messages of the last request that lineage served. The
+        # first lineage lives under the bare session id (single-conversation
+        # sessions behave exactly as before); later lineages get unique
+        # "<session_id>\x00<n>" keys — NUL cannot appear in an HTTP header
+        # value, so a synthetic key can never collide with a client-supplied
+        # x-headroom-session-id.
+        self._lineages: dict[str, OrderedDict[str, list[Any]]] = {}
+        self._lineage_counter = itertools.count(1)
 
     def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""
@@ -737,11 +837,132 @@ class SessionTrackerStore:
 
         if session_id in self._trackers:
             tracker = self._trackers[session_id]
+            # Snapshot idle-since-last-response BEFORE bumping the access clock,
+            # so the net-cost/TTL gate sees the true gap (see the attribute's
+            # docstring in PrefixCacheTracker.__init__).
+            tracker._idle_seconds_at_fetch = max(0.0, time.time() - tracker._last_activity)
             tracker._last_activity = time.time()
             return tracker
 
         tracker = PrefixCacheTracker(provider, self._default_config)
+        tracker._idle_seconds_at_fetch = 0.0  # cold start: nothing cached to lapse
         self._trackers[session_id] = tracker
+        return tracker
+
+    def resolve_tracker(
+        self,
+        session_id: str,
+        provider: str,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> PrefixCacheTracker:
+        """Resolve the tracker for THIS conversation within a session id (#2085).
+
+        Concurrent conversations often share a fallback session id — same
+        model + system prompt covers a Claude Code session together with its
+        parallel subagents, or several sessions in one workspace. On a shared
+        tracker their interleaved histories cross-contaminate the
+        frozen-prefix state: freeze never stabilizes and the provider prompt
+        cache is re-written on nearly every call.
+
+        Lineage resolution keys trackers by conversation content instead:
+        reuse the tracker whose previous request messages are a prefix of the
+        incoming history (client histories are append-only, so a
+        conversation's next request always extends its previous one); start a
+        fresh lineage when the history diverges or was rewritten (client-side
+        compaction — the provider cache line is gone then anyway).
+        Byte-identical histories (templated fan-outs before they diverge)
+        intentionally share a tracker: their provider cache line is identical
+        too, so sharing is harmless.
+
+        The session id itself is never altered, so session-sticky state keyed
+        on it elsewhere (beta headers, CCR/memory registries, the compression
+        cache) is unaffected.
+
+        Args:
+            session_id: Session identity from :meth:`compute_session_id`.
+            provider: Provider name for a newly created tracker.
+            messages: The request's original client messages, as captured
+                right after the INPUT_RECEIVED pipeline extension and before
+                security-scan/hook/image-compression mutation — the same
+                snapshot ``update_from_response`` records, so the chain
+                compares like against like across turns. ``None``/empty
+                (legacy callers, stub stores in tests) falls back to plain
+                :meth:`get_or_create`.
+
+        Returns:
+            The ``PrefixCacheTracker`` for this conversation's lineage.
+        """
+        if not messages or not self._default_config.enabled:
+            # No lineage signal, or prefix freeze is disabled (there is no
+            # frozen state to protect): legacy one-tracker-per-session-id.
+            return self.get_or_create(session_id, provider)
+
+        # Prune expired trackers BEFORE matching, so a dead lineage cannot win
+        # the match. This also arms the cleanup interval: the get_or_create
+        # calls below cannot re-trigger a prune mid-function, so the family
+        # read here stays attached through the stamp at the end.
+        self._maybe_cleanup()
+
+        # The repo's canonical cross-turn equivalence, shared with the
+        # cache-stable delta path: a moved cache breakpoint, string<->block
+        # content sugar, or per-turn transport annotations must not read as
+        # a rewritten history. Object comparison plus one structural snapshot
+        # per request (~1ms on a 2MB history — same order as the handler's
+        # existing request deepcopy; no serialization or hashing).
+        canon = _canonicalize_for_prefix_compare(messages)
+        if not canon:
+            # Degenerate: every message projected away (pure directive
+            # content) — no lineage signal to match on.
+            return self.get_or_create(session_id, provider)
+        snap = _lineage_snapshot(canon)
+
+        family = self._lineages.setdefault(session_id, OrderedDict())
+
+        # Longest recorded chain that prefixes the incoming history wins.
+        best_key: str | None = None
+        best_len = -1
+        for key, chain in family.items():
+            if len(chain) > len(snap) or len(chain) <= best_len:
+                continue
+            if snap[: len(chain)] == chain:
+                best_key, best_len = key, len(chain)
+
+        if best_key is None:
+            cap = self._default_config.max_lineages_per_session
+            if len(family) >= cap:
+                # Family is full: over-cap conversations share one overflow
+                # tracker instead of evicting an established lineage. Any
+                # eviction policy degrades EVERY conversation once the
+                # working set exceeds the cap (under round-robin the victim
+                # is always the conversation about to arrive), while overflow
+                # sharing degrades only the over-cap tail — to exactly the
+                # pre-lineage shared-tracker behavior — and established
+                # lineages keep their state. A cap <= 0 therefore disables
+                # lineage splitting entirely.
+                overflow_key = f"{session_id}\x00overflow"
+                if overflow_key not in self._trackers:
+                    logger.info(
+                        "SessionTrackerStore: lineage cap %d reached for session %s; "
+                        "over-cap conversations share an overflow tracker (raise "
+                        "PrefixFreezeConfig.max_lineages_per_session if this "
+                        "workspace genuinely runs more concurrent conversations)",
+                        cap,
+                        session_id,
+                    )
+                return self.get_or_create(overflow_key, provider)
+            if not family:
+                # First lineage rides the bare session id; this also adopts a
+                # tracker created earlier via plain get_or_create.
+                best_key = session_id
+            else:
+                best_key = f"{session_id}\x00{next(self._lineage_counter)}"
+
+        # get_or_create (not a private fetch) so test stubs that patch the
+        # instance method keep intercepting tracker creation; its internal
+        # cleanup is interval-gated and was armed above, so it cannot prune
+        # the family before the stamp below.
+        tracker = self.get_or_create(best_key, provider)
+        family[best_key] = snap
         return tracker
 
     def compute_session_id(
@@ -755,6 +976,21 @@ class SessionTrackerStore:
         Priority:
         1. x-headroom-session-id header (explicit)
         2. Hash of (model + system prompt) — stable per conversation
+
+        The system prompt is harvested from the LEADING run of ``role:"system"``
+        entries in ``messages`` (everything before the first non-system turn).
+        Anthropic carries the system prompt as a top-level ``body["system"]``
+        field instead, so its handler prepends that as a synthetic
+        ``role:"system"`` message before calling this — otherwise every
+        Anthropic conversation on the same model would collapse to one session id
+        and their session-sticky state (CCR/memory tools, beta headers, frozen
+        prefix) would cross-contaminate.
+
+        Only the leading run counts: agentic clients (Claude Code) interleave
+        ``role:"system"`` reminder turns INTO the history as it grows (hook
+        output, skills lists, truncation notices). Hashing those would rotate
+        the session id mid-conversation, orphaning the prefix tracker and every
+        other session-sticky subsystem each time a reminder lands (#2085).
         """
         # Check for explicit session header
         if hasattr(request, "headers"):
@@ -762,17 +998,18 @@ class SessionTrackerStore:
             if session_header:
                 return str(session_header)
 
-        # Fall back to hashing model + all system-text content.
+        # Fall back to hashing model + the leading system-text run.
         system_parts: list[str] = []
         for msg in messages:
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    system_parts.append(content)
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            system_parts.append(block.get("text", ""))
+            if msg.get("role") != "system":
+                break
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                system_parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        system_parts.append(block.get("text", ""))
 
         system_content = json.dumps(system_parts, ensure_ascii=False, separators=(",", ":"))
         key = f"{model}:{system_content}"
@@ -789,11 +1026,18 @@ class SessionTrackerStore:
             del self._trackers[sid]
 
         if expired:
+            # Keep the lineage index in step with the tracker map.
+            for base in list(self._lineages):
+                family = self._lineages[base]
+                for key in [k for k in family if k not in self._trackers]:
+                    del family[key]
+                if not family:
+                    del self._lineages[base]
             logger.debug("SessionTrackerStore: cleaned up %d expired sessions", len(expired))
 
         self._last_cleanup = now
 
     @property
     def active_sessions(self) -> int:
-        """Number of active session trackers."""
+        """Number of active session trackers (one per conversation lineage)."""
         return len(self._trackers)

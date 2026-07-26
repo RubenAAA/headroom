@@ -131,7 +131,9 @@ def test_version_prefers_source_tree_release_history() -> None:
         patch.object(version_module, "_source_tree_version", return_value="0.21.17"),
         patch.object(version_module, "version", return_value="0.9.1") as package_version,
     ):
-        assert version_module.get_version() == "0.21.17"
+        # Source checkouts are marked -dev so a dev build is never mistaken
+        # for the published release.
+        assert version_module.get_version() == "0.21.17-dev"
 
     package_version.assert_not_called()
 
@@ -159,6 +161,37 @@ def test_proxy_package_import_does_not_eagerly_load_server() -> None:
 
     data = json.loads(result.stdout.strip())
     assert data["server_loaded"] is False
+
+
+def test_codex_package_import_stays_runtime_only() -> None:
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+
+        import headroom.providers.codex
+
+        print(json.dumps({
+            "images_loaded": "headroom.providers.codex.images" in sys.modules,
+            "model_metadata_loaded": "headroom.providers.codex.model_metadata" in sys.modules,
+            "responses_loaded": "headroom.providers.codex.responses" in sys.modules,
+        }))
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    data = json.loads(result.stdout.strip())
+    assert data == {
+        "images_loaded": False,
+        "model_metadata_loaded": False,
+        "responses_loaded": False,
+    }
 
 
 def test_proxy_server_import_skips_litellm_backend() -> None:
