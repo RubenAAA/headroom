@@ -1708,14 +1708,16 @@ class HeadroomProxy(
                 self.warmup.merge_transform_status(transform_status)
 
         # Update internal status from eager loading results
-        if eager_status.get("kompress") == "enabled":
-            self._kompress_status = "enabled"
+        if eager_status.get("kompress") in {"enabled", "deferred"}:
+            self._kompress_status = eager_status["kompress"]
         if eager_status.get("code_aware") == "enabled":
             self._code_aware_status = "enabled"
 
         # Log component status
         if self._kompress_status == "enabled":
             logger.info("Kompress: ENABLED (ModernBERT token compressor)")
+        elif self._kompress_status == "deferred":
+            logger.info("Kompress: DEFERRED (model loads on first request)")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -1897,6 +1899,10 @@ class HeadroomProxy(
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
         logger.info(f"Tokens saved:          {m.tokens_saved_total:,}")
+        if m.tool_search_saved_total > 0:
+            # Tool-schema deferral / turn-hook tool shrink — counted apart from
+            # message compression (tool bytes never move tok_before/after).
+            logger.info(f"Tool schemas deferred: {m.tool_search_saved_total:,}")
         # Active-compression ratio: savings as a fraction of what we
         # *attempted* to compress (extracted units + tool schema),
         # NOT the whole request. The full-request denominator is
@@ -2626,6 +2632,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 return True
             proxy.warmup.kompress.mark_loaded(handle=compressor, backend=backend)
             return True
+
+        try:
+            from headroom.transforms.kompress_compressor import HF_MODEL_ID, _kompress_cache
+        except ImportError:
+            return True
+
+        cached = _kompress_cache.get(HF_MODEL_ID)
+        if cached is not None:
+            try:
+                model, _tokenizer, backend = cached
+            except (TypeError, ValueError):
+                pass
+            else:
+                if backend and proxy.warmup.kompress.status != "loaded":
+                    proxy.warmup.kompress.mark_loaded(handle=model, backend=backend)
         return True
 
     def _health_checks() -> dict[str, dict[str, Any]]:
@@ -3647,7 +3668,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # compression and the configured context tool both remove tokens before
         # they reach model context, so dashboard-facing savings combines them.
         proxy_compression_tokens = m.tokens_saved_total
-        all_layers_tokens_saved = proxy_compression_tokens + cli_tokens_avoided
+        # "All layers" must include tool-schema deferral (the tool_search layer
+        # enumerated in by_layer below) — otherwise the advertised total omits it.
+        all_layers_tokens_saved = (
+            proxy_compression_tokens + cli_tokens_avoided + m.tool_search_saved_total
+        )
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
         proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
         # `attempted_input_tokens` is the compressible-only denominator

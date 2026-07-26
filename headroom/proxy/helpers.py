@@ -929,24 +929,36 @@ async def request_with_transient_retry(
 
 # Image compression availability (do not retain a global compressor instance)
 _image_compressor_available: bool | None = None
+_image_compressor_instance: Any = None
 
 
 def _get_image_compressor():
-    """Create a short-lived image compressor on demand."""
-    global _image_compressor_available
+    """Return the process-wide image compressor, or None if unavailable.
+
+    The compressor caches heavyweight models; creating a new one per request
+    (and a new ONNX router per image) accumulated native memory and grew RSS
+    unboundedly (#2513). Reuse a single shared instance. It is marked a
+    singleton so a caller's per-request ``close()`` is a no-op and the models
+    stay loaded. The main-process handlers only call ``has_images()`` on it (the
+    heavy compression runs in the isolation worker), but sharing still avoids a
+    fresh object per request.
+    """
+    global _image_compressor_available, _image_compressor_instance
     if _image_compressor_available is False:
         return None
+    if _image_compressor_instance is not None:
+        return _image_compressor_instance
 
     try:
         from headroom.image import ImageCompressor
 
-        # Callers own closing the compressor; this helper only memoizes whether
-        # the optional image stack is importable.
-        compressor = ImageCompressor()
+        instance = ImageCompressor()
+        instance._is_singleton = True
         if _image_compressor_available is None:
             logger.info("Image compression enabled (model: chopratejas/technique-router)")
         _image_compressor_available = True
-        return compressor
+        _image_compressor_instance = instance
+        return instance
     except ImportError as e:
         if _image_compressor_available is not False:
             logger.warning(f"Image compression not available: {e}")

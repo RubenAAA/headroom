@@ -11,6 +11,7 @@ bind still happens and transforms fall back to lazy loading.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -116,5 +117,27 @@ async def test_startup_merges_warmup_for_normal_transforms(monkeypatch):
         await proxy.startup()
         assert {"kompress": "enabled"} in captured
         assert proxy._kompress_status == "enabled"
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_reports_deferred_kompress(caplog):
+    proxy = _make_proxy(optimize=True)
+    proxy.anthropic_pipeline = _FakePipeline([_FastTransform({"kompress": "deferred"})])
+    proxy.openai_pipeline = _FakePipeline([])
+
+    try:
+        # Proxy setup disables propagation on the ``headroom`` logger, so
+        # attach caplog's handler directly to the logger that emits this line.
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert proxy._kompress_status == "deferred"
+        assert "Kompress: DEFERRED (model loads on first request)" in caplog.messages
+        assert not any("Kompress: not installed" in message for message in caplog.messages)
     finally:
         await proxy.shutdown()

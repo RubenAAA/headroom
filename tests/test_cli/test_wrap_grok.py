@@ -44,6 +44,7 @@ def test_wrap_grok_sets_proxy_env(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env[PROXY_ENV_KEY] == f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+    assert "GROK_CLI_CHAT_PROXY_BASE_URL" not in env
     assert captured["tool_label"] == "GROK"
     assert captured["agent_type"] == "grok"
     assert captured["args"] == ("-p", "hello")
