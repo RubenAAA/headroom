@@ -323,10 +323,14 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(router, "_compress_mixed", lambda *args, **kwargs: mixed_result)
     monkeypatch.setattr(router, "_compress_pure", lambda *args, **kwargs: pure_result)
 
-    monkeypatch.setattr(router, "_determine_strategy", lambda content: CompressionStrategy.MIXED)
+    monkeypatch.setattr(
+        router, "_determine_strategy", lambda content, **_kwargs: CompressionStrategy.MIXED
+    )
     assert router.compress("mixed") is mixed_result
 
-    monkeypatch.setattr(router, "_determine_strategy", lambda content: CompressionStrategy.TEXT)
+    monkeypatch.setattr(
+        router, "_determine_strategy", lambda content, **_kwargs: CompressionStrategy.TEXT
+    )
     assert router.compress("pure") is pure_result
     assert router.compress("   ").strategy_used is CompressionStrategy.PASSTHROUGH
 

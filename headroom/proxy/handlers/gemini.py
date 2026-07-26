@@ -38,6 +38,16 @@ def _usage_int(value: Any, default: int = 0) -> int:
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
 
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_tokens_offloaded
+
+        return await count_tokens_offloaded(self, model, messages)
+
+    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_texts_offloaded
+
+        return await count_texts_offloaded(self, model, texts)
+
     def _is_cloudcode_antigravity_request(
         self, body: dict[str, Any], headers: dict[str, str]
     ) -> bool:
@@ -56,6 +66,24 @@ class GeminiHandlerMixin:
             return ANTIGRAVITY_DAILY_API_URL
         return getattr(self, "CLOUDCODE_API_URL", DEFAULT_CLOUDCODE_API_URL).rstrip("/")
 
+    @staticmethod
+    def _dict_parts(content: Any) -> list[dict]:
+        """Return the dict entries of a Gemini content's ``parts``.
+
+        ``parts`` is request-controlled. ``.get("parts", [])`` only falls back
+        when the key is absent, so a present-but-null ``parts`` returns ``None``
+        (crashing ``for part in parts``), and a list carrying a bare string —
+        which a client that treats ``parts`` as a string array can send —
+        crashes ``part.get(...)`` / ``key in part`` semantics downstream.
+        Coerce to a clean list of dict parts so every caller can iterate safely.
+        """
+        if not isinstance(content, dict):
+            return []
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            return []
+        return [part for part in parts if isinstance(part, dict)]
+
     def _has_non_text_parts(self, content: dict) -> bool:
         """Check if a Gemini content entry has non-text parts.
 
@@ -73,8 +101,7 @@ class GeminiHandlerMixin:
         Returns:
             True if any part contains non-text data.
         """
-        parts = content.get("parts", [])
-        for part in parts:
+        for part in self._dict_parts(content):
             if any(
                 key in part
                 for key in (
@@ -110,7 +137,7 @@ class GeminiHandlerMixin:
         opt_iter = iter(optimized_contents)
         result: list[dict] = []
         for idx, content in enumerate(original_contents):
-            had_text = any("text" in p for p in content.get("parts", []))
+            had_text = any("text" in p for p in self._dict_parts(content))
             if idx in preserved_indices:
                 result.append(preserved_contents[idx])
                 if had_text:
@@ -155,8 +182,8 @@ class GeminiHandlerMixin:
 
         # Add system instruction as system message
         if system_instruction:
-            parts = system_instruction.get("parts", [])
-            text_parts = [p.get("text", "") for p in parts if "text" in p]
+            sys_parts = self._dict_parts(system_instruction)
+            text_parts = [p.get("text", "") for p in sys_parts if "text" in p]
             if text_parts:
                 messages.append({"role": "system", "content": "\n".join(text_parts)})
 
@@ -166,12 +193,12 @@ class GeminiHandlerMixin:
             if self._has_non_text_parts(content):
                 preserved_indices.add(idx)
 
-            role = content.get("role", "user")
+            role = content.get("role", "user") if isinstance(content, dict) else "user"
             # Map Gemini roles to OpenAI roles
             if role == "model":
                 role = "assistant"
 
-            parts = content.get("parts", [])
+            parts = self._dict_parts(content)
             text_parts = [p.get("text", "") for p in parts if "text" in p]
 
             if text_parts:
@@ -242,7 +269,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -474,9 +500,8 @@ class GeminiHandlerMixin:
                     headers=response_headers,
                 )
 
-        # Token counting
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Optimization
         transforms_applied: list[str] = []
@@ -799,7 +824,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -863,8 +887,10 @@ class GeminiHandlerMixin:
             if isinstance(contents, list) and idx < len(contents)
         }
 
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages) if messages else 0
+        # Token counting (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+        if not messages:
+            original_tokens = 0
         optimized_messages = messages
         optimized_tokens = original_tokens
         transforms_applied: list[str] = []
@@ -964,7 +990,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
 
         start_time = time.time()
         request_id = await self._next_request_id()
@@ -1002,14 +1027,17 @@ class GeminiHandlerMixin:
             request_id=request_id,
         )
 
-        # Token counting
-        tokenizer = get_tokenizer(model)
-        original_tokens = 0
-        for content in contents:
-            parts = content.get("parts", [])
-            for part in parts:
-                if "text" in part:
-                    original_tokens += tokenizer.count_text(part["text"])
+        # Token counting (offloaded off the event loop — GH #1701). Reuse the
+        # shared _dict_parts coercion and keep only str text values: count_text
+        # raises on a non-str part value and the fail-open path re-runs the same
+        # input, so a malformed part would otherwise 500 the streaming request.
+        text_parts = [
+            part["text"]
+            for content in (contents if isinstance(contents, list) else [])
+            for part in self._dict_parts(content)
+            if isinstance(part.get("text"), str)
+        ]
+        _, original_tokens = await self._count_texts_offloaded(model, text_parts)
 
         optimization_latency = (time.time() - start_time) * 1000
 
@@ -1052,7 +1080,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1123,9 +1150,8 @@ class GeminiHandlerMixin:
                 headers=response_headers,
             )
 
-        # Token counting (original)
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting (original, offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Apply compression using the same pipeline as generateContent
         transforms_applied: list[str] = []

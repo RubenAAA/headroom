@@ -61,6 +61,9 @@ class RemoteKompressCompressor:
     def is_ready(self) -> bool:
         return True
 
+    def ready_backend(self) -> str | None:
+        return "remote"
+
     def preload(self, *, allow_download: bool = True) -> str:
         return "remote"
 

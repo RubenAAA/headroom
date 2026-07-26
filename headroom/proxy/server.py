@@ -654,6 +654,93 @@ def _provider_httpx_client_options(
     return config.http2 and not config.http_proxy, client_kwargs
 
 
+# Recognized built-in compressor names → the `ContentRouterConfig` `enable_*`
+# flag that gates each one. This is the whole selection surface: a `--compressor`
+# selection is mapped onto these existing flags with ZERO new dispatch logic, so
+# the router's if/elif built-in dispatch stays byte-identical. Names outside this
+# map (e.g. a third-party `headroom.compressor` entry point) are intentionally
+# ignored here — they belong to the registry, not the built-in enable_* seam.
+BUILTIN_COMPRESSOR_FLAGS: dict[str, str] = {
+    "smart_crusher": "enable_smart_crusher",
+    "kompress": "enable_kompress",
+    "code_aware": "enable_code_aware",
+    "search": "enable_search_compressor",
+    "log": "enable_log_compressor",
+    "tabular": "enable_tabular_compressor",
+    "config": "enable_config_compressor",
+    "html": "enable_html_extractor",
+    "image": "enable_image_optimizer",
+}
+
+
+def _apply_compressor_selection(
+    router_config: ContentRouterConfig,
+    compressors: set[str] | None,
+) -> None:
+    """Narrow the built-in compressor set on ``router_config`` in place.
+
+    ``compressors is None`` (the default) is a no-op: every ``enable_*`` flag
+    keeps its dataclass default, so behavior is byte-identical to today. When a
+    selection is given, each recognized built-in in :data:`BUILTIN_COMPRESSOR_FLAGS`
+    is enabled iff it (or the wildcard ``"*"``) was selected, and disabled
+    otherwise. Unrecognized names select no flag (reserved for the compressor
+    registry) but are surfaced with a warning, because a typo'd selection is
+    otherwise indistinguishable from "compress nothing" (#2384). This maps a
+    selection onto the existing flags without adding any dispatch logic.
+    """
+    if compressors is None:
+        return
+    selected = {name.strip() for name in compressors if name.strip()}
+    if not selected:
+        return
+    select_all = "*" in selected
+    unmatched = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS) - {"*"})
+    if unmatched:
+        if select_all or selected & set(BUILTIN_COMPRESSOR_FLAGS):
+            logger.warning(
+                "compressor selection: %s match no built-in compressor "
+                "(assumed registry names); built-ins: %s",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
+        else:
+            logger.warning(
+                "compressor selection %s matches no built-in compressor — every "
+                "built-in compressor is now disabled. If this is a typo, valid "
+                "names are: %s (or '*' for all).",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
+    for name, flag in BUILTIN_COMPRESSOR_FLAGS.items():
+        setattr(router_config, flag, select_all or name in selected)
+
+
+def _external_compressor_selection(compressors: set[str] | None) -> list[str] | None:
+    """Return the selected EXTERNAL (non-built-in) compressor names, or ``None``.
+
+    The built-in selection (:func:`_apply_compressor_selection`) consumes only
+    the names in :data:`BUILTIN_COMPRESSOR_FLAGS`; every OTHER selected name is a
+    third-party ``headroom.compressor`` entry point. This threads those to the
+    router (via ``ContentRouterConfig.active_external_compressors``) so it can
+    route matching blocks through them.
+
+    Returns ``None`` — the router's external-dispatch branch stays inert, so the
+    request path is byte-identical to today — when the selection is empty or
+    contains only recognized built-in names. ``"*"`` is preserved so the router
+    activates every discovered external compressor (mirroring the wildcard's
+    "select everything" meaning on the built-in side).
+    """
+    if not compressors:
+        return None
+    selected = {name.strip() for name in compressors if name.strip()}
+    if not selected:
+        return None
+    if "*" in selected:
+        return ["*"]
+    external = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS))
+    return external or None
+
+
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
@@ -752,6 +839,19 @@ class HeadroomProxy(
             ccr_inject_marker=config.ccr_inject_marker,
             force_kompress_all=config.force_kompress_all,
             lossless=config.lossless,
+        )
+        # Compressor selection (opt-in). None keeps every built-in enabled
+        # (default, byte-identical to today); a selection maps the recognized
+        # built-in names onto the `enable_*` flags just constructed above.
+        # Runs BEFORE the disable_kompress override below so that flag stays
+        # authoritative for turning Kompress off.
+        _apply_compressor_selection(router_config, config.compressors)
+        # External (non-built-in) `headroom.compressor` selections are ignored by
+        # `_apply_compressor_selection` (they have no enable_* flag). Thread them
+        # to the router here so it can route matching blocks through them; None
+        # (no external selected) keeps the external-dispatch branch inert.
+        router_config.active_external_compressors = _external_compressor_selection(
+            config.compressors
         )
         # No-CCR lossless mode: compress tool outputs with format-native
         # lossless compaction and marker-free SmartCrusher, and suppress every
@@ -1608,14 +1708,16 @@ class HeadroomProxy(
                 self.warmup.merge_transform_status(transform_status)
 
         # Update internal status from eager loading results
-        if eager_status.get("kompress") == "enabled":
-            self._kompress_status = "enabled"
+        if eager_status.get("kompress") in {"enabled", "deferred"}:
+            self._kompress_status = eager_status["kompress"]
         if eager_status.get("code_aware") == "enabled":
             self._code_aware_status = "enabled"
 
         # Log component status
         if self._kompress_status == "enabled":
             logger.info("Kompress: ENABLED (ModernBERT token compressor)")
+        elif self._kompress_status == "deferred":
+            logger.info("Kompress: DEFERRED (model loads on first request)")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -1797,6 +1899,10 @@ class HeadroomProxy(
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
         logger.info(f"Tokens saved:          {m.tokens_saved_total:,}")
+        if m.tool_search_saved_total > 0:
+            # Tool-schema deferral / turn-hook tool shrink — counted apart from
+            # message compression (tool bytes never move tok_before/after).
+            logger.info(f"Tool schemas deferred: {m.tool_search_saved_total:,}")
         # Active-compression ratio: savings as a fraction of what we
         # *attempted* to compress (extracted units + tool schema),
         # NOT the whole request. The full-request denominator is
@@ -1836,7 +1942,18 @@ class HeadroomProxy(
         """
         from headroom.proxy.outcome import emit_request_outcome
 
-        await emit_request_outcome(self, outcome)
+        # Shielded because four call sites are `finally:` blocks inside streaming
+        # async generators (streaming.py:1611, :1859, :2069, openai.py:8614). A
+        # client disconnect cancels that task, and the funnel now suspends partway
+        # through: `record_request` commits the Prometheus counters, then awaits
+        # the ledger append in a worker thread. A cancellation landing on that
+        # await leaves the request counted in Prometheus but missing from the cost
+        # tracker, the request log, and the PERF line `headroom perf` reads.
+        #
+        # The shield does not swallow the cancellation — the await below still
+        # raises CancelledError, so generator teardown propagates exactly as
+        # before. It only keeps the bookkeeping from being torn in half.
+        await asyncio.shield(emit_request_outcome(self, outcome))
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
@@ -2478,7 +2595,62 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             **details,
         }
 
+    def _kompress_health_routers() -> list[ContentRouter]:
+        routers: list[ContentRouter] = []
+        for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+            for transform in getattr(pipeline, "transforms", ()):
+                if (
+                    isinstance(transform, ContentRouter)
+                    and transform.config.enable_kompress
+                    and all(transform is not item for item in routers)
+                ):
+                    routers.append(transform)
+        return routers
+
+    def _reconcile_kompress_health() -> bool:
+        routers = _kompress_health_routers()
+        if not routers:
+            return False
+
+        compressors: list[Any] = []
+        for router in routers:
+            for name in ("_kompress", "_kompress_remote"):
+                compressor = getattr(router, name, None)
+                if compressor is not None and all(compressor is not item for item in compressors):
+                    compressors.append(compressor)
+
+        for compressor in compressors:
+            try:
+                if not compressor.is_ready():
+                    continue
+                backend = compressor.ready_backend()
+                if not backend:
+                    continue
+            except Exception:
+                continue
+            if proxy.warmup.kompress.status == "loaded":
+                return True
+            proxy.warmup.kompress.mark_loaded(handle=compressor, backend=backend)
+            return True
+
+        try:
+            from headroom.transforms.kompress_compressor import HF_MODEL_ID, _kompress_cache
+        except ImportError:
+            return True
+
+        cached = _kompress_cache.get(HF_MODEL_ID)
+        if cached is not None:
+            try:
+                model, _tokenizer, backend = cached
+            except (TypeError, ValueError):
+                pass
+            else:
+                if backend and proxy.warmup.kompress.status != "loaded":
+                    proxy.warmup.kompress.mark_loaded(handle=model, backend=backend)
+        return True
+
     def _health_checks() -> dict[str, dict[str, Any]]:
+        kompress_enabled = _reconcile_kompress_health()
         memory_status = (
             proxy.memory_handler.health_status()
             if proxy.memory_handler
@@ -2525,7 +2697,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 error=_upstream_check_cache["error"],
             ),
             "kompress": _component_health(
-                enabled=not config.disable_kompress,
+                enabled=kompress_enabled,
                 ready=proxy.warmup.kompress.status == "loaded",
                 backend=proxy.warmup.kompress.info.get("backend", None),
             ),
@@ -3496,7 +3668,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # compression and the configured context tool both remove tokens before
         # they reach model context, so dashboard-facing savings combines them.
         proxy_compression_tokens = m.tokens_saved_total
-        all_layers_tokens_saved = proxy_compression_tokens + cli_tokens_avoided
+        # "All layers" must include tool-schema deferral (the tool_search layer
+        # enumerated in by_layer below) — otherwise the advertised total omits it.
+        all_layers_tokens_saved = (
+            proxy_compression_tokens + cli_tokens_avoided + m.tool_search_saved_total
+        )
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
         proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
         # `attempted_input_tokens` is the compressible-only denominator
@@ -4711,8 +4887,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "data": retrieval_data,
         }
 
-    # Compression-only endpoint (for TypeScript SDK and other HTTP clients)
-    @app.post("/v1/compress", dependencies=[Depends(_require_loopback)])
+    # Compression-only endpoint (for TypeScript SDK and other HTTP clients).
+    # Loopback-only by default (guard added in #1537). An operator can opt in to
+    # network access for an authorized in-network sidecar/gateway (e.g. Kong,
+    # LiteLLM) on a trusted network by setting HEADROOM_COMPRESS_ALLOW_REMOTE=1,
+    # which drops ONLY this route's loopback dependency. Inbound auth
+    # (HEADROOM_PROXY_TOKEN via _security_gate) and network scoping still apply;
+    # all other _require_loopback routes are unaffected. Unset/false preserves
+    # today's loopback-only behavior.
+    _compress_dependencies = (
+        []
+        if _get_env_bool("HEADROOM_COMPRESS_ALLOW_REMOTE", False)
+        else [Depends(_require_loopback)]
+    )
+
+    @app.post("/v1/compress", dependencies=_compress_dependencies)
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 

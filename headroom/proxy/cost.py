@@ -44,6 +44,22 @@ def _get_litellm_module() -> Any | None:
 
 logger = logging.getLogger("headroom.proxy")
 
+# Pricing-lookup warnings are emitted on the per-request cost path, so an
+# unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
+# e.g. glm-5.2) floods proxy.log with an identical WARNING every single request
+# (#2504). Track which models have already been warned so each fires once per
+# process; the set is tiny and bounded by the number of distinct models seen.
+_warned_pricing_models: set[str] = set()
+
+
+def _warn_pricing_once(model: str, message: str) -> None:
+    """Emit ``message`` at WARNING only the first time ``model`` fails pricing."""
+    if model in _warned_pricing_models:
+        return
+    _warned_pricing_models.add(model)
+    logger.warning(message)
+
+
 # Provider-specific cache discount multipliers (what fraction of input price)
 # Used to calculate dollar savings from prefix caching
 _CACHE_ECONOMICS = {
@@ -577,6 +593,15 @@ def build_session_summary(
             "rtk_tokens_avoided": cli_tokens_avoided,
             "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
             "total_tokens_before_with_rtk": total_tokens_before,
+            # Tool-schema deferral / turn-hook tool shrink, tracked apart from
+            # message compression. New fields (existing ones stay message+CLI only
+            # for backward compat) so consumers can see the full picture.
+            "tool_schema_tokens_saved": getattr(metrics, "tool_search_saved_total", 0),
+            "total_tokens_saved_all_layers": (
+                metrics.tokens_saved_total
+                + cli_tokens_avoided
+                + getattr(metrics, "tool_search_saved_total", 0)
+            ),
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
         "cost": {
@@ -706,7 +731,10 @@ class CostTracker:
         """
         litellm = _get_litellm_module()
         if litellm is None:
-            logger.warning("LiteLLM not available - cannot calculate costs")
+            _warn_pricing_once(
+                f"__litellm_unavailable__:{model}",
+                f"LiteLLM not available - cannot calculate costs for model {model}",
+            )
             return None
 
         try:
@@ -728,7 +756,7 @@ class CostTracker:
             return float(total_cost) if total_cost > 0 else None
 
         except Exception as e:
-            logger.warning(f"Failed to get pricing for model {model}: {e}")
+            _warn_pricing_once(model, f"Failed to get pricing for model {model}: {e}")
             return None
 
     def _prune_old_costs(self):

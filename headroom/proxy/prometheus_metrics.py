@@ -97,6 +97,11 @@ class PrometheusMetrics:
         self.tokens_input_total = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
+        # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
+        # per-request tags. Tracked apart from tokens_saved_total (which is message
+        # compression only — tool bytes never move tok_before/after) so every sink
+        # can surface the tool-schema layer instead of silently dropping it.
+        self.tool_search_saved_total = 0
         # Sum of tokens we actually attempted to compress across the
         # session: extracted units that passed all gates + tool-schema
         # tokens we ran compaction against. Excludes prefix-frozen
@@ -324,6 +329,7 @@ class PrometheusMetrics:
             self.tokens_input_total = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
+            self.tool_search_saved_total = 0
             self.attempted_input_tokens_total = 0
 
             self.compressions_by_strategy.clear()
@@ -683,6 +689,7 @@ class PrometheusMetrics:
         output_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
+        tool_search_saved: int = 0,
     ):
         """Record metrics for a request."""
         # Post-guard invariant (all providers): Headroom never forwards a request
@@ -709,6 +716,7 @@ class PrometheusMetrics:
             self.tokens_input_total += input_tokens
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
+            self.tool_search_saved_total += max(0, int(tool_search_saved))
             # See the attribute definition for why this is the right
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
@@ -810,29 +818,42 @@ class PrometheusMetrics:
                 output_tokens_saved=output_tokens_saved,
             )
 
-            # Also append to the durable, multi-process savings ledger so
-            # `headroom savings` reflects proxy traffic alongside MCP-tool usage.
-            # The real upstream model means litellm prices it accurately. The
-            # client is the harness classified from the User-Agent / X-Client
-            # (claude-code, codex, cursor, ...); it falls back to "proxy" only
-            # when the harness is unidentified.
-            if tokens_saved > 0 and not self._stateless:
-                # `input_tokens` here is the optimized (post-compression) count
-                # that was actually forwarded — see emit_request_outcome, which
-                # passes `input_tokens=outcome.optimized_tokens`. The ledger's
-                # `before` is the pre-compression original and `after` is what we
-                # forwarded, and `headroom savings` derives the reduction percent
-                # as saved / before. Passing the forwarded count as `before`
-                # understated the original by `tokens_saved`, inflating that
-                # percentage (e.g. a real 40% reduction was reported as ~67%).
-                # Reconstruct the original as forwarded + saved.
-                savings_ledger.record_savings_event(
-                    tokens_before=input_tokens + tokens_saved,
-                    tokens_after=input_tokens,
-                    model=model,
-                    client=client or "proxy",
-                    source="proxy",
-                )
+        # Also append to the durable, multi-process savings ledger so
+        # `headroom savings` reflects proxy traffic alongside MCP-tool usage.
+        # The real upstream model means litellm prices it accurately. The
+        # client is the harness classified from the User-Agent / X-Client
+        # (claude-code, codex, cursor, ...); it falls back to "proxy" only
+        # when the harness is unidentified.
+        #
+        # Deliberately outside `self._lock` and off the loop. The append does
+        # synchronous open + fcntl.flock + write, and rewrites the whole file
+        # once it passes 1 MB — and it fires on every compressed request. Under
+        # the lock that queued every other metrics caller behind the disk,
+        # including `export()`, which holds the same lock for the full
+        # Prometheus serialization. The ledger takes its own flock across
+        # processes, so the metrics lock was never what made it safe. Moving it
+        # out is not optional once it becomes an await: awaiting inside the lock
+        # would hold the lock for the whole write instead of just the syscall.
+        # ponytail: default thread pool, not a dedicated executor -- give it one
+        # if a profile ever shows writers parked on flock saturating the pool.
+        if tokens_saved > 0 and not self._stateless:
+            # `input_tokens` here is the optimized (post-compression) count
+            # that was actually forwarded — see emit_request_outcome, which
+            # passes `input_tokens=outcome.optimized_tokens`. The ledger's
+            # `before` is the pre-compression original and `after` is what we
+            # forwarded, and `headroom savings` derives the reduction percent
+            # as saved / before. Passing the forwarded count as `before`
+            # understated the original by `tokens_saved`, inflating that
+            # percentage (e.g. a real 40% reduction was reported as ~67%).
+            # Reconstruct the original as forwarded + saved.
+            await asyncio.to_thread(
+                savings_ledger.record_savings_event,
+                tokens_before=input_tokens + tokens_saved,
+                tokens_after=input_tokens,
+                model=model,
+                client=client or "proxy",
+                source="proxy",
+            )
 
         self._get_otel_metrics().record_proxy_request(
             provider=provider,
