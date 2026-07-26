@@ -923,8 +923,6 @@ def install_individual_grammar_parsers() -> None:
     Raises ImportError when the grammar wheels / core binding aren't present
     (the workload driver soft-fails, like kompress without its model).
     """
-    from tree_sitter import Language, Parser
-
     import tree_sitter_c
     import tree_sitter_cpp
     import tree_sitter_go
@@ -933,6 +931,7 @@ def install_individual_grammar_parsers() -> None:
     import tree_sitter_python
     import tree_sitter_rust
     import tree_sitter_typescript
+    from tree_sitter import Language, Parser
 
     from headroom.transforms import code_compressor as cc
 
