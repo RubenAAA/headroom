@@ -105,7 +105,7 @@ headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
 
-To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy, sets up an MCP server that provides tools such as rtk and tokensave, and launches a coding agent session configured to proxy requests to headroom.
+To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy, installs **Serena** for semantic code navigation, and launches a coding agent session configured to proxy requests through headroom.
 
 The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is the TypeScript SDK — a library you import (`import { compress } from 'headroom-ai'`), not a CLI, so it provides no `headroom` command.
 
@@ -227,7 +227,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 |--------------|:---------------:|----------------------------------|
 | Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
 | Codex        | ✅              | shares memory with Claude        |
-| Grok CLI     | ✅              | routes via `GROK_CLI_CHAT_PROXY_BASE_URL` |
+| Grok CLI     | ✅              | routes via `GROK_MODELS_BASE_URL` |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
@@ -538,7 +538,7 @@ Headroom runs **locally**, covers **every** content type, works with every major
 | [Compresr](https://compresr.ai), [Token Co.](https://thetokencompany.ai)    | Text sent to their API                         | Hosted API call                    | No    | No         |
 | OpenAI Compaction                                                            | Conversation history                           | Provider-native                    | No    | No         |
 
-> **Attribution.** Headroom ships with the excellent [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriting — `git show --short`, scoped `ls`, summarized installers. Huge thanks to the RTK team; their tool is a first-class part of our stack, and Headroom compresses everything downstream of it. Headroom can also use [lean-ctx](https://github.com/yvgude/lean-ctx) as the selected CLI context tool; set `HEADROOM_CONTEXT_TOOL=lean-ctx` before running `headroom wrap ...`.
+> **Stack & integrations.** Headroom is the **proxy** — that's what we build and offer, and it compresses everything flowing through it no matter what sits upstream. Our recommended companion is **[Serena](https://github.com/oraios/serena)** (installed by default when you wrap an agent) for semantic code navigation — plus **Ponytail** if you want leaner model output. Everything else is your call: Headroom vendors the third-party [RTK](https://github.com/rtk-ai/rtk) and [lean-ctx](https://github.com/yvgude/lean-ctx) binaries for shell-output rewriting, but we don't own or control either project — swap between them with `HEADROOM_CONTEXT_TOOL`, or turn them off. You're free to attach your own tooling too — code-memory MCP, Graphify, Caveman, or any MCP server — and Headroom compresses downstream of all of it.
 
 ## Contributing
 

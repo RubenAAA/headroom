@@ -308,6 +308,54 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
 _TOOL_SEARCH_FALSY = {"false", "0", "no", "off"}
 
 
+# Reduce-at-source: CLI tools pad tool_result output with progress bars, pager
+# framing, funding/telemetry banners, and version nags — all zero-signal tokens
+# the agent never acts on. Setting conservative, SAFE env defaults in the
+# launched agent's environment makes those tools emit less AT THE SOURCE, so the
+# proxy never has to strip them. Only knobs that can't hide diffs, errors,
+# summaries, or search results are set here (no blanket --silent/--quiet).
+# Opt out entirely with HEADROOM_WRAP_QUIET=0 (or false/no/off).
+_QUIET_CLI_ENV = "HEADROOM_WRAP_QUIET"
+_QUIET_CLI_FALSY = {"0", "false", "no", "off"}
+# name -> value, injected only when the user has not already set it.
+_QUIET_CLI_DEFAULTS: dict[str, str] = {
+    "GIT_PAGER": "cat",  # never page (keeps full content, drops pager framing)
+    "PIP_QUIET": "1",  # drop "Requirement already satisfied"/download chatter
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",  # drop the "new pip available" nag
+    "npm_config_fund": "false",  # drop the funding banner
+    "npm_config_audit": "false",  # drop the audit summary (not a security scan here)
+    "npm_config_progress": "false",  # drop the install progress bar
+}
+
+
+def _quiet_cli_enabled() -> bool:
+    """Quiet-CLI source defaults are on unless HEADROOM_WRAP_QUIET is falsy."""
+    return os.environ.get(_QUIET_CLI_ENV, "").strip().lower() not in _QUIET_CLI_FALSY
+
+
+def _configure_quiet_cli_env(env: dict[str, str]) -> list[str]:
+    """Inject SAFE quiet-CLI defaults into ``env`` in place; return names set.
+
+    No-op when ``HEADROOM_WRAP_QUIET`` is falsy. A value the user already set
+    always wins (defaults are only filled when absent). ``PYTEST_ADDOPTS`` is
+    *augmented* with ``-q`` rather than clobbered, so an existing value survives.
+    Nothing RISKY (anything that could suppress diffs/errors/summaries/search
+    output) is ever set here.
+    """
+    if not _quiet_cli_enabled():
+        return []
+    written: list[str] = []
+    for name, value in _QUIET_CLI_DEFAULTS.items():
+        if name not in env:
+            env[name] = value
+            written.append(name)
+    existing = env.get("PYTEST_ADDOPTS", "")
+    if "-q" not in existing.split():
+        env["PYTEST_ADDOPTS"] = f"{existing} -q".strip()
+        written.append("PYTEST_ADDOPTS")
+    return written
+
+
 def _resolved_tool_search_mode(flag_value: str | None) -> str:
     """Predict the ``ENABLE_TOOL_SEARCH`` value the launched process will get.
 
@@ -741,39 +789,38 @@ _serena_instructions_option = click.option(
 
 
 # --- Code-memory MCP selection ------------------------------------------------
-# The code-memory MCP is on by default (tokensave). Swap it with --code-memory
-# serena, or turn it off with --code-memory none. Selection flows through
-# HEADROOM_CODE_MEMORY (set by the eager --code-memory callback) so it works the
-# same on every agent without threading a param through each subcommand — the
-# same approach as _rtk_option above.
+# The code-memory MCP is Serena by default; turn it off with --code-memory none.
+# Selection flows through HEADROOM_CODE_MEMORY (set by the eager --code-memory
+# callback) so it works the same on every agent without threading a param
+# through each subcommand — the same approach as _rtk_option above.
 _CODE_MEMORY_ENV = "HEADROOM_CODE_MEMORY"
-_CODE_MEMORY_TOKENSAVE = "tokensave"
 _CODE_MEMORY_SERENA = "serena"
 _CODE_MEMORY_NONE = "none"
-_VALID_CODE_MEMORY = {_CODE_MEMORY_TOKENSAVE, _CODE_MEMORY_SERENA, _CODE_MEMORY_NONE}
+_VALID_CODE_MEMORY = {_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE}
 
 
 def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
     """Resolve which code-memory MCP to register.
 
     Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
-    wins; otherwise the deprecated ``--serena`` / ``--no-tokensave`` / ``--no-serena``
-    flags map into it; otherwise the default is ``serena`` — mature, offline,
-    symbol-level code navigation (tokensave is a lighter opt-in).
+    wins; otherwise the deprecated ``--serena`` / ``--no-serena`` flags map into
+    it; otherwise the default is ``serena`` — mature, offline, symbol-level code
+    navigation. The retired ``tokensave`` option is accepted gracefully: an
+    explicit ``tokensave`` selector (or the deprecated ``--no-tokensave`` flag)
+    now resolves to Serena.
     """
     env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
+    if env == "tokensave":
+        click.echo("  Note: the tokensave code-memory option was retired — using Serena instead.")
+        return _CODE_MEMORY_SERENA
     if env:
         if env not in _VALID_CODE_MEMORY:
             raise click.ClickException(
                 f"{_CODE_MEMORY_ENV} must be one of: {', '.join(sorted(_VALID_CODE_MEMORY))}"
             )
         return env
-    if kwargs.get("serena"):
-        return _CODE_MEMORY_SERENA
-    if kwargs.get("no_tokensave"):
-        return _CODE_MEMORY_NONE if kwargs.get("no_serena") else _CODE_MEMORY_SERENA
     if kwargs.get("no_serena"):
-        return _CODE_MEMORY_TOKENSAVE
+        return _CODE_MEMORY_NONE
     return _CODE_MEMORY_SERENA
 
 
@@ -791,14 +838,14 @@ def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str |
 # through HEADROOM_CODE_MEMORY.
 _code_memory_option = click.option(
     "--code-memory",
-    type=click.Choice([_CODE_MEMORY_TOKENSAVE, _CODE_MEMORY_SERENA, _CODE_MEMORY_NONE]),
+    type=click.Choice([_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE]),
     default=None,
     expose_value=False,
     is_eager=True,
     callback=_code_memory_flag_callback,
     help=(
-        "Code-memory MCP to register: 'serena' (default), 'tokensave', or 'none'. "
-        "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena/--no-tokensave."
+        "Code-memory MCP to register: 'serena' (default) or 'none'. "
+        "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
     ),
 )
 
@@ -1800,7 +1847,7 @@ def _index_serena_project(*, verbose: bool = False) -> None:
     start the MCP server) in the project directory so the first symbol query is
     not paying for a cold index. Timeout-guarded and best-effort: Serena also
     indexes lazily on demand, so a failure or timeout here never blocks the
-    wrap. Mirrors :func:`_index_tokensave_project`.
+    wrap.
     """
     if shutil.which("uvx") is None:
         if verbose:
@@ -1927,8 +1974,8 @@ def _disable_serena_mcp(
     keeps launching Serena on startup. Just *skipping* registration on a later
     run leaves that stale entry in place — so this removes the entry Headroom
     installed. A user-managed Serena (absent from our ledger) is reported but
-    left untouched. ``reason`` is surfaced in the message: ``--no-serena`` when
-    the user opted out, or a note that tokensave is now the primary compressor.
+    left untouched. ``reason`` is surfaced in the message (e.g. ``--no-serena``
+    or ``--code-memory none`` when the user opted out).
     """
     if not registrar.detect():
         if verbose:
@@ -1956,117 +2003,9 @@ def _disable_serena_mcp(
 
 
 # =============================================================================
-# tokensave — primary coding-task compressor (Serena is the backup)
+# tokensave — retired; Serena replaced it. The helpers below only clean up a
+# tokensave entry a prior release installed, so upgrading users stop launching it.
 # =============================================================================
-
-
-def _ensure_tokensave_binary(verbose: bool = False) -> Path | None:
-    """Resolve the tokensave binary, fetching the release asset if missing.
-
-    Returns the binary path, or ``None`` when tokensave is unavailable
-    (offline, unsupported platform, or download failure) — the caller then
-    falls back to Serena.
-    """
-    from headroom.graph.tokensave_installer import ensure_tokensave, get_tokensave_path
-
-    existing = get_tokensave_path()
-    if existing:
-        return existing
-
-    click.echo("  tokensave: fetching code-graph binary...")
-    path = ensure_tokensave()
-    if path:
-        click.echo(f"  tokensave: installed at {path}")
-    else:
-        click.echo(
-            "  tokensave: no prebuilt binary available for this platform "
-            "(try 'cargo install tokensave') — falling back to Serena"
-        )
-    return path
-
-
-def _index_tokensave_project(bin_path: Path, *, verbose: bool = False) -> None:
-    """Index the current project into the tokensave graph (non-fatal).
-
-    Runs ``tokensave init`` the first time (creates ``.tokensave/``), then
-    ``tokensave sync`` for incremental updates. tokensave also re-checks
-    staleness on demand, so a failure here is logged but never blocks the
-    wrap — the MCP server still indexes lazily on first query.
-    """
-    project_dir = Path.cwd()
-    subcommand = "sync" if (project_dir / ".tokensave").exists() else "init"
-    try:
-        result = run(
-            [str(bin_path), subcommand],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0:
-            click.echo("  Code graph: indexed (tokensave)")
-        elif verbose:
-            click.echo(f"  Code graph: tokensave {subcommand} failed ({result.stderr[:100]})")
-    except subprocess.TimeoutExpired:
-        click.echo("  Code graph: tokensave indexing timed out (will complete on demand)")
-    except Exception as e:
-        if verbose:
-            click.echo(f"  Code graph: tokensave indexing skipped ({e})")
-
-
-def _setup_tokensave_mcp(registrar: Any, *, verbose: bool = False, force: bool = False) -> bool:
-    """Register tokensave MCP with the given agent (idempotent).
-
-    Returns ``True`` when tokensave is available and set up, ``False`` when the
-    binary is unavailable — the caller then falls back to Serena. Mirrors
-    :func:`_setup_serena_mcp`'s ledger-aware migration: a stale
-    Headroom-installed ``tokensave`` entry is force-updated to the current
-    spec, while a user-managed entry is left untouched.
-    """
-    from headroom.mcp_registry import build_tokensave_spec, format_result
-    from headroom.mcp_registry.base import RegisterStatus
-    from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
-
-    if not registrar.detect():
-        if verbose:
-            click.echo(f"  tokensave MCP: {registrar.display_name} not detected — skipping")
-        return False
-
-    bin_path = _ensure_tokensave_binary(verbose=verbose)
-    if bin_path is None:
-        return False
-
-    # Warm the graph so the first query is instant (non-fatal).
-    _index_tokensave_project(bin_path, verbose=verbose)
-
-    spec = build_tokensave_spec(str(bin_path))
-    result = registrar.register_server(spec, force=force)
-
-    # Migrate a stale Headroom-installed entry (e.g. an older binary path or
-    # pinned version), mirroring the Serena migration path. Only force-update
-    # when the ledger proves Headroom installed the entry on disk.
-    if (
-        result.status == RegisterStatus.MISMATCH
-        and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("tokensave"))
-    ):
-        result = registrar.register_server(spec, force=True)
-        if result.status == RegisterStatus.REGISTERED:
-            click.echo("  tokensave MCP: migrated previously-installed entry to current spec")
-
-    if result.status == RegisterStatus.REGISTERED:
-        record_install(registrar.name, spec)
-
-    line = format_result(
-        registrar.name,
-        result,
-        label="tokensave MCP",
-        verbose=verbose,
-        overwrite_hint="update or remove the existing tokensave MCP entry, then rerun headroom wrap",
-        restart_hint=f"restart {registrar.display_name} if it was already running",
-    )
-    if line is not None:
-        click.echo(line)
-    return True
 
 
 def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
@@ -2083,25 +2022,33 @@ def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
 
 
 def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
-    """Make ``--no-tokensave`` actively remove a Headroom-installed tokensave entry."""
+    """Remove a Headroom-installed tokensave MCP entry left by a prior release.
+
+    tokensave was retired in favour of Serena. On upgrade we actively remove the
+    stale ``tokensave`` entry so the agent stops launching it, and point the user
+    at the leftover on-disk artifacts (we never delete files for them). A
+    user-managed entry (absent from our ledger) is reported but left in place.
+    """
     if not registrar.detect():
         if verbose:
             click.echo(f"  tokensave MCP: {registrar.display_name} not detected — skipping")
         return
 
     if registrar.get_server("tokensave") is None:
-        if verbose:
-            click.echo("  Skipping tokensave MCP (--no-tokensave)")
         return
 
     status = _remove_headroom_installed_tokensave_mcp(registrar)
     if status == "removed":
-        click.echo("  Removed previously-installed tokensave MCP (--no-tokensave)")
+        click.echo("  Removed retired tokensave MCP (replaced by Serena)")
         click.echo(f"    restart {registrar.display_name} if it was already running")
+        click.echo(
+            "    leftover files are safe to delete: the 'tokensave' binary in "
+            "~/.local/bin and any '.tokensave/' folder in your projects"
+        )
     elif status == "not_headroom_owned":
         click.echo(
             "  tokensave MCP is present but user-managed — leaving it in place "
-            "(--no-tokensave only removes entries Headroom installed)"
+            "(Headroom only removes entries it installed)"
         )
     else:  # "failed"
         click.echo(
@@ -2115,66 +2062,29 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 
     Selection (see :func:`_resolve_code_memory`):
 
-    * ``serena`` (default) — register Serena and remove any Headroom-installed
-      tokensave. Serena is mature, offline, and symbol-level.
-    * ``tokensave`` — register tokensave (lighter/faster); Serena is registered
-      automatically only as a backup when tokensave is unavailable (unless the
-      deprecated ``--no-serena`` suppressed the fallback).
-    * ``none`` — remove both Headroom-installed entries.
+    * ``serena`` (default) — register Serena (mature, offline, symbol-level).
+    * ``none`` — register nothing.
 
-    Deprecated ``--serena`` / ``--no-serena`` / ``--no-tokensave`` flags map into
-    the selector. User-managed MCP entries are always left untouched (ledger).
+    Either way, any Headroom-installed ``tokensave`` entry from a prior release
+    is removed (tokensave was retired in favour of Serena). The deprecated
+    ``--serena`` / ``--no-serena`` flags map into the selector; user-managed MCP
+    entries are always left untouched (ledger).
     """
     force = bool(kwargs.get("force"))
     verbose = bool(kwargs.get("verbose"))
     selection = _resolve_code_memory(kwargs)
-    # Deprecated --no-serena: in tokensave mode, don't auto-fall back to Serena.
-    suppress_serena_fallback = bool(kwargs.get("no_serena"))
+
+    # Retire any tokensave entry a prior release installed, whatever the selection.
+    _disable_tokensave_mcp(registrar, verbose=verbose)
 
     if selection == _CODE_MEMORY_NONE:
-        _disable_tokensave_mcp(registrar, verbose=verbose)
         _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory none")
         return
 
-    if selection == _CODE_MEMORY_SERENA:
-        _disable_tokensave_mcp(registrar, verbose=verbose)
-        _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
-        return
-
-    # tokensave (explicit opt-in): register it; Serena is the automatic backup.
-    tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
-    if not tokensave_ok and not suppress_serena_fallback:
-        _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
-    else:
-        reason = (
-            "--no-serena"
-            if suppress_serena_fallback
-            else "tokensave is the primary code-graph compressor"
-        )
-        _disable_serena_mcp(registrar, verbose=verbose, reason=reason)
+    _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
 
 
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
-
-
-def _setup_code_graph(verbose: bool = False) -> bool:
-    """Ensure the tokensave code graph is set up and the project indexed.
-
-    tokensave is Headroom's primary code-graph compressor and is normally
-    installed by default (it builds a semantic knowledge graph the LLM can
-    query for call chains, definitions, and impact analysis instead of
-    reading whole files). ``--code-graph`` is kept for backward compatibility
-    and as an explicit "set up the graph and force an index now" switch, even
-    when tokensave registration was otherwise skipped.
-
-    Returns True if the graph is ready, False if tokensave is unavailable.
-    Earlier releases backed this flag with ``codebase-memory-mcp``; that
-    server is no longer installed, and ``headroom unwrap`` still cleans up any
-    legacy ``codebase-memory-mcp`` entry a prior wrap left behind.
-    """
-    from headroom.mcp_registry import ClaudeRegistrar
-
-    return _setup_tokensave_mcp(ClaudeRegistrar(), verbose=verbose, force=True)
 
 
 # rtk instructions for tools without hook support (Codex, Cursor, Aider).
@@ -4599,13 +4509,19 @@ def _launch_tool(
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
 
-        if code_graph:
-            _setup_code_graph(verbose=False)
+        # Reduce-at-source: fill in SAFE quiet-CLI env defaults for the launched
+        # agent (git/npm/pip/pytest emit less noise), unless the user opted out.
+        # Applies to every wrapped tool since they all launch through here.
+        _quiet_written = _configure_quiet_cli_env(env)
 
         click.echo()
         click.echo(f"  Launching {tool_label} (API routed through Headroom)...")
         for var in env_vars_display:
             click.echo(f"  {var}")
+        if _quiet_written:
+            click.echo(
+                f"  Quiet CLI defaults: {', '.join(_quiet_written)} (opt out: {_QUIET_CLI_ENV}=0)"
+            )
         if args:
             click.echo(f"  Extra args: {' '.join(args)}")
         _print_telemetry_notice()
@@ -4900,7 +4816,7 @@ def wrap_selfheal(marker: str | None) -> None:
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
+    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
 )
 @click.option(
     "--serena",
@@ -4912,12 +4828,12 @@ def wrap_selfheal(marker: str | None) -> None:
     "--no-serena",
     is_flag=True,
     hidden=True,
-    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
 )
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable the proxy's live code-graph file watcher for the current project.",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -4991,17 +4907,14 @@ def claude(
 
     \b
     Examples:
-        headroom wrap claude                    # Start everything
+        headroom wrap claude                    # Start everything (Serena code memory)
         headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
-        headroom wrap claude                    # tokensave code graph (primary)
-        headroom wrap claude --no-tokensave     # Skip tokensave; fall back to Serena
-        headroom wrap claude --serena           # Also register the Serena backup
         headroom wrap claude --context-tool     # Enable CLI context-tool setup
         headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
-        headroom wrap claude --no-serena        # Never register the Serena backup
+        headroom wrap claude --code-memory none # No code-memory MCP
         headroom wrap claude --1m               # Preserve the 1M context window
     """
     # RTK/context-tool is opt-in (off by default): --context-tool (legacy) and
@@ -5156,7 +5069,7 @@ def claude(
         elif verbose:
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-        # Coding-task compressor: tokensave primary, Serena backup.
+        # Coding-task compressor: Serena (retires any legacy tokensave entry).
         from headroom.mcp_registry import ClaudeRegistrar
 
         _setup_coding_compressor(
@@ -5167,9 +5080,6 @@ def claude(
             no_tokensave=no_tokensave,
             verbose=verbose,
         )
-
-        if code_graph:
-            _setup_code_graph(verbose=verbose)
 
         proxy_url = _claude_proxy_base_url(actual_port)
         click.echo()
@@ -5800,8 +5710,8 @@ def _prepare_codex_wrap_state(
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-    # Coding-task compressor: tokensave primary, Serena backup. Codex starts
-    # long-lived MCP subprocesses from config.toml, so force re-registration.
+    # Coding-task compressor: Serena (retires any legacy tokensave entry). Codex
+    # starts long-lived MCP subprocesses from config.toml, so force re-registration.
     from headroom.mcp_registry import CodexRegistrar
 
     _setup_coding_compressor(
@@ -5978,7 +5888,7 @@ def _run_codex_wrap(
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
+    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
 )
 @click.option(
     "--serena",
@@ -5990,12 +5900,12 @@ def _run_codex_wrap(
     "--no-serena",
     is_flag=True,
     hidden=True,
-    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
 )
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable the proxy's live code-graph file watcher for the current project.",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -6051,9 +5961,7 @@ def codex(
         headroom wrap codex -- "fix the bug"        # Pass prompt to codex
         headroom wrap codex --no-context-tool       # Skip CLI context-tool setup
         headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
-        headroom wrap codex --no-tokensave          # Skip tokensave; fall back to Serena
-        headroom wrap codex --serena                # Also register the Serena backup
-        headroom wrap codex --no-serena             # Never register the Serena backup
+        headroom wrap codex --code-memory none      # No code-memory MCP
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
@@ -6477,7 +6385,7 @@ def kimi(
     "--no-tokensave",
     is_flag=True,
     hidden=True,
-    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
+    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
 )
 @click.option(
     "--serena",
@@ -6489,12 +6397,12 @@ def kimi(
     "--no-serena",
     is_flag=True,
     hidden=True,
-    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
 )
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable the proxy's live code-graph file watcher for the current project.",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -6530,9 +6438,10 @@ def grok(
     """Launch Grok CLI through Headroom proxy.
 
     \b
-    Sets ``GROK_CLI_CHAT_PROXY_BASE_URL`` so Grok routes inference traffic
-    through Headroom. Registers the headroom MCP server in ``~/.grok/config.toml``
-    so Grok can call ``headroom_retrieve`` on compression markers.
+    Sets ``GROK_MODELS_BASE_URL`` so Grok routes inference traffic through
+    Headroom while preserving native settings and authentication routing.
+    Registers the headroom MCP server in ``~/.grok/config.toml`` so Grok can
+    call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
@@ -8359,10 +8268,11 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
 def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
     """Undo durable ``headroom wrap grok`` MCP and guidance edits.
 
-    Grok API routing is session-scoped via ``GROK_CLI_CHAT_PROXY_BASE_URL`` and
-    does not require config restoration. This command removes Headroom MCP
-    servers from ``~/.grok/config.toml`` and strips injected RTK guidance from
-    the project ``AGENTS.md``.
+    Grok inference routing is session-scoped via ``GROK_MODELS_BASE_URL`` and
+    does not require config restoration. Native settings and authentication
+    routing stay unchanged. This command removes Headroom MCP servers from
+    ``~/.grok/config.toml`` and strips injected RTK guidance from the project
+    ``AGENTS.md``.
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")

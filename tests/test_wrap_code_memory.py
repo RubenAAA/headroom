@@ -1,8 +1,9 @@
-"""Code-memory MCP is selectable via --code-memory (default tokensave).
+"""Code-memory MCP is selectable via --code-memory (default serena).
 
 Covers the resolver precedence (selector > deprecated flags > default), the
-orchestrator dispatch for each selection, and that --code-memory is exposed on
-the code-memory-capable subcommands (claude/codex/grok) but not others.
+graceful retirement of the removed ``tokensave`` option, the orchestrator
+dispatch for each selection, and that --code-memory is exposed on the
+code-memory-capable subcommands (claude/codex/grok) but not others.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import click
 from click.testing import CliRunner
 
 from headroom.cli import wrap
@@ -27,22 +29,26 @@ def test_default_is_serena() -> None:
 
 
 def test_selector_env_wins() -> None:
-    for val in (wrap._CODE_MEMORY_SERENA, wrap._CODE_MEMORY_NONE, wrap._CODE_MEMORY_TOKENSAVE):
+    for val in (wrap._CODE_MEMORY_SERENA, wrap._CODE_MEMORY_NONE):
         with patch.dict(os.environ, {"HEADROOM_CODE_MEMORY": val}):
             # selector beats any legacy flag
-            assert wrap._resolve_code_memory({"serena": True, "no_tokensave": True}) == val
+            assert wrap._resolve_code_memory({"serena": True, "no_serena": True}) == val
 
 
 def test_deprecated_flags_map_into_selector() -> None:
     with patch.dict(os.environ, _clean_env(), clear=True):
         assert wrap._resolve_code_memory({"serena": True}) == wrap._CODE_MEMORY_SERENA
+        # tokensave is retired: --no-tokensave is now a no-op → default serena
         assert wrap._resolve_code_memory({"no_tokensave": True}) == wrap._CODE_MEMORY_SERENA
-        # --no-serena means "not serena" → the other real graph, tokensave
-        assert wrap._resolve_code_memory({"no_serena": True}) == wrap._CODE_MEMORY_TOKENSAVE
-        assert (
-            wrap._resolve_code_memory({"no_tokensave": True, "no_serena": True})
-            == wrap._CODE_MEMORY_NONE
-        )
+        # --no-serena means "no code memory" now that tokensave is gone
+        assert wrap._resolve_code_memory({"no_serena": True}) == wrap._CODE_MEMORY_NONE
+
+
+def test_retired_tokensave_selector_maps_to_serena() -> None:
+    # An explicit HEADROOM_CODE_MEMORY=tokensave (or --code-memory tokensave from
+    # an old script) degrades gracefully to Serena instead of erroring.
+    with patch.dict(os.environ, {"HEADROOM_CODE_MEMORY": "tokensave"}):
+        assert wrap._resolve_code_memory({}) == wrap._CODE_MEMORY_SERENA
 
 
 def test_serena_dashboard_disabled_flips_existing_config(tmp_path, monkeypatch) -> None:
@@ -67,8 +73,6 @@ def test_serena_dashboard_disabled_creates_config(tmp_path, monkeypatch) -> None
 
 
 def test_invalid_env_raises() -> None:
-    import click
-
     with patch.dict(os.environ, {"HEADROOM_CODE_MEMORY": "bogus"}):
         try:
             wrap._resolve_code_memory({})
@@ -86,9 +90,6 @@ def _dispatch_calls(selection: str, extra: dict | None = None) -> list[str]:
     env["HEADROOM_CODE_MEMORY"] = selection
     with (
         patch.dict(os.environ, env, clear=True),
-        patch.object(
-            wrap, "_setup_tokensave_mcp", lambda *a, **k: (calls.append("tokensave"), True)[1]
-        ),
         patch.object(wrap, "_setup_serena_mcp", lambda *a, **k: calls.append("serena")),
         patch.object(
             wrap, "_disable_tokensave_mcp", lambda *a, **k: calls.append("disable_tokensave")
@@ -100,7 +101,7 @@ def _dispatch_calls(selection: str, extra: dict | None = None) -> list[str]:
 
 
 def test_orchestrator_dispatch() -> None:
-    assert _dispatch_calls(wrap._CODE_MEMORY_TOKENSAVE) == ["tokensave", "disable_serena"]
+    # A legacy tokensave entry is always retired first, then the selection applies.
     assert _dispatch_calls(wrap._CODE_MEMORY_SERENA) == ["disable_tokensave", "serena"]
     assert set(_dispatch_calls(wrap._CODE_MEMORY_NONE)) == {"disable_tokensave", "disable_serena"}
 

@@ -97,6 +97,11 @@ class PrometheusMetrics:
         self.tokens_input_total = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
+        # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
+        # per-request tags. Tracked apart from tokens_saved_total (which is message
+        # compression only — tool bytes never move tok_before/after) so every sink
+        # can surface the tool-schema layer instead of silently dropping it.
+        self.tool_search_saved_total = 0
         # Sum of tokens we actually attempted to compress across the
         # session: extracted units that passed all gates + tool-schema
         # tokens we ran compaction against. Excludes prefix-frozen
@@ -324,6 +329,7 @@ class PrometheusMetrics:
             self.tokens_input_total = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
+            self.tool_search_saved_total = 0
             self.attempted_input_tokens_total = 0
 
             self.compressions_by_strategy.clear()
@@ -683,6 +689,7 @@ class PrometheusMetrics:
         output_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
+        tool_search_saved: int = 0,
     ):
         """Record metrics for a request."""
         # Post-guard invariant (all providers): Headroom never forwards a request
@@ -709,6 +716,7 @@ class PrometheusMetrics:
             self.tokens_input_total += input_tokens
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
+            self.tool_search_saved_total += max(0, int(tool_search_saved))
             # See the attribute definition for why this is the right
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
