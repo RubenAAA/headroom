@@ -11,9 +11,9 @@
 //! locally after `python scripts/record_kompress_trace.py` to get the
 //! real assertion.
 //!
-//! Set `HEADROOM_REQUIRE_KOMPRESS_MODEL=1` (the CI kompress-parity job
-//! does) to turn every skip into a hard failure, so a cold cache can't
-//! silently pass.
+//! Set `HEADROOM_REQUIRE_KOMPRESS_MODEL=1` to turn every skip into a hard
+//! failure, so a cold cache can't silently pass. Any job that warms the
+//! model into the HF cache should set it.
 
 use std::fs;
 use std::path::{Path, PathBuf};

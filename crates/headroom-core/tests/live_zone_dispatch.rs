@@ -401,9 +401,9 @@ fn plain_text_tool_result_routes_to_kompress() {
         }
     } else {
         // Model not cached → passthrough, exactly like Python when Kompress
-        // is unavailable. Under HEADROOM_REQUIRE_KOMPRESS_MODEL (the CI
-        // kompress-parity job) a cold cache is a failure, not a pass —
-        // otherwise the routing assertion above never runs.
+        // is unavailable. Under HEADROOM_REQUIRE_KOMPRESS_MODEL a cold
+        // cache is a failure, not a pass — otherwise the routing assertion
+        // above never runs.
         assert!(
             std::env::var_os("HEADROOM_REQUIRE_KOMPRESS_MODEL").is_none(),
             "HEADROOM_REQUIRE_KOMPRESS_MODEL is set but the kompress model is not in the HF cache"
