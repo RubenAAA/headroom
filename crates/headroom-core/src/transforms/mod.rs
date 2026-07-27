@@ -21,6 +21,7 @@ pub mod code_compressor;
 pub mod content_detector;
 pub mod detection;
 pub mod diff_compressor;
+#[cfg(feature = "ml")]
 pub mod kompress;
 pub mod live_zone;
 pub mod log_compressor;
@@ -46,6 +47,7 @@ pub use detection::detect;
 pub use diff_compressor::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
 };
+#[cfg(feature = "ml")]
 pub use kompress::{
     Kompress, KompressConfig, KompressError, KompressResult, DEFAULT_MODEL_ID,
     DEFAULT_TOKENIZER_REPO,
