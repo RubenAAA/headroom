@@ -1,9 +1,10 @@
 //! Parity harness: load JSON fixtures recorded from the Python implementation,
 //! run the Rust port, and compare outputs.
 //!
-//! Phase 0: the per-transform comparators are stubs (`todo!()`), but the
-//! harness wiring (fixture loading, dispatch, diff reporting) is real and
-//! covered by a negative test.
+//! Six of the eight comparators are real: `log_compressor`, `diff_compressor`,
+//! `tokenizer`, `smart_crusher`, `content_detector`, `text_crusher`. Two remain
+//! stubs and report `Skipped` — see the `stub_comparator!` block below for what
+//! each is waiting on.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -147,9 +148,15 @@ pub fn run_comparator(dir: &Path, comparator: &dyn TransformComparator) -> Resul
 
 // --- Built-in comparator stubs ---------------------------------------------
 //
-// Phase 1 will replace `todo!()` bodies with real Rust ports. Until then they
-// return `Err`, causing the harness to mark fixtures as `Skipped` instead of
-// panicking. The parity-run binary wires them up so the CLI works today.
+// These return `Err`, which the harness turns into `Skipped` rather than a
+// panic or a diff — so a stubbed comparator cannot fail the parity gate. Both
+// are blocked on missing Rust surface, not on wiring:
+//
+// * `cache_aligner` — needs the volatile-content detector, which lives in
+//   `headroom-proxy` while this crate depends only on `headroom-core`. Either
+//   add the dependency or move the detector down into core.
+// * `ccr` — the fixtures compare `ccr_retrieve` tool-definition injection
+//   (`headroom/ccr/tool_injection.py`), which has no Rust port at all.
 
 macro_rules! stub_comparator {
     ($ty:ident, $name:literal) => {
@@ -169,9 +176,105 @@ macro_rules! stub_comparator {
     };
 }
 
-stub_comparator!(LogCompressorComparator, "log_compressor");
 stub_comparator!(CacheAlignerComparator, "cache_aligner");
 stub_comparator!(CcrComparator, "ccr");
+
+/// Real comparator for the `log_compressor` transform.
+///
+/// Two wrinkles beyond the usual adapter shape:
+///
+/// * **bias.** Python's signature is `compress(content, context="", bias=1.0)`
+///   and the recorder captured only `content`, so every fixture was produced at
+///   the default `bias = 1.0`. Rust takes `bias` positionally — pass 1.0.
+/// * **CCR store.** The Python compressor owns its store internally, while Rust
+///   mints a `cache_key` only when one is handed to `compress_with_store`.
+///   Without a store the CCR branch bails out with `"no store provided"` and
+///   `cache_key` comes back `None`, which would diff against any fixture that
+///   recorded a key. A throwaway `InMemoryCcrStore` is enough: the key is
+///   `md5(content)[:24]` on both sides and does not depend on the backend.
+pub struct LogCompressorComparator;
+
+impl TransformComparator for LogCompressorComparator {
+    fn name(&self) -> &str {
+        "log_compressor"
+    }
+
+    fn run(
+        &self,
+        input: &serde_json::Value,
+        config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use headroom_core::ccr::InMemoryCcrStore;
+        use headroom_core::transforms::{LogCompressor, LogCompressorConfig};
+
+        let content = input
+            .as_str()
+            .context("log_compressor fixture input must be a JSON string")?;
+
+        let usize_or = |key: &str, default: usize| -> usize {
+            config
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(default)
+        };
+        let bool_or = |key: &str, default: bool| -> bool {
+            config.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+        };
+
+        let cfg = LogCompressorConfig {
+            // The twelve fields the Python dataclass carries, all recorded.
+            max_errors: usize_or("max_errors", 10),
+            error_context_lines: usize_or("error_context_lines", 3),
+            keep_first_error: bool_or("keep_first_error", true),
+            keep_last_error: bool_or("keep_last_error", true),
+            max_stack_traces: usize_or("max_stack_traces", 3),
+            stack_trace_max_lines: usize_or("stack_trace_max_lines", 20),
+            max_warnings: usize_or("max_warnings", 5),
+            dedupe_warnings: bool_or("dedupe_warnings", true),
+            keep_summary_lines: bool_or("keep_summary_lines", true),
+            max_total_lines: usize_or("max_total_lines", 100),
+            enable_ccr: bool_or("enable_ccr", true),
+            min_lines_for_ccr: usize_or("min_lines_for_ccr", 50),
+
+            // Rust-only knobs, absent from the fixtures. Each falls back to the
+            // Rust default rather than to a Python-equivalent value, so the
+            // comparator exercises the code as it actually ships.
+            //
+            // Python applies the same 0.5 ratio gate inline.
+            min_compression_ratio_for_ccr: config
+                .get("min_compression_ratio_for_ccr")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5),
+            // Rust's `true` collapses runtime frames where Python truncates the
+            // tail — a deliberate upgrade, and the one place these two
+            // implementations are known to disagree. Kept at the Rust default
+            // anyway: measured both ways, all 20 fixtures match either setting,
+            // because every recorded traceback is 3 lines and the collapse path
+            // only opens above `stack_trace_max_lines` (20). Leaving it `true`
+            // means a future fixture with a deep traceback will surface the
+            // divergence instead of having it configured away here.
+            collapse_runtime_frames: bool_or("collapse_runtime_frames", true),
+            trace_head_frames: usize_or("trace_head_frames", 3),
+            trace_app_frames: usize_or("trace_app_frames", 5),
+        };
+
+        let store = InMemoryCcrStore::new();
+        let (result, _sidecar) =
+            LogCompressor::new(cfg).compress_with_store(content, 1.0, Some(&store));
+
+        Ok(serde_json::json!({
+            "cache_key": result.cache_key,
+            "compressed": result.compressed,
+            "compressed_line_count": result.compressed_line_count,
+            "compression_ratio": result.compression_ratio,
+            "format_detected": result.format_detected.as_str(),
+            "original": result.original,
+            "original_line_count": result.original_line_count,
+            "stats": result.stats,
+        }))
+    }
+}
 
 /// Real comparator for the `diff_compressor` transform. Drives the Rust port
 /// over the recorded fixture inputs and emits the Python-shaped JSON output
@@ -466,6 +569,51 @@ impl TransformComparator for ContentDetectorComparator {
     }
 }
 
+/// Real comparator for the `text_crusher` transform. The fixture `input` is an
+/// object rather than a bare string, mirroring the recorder's three arguments
+/// (`tests/parity/record_text_crusher.py`), and `config` is always `null` — the
+/// recorder drove the Python default config, so the Rust side uses
+/// `TextCrusherConfig::default()` to match.
+pub struct TextCrusherComparator;
+
+impl TransformComparator for TextCrusherComparator {
+    fn name(&self) -> &str {
+        "text_crusher"
+    }
+
+    fn run(
+        &self,
+        input: &serde_json::Value,
+        _config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use headroom_core::transforms::{TextCrusher, TextCrusherConfig};
+
+        let content = input
+            .get("content")
+            .and_then(|v| v.as_str())
+            .context("text_crusher fixture input needs a string `content`")?;
+        let context = input
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        // Null in the `short_passthrough` fixture, where the recorder passed no
+        // ratio at all — `Option<f64>` carries that through to the same default
+        // the Python call used.
+        let target_ratio = input.get("target_ratio").and_then(|v| v.as_f64());
+
+        let result =
+            TextCrusher::new(TextCrusherConfig::default()).compress(content, context, target_ratio);
+        Ok(serde_json::json!({
+            "compressed": result.compressed,
+            "original_tokens": result.original_tokens,
+            "compressed_tokens": result.compressed_tokens,
+            "compression_ratio": result.compression_ratio,
+            "kept_segments": result.kept_segments,
+            "total_segments": result.total_segments,
+        }))
+    }
+}
+
 /// Kompress comparator — runs the ML prose compressor against fixtures
 /// recorded from the Python reference.
 ///
@@ -693,6 +841,7 @@ pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
         Box::new(CcrComparator),
         Box::new(SmartCrusherComparator),
         Box::new(ContentDetectorComparator),
+        Box::new(TextCrusherComparator),
         Box::new(KompressComparator::new()),
         Box::new(CodeCompressorComparator),
     ]
@@ -792,14 +941,17 @@ mod tests {
 
     #[test]
     fn stub_comparators_skip_rather_than_panic() {
+        // Uses `cache_aligner` because `log_compressor` is a real comparator
+        // now. Any remaining `stub_comparator!` works here — the point is that
+        // an unimplemented comparator reports Skipped instead of panicking.
         let tmp = tempdir();
         write_fixture(
             tmp.path(),
-            "log_compressor",
+            "cache_aligner",
             "case1",
             serde_json::json!({"compressed": "x"}),
         );
-        let report = run_comparator(tmp.path(), &LogCompressorComparator).unwrap();
+        let report = run_comparator(tmp.path(), &CacheAlignerComparator).unwrap();
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.matched, 0);
     }
