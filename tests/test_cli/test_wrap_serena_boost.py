@@ -258,3 +258,34 @@ def test_preindex_generic_error_is_non_fatal(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(wrap_cli, "run", Mock(side_effect=RuntimeError("boom")))
     # Must not propagate.
     wrap_cli._index_serena_project(verbose=True)
+
+
+# ---------------------------------------------------------------------------
+# _serena_project_skip_reason — keep per-project setup off non-project roots
+# ---------------------------------------------------------------------------
+
+
+def test_skip_reason_none_for_ordinary_project(tmp_path: Path) -> None:
+    assert wrap_cli._serena_project_skip_reason(tmp_path) is None
+
+
+def test_skip_reason_none_for_normal_checkout(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()  # real checkout: .git is a directory
+
+    assert wrap_cli._serena_project_skip_reason(tmp_path) is None
+
+
+def test_skip_reason_flags_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert wrap_cli._serena_project_skip_reason(tmp_path) == "$HOME is not a project"
+
+
+def test_skip_reason_flags_linked_worktree(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text("gitdir: /repo/.git/worktrees/wt\n")
+
+    assert wrap_cli._serena_project_skip_reason(tmp_path) == "linked git worktree"
+
+
+def test_skip_reason_survives_unresolvable_root(tmp_path: Path) -> None:
+    assert wrap_cli._serena_project_skip_reason(tmp_path / "gone") is None
