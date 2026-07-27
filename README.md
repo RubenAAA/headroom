@@ -80,7 +80,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **ContentRouter** — detects content type, selects the right compressor
 - **SmartCrusher / CodeCompressor / Kompress-v2-base** — compress JSON, AST, or prose
-- **CacheAligner** — stabilizes prefixes so provider KV caches actually hit
+- **CacheAligner** - detects and warns about volatile content that can bust provider KV cache prefixes; never rewrites prompts
 - **CCR** — stores originals locally; LLM calls `headroom_retrieve` if it needs them
 
 → [Architecture](https://headroom-docs.vercel.app/docs/architecture) · [CCR reversible compression](https://headroom-docs.vercel.app/docs/ccr) · [Kompress-v2-base model card](https://huggingface.co/chopratejas/kompress-v2-base)
@@ -319,7 +319,7 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 - **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, Perl.
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction via trained ML router.
-- **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
+- **CacheAligner** - detects and warns about volatile content that can bust provider KV cache prefixes; never rewrites prompts.
 - **Live-zone compression** — compresses only new bytes (fresh tool output, latest turn); frozen prefix stays byte-identical so provider cache is not busted. History is never dropped.
 - **CCR** — reversible compression; LLM retrieves originals on demand.
 - **Cross-agent memory** — shared store, agent provenance, auto-dedup.
