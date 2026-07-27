@@ -40,6 +40,15 @@ pub fn hello() -> &'static str {
 /// `ORT_DYLIB_PATH` at an OpenVINO-enabled `onnxruntime.dll`, and put the
 /// matching `openvino` libs (version-matched to the provider) on `PATH`.
 ///
+/// The loaded `onnxruntime` must also be **1.24 or newer**. `ort-sys` derives
+/// `ORT_API_VERSION` from the enabled `api-N` features, which are additive
+/// across the dependency graph — `fastembed` turns on `api-24`, so 1.24 is the
+/// effective floor for the whole workspace. An older runtime does not report a
+/// version mismatch: `ort` builds the error from inside `load_dylib_from_path`,
+/// which runs inside the `Once` that `setup_api()` is still initialising, so
+/// the re-entry deadlocks and the process parks at 0% CPU. `ORT_DYLIB_PATH`
+/// does not help. If a session never returns, check the runtime version first.
+///
 /// Valid values for `HEADROOM_ORT_EP`:
 /// - unset / `cpu` — no-op; ORT defaults to CPU (always available)
 /// - `openvino`    — Intel CPU, GPU, or NPU via OpenVINO runtime
