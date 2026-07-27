@@ -58,6 +58,12 @@ from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
 from headroom.copilot_auth import (
+    _API_TOKEN_ENV_VARS,
+    _API_TOKEN_EXPIRES_AT_ENV_VAR,
+    _COPILOT_OAUTH_TOKEN_ENV_VARS,
+    _GENERIC_GITHUB_TOKEN_ENV_VARS,
+    _REFRESH_OAUTH_TOKEN_ENV_VAR,
+    CopilotSubscriptionTokenResolution,
     has_oauth_auth,
     resolve_client_bearer_token,
     resolve_copilot_api_url,
@@ -167,13 +173,25 @@ from .main import main
 
 _COPILOT_PROXY_SEED_ENV_VARS = (
     "GITHUB_COPILOT_API_TOKEN",
-    "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
-    "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT",
+    _REFRESH_OAUTH_TOKEN_ENV_VAR,
+    _API_TOKEN_EXPIRES_AT_ENV_VAR,
+)
+_COPILOT_SUBSCRIPTION_LAUNCH_SECRET_ENV_VARS = (
+    *_API_TOKEN_ENV_VARS,
+    _REFRESH_OAUTH_TOKEN_ENV_VAR,
+    _API_TOKEN_EXPIRES_AT_ENV_VAR,
+    *_COPILOT_OAUTH_TOKEN_ENV_VARS,
+    *_GENERIC_GITHUB_TOKEN_ENV_VARS,
 )
 
 
 def _scrub_copilot_proxy_seed_env(env: dict[str, str]) -> None:
     for key in _COPILOT_PROXY_SEED_ENV_VARS:
+        env.pop(key, None)
+
+
+def _scrub_copilot_subscription_launch_env(env: dict[str, str]) -> None:
+    for key in _COPILOT_SUBSCRIPTION_LAUNCH_SECRET_ENV_VARS:
         env.pop(key, None)
 
 
@@ -288,6 +306,54 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
 # ENABLE_TOOL_SEARCH modes that turn deferral OFF. Everything else Claude Code
 # accepts (true/1/yes/on/auto/auto:N) keeps on-demand tool loading active.
 _TOOL_SEARCH_FALSY = {"false", "0", "no", "off"}
+
+
+# Reduce-at-source: CLI tools pad tool_result output with progress bars, pager
+# framing, funding/telemetry banners, and version nags — all zero-signal tokens
+# the agent never acts on. Setting conservative, SAFE env defaults in the
+# launched agent's environment makes those tools emit less AT THE SOURCE, so the
+# proxy never has to strip them. Only knobs that can't hide diffs, errors,
+# summaries, or search results are set here (no blanket --silent/--quiet).
+# Opt out entirely with HEADROOM_WRAP_QUIET=0 (or false/no/off).
+_QUIET_CLI_ENV = "HEADROOM_WRAP_QUIET"
+_QUIET_CLI_FALSY = {"0", "false", "no", "off"}
+# name -> value, injected only when the user has not already set it.
+_QUIET_CLI_DEFAULTS: dict[str, str] = {
+    "GIT_PAGER": "cat",  # never page (keeps full content, drops pager framing)
+    "PIP_QUIET": "1",  # drop "Requirement already satisfied"/download chatter
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",  # drop the "new pip available" nag
+    "npm_config_fund": "false",  # drop the funding banner
+    "npm_config_audit": "false",  # drop the audit summary (not a security scan here)
+    "npm_config_progress": "false",  # drop the install progress bar
+}
+
+
+def _quiet_cli_enabled() -> bool:
+    """Quiet-CLI source defaults are on unless HEADROOM_WRAP_QUIET is falsy."""
+    return os.environ.get(_QUIET_CLI_ENV, "").strip().lower() not in _QUIET_CLI_FALSY
+
+
+def _configure_quiet_cli_env(env: dict[str, str]) -> list[str]:
+    """Inject SAFE quiet-CLI defaults into ``env`` in place; return names set.
+
+    No-op when ``HEADROOM_WRAP_QUIET`` is falsy. A value the user already set
+    always wins (defaults are only filled when absent). ``PYTEST_ADDOPTS`` is
+    *augmented* with ``-q`` rather than clobbered, so an existing value survives.
+    Nothing RISKY (anything that could suppress diffs/errors/summaries/search
+    output) is ever set here.
+    """
+    if not _quiet_cli_enabled():
+        return []
+    written: list[str] = []
+    for name, value in _QUIET_CLI_DEFAULTS.items():
+        if name not in env:
+            env[name] = value
+            written.append(name)
+    existing = env.get("PYTEST_ADDOPTS", "")
+    if "-q" not in existing.split():
+        env["PYTEST_ADDOPTS"] = f"{existing} -q".strip()
+        written.append("PYTEST_ADDOPTS")
+    return written
 
 
 def _resolved_tool_search_mode(flag_value: str | None) -> str:
@@ -676,6 +742,111 @@ _rtk_option = click.option(
     is_eager=True,
     callback=_rtk_flag_callback,
     help="Enable RTK CLI-command filtering (opt-in; off by default). Also enabled by HEADROOM_RTK=1.",
+)
+
+
+def _serena_instructions_opt_in() -> bool:
+    """Whether Serena instruction injection into the agent's hint file is enabled.
+
+    Injecting "prefer Serena symbol tools" guidance rewrites the user's
+    ``CLAUDE.md``/``AGENTS.md``, so it is opt-in (off by default): turn it on
+    with ``--serena-instructions`` (which sets ``HEADROOM_SERENA_INSTRUCTIONS=1``)
+    or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. Serena's ``.serena/``-only
+    setup (language scoping, pre-indexing) stays on by default regardless.
+    """
+    return os.environ.get("HEADROOM_SERENA_INSTRUCTIONS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _serena_instructions_flag_callback(ctx: Any, param: Any, value: bool) -> bool:
+    """Click eager callback: ``--serena-instructions`` sets
+    HEADROOM_SERENA_INSTRUCTIONS so the central gate
+    (:func:`_serena_instructions_opt_in`) sees the opt-in without threading a
+    param through every wrap subcommand."""
+    if value:
+        os.environ["HEADROOM_SERENA_INSTRUCTIONS"] = "1"
+    return value
+
+
+# Shared opt-in flag for Serena instruction injection, applied to the wrap
+# subcommands that set up Serena. ``expose_value=False`` so no subcommand
+# signature changes; it works purely through HEADROOM_SERENA_INSTRUCTIONS. Same
+# approach as _rtk_option above — set via the callback with NO ``envvar=`` so the
+# settings_store drift guard doesn't flag it.
+_serena_instructions_option = click.option(
+    "--serena-instructions",
+    is_flag=True,
+    default=False,
+    expose_value=False,
+    is_eager=True,
+    callback=_serena_instructions_flag_callback,
+    help="Inject 'prefer Serena symbol tools' guidance into the agent's hint file (opt-in; off by default).",
+)
+
+
+# --- Code-memory MCP selection ------------------------------------------------
+# The code-memory MCP is Serena by default; turn it off with --code-memory none.
+# Selection flows through HEADROOM_CODE_MEMORY (set by the eager --code-memory
+# callback) so it works the same on every agent without threading a param
+# through each subcommand — the same approach as _rtk_option above.
+_CODE_MEMORY_ENV = "HEADROOM_CODE_MEMORY"
+_CODE_MEMORY_SERENA = "serena"
+_CODE_MEMORY_NONE = "none"
+_VALID_CODE_MEMORY = {_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE}
+
+
+def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
+    """Resolve which code-memory MCP to register.
+
+    Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
+    wins; otherwise the deprecated ``--serena`` / ``--no-serena`` flags map into
+    it; otherwise the default is ``serena`` — mature, offline, symbol-level code
+    navigation. The retired ``tokensave`` option is accepted gracefully: an
+    explicit ``tokensave`` selector (or the deprecated ``--no-tokensave`` flag)
+    now resolves to Serena.
+    """
+    env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
+    if env == "tokensave":
+        click.echo("  Note: the tokensave code-memory option was retired — using Serena instead.")
+        return _CODE_MEMORY_SERENA
+    if env:
+        if env not in _VALID_CODE_MEMORY:
+            raise click.ClickException(
+                f"{_CODE_MEMORY_ENV} must be one of: {', '.join(sorted(_VALID_CODE_MEMORY))}"
+            )
+        return env
+    if kwargs.get("no_serena"):
+        return _CODE_MEMORY_NONE
+    return _CODE_MEMORY_SERENA
+
+
+def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
+    """Click eager callback: ``--code-memory X`` sets HEADROOM_CODE_MEMORY so the
+    central resolver (:func:`_resolve_code_memory`) sees the choice without
+    threading a param through every wrap subcommand."""
+    if value:
+        os.environ[_CODE_MEMORY_ENV] = value
+    return value
+
+
+# Shared selector applied to code-memory-capable subcommands (claude/codex/grok).
+# ``expose_value=False`` so no subcommand signature changes; it flows purely
+# through HEADROOM_CODE_MEMORY.
+_code_memory_option = click.option(
+    "--code-memory",
+    type=click.Choice([_CODE_MEMORY_SERENA, _CODE_MEMORY_NONE]),
+    default=None,
+    expose_value=False,
+    is_eager=True,
+    callback=_code_memory_flag_callback,
+    help=(
+        "Code-memory MCP to register: 'serena' (default) or 'none'. "
+        "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
+    ),
 )
 
 
@@ -1432,6 +1603,303 @@ def _setup_headroom_mcp(
         click.echo(line)
 
 
+def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
+    """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
+
+    Serena opens its web dashboard in a browser tab on launch by default
+    (``web_dashboard_open_on_launch: true``). Since Headroom now registers Serena
+    as the default code-memory MCP, flip that setting off so wrapped sessions
+    don't spawn a browser tab. The dashboard backend still runs and stays
+    reachable at http://localhost:24282/dashboard/. The setting lives in Serena's
+    own config (authoritative, unlike a startup flag); other keys and comments are
+    preserved via a targeted line edit rather than a YAML rewrite.
+    """
+    import re
+
+    cfg = Path.home() / ".serena" / "serena_config.yml"
+    key = "web_dashboard_open_on_launch"
+    try:
+        if cfg.exists():
+            text = cfg.read_text(encoding="utf-8")
+            pattern = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
+            if pattern.search(text):
+                new = pattern.sub(rf"\g<1>{key}: false", text)
+            else:
+                new = text.rstrip("\n") + f"\n{key}: false\n"
+            if new != text:
+                cfg.write_text(new, encoding="utf-8")
+                if verbose:
+                    click.echo("  Serena: disabled dashboard browser auto-open (serena_config.yml)")
+        else:
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            # Serena fills defaults for any keys we omit, so a single-key file is valid.
+            cfg.write_text(f"{key}: false\n", encoding="utf-8")
+            if verbose:
+                click.echo("  Serena: created serena_config.yml with dashboard auto-open off")
+    except OSError as e:
+        if verbose:
+            click.echo(f"  Serena: could not update serena_config.yml ({e})")
+
+
+# Marker-fenced guidance steering the agent toward Serena's symbol tools.
+# Injected only when Serena is the active code-memory engine. Mirrors the RTK
+# instruction block (idempotent, marker-guarded).
+_SERENA_MARKER = "<!-- headroom:serena-instructions -->"
+
+SERENA_INSTRUCTIONS_BLOCK = """\
+<!-- headroom:serena-instructions -->
+# Serena — Symbol-First Code Navigation
+
+Serena's MCP tools expose this project's code as a symbol graph backed by a
+language server. **Prefer these tools over reading whole files** — they return
+only the code you need, cutting context usage sharply. Read a file end-to-end
+only when a symbol view is insufficient (non-code files, or when you need the
+surrounding glue).
+
+## Preferred workflow
+- `get_symbols_overview(<file>)` — list a file's top-level symbols before opening it.
+- `find_symbol(<name>)` — fetch a symbol's definition/body instead of reading the file.
+- `find_referencing_symbols(<name>)` — find call sites / usages instead of grepping.
+- `find_declaration(<name>)` — jump to where a symbol is defined.
+
+## Rule
+Reach for a symbol tool first; fall back to reading a whole file only when the
+symbol view does not answer the question.
+<!-- /headroom:serena-instructions -->
+"""
+
+# Ext → Serena language key. Values match the ``Language`` enum in Serena's
+# solidlsp ``ls_config`` (the same keys accepted by ``.serena/project.yml``'s
+# ``languages`` list). Only real programming languages are mapped — data/markup
+# formats (json/yaml/toml/md/html/css) are intentionally skipped so Serena does
+# not spin up language servers that add no symbol-navigation value.
+_EXT_TO_SERENA_LANGUAGE: dict[str, str] = {
+    ".py": "python",
+    ".pyi": "python",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".js": "typescript",
+    ".jsx": "typescript",
+    ".mjs": "typescript",
+    ".cjs": "typescript",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".rb": "ruby",
+    ".erb": "ruby",
+    ".cs": "csharp",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".c++": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
+    ".c": "cpp",
+    ".h": "cpp",
+    ".php": "php",
+    ".swift": "swift",
+    ".dart": "dart",
+    ".scala": "scala",
+    ".sbt": "scala",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".lua": "lua",
+    ".r": "r",
+    ".pl": "perl",
+    ".pm": "perl",
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".clj": "clojure",
+    ".cljs": "clojure",
+    ".cljc": "clojure",
+    ".elm": "elm",
+    ".tf": "terraform",
+    ".tfvars": "terraform",
+    ".zig": "zig",
+    ".nix": "nix",
+    ".hs": "haskell",
+    ".jl": "julia",
+    ".sol": "solidity",
+    ".vue": "vue",
+    ".svelte": "svelte",
+}
+
+# Directories never worth scanning for language detection (VCS, dependencies,
+# build output, virtualenvs, caches). Pruned in-place during the walk.
+_LANG_SCAN_IGNORE_DIRS = frozenset(
+    {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"}
+)
+
+
+def _serena_instruction_file(registrar: Any) -> Path:
+    """Resolve the project instruction file the agent reads for guidance.
+
+    Claude Code reads ``CLAUDE.md``; Codex, Grok, and OpenCode read
+    ``AGENTS.md``. Both live at the project root, mirroring the RTK instruction
+    targets.
+    """
+    name = getattr(registrar, "name", "") or ""
+    filename = "CLAUDE.md" if name == "claude" else "AGENTS.md"
+    return Path.cwd() / filename
+
+
+def _inject_serena_instructions(file_path: Path, verbose: bool = False) -> bool:
+    """Steer the agent toward Serena's symbol tools over whole-file reads.
+
+    Opt-in (off by default): mirrors :func:`_inject_rtk_instructions` and
+    early-returns unless ``--serena-instructions`` / ``HEADROOM_SERENA_INSTRUCTIONS``
+    is set, so the user's hint file is left untouched by default.
+
+    Idempotent — skips if the marker is already present. Appends to an existing
+    instruction file, or creates one. Returns True once the guidance is in place.
+    """
+    if not _serena_instructions_opt_in():
+        return False
+    if file_path.exists():
+        existing = _read_text(file_path)
+        if _SERENA_MARKER in existing:
+            if verbose:
+                click.echo(f"  Serena instructions already in {file_path.name}")
+            return True
+        _append_text(file_path, "\n\n" + SERENA_INSTRUCTIONS_BLOCK)
+    else:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(file_path, SERENA_INSTRUCTIONS_BLOCK)
+
+    click.echo(f"  Serena instructions injected into {file_path}")
+    return True
+
+
+def _detect_repo_languages(root: Path) -> list[str]:
+    """Detect the Serena languages present under *root* by file extension.
+
+    Returns the mapped Serena language keys ordered by file count (most common
+    first — Serena treats the first entry as the default/fallback language
+    server), with ties broken alphabetically for determinism. Dependency,
+    build, VCS, and cache directories are pruned from the walk.
+    """
+    counts: dict[str, int] = {}
+    for _dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _LANG_SCAN_IGNORE_DIRS]
+        for filename in filenames:
+            lang = _EXT_TO_SERENA_LANGUAGE.get(Path(filename).suffix.lower())
+            if lang is not None:
+                counts[lang] = counts.get(lang, 0) + 1
+    return [lang for lang, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _scope_serena_languages(*, verbose: bool = False) -> None:
+    """Pin the repo's languages into ``.serena/project.yml`` (best-effort).
+
+    Scoping the LSP to the languages actually present keeps Serena from
+    starting unnecessary language servers. Runs before indexing so
+    ``serena project index`` respects the scope. Writes the ``languages`` key as
+    a YAML flow list (the format Serena's own project template uses) via a
+    targeted line edit — mirroring :func:`_ensure_serena_dashboard_disabled` —
+    and creates a minimal ``project.yml`` (``project_name`` + ``languages``, the
+    only fields Serena requires) when absent. An existing block-style or
+    otherwise unexpected ``languages`` entry is left untouched rather than risk
+    corrupting the file. Non-fatal on any I/O error.
+    """
+    languages = _detect_repo_languages(Path.cwd())
+    if not languages:
+        if verbose:
+            click.echo("  Serena: no recognized source languages detected — leaving scope unset")
+        return
+
+    cfg = Path.cwd() / ".serena" / "project.yml"
+    value = "[" + ", ".join(f'"{lang}"' for lang in languages) + "]"
+    try:
+        if cfg.exists():
+            text = _read_text(cfg)
+            # Match only a single-line flow list (the format we and Serena write).
+            pattern = re.compile(r"^(\s*)languages:\s*\[[^\]\n]*\]\s*$", re.MULTILINE)
+            if pattern.search(text):
+                new = pattern.sub(rf"\g<1>languages: {value}", text, count=1)
+                if new != text:
+                    _write_text(cfg, new)
+                    if verbose:
+                        click.echo(f"  Serena: scoped languages to {value} (project.yml)")
+            elif verbose:
+                click.echo(
+                    "  Serena: project.yml has a custom languages entry — leaving it untouched"
+                )
+        else:
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            project_name = Path.cwd().name or "project"
+            _write_text(cfg, f'project_name: "{project_name}"\nlanguages: {value}\n')
+            if verbose:
+                click.echo(f"  Serena: created project.yml scoped to {value}")
+    except OSError as e:
+        if verbose:
+            click.echo(f"  Serena: could not scope languages ({e})")
+
+
+def _serena_project_skip_reason(root: Path) -> str | None:
+    """Why Serena's per-project setup must not run for *root* (None = proceed).
+
+    ``$HOME`` is never a project: scanning it walks every unrelated tree
+    (Downloads, VM images, network mounts) and would write ``project.yml`` into
+    Serena's own ``~/.serena`` config directory. A linked git worktree (its
+    top-level ``.git`` is a file, not a directory) is an ephemeral checkout that
+    would pay for its own index at a path that soon disappears.
+    """
+    try:
+        resolved = root.resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    if resolved == home:
+        return "$HOME is not a project"
+    if (resolved / ".git").is_file():
+        return "linked git worktree"
+    return None
+
+
+def _index_serena_project(*, verbose: bool = False) -> None:
+    """Warm Serena's symbol cache for the current project (non-fatal).
+
+    Runs ``serena project index`` (the same ``uvx --from git+…`` launch used to
+    start the MCP server) in the project directory so the first symbol query is
+    not paying for a cold index. Timeout-guarded and best-effort: Serena also
+    indexes lazily on demand, so a failure or timeout here never blocks the
+    wrap.
+    """
+    if shutil.which("uvx") is None:
+        if verbose:
+            click.echo("  Serena: uvx not found — skipping pre-index")
+        return
+    try:
+        result = run(
+            [
+                "uvx",
+                "--from",
+                "git+https://github.com/oraios/serena",
+                "serena",
+                "project",
+                "index",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(Path.cwd()),
+        )
+        if result.returncode == 0:
+            click.echo("  Serena: project pre-indexed (symbol cache warmed)")
+        elif verbose:
+            click.echo(f"  Serena: pre-index failed ({(result.stderr or '')[:100]})")
+    except subprocess.TimeoutExpired:
+        click.echo("  Serena: pre-index timed out (will index on demand)")
+    except Exception as e:
+        if verbose:
+            click.echo(f"  Serena: pre-index skipped ({e})")
+
+
 def _setup_serena_mcp(
     registrar: Any, *, context: str, verbose: bool = False, force: bool = False
 ) -> None:
@@ -1459,6 +1927,9 @@ def _setup_serena_mcp(
     if shutil.which("uvx") is None:
         click.echo("  Serena MCP: uvx not found — install uv/uvx to enable Serena; skipping")
         return
+
+    # Serena is a real launch now — make sure it won't pop a browser tab.
+    _ensure_serena_dashboard_disabled(verbose=verbose)
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
@@ -1491,6 +1962,20 @@ def _setup_serena_mcp(
     if line is not None:
         click.echo(line)
 
+    # Serena is the active engine here (we passed the detect/uvx guards): steer
+    # the agent toward symbol-level tools, scope the LSP to the repo's
+    # languages, then warm the symbol cache. Scoping runs before indexing so
+    # ``serena project index`` respects the scope. Each step is best-effort and
+    # non-fatal — none of them block the wrap.
+    _inject_serena_instructions(_serena_instruction_file(registrar), verbose=verbose)
+    skip_reason = _serena_project_skip_reason(Path.cwd())
+    if skip_reason is not None:
+        if verbose:
+            click.echo(f"  Serena: skipping language scope + pre-index ({skip_reason})")
+        return
+    _scope_serena_languages(verbose=verbose)
+    _index_serena_project(verbose=verbose)
+
 
 def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     """Remove Serena MCP only if the ledger proves Headroom installed it."""
@@ -1515,8 +2000,8 @@ def _disable_serena_mcp(
     keeps launching Serena on startup. Just *skipping* registration on a later
     run leaves that stale entry in place — so this removes the entry Headroom
     installed. A user-managed Serena (absent from our ledger) is reported but
-    left untouched. ``reason`` is surfaced in the message: ``--no-serena`` when
-    the user opted out, or a note that tokensave is now the primary compressor.
+    left untouched. ``reason`` is surfaced in the message (e.g. ``--no-serena``
+    or ``--code-memory none`` when the user opted out).
     """
     if not registrar.detect():
         if verbose:
@@ -1544,117 +2029,9 @@ def _disable_serena_mcp(
 
 
 # =============================================================================
-# tokensave — primary coding-task compressor (Serena is the backup)
+# tokensave — retired; Serena replaced it. The helpers below only clean up a
+# tokensave entry a prior release installed, so upgrading users stop launching it.
 # =============================================================================
-
-
-def _ensure_tokensave_binary(verbose: bool = False) -> Path | None:
-    """Resolve the tokensave binary, fetching the release asset if missing.
-
-    Returns the binary path, or ``None`` when tokensave is unavailable
-    (offline, unsupported platform, or download failure) — the caller then
-    falls back to Serena.
-    """
-    from headroom.graph.tokensave_installer import ensure_tokensave, get_tokensave_path
-
-    existing = get_tokensave_path()
-    if existing:
-        return existing
-
-    click.echo("  tokensave: fetching code-graph binary...")
-    path = ensure_tokensave()
-    if path:
-        click.echo(f"  tokensave: installed at {path}")
-    else:
-        click.echo(
-            "  tokensave: no prebuilt binary available for this platform "
-            "(try 'cargo install tokensave') — falling back to Serena"
-        )
-    return path
-
-
-def _index_tokensave_project(bin_path: Path, *, verbose: bool = False) -> None:
-    """Index the current project into the tokensave graph (non-fatal).
-
-    Runs ``tokensave init`` the first time (creates ``.tokensave/``), then
-    ``tokensave sync`` for incremental updates. tokensave also re-checks
-    staleness on demand, so a failure here is logged but never blocks the
-    wrap — the MCP server still indexes lazily on first query.
-    """
-    project_dir = Path.cwd()
-    subcommand = "sync" if (project_dir / ".tokensave").exists() else "init"
-    try:
-        result = run(
-            [str(bin_path), subcommand],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0:
-            click.echo("  Code graph: indexed (tokensave)")
-        elif verbose:
-            click.echo(f"  Code graph: tokensave {subcommand} failed ({result.stderr[:100]})")
-    except subprocess.TimeoutExpired:
-        click.echo("  Code graph: tokensave indexing timed out (will complete on demand)")
-    except Exception as e:
-        if verbose:
-            click.echo(f"  Code graph: tokensave indexing skipped ({e})")
-
-
-def _setup_tokensave_mcp(registrar: Any, *, verbose: bool = False, force: bool = False) -> bool:
-    """Register tokensave MCP with the given agent (idempotent).
-
-    Returns ``True`` when tokensave is available and set up, ``False`` when the
-    binary is unavailable — the caller then falls back to Serena. Mirrors
-    :func:`_setup_serena_mcp`'s ledger-aware migration: a stale
-    Headroom-installed ``tokensave`` entry is force-updated to the current
-    spec, while a user-managed entry is left untouched.
-    """
-    from headroom.mcp_registry import build_tokensave_spec, format_result
-    from headroom.mcp_registry.base import RegisterStatus
-    from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
-
-    if not registrar.detect():
-        if verbose:
-            click.echo(f"  tokensave MCP: {registrar.display_name} not detected — skipping")
-        return False
-
-    bin_path = _ensure_tokensave_binary(verbose=verbose)
-    if bin_path is None:
-        return False
-
-    # Warm the graph so the first query is instant (non-fatal).
-    _index_tokensave_project(bin_path, verbose=verbose)
-
-    spec = build_tokensave_spec(str(bin_path))
-    result = registrar.register_server(spec, force=force)
-
-    # Migrate a stale Headroom-installed entry (e.g. an older binary path or
-    # pinned version), mirroring the Serena migration path. Only force-update
-    # when the ledger proves Headroom installed the entry on disk.
-    if (
-        result.status == RegisterStatus.MISMATCH
-        and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("tokensave"))
-    ):
-        result = registrar.register_server(spec, force=True)
-        if result.status == RegisterStatus.REGISTERED:
-            click.echo("  tokensave MCP: migrated previously-installed entry to current spec")
-
-    if result.status == RegisterStatus.REGISTERED:
-        record_install(registrar.name, spec)
-
-    line = format_result(
-        registrar.name,
-        result,
-        label="tokensave MCP",
-        verbose=verbose,
-        overwrite_hint="update or remove the existing tokensave MCP entry, then rerun headroom wrap",
-        restart_hint=f"restart {registrar.display_name} if it was already running",
-    )
-    if line is not None:
-        click.echo(line)
-    return True
 
 
 def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
@@ -1671,25 +2048,33 @@ def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
 
 
 def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
-    """Make ``--no-tokensave`` actively remove a Headroom-installed tokensave entry."""
+    """Remove a Headroom-installed tokensave MCP entry left by a prior release.
+
+    tokensave was retired in favour of Serena. On upgrade we actively remove the
+    stale ``tokensave`` entry so the agent stops launching it, and point the user
+    at the leftover on-disk artifacts (we never delete files for them). A
+    user-managed entry (absent from our ledger) is reported but left in place.
+    """
     if not registrar.detect():
         if verbose:
             click.echo(f"  tokensave MCP: {registrar.display_name} not detected — skipping")
         return
 
     if registrar.get_server("tokensave") is None:
-        if verbose:
-            click.echo("  Skipping tokensave MCP (--no-tokensave)")
         return
 
     status = _remove_headroom_installed_tokensave_mcp(registrar)
     if status == "removed":
-        click.echo("  Removed previously-installed tokensave MCP (--no-tokensave)")
+        click.echo("  Removed retired tokensave MCP (replaced by Serena)")
         click.echo(f"    restart {registrar.display_name} if it was already running")
+        click.echo(
+            "    leftover files are safe to delete: the 'tokensave' binary in "
+            "~/.local/bin and any '.tokensave/' folder in your projects"
+        )
     elif status == "not_headroom_owned":
         click.echo(
             "  tokensave MCP is present but user-managed — leaving it in place "
-            "(--no-tokensave only removes entries Headroom installed)"
+            "(Headroom only removes entries it installed)"
         )
     else:  # "failed"
         click.echo(
@@ -1699,63 +2084,33 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
 
 
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
-    """Set up the coding-task compressor: tokensave primary, Serena backup.
+    """Set up the code-memory MCP, selected via ``--code-memory`` (default serena).
 
-    Policy (decided per the integration):
+    Selection (see :func:`_resolve_code_memory`):
 
-    * ``no_tokensave`` — skip/disable tokensave entirely.
-    * tokensave is set up by default; on success it becomes the primary
-      compressor and any Headroom-installed Serena entry is removed.
-    * Serena is the backup: registered automatically when tokensave is
-      unavailable (unless ``no_serena``), or forced on with ``serena=True``.
+    * ``serena`` (default) — register Serena (mature, offline, symbol-level).
+    * ``none`` — register nothing.
 
-    ``kwargs`` carries the boolean flags ``serena``, ``no_serena``,
-    ``no_tokensave`` and the per-agent registrar ``force`` semantics.
+    Either way, any Headroom-installed ``tokensave`` entry from a prior release
+    is removed (tokensave was retired in favour of Serena). The deprecated
+    ``--serena`` / ``--no-serena`` flags map into the selector; user-managed MCP
+    entries are always left untouched (ledger).
     """
-    serena = bool(kwargs.get("serena"))
-    no_serena = bool(kwargs.get("no_serena"))
-    no_tokensave = bool(kwargs.get("no_tokensave"))
     force = bool(kwargs.get("force"))
     verbose = bool(kwargs.get("verbose"))
+    selection = _resolve_code_memory(kwargs)
 
-    tokensave_ok = False
-    if no_tokensave:
-        _disable_tokensave_mcp(registrar, verbose=verbose)
-    else:
-        tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
+    # Retire any tokensave entry a prior release installed, whatever the selection.
+    _disable_tokensave_mcp(registrar, verbose=verbose)
 
-    if serena or (not tokensave_ok and not no_serena):
-        _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
-    else:
-        # tokensave is primary (or Serena was explicitly disabled): drop any
-        # Serena entry a prior wrap installed; user-managed entries are kept.
-        reason = (
-            "--no-serena" if no_serena else "tokensave is now the primary code-graph compressor"
-        )
-        _disable_serena_mcp(registrar, verbose=verbose, reason=reason)
+    if selection == _CODE_MEMORY_NONE:
+        _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory none")
+        return
+
+    _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
 
 
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
-
-
-def _setup_code_graph(verbose: bool = False) -> bool:
-    """Ensure the tokensave code graph is set up and the project indexed.
-
-    tokensave is Headroom's primary code-graph compressor and is normally
-    installed by default (it builds a semantic knowledge graph the LLM can
-    query for call chains, definitions, and impact analysis instead of
-    reading whole files). ``--code-graph`` is kept for backward compatibility
-    and as an explicit "set up the graph and force an index now" switch, even
-    when tokensave registration was otherwise skipped.
-
-    Returns True if the graph is ready, False if tokensave is unavailable.
-    Earlier releases backed this flag with ``codebase-memory-mcp``; that
-    server is no longer installed, and ``headroom unwrap`` still cleans up any
-    legacy ``codebase-memory-mcp`` entry a prior wrap left behind.
-    """
-    from headroom.mcp_registry import ClaudeRegistrar
-
-    return _setup_tokensave_mcp(ClaudeRegistrar(), verbose=verbose, force=True)
 
 
 # rtk instructions for tools without hook support (Codex, Cursor, Aider).
@@ -1872,8 +2227,21 @@ def _codex_toml_value(value: Any) -> str:
     raise TypeError(f"unsupported Codex config override: {type(value).__name__}")
 
 
+_CODEX_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _codex_dotted_key(*parts: str) -> str:
-    return ".".join(json.dumps(part) for part in parts)
+    """Dotted ``--config`` key with segments bare wherever possible.
+
+    Codex's override parser (observed on 0.144.x) matches dotted segments
+    literally and silently ignores quoted ones, so quoting every segment made
+    the whole override a no-op and traffic bypassed the proxy (#2358). Quote
+    only segments that are not valid TOML bare keys (e.g. a provider name
+    containing a dot), where bare emission would corrupt the path.
+    """
+    return ".".join(
+        part if _CODEX_BARE_KEY_RE.fullmatch(part) else json.dumps(part) for part in parts
+    )
 
 
 def _codex_session_launch_settings(
@@ -3568,8 +3936,10 @@ def _ensure_proxy(
 ) -> tuple[subprocess.Popen | None, int]:
     """Start or verify proxy. Returns (process_handle, actual_port)."""
     helpers = _live_wrap_module()
-    copilot_subscription_seed_requested = bool(copilot_refresh_oauth_token) or (
-        copilot_api_token_expires_at is not None
+    copilot_subscription_seed_requested = (
+        bool(copilot_api_token)
+        or bool(copilot_refresh_oauth_token)
+        or copilot_api_token_expires_at is not None
     )
     # --no-proxy reuses an already-running proxy, so backend/region/provider
     # flags (which only apply when we start one) would be silently dropped.
@@ -3585,7 +3955,7 @@ def _ensure_proxy(
         )
         if isolated_copilot_subscription_proxy:
             click.echo(
-                "  Copilot subscription refresh seeds are session-specific; "
+                "  Copilot subscription seeds are session-specific; "
                 "starting a dedicated local proxy instance for this wrap session."
             )
         if not isolated_copilot_subscription_proxy and manifest is not None:
@@ -4165,13 +4535,19 @@ def _launch_tool(
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
 
-        if code_graph:
-            _setup_code_graph(verbose=False)
+        # Reduce-at-source: fill in SAFE quiet-CLI env defaults for the launched
+        # agent (git/npm/pip/pytest emit less noise), unless the user opted out.
+        # Applies to every wrapped tool since they all launch through here.
+        _quiet_written = _configure_quiet_cli_env(env)
 
         click.echo()
         click.echo(f"  Launching {tool_label} (API routed through Headroom)...")
         for var in env_vars_display:
             click.echo(f"  {var}")
+        if _quiet_written:
+            click.echo(
+                f"  Quiet CLI defaults: {', '.join(_quiet_written)} (opt out: {_QUIET_CLI_ENV}=0)"
+            )
         if args:
             click.echo(f"  Extra args: {' '.join(args)}")
         _print_telemetry_notice()
@@ -4435,6 +4811,7 @@ def wrap_selfheal(marker: str | None) -> None:
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
     "--port",
@@ -4460,22 +4837,29 @@ def wrap_selfheal(marker: str | None) -> None:
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable the proxy's live code-graph file watcher for the current project.",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -4549,17 +4933,14 @@ def claude(
 
     \b
     Examples:
-        headroom wrap claude                    # Start everything
+        headroom wrap claude                    # Start everything (Serena code memory)
         headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
-        headroom wrap claude                    # tokensave code graph (primary)
-        headroom wrap claude --no-tokensave     # Skip tokensave; fall back to Serena
-        headroom wrap claude --serena           # Also register the Serena backup
         headroom wrap claude --context-tool     # Enable CLI context-tool setup
         headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
-        headroom wrap claude --no-serena        # Never register the Serena backup
+        headroom wrap claude --code-memory none # No code-memory MCP
         headroom wrap claude --1m               # Preserve the 1M context window
     """
     # RTK/context-tool is opt-in (off by default): --context-tool (legacy) and
@@ -4714,7 +5095,7 @@ def claude(
         elif verbose:
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-        # Coding-task compressor: tokensave primary, Serena backup.
+        # Coding-task compressor: Serena (retires any legacy tokensave entry).
         from headroom.mcp_registry import ClaudeRegistrar
 
         _setup_coding_compressor(
@@ -4725,9 +5106,6 @@ def claude(
             no_tokensave=no_tokensave,
             verbose=verbose,
         )
-
-        if code_graph:
-            _setup_code_graph(verbose=verbose)
 
         proxy_url = _claude_proxy_base_url(actual_port)
         click.echo()
@@ -4884,6 +5262,38 @@ def claude(
 # =============================================================================
 
 
+def _warn_if_proxy_env_leaked(port: int) -> None:
+    """Issue #2238: surface a proxy URL that survived unwrap in the live shell.
+
+    ``unwrap_claude`` restores settings.local.json, but if ``ANTHROPIC_BASE_URL``
+    (or the Foundry/Vertex equivalents) was exported into the current shell or a
+    persistent profile, it outlives the JSON edit and Claude keeps trying to reach
+    the (now unwrapped) proxy, failing with a connection error. The user previously
+    had to discover ``Remove-Item Env:ANTHROPIC_BASE_URL`` by hand — emit it here.
+    """
+    proxy_host = f"127.0.0.1:{port}"
+    leaked = []
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"):
+        value = os.environ.get(name, "").strip()
+        if proxy_host in value:
+            leaked.append((name, value))
+    if not leaked:
+        return
+    click.echo("  ⚠ Headroom's proxy URL is still exported in this shell's environment:")
+    for name, value in leaked:
+        click.echo(f"      {name}={value}")
+    click.echo(
+        "    Claude will keep routing through the (now unwrapped) proxy and fail to connect."
+    )
+    click.echo("    Clear it for the current shell, then restart Claude Code:")
+    click.echo("      PowerShell:  Remove-Item Env:ANTHROPIC_BASE_URL")
+    click.echo("      bash/zsh:    unset ANTHROPIC_BASE_URL")
+    click.echo(
+        "    If it reappears after restart, remove it from your shell profile "
+        "(e.g. $PROFILE / ~/.bashrc / ~/.zshrc)."
+    )
+
+
 @unwrap.command("claude")
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
@@ -4958,6 +5368,13 @@ def unwrap_claude(
             settings_path=_unwrap_settings_path,
         )
 
+    # Issue #2238: unwrap restores settings.local.json, but a proxy URL that was
+    # exported into the live shell (or a persistent profile) survives unwrap and
+    # leaves Claude unable to reach the real API ("connection error" until the
+    # user manually runs `Remove-Item Env:ANTHROPIC_BASE_URL`). Warn loudly and
+    # give the exact per-shell fix instead of leaving the user to discover it.
+    _warn_if_proxy_env_leaked(port)
+
     click.echo()
     clean_unwrap = True
     if no_stop_proxy:
@@ -4977,6 +5394,17 @@ def unwrap_claude(
 # =============================================================================
 # GitHub Copilot CLI
 # =============================================================================
+
+
+def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolution:
+    resolution = resolve_subscription_bearer_token_details()
+    if resolution is None:
+        raise click.ClickException(
+            "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
+            "token, but none could be resolved. Run `headroom copilot-auth login` first, or set "
+            "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
+        )
+    return resolution
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -5121,7 +5549,8 @@ def copilot(
     copilot_proxy_token: str | None = None
     copilot_refresh_oauth_token: str | None = None
     copilot_api_token_expires_at: float | None = None
-    subscription_resolution = None
+    client_bearer: str | None = None
+    subscription_resolution: CopilotSubscriptionTokenResolution | None = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
@@ -5129,10 +5558,8 @@ def copilot(
         force_subscription=subscription,
     ):
         if subscription:
-            subscription_resolution = resolve_subscription_bearer_token_details()
-            client_bearer = (
-                subscription_resolution.token if subscription_resolution is not None else None
-            )
+            subscription_resolution = _require_copilot_subscription_resolution()
+            client_bearer = subscription_resolution.token
         else:
             client_bearer = resolve_client_bearer_token()
         if not client_bearer:
@@ -5348,8 +5775,8 @@ def _prepare_codex_wrap_state(
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-    # Coding-task compressor: tokensave primary, Serena backup. Codex starts
-    # long-lived MCP subprocesses from config.toml, so force re-registration.
+    # Coding-task compressor: Serena (retires any legacy tokensave entry). Codex
+    # starts long-lived MCP subprocesses from config.toml, so force re-registration.
     from headroom.mcp_registry import CodexRegistrar
 
     _setup_coding_compressor(
@@ -5505,6 +5932,7 @@ def _run_codex_wrap(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5520,22 +5948,29 @@ def _run_codex_wrap(
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable the proxy's live code-graph file watcher for the current project.",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -5591,9 +6026,7 @@ def codex(
         headroom wrap codex -- "fix the bug"        # Pass prompt to codex
         headroom wrap codex --no-context-tool       # Skip CLI context-tool setup
         headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
-        headroom wrap codex --no-tokensave          # Skip tokensave; fall back to Serena
-        headroom wrap codex --serena                # Also register the Serena backup
-        headroom wrap codex --no-serena             # Never register the Serena backup
+        headroom wrap codex --code-memory none      # No code-memory MCP
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
@@ -6000,6 +6433,7 @@ def kimi(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6011,22 +6445,29 @@ def kimi(
     help="Skip CLI context-tool setup",
 )
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated and ignored: tokensave was retired; Serena is the default code memory.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory none. Register no code-memory MCP.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable the proxy's live code-graph file watcher for the current project.",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -6062,9 +6503,10 @@ def grok(
     """Launch Grok CLI through Headroom proxy.
 
     \b
-    Sets ``GROK_CLI_CHAT_PROXY_BASE_URL`` so Grok routes inference traffic
-    through Headroom. Registers the headroom MCP server in ``~/.grok/config.toml``
-    so Grok can call ``headroom_retrieve`` on compression markers.
+    Sets ``GROK_MODELS_BASE_URL`` so Grok routes inference traffic through
+    Headroom while preserving native settings and authentication routing.
+    Registers the headroom MCP server in ``~/.grok/config.toml`` so Grok can
+    call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
@@ -7184,6 +7626,7 @@ def openclaw(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -7207,6 +7650,11 @@ def openclaw(
     help="Enable code graph indexing via codebase-memory-mcp (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option(
+    "--copilot-subscription",
+    is_flag=True,
+    help="Route headroom/* models through the authenticated GitHub Copilot subscription",
+)
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
@@ -7225,6 +7673,7 @@ def opencode(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    copilot_subscription: bool,
     learn: bool,
     memory: bool,
     backend: str | None,
@@ -7251,7 +7700,28 @@ def opencode(
         headroom wrap opencode --no-serena             # Skip Serena MCP registration
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
+        headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
     """
+    subscription_resolution = None
+    if copilot_subscription:
+        effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
+        if effective_backend not in (None, "", "anthropic"):
+            raise click.ClickException(
+                "--copilot-subscription cannot be combined with translated backends "
+                "such as anyllm or litellm-*; use the anthropic backend."
+            )
+        if no_proxy:
+            raise click.ClickException(
+                "--copilot-subscription cannot be combined with --no-proxy because "
+                "it requires a private seeded proxy."
+            )
+        if prepare_only:
+            raise click.ClickException(
+                "--copilot-subscription cannot be combined with --prepare-only because "
+                "it requires a running private seeded proxy."
+            )
+        subscription_resolution = _require_copilot_subscription_resolution()
+
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
     _opencode_config_file, _opencode_backup_file = opencode_config_paths()
@@ -7331,33 +7801,44 @@ def opencode(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+        openai_api_url=(subscription_resolution.api_url if subscription_resolution else None),
+        copilot_api_token=(subscription_resolution.token if subscription_resolution else None),
+        copilot_refresh_oauth_token=(
+            subscription_resolution.refresh_oauth_token if subscription_resolution else None
+        ),
+        copilot_api_token_expires_at=(
+            subscription_resolution.api_token_expires_at if subscription_resolution else None
+        ),
     )
 
-    # If the proxy fell back to a different port, move our marker so
-    # cleanup tracking stays accurate and update MCP config.
-    if actual_port != port:
-        _unregister_proxy_client(port)
-        _register_proxy_client(actual_port)
-        if not no_mcp:
-            from headroom.mcp_registry import OpencodeRegistrar
+    try:
+        # If the proxy fell back to a different port, move our marker so
+        # cleanup tracking stays accurate and update MCP config.
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+            if not no_mcp:
+                from headroom.mcp_registry import OpencodeRegistrar
 
-            _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
+                _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
 
-    env, env_vars_display = _build_opencode_launch_env(
-        actual_port, os.environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
-    )
-
-    # Inject Headroom provider into OpenCode config so traffic routes through proxy.
-    inject_opencode_provider_config(actual_port)
-    if memory:
-        mem_dir = Path.cwd() / ".headroom"
-        _inject_memory_mcp_config(
-            os.environ.get("USER", os.environ.get("USERNAME", "default")),
+        launch_environ = os.environ.copy()
+        if subscription_resolution is not None:
+            _scrub_copilot_subscription_launch_env(launch_environ)
+        env, env_vars_display = _build_opencode_launch_env(
+            actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
         )
 
-    # Proxy already started by _ensure_proxy above; tell _launch_tool to
-    # skip duplicate startup.
-    try:
+        # Inject Headroom provider into OpenCode config so traffic routes through proxy.
+        inject_opencode_provider_config(actual_port)
+        if memory:
+            mem_dir = Path.cwd() / ".headroom"
+            _inject_memory_mcp_config(
+                os.environ.get("USER", os.environ.get("USERNAME", "default")),
+            )
+
+        # Proxy already started by _ensure_proxy above; tell _launch_tool to
+        # skip duplicate startup.
         _launch_tool(
             binary=opencode_bin,
             args=opencode_args,
@@ -7852,10 +8333,11 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
 def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
     """Undo durable ``headroom wrap grok`` MCP and guidance edits.
 
-    Grok API routing is session-scoped via ``GROK_CLI_CHAT_PROXY_BASE_URL`` and
-    does not require config restoration. This command removes Headroom MCP
-    servers from ``~/.grok/config.toml`` and strips injected RTK guidance from
-    the project ``AGENTS.md``.
+    Grok inference routing is session-scoped via ``GROK_MODELS_BASE_URL`` and
+    does not require config restoration. Native settings and authentication
+    routing stay unchanged. This command removes Headroom MCP servers from
+    ``~/.grok/config.toml`` and strips injected RTK guidance from the project
+    ``AGENTS.md``.
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")

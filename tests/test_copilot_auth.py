@@ -25,6 +25,7 @@ def _isolated_copilot_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
         "GH_TOKEN",
         "GITHUB_TOKEN",
         "GITHUB_COPILOT_API_URL",
+        "GITHUB_COPILOT_HOST",
         "GITHUB_COPILOT_ENTERPRISE_URL",
         "GITHUB_COPILOT_ENTERPRISE_DOMAIN",
         "GITHUB_COPILOT_TOKEN_EXCHANGE_URL",
@@ -68,6 +69,86 @@ def test_default_oauth_domain_falls_back_to_github_com_when_env_blank(
     monkeypatch.setenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", "")
 
     assert copilot_auth.default_oauth_domain() == "github.com"
+
+
+@pytest.mark.parametrize(
+    ("api_url", "expected"),
+    [
+        ("https://api.GHE.Example.com:8443/copilot", "ghe.example.com"),
+        ("https://copilot-api.GHE.Example.com", "ghe.example.com"),
+        ("https://api.githubcopilot.com", "github.com"),
+        ("https://api.business.githubcopilot.com", "github.com"),
+        ("https://api.enterprise.githubcopilot.com", "github.com"),
+        ("https://api.individual.githubcopilot.com", "github.com"),
+        ("https://api.ghe.example.com:invalid/copilot", "github.com"),
+        ("https://[", "github.com"),
+        ("not a URL", "github.com"),
+        ("https://", "github.com"),
+    ],
+)
+def test_github_host_derives_from_api_url(
+    monkeypatch: pytest.MonkeyPatch, api_url: str, expected: str
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", api_url)
+    assert copilot_auth._github_host() == expected
+
+
+def test_github_host_explicit_value_wins_over_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "  Explicit.GHE.COM ")
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://other.example.com/api")
+    assert copilot_auth._github_host() == "explicit.ghe.com"
+
+
+def test_github_host_uses_configured_enterprise_domain_before_api_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_ENTERPRISE_URL", "https://enterprise.ghe.example.com")
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.other.example.com/api")
+    assert copilot_auth._github_host() == "enterprise.ghe.example.com"
+
+
+def test_github_host_invalid_enterprise_url_falls_back_to_github_com(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_ENTERPRISE_URL", "https://[")
+    assert copilot_auth._github_host() == "github.com"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value"),
+    [
+        ("GITHUB_COPILOT_ENTERPRISE_URL", "https://api.business.githubcopilot.com"),
+        ("GITHUB_COPILOT_ENTERPRISE_DOMAIN", "enterprise.githubcopilot.com"),
+    ],
+)
+def test_public_enterprise_config_keeps_public_defaults(
+    monkeypatch: pytest.MonkeyPatch, env_name: str, env_value: str
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_TOKEN_EXCHANGE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_USER_INFO_URL", raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    assert copilot_auth._github_host() == "github.com"
+    assert copilot_auth.default_oauth_domain() == "github.com"
+    assert copilot_auth._token_exchange_url() == copilot_auth.DEFAULT_TOKEN_EXCHANGE_URL
+    assert copilot_auth._user_info_url() == copilot_auth.DEFAULT_USER_INFO_URL
+
+
+def test_enterprise_hostname_blank_returns_empty() -> None:
+    assert copilot_auth._enterprise_hostname("   ") == ""
+
+
+def test_configured_url_hostname_blank_returns_empty() -> None:
+    assert copilot_auth._configured_url_hostname("   ") == ""
+
+
+def test_copilot_subdomain_enterprise_host_rejects_blank_and_public_hosts() -> None:
+    assert copilot_auth._copilot_subdomain_enterprise_host("   ") is None
+    assert copilot_auth._copilot_subdomain_enterprise_host("https://github.com") is None
+    assert (
+        copilot_auth._copilot_subdomain_enterprise_host("https://api.business.githubcopilot.com")
+        is None
+    )
 
 
 def test_read_cached_oauth_token_prefers_copilot_cli_before_generic_github_token(
@@ -173,7 +254,7 @@ def test_resolve_subscription_bearer_token_does_not_fallback_to_unexchanged_oaut
     assert copilot_auth.resolve_subscription_bearer_token() is None
 
 
-def test_resolve_subscription_bearer_token_details_exchanges_oauth_candidate(
+def test_subscription_enterprise_host_repro(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GITHUB_COPILOT_API_TOKEN", raising=False)
@@ -202,7 +283,7 @@ def test_resolve_subscription_bearer_token_details_exchanges_oauth_candidate(
         return {
             "token": "copilot-api",
             "expires_at": int(time.time()) + 3600,
-            "endpoints": {"api": "https://api.business.githubcopilot.com"},
+            "endpoints": {"api": "https://api.enterprise.githubcopilot.com"},
         }
 
     monkeypatch.setattr(
@@ -217,7 +298,7 @@ def test_resolve_subscription_bearer_token_details_exchanges_oauth_candidate(
     assert resolution.token == "copilot-api"
     assert resolution.source == "headroom-copilot-auth:/tmp/copilot_auth.json:token-exchange"
     assert resolution.confidence == "copilot-token-exchange"
-    assert resolution.api_url == "https://api.business.githubcopilot.com"
+    assert resolution.api_url == copilot_auth.DEFAULT_API_URL
     assert resolution.token_fingerprint == copilot_auth.token_fingerprint("copilot-api")
     assert resolution.refresh_oauth_token == "gho-oauth"
     assert isinstance(resolution.api_token_expires_at, float)
@@ -259,13 +340,13 @@ def test_resolve_subscription_exchange_uses_cloud_enterprise_advertised_api(
     monkeypatch.setattr(
         copilot_auth,
         "_fetch_copilot_user_info",
-        lambda _token: {"endpoints": {"api": "https://api.business.githubcopilot.com"}},
+        lambda _token: {"endpoints": {"api": "https://api.enterprise.githubcopilot.com"}},
     )
 
     resolution = copilot_auth.resolve_subscription_bearer_token_details()
 
     assert resolution is not None
-    assert resolution.api_url == "https://api.business.githubcopilot.com"
+    assert resolution.api_url == copilot_auth.DEFAULT_API_URL
     assert copilot_auth._token_exchange_url() == "https://api.github.com/copilot_internal/v2/token"
 
 
@@ -286,7 +367,144 @@ def test_api_url_from_exchange_payload_rejects_non_copilot_host(
         oauth_token="gho-oauth",
     )
 
-    assert resolved == "https://api.business.githubcopilot.com"
+    assert resolved == copilot_auth.DEFAULT_API_URL
+
+
+def _resolve_subscription_producer_path(
+    monkeypatch: pytest.MonkeyPatch,
+    producer: str,
+    payload_host: str,
+    configured_api_url: str | None = None,
+    enterprise_domain: str | None = None,
+) -> str:
+    with monkeypatch.context() as patch:
+        patch.delenv("GITHUB_COPILOT_API_TOKEN", raising=False)
+        patch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+        patch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+        if configured_api_url is not None:
+            patch.setenv("GITHUB_COPILOT_API_URL", configured_api_url)
+        if enterprise_domain is not None:
+            patch.setenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", enterprise_domain)
+
+        payload = {"endpoints": {"api": payload_host}}
+        if producer == "exchange":
+            patch.setattr(
+                copilot_auth,
+                "iter_oauth_token_candidates",
+                lambda: [
+                    copilot_auth.CopilotTokenCandidate(
+                        token="gho-oauth", source="test", confidence="test"
+                    )
+                ],
+            )
+            patch.setattr(
+                copilot_auth.CopilotTokenProvider,
+                "_exchange_token_sync",
+                staticmethod(lambda _headers: {"token": "tid-api", **payload}),
+            )
+        elif producer == "explicit":
+            patch.setenv("GITHUB_COPILOT_API_TOKEN", "tid-api")
+            patch.setattr(copilot_auth, "_fetch_copilot_user_info", lambda _token: payload)
+        else:
+            patch.setattr(
+                copilot_auth,
+                "iter_oauth_token_candidates",
+                lambda: [
+                    copilot_auth.CopilotTokenCandidate(
+                        token="tid_api", source="test", confidence="test"
+                    )
+                ],
+            )
+            patch.setattr(copilot_auth, "_fetch_copilot_user_info", lambda _token: payload)
+
+        resolution = copilot_auth.resolve_subscription_bearer_token_details()
+        assert resolution is not None
+        return resolution.api_url
+
+
+@pytest.mark.parametrize("producer", ["exchange", "explicit", "candidate"])
+def test_subscription_api_url_pin_precedence(
+    monkeypatch: pytest.MonkeyPatch, producer: str
+) -> None:
+    assert (
+        _resolve_subscription_producer_path(
+            monkeypatch,
+            producer,
+            "https://api.enterprise.githubcopilot.com",
+            configured_api_url="https://api.pinned.example.com",
+        )
+        == "https://api.pinned.example.com"
+    )
+    assert (
+        _resolve_subscription_producer_path(
+            monkeypatch,
+            producer,
+            "https://api.other.githubcopilot.com",
+            configured_api_url=copilot_auth.DEFAULT_API_URL,
+        )
+        == copilot_auth.DEFAULT_API_URL
+    )
+
+
+@pytest.mark.parametrize("producer", ["exchange", "explicit", "candidate"])
+def test_subscription_enterprise_domain_precedence(
+    monkeypatch: pytest.MonkeyPatch, producer: str
+) -> None:
+    assert (
+        _resolve_subscription_producer_path(
+            monkeypatch,
+            producer,
+            "https://api.business.githubcopilot.com",
+            enterprise_domain="ghe.example.com",
+        )
+        == "https://copilot-api.ghe.example.com"
+    )
+
+
+def test_subscription_unknown_host_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert (
+        copilot_auth._subscription_api_url_from_user_info_payload(
+            {"endpoints": {"api": "https://api.other.githubcopilot.com"}}
+        )
+        == "https://api.other.githubcopilot.com"
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_host",
+    [
+        "https://api.githubcopilot.com",
+        "https://api.individual.githubcopilot.com",
+        "https://api.business.githubcopilot.com",
+        "https://api.enterprise.githubcopilot.com",
+    ],
+)
+def test_subscription_known_hosts_normalize_to_default(payload_host: str) -> None:
+    assert (
+        copilot_auth._subscription_api_url_from_user_info_payload(
+            {"endpoints": {"api": payload_host}}
+        )
+        == copilot_auth.DEFAULT_API_URL
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"endpoints": {}},
+        {"endpoints": {"api": " "}},
+        {"endpoints": {"api": 4}},
+        {"endpoints": {"api": "https://api.openai.com/v1"}},
+    ],
+)
+def test_subscription_payload_host_fallback(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, object] | None
+) -> None:
+    assert copilot_auth._subscription_api_url_from_user_info_payload(payload) == (
+        copilot_auth.DEFAULT_API_URL
+    )
 
 
 def test_api_url_from_exchange_payload_normalizes_individual_public_host(
@@ -464,6 +682,25 @@ def test_read_macos_keychain_oauth_token_uses_security(
     assert calls == ["github.com"]
 
 
+def test_keychain_and_secret_service_use_derived_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_macos(*, host: str) -> None:
+        calls.append(("macos", host))
+        return None
+
+    def fake_linux(*, host: str) -> None:
+        calls.append(("linux", host))
+        return None
+
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://ghe.example.com/api")
+    monkeypatch.setattr(copilot_auth, "read_macos_keychain_token", fake_macos)
+    monkeypatch.setattr(copilot_auth, "read_linux_secret_token", fake_linux)
+    assert copilot_auth._read_macos_keychain_oauth_token() is None
+    assert copilot_auth._read_linux_secret_oauth_token() is None
+    assert calls == [("macos", "ghe.example.com"), ("linux", "ghe.example.com")]
+
+
 def test_read_cached_oauth_token_reads_hosts_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -486,6 +723,30 @@ def test_read_cached_oauth_token_reads_hosts_file(
     monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
 
     assert copilot_auth.read_cached_oauth_token() == "gho-file"
+
+
+def test_read_cached_oauth_token_reads_custom_api_host_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hosts = tmp_path / "hosts.json"
+    hosts.write_text(
+        json.dumps(
+            {
+                "ghe.example.com": {"oauth_token": "gho-ghe"},
+                "adjacent.example.com": {"oauth_token": "gho-adjacent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.ghe.example.com:8443/copilot")
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_FILE", str(hosts))
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+
+    candidates = copilot_auth._read_file_oauth_token_candidates()
+    assert [candidate.token for candidate in candidates] == ["gho-ghe"]
+    assert copilot_auth.read_cached_oauth_token() == "gho-ghe"
 
 
 def test_read_cached_oauth_token_skips_expired_entries(
@@ -523,6 +784,23 @@ def test_read_gh_cli_oauth_token_uses_hostname(monkeypatch: pytest.MonkeyPatch) 
 
     assert copilot_auth._read_gh_cli_oauth_token() == "gho-gh-cli"
     assert calls == [["gh", "auth", "token", "--hostname", "example.ghe.com"]]
+
+
+def test_read_gh_cli_oauth_token_uses_api_url_hostname(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    class CompletedProcess:
+        returncode = 0
+        stdout = "gho-gh-cli\n"
+
+    def fake_run(*args: object, **kwargs: object) -> CompletedProcess:
+        calls.append(list(args[0]))
+        return CompletedProcess()
+
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.ghe.example.com/api")
+    monkeypatch.setattr(copilot_auth, "run", fake_run)
+    assert copilot_auth._read_gh_cli_oauth_token() == "gho-gh-cli"
+    assert calls == [["gh", "auth", "token", "--hostname", "ghe.example.com"]]
 
 
 def test_read_gh_cli_oauth_token_returns_none_when_invocation_fails(
@@ -609,6 +887,34 @@ def test_build_copilot_upstream_url_strips_v1_only_for_copilot_hosts() -> None:
             "/v1/chat/completions",
         )
         == "https://api.openai.com/v1/chat/completions"
+    )
+
+
+def test_build_copilot_upstream_url_preserves_v1_messages_for_copilot() -> None:
+    # Copilot's Anthropic surface for Claude models is /v1/messages (with the
+    # /v1); stripping it forwarded /messages and Copilot 404'd (#2409).
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://api.githubcopilot.com",
+            "/v1/messages",
+        )
+        == "https://api.githubcopilot.com/v1/messages"
+    )
+    # Batches under the messages endpoint keep /v1 too.
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://api.githubcopilot.com",
+            "/v1/messages/batches",
+        )
+        == "https://api.githubcopilot.com/v1/messages/batches"
+    )
+    # A GHE Copilot host keeps /v1/messages as well.
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://copilot-api.acme.ghe.com",
+            "/v1/messages",
+        )
+        == "https://copilot-api.acme.ghe.com/v1/messages"
     )
 
 

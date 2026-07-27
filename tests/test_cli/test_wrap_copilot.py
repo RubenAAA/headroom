@@ -987,7 +987,7 @@ def test_wrap_copilot_subscription_uses_resolved_subscription_endpoint(
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "copilot-api"
 
 
-def test_wrap_copilot_subscription_normalizes_individual_public_endpoint(
+def test_wrap_copilot_subscription_normalizes_enterprise_host(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
@@ -1019,7 +1019,7 @@ def test_wrap_copilot_subscription_normalizes_individual_public_endpoint(
                 lambda _headers: {
                     "token": "copilot-api",
                     "expires_at": 9999999999,
-                    "endpoints": {"api": "https://api.individual.githubcopilot.com"},
+                    "endpoints": {"api": "https://api.enterprise.githubcopilot.com"},
                 }
             ),
         ),

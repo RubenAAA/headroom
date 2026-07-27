@@ -721,10 +721,13 @@ def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn()
     ) == [compressed]
 
 
-def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
+def test_proxy_helper_reuses_a_singleton_image_compressor(monkeypatch) -> None:
+    # #2513: the compressor caches heavyweight models, so it must be a
+    # process-wide singleton rather than a fresh instance per request.
     from headroom.proxy import helpers
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     _FreshCompressor.instances = 0
 
     with patch("headroom.image.ImageCompressor", _FreshCompressor):
@@ -732,9 +735,9 @@ def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
         second = helpers._get_image_compressor()
 
     assert isinstance(first, _FreshCompressor)
-    assert isinstance(second, _FreshCompressor)
-    assert first is not second
-    assert _FreshCompressor.instances == 2
+    assert first is second
+    assert first._is_singleton is True
+    assert _FreshCompressor.instances == 1
 
 
 def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
@@ -751,6 +754,7 @@ def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
     assert helpers._get_image_compressor() is None

@@ -793,6 +793,24 @@ class LiteLLMBackend(Backend):
         """Convert LiteLLM/OpenAI response to Anthropic format."""
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+        # A non-streaming upstream response can be HTTP 200 with an empty
+        # ``choices`` list (e.g. Azure OpenAI content filtering, or any
+        # OpenAI-compatible gateway on a usage-only / filtered turn). The
+        # streaming sibling already `continue`s past this (`if not
+        # chunk.choices`); indexing ``choices[0]`` here would instead raise
+        # IndexError and 500 the request. Return a valid empty assistant turn.
+        if not getattr(litellm_response, "choices", None):
+            return {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": original_model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": _anthropic_usage_from_litellm(getattr(litellm_response, "usage", None)),
+            }
+
         # Extract content from OpenAI format
         choice = litellm_response.choices[0]
         message = choice.message

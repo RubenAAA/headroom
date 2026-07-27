@@ -21,7 +21,9 @@ on:
       - 'Makefile'
       - '.github/workflows/rust.yml'
   schedule:
-    # Nightly parity run at 07:17 UTC (weekdays only). Phase 0 allows failure.
+    # Nightly parity run at 07:17 UTC (weekdays only). Redundant with the
+    # per-PR gate below, but catches drift from toolchain/dependency updates
+    # that land without touching any filtered path.
     - cron: '17 7 * * 1-5'
 
 concurrency:
@@ -154,28 +156,27 @@ jobs:
         continue-on-error: true
         run: cargo deny check licenses
 
-  parity-nightly:
-    name: parity (nightly, allowed to fail during Phase 0)
-    if: github.event_name == 'schedule'
+  # Blocking on every PR that touches Rust. Safe to harden now because the
+  # harness fails only on a Diff — `parity-run` sets `any_diffs` inside the
+  # diffed loop alone, so the 65 fixtures still served by `stub_comparator!`
+  # report as Skipped and cannot turn this red. Measured on main today:
+  # 111 matched / 65 skipped / 0 diffed.
+  #
+  # What it protects: the recorded fixtures are frozen Python output, so this
+  # gate catches the Rust side drifting away from that snapshot — exactly the
+  # failure mode the ongoing port produces. It cannot detect the Python side
+  # drifting away from the fixtures; that needs re-recording, not this job.
+  parity:
+    name: parity
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
       - uses: Swatinem/rust-cache@v2
-      - name: Install deps
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin
-          pip install -e .
+      # No Python toolchain: headroom-parity links headroom-core directly and
+      # never crosses into the interpreter, so the venv + maturin + `pip
+      # install -e .` setup this job used to do was pure overhead.
       - name: Run parity harness
-        run: |
-          source .venv/bin/activate
-          make test-parity
+        run: make test-parity

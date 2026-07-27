@@ -1172,9 +1172,37 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     )
 
     assert "model_provider=headroom" not in " ".join(args)
-    assert '"model_providers"."company"."base_url"="http://127.0.0.1:9898/v1"' in args
+    # Bare dotted keys — Codex (0.144.x) silently ignores quoted segments (#2358).
+    assert 'model_providers.company.base_url="http://127.0.0.1:9898/v1"' in args
+    assert "model_providers.company.supports_websockets=true" in args
+    assert (
+        "model_providers.company.env_http_headers.X-Headroom-Base-Url"
+        '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+    ) in args
     assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
     assert config_file.read_text(encoding="utf-8") == original_config
+
+
+def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
+    """#2358: quoted segments are silently ignored by Codex's --config parser."""
+    assert (
+        wrap_mod._codex_dotted_key("model_providers", "litellm_prod", "base_url")
+        == "model_providers.litellm_prod.base_url"
+    )
+    # Hyphens are valid in bare keys (header names under env_http_headers).
+    assert (
+        wrap_mod._codex_dotted_key("env_http_headers", "X-Headroom-Base-Url")
+        == "env_http_headers.X-Headroom-Base-Url"
+    )
+
+
+def test_codex_dotted_key_quotes_only_unsafe_segments() -> None:
+    # A provider name that would corrupt the dotted path if emitted bare keeps
+    # its quotes; every safe neighbor stays bare.
+    assert (
+        wrap_mod._codex_dotted_key("model_providers", "my.provider", "base_url")
+        == 'model_providers."my.provider".base_url'
+    )
 
 
 def test_wrap_codex_rejects_custom_provider_without_upstream_base_url(
@@ -1622,13 +1650,8 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
 
     with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
         with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
-            # tokensave is the primary code-graph compressor; Serena is only
-            # the backup, registered when tokensave is unavailable. Force it
-            # unavailable so this test deterministically exercises the Serena
-            # path regardless of whether a real tokensave binary was installed
-            # in the shared bin dir by an earlier test in the suite.
-            with patch("headroom.cli.wrap._ensure_tokensave_binary", return_value=None):
-                result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
+            # Serena is the code-memory MCP; assert it lands in the codex config.
+            result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
     content = config_file.read_text(encoding="utf-8")
