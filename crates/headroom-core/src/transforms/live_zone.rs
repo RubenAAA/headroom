@@ -94,8 +94,10 @@
 //! parameter in the signature now means later PRs are pure
 //! implementation swaps, not signature redesigns.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashSet, sync::OnceLock};
+
+#[cfg(feature = "ml")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -105,6 +107,7 @@ use thiserror::Error;
 use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
+#[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
@@ -125,6 +128,7 @@ const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 /// Strategy tag emitted when CodeCompressor rewrote a source-code block.
 const STRATEGY_CODE_COMPRESSOR: &str = "code_aware_compressor";
 /// Strategy tag emitted when Kompress rewrote a plain-text block.
+#[cfg(feature = "ml")]
 const STRATEGY_KOMPRESS: &str = "kompress";
 
 /// Empty query context passed to compressors that take a relevance
@@ -567,13 +571,18 @@ fn code_compressor() -> &'static CodeAwareCompressor {
 // carries a ~261 MB ONNX model, so an operator must opt in before it is ever
 // loaded. Mirrors the Python reference's `config.enable_kompress`. The proxy
 // sets this once at startup from `--enable-kompress`.
+#[cfg(feature = "ml")]
 static KOMPRESS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable the Kompress `PlainText` compressor process-wide. Call
 /// once at startup (before serving) from config. When disabled, plain-text
 /// blocks pass through and the model is never loaded.
 pub fn set_kompress_enabled(enabled: bool) {
+    #[cfg(feature = "ml")]
     KOMPRESS_ENABLED.store(enabled, Ordering::Relaxed);
+
+    #[cfg(not(feature = "ml"))]
+    let _ = enabled;
 }
 
 // Loaded Kompress singleton. Populated **only** by `warm_live_zone_compressors`
@@ -581,6 +590,7 @@ pub fn set_kompress_enabled(enabled: bool) {
 // path. The model is a ~261 MB ONNX session whose load can be slow (on the
 // OpenVINO/NPU EP the graph compile takes ~13s+), so the request path must
 // never trigger or block on that init. See `kompress()`.
+#[cfg(feature = "ml")]
 static KOMPRESS_INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
 
 // Kompress is the ML prose compressor. Unlike the others it carries a ~261 MB
@@ -594,6 +604,7 @@ static KOMPRESS_INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
 // exactly as when Kompress is unavailable. It must NOT call `get_or_init`:
 // that would make a request thread block on the (possibly slow) model load.
 // The load happens once, off the request path, in `warm_live_zone_compressors`.
+#[cfg(feature = "ml")]
 fn kompress() -> Option<&'static Kompress> {
     if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
         return None;
@@ -609,25 +620,34 @@ fn kompress() -> Option<&'static Kompress> {
 /// only when enabled via [`set_kompress_enabled`], and even then **cache-only**
 /// (never downloads). The load can block (an NPU graph compile takes seconds),
 /// so call this on a dedicated blocking/startup thread — never on the request
-/// path. Until it completes, [`kompress`] returns `None` and `PlainText` blocks
+/// path. Until it completes, `kompress` returns `None` and `PlainText` blocks
 /// pass through; once it completes the model is live for subsequent requests.
 /// Returns whether the Kompress model was cached/loaded (`false` when disabled
 /// or not cached). Idempotent: the underlying `OnceLock` loads at most once.
 pub fn warm_live_zone_compressors() -> bool {
     // CodeCompressor: statically-linked grammars, trivial to construct.
     let _ = code_compressor();
+
     // Kompress: perform the (potentially slow) load here, off the request path.
     // `Some` iff enabled AND the model was already in the HF cache.
-    KOMPRESS_INSTANCE
-        .get_or_init(|| {
-            if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
-                return None;
-            }
-            Kompress::from_cache(KompressConfig::default())
-                .ok()
-                .flatten()
-        })
-        .is_some()
+    #[cfg(feature = "ml")]
+    {
+        KOMPRESS_INSTANCE
+            .get_or_init(|| {
+                if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
+                    return None;
+                }
+                Kompress::from_cache(KompressConfig::default())
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+    }
+
+    #[cfg(not(feature = "ml"))]
+    {
+        false
+    }
 }
 
 // ─── Public entry point ────────────────────────────────────────────────
@@ -1397,6 +1417,41 @@ enum DispatchResult {
     },
 }
 
+#[cfg(feature = "ml")]
+fn dispatch_plain_text(text: &str, content_type: ContentType) -> DispatchResult {
+    match kompress() {
+        // Cache-only model present → let it score the prose. Passes
+        // through (NoOp) when the model keeps everything or the input is
+        // too short (engine returns the input unchanged).
+        Some(model) => {
+            let result = model.compress(text);
+            if result.compressed == text {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
+            }
+            DispatchResult::Compressed {
+                strategy: STRATEGY_KOMPRESS,
+                compressed: result.compressed,
+            }
+        }
+        // Model not cached → passthrough, mirroring the Python reference's
+        // "unavailable → unchanged" behavior. A background warm-up
+        // (`warm_live_zone_compressors`) populates the cache off the
+        // request path.
+        None => DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+        },
+    }
+}
+
+#[cfg(not(feature = "ml"))]
+fn dispatch_plain_text(_text: &str, content_type: ContentType) -> DispatchResult {
+    DispatchResult::NoOp {
+        content_type: content_type.as_str(),
+    }
+}
+
 /// Map `(text, content_type)` to the compressor result.
 ///
 /// Per spec PR-B3:
@@ -1484,30 +1539,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        ContentType::PlainText => match kompress() {
-            // Cache-only model present → let it score the prose. Passes
-            // through (NoOp) when the model keeps everything or the input is
-            // too short (engine returns the input unchanged).
-            Some(model) => {
-                let result = model.compress(text);
-                if result.compressed == text {
-                    return DispatchResult::NoOp {
-                        content_type: content_type.as_str(),
-                    };
-                }
-                DispatchResult::Compressed {
-                    strategy: STRATEGY_KOMPRESS,
-                    compressed: result.compressed,
-                }
-            }
-            // Model not cached → passthrough, mirroring the Python reference's
-            // "unavailable → unchanged" behavior. A background warm-up
-            // (`warm_live_zone_compressors`) populates the cache off the
-            // request path.
-            None => DispatchResult::NoOp {
-                content_type: content_type.as_str(),
-            },
-        },
+        ContentType::PlainText => dispatch_plain_text(text, content_type),
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
         ContentType::Html => DispatchResult::NoOp {
