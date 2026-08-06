@@ -109,14 +109,30 @@ impl Tokenizer for TiktokenCounter {
 fn encoding_for(model: &str) -> Result<&'static str, TiktokenError> {
     let m = model.to_ascii_lowercase();
 
-    // o200k_base: GPT-4o + o1/o3 reasoning families.
-    if m.starts_with("gpt-4o") || m.starts_with("o1") || m.starts_with("o3") {
-        return Ok("o200k_base");
-    }
-
-    // cl100k_base: GPT-4, GPT-3.5-turbo, embeddings.
-    if m.starts_with("gpt-4") || m.starts_with("gpt-3.5") || m.starts_with("text-embedding") {
-        return Ok("cl100k_base");
+    // Prefix table, most-specific first. Order is load-bearing: "gpt-4.1" and
+    // "gpt-4.5" must precede "gpt-4", which they would otherwise match and be
+    // mis-encoded as cl100k_base. Mirrors the tuple order in Python's
+    // `get_encoding_for_model`.
+    const PREFIX_ENCODINGS: &[(&str, &str)] = &[
+        ("gpt-4o", "o200k_base"),
+        ("gpt-4.1", "o200k_base"),
+        ("gpt-4.5", "o200k_base"),
+        // Without this, gpt-5 fell through to cl100k_base and over-counted
+        // CJK by ~33%.
+        ("gpt-5", "o200k_base"),
+        ("gpt-4-turbo", "cl100k_base"),
+        ("gpt-4", "cl100k_base"),
+        ("gpt-3.5", "cl100k_base"),
+        ("text-embedding", "cl100k_base"),
+        ("o1", "o200k_base"),
+        ("o3", "o200k_base"),
+        // o4 reasoning models likewise fell through to cl100k_base.
+        ("o4", "o200k_base"),
+    ];
+    for (prefix, encoding) in PREFIX_ENCODINGS {
+        if m.starts_with(prefix) {
+            return Ok(encoding);
+        }
     }
 
     // p50k_base: code-* and the davinci-002/003 text-completion line.
@@ -261,5 +277,43 @@ mod tests {
     fn backend_is_tiktoken() {
         let t = TiktokenCounter::for_model("gpt-4o-mini").unwrap();
         assert_eq!(t.backend(), Backend::Tiktoken);
+    }
+
+    /// Model families that used to fall into the generic `gpt-4` branch (or
+    /// off the table entirely) and take cl100k_base. Mirrors the prefix order
+    /// in Python's `get_encoding_for_model`.
+    #[test]
+    fn newer_families_resolve_to_o200k() {
+        for model in [
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4.5-preview",
+            "gpt-5",
+            "gpt-5.6-terra",
+            "o4-mini",
+        ] {
+            assert_eq!(
+                encoding_for(model).unwrap(),
+                "o200k_base",
+                "{model} must not fall back to cl100k_base"
+            );
+        }
+    }
+
+    /// The generic gpt-4 line keeps cl100k_base — the fix above must not
+    /// drag plain snapshots onto o200k.
+    #[test]
+    fn plain_gpt4_line_stays_cl100k() {
+        for model in ["gpt-4", "gpt-4-turbo", "gpt-4-0613", "gpt-3.5-turbo"] {
+            assert_eq!(encoding_for(model).unwrap(), "cl100k_base");
+        }
+    }
+
+    /// A gpt-5 counter must actually be constructible: `detect_backend` has to
+    /// route the family to tiktoken or `encoding_for` is never consulted.
+    #[test]
+    fn gpt5_counter_uses_o200k() {
+        let t = TiktokenCounter::for_model("gpt-5").unwrap();
+        assert_eq!(t.encoding_name(), "o200k_base");
     }
 }

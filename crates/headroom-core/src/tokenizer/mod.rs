@@ -41,6 +41,7 @@ pub use mistral::{mistral_hf_repo, mistral_tokenizer_version, try_register_defau
 pub use registry::{
     clear_hf_registrations, detect_backend, get_tokenizer, register_hf, try_register_hf, Backend,
 };
+pub(crate) use registry::name_candidates;
 pub use tiktoken_impl::{TiktokenCounter, TiktokenError};
 
 /// Token overhead per message (role, formatting, etc.).
@@ -294,6 +295,30 @@ fn count_serialized(tokenizer: &dyn Tokenizer, obj: &serde_json::Value) -> usize
     (sample_tokens as f64 * s.len() as f64 / sample.len() as f64) as usize
 }
 
+/// Return `value` as text safe to count. Matches Python
+/// `coerce_countable_text`.
+///
+/// Tool-call fields (`function.name`, `function.arguments`, `id`) are strings
+/// per the OpenAI spec, but OpenAI-compatible upstreams do emit `null` or a
+/// raw object there. Treating those as `""` prices a whole tool call at the
+/// bare overhead, so a request carrying an object `arguments` looks far
+/// cheaper than it is — and the malformed message stays in conversation
+/// history, so every later request undercounts too.
+///
+/// Objects and arrays are JSON-serialized (priced roughly like the JSON
+/// string they should have been); scalars render as themselves; `null` and
+/// missing count as nothing.
+fn coerce_countable_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+            serde_json::to_string(v).unwrap_or_default()
+        }
+        Some(v) => v.to_string(),
+    }
+}
+
 /// Count tokens in tool calls.
 /// Matches Python `_count_tool_calls`.
 fn count_tool_calls(tokenizer: &dyn Tokenizer, tool_calls: &[serde_json::Value]) -> usize {
@@ -303,15 +328,11 @@ fn count_tool_calls(tokenizer: &dyn Tokenizer, tool_calls: &[serde_json::Value])
         total += 4; // Tool call overhead
 
         if let Some(func) = call.get("function") {
-            let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            total += tokenizer.count_text(name);
-            let args = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
-            total += tokenizer.count_text(args);
+            total += tokenizer.count_text(&coerce_countable_text(func.get("name")));
+            total += tokenizer.count_text(&coerce_countable_text(func.get("arguments")));
         }
 
-        if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
-            total += tokenizer.count_text(id);
-        }
+        total += tokenizer.count_text(&coerce_countable_text(call.get("id")));
     }
 
     total
@@ -321,16 +342,8 @@ fn count_tool_calls(tokenizer: &dyn Tokenizer, tool_calls: &[serde_json::Value])
 /// Matches Python `_count_function_call`.
 fn count_function_call(tokenizer: &dyn Tokenizer, function_call: &serde_json::Value) -> usize {
     let mut total = 4; // Function call overhead
-    let name = function_call
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
-    total += tokenizer.count_text(name);
-    let args = function_call
-        .get("arguments")
-        .and_then(|a| a.as_str())
-        .unwrap_or("");
-    total += tokenizer.count_text(args);
+    total += tokenizer.count_text(&coerce_countable_text(function_call.get("name")));
+    total += tokenizer.count_text(&coerce_countable_text(function_call.get("arguments")));
     total
 }
 
@@ -524,4 +537,37 @@ mod tests {
         let count = tok.count_messages(&msgs);
         assert!(count > MESSAGE_OVERHEAD + REPLY_OVERHEAD);
     }
+
+    /// Tool-call fields are strings per the OpenAI spec, but upstreams do send
+    /// objects and nulls. Those must be priced, not silently zeroed.
+    #[test]
+    fn tool_call_object_arguments_are_counted() {
+        let t = estimator();
+        let object_args = serde_json::json!([{
+            "id": "call_1",
+            "function": {"name": "search", "arguments": {"query": "a rather long search string"}},
+        }]);
+        let string_args = serde_json::json!([{
+            "id": "call_1",
+            "function": {"name": "search", "arguments": "{\"query\":\"a rather long search string\"}"},
+        }]);
+        let object_total = count_tool_calls(&t, object_args.as_array().unwrap());
+        let string_total = count_tool_calls(&t, string_args.as_array().unwrap());
+        // Before the coercion the object form counted as bare overhead only.
+        assert!(
+            object_total > 4 + t.count_text("search"),
+            "object arguments must contribute tokens, got {object_total}"
+        );
+        // And it should land close to the JSON string it stands in for.
+        let delta = (object_total as i64 - string_total as i64).abs();
+        assert!(delta <= 4, "object vs string arguments diverged by {delta}");
+    }
+
+    #[test]
+    fn null_and_missing_tool_call_fields_count_as_nothing() {
+        let t = estimator();
+        let calls = serde_json::json!([{"id": null, "function": {"name": null}}]);
+        assert_eq!(count_tool_calls(&t, calls.as_array().unwrap()), 4);
+    }
+
 }

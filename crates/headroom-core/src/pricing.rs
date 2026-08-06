@@ -107,6 +107,22 @@ static TABLE: &[(&str, ModelPricing)] = &[
 /// like the LiteLLM keys). Returns `None` for unknown families (e.g.
 /// `test-model`, `deepseek-*`) so callers fall back to a blended rate.
 pub fn lookup(model: &str) -> Option<&'static ModelPricing> {
+    // The verbatim name first: table keys are case-sensitive, and
+    // `name_candidates` lowercases, so trying it first keeps every
+    // currently-correct resolution byte-identical.
+    if let Some(p) = lookup_exact_or_prefix(model) {
+        return Some(p);
+    }
+    // Gateways wrap the bare id (`bedrock/anthropic.claude-…`, `vertex_ai/…`,
+    // `us.anthropic.claude-…`). Every table key is a bare id, so a wrapped
+    // name matches nothing and the caller silently falls back to the blended
+    // rate. Mirrors Python's `unwrapped_model_forms`.
+    crate::tokenizer::name_candidates(model)
+        .iter()
+        .find_map(|candidate| lookup_exact_or_prefix(candidate))
+}
+
+fn lookup_exact_or_prefix(model: &str) -> Option<&'static ModelPricing> {
     // Exact match first.
     if let Some((_, p)) = TABLE.iter().find(|(k, _)| *k == model) {
         return Some(p);
@@ -239,4 +255,32 @@ mod tests {
     fn estimate_clamps_negative() {
         assert_eq!(estimate_cost_usd("test-model", -5, -5, -5, -5, 1e-6), 0.0);
     }
+
+    /// Gateway-wrapped ids used to match no table key and silently fall back
+    /// to the blended rate — the same price as an unknown model.
+    #[test]
+    fn wrapped_model_ids_resolve_to_real_pricing() {
+        let bare = lookup("claude-sonnet-4-5").expect("bare id is in the table");
+        for wrapped in [
+            "bedrock/anthropic.claude-sonnet-4-5",
+            "us.anthropic.claude-sonnet-4-5",
+            "vertex_ai/claude-sonnet-4-5",
+            "openrouter/anthropic/claude-sonnet-4-5",
+        ] {
+            let got = lookup(wrapped)
+                .unwrap_or_else(|| panic!("{wrapped} must resolve, not hit the blended fallback"));
+            assert_eq!(
+                got.input_cost_per_token, bare.input_cost_per_token,
+                "{wrapped} priced differently from its bare form"
+            );
+        }
+    }
+
+    /// Unwrapping must not turn a genuinely unknown model into a false match.
+    #[test]
+    fn unknown_models_still_return_none() {
+        assert!(lookup("test-model").is_none());
+        assert!(lookup("bedrock/some-unlisted-vendor.mystery-model").is_none());
+    }
+
 }
