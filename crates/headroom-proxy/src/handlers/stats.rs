@@ -26,7 +26,24 @@ pub async fn handle_stats(State(state): State<AppState>) -> Json<serde_json::Val
         "persistent_savings": savings_preview,
         "recent_requests": recent,
         "total_logged": state.request_logger.len(),
+        "codex_rate_limits": state
+            .codex_rate_limits
+            .snapshot()
+            .map(|s| s.to_json()),
     }))
+}
+
+// ── /codex-limits ──
+
+/// Latest Codex quota snapshot, for the statusline.
+///
+/// Split out from `/stats` because the statusline polls it on every prompt and
+/// `/stats` builds the whole cost/savings/recent-request payload to answer.
+pub async fn handle_codex_limits(State(state): State<AppState>) -> Json<serde_json::Value> {
+    match state.codex_rate_limits.snapshot() {
+        Some(snapshot) => Json(snapshot.to_json()),
+        None => Json(serde_json::json!({"observed_at": null})),
+    }
 }
 
 // ── /stats/reset ──

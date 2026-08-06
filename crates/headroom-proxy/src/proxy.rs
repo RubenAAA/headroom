@@ -87,6 +87,10 @@ pub struct AppState {
     /// Pure observer — never mutates bytes; snapshot served at
     /// `GET /cache-health`.
     pub usage_observer: Arc<cache_stabilization::usage_observer::UsageObserver>,
+    /// Last Codex quota snapshot seen on the translate path, served at
+    /// `GET /codex-limits` for the statusline. Pure observer; empty until a
+    /// codex-routed turn has completed.
+    pub codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore,
     /// CTX-2: passive session-capture observer. `Some` only when
     /// `config.ctx_capture` is set; otherwise capture is a no-op and no
     /// sessions DB is opened. Pure observer — never mutates or delays a
@@ -484,6 +488,7 @@ impl AppState {
             replay_store: SessionReplayStore::new(REPLAY_STORE_CAPACITY),
             vertex_token_source,
             usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
+            codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
             ctx_observer,
             ctx_offload,
             ctx_inject,
@@ -752,6 +757,12 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/stats",
             get(crate::handlers::stats::handle_stats),
+        )
+        // Polled by the statusline on every prompt, so it stays separate from
+        // the heavier /stats payload.
+        .route(
+            "/codex-limits",
+            get(crate::handlers::stats::handle_codex_limits),
         )
         .route(
             "/stats/reset",

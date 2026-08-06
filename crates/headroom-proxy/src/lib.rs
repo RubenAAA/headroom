@@ -7,6 +7,7 @@ pub mod bedrock;
 pub mod body;
 pub mod cache_stabilization;
 pub mod cc_switch_reconciler;
+pub mod codex_rate_limits;
 pub mod compression;
 pub mod compression_decision;
 pub mod compression_failure;

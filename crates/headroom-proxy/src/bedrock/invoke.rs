@@ -657,6 +657,7 @@ mod tests {
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
+            codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
             ctx_observer: None,
             ctx_offload: None,
             ctx_inject: None,
@@ -747,6 +748,7 @@ mod tests {
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
+            codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
             ctx_observer: None,
             ctx_offload: None,
             ctx_inject: None,

@@ -768,7 +768,7 @@ pub async fn handle_messages(
     let upstream_status = upstream_resp.status();
 
     if downstream_is_stream {
-        handle_streaming_response(upstream_resp, &parsed).await
+        handle_streaming_response(upstream_resp, &parsed, state.codex_rate_limits.clone()).await
     } else if target_model.is_some() {
         handle_buffered_responses_response(upstream_resp, &parsed, upstream_status).await
     } else {
@@ -2025,15 +2025,24 @@ fn openai_to_anthropic_response(openai: &Value, original: &Value) -> Value {
 // Streaming response translation: OpenAI SSE → Anthropic SSE
 // ---------------------------------------------------------------------------
 
-async fn handle_streaming_response(upstream_resp: reqwest::Response, original: &Value) -> Response {
+async fn handle_streaming_response(
+    upstream_resp: reqwest::Response,
+    original: &Value,
+    codex_limits: crate::codex_rate_limits::CodexRateLimitStore,
+) -> Response {
     let original_model = original
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
 
+    // Quota headers ride on the response envelope and are gone once the body
+    // is taken, so read them first. Nothing downstream depends on this.
+    codex_limits.record_headers(&original_model, upstream_resp.headers());
+
     let stream = upstream_resp.bytes_stream();
-    let translated_stream = translate_openai_stream_to_anthropic(stream, original_model);
+    let translated_stream =
+        translate_openai_stream_to_anthropic(stream, original_model, codex_limits);
 
     let body = axum::body::Body::from_stream(translated_stream);
 
@@ -2060,6 +2069,9 @@ struct StreamTranslator {
     /// Identity of the reasoning item currently streaming, assembled from the
     /// `output_item.added`/`.done` pair that describes it.
     pending_reasoning: PendingReasoning,
+    /// Where to file a `rate_limits` object if one appears in the stream.
+    /// `None` in unit tests, which do not exercise quota reporting.
+    codex_limits: Option<crate::codex_rate_limits::CodexRateLimitStore>,
 }
 
 impl StreamTranslator {
@@ -2076,7 +2088,13 @@ impl StreamTranslator {
             total_output_tokens: 0,
             saw_tool_use: false,
             pending_reasoning: PendingReasoning::default(),
+            codex_limits: None,
         }
+    }
+
+    fn with_codex_limits(mut self, store: crate::codex_rate_limits::CodexRateLimitStore) -> Self {
+        self.codex_limits = Some(store);
+        self
     }
 
     #[cfg(test)]
@@ -2282,6 +2300,14 @@ impl StreamTranslator {
             Ok(v) => v,
             Err(_) => return events,
         };
+
+        // Quota can ride in the stream as well as the headers, and which one
+        // carries it has changed before. Take it from wherever it shows up.
+        if let Some(store) = self.codex_limits.as_ref() {
+            if let Some(limits) = crate::codex_rate_limits::extract_rate_limits(&chunk) {
+                store.record_rate_limits(&self.model, limits);
+            }
+        }
 
         if !self.started && event_name == "response.created" {
             if let Some(model) = chunk
@@ -2668,10 +2694,11 @@ impl StreamTranslator {
 fn translate_openai_stream_to_anthropic(
     stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
+    codex_limits: crate::codex_rate_limits::CodexRateLimitStore,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::StreamExt;
 
-    let mut translator = StreamTranslator::new(model);
+    let mut translator = StreamTranslator::new(model).with_codex_limits(codex_limits);
     let mut buffer = String::new();
     let mut current_event: Option<String> = None;
     let mut current_data: Vec<String> = Vec::new();
