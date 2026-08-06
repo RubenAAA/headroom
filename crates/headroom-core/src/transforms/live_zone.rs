@@ -112,6 +112,7 @@ use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
 use crate::tokenizer::get_tokenizer;
+use crate::tool_exclusion::is_ccr_retrieve_tool;
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────
 
@@ -369,6 +370,11 @@ pub enum ExclusionReason {
     /// Block type is on the cache-hot list (e.g. `tool_use`,
     /// `thinking`, `redacted_thinking`).
     HotZoneBlockType,
+    /// Block is the result of a `headroom_retrieve` call — the bytes
+    /// the model just asked to have restored from the CCR store.
+    /// Compressing them again writes a fresh `<<ccr:hash>>` marker
+    /// nobody can redeem.
+    CcrRetrieveResult,
 }
 
 /// Aggregated per-request manifest. Always populated, regardless of
@@ -780,7 +786,9 @@ pub fn compress_anthropic_live_zone_with_ccr(
     // the body via `RawValue` borrowed slices. The Vec<Replacement>
     // produced here is the surgery plan; we do *not* mutate `body_raw`
     // while computing it.
-    let plan = match plan_block_replacements(body_raw, target_idx) {
+    let ccr_retrieve_tool_ids = collect_ccr_retrieve_tool_ids(messages);
+
+    let plan = match plan_block_replacements(body_raw, target_idx, &ccr_retrieve_tool_ids) {
         Ok(p) => p,
         Err(_) => {
             // Body shape doesn't match what we expect (e.g. content
@@ -813,13 +821,11 @@ pub fn compress_anthropic_live_zone_with_ccr(
 
     for slot in plan {
         let outcome = match slot.kind {
-            SlotKind::HotZone(block_type) => BlockOutcome {
+            SlotKind::Excluded { block_type, reason } => BlockOutcome {
                 message_index: target_idx,
                 block_index: Some(slot.block_index),
                 block_type,
-                action: BlockAction::Excluded {
-                    reason: ExclusionReason::HotZoneBlockType,
-                },
+                action: BlockAction::Excluded { reason },
             },
             SlotKind::Compressible {
                 block_type,
@@ -953,6 +959,7 @@ pub fn compress_anthropic_all_messages(
 
     let messages_total = messages.len();
     let tokenizer = get_tokenizer(model);
+    let ccr_retrieve_tool_ids = collect_ccr_retrieve_tool_ids(messages);
     let mut block_outcomes: Vec<BlockOutcome> = Vec::new();
     let mut replacements: Vec<Replacement> = Vec::new();
 
@@ -963,20 +970,18 @@ pub fn compress_anthropic_all_messages(
         }
 
         // Plan block replacements for this message.
-        let plan = match plan_block_replacements(body_raw, msg_idx) {
+        let plan = match plan_block_replacements(body_raw, msg_idx, &ccr_retrieve_tool_ids) {
             Ok(p) => p,
             Err(_) => continue, // Skip messages with unexpected shape.
         };
 
         for slot in plan {
             let outcome = match slot.kind {
-                SlotKind::HotZone(block_type) => BlockOutcome {
+                SlotKind::Excluded { block_type, reason } => BlockOutcome {
                     message_index: msg_idx,
                     block_index: Some(slot.block_index),
                     block_type,
-                    action: BlockAction::Excluded {
-                        reason: ExclusionReason::HotZoneBlockType,
-                    },
+                    action: BlockAction::Excluded { reason },
                 },
                 SlotKind::Compressible {
                     block_type,
@@ -1238,6 +1243,10 @@ struct BlockHeader<'a> {
     r#type: Option<&'a str>,
     #[serde(borrow, default)]
     content: Option<&'a RawValue>,
+    /// Present on `tool_result` blocks; names the assistant `tool_use`
+    /// block this result answers. Used to resolve the tool's name.
+    #[serde(borrow, default)]
+    tool_use_id: Option<&'a str>,
 }
 
 /// Per-block dispatch slot the planner emits.
@@ -1260,9 +1269,55 @@ enum SlotKind {
         content_text: String,
         content_byte_range: (usize, usize),
     },
-    /// Block type is on the cache-hot list — record but do not
-    /// dispatch.
-    HotZone(String),
+    /// Block is ineligible for compression — record but do not
+    /// dispatch. Carries the reason so the manifest can report why.
+    Excluded {
+        block_type: String,
+        reason: ExclusionReason,
+    },
+}
+
+/// Ids of assistant `tool_use` blocks that called the CCR retrieval
+/// tool, in any of its client spellings.
+///
+/// A `tool_result` answering one of these carries content the model
+/// just asked to have restored from the CCR store. Compressing it
+/// again writes a new `<<ccr:hash>>` marker the agent can never
+/// redeem — an unresolvable retrieval loop. The planner consults this
+/// set unconditionally and ahead of every other classification: an
+/// aged-out marker is exactly as unredeemable as a fresh one, so this
+/// must never decay into compression the way an ordinary excluded
+/// tool does.
+///
+/// Known, accepted tradeoff: `is_ccr_retrieve_tool`'s alias matching
+/// strips ANY `mcp__<server>__` prefix before comparing, so a
+/// third-party server exposing a tool literally named
+/// `headroom_retrieve` matches here too. Narrowing it to headroom's
+/// own server would need a bespoke check inconsistent with every
+/// other excluded-tool entry; given how specific the name is, the
+/// collision risk is accepted rather than special-cased.
+fn collect_ccr_retrieve_tool_ids(messages: &[Value]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for msg in messages {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let (Some(id), Some(name)) = (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if is_ccr_retrieve_tool(name) {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
 }
 
 /// Walk the buffered body, return one `PlanSlot` per block in the
@@ -1289,6 +1344,7 @@ fn block_has_string_text_field(block_json: &str) -> bool {
 fn plan_block_replacements(
     body_raw: &[u8],
     target_msg_idx: usize,
+    ccr_retrieve_tool_ids: &HashSet<String>,
 ) -> Result<Vec<PlanSlot>, PlanError> {
     // `serde_json::from_slice` requires UTF-8; we re-validate here
     // explicitly so the pointer-arithmetic helper can take a `&str`
@@ -1362,10 +1418,31 @@ fn plan_block_replacements(
             None => "unknown".to_string(),
         };
 
+        // Ahead of every other classification: a tool_result answering a
+        // headroom_retrieve call is already-retrieved original content and
+        // must never be compressed. See `collect_ccr_retrieve_tool_ids`.
+        if block_type == "tool_result"
+            && header
+                .tool_use_id
+                .is_some_and(|id| ccr_retrieve_tool_ids.contains(id))
+        {
+            slots.push(PlanSlot {
+                block_index: block_idx,
+                kind: SlotKind::Excluded {
+                    block_type,
+                    reason: ExclusionReason::CcrRetrieveResult,
+                },
+            });
+            continue;
+        }
+
         if HOT_ZONE_BLOCK_TYPES.iter().any(|t| *t == block_type) {
             slots.push(PlanSlot {
                 block_index: block_idx,
-                kind: SlotKind::HotZone(block_type),
+                kind: SlotKind::Excluded {
+                    block_type,
+                    reason: ExclusionReason::HotZoneBlockType,
+                },
             });
             continue;
         }
@@ -2203,6 +2280,131 @@ mod tests {
             am.block_outcomes[0].block_type
         );
         assert_eq!(cm.block_outcomes[0].block_type, "text");
+    }
+
+    /// A payload the dispatcher reliably compresses, so a test that
+    /// asserts "not compressed" is actually testing the guard.
+    fn compressible_payload() -> String {
+        "{\"k\": \"v\", \"n\": 1}\n".repeat(200)
+    }
+
+    /// Negative control for the two CCR-retrieve guard tests below: the
+    /// same payload under an ordinary tool must still compress, so the
+    /// guard is not just "tool_results are never touched".
+    #[test]
+    fn normal_tool_result_still_compresses() {
+        let b = body(json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": compressible_payload()}
+                ]},
+            ]
+        }));
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Compressed { .. }]
+            ),
+            "an ordinary tool_result of this payload must compress; got {:?}",
+            outcome_block_actions(&out)
+        );
+    }
+
+    /// The bug: recompressing a headroom_retrieve result writes a new
+    /// `<<ccr:hash>>` marker the agent can never redeem.
+    #[test]
+    fn ccr_retrieve_tool_result_is_never_compressed() {
+        for name in [
+            "headroom_retrieve",
+            "mcp__Headroom__headroom_retrieve",
+            "mcp_Headroom_headroom_retrieve",
+        ] {
+            let b = body(json!({
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "ccr1", "name": name, "input": {"hash": "abc"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "ccr1",
+                         "content": compressible_payload()}
+                    ]},
+                ]
+            }));
+            let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+            assert!(
+                matches!(out, LiveZoneOutcome::NoChange { .. }),
+                "{name}: body must be forwarded unmodified"
+            );
+            assert!(
+                matches!(
+                    outcome_block_actions(&out).as_slice(),
+                    [BlockAction::Excluded {
+                        reason: ExclusionReason::CcrRetrieveResult
+                    }]
+                ),
+                "{name}: got {:?}",
+                outcome_block_actions(&out)
+            );
+        }
+    }
+
+    /// The decay case: the all-messages dispatcher reaches tool_results
+    /// that have aged out of the latest user message. An aged CCR marker
+    /// is exactly as unredeemable as a fresh one, so the guard must hold
+    /// there too — while the ordinary tool_result beside it still
+    /// compresses.
+    #[test]
+    fn aged_out_ccr_retrieve_tool_result_is_never_compressed() {
+        let b = body(json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "ccr1", "name": "headroom_retrieve",
+                     "input": {"hash": "abc"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "ccr1",
+                     "content": compressible_payload()}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "b1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "b1",
+                     "content": compressible_payload()}
+                ]},
+            ]
+        }));
+        let out = compress_anthropic_all_messages(&b, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+        let manifest = match &out {
+            LiveZoneOutcome::NoChange { manifest } => manifest,
+            LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        };
+        let by_msg = |idx: usize| {
+            manifest
+                .block_outcomes
+                .iter()
+                .find(|b| b.message_index == idx)
+                .map(|b| &b.action)
+        };
+        assert!(
+            matches!(
+                by_msg(1),
+                Some(BlockAction::Excluded {
+                    reason: ExclusionReason::CcrRetrieveResult
+                })
+            ),
+            "aged-out retrieve result must stay excluded; got {:?}",
+            by_msg(1)
+        );
+        assert!(
+            matches!(by_msg(3), Some(BlockAction::Compressed { .. })),
+            "the ordinary aged-out tool_result must still compress; got {:?}",
+            by_msg(3)
+        );
     }
 
     #[test]
