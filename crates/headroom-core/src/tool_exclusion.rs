@@ -34,6 +34,20 @@ pub const DEFAULT_EXCLUDE_TOOLS: &[&str] = &[
     "web_fetch",
 ];
 
+/// [`DEFAULT_EXCLUDE_TOOLS`] in the comma-separated shape `--exclude-tools`
+/// takes, so the flag's default and the constant above cannot drift apart.
+///
+/// The lowercase spellings are left out on purpose: matching is
+/// case-insensitive, so listing them again would only pad `--help`.
+///
+/// These are the tools whose results the model is most likely to need
+/// verbatim — the contents of a file it is about to edit, the exact lines a
+/// search matched. Compressing those trades a few thousand tokens for the risk
+/// of the model acting on a summary of a file rather than the file. Pass
+/// `--exclude-tools ""` to compress them anyway.
+pub const DEFAULT_EXCLUDE_TOOLS_CSV: &str =
+    "Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,headroom_retrieve";
+
 /// Excluded tools whose results must stay *byte-faithful* — not merely
 /// uncompressed. Even the excluded-tool lossless fold rewrites formatted JSON,
 /// which is enough to break them.

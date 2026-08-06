@@ -1053,10 +1053,16 @@ pub struct CliArgs {
 
     // ─── Tool filtering ──────────────────────────────────────────────────
     /// Comma-separated tool names to exclude from compression.
+    ///
+    /// Defaults to Python's `DEFAULT_EXCLUDE_TOOLS`: file and search results
+    /// are what the model is most likely to need verbatim, and the
+    /// `all_messages` path compresses without storing an original to retrieve,
+    /// so a summarized file read cannot be undone. Pass `--exclude-tools ""`
+    /// to compress them anyway.
     #[arg(
         long = "exclude-tools",
         env = "HEADROOM_EXCLUDE_TOOLS",
-        default_value = ""
+        default_value = headroom_core::tool_exclusion::DEFAULT_EXCLUDE_TOOLS_CSV
     )]
     pub exclude_tools: String,
 
@@ -2114,6 +2120,42 @@ mod ctx_implies_interception_tests {
         let mut argv = vec!["headroom-proxy", "--upstream", "https://api.anthropic.com"];
         argv.extend_from_slice(extra);
         Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+    }
+
+    /// The default exclude list has to survive the trip from the constant
+    /// through clap and the CSV split, or file reads get lossily compressed
+    /// with nothing stored to retrieve them from.
+    #[test]
+    fn exclude_tools_defaults_to_the_python_list() {
+        let c = cfg(&[]);
+        for tool in [
+            "Read",
+            "Glob",
+            "Grep",
+            "Write",
+            "Edit",
+            "WebSearch",
+            "WebFetch",
+        ] {
+            assert!(
+                c.exclude_tools.iter().any(|t| t == tool),
+                "{tool} must be excluded from compression by default"
+            );
+        }
+        assert!(
+            headroom_core::tool_exclusion::is_tool_excluded(
+                "Read",
+                c.exclude_tools.iter().map(String::as_str)
+            ),
+            "the parsed default must actually match through is_tool_excluded"
+        );
+    }
+
+    /// An operator who wants the old behaviour can still ask for it.
+    #[test]
+    fn exclude_tools_can_be_emptied_explicitly() {
+        let c = cfg(&["--exclude-tools", ""]);
+        assert!(c.exclude_tools.is_empty());
     }
 
     #[test]
