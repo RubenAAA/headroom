@@ -273,6 +273,10 @@ fn resolve_codex_routing_headers(
 struct CtxTransformReport {
     transforms_applied: Vec<String>,
     tokens_saved: i64,
+    /// The session key the drift detector and offload gate used. Prefix replay
+    /// must key off the same one — the Claude path shares a single key across
+    /// all three deliberately, so they agree on what "this conversation" is.
+    session_key: String,
 }
 
 /// Apply headroom's CTX request-side transforms to a routed model's parsed
@@ -299,6 +303,7 @@ fn apply_ctx_request_transforms(
     // fingerprints the conversation's first message when no
     // `x-headroom-session-id` header is present.
     let session_key = derive_session_key(headers, client_addr, parsed, ApiKind::Anthropic);
+    report.session_key = session_key.clone();
 
     // Observe cache-prefix drift on the incoming body (before any transform),
     // matching the Claude path's ordering. Runs unconditionally so the
@@ -388,6 +393,168 @@ fn apply_ctx_request_transforms(
     report
 }
 
+/// What the compression + replay stage did, for the request outcome.
+#[derive(Debug, Default)]
+struct CompressionReport {
+    transforms_applied: Vec<String>,
+    tokens_saved: i64,
+    /// Set when the prefix-replay stage parked this turn, so the response side
+    /// knows to feed cache tokens back with [`SessionReplayStore::complete`].
+    replay_parked: bool,
+}
+
+/// Live-zone compression and freeze-replay for a routed request, mirroring the
+/// `AnthropicMessages` arm of `forward_http`.
+///
+/// The routed body is still in Anthropic shape at this point — translation to
+/// the OpenAI wire format happens after — so the same dispatcher applies, and
+/// gating reads the same config fields rather than anything routed-specific.
+/// A routed model therefore compresses exactly when a Claude model would:
+/// `--compression` (implied by any `--ctx-*` flag) with a `--compression-mode`
+/// other than `off`, no `x-headroom-bypass`, and a non-empty `messages`.
+///
+/// Replay runs after compression and is gated on `--prefix-replay`
+/// independently, matching the Claude path. That ordering is the point of the
+/// stage: compression rewrites bytes inside the prompt-cache prefix, and replay
+/// puts the previously-forwarded bytes back so the provider's cache still hits.
+/// Turning compression on without replay moves the prefix every turn — true on
+/// both paths, and worth knowing before enabling one without the other.
+fn apply_compression_and_replay(
+    state: &AppState,
+    parsed: &mut Value,
+    headers: &HeaderMap,
+    request_id: &str,
+    session_key: &str,
+) -> CompressionReport {
+    let mut report = CompressionReport::default();
+
+    let has_messages = parsed
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let decision = crate::compression_decision::CompressionDecision::decide(
+        headers,
+        state.config.compression,
+        true, // license_allows — same TODO(license) stub as the Claude path
+        has_messages,
+    );
+
+    // Nothing to do at all: no compression and no replay. Skip the
+    // serialize/reparse round trip entirely so the flags-off path stays free.
+    if !decision.should_compress && !state.config.prefix_replay {
+        return report;
+    }
+
+    let body = match serde_json::to_vec(parsed) {
+        Ok(b) => bytes::Bytes::from(b),
+        Err(e) => {
+            tracing::warn!(
+                event = "routed_compression_skipped",
+                request_id = %request_id,
+                error = %e,
+                "could not serialize routed body; skipping compression and replay"
+            );
+            return report;
+        }
+    };
+
+    // Snapshot the messages as they stand *before* compression: they are the
+    // append-only guard's comparison source and next turn's replay key. Taken
+    // after the CTX transforms, which is where the Claude path takes it too —
+    // `buffered` there has already been rewritten by them.
+    let replay_original_messages: Option<Vec<Value>> = if state.config.prefix_replay {
+        parsed
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .cloned()
+    } else {
+        None
+    };
+
+    let body = if decision.should_compress {
+        // PR-E3: the Phase E byte-mutating passes gate on PAYG, with the same
+        // enforcement-flag override the Claude path applies.
+        let auth_mode = if state.config.auth_mode_policy_enforcement.is_enabled() {
+            headroom_core::auth_mode::classify(headers)
+        } else {
+            headroom_core::auth_mode::AuthMode::Payg
+        };
+        let outcome = crate::compression::compress_anthropic_request(
+            &body,
+            state.config.compression_mode,
+            state.config.cache_control_auto_frozen,
+            auth_mode,
+            request_id,
+            &state.config.exclude_tools,
+        );
+        let outcome = crate::compression::apply_cross_turn_dedup(
+            outcome,
+            &body,
+            &state.config,
+            "/v1/messages",
+            request_id,
+        );
+        match outcome {
+            crate::compression::Outcome::Compressed {
+                body: compressed,
+                tokens_before,
+                tokens_after,
+                strategies_applied,
+                ..
+            } => {
+                report.tokens_saved += (tokens_before as i64 - tokens_after as i64).max(0);
+                report
+                    .transforms_applied
+                    .extend(strategies_applied.iter().map(|s| s.to_string()));
+                tracing::debug!(
+                    event = "routed_compression_applied",
+                    request_id = %request_id,
+                    tokens_before,
+                    tokens_after,
+                    "compressed routed-model request"
+                );
+                compressed
+            }
+            _ => body,
+        }
+    } else {
+        body
+    };
+
+    let body = match replay_original_messages {
+        Some(original_messages) => {
+            report.replay_parked = true;
+            crate::proxy::apply_prefix_replay(
+                &state.replay_store,
+                session_key,
+                request_id,
+                original_messages,
+                body,
+            )
+        }
+        None => body,
+    };
+
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(v) => *parsed = v,
+        Err(e) => {
+            // Leave `parsed` as it was — forwarding the pre-compression body is
+            // always safe, and is what every failure arm above already does.
+            tracing::warn!(
+                event = "routed_compression_reparse_failed",
+                request_id = %request_id,
+                error = %e,
+                "compressed routed body did not re-parse; forwarding uncompressed"
+            );
+            report.tokens_saved = 0;
+            report.transforms_applied.clear();
+            report.replay_parked = false;
+        }
+    }
+
+    report
+}
+
 /// Assemble the outcome context for a routed request.
 ///
 /// `target_model` present means the Responses API; absent means Chat
@@ -403,6 +570,8 @@ fn build_routed_outcome_context(
     report: CtxTransformReport,
     overhead_ms: f64,
     started_at: std::time::Instant,
+    request_id: String,
+    replay_store: Option<crate::cache_stabilization::prefix_replay::SessionReplayStore>,
 ) -> Option<RoutedOutcomeContext> {
     // Resolve the project the same way the Claude path does, so routed turns
     // land in the same per-project buckets rather than an "unknown" pile.
@@ -425,7 +594,9 @@ fn build_routed_outcome_context(
 
     Some(RoutedOutcomeContext {
         sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink::from_state(state)),
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id,
+        replay_store,
+        session_key: report.session_key,
         // The upstream model. `body_model` is the client-facing alias, which is
         // deliberately named `claude-*` so Claude Code will offer it in
         // `/model` — booking that would price OpenAI tokens off the `claude-`
@@ -548,6 +719,10 @@ pub async fn handle_messages(
     // Clock for the request outcome, started before any work so the recorded
     // latency covers what the client actually waited for.
     let request_started = std::time::Instant::now();
+    // One id for this turn, shared by the request outcome and the prefix-replay
+    // store — `begin_request` parks under it and the response side hands it
+    // back to `complete`, so the two must be the same value.
+    let request_id = uuid::Uuid::new_v4().to_string();
     // Parse body to extract model name.
     let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -696,7 +871,17 @@ pub async fn handle_messages(
     // searchable archive as the Claude passthrough path, gated on the same
     // flags. Mutates `parsed` before translation.
     let transform_started = std::time::Instant::now();
-    let ctx_report = apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr);
+    let mut ctx_report = apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr);
+
+    // Live-zone compression + freeze-replay, on the same flags as the Claude
+    // path and in the same order (compress, then replay the cached prefix).
+    let session_key = ctx_report.session_key.clone();
+    let compression_report =
+        apply_compression_and_replay(&state, &mut parsed, &headers, &request_id, &session_key);
+    ctx_report.tokens_saved += compression_report.tokens_saved;
+    ctx_report
+        .transforms_applied
+        .extend(compression_report.transforms_applied);
     let overhead_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
 
     // Translation path: Anthropic → OpenAI.
@@ -769,6 +954,13 @@ pub async fn handle_messages(
         ctx_report,
         overhead_ms,
         request_started,
+        request_id.clone(),
+        // Only hand the response side a store when this turn was actually
+        // parked; `complete` on an unparked id is a no-op, but passing `None`
+        // keeps the flag-off path from cloning a handle it will never use.
+        compression_report
+            .replay_parked
+            .then(|| state.replay_store.clone()),
     );
 
     let openai_body_bytes = match serde_json::to_vec(&openai_body) {
@@ -2267,6 +2459,11 @@ struct RoutedOutcomeContext {
     /// Time spent in headroom's own transforms, as distinct from waiting on
     /// upstream.
     overhead_ms: f64,
+    /// `Some` when the prefix-replay stage parked this turn. The store needs
+    /// the response's cache-token counts to decide how much of the prefix the
+    /// provider actually held, so a parked turn must be completed.
+    replay_store: Option<crate::cache_stabilization::prefix_replay::SessionReplayStore>,
+    session_key: String,
 }
 
 /// Safety net for turns that never reach a terminal event — a client
@@ -2408,6 +2605,32 @@ impl StreamTranslator {
     fn with_outcome(mut self, ctx: Option<RoutedOutcomeContext>) -> Self {
         self.outcome = ctx;
         self
+    }
+
+    /// Hand the turn's cache-token counts to the prefix-replay store, which
+    /// needs them to judge how much of the prefix the provider actually held.
+    ///
+    /// Only on a clean completion, matching the Claude path's `MessageStop`
+    /// gate: a turn that died mid-stream tells us nothing reliable about the
+    /// cache, and recording it would corrupt next turn's replay decision.
+    /// The Responses API reports cache *reads* only — there is no write
+    /// counter to pass, unlike Anthropic's `cache_creation_input_tokens`.
+    fn complete_replay(&self, usage: Option<&Value>) {
+        let Some(ctx) = self.outcome.as_ref() else {
+            return;
+        };
+        let Some(store) = ctx.replay_store.as_ref() else {
+            return;
+        };
+        let cache_read = usage
+            .and_then(|u| {
+                u.get("input_tokens_details")
+                    .or_else(|| u.get("prompt_tokens_details"))
+            })
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        store.complete(&ctx.request_id, cache_read, 0);
     }
 
     /// Latch time-to-first-byte. Written once and never overwritten, mirroring
@@ -2869,6 +3092,7 @@ impl StreamTranslator {
                     .get("response")
                     .and_then(|v| v.get("usage"))
                     .cloned();
+                self.complete_replay(usage.as_ref());
                 self.emit_outcome(usage.as_ref(), 200);
                 if self.in_thinking_block {
                     events.push(self.emit_content_block_stop());
@@ -3160,6 +3384,293 @@ mod tests {
         std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path);
     }
 
+    /// Minimal `AppState` for exercising the request-side stages.
+    fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> AppState {
+        let mut config =
+            crate::config::Config::for_test(url::Url::parse("http://upstream:8080").unwrap());
+        configure(&mut config);
+        AppState {
+            config: std::sync::Arc::new(config),
+            client: reqwest::Client::new(),
+            bedrock_credentials: None,
+            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
+            replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
+            usage_observer: std::sync::Arc::new(
+                crate::cache_stabilization::usage_observer::UsageObserver::new(),
+            ),
+            codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
+            ctx_observer: None,
+            ctx_offload: None,
+            ctx_inject: None,
+            ccr_context_tracker: None,
+            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
+            )),
+            savings_tracker: std::sync::Arc::new(
+                headroom_core::savings_tracker::SavingsTracker::new(None, false),
+            ),
+            request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
+            vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
+                "test".to_string(),
+            )),
+            dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
+            ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::ws_session_registry::WebSocketSessionRegistry::new(),
+            )),
+            rate_limiter: None,
+            semantic_cache: None,
+            memory_handler: None,
+            probe_recorder: None,
+            compression_feedback: None,
+            trusted_gateway_cidrs: vec![],
+            background_compressor: None,
+            compression_failure_action: crate::compression_failure::CompressionFailureAction {
+                refuse: false,
+                reason: "test".into(),
+                frame_bytes: 0,
+            },
+            batch_context_store: std::sync::Arc::new(headroom_core::ccr::BatchContextStore::new(
+                std::time::Duration::from_secs(86_400),
+                10_000,
+            )),
+        }
+    }
+
+    fn conversation(tail: &str) -> Value {
+        json!({
+            "model": "claude-codex-5.6",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": tail}
+            ]
+        })
+    }
+
+    /// Compression is off unless the operator turned it on — the routed path
+    /// must not start rewriting bodies that the Claude path would forward
+    /// untouched.
+    #[test]
+    fn routed_compression_is_off_by_default() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = false;
+        });
+        let mut body = conversation("hello");
+        let before = body.clone();
+        let report = apply_compression_and_replay(
+            &state,
+            &mut body,
+            &HeaderMap::new(),
+            "req-1",
+            "sess-1",
+        );
+        assert_eq!(body, before, "body must forward byte-equal");
+        assert_eq!(report.tokens_saved, 0);
+        assert!(!report.replay_parked);
+    }
+
+    /// `x-headroom-bypass` wins over the config, same as on the Claude path.
+    #[test]
+    fn routed_compression_honours_the_bypass_header() {
+        let state = test_state(|c| {
+            c.compression = true;
+            c.compression_mode = crate::config::CompressionMode::AllMessages;
+            c.prefix_replay = false;
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-headroom-bypass", HeaderValue::from_static("true"));
+        let mut body = conversation("hello");
+        let before = body.clone();
+        let report =
+            apply_compression_and_replay(&state, &mut body, &headers, "req-2", "sess-2");
+        assert_eq!(body, before);
+        assert!(report.transforms_applied.is_empty());
+    }
+
+    /// A conversation whose client-side `cache_control` markers move each turn
+    /// — exactly the churn the replay stage exists to absorb. The stage
+    /// rewrites these, so the forwarded bytes differ from the input and the
+    /// replay assertion below cannot pass vacuously.
+    fn conversation_with_cache_markers(marker_on: usize) -> Value {
+        let mut messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "first turn"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "second turn"}]}),
+        ];
+        messages[marker_on]["content"][0]["cache_control"] =
+            json!({"type": "ephemeral"});
+        json!({"model": "claude-codex-5.6", "messages": messages})
+    }
+
+    /// The point of the stage: turn two forwards the bytes turn one forwarded,
+    /// so the provider's prompt-cache prefix does not move even though the
+    /// client shuffled its `cache_control` breakpoint in between.
+    #[test]
+    fn prefix_replay_reuses_the_previously_forwarded_prefix() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = true;
+        });
+        let headers = HeaderMap::new();
+
+        let mut turn1 = conversation_with_cache_markers(0);
+        let raw1 = turn1["messages"].as_array().unwrap().clone();
+        let r1 = apply_compression_and_replay(&state, &mut turn1, &headers, "req-a", "sess-x");
+        assert!(r1.replay_parked, "turn one must park for turn two");
+        let forwarded1 = turn1["messages"].as_array().unwrap().clone();
+        assert_ne!(
+            forwarded1, raw1,
+            "guard: the stage must rewrite something, else the assertion below proves nothing"
+        );
+
+        // Close the turn out the way a clean stream does, then extend the
+        // conversation append-only with the marker moved, as a client does.
+        state.replay_store.complete("req-a", 1_000, 0);
+        let mut turn2 = conversation_with_cache_markers(2);
+        turn2["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "assistant", "content": [{"type": "text", "text": "third"}]}));
+        apply_compression_and_replay(&state, &mut turn2, &headers, "req-b", "sess-x");
+
+        let forwarded2 = turn2["messages"].as_array().unwrap();
+        assert_eq!(
+            forwarded2.len(),
+            forwarded1.len() + 1,
+            "only the new message should be appended"
+        );
+        // Compared with `cache_control` stripped, matching the contract: the
+        // replayed prefix is byte-identical in *content*, while the single
+        // ephemeral breakpoint is deliberately re-placed on the new last
+        // message each turn. That re-placement is the mechanism keeping the
+        // marker count bounded — Anthropic hard-errors above four.
+        assert_eq!(
+            strip_cache_control(&forwarded2[..forwarded1.len()]),
+            strip_cache_control(&forwarded1),
+            "the replayed prefix must match what turn one forwarded"
+        );
+        let markers = forwarded2
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
+            })
+            .count();
+        assert_eq!(markers, 1, "markers must not accumulate across turns");
+    }
+
+    fn strip_cache_control(messages: &[Value]) -> Vec<Value> {
+        messages
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if let Some(blocks) = m["content"].as_array_mut() {
+                    for b in blocks {
+                        if let Some(obj) = b.as_object_mut() {
+                            obj.remove("cache_control");
+                        }
+                    }
+                }
+                m
+            })
+            .collect()
+    }
+
+    /// The append-only guard: when an earlier message actually changed, the
+    /// stored prefix no longer describes this conversation and replaying it
+    /// would forward content the client did not send.
+    #[test]
+    fn prefix_replay_declines_when_history_was_rewritten() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = true;
+        });
+        let headers = HeaderMap::new();
+
+        let mut turn1 = conversation_with_cache_markers(0);
+        apply_compression_and_replay(&state, &mut turn1, &headers, "req-a", "sess-y");
+        state.replay_store.complete("req-a", 1_000, 0);
+
+        // Rewrite history rather than appending to it.
+        let mut turn2 = conversation_with_cache_markers(0);
+        turn2["messages"][0]["content"][0]["text"] = json!("a different first turn");
+        let expected_tail = turn2["messages"][0].clone();
+        apply_compression_and_replay(&state, &mut turn2, &headers, "req-b", "sess-y");
+
+        assert_eq!(
+            turn2["messages"][0]["content"][0]["text"], expected_tail["content"][0]["text"],
+            "the client's own first message must survive, not turn one's"
+        );
+    }
+
+    /// Compression is wired to a live dispatcher, not just gated correctly:
+    /// a body with a compressible block must come back smaller.
+    #[test]
+    fn routed_compression_actually_shrinks_a_compressible_body() {
+        let state = test_state(|c| {
+            c.compression = true;
+            c.compression_mode = crate::config::CompressionMode::AllMessages;
+            c.prefix_replay = false;
+        });
+        // Repeated whitespace-heavy log output: the shape the live-zone
+        // strategies are built for.
+        let noisy = "ERROR   module.rs:12    something failed\n".repeat(400);
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": noisy},
+                    {"type": "text", "text": "what went wrong?"}
+                ]
+            }]
+        });
+        let before = serde_json::to_string(&body).unwrap().len();
+        let report = apply_compression_and_replay(
+            &state,
+            &mut body,
+            &HeaderMap::new(),
+            "req-c",
+            "sess-c",
+        );
+        let after = serde_json::to_string(&body).unwrap().len();
+        assert!(
+            report.tokens_saved > 0,
+            "expected a real saving, got {} (bytes {before} -> {after})",
+            report.tokens_saved
+        );
+        assert!(after < before, "body should shrink: {before} -> {after}");
+        assert!(
+            !report.transforms_applied.is_empty(),
+            "the strategy that ran should be named in the outcome"
+        );
+    }
+
+    /// A different session must not inherit another's prefix.
+    #[test]
+    fn prefix_replay_is_scoped_to_its_session() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = true;
+        });
+        let headers = HeaderMap::new();
+        let mut a = conversation("session a");
+        apply_compression_and_replay(&state, &mut a, &headers, "req-a", "sess-a");
+        state.replay_store.complete("req-a", 1_000, 0);
+
+        let mut b = conversation("session b");
+        let before = b.clone();
+        apply_compression_and_replay(&state, &mut b, &headers, "req-b", "sess-b");
+        assert_eq!(b, before, "a cold session has nothing to replay");
+    }
+
     /// Translator wired to real trackers, so a test can assert on what the
     /// outcome funnel recorded rather than on the events it emitted.
     fn translator_with_outcome(
@@ -3184,6 +3695,8 @@ mod tests {
                 request_logger: request_logger.clone(),
             }),
             request_id: "req-test".to_string(),
+            replay_store: None,
+            session_key: "sess-test".to_string(),
             model: model.to_string(),
             provider: "openai_responses".to_string(),
             client: None,

@@ -3796,7 +3796,12 @@ fn is_sse_response(headers: &http::HeaderMap) -> bool {
 /// messages; otherwise the dispatcher's bytes forward untouched.
 /// (`serde_json` runs with `preserve_order`, so a re-serialization
 /// keeps key order — the same property Python gets from `dict`.)
-fn apply_prefix_replay(
+///
+/// Visible crate-wide so the routed-model translate path replays its prefix
+/// through this exact code rather than a parallel implementation — the whole
+/// value of the stage is that the replayed bytes are byte-identical, which a
+/// second implementation would be one refactor away from breaking.
+pub(crate) fn apply_prefix_replay(
     store: &SessionReplayStore,
     session_key: &str,
     request_id: &str,
