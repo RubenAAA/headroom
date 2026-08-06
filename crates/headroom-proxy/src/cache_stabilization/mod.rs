@@ -57,6 +57,11 @@
 //!   (lossless — same definitions, byte for byte); declines whenever a
 //!   tool carries a `cache_control` marker, which is what keeps it out
 //!   of PR-E1/PR-E3's way on PAYG.
+//! - [`cache_ttl`] — B1: rewrites every `cache_control` marker to
+//!   `ttl: "1h"` so the cached prefix survives idle gaps past the
+//!   5-minute default. **Mutates the body**; default off and skipped
+//!   on PAYG, where a 1h write is priced at 2× base input against
+//!   1.25× for 5m. Changes a marker's duration, never its placement.
 //!
 //! Sibling PRs hang additional submodules off this `mod.rs`. Conflict
 //! resolution between parallel Phase E PRs is intentionally trivial:
@@ -64,6 +69,7 @@
 //! `mod.rs`'s `pub mod` list.
 
 pub mod anthropic_cache_control;
+pub mod cache_ttl;
 pub mod capture;
 pub mod drift_detector;
 pub mod openai_cache_key;

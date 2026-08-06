@@ -62,7 +62,7 @@ subscription `unified` window is inferred to mirror it — confirm via
 ### Class B — prevent cache misses (lossless)
 | # | lever | mechanism | risk | status |
 |---|---|---|---|---|
-| B1 | force 1h cache TTL | pin `ttl:'1h'` so the prefix survives >5min gaps instead of full re-creation | low | not started |
+| B1 | force 1h cache TTL | pin `ttl:'1h'` so the prefix survives >5min gaps instead of full re-creation | low | **BUILT + WIRED, default off** — non-PAYG only; corpus shows no gap it would have rescued, see below |
 | B2 | cache-bust prevention | pin system/tools/cache_control/betas/effort stable so client churn doesn't re-create the ~180k prefix | low (lossless) | **tools axis BUILT + WIRED** (−21.3% cache-creation on the corpus); other axes measured stable, see below |
 
 ## Results (data-backed, real captures, 8-request conversation)
@@ -80,6 +80,48 @@ ON−OFF delta is the clean signal (absolute numbers drift via cache warming).
 | **all_messages, kompress off (A2)** | **+4.3%** | first real win; cache-stable |
 | **clear_tool_uses keep2/20k (A1, idealized warm)** | **+28%** | big; some warming inflation |
 | economics ceiling (tool_results @ 50% consistent) | +34.8% | upper bound for A2 at 2× ratio |
+
+### B1 — what forcing 1h is worth (39 real captures + Anthropic docs)
+
+Two documented facts, pointing opposite ways
+([rate-limits](https://platform.claude.com/docs/en/api/rate-limits),
+[prompt-caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)):
+
+- **Rate limits count cache writes at their raw token count**, with no TTL
+  distinction: *"`cache_creation_input_tokens` (tokens being written to cache) ✓
+  Count toward ITPM"*. On the usage-window axis, 1h costs the same as 5m.
+- **Dollars do distinguish**: *"5-minute cache write tokens are 1.25 times the
+  base input tokens price... 1-hour cache write tokens are 2 times"* — 60% more
+  per creation.
+
+So B1 is free on a subscription and a real bill on PAYG. Hence the PAYG gate.
+
+Two more facts cut the upside sharply:
+
+- **The 5-minute cache refreshes on every use, at no cost** — *"The cache is
+  refreshed for no additional cost each time the cached content is used."* It
+  never lapses during sustained work, so B1 only rescues a gap since the *last
+  touch*, not since creation.
+- **Claude Code already asks for 1h itself** on the main conversation. In the
+  corpus only subagent traffic used the 5m default, and subagents run to
+  completion in seconds.
+
+Measured on the corpus: **no gap between consecutive turns exceeded 231
+seconds** (opus median 13s, sonnet 6s), so B1 would have rescued nothing. But
+that corpus is one 13-minute burst, which structurally cannot contain the gaps
+B1 exists to survive — it disproves a benefit *during* sustained work, and says
+nothing about resuming a session after lunch. Settling that needs a capture
+spanning hours.
+
+Costs one cache creation per affected conversation on the turn it is switched
+on, since a 5m and a 1h breakpoint are different cache entries. No beta header
+needed — the 1h TTL went GA on 2025-08-13.
+
+**Undocumented, and worth knowing:** Anthropic publishes nothing about how
+Pro/Max weekly and 5-hour limits weight cache creation against cache reads, or
+whether 1h writes are counted differently from 5m there. The reasoning above
+infers the subscription window mirrors the ITPM rule, which is the same
+inference this doc makes elsewhere — it is not confirmed.
 
 ### B2 — what actually drifts (39 real captures)
 

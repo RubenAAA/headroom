@@ -1602,6 +1602,35 @@ fn maybe_stabilize_tool_order(
     }
 }
 
+/// B1: pin every `cache_control.ttl` in the body to `1h`.
+///
+/// Runs last, after every mutation that could add or move a marker, so what we
+/// pin is what goes on the wire. See [`cache_stabilization::cache_ttl`] for the
+/// economics and why this is skipped on PAYG.
+///
+/// Forwards the original bytes untouched when there is no marker to change or
+/// on any parse/serialize failure.
+fn maybe_force_1h_cache_ttl(body: bytes::Bytes, request_id: &str) -> bytes::Bytes {
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    if !cache_stabilization::cache_ttl::force_1h_ttl(&mut value) {
+        return body;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::debug!(
+                request_id = %request_id,
+                event = "force_1h_cache_ttl",
+                "pinned cache_control ttl to 1h"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
 /// Whether an upstream `reqwest` send error is a transient transport
 /// failure worth retrying on a fresh connection.
 ///
@@ -3083,6 +3112,21 @@ pub(crate) async fn forward_http(
                 &request_session_key,
                 &request_id,
             )
+        } else {
+            body_to_send
+        };
+
+        // B1 cache-TTL pin. Last of all, so every marker any earlier stage
+        // placed or moved is covered. Skipped on PAYG, where a 1h write is
+        // priced 60% above a 5m one and the operator pays the difference in
+        // dollars rather than in a token-counted usage window.
+        let body_to_send = if state.config.force_1h_cache_ttl
+            && auth_mode != AuthMode::Payg
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            ) {
+            maybe_force_1h_cache_ttl(body_to_send, &request_id)
         } else {
             body_to_send
         };

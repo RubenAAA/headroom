@@ -561,6 +561,25 @@ pub struct CliArgs {
     )]
     pub cache_stable_tool_order: bool,
 
+    /// B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached
+    /// prefix survives idle gaps past the 5-minute default. Anthropic only,
+    /// and skipped on PAYG — a 1h write is priced at 2× base input against
+    /// 1.25× for 5m, so it is free on a subscription (where writes are
+    /// token-counted for the usage window) and 60% dearer in dollars on an
+    /// API key.
+    ///
+    /// Default `false`. The 5-minute cache refreshes on every use at no cost,
+    /// so this only ever rescues a gap since the last touch; whether that is
+    /// worth a one-time cache creation per conversation depends on an idle
+    /// pattern only the operator can see.
+    #[arg(
+        long = "force-1h-cache-ttl",
+        env = "HEADROOM_PROXY_FORCE_1H_CACHE_TTL",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub force_1h_cache_ttl: bool,
+
     /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
     /// to be offloaded. Static per invariant I3 (never changes mid-session).
     /// Default `50_000` (mirrors context-mode's Read threshold).
@@ -1409,6 +1428,8 @@ pub struct Config {
     /// B2: replay last turn's tool order, appending new tools at the end.
     /// Default `true`.
     pub cache_stable_tool_order: bool,
+    /// B1: pin `cache_control.ttl` to `1h`. Non-PAYG only. Default `false`.
+    pub force_1h_cache_ttl: bool,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
@@ -1643,6 +1664,7 @@ impl Config {
             ctx_offload: args.ctx_offload,
             prefix_replay: args.prefix_replay,
             cache_stable_tool_order: args.cache_stable_tool_order,
+            force_1h_cache_ttl: args.force_1h_cache_ttl,
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
@@ -1868,6 +1890,7 @@ impl Config {
             // B2 off in the test default so existing request-path tests keep
             // asserting byte-identical tool arrays; production defaults to on.
             cache_stable_tool_order: false,
+            force_1h_cache_ttl: false,
             ctx_offload_min_bytes: 50_000,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,
