@@ -2105,6 +2105,11 @@ pub(crate) async fn forward_http(
         // PR-J4: whether the drift detector saw a cache hot-zone rebuild on
         // this turn. Consumed below by the offload boundary gate.
         let mut rebuild_boundary = false;
+        // Tokens removed by transforms that run *outside* the compression
+        // pipeline (ctx_offload). Compression reports its own savings; these
+        // reached no metric at all, so a body that genuinely shrank still
+        // showed `tok_saved=0` in /stats and the dashboard.
+        let mut ctx_transform_tokens_saved: i64 = 0;
         // One session key per request, derived here and reused by every
         // downstream consumer (ctx injection, the offload boundary gate,
         // prefix replay). `derive_session_key` fingerprints the
@@ -2364,6 +2369,7 @@ pub(crate) async fn forward_http(
                         }
                         if out.changed() {
                             changed = true;
+                            ctx_transform_tokens_saved += out.tokens_saved;
                             // CTX-6: offload metrics are recorded by the
                             // offload-store worker after persist_one confirms
                             // the record is durably recoverable, not here —
@@ -2372,6 +2378,7 @@ pub(crate) async fn forward_http(
                                 request_id = %request_id,
                                 blocks_offloaded = out.blocks_offloaded,
                                 blocks_deferred = out.blocks_deferred,
+                                tokens_saved = out.tokens_saved,
                                 rebuild_boundary,
                                 "ctx_offload rewrote tool_result blocks"
                             );
@@ -2843,7 +2850,9 @@ pub(crate) async fn forward_http(
                 client: None,
                 project,
                 original_tokens: compress_tokens_before,
-                tokens_saved: compress_tokens_saved,
+                // Compression's own saving plus anything the CTX transforms
+                // removed before it ran.
+                tokens_saved: compress_tokens_saved + ctx_transform_tokens_saved,
                 transforms_applied: compress_strategies.clone(),
                 num_messages: num_messages as i64,
                 total_latency_ms: start.elapsed().as_millis() as f64,
@@ -3678,8 +3687,8 @@ pub(crate) async fn forward_http(
                             provider: ctx.provider.clone(),
                             model: ctx.model.clone(),
                             status_code: status.as_u16() as i64,
-                            original_tokens: ctx.original_tokens,
-                            optimized_tokens: ctx.original_tokens.saturating_sub(ctx.tokens_saved),
+                            original_tokens: ctx.sizes(attempted_input).0,
+                            optimized_tokens: ctx.sizes(attempted_input).1,
                             output_tokens: output_tok,
                             tokens_saved: ctx.tokens_saved,
                             attempted_input_tokens: attempted_input,
@@ -4074,6 +4083,29 @@ struct OutcomeContext {
     waste_signals: Option<Vec<(String, i64)>>,
 }
 
+impl OutcomeContext {
+    /// Resolve `(original_tokens, optimized_tokens)` for this request.
+    ///
+    /// `original_tokens` is only populated when the compression pipeline ran —
+    /// it comes from `Outcome::Compressed { tokens_before }`. A transform that
+    /// shrinks the body outside that pipeline (ctx_offload) therefore produced
+    /// a real `tokens_saved` against a zero baseline, which reads as a 0%
+    /// saving and contributes nothing to the savings tracker.
+    ///
+    /// Fall back to the provider's own input count: that is, by definition, the
+    /// size we forwarded, so the pre-transform size is it plus what we removed.
+    fn sizes(&self, attempted_input_tokens: i64) -> (i64, i64) {
+        if self.original_tokens > 0 {
+            return (
+                self.original_tokens,
+                self.original_tokens.saturating_sub(self.tokens_saved),
+            );
+        }
+        let forwarded = attempted_input_tokens.max(0);
+        (forwarded + self.tokens_saved.max(0), forwarded)
+    }
+}
+
 /// Latch time-to-first-byte on the first upstream chunk. Every SSE arm calls
 /// this from its receive loop; the value is written once and never overwritten.
 fn latch_ttfb(ttfb_ms: &mut f64, outcome_ctx: &Option<OutcomeContext>) {
@@ -4204,8 +4236,8 @@ async fn run_sse_state_machine(
                     request_id: request_id.clone(),
                     provider: ctx.provider.clone(),
                     model: ctx.model.clone(),
-                    original_tokens: ctx.original_tokens,
-                    optimized_tokens: ctx.original_tokens.saturating_sub(ctx.tokens_saved),
+                    original_tokens: ctx.sizes(state.usage.input_tokens as i64).0,
+                    optimized_tokens: ctx.sizes(state.usage.input_tokens as i64).1,
                     output_tokens: state.usage.output_tokens as i64,
                     tokens_saved: ctx.tokens_saved,
                     attempted_input_tokens: state.usage.input_tokens as i64,
@@ -4359,8 +4391,8 @@ async fn run_sse_state_machine(
                     request_id: request_id.clone(),
                     provider: ctx.provider.clone(),
                     model: ctx.model.clone(),
-                    original_tokens: ctx.original_tokens,
-                    optimized_tokens: ctx.original_tokens.saturating_sub(ctx.tokens_saved),
+                    original_tokens: ctx.sizes(input_tok).0,
+                    optimized_tokens: ctx.sizes(input_tok).1,
                     output_tokens: output_tok,
                     tokens_saved: ctx.tokens_saved,
                     attempted_input_tokens: input_tok,
@@ -4535,8 +4567,8 @@ async fn run_sse_state_machine(
                     request_id: request_id.clone(),
                     provider: ctx.provider.clone(),
                     model: ctx.model.clone(),
-                    original_tokens: ctx.original_tokens,
-                    optimized_tokens: ctx.original_tokens.saturating_sub(ctx.tokens_saved),
+                    original_tokens: ctx.sizes(input_tok).0,
+                    optimized_tokens: ctx.sizes(input_tok).1,
                     output_tokens: output_tok,
                     tokens_saved: ctx.tokens_saved,
                     attempted_input_tokens: input_tok,
@@ -5242,6 +5274,72 @@ mod tests {
             maybe_compact_tool_schemas(original.clone(), "req-test"),
             original
         );
+    }
+
+    fn outcome_ctx_for_sizes(original_tokens: i64, tokens_saved: i64) -> OutcomeContext {
+        OutcomeContext {
+            sink: Arc::new(ProxyOutcomeSink {
+                cost_tracker: Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                    None, "monthly",
+                )),
+                savings_tracker: Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+                    None, false,
+                )),
+                request_logger: Arc::new(crate::request_logger::RequestLogger::new(None)),
+            }),
+            model: "m".into(),
+            provider: "anthropic".into(),
+            tags: Default::default(),
+            client: None,
+            project: None,
+            original_tokens,
+            tokens_saved,
+            transforms_applied: vec![],
+            num_messages: 0,
+            total_latency_ms: 0.0,
+            overhead_ms: 0.0,
+            started_at: Instant::now(),
+            waste_signals: None,
+        }
+    }
+
+    /// When compression ran, its own pre-compression size is the baseline.
+    #[test]
+    fn sizes_uses_the_compression_baseline_when_there_is_one() {
+        let ctx = outcome_ctx_for_sizes(10_000, 2_000);
+        // The provider's count is deliberately inconsistent here: compression
+        // measured the body itself, so its numbers win.
+        assert_eq!(ctx.sizes(7_500), (10_000, 8_000));
+    }
+
+    /// The gap this closes: ctx_offload shrinks the body outside the
+    /// compression pipeline, so `original_tokens` is 0 while `tokens_saved` is
+    /// real. Booking that against a zero baseline reported a 0% saving and
+    /// contributed nothing to the savings tracker.
+    #[test]
+    fn sizes_derives_a_baseline_when_compression_did_not_run() {
+        let ctx = outcome_ctx_for_sizes(0, 1_500);
+        // Forwarded 20k, removed 1.5k, so the body arrived at 21.5k.
+        assert_eq!(ctx.sizes(20_000), (21_500, 20_000));
+
+        let outcome = headroom_core::request_outcome::RequestOutcome {
+            original_tokens: 21_500,
+            tokens_saved: 1_500,
+            ..Default::default()
+        };
+        assert!(
+            (outcome.savings_pct() - 6.976_744_186_046_512).abs() < 1e-9,
+            "a real saving must report a real percentage, got {}",
+            outcome.savings_pct()
+        );
+    }
+
+    /// A passthrough turn stays at zero rather than inventing a saving.
+    #[test]
+    fn sizes_reports_no_saving_for_an_untouched_body() {
+        let ctx = outcome_ctx_for_sizes(0, 0);
+        assert_eq!(ctx.sizes(20_000), (20_000, 20_000));
+        assert_eq!(ctx.sizes(0), (0, 0));
     }
 
     #[test]

@@ -550,3 +550,34 @@ fn opens_ts_created_db() {
 // Re-export a small chunk-testing hook and the cap constant for the tests that
 // exercise the private chunker.
 const MAX_CHUNK_BYTES_TEST: usize = 4096;
+
+// ── find_all_positions: character-boundary safety ──
+
+/// Reproduces the panic that poisoned the store mutex in production.
+///
+/// The scan advanced one *byte* past each hit, so a term starting with a
+/// multi-byte character left `start` inside that character and the next
+/// `text[start..]` panicked. It runs under `search`'s lock, so the panic took
+/// every later ctx search in the process down with it.
+#[test]
+fn find_all_positions_handles_multibyte_terms() {
+    // Cyrillic, em-dash and emoji terms: every one is multi-byte.
+    for term in ["тест", "—", "🙂", "ё"] {
+        let text = format!("a{term}b{term}c{term}");
+        let hits = find_all_positions(&text, term);
+        assert_eq!(hits.len(), 3, "term={term} text={text:?}");
+        for i in &hits {
+            assert!(text.is_char_boundary(*i), "offset {i} is not a boundary");
+            assert!(text[*i..].starts_with(term));
+        }
+    }
+}
+
+/// Overlapping matches still work; the scan advances a character at a time.
+#[test]
+fn find_all_positions_finds_overlapping_matches() {
+    assert_eq!(find_all_positions("aaaa", "aa"), vec![0, 1, 2]);
+    assert_eq!(find_all_positions("——————", "——"), vec![0, 3, 6, 9, 12]);
+    assert!(find_all_positions("abc", "").is_empty());
+    assert!(find_all_positions("abc", "z").is_empty());
+}

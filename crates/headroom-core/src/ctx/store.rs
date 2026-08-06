@@ -836,7 +836,11 @@ fn find_all_positions(text: &str, term: &str) -> Vec<usize> {
     while let Some(rel) = text[start..].find(term) {
         let idx = start + rel;
         positions.push(idx);
-        start = idx + 1;
+        // Advance one *character*, not one byte. `idx + 1` lands inside any
+        // multi-byte character the term starts with, and the next `text[start..]`
+        // then panics — inside `search`, which holds the store mutex, so the
+        // panic poisons it and every later ctx search in the process dies too.
+        start = idx + text[idx..].chars().next().map_or(1, char::len_utf8);
     }
     positions
 }

@@ -612,11 +612,14 @@ fn extract_constraint(block: &Value, out: &mut Vec<ExtractedEvent>) {
         "permission denied",
         "incompatible",
     ];
-    let lower = response.to_lowercase();
     for pattern in &patterns {
-        if let Some(idx) = lower.find(pattern) {
-            let start = idx.saturating_sub(50);
-            let end = (idx + 200).min(response.len());
+        if let Some(idx) = find_ascii_case_insensitive(&response, pattern) {
+            // Byte offsets, so both ends must be walked back to a character
+            // boundary: a window edge landing inside a multi-byte character
+            // (an em-dash, a box-drawing rule, any Cyrillic letter) panics the
+            // slice and kills the capture worker for the rest of the process.
+            let start = floor_char_boundary(&response, idx.saturating_sub(50));
+            let end = ceil_char_boundary(&response, idx.saturating_add(200));
             let context = response[start..end].trim().to_string();
             out.push(ExtractedEvent::new(
                 "constraint",
@@ -627,6 +630,47 @@ fn extract_constraint(block: &Value, out: &mut Vec<ExtractedEvent>) {
             return;
         }
     }
+}
+
+/// Byte offset of the first case-insensitive match of an **ASCII** `needle`.
+///
+/// Searching a lowercased copy and then slicing the original is not equivalent:
+/// `to_lowercase` is not length-preserving (`İ` is two bytes lowercased, `ẞ`
+/// three), so an offset found in the copy can point somewhere else entirely in
+/// the original. Scanning the original directly keeps the offset meaningful,
+/// and starting only at `char_indices` boundaries keeps it sliceable.
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let (hay, ndl) = (haystack.as_bytes(), needle.as_bytes());
+    if ndl.is_empty() || ndl.len() > hay.len() {
+        return None;
+    }
+    haystack
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| i + ndl.len() <= hay.len())
+        .find(|&i| hay[i..i + ndl.len()].eq_ignore_ascii_case(ndl))
+}
+
+/// Largest character boundary `<= i` (clamped to the string's length).
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest character boundary `>= i` (clamped to the string's length).
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 // ─────────────────────────────────────────────────────────
@@ -727,6 +771,72 @@ fn extract_mcp(block: &Value, out: &mut Vec<ExtractedEvent>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Reproduces the panic that killed the capture worker in production: a
+    /// multi-byte character sitting on the context window's edge.
+    ///
+    /// The three characters below are the ones the real crashes landed on —
+    /// an em-dash, a box-drawing rule, and Cyrillic.
+    #[test]
+    fn constraint_context_survives_multibyte_characters() {
+        for filler in ["—", "─", "тест", "🙂"] {
+            for pad in 40..70 {
+                let text = format!(
+                    "{}cannot open file{}",
+                    filler.repeat(pad),
+                    filler.repeat(pad)
+                );
+                let block = json!({
+                    "type": "tool_result",
+                    "is_error": true,
+                    "content": text,
+                });
+                let mut out = Vec::new();
+                // Panicked before the fix; the assertion is that it returns.
+                extract_constraint(&block, &mut out);
+                assert_eq!(out.len(), 1, "filler={filler} pad={pad}");
+            }
+        }
+    }
+
+    /// The offset came from a lowercased copy but indexed the original.
+    /// `to_lowercase` is not length-preserving, so the two disagree.
+    #[test]
+    fn constraint_context_offsets_survive_case_folding() {
+        // 'İ' is 2 bytes; lowercased it becomes 3. Enough of them ahead of the
+        // pattern and an offset taken from the copy points past the match.
+        let text = format!("{} CANNOT proceed further", "İ".repeat(30));
+        let block = json!({"type": "tool_result", "is_error": true, "content": text});
+        let mut out = Vec::new();
+        extract_constraint(&block, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].data.to_lowercase().contains("cannot"),
+            "context should contain the matched pattern, got {:?}",
+            out[0].data
+        );
+    }
+
+    #[test]
+    fn ascii_case_insensitive_find_matches_regardless_of_case() {
+        assert_eq!(find_ascii_case_insensitive("a CANNOT b", "cannot"), Some(2));
+        assert_eq!(find_ascii_case_insensitive("—cannot", "cannot"), Some(3));
+        assert_eq!(find_ascii_case_insensitive("nope", "cannot"), None);
+        // Never returns an offset that cannot be sliced.
+        let s = "—————cannot—————";
+        let i = find_ascii_case_insensitive(s, "cannot").unwrap();
+        assert!(s.is_char_boundary(i));
+    }
+
+    #[test]
+    fn char_boundary_helpers_clamp_into_range() {
+        let s = "a—b"; // 1 + 3 + 1 bytes
+        assert_eq!(floor_char_boundary(s, 2), 1);
+        assert_eq!(ceil_char_boundary(s, 2), 4);
+        assert_eq!(floor_char_boundary(s, 999), s.len());
+        assert_eq!(ceil_char_boundary(s, 999), s.len());
+        assert_eq!(floor_char_boundary(s, 0), 0);
+    }
 
     #[test]
     fn intent_from_user_text() {
