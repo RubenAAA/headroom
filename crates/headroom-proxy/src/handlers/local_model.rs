@@ -386,9 +386,7 @@ async fn apply_ctx_request_transforms(
             if injected {
                 if let Some(obj) = parsed.as_object_mut() {
                     obj.insert("tools".to_string(), Value::Array(new_tools));
-                    report
-                        .transforms_applied
-                        .push("memory_tools".to_string());
+                    report.transforms_applied.push("memory_tools".to_string());
                     tracing::debug!(
                         event = "codex_memory_tools",
                         "injected memory tool definitions into routed-model request"
@@ -476,9 +474,7 @@ async fn apply_ctx_request_transforms(
                     if bytes > 0 {
                         if let Some(msgs) = parsed.get_mut("messages") {
                             *msgs = Value::Array(new_msgs);
-                            report
-                                .transforms_applied
-                                .push("memory_context".to_string());
+                            report.transforms_applied.push("memory_context".to_string());
                             tracing::debug!(
                                 event = "codex_memory_context",
                                 bytes_appended = bytes,
@@ -595,10 +591,7 @@ fn apply_compression_and_replay(
     // after the CTX transforms, which is where the Claude path takes it too —
     // `buffered` there has already been rewritten by them.
     let replay_original_messages: Option<Vec<Value>> = if state.config.prefix_replay {
-        parsed
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .cloned()
+        parsed.get("messages").and_then(|m| m.as_array()).cloned()
     } else {
         None
     };
@@ -721,8 +714,8 @@ fn build_routed_outcome_context(
         base_user_id: String::new(),
         project_root_override: None,
     };
-    let project = crate::memory::router::ProjectResolver::resolve(&project_ctx)
-        .map(|(key, _display)| key);
+    let project =
+        crate::memory::router::ProjectResolver::resolve(&project_ctx).map(|(key, _display)| key);
 
     Some(RoutedOutcomeContext {
         sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink::from_state(state)),
@@ -1673,7 +1666,10 @@ fn image_block_to_data_url(block: &Value) -> Option<String> {
         .decode(&compact)
         .or_else(|_| STANDARD_NO_PAD.decode(&compact))
         .ok()?;
-    Some(format!("data:{media_type};base64,{}", STANDARD.encode(decoded)))
+    Some(format!(
+        "data:{media_type};base64,{}",
+        STANDARD.encode(decoded)
+    ))
 }
 
 /// Render `tool_result.content` into ordered parts.
@@ -1700,12 +1696,12 @@ fn render_tool_result_parts(content: Option<&Value>) -> Vec<ToolResultPart> {
                         "[unsupported content block omitted: image]".to_string(),
                     ),
                 },
-                Some(other) => ToolResultPart::Text(format!(
-                    "[unsupported content block omitted: {other}]"
-                )),
-                None => ToolResultPart::Text(
-                    "[unsupported content block omitted: unknown]".to_string(),
-                ),
+                Some(other) => {
+                    ToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
+                }
+                None => {
+                    ToolResultPart::Text("[unsupported content block omitted: unknown]".to_string())
+                }
             })
             .collect(),
         Some(other) => vec![ToolResultPart::Text(other.to_string())],
@@ -1720,9 +1716,7 @@ fn render_tool_result_parts(content: Option<&Value>) -> Vec<ToolResultPart> {
 /// only when necessary keeps those bytes identical to before.
 fn tool_result_output_value(content: Option<&Value>, is_error: bool) -> Value {
     let parts = render_tool_result_parts(content);
-    let has_image = parts
-        .iter()
-        .any(|p| matches!(p, ToolResultPart::Image(_)));
+    let has_image = parts.iter().any(|p| matches!(p, ToolResultPart::Image(_)));
 
     if !has_image {
         let joined = parts
@@ -3231,10 +3225,7 @@ impl StreamTranslator {
                         "codex prompt-cache effectiveness for this turn"
                     );
                 }
-                let usage = chunk
-                    .get("response")
-                    .and_then(|v| v.get("usage"))
-                    .cloned();
+                let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
                 self.complete_replay(usage.as_ref());
                 self.emit_outcome(usage.as_ref(), 200);
                 if self.in_thinking_block {
@@ -3283,10 +3274,7 @@ impl StreamTranslator {
                 }
                 // Booked as a 500 so the outcome funnel routes it to
                 // `record_failed` — a failed turn must not feed the save-rate.
-                let usage = chunk
-                    .get("response")
-                    .and_then(|v| v.get("usage"))
-                    .cloned();
+                let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
                 self.emit_outcome(usage.as_ref(), 500);
             }
             "response.incomplete" => {
@@ -3318,10 +3306,7 @@ impl StreamTranslator {
                 }
                 // Outside the `if let`: a response that stopped short still
                 // spent tokens, whether or not it said why.
-                let usage = chunk
-                    .get("response")
-                    .and_then(|v| v.get("usage"))
-                    .cloned();
+                let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
                 self.emit_outcome(usage.as_ref(), 200);
             }
             _ => {}
@@ -3603,13 +3588,8 @@ mod tests {
         });
         let mut body = conversation("hello");
         let before = body.clone();
-        let report = apply_compression_and_replay(
-            &state,
-            &mut body,
-            &HeaderMap::new(),
-            "req-1",
-            "sess-1",
-        );
+        let report =
+            apply_compression_and_replay(&state, &mut body, &HeaderMap::new(), "req-1", "sess-1");
         assert_eq!(body, before, "body must forward byte-equal");
         assert_eq!(report.tokens_saved, 0);
         assert!(!report.replay_parked);
@@ -3627,8 +3607,7 @@ mod tests {
         headers.insert("x-headroom-bypass", HeaderValue::from_static("true"));
         let mut body = conversation("hello");
         let before = body.clone();
-        let report =
-            apply_compression_and_replay(&state, &mut body, &headers, "req-2", "sess-2");
+        let report = apply_compression_and_replay(&state, &mut body, &headers, "req-2", "sess-2");
         assert_eq!(body, before);
         assert!(report.transforms_applied.is_empty());
     }
@@ -3643,8 +3622,7 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
             json!({"role": "user", "content": [{"type": "text", "text": "second turn"}]}),
         ];
-        messages[marker_on]["content"][0]["cache_control"] =
-            json!({"type": "ephemeral"});
+        messages[marker_on]["content"][0]["cache_control"] = json!({"type": "ephemeral"});
         json!({"model": "claude-codex-5.6", "messages": messages})
     }
 
@@ -3879,13 +3857,8 @@ mod tests {
             }]
         });
         let before = serde_json::to_string(&body).unwrap().len();
-        let report = apply_compression_and_replay(
-            &state,
-            &mut body,
-            &HeaderMap::new(),
-            "req-c",
-            "sess-c",
-        );
+        let report =
+            apply_compression_and_replay(&state, &mut body, &HeaderMap::new(), "req-c", "sess-c");
         let after = serde_json::to_string(&body).unwrap().len();
         assert!(
             report.tokens_saved > 0,
@@ -4269,7 +4242,10 @@ mod tests {
             ])),
             true,
         );
-        assert_eq!(with_image[0], json!({"type": "input_text", "text": "Error:"}));
+        assert_eq!(
+            with_image[0],
+            json!({"type": "input_text", "text": "Error:"})
+        );
         assert_eq!(with_image[1]["type"], "input_image");
     }
 
