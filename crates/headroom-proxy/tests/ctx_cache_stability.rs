@@ -233,6 +233,113 @@ fn tool_result_stable_crossing_live_into_frozen_zone_full_pipeline() {
     }
 }
 
+/// Apply offload + the compressor in a given mode and auth mode. Reports
+/// whether the compressor actually ran, so a caller can refuse to draw a
+/// stability conclusion from a body nothing touched.
+fn transform_in_mode(request: &Value, mode: CompressionMode, auth: AuthMode) -> (Value, bool) {
+    let mut v = request.clone();
+    offload_anthropic_request(&mut v, &cfg(), None);
+    let offloaded = serde_json::to_vec(&v).unwrap();
+    let outcome = compress_anthropic_request(
+        &offloaded.clone().into(),
+        mode,
+        CacheControlAutoFrozen::Enabled,
+        auth,
+        "test-ctx-mode",
+        &[],
+    );
+    let (final_bytes, fired) = match outcome {
+        Outcome::Compressed { body, .. } => (body.to_vec(), true),
+        _ => (offloaded, false),
+    };
+    (serde_json::from_slice(&final_bytes).unwrap(), fired)
+}
+
+/// Offload and `all_messages` composed, over a growing conversation. Guards
+/// the combination — the compressor itself is covered by
+/// [`all_messages_prefix_is_stable_without_offload`].
+#[test]
+fn all_messages_prefix_is_stable_across_six_turns() {
+    for auth in [AuthMode::Payg, AuthMode::Subscription] {
+        let turns = growing_conversation(6);
+        let results: Vec<(Value, bool)> = turns
+            .iter()
+            .map(|msgs| transform_in_mode(&body(msgs), CompressionMode::AllMessages, auth))
+            .collect();
+
+        // The compressor deliberately does NOT fire here: offload has already
+        // replaced each big tool_result with a small digest, well under the
+        // compression threshold. So the sanity check is that offload ran —
+        // asserting on the compressor instead would fail, and did.
+        let last = serde_json::to_string(&results.last().unwrap().0).unwrap();
+        assert!(
+            last.contains("<<ctx:"),
+            "{auth:?}: offload never ran — the stability check below would be \
+             vacuous"
+        );
+
+        for n in 0..results.len() - 1 {
+            let prev = message_bytes(&results[n].0);
+            let next = message_bytes(&results[n + 1].0);
+            assert_prefix(&prev, &next, n);
+        }
+    }
+}
+
+/// `all_messages` is the mode the proxy now defaults to whenever compression
+/// is on, and unlike `live_zone` it rewrites content *inside* the cached
+/// prefix rather than only the live tail. That is only safe if a given message
+/// compresses to the same bytes on every turn — otherwise the prefix moves
+/// under the provider every turn and every request pays full price, which is
+/// the −54.1% "position-keyed cascade" result in
+/// `docs/subscription-optimization.md`.
+///
+/// The rest of this harness predates the default flip and only ever exercised
+/// `live_zone`, so nothing held `all_messages` to the same contract. No offload
+/// stage here, so the tool_results stay big enough for the compressor to
+/// actually run and a failure points at the compressor rather than at digest
+/// churn.
+#[test]
+fn all_messages_prefix_is_stable_without_offload() {
+    for auth in [AuthMode::Payg, AuthMode::Subscription] {
+        let turns = growing_conversation(6);
+        let transformed: Vec<(Value, bool)> = turns
+            .iter()
+            .map(|msgs| {
+                let bytes = serde_json::to_vec(&body(msgs)).unwrap();
+                let outcome = compress_anthropic_request(
+                    &bytes.clone().into(),
+                    CompressionMode::AllMessages,
+                    CacheControlAutoFrozen::Enabled,
+                    auth,
+                    "test-ctx-am",
+                    &[],
+                );
+                let (final_bytes, fired) = match outcome {
+                    Outcome::Compressed { body, .. } => (body.to_vec(), true),
+                    _ => (bytes, false),
+                };
+                (
+                    serde_json::from_slice::<Value>(&final_bytes).unwrap(),
+                    fired,
+                )
+            })
+            .collect();
+
+        assert!(
+            transformed.iter().any(|(_, fired)| *fired),
+            "{auth:?}: compressor never ran — the stability check below would \
+             be vacuous"
+        );
+
+        for n in 0..transformed.len() - 1 {
+            let prev = message_bytes(&transformed[n].0);
+            let next = message_bytes(&transformed[n + 1].0);
+            assert_prefix(&prev, &next, n);
+        }
+    }
+}
+
 #[test]
 fn identical_content_offloads_to_identical_digest() {
     // The same tool_result body appearing in two different turns/ids must
