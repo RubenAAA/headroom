@@ -14,12 +14,14 @@ from unittest.mock import patch
 
 import pytest
 
+import headroom.transforms.code_compressor as cc
 from headroom.transforms.code_compressor import (
     CodeAwareCompressor,
     CodeCompressionResult,
     CodeCompressorConfig,
     CodeLanguage,
     DocstringMode,
+    coerce_language,
     detect_language,
     is_tree_sitter_available,
     is_tree_sitter_loaded,
@@ -1535,6 +1537,38 @@ class TestRealASTRuns:
             )
         )
 
+    def _recovery_compressor(self, **overrides):
+        defaults = {
+            "min_tokens_for_compression": 1,
+            "max_body_lines": 2,
+            "enable_ccr": False,
+            "semantic_analysis": False,
+        }
+        defaults.update(overrides)
+        return CodeAwareCompressor(CodeCompressorConfig(**defaults))
+
+    def _python_recovery_fixture(self) -> str:
+        return textwrap.dedent(
+            """\
+            from pathlib import Path
+
+            def expand_search_roots(user_root: str) -> list[Path]:
+                root = Path(user_root)
+                candidates = [root]
+                for child in root.iterdir():
+                    candidates.append(child.resolve())
+                return candidates
+
+            def load_user_overrides(config_path: str) -> dict[str, str]:
+                config: dict[str, str] = {}
+                for line in Path(config_path).read_text().splitlines():
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        config[key.strip()] = value.strip()
+                return config
+            """
+        )
+
     def test_get_parser_returns_stock_node_api(self):
         """The parser must yield nodes with the stock tree_sitter property API
         that the tree-walking code relies on (``.type``/``.children``/...)."""
@@ -1610,6 +1644,101 @@ class TestRealASTRuns:
         assert "import math" in result.compressed
         assert "def compute(values):" in result.compressed
         # Output is still valid Python.
+        compile(result.compressed, "<test>", "exec")
+
+    def test_python_invalid_node_falls_back_locally(self):
+        """One invalid Python rewrite must preserve only that definition."""
+        compressor = self._recovery_compressor()
+        code = self._python_recovery_fixture()
+        original_compress_function_ast = compressor._compress_function_ast
+
+        def _patched(node, code_text, language, lang_config, body_limits, analysis):
+            name = cc._get_definition_name(node)
+            if name == "expand_search_roots":
+                return "def expand_search_roots(user_root: str) -> list[Path]:\n    if True\n"
+            if name == "load_user_overrides":
+                return (
+                    "def load_user_overrides(config_path: str) -> dict[str, str]:\n"
+                    "    config: dict[str, str] = {}\n"
+                    "    # [4 lines omitted]\n"
+                    "    return config"
+                )
+            return original_compress_function_ast(
+                node,
+                code_text,
+                language,
+                lang_config,
+                body_limits,
+                analysis,
+            )
+
+        with patch.object(compressor, "_compress_function_ast", side_effect=_patched):
+            result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert result.compressed != code
+        assert "if True" not in result.compressed
+        assert "for child in root.iterdir():" in result.compressed
+        assert "# [4 lines omitted]" in result.compressed
+        compile(result.compressed, "<test>", "exec")
+
+    def test_python_recovery_does_not_block_valid_modern_syntax(self):
+        """Valid decorators, nested defs, and match syntax still compress."""
+        compressor = self._recovery_compressor(max_body_lines=4)
+        code = textwrap.dedent(
+            """\
+            from dataclasses import dataclass
+
+            def traced(fn):
+                return fn
+
+            @dataclass
+            class Command:
+                name: str
+                payload: dict[str, int]
+
+            @traced
+            def route_command(command: Command) -> str:
+                def normalize(value: str) -> str:
+                    return value.strip().lower()
+
+                match normalize(command.name):
+                    case "ping":
+                        return "pong"
+                    case "echo":
+                        return str(command.payload)
+                    case _:
+                        return "unknown"
+            """
+        )
+
+        result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "@traced" in result.compressed
+        assert "class Command:" in result.compressed
+        assert "def route_command(command: Command) -> str:" in result.compressed
+        compile(result.compressed, "<test>", "exec")
+
+    def test_python_recovery_still_returns_original_when_all_candidates_invalid(self):
+        """Recovery keeps the terminal whole-file fail-safe."""
+        compressor = self._recovery_compressor()
+        code = self._python_recovery_fixture()
+
+        def _patched(node, _code_text, _language, _lang_config, _body_limits, _analysis):
+            name = cc._get_definition_name(node) or "broken"
+            return f"def {name}(:\n    pass"
+
+        with patch.object(compressor, "_compress_function_ast", side_effect=_patched):
+            result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio == 1.0
+        assert "(:\n" not in result.compressed
+        assert "for child in root.iterdir():" in result.compressed
+        assert 'key, value = line.split("=", 1)' in result.compressed
         compile(result.compressed, "<test>", "exec")
 
     def test_get_node_text_uses_utf8_byte_offsets(self):
@@ -1968,3 +2097,116 @@ class TestCSharpSupport:
         lang, confidence = detect_language(code)
         assert lang == CodeLanguage.CSHARP
         assert confidence > 0.0
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestPhpSupport:
+    """PHP (``php`` grammar) parity with C#: signatures preserved verbatim,
+    function/method bodies compressed, ``<?php`` tag and ``namespace``/``use``
+    header order preserved, Perl sigil-overlap disambiguated in detection,
+    malformed input passed through.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+            )
+        )
+
+    def test_class_methods_compress_signatures_preserved(self):
+        code = (
+            "<?php\n"
+            "namespace App\\Service;\n"
+            "\n"
+            "use App\\Model\\User;\n"
+            "\n"
+            "final class UserService {\n"
+            "    private $logger;\n"
+            "\n"
+            "    public function process(User $u): bool {\n"
+            "        $name = strtolower(trim($u->getName()));\n"
+            "        $tags = [];\n"
+            "        foreach ($u->getTags() as $tag) {\n"
+            "            $tags[] = $tag->normalize();\n"
+            "        }\n"
+            "        $this->logger->info($name);\n"
+            "        return true;\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="php")
+
+        assert result.language == CodeLanguage.PHP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        # signature + class header preserved verbatim
+        assert "final class UserService" in result.compressed
+        assert "public function process(User $u): bool" in result.compressed
+        # method body actually compressed
+        assert "lines omitted" in result.compressed
+        assert "$tag->normalize()" not in result.compressed
+        # the class is emitted exactly once
+        assert result.compressed.count("class UserService") == 1
+
+    def test_php_tag_and_namespace_precede_uses_and_types(self):
+        """``<?php`` must stay first and ``namespace X;`` must precede the
+        ``use`` imports and type declarations — any other order is not valid
+        PHP."""
+        code = (
+            "<?php\n"
+            "namespace App\\Tools;\n"
+            "\n"
+            "use App\\Model\\Item;\n"
+            "\n"
+            "function helper(int $x): int {\n"
+            "    $acc = 0;\n"
+            "    for ($i = 0; $i < $x; $i++) {\n"
+            "        $acc += $i;\n"
+            "        $acc -= 1;\n"
+            "    }\n"
+            "    return $acc;\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="php")
+
+        assert result.language == CodeLanguage.PHP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        compressed = result.compressed
+        assert compressed.lstrip().startswith("<?php")
+        assert compressed.index("<?php") < compressed.index("namespace App\\Tools;")
+        assert compressed.index("namespace App\\Tools;") < compressed.index("use App\\Model\\Item;")
+        assert compressed.index("use App\\Model\\Item;") < compressed.index("function helper")
+        assert "lines omitted" in compressed
+
+    def test_detect_language_identifies_php(self):
+        """Auto-detection recognizes PHP despite the Perl sigil overlap
+        (``$var`` matches Perl's prefilter; the ``<?php`` tag disambiguates)."""
+        code = (
+            "<?php\n"
+            "namespace Acme;\n"
+            "\n"
+            "use Acme\\Widget;\n"
+            "\n"
+            "class Svc {\n"
+            "    public function add(int $a, int $b): int {\n"
+            "        $sum = $a + $b;\n"
+            "        return $sum;\n"
+            "    }\n"
+            "}\n"
+        )
+        lang, confidence = detect_language(code)
+        assert lang == CodeLanguage.PHP
+        assert confidence > 0.0
+
+    def test_phtml_alias_coerces_to_php(self):
+        assert coerce_language("phtml") == CodeLanguage.PHP
+        assert coerce_language("php8") == CodeLanguage.PHP
+
+    def test_malformed_php_passes_through_unchanged(self):
+        code = "<?php\nclass Broken {\n    public function oops( {\n"
+        result = self._compressor().compress(code, language="php")
+        assert result.compressed == code

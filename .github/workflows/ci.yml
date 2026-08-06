@@ -43,7 +43,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
-      e2e: ${{ steps.filter.outputs.e2e }}
+      native: ${{ steps.filter.outputs.native }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      packaging: ${{ steps.filter.outputs.packaging }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
       - uses: actions/checkout@v7
@@ -61,14 +63,40 @@ jobs:
               - 'tests/**'
               - 'scripts/**'
               - '.github/workflows/**'
-            e2e:
-              - 'headroom/**'
+            # native = anything that can change the compiled wrapper, the native
+            # install flow, or the docker image (drives the scarce macOS/Windows
+            # runners + docker E2E). A pure-Python logic change hits none of these.
+            native:
+              - 'headroom/cli/**'
+              - 'headroom/install/**'
+              - 'headroom/providers/**'
               - 'crates/**'
+              - '**/*.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'docker/**'
               - 'Dockerfile'
               - 'e2e/**'
               - 'scripts/install*'
               - 'pyproject.toml'
+              - '.github/workflows/**'
+            dashboard:
+              - 'headroom/dashboard/**'
+              - '.github/workflows/**'
+            # packaging = anything that changes how the wheel is built (so the
+            # cross-platform wheel build only reruns when the build actually changes).
+            packaging:
+              - 'pyproject.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'uv.lock'
+              - 'rust-toolchain.toml'
+              - 'crates/**'
+              - '**/*.rs'
+              - 'scripts/**'
+              - 'MANIFEST.in'
+              - '.github/workflows/**'
             workflows:
               - '.github/workflows/**'
 
@@ -88,7 +116,10 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-lint-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-lint-
-      - run: python -m pip install --upgrade pip "ruff==0.15.17" "mypy==1.20.2"
+      - name: Verify Ruff version alignment
+        id: ruff-version
+        run: echo "version=$(python scripts/verify-ruff-version.py --print-version)" >> "$GITHUB_OUTPUT"
+      - run: python -m pip install --upgrade pip "ruff==${{ steps.ruff-version.outputs.version }}" "mypy==1.20.2"
       - name: ruff check
         run: ruff check .
       - name: ruff format --check
@@ -122,7 +153,7 @@ jobs:
 
   build-wheel-windows:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.packaging == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -262,6 +293,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: coverage-${{ matrix.shard }}.xml
+          disable_search: true
           flags: python
           name: python-shard-${{ matrix.shard }}
           # Token is sent so uploads authenticate once the repo is activated on
@@ -354,7 +386,7 @@ jobs:
 
   test-dashboard-ui:
     needs: [changes, build-wheel]
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.dashboard == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -474,7 +506,7 @@ jobs:
 
   docker-native-e2e:
     needs: changes
-    if: needs.changes.outputs.e2e == 'true'
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -518,7 +550,7 @@ jobs:
 
   windows-native-wrapper:
     needs: changes
-    if: needs.changes.outputs.e2e == 'true'
+    if: needs.changes.outputs.native == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -535,7 +567,7 @@ jobs:
 
   macos-native-wrapper:
     needs: changes
-    if: needs.changes.outputs.e2e == 'true'
+    if: needs.changes.outputs.native == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
     steps:

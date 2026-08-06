@@ -15,6 +15,7 @@ import pytest
 from headroom.proxy.helpers import (
     _model_supports_openai_tool_search,
     inject_tool_search_deferral_openai,
+    openai_tool_search_client_supported,
 )
 
 
@@ -55,6 +56,35 @@ def test_env_override_wins_then_falls_back(monkeypatch):
 
 
 # --- deferral behavior -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("client", "supported"),
+    [(None, True), ("codex", False), (" CODEX ", False), ("opencode", True), ("claude", True)],
+)
+def test_client_supported(client, supported):
+    assert openai_tool_search_client_supported(client) is supported
+
+
+def test_codex_client_does_not_inject():
+    tools = _tools()
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client="codex")
+
+    assert out is tools
+    assert all(tool.get("type") != "tool_search" for tool in out)
+    assert all("defer_loading" not in tool for tool in out)
+
+
+@pytest.mark.parametrize("client", [None, "opencode"])
+def test_supported_clients_still_inject(client):
+    tools = _tools()
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client=client)
+
+    assert out is not tools
+    assert out[0] == {"type": "tool_search"}
+    assert any(tool.get("defer_loading") is True for tool in out)
 
 
 def test_defers_non_core_and_injects_search_tool():
@@ -143,3 +173,17 @@ def test_noop_when_nothing_deferrable():
 
 def test_noop_for_non_list():
     assert inject_tool_search_deferral_openai(None, "gpt-5.5") is None
+
+
+def test_resident_names_match_case_insensitively():
+    # The resident-name sets are lowercase; clients are not required to be. An
+    # exact match deferred every tool for a PascalCase client, including its own
+    # tool-search tool. Mirrors the Anthropic-side fix.
+    tools = [_fn(n) for n in ("Bash", "Read", "Edit", "Terminal", "ToolSearch")] + [
+        _fn(f"slack_{i}") for i in range(10)
+    ]
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5")
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    for name in ("Bash", "Read", "Edit", "Terminal", "ToolSearch"):
+        assert by_name[name].get("defer_loading") is None, name
+    assert by_name["slack_0"].get("defer_loading") is True

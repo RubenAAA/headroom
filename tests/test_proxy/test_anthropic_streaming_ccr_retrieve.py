@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,6 +14,7 @@ httpx = pytest.importorskip("httpx")
 
 from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.requests import Request  # noqa: E402
 
 from headroom.cache.compression_store import get_compression_store  # noqa: E402
 from headroom.ccr.tool_injection import create_ccr_tool_definition  # noqa: E402
@@ -47,6 +50,10 @@ def _message_response(content: list[dict], *, stop_reason: str = "end_turn") -> 
             "cache_creation_input_tokens": 0,
         },
     }
+
+
+def _is_client_visible_sse(body: bytes) -> bool:
+    return b"event:" in body or b"data:" in body
 
 
 class _ContinuationClient:
@@ -223,7 +230,12 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
     proxy._stream_response.assert_not_awaited()
 
 
-def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
+def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
+    """LEGAL mixed turn (#839, #2089): headroom_retrieve emitted alongside a
+    client tool. The proxy cannot synthesize the client tool_result, so it must
+    hand the turn back for the client to resolve — a 200 SSE stream preserving
+    BOTH tool_use blocks, matching the non-streaming path. It must NOT 502 and
+    must NOT issue a continuation request."""
     config = _make_config()
     initial_response = _message_response(
         [
@@ -247,6 +259,9 @@ def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
         app = create_app(config)
         with TestClient(app) as client:
             proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                side_effect=AssertionError("live streaming path should not be used")
+            )
             continuation_client = _ContinuationClient(_message_response([]))
             proxy.http_client = continuation_client
 
@@ -275,9 +290,325 @@ def test_mixed_ccr_and_client_tool_does_not_issue_continuation() -> None:
                 },
             )
 
-    assert resp.status_code == 502, resp.text
+    assert resp.status_code == 200, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    assert "headroom_retrieve" not in resp.text
-    assert "client_tool" not in resp.text
-    assert "Unable to safely complete streamed CCR retrieval" in resp.text
+    # Both tool_use blocks are preserved for the client to resolve.
+    assert "headroom_retrieve" in resp.text
+    assert "client_tool" in resp.text
+    assert "toolu_ccr" in resp.text
+    assert "toolu_client" in resp.text
+    assert "Unable to safely complete streamed CCR retrieval" not in resp.text
+    # No continuation is issued — the client resolves all tool calls.
     assert continuation_client.post_calls == []
+
+
+def test_unresolved_ccr_only_streams_through_as_200() -> None:
+    """CCR-only turn that never resolves: the model keeps re-emitting
+    headroom_retrieve so the continuation exhausts its retrieval rounds with a
+    residual marker and no accompanying client tool. Per #2089 the streaming
+    path streams the residual headroom_retrieve back as a 200 SSE so the client
+    can resolve or retry it, matching the non-streaming path."""
+    config = _make_config()
+    persistent_ccr = _message_response(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_ccr",
+                "name": "headroom_retrieve",
+                "input": {"hash": "deadbeef"},
+            },
+        ],
+        stop_reason="tool_use",
+    )
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                side_effect=AssertionError("live streaming path should not be used")
+            )
+            # Every continuation re-emits headroom_retrieve, so it never resolves.
+            continuation_client = _ContinuationClient(persistent_ccr)
+            proxy.http_client = continuation_client
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                return httpx.Response(200, json=persistent_ccr)
+
+            proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+            resp = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": "use tools"}],
+                },
+            )
+
+    assert resp.status_code == 200, resp.text
+    assert "text/event-stream" in resp.headers["content-type"]
+    assert "headroom_retrieve" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_buffered_ccr_emits_keepalive_before_delayed_upstream() -> None:
+    config = _make_config()
+    final_response = _message_response([{"type": "text", "text": "done"}])
+    started = asyncio.Event()
+    release = asyncio.Event()
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [create_ccr_tool_definition("anthropic")],
+        "messages": [{"role": "user", "content": "wait"}],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", b"test-key"), (b"anthropic-version", b"2023-06-01")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app):
+            proxy = app.state.proxy
+
+            async def delayed_retry(*args, **kwargs):  # noqa: ANN002, ANN003
+                started.set()
+                await release.wait()
+                return httpx.Response(200, json=final_response)
+
+            proxy._retry_request = delayed_retry
+            task = asyncio.create_task(proxy.handle_anthropic_messages(Request(scope, receive)))
+            await started.wait()
+            response = await asyncio.wait_for(asyncio.shield(task), 1)
+            events: list[dict] = []
+            first_visible_body = asyncio.Event()
+
+            async def send(message):  # noqa: ANN001
+                events.append(message)
+                if message["type"] == "http.response.body" and _is_client_visible_sse(
+                    message["body"]
+                ):
+                    first_visible_body.set()
+
+            response_task = asyncio.create_task(response(scope, receive, send))
+            await asyncio.wait_for(first_visible_body.wait(), 2)
+            assert not release.is_set()
+            release.set()
+            await response_task
+
+    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
+    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
+    assert b"done" in b"".join(bodies)
+
+
+@pytest.mark.asyncio
+async def test_buffered_ccr_preserves_early_failure_status_and_headers() -> None:
+    config = _make_config()
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [create_ccr_tool_definition("anthropic")],
+        "messages": [{"role": "user", "content": "fail early"}],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", b"test-key"), (b"anthropic-version", b"2023-06-01")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app):
+            proxy = app.state.proxy
+
+            async def early_failure(*args, **kwargs):  # noqa: ANN002, ANN003
+                await asyncio.sleep(0.05)
+                return httpx.Response(
+                    429,
+                    headers={"retry-after": "7"},
+                    json={"error": {"message": "slow down"}},
+                )
+
+            proxy._retry_request = early_failure
+            response = await proxy.handle_anthropic_messages(Request(scope, receive))
+            events: list[dict] = []
+
+            async def send(message):  # noqa: ANN001
+                events.append(message)
+
+            await response(scope, receive, send)
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    assert start["status"] == 429
+    assert headers[b"retry-after"] == b"7"
+    assert b": headroom-keepalive\n\n" not in b"".join(
+        event["body"] for event in events if event["type"] == "http.response.body"
+    )
+
+
+@pytest.mark.asyncio
+async def test_buffered_ccr_late_failure_emits_sanitized_error_event() -> None:
+    config = _make_config()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [create_ccr_tool_definition("anthropic")],
+        "messages": [{"role": "user", "content": "wait"}],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", b"test-key"), (b"anthropic-version", b"2023-06-01")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app):
+            proxy = app.state.proxy
+            proxy_logger = logging.getLogger("headroom.proxy")
+            error_records: list[logging.LogRecord] = []
+            log_handler = logging.Handler()
+            log_handler.setLevel(logging.ERROR)
+            log_handler.emit = error_records.append
+            proxy_logger.addHandler(log_handler)
+
+            async def delayed_failure(*args, **kwargs):  # noqa: ANN002, ANN003
+                started.set()
+                await release.wait()
+                raise RuntimeError("boom")
+
+            with patch.object(
+                proxy.metrics, "record_failed", new_callable=AsyncMock
+            ) as record_failed:
+                proxy._retry_request = delayed_failure
+                task = asyncio.create_task(proxy.handle_anthropic_messages(Request(scope, receive)))
+                await started.wait()
+                response = await asyncio.wait_for(asyncio.shield(task), 1)
+                events: list[dict] = []
+                first_body = asyncio.Event()
+
+                async def send(message):  # noqa: ANN001
+                    events.append(message)
+                    if message["type"] == "http.response.body" and message["body"]:
+                        first_body.set()
+
+                response_task = asyncio.create_task(response(scope, receive, send))
+                await asyncio.wait_for(first_body.wait(), 2)
+                release.set()
+                await response_task
+                record_failed.assert_awaited_once_with(provider="anthropic")
+            proxy_logger.removeHandler(log_handler)
+
+    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
+    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
+    assert b"An error occurred while processing the request." in bodies[-1]
+    assert b"boom" not in bodies[-1]
+    assert events[-1]["more_body"] is False
+    assert any(
+        record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage()
+        for record in error_records
+    )
+
+
+@pytest.mark.asyncio
+async def test_buffered_ccr_pre_keepalive_exception_returns_json_error() -> None:
+    config = _make_config()
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [create_ccr_tool_definition("anthropic")],
+        "messages": [{"role": "user", "content": "fail before keepalive"}],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", b"test-key"), (b"anthropic-version", b"2023-06-01")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app):
+            proxy = app.state.proxy
+
+            async def early_exception(*args, **kwargs):  # noqa: ANN002, ANN003
+                raise RuntimeError("boom")
+
+            proxy._retry_request = early_exception
+            response = await proxy.handle_anthropic_messages(Request(scope, receive))
+            events: list[dict] = []
+
+            async def send(message):  # noqa: ANN001
+                events.append(message)
+
+            await response(scope, receive, send)
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
+    assert start["status"] == 502
+    assert dict(start["headers"])[b"content-type"] == b"application/json"
+    payload = json.loads(bodies[-1].decode())
+    assert (
+        payload["error"]["message"]
+        == "An error occurred while processing your request. Please try again."
+    )

@@ -225,17 +225,41 @@ class BatchHandlerMixin:
                     optimized_messages
                 )
 
-                # Restore preserved content entries that had non-text parts
-                for orig_idx, original_content in preserved_contents.items():
-                    if orig_idx < len(optimized_contents):
-                        optimized_contents[orig_idx] = original_content
+                # Restore preserved (non-text) entries at their ORIGINAL positions.
+                # preserved_indices are indices into the original contents[], but
+                # optimized_contents lives in a shorter index space (text-less
+                # entries produced no message), so indexing it by orig_idx
+                # overwrites the wrong entry and drops any preserved entry whose
+                # original index is >= len(optimized_contents). Use the shared
+                # interleaving helper the non-batch Gemini handlers already use
+                # (#836).
+                optimized_contents = self._rebuild_gemini_contents(
+                    contents, preserved_indices, preserved_contents, optimized_contents
+                )
 
                 # Create compressed batch request
                 compressed_req_content = {**req_content, "contents": optimized_contents}
                 if optimized_sys_inst:
                     compressed_req_content["systemInstruction"] = optimized_sys_inst
                 if existing_funcs is not None:
-                    compressed_req_content["tools"] = [{"functionDeclarations": existing_funcs}]
+                    # Preserve sibling tool configs (googleSearch, codeExecution,
+                    # ...) that live alongside functionDeclarations in the tools
+                    # array. Replace only the functionDeclarations entry with the
+                    # (possibly CCR-injected) funcs and append a new entry when the
+                    # original had none, instead of collapsing the whole array to a
+                    # single functionDeclarations entry (which dropped the siblings
+                    # and silently disabled Google Search / code execution).
+                    rebuilt_tools = []
+                    replaced = False
+                    for tool in tools or []:
+                        if "functionDeclarations" in tool:
+                            rebuilt_tools.append({**tool, "functionDeclarations": existing_funcs})
+                            replaced = True
+                        else:
+                            rebuilt_tools.append(tool)
+                    if not replaced:
+                        rebuilt_tools.append({"functionDeclarations": existing_funcs})
+                    compressed_req_content["tools"] = rebuilt_tools
 
                 compressed_req = {
                     "request": compressed_req_content,

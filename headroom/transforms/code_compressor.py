@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -102,6 +103,9 @@ def _tree_sitter_importable() -> bool:
         return False
 
 
+_UNSAFE_TREE_SITTER_LANGUAGES: frozenset[str] = frozenset({"perl"})
+
+
 def _get_parser(language: str) -> Any:
     """Get a tree-sitter parser for the given language.
 
@@ -129,6 +133,8 @@ def _get_parser(language: str) -> Any:
         ImportError: If tree-sitter is not installed.
         ValueError: If language is not supported.
     """
+    if language in _UNSAFE_TREE_SITTER_LANGUAGES:
+        raise ValueError(f"Language '{language}' is quarantined for code-aware compression.")
     # NOTE: guard on importability (not _check_tree_sitter_available), because
     # _check_tree_sitter_available now performs a real end-to-end parse via
     # _get_parser; guarding on it here would recurse.
@@ -161,7 +167,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, perl. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, php. "
                 f"Error: {e}"
             ) from e
 
@@ -217,6 +223,7 @@ class CodeLanguage(Enum):
     CPP = "cpp"
     PERL = "perl"
     CSHARP = "csharp"
+    PHP = "php"
     UNKNOWN = "unknown"
 
 
@@ -241,6 +248,10 @@ _LANGUAGE_ALIASES: dict[str, CodeLanguage] = {
     "cc": CodeLanguage.CPP,
     "hpp": CodeLanguage.CPP,
     "pl": CodeLanguage.PERL,
+    "phtml": CodeLanguage.PHP,
+    "php5": CodeLanguage.PHP,
+    "php7": CodeLanguage.PHP,
+    "php8": CodeLanguage.PHP,
 }
 
 
@@ -455,6 +466,23 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         container_node_types=frozenset({"namespace_declaration"}),
         opaque_node_types=frozenset({"preproc_if"}),
     ),
+    CodeLanguage.PHP: LangConfig(
+        import_nodes=frozenset({"namespace_use_declaration"}),
+        function_nodes=frozenset({"function_definition", "method_declaration"}),
+        class_nodes=frozenset({"class_declaration", "interface_declaration", "trait_declaration"}),
+        type_nodes=frozenset({"enum_declaration"}),
+        body_node_types=frozenset({"compound_statement"}),
+        decorator_node=None,
+        comment_prefix="//",
+        uses_colon_after_signature=False,
+        # Statement-scoped `namespace App;` hoists to the top of the output
+        # (before the use declarations); the rarer block-scoped
+        # `namespace A { ... }` form takes the same path and is preserved
+        # verbatim — valid output, no compression inside the block.
+        package_node="namespace_definition",
+        detection_hints=("<?php", "function ", "namespace ", "->", "$this"),
+        class_body_node_types=frozenset({"declaration_list"}),
+    ),
 }
 
 
@@ -660,6 +688,16 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         ),
         re.compile(r"\bget;\s*set;", re.MULTILINE),
     ],
+    CodeLanguage.PHP: [
+        re.compile(r"<\?php\b"),
+        re.compile(r"^\s*namespace\s+[\w\\]+\s*;", re.MULTILINE),
+        re.compile(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;", re.MULTILINE),
+        re.compile(
+            r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\(",
+            re.MULTILINE,
+        ),
+        re.compile(r"\$this->|->\w+\s*\(", re.MULTILINE),
+    ],
 }
 
 
@@ -713,6 +751,23 @@ def detect_language(code: str) -> tuple[CodeLanguage, float]:
     if CodeLanguage.CPP in candidates and CodeLanguage.C in candidates:
         if candidates[CodeLanguage.CPP] >= 2:
             candidates[CodeLanguage.C] = 0
+
+    # Disambiguation: PHP's sigil variables ($x) overlap Perl's prefilter.
+    # An explicit `<?php` open tag is unambiguous — no Perl source contains
+    # it, so drop Perl from the candidates before the Perl-dominance guard
+    # below returns UNKNOWN for what is actually PHP.
+    if CodeLanguage.PHP in candidates and "<?php" in sample:
+        candidates.pop(CodeLanguage.PERL, None)
+
+    perl_score = candidates.get(CodeLanguage.PERL, 0)
+    if perl_score > 0:
+        best_non_perl = max(
+            (score for lang, score in candidates.items() if lang != CodeLanguage.PERL),
+            default=0,
+        )
+        if perl_score > best_non_perl:
+            return CodeLanguage.UNKNOWN, 0.0
+        candidates.pop(CodeLanguage.PERL, None)
 
     # Phase 2: If tree-sitter available, parse with candidates and pick fewest errors
     if _check_tree_sitter_available():
@@ -1142,6 +1197,19 @@ class CodeAwareCompressor(Transform):
                     language_confidence=0.0,
                     syntax_valid=True,
                 )
+        if detected_lang == CodeLanguage.PERL:
+            if self.config.fallback_to_kompress:
+                return self._fallback_compress(code, original_tokens)
+            return CodeCompressionResult(
+                compressed=code,
+                original=code,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                compression_ratio=1.0,
+                language=detected_lang,
+                language_confidence=confidence,
+                syntax_valid=True,
+            )
 
         # Check if tree-sitter is available
         if not _check_tree_sitter_available():
@@ -1168,6 +1236,20 @@ class CodeAwareCompressor(Transform):
 
             # Verify syntax validity (checks both ERROR and MISSING nodes)
             syntax_valid = self._verify_syntax(compressed, detected_lang)
+            original_syntax_valid = True
+
+            if not syntax_valid and detected_lang == CodeLanguage.PYTHON:
+                original_syntax_valid = self._verify_syntax(code, detected_lang)
+                if original_syntax_valid:
+                    compressed, structure, symbol_scores = self._compress_with_ast(
+                        code,
+                        detected_lang,
+                        context,
+                        tokenizer,
+                        recover_invalid_python_nodes=True,
+                    )
+                    compressed_tokens = self._estimate_tokens(compressed, tokenizer)
+                    syntax_valid = self._verify_syntax(compressed, detected_lang)
 
             # If syntax invalid, return original (never serve broken code)
             if not syntax_valid:
@@ -1266,6 +1348,7 @@ class CodeAwareCompressor(Transform):
         language: CodeLanguage,
         context: str,
         tokenizer: Tokenizer | None = None,
+        recover_invalid_python_nodes: bool = False,
     ) -> tuple[str, CodeStructure, dict[str, float]]:
         """Compress code using AST parsing with symbol importance analysis.
 
@@ -1284,6 +1367,23 @@ class CodeAwareCompressor(Transform):
         parser = _get_parser(language.value)
         tree = parser.parse(bytes(code, "utf-8"))
         root = tree.root_node
+        candidate_validator: Callable[[Any, str], str] | None = None
+
+        if recover_invalid_python_nodes and language == CodeLanguage.PYTHON:
+            code_bytes = code.encode("utf-8")
+
+            def candidate_validator(node: Any, candidate_text: str) -> str:
+                original_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
+                if candidate_text == original_text:
+                    return candidate_text
+                candidate_module = (
+                    code_bytes[: node.start_byte]
+                    + candidate_text.encode("utf-8")
+                    + code_bytes[node.end_byte :]
+                ).decode("utf-8")
+                if self._verify_syntax(candidate_module, CodeLanguage.PYTHON):
+                    return candidate_text
+                return original_text
 
         # Analyze symbol importance and allocate compression budget
         analysis = self._analyze_symbol_importance(root, code, language, context)
@@ -1293,7 +1393,13 @@ class CodeAwareCompressor(Transform):
         lang_config = _LANG_CONFIGS.get(language)
         if lang_config:
             structure = self._extract_structure(
-                root, code, language, lang_config, body_limits, analysis
+                root,
+                code,
+                language,
+                lang_config,
+                body_limits,
+                analysis,
+                candidate_validator=candidate_validator,
             )
         else:
             structure = self._extract_generic_structure(root, code)
@@ -1323,6 +1429,7 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        candidate_validator: Callable[[Any, str], str] | None = None,
     ) -> CodeStructure:
         """Extract structure from AST using data-driven language config.
 
@@ -1331,6 +1438,11 @@ class CodeAwareCompressor(Transform):
         """
         structure = CodeStructure()
         captured_byte_ranges: list[tuple[int, int]] = []
+
+        def _validated_candidate(node: Any, compressed: str) -> str:
+            if candidate_validator is None:
+                return compressed
+            return candidate_validator(node, compressed)
 
         def visit(node: Any) -> None:
             node_type = node.type
@@ -1368,7 +1480,11 @@ class CodeAwareCompressor(Transform):
                         export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
                         export_suffix = _slice_code_bytes(code, child.end_byte, node.end_byte)
                         structure.function_signatures.append(
-                            leading + export_prefix + compressed + export_suffix
+                            leading
+                            + _validated_candidate(
+                                node,
+                                export_prefix + compressed + export_suffix,
+                            )
                         )
                         break
                 if not has_func_or_class:
@@ -1393,16 +1509,21 @@ class CodeAwareCompressor(Transform):
                             child, code, language, lang_config, body_limits, analysis
                         )
                 if decorator_text and definition_compressed:
-                    full_def = leading + "\n".join(decorator_text) + "\n" + definition_compressed
+                    full_def = _validated_candidate(
+                        node,
+                        "\n".join(decorator_text) + "\n" + definition_compressed,
+                    )
                     # Route to correct list based on inner definition type
                     for child in node.children:
                         if child.type in lang_config.class_nodes:
-                            structure.class_definitions.append(full_def)
+                            structure.class_definitions.append(leading + full_def)
                             break
                     else:
-                        structure.function_signatures.append(full_def)
+                        structure.function_signatures.append(leading + full_def)
                 elif definition_compressed:
-                    structure.function_signatures.append(leading + definition_compressed)
+                    structure.function_signatures.append(
+                        leading + _validated_candidate(node, definition_compressed)
+                    )
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1412,7 +1533,9 @@ class CodeAwareCompressor(Transform):
                 compressed = self._compress_function_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.function_signatures.append(leading + compressed)
+                structure.function_signatures.append(
+                    leading + _validated_candidate(node, compressed)
+                )
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1420,7 +1543,7 @@ class CodeAwareCompressor(Transform):
                 compressed = self._compress_class_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.class_definitions.append(compressed)
+                structure.class_definitions.append(_validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1430,7 +1553,7 @@ class CodeAwareCompressor(Transform):
                 compressed = self._compress_class_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.class_definitions.append(leading + compressed)
+                structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 trailing_semicolon = _get_same_line_trailing_semicolon(node)
                 if trailing_semicolon is not None:

@@ -25,8 +25,11 @@ MODEL_ALIASES: dict[str, str] = {
     # Claude 3.5 Sonnet retired Feb 2026, pricing same as claude-sonnet-4-20250514
     "claude-3-5-sonnet-20241022": "claude-sonnet-4-20250514",
     "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
-    # Claude 3 Sonnet retired
-    "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
+    # Claude 3 Sonnet retired. It was a Sonnet-tier model ($3/$15 per 1M
+    # in/out) — same price as claude-sonnet-4-20250514 — so alias it there.
+    # The old target, claude-3-haiku-20240307 ($0.25/$1.25), is a different
+    # (Haiku) tier and underpriced every cost/savings figure ~12x.
+    "claude-3-sonnet-20240229": "claude-sonnet-4-20250514",
 }
 
 
@@ -67,13 +70,30 @@ def resolution_candidates(model: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(candidates))
 
 
+def unwrapped_model_forms(model: str) -> tuple[str, ...]:
+    """Progressively drop leading gateway segments: ``a/b/c`` -> ``b/c``, ``c``.
+
+    A gateway-routed name wraps the real model id, and ``litellm.model_cost`` keys
+    the *unwrapped* form -- e.g. it has ``anthropic.claude-3-5-sonnet-20241022-v2:0``
+    but not ``bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0``. Deriving the
+    forms by splitting on ``/`` avoids maintaining yet another list of gateway
+    prefixes, and costs nothing when wrong: each candidate is an exact dict
+    lookup, so a bad guess simply misses.
+    """
+    parts = model.split("/")
+    return tuple("/".join(parts[i:]) for i in range(1, len(parts)))
+
+
 def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM model_cost keys to try for pricing lookup."""
     candidates = [model]
     candidates.extend(f"{prefix}{model}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
-    alias = MODEL_ALIASES.get(model)
-    if alias:
-        candidates.append(alias)
+    # Unwrapped forms come after the prefixed ones so existing precedence is
+    # unchanged for names that already resolved.
+    candidates.extend(unwrapped_model_forms(model))
+    candidates.extend(
+        alias for candidate in tuple(candidates) if (alias := MODEL_ALIASES.get(candidate))
+    )
     return tuple(dict.fromkeys(candidates))
 
 

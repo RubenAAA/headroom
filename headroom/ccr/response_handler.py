@@ -30,6 +30,25 @@ from .tool_injection import CCR_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
+# Residual-CCR status signals (provider-generic).
+#
+# ``handle_response`` may return a response that still contains
+# ``headroom_retrieve`` tool calls. Callers need to know *why* so they can
+# decide whether that is a safe passthrough or a genuine failure:
+#
+# - RESIDUAL_CCR_RESOLVED:       no CCR tool calls remain — fully handled.
+# - RESIDUAL_CCR_SKIPPED_MIXED:  CCR was intentionally skipped because the model
+#                                emitted headroom_retrieve alongside a non-CCR
+#                                client tool (#839). The client must resolve both
+#                                tool calls; the proxy must pass the turn through
+#                                unchanged (200), not fail closed.
+# - RESIDUAL_CCR_ERROR:          CCR tool calls remain with no accompanying client
+#                                tool — i.e. a real conversion/handling failure the
+#                                proxy could not resolve. Callers should fail closed.
+RESIDUAL_CCR_RESOLVED = "resolved"
+RESIDUAL_CCR_SKIPPED_MIXED = "skipped_mixed_tools"
+RESIDUAL_CCR_ERROR = "error"
+
 
 @dataclass
 class CCRToolResult:
@@ -109,6 +128,33 @@ class CCRResponseHandler:
             True if response contains headroom_retrieve tool calls.
         """
         return has_ccr_tool_calls(response, provider)
+
+    def residual_ccr_status(
+        self,
+        response: dict[str, Any],
+        provider: str = "anthropic",
+    ) -> str:
+        """Classify why (if at all) CCR tool calls remain in a handled response.
+
+        This is a stateless, provider-generic signal derived from the same
+        parsing ``handle_response`` uses, so it stays correct under concurrency
+        and works identically for every provider/harness.
+
+        Returns one of:
+        - ``RESIDUAL_CCR_RESOLVED``: no headroom_retrieve tool calls remain.
+        - ``RESIDUAL_CCR_SKIPPED_MIXED``: headroom_retrieve remains *alongside*
+          a non-CCR client tool call. This is an intentional skip (#839) — the
+          proxy cannot synthesize the client tool_result, so the turn must be
+          handed back to the client unchanged rather than failed closed.
+        - ``RESIDUAL_CCR_ERROR``: headroom_retrieve remains with no accompanying
+          client tool call — a genuine handling/conversion failure.
+        """
+        ccr_calls, other_calls = self._parse_ccr_tool_calls(response, provider)
+        if not ccr_calls:
+            return RESIDUAL_CCR_RESOLVED
+        if other_calls:
+            return RESIDUAL_CCR_SKIPPED_MIXED
+        return RESIDUAL_CCR_ERROR
 
     def _extract_tool_calls(
         self,
@@ -333,7 +379,15 @@ class CCRResponseHandler:
                 "content": response.get("content", []),
             }
         elif provider == "openai":
-            message = response.get("choices", [{}])[0].get("message", {})
+            # Guard an empty/malformed ``choices`` the same way the Google branch
+            # below (and ccr/tool_calls.py) already do: ``response.get("choices",
+            # [{}])`` only falls back when the key is absent, so a present-but-
+            # empty ``choices: []`` (or ``[null]``) — which OpenAI-compatible
+            # gateways can send on a content-filtered/usage-only response — made
+            # ``[0]`` raise IndexError (or ``.get`` raise on a non-dict).
+            choices = response.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else {}
+            message = first.get("message", {}) if isinstance(first, dict) else {}
             return {
                 "role": "assistant",
                 "content": message.get("content"),
@@ -757,9 +811,11 @@ class StreamingCCRHandler:
                 if dtype == "text_delta":
                     target["text"] = target.get("text", "") + delta.get("text", "")
                 elif dtype == "input_json_delta":
-                    if target.get("type") == "tool_use":
-                        partial = delta.get("partial_json", "")
-                        target["_partial_json"] = target.get("_partial_json", "") + partial
+                    # Accumulate for any block streaming input (tool_use AND
+                    # server_tool_use); the stop handler parses it into `input`
+                    # (#2438).
+                    partial = delta.get("partial_json", "")
+                    target["_partial_json"] = target.get("_partial_json", "") + partial
                 elif dtype == "thinking_delta":
                     target["thinking_buffer"] = target.get("thinking_buffer", "") + delta.get(
                         "thinking", ""
@@ -776,13 +832,17 @@ class StreamingCCRHandler:
                 idx = event.get("index")
                 target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
                 if target is not None:
-                    if target.get("type") == "tool_use" and "_partial_json" in target:
-                        partial = target.pop("_partial_json", "")
-                        if partial:
-                            try:
-                                target["input"] = json.loads(partial)
-                            except json.JSONDecodeError:
-                                target["input"] = {}
+                    # Parse streamed `_partial_json` into `input` for any block
+                    # that carried input_json_delta — tool_use AND
+                    # server_tool_use — not just tool_use. The narrow type gate
+                    # left server_tool_use.input malformed and leaked the scratch
+                    # key into replayed history (#2438). Always strip the key.
+                    if "_partial_json" in target:
+                        partial = target.pop("_partial_json")
+                        try:
+                            target["input"] = json.loads(partial) if partial else {}
+                        except json.JSONDecodeError:
+                            target["input"] = {}
                     if target.get("type") == "thinking" and "thinking_buffer" in target:
                         target["thinking"] = target.pop("thinking_buffer")
                     if target not in response["content"]:

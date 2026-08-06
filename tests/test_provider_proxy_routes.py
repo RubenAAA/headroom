@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.providers.codex.runtime import CodexRoutingDecision
+from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
@@ -479,6 +480,31 @@ def test_openai_response_websocket_aliases_delegate_to_openai_ws_handler(monkeyp
         "/backend-api/responses",
         "/backend-api/codex/responses",
     ]
+
+
+def test_project_prefixed_openai_response_websocket_delegates_to_openai_ws_handler(
+    monkeypatch,
+) -> None:
+    seen_paths: list[str] = []
+    seen_projects: list[str | None] = []
+
+    async def fake_ws(self, websocket):  # type: ignore[no-untyped-def]
+        seen_paths.append(websocket.url.path)
+        seen_projects.append(get_current_project())
+        await websocket.accept()
+        await websocket.send_json({"path": websocket.url.path})
+        await websocket.close()
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_responses_ws", fake_ws)
+
+    with TestClient(_app()) as client:
+        with client.websocket_connect("/p/test-project/v1/responses") as websocket:
+            assert websocket.receive_json() == {"path": "/v1/responses"}
+
+    assert seen_paths == ["/v1/responses"]
+    # The /p/<name> prefix is bound as the project even without a header, so a
+    # prefix-only Codex WS client is still attributed (not just routed).
+    assert seen_projects == ["test-project"]
 
 
 def test_openai_response_subpath_passthrough_returns_502_on_http_failure() -> None:

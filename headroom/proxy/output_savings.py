@@ -50,6 +50,9 @@ from .output_savings_policy import (
     conversation_key_from_body as conversation_key_from_body,
 )
 from .output_savings_policy import (
+    conversation_key_from_responses_body as conversation_key_from_responses_body,
+)
+from .output_savings_policy import (
     input_bucket as input_bucket,
 )
 from .output_savings_policy import (
@@ -383,6 +386,26 @@ class SavingsRecorder:
                     self._flush_locked()
             return True
         return False
+
+    def estimate_request_savings(self, labels: Any, output_tokens: int) -> int:
+        """Per-request output tokens saved, for the savings rollup.
+
+        For a treatment request, the synthetic-control estimate
+        ``max(0, baseline_mean(stratum) - output_tokens)``; 0 for control,
+        unknown strata, or when no shaping label is present. Read-only:
+        unlike ``record_from_labels`` it does not mutate the ledger, so the
+        two compose without double-counting."""
+        for label in labels or ():
+            parsed = parse_stratum_label(str(label))
+            if parsed is None:
+                continue
+            arm, key = parsed
+            if arm != "treatment":
+                return 0
+            with self._lock:
+                mean, _var, n = self._ledger.baseline.lookup(key)
+            return max(0, int(round(mean - output_tokens))) if n > 0 else 0
+        return 0
 
     def _reload_baseline_locked(self) -> None:
         """Adopt the on-disk baseline written by ``learn --verbosity --apply``.

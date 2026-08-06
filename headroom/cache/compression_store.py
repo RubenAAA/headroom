@@ -324,6 +324,36 @@ class CompressionStore:
             # deterministically under whichever function is in use.
             hash_key = hashlib.sha256(original.encode()).hexdigest()[:24]
 
+        # Refuse to persist a bare CCR marker as an entry's "original"
+        # (#2694). A marker is a *pointer* to content, never content: an
+        # entry like `hash=abc123 -> "<<ccr:abc123,base64,2.0KB>>"` answers a
+        # retrieve with the very placeholder the caller is trying to resolve,
+        # and (worse) can overwrite a good entry with a useless one. Any
+        # producer that gets here has lost the source bytes upstream, so fail
+        # loudly rather than silently converting "retrievable" into "gone".
+        # Narrow by design: only a *bare* marker is rejected. Legitimate
+        # originals may legally CONTAIN markers (nested offloads, a tool that
+        # echoed one), and refusing those would drop recoverable data.
+        #
+        # The rejected value is never echoed into the log. It is provably a
+        # bare marker here, but `original` is the store's credential-bearing
+        # payload in the general case (this issue was reported against an
+        # OAuth token), and an error path is exactly where that sort of leak
+        # survives review. `hash_key` already identifies the entry.
+        stripped = original.strip()
+        if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
+            logger.error(
+                "CCR store: refusing to persist a bare retrieval marker as "
+                "original_content (hash=%s tool=%s strategy=%s len=%d) — the "
+                "producer lost the source bytes; retrieval for this hash will "
+                "miss instead of returning a placeholder",
+                hash_key,
+                tool_name,
+                compression_strategy,
+                len(stripped),
+            )
+            return hash_key
+
         entry = CompressionEntry(
             hash=hash_key,
             original_content=original,
@@ -347,16 +377,22 @@ class CompressionStore:
             self.process_pending_feedback()
 
         with self._lock:
-            self._evict_if_needed()
-
-            # CRITICAL FIX: Hash collision detection
-            # If hash already exists with DIFFERENT content, log a warning.
-            # This indicates either a hash collision or duplicate store calls.
+            # Decide whether this is a NEW key before evicting. Evicting to make
+            # room only applies to a genuinely new entry; a re-store of an
+            # existing key overwrites in place (no room needed). Evicting first
+            # for a duplicate would needlessly destroy a live, unrelated entry
+            # and drop the store below capacity, making that entry's <<ccr:...>>
+            # marker (still sitting in the conversation) unredeemable — a 404.
+            # The CCR mirror bridge re-stores the same explicit_hash on every
+            # turn a marker is re-encountered, so duplicate stores are common.
             existing = self._backend.get(hash_key)
-            if existing is not None:
+            if existing is None:
+                self._evict_if_needed()
+            else:
+                # Hash already present. Different content means a true (extremely
+                # rare with SHA256[:24]) collision; same content is a duplicate
+                # re-store. Either way we overwrite in place.
                 if existing.original_content != original:
-                    # True hash collision - different content, same hash
-                    # This is extremely rare with SHA256[:24] but should be logged
                     logger.warning(
                         "Hash collision detected: hash=%s tool=%s (existing_len=%d, new_len=%d)",
                         hash_key,
@@ -365,12 +401,11 @@ class CompressionStore:
                         len(original),
                     )
                 else:
-                    # Same content being stored again - this is fine, just update
                     logger.debug(
                         "Duplicate store for hash=%s, updating entry",
                         hash_key,
                     )
-                # Mark old heap entry as stale since we're replacing
+                # Mark old heap entry as stale since we're replacing it.
                 self._stale_heap_entries += 1
 
             self._backend.set(hash_key, entry)
@@ -475,6 +510,7 @@ class CompressionStore:
                 "compressed_item_count": entry.compressed_item_count,
                 "query_context": entry.query_context,
                 "compressed_content": entry.compressed_content,
+                "original_content_preview": entry.original_content[:2000],
                 "created_at": entry.created_at,
                 "ttl": entry.ttl,
             }

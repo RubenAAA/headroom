@@ -16,6 +16,81 @@ import pytest
 
 from tests._skip_helpers import external_model_skip_reason
 
+
+# A live `headroom` dev session exports HEADROOM_* into the shell (and the
+# Claude wrap adds ANTHROPIC_CUSTOM_HEADERS). Click `envvar=` options pick
+# those up inside CliRunner, so assertions would see the developer's proxy
+# config instead of the test's. Scrub them so local runs match CI; tests
+# that need a value set it explicitly via monkeypatch or CliRunner env.
+@pytest.fixture(autouse=True)
+def _scrub_developer_headroom_env(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("HEADROOM_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+
+
+# The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
+# and the beacon defaults to ON. So scrubbing for hermeticity is precisely what
+# switches it on, and with HEADROOM_TELEMETRY_ENDPOINT scrubbed too it falls back
+# to the real production endpoint. Every test that reaches the outcome funnel
+# then POSTs a session event for real: observed writing into the live corpus
+# during a local run, and CI would do the same on every push.
+#
+# Depends on the scrub fixture so it is guaranteed to run after it rather than
+# relying on declaration order. A test that wants the beacon on just sets the
+# var itself — monkeypatch inside the test wins over this.
+@pytest.fixture(autouse=True)
+def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_BEACON", "off")
+
+
+# The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
+# test that registers a server (directly or through `wrap`) writes into the
+# developer's REAL ledger — observed adding a live `claude/serena` entry during a
+# local run. Since the scrub above deletes HEADROOM_WORKSPACE_DIR, the default is
+# always the real home. Redirect the ledger per-test instead: every writer
+# (`record_install` / `clear_install` / `headroom_installed_matching`) resolves it
+# through this module-global, so one patch covers them all. Patched here rather
+# than pointing workspace_dir() at a tmp path, which would break the tests that
+# assert the default workspace layout.
+@pytest.fixture(autouse=True)
+def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
+    # Same guard as _reset_copilot_routing_flag below: the macos/windows-native-
+    # wrapper CI jobs install only pytest and drive the installer shell scripts
+    # via subprocess, so headroom isn't importable and there is no ledger to
+    # redirect. Skip there instead of erroring at setup.
+    try:
+        from headroom.mcp_registry import ledger
+    except ModuleNotFoundError:
+        return
+
+    ledger_file = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
+    monkeypatch.setattr(ledger, "ledger_path", lambda: ledger_file)
+
+
+# The Copilot "routed to Copilot" flag is a module-global ContextVar that
+# build_copilot_upstream_url() sets as a side effect. Unit tests that call that
+# builder directly (or otherwise run in the shared root context) would leave it
+# set and mislabel a later test's request outcome as "copilot". Reset it around
+# every test so build-time side effects can't leak between tests.
+@pytest.fixture(autouse=True)
+def _reset_copilot_routing_flag():
+    # The macos/windows-native-wrapper CI jobs run the installer tests with only
+    # pytest installed (no headroom): they drive the installer shell scripts via
+    # subprocess, so headroom isn't importable and there's no routing flag to
+    # reset. Skip the reset there instead of erroring at setup.
+    try:
+        from headroom.copilot_auth import reset_request_routed_to_copilot
+    except ModuleNotFoundError:
+        yield
+        return
+
+    reset_request_routed_to_copilot()
+    yield
+    reset_request_routed_to_copilot()
+
+
 # =============================================================================
 # Global test hooks
 # =============================================================================
@@ -67,6 +142,11 @@ def _reset_headroom_logger_propagation():
         if _name == "headroom" or _name.startswith("headroom."):
             logger = _logging.getLogger(_name)
             logger.disabled = False
+            # The benchmark also raises the level to CRITICAL; children
+            # inherit it (effective level), so a WARNING would be filtered
+            # at the logger before it can propagate to caplog. Reset to
+            # NOTSET so the subtree inherits root's level deterministically.
+            logger.setLevel(_logging.NOTSET)
             logger.propagate = True
     yield
 

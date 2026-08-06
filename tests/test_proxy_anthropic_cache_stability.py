@@ -607,6 +607,122 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
         assert captured["inject_tool"] is False
 
 
+def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
+    """``tools`` identity must survive the ``frozen 0 -> >0`` transition.
+
+    ``tools`` is the head of Anthropic's cache key, so adding or removing
+    ``headroom_retrieve`` between turns invalidates 100% of the provider-cached
+    prefix — in both directions. Turn 1 (cold prefix, fresh markers) injects the
+    tool; turn 2 (warm prefix, no *new* markers) must forward the same bytes
+    rather than dropping it.
+
+    Asserts on the forwarded request body, not on a policy function's return
+    value: unit-testing the old policy in isolation is exactly what let a
+    wrong-but-self-consistent decision pass.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+    from headroom.proxy.helpers import (
+        _reset_session_ccr_tracker_for_test,
+        serialize_tool_definition_canonical,
+    )
+
+    marker_message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_bash_x",
+                "content": (
+                    "[50 items compressed to 5. Retrieve more: hash=abc123def456abc123def456]"
+                ),
+            }
+        ],
+    }
+    forwarded: list[dict] = []
+
+    _reset_session_ccr_tracker_for_test()
+    try:
+        with _make_proxy_client() as client:
+            proxy = client.app.state.proxy
+            proxy.config.optimize = False
+            proxy.config.image_optimize = False
+            proxy.config.ccr_inject_tool = True
+            proxy.config.ccr_inject_system_instructions = False
+
+            fake_tracker = _FakePrefixTracker(frozen_count=0)
+            proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+                "frozen-transition-session"
+            )
+            proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                forwarded.append(body)
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "msg_frozen_transition",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 3,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                        },
+                    },
+                )
+
+            proxy._retry_request = _fake_retry
+
+            def _post():
+                return client.post(
+                    "/v1/messages",
+                    headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 64,
+                        "messages": [marker_message],
+                    },
+                )
+
+            # Turn 1 — cold prefix, marker is new: first-time injection.
+            assert _post().status_code == 200
+
+            # Turn 2 — the provider cached turn 1's prefix (tool included), and
+            # the marker is now historical rather than new. Seed both facts
+            # explicitly instead of relying on ``update_from_response`` plumbing:
+            # if the marker still counted as new, the old code would have
+            # injected via its override path and this test would pass against
+            # the defect.
+            fake_tracker._frozen_count = 3
+            fake_tracker._last_forwarded_messages = [marker_message]
+
+            assert _post().status_code == 200
+    finally:
+        _reset_session_ccr_tracker_for_test()
+
+    assert len(forwarded) == 2, "expected exactly two forwarded requests"
+
+    def _ccr_tools(body: dict) -> list[dict]:
+        return [t for t in (body.get("tools") or []) if t.get("name") == CCR_TOOL_NAME]
+
+    turn1 = _ccr_tools(forwarded[0])
+    turn2 = _ccr_tools(forwarded[1])
+
+    assert turn1, "test setup: turn 1 should inject headroom_retrieve on fresh markers"
+    assert turn2, (
+        "headroom_retrieve was dropped from the forwarded tools array once the "
+        "prefix went warm — that removes a tool already inside the cached prefix "
+        "and busts 100% of it"
+    )
+    # Byte-identity, not ``==``: a re-serialized definition with a different key
+    # order compares equal as a dict but busts the cache just as hard.
+    assert serialize_tool_definition_canonical(turn1[0]) == serialize_tool_definition_canonical(
+        turn2[0]
+    ), "headroom_retrieve was re-serialized rather than replayed byte-for-byte"
+
+
 def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:
     captured = {}
     with _make_proxy_client() as client:
