@@ -1,7 +1,7 @@
 """Direct unit tests for the shared wrap-subcommand helpers.
 
-These helpers (`_print_wrap_banner`, `_setup_context_tool_for_agent`,
-`_run_proxy_only_watcher`) were extracted to remove ~150 LOC of
+These helpers (`_print_wrap_banner`, `_run_proxy_only_watcher`) were
+extracted to remove ~150 LOC of
 copy-pasted scaffolding across the wrap subcommands (cursor / cline /
 continue / goose / openhands). The wrap-*.py subcommand tests exercise
 them indirectly; these tests pin the contract directly so a future
@@ -15,11 +15,9 @@ from __future__ import annotations
 import errno
 import json
 import os
-import subprocess
-import sys
+import signal
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import click
 import pytest
@@ -97,29 +95,8 @@ def test_print_wrap_banner_title_is_centered_or_near_centered() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _setup_context_tool_for_agent — all five branches:
-#   1. lean-ctx mode → calls _setup_lean_ctx_agent, returns None
-#   2. rtk install success → calls on_rtk_ready, returns rtk_path
-#   3. rtk install fail + rtk_required=False → returns None silently
-#   4. rtk install fail + rtk_required=True → SystemExit(1)
-#   5. KeyboardInterrupt → _emit_wrap_interrupted, SystemExit(130)
+# wrap claude argument passthrough.
 # ---------------------------------------------------------------------------
-
-
-def test_claude_context_tool_is_opt_in_for_prepare_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Claude skips context-tool setup unless the positive flag is passed."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    runner = CliRunner()
-
-    with patch.object(wrap_mod, "_prepare_wrap_rtk") as prepare_rtk:
-        default = runner.invoke(main, ["wrap", "claude", "--prepare-only"])
-        opt_in = runner.invoke(main, ["wrap", "claude", "--prepare-only", "--context-tool"])
-
-    assert default.exit_code == 0, default.output
-    assert opt_in.exit_code == 0, opt_in.output
-    assert prepare_rtk.call_count == 1
 
 
 def test_wrap_claude_allows_claude_print_short_flag_in_passthrough_args() -> None:
@@ -130,197 +107,6 @@ def test_wrap_claude_allows_claude_print_short_flag_in_passthrough_args() -> Non
     )
 
     assert result.exit_code == 0, result.output
-
-
-def test_claude_context_tool_opt_in_preserves_lean_ctx_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The positive flag enables the configured lean-ctx installer."""
-    monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "lean-ctx")
-    runner = CliRunner()
-
-    with patch.object(wrap_mod, "_setup_lean_ctx_agent") as setup_lean_ctx:
-        result = runner.invoke(main, ["wrap", "claude", "--prepare-only", "--context-tool"])
-
-    assert result.exit_code == 0, result.output
-    setup_lean_ctx.assert_called_once_with("claude", verbose=False)
-
-
-def test_claude_no_context_tool_wins_over_context_tool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The legacy opt-out remains authoritative when both flags are supplied."""
-    runner = CliRunner()
-
-    with patch.object(wrap_mod, "_prepare_wrap_rtk") as prepare_rtk:
-        result = runner.invoke(
-            main,
-            ["wrap", "claude", "--prepare-only", "--context-tool", "--no-context-tool"],
-        )
-
-    assert result.exit_code == 0, result.output
-    prepare_rtk.assert_not_called()
-
-
-def test_non_claude_context_tool_setup_remains_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Copilot still sets up RTK without a new positive opt-in flag."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-dummy")
-
-    with (
-        patch.object(wrap_mod.shutil, "which", return_value="copilot"),
-        patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")) as ensure_rtk,
-        patch.object(wrap_mod, "_launch_tool"),
-    ):
-        result = CliRunner().invoke(
-            main,
-            ["wrap", "copilot", "--no-proxy", "--", "--model", "claude-sonnet-4-20250514"],
-        )
-
-    assert result.exit_code == 0, result.output
-    ensure_rtk.assert_called_once_with(verbose=False)
-
-
-def test_setup_context_tool_lean_ctx_calls_lean_ctx_setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When HEADROOM_CONTEXT_TOOL=lean-ctx, helper calls _setup_lean_ctx_agent."""
-    monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "lean-ctx")
-    called_with: dict[str, Any] = {}
-
-    def fake_lean_ctx(agent: str, verbose: bool = False) -> Path | None:
-        called_with["agent"] = agent
-        called_with["verbose"] = verbose
-        return None
-
-    monkeypatch.setattr(wrap_mod, "_setup_lean_ctx_agent", fake_lean_ctx)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        result = wrap_mod._setup_context_tool_for_agent(
-            agent="cline",
-            agent_display="Cline",
-            marker_path=None,
-        )
-        assert result is None
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 0, inv.output
-    assert called_with == {"agent": "cline", "verbose": False}
-
-
-def test_setup_context_tool_rtk_success_calls_on_rtk_ready(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """rtk install success → on_rtk_ready receives the rtk binary path."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    fake_rtk = Path("/tmp/rtk-fake")
-    received: list[Path] = []
-
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: fake_rtk)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        result = wrap_mod._setup_context_tool_for_agent(
-            agent="cline",
-            agent_display="Cline",
-            marker_path=tmp_path / ".clinerules",
-            on_rtk_ready=lambda rtk: received.append(rtk),
-        )
-        assert result == fake_rtk
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 0, inv.output
-    assert received == [fake_rtk]
-
-
-def test_setup_context_tool_rtk_failure_with_not_required_returns_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """rtk install failure + rtk_required=False → silent fall-through, None."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: None)
-
-    on_rtk_called = False
-
-    def _should_not_be_called(_rtk: Path) -> None:
-        nonlocal on_rtk_called
-        on_rtk_called = True
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        result = wrap_mod._setup_context_tool_for_agent(
-            agent="cursor",
-            agent_display="Cursor",
-            marker_path=None,
-            on_rtk_ready=_should_not_be_called,
-            rtk_required=False,
-        )
-        assert result is None
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 0, inv.output
-    assert not on_rtk_called, "on_rtk_ready should not be called when rtk install fails"
-
-
-def test_setup_context_tool_rtk_failure_with_required_exits_1(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """rtk install failure + rtk_required=True → SystemExit(1) with refusal message."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: None)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        wrap_mod._setup_context_tool_for_agent(
-            agent="openhands",
-            agent_display="OpenHands",
-            marker_path=None,
-            rtk_required=True,
-        )
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 1, inv.output
-    assert "rtk install failed" in inv.output
-    assert "refusing to inject" in inv.output
-
-
-def test_setup_context_tool_keyboardinterrupt_emits_interrupted_and_exits_130(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """KeyboardInterrupt during setup → _emit_wrap_interrupted, SystemExit(130)."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-
-    marker = tmp_path / ".clinerules"
-    marker.write_text("pre-existing")
-
-    def raise_kbd(verbose: bool = False) -> Path | None:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", raise_kbd)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        wrap_mod._setup_context_tool_for_agent(
-            agent="cline",
-            agent_display="Cline",
-            marker_path=marker,
-        )
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 130
-    assert "interrupted" in inv.output.lower()
-    assert "idempotent" in inv.output.lower()
-    assert str(marker) in inv.output
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +208,57 @@ def test_run_proxy_only_watcher_keyboardinterrupt_shuts_down_cleanly(
     inv = runner.invoke(_cmd)
     assert inv.exit_code == 0, inv.output
     assert "Shutting down..." in inv.output
+
+
+def test_run_proxy_only_watcher_signal_handler_uses_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows console stop handlers must use the clean shutdown path."""
+
+    handlers: dict[int, Any] = {}
+    cleanup_calls = {"n": 0}
+
+    class _FakeProc:
+        def poll(self) -> None:
+            return None
+
+    def capture_handler(sig: int, handler: Any) -> None:
+        handlers[sig] = handler
+
+    def trigger_sigint(_seconds: float) -> None:
+        handlers[signal.SIGINT](signal.SIGINT, None)
+
+    def cleanup(*_args: Any) -> None:
+        cleanup_calls["n"] += 1
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (_FakeProc(), 8787))
+    monkeypatch.setattr(wrap_mod.time, "sleep", trigger_sigint)
+    monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: cleanup)
+    monkeypatch.setattr(wrap_mod.signal, "signal", capture_handler)
+    monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    sigbreak = 999
+    monkeypatch.setattr(wrap_mod.signal, "SIGBREAK", sigbreak, raising=False)
+
+    runner = CliRunner()
+
+    @click.command()
+    def _cmd() -> None:
+        wrap_mod._run_proxy_only_watcher(
+            agent_label="vscode copilot",
+            port=8787,
+            no_proxy=False,
+            learn=False,
+            memory=False,
+            agent_type="copilot",
+            print_setup_lines=lambda _port: None,
+        )
+
+    inv = runner.invoke(_cmd)
+    assert inv.exit_code == 0, inv.output
+    assert "Shutting down..." in inv.output
+    assert "Proxy process exited unexpectedly" not in inv.output
+    assert sigbreak in handlers
+    assert cleanup_calls["n"] >= 2  # signal handler plus finally (idempotent)
 
 
 def test_run_proxy_only_watcher_unexpected_exception_returns_exit_1(
@@ -705,6 +542,27 @@ class TestProxyClientRefCounting:
         # Our own marker is removed before we count.
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=False) == []
 
+    def test_cleanup_stops_detached_windows_serving_child(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl+C must stop the listener even when its launcher already exited."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        proc.poll = lambda: 0  # type: ignore[method-assign]
+        stopped: list[int] = []
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(
+            wrap_mod,
+            "_stop_local_proxy_for_unwrap",
+            lambda port: stopped.append(port) or "stopped",
+        )
+
+        wrap_mod._make_cleanup([proc], self.PORT)()
+
+        assert not proc.terminated
+        assert stopped == [self.PORT]
+
     def test_cleanup_leaves_proxy_running_when_other_client_alive(self, clients_dir: Path) -> None:
         """A second live client (here: the test's parent) keeps the proxy up."""
         wrap_mod._register_proxy_client(self.PORT)
@@ -718,13 +576,13 @@ class TestProxyClientRefCounting:
 
         assert proc.terminated is False
 
-    def test_dead_client_marker_is_pruned_and_not_counted(self, clients_dir: Path) -> None:
+    def test_dead_client_marker_is_pruned_and_not_counted(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A marker for a dead PID is pruned from disk and never counted."""
-        # Spawn and reap a child so its PID is reliably dead (not a zombie).
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        dead_pid = child.pid
+        dead_pid = 358784
         marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 

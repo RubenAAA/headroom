@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
-from headroom._subprocess import run
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -73,9 +72,6 @@ from headroom.proxy.ccr_golden_policy import (
 )
 from headroom.proxy.ccr_marker_policy import (
     has_new_ccr_markers as _has_new_ccr_markers,
-)
-from headroom.proxy.ccr_marker_policy import (
-    should_inject_ccr_tool as _should_inject_ccr_tool,
 )
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
 from headroom.proxy.internal_header_policy import (
@@ -498,37 +494,6 @@ def append_text_to_latest_user_input_item(
 
     return body_input, 0
 
-
-_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
-_CONTEXT_TOOL_RTK = "rtk"
-_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_RTK_GAIN_SCOPE_ENV = "HEADROOM_RTK_GAIN_SCOPE"
-_RTK_GAIN_SCOPE_GLOBAL = "global"
-_RTK_GAIN_SCOPE_PROJECT = "project"
-_RTK_GAIN_SCOPES = {_RTK_GAIN_SCOPE_GLOBAL, _RTK_GAIN_SCOPE_PROJECT}
-
-RTK_STATS_CACHE_TTL_SECONDS = float(os.environ.get("HEADROOM_CONTEXT_TOOL_STATS_TTL_SECONDS", "60"))
-CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS = RTK_STATS_CACHE_TTL_SECONDS
-_context_tool_stats_cache_lock = threading.Lock()
-_context_tool_stats_cache: dict[str, Any] = {
-    "expires_at": 0.0,
-    "has_value": False,
-    "tool": None,
-    "value": None,
-}
-_context_tool_session_baseline: dict[str, Any] = {
-    "initialized": False,
-    "tool": None,
-    "total_commands": 0,
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "tokens_saved": 0,
-    "total_time_ms": 0,
-    "captured_at": 0.0,
-}
-_rtk_stats_cache_lock = _context_tool_stats_cache_lock
-_rtk_stats_cache = _context_tool_stats_cache
-_rtk_session_baseline = _context_tool_session_baseline
 
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
@@ -1008,529 +973,6 @@ def _setup_file_logging() -> None:
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
-
-
-def _selected_context_tool() -> str:
-    raw = os.environ.get(_CONTEXT_TOOL_ENV, _CONTEXT_TOOL_RTK).strip().lower()
-    normalized = raw.replace("_", "-")
-    if normalized in ("leanctx", _CONTEXT_TOOL_LEAN_CTX):
-        return _CONTEXT_TOOL_LEAN_CTX
-    return _CONTEXT_TOOL_RTK
-
-
-def _context_tool_label(tool: str) -> str:
-    if tool == _CONTEXT_TOOL_LEAN_CTX:
-        return "lean-ctx"
-    return "RTK"
-
-
-def _context_tool_default_scope(tool: str) -> str:
-    if tool == _CONTEXT_TOOL_LEAN_CTX:
-        return "local"
-    return _RTK_GAIN_SCOPE_GLOBAL
-
-
-def _rtk_gain_scope() -> str:
-    raw = os.environ.get(_RTK_GAIN_SCOPE_ENV, "").strip().lower()
-    if not raw:
-        return _RTK_GAIN_SCOPE_GLOBAL
-    if raw in _RTK_GAIN_SCOPES:
-        return raw
-
-    logger.warning(
-        "event=rtk_gain_scope_invalid env=%s value=%r default=%s",
-        _RTK_GAIN_SCOPE_ENV,
-        raw,
-        _RTK_GAIN_SCOPE_GLOBAL,
-    )
-    return _RTK_GAIN_SCOPE_GLOBAL
-
-
-def _rtk_gain_command(rtk_path: Any, scope: str) -> list[str]:
-    command = [str(rtk_path), "gain"]
-    if scope == _RTK_GAIN_SCOPE_PROJECT:
-        command.append("--project")
-    command.extend(["--format", "json"])
-    return command
-
-
-def _coerce_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return default
-
-
-def _coerce_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return default
-
-
-def _first_value(mapping: dict[str, Any], keys: tuple[str, ...], default: Any = 0) -> Any:
-    for key in keys:
-        if key in mapping and mapping[key] is not None:
-            return mapping[key]
-    return default
-
-
-def _context_tool_summary_payload(
-    *,
-    tool: str,
-    installed: bool,
-    scope: str | None = None,
-    summary: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Normalize RTK/lean-ctx lifetime gain output into one schema.
-
-    Both tools expose cumulative counters, but field names vary slightly.
-    Headroom computes session values by subtracting a startup baseline, so
-    keeping raw input/output counters is necessary for a truthful session
-    savings percentage.
-    """
-
-    summary = summary or {}
-    input_tokens = _coerce_int(
-        _first_value(
-            summary,
-            (
-                "total_input",
-                "total_input_tokens",
-                "input_tokens",
-                "tokens_input",
-                "totalBefore",
-            ),
-        )
-    )
-    output_tokens = _coerce_int(
-        _first_value(
-            summary,
-            (
-                "total_output",
-                "total_output_tokens",
-                "output_tokens",
-                "tokens_output",
-                "totalAfter",
-            ),
-        )
-    )
-    tokens_saved = _coerce_int(
-        _first_value(
-            summary,
-            (
-                "total_saved",
-                "tokens_saved",
-                "total_tokens_saved",
-                "saved_tokens",
-                "totalSaved",
-            ),
-        )
-    )
-    if tokens_saved <= 0 and input_tokens > 0 and output_tokens >= 0:
-        tokens_saved = max(input_tokens - output_tokens, 0)
-    if input_tokens <= 0 and tokens_saved > 0 and output_tokens >= 0:
-        input_tokens = tokens_saved + output_tokens
-
-    lifetime_savings_pct = _coerce_float(
-        _first_value(
-            summary,
-            (
-                "avg_savings_pct",
-                "average_savings_pct",
-                "savings_pct",
-                "savings_percent",
-                "avgSavingsPct",
-            ),
-            0.0,
-        )
-    )
-    if lifetime_savings_pct <= 0 and input_tokens > 0:
-        lifetime_savings_pct = (tokens_saved / input_tokens) * 100.0
-
-    return {
-        "tool": tool,
-        "label": _context_tool_label(tool),
-        "installed": installed,
-        "scope": scope or _context_tool_default_scope(tool),
-        "total_commands": _coerce_int(
-            _first_value(
-                summary,
-                (
-                    "total_commands",
-                    "commands",
-                    "command_count",
-                    "totalCommandCount",
-                ),
-            )
-        ),
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "tokens_saved": tokens_saved,
-        # Backward-compatible name. See `lifetime_avg_savings_pct` and
-        # `session_savings_pct` below for explicit scopes.
-        "avg_savings_pct": lifetime_savings_pct,
-        "lifetime_avg_savings_pct": lifetime_savings_pct,
-        "total_time_ms": _coerce_int(
-            _first_value(summary, ("total_time_ms", "time_ms", "totalTimeMs"))
-        ),
-    }
-
-
-def _context_tool_zero_payload(
-    *,
-    tool: str,
-    installed: bool,
-    scope: str | None = None,
-) -> dict[str, Any]:
-    return _context_tool_summary_payload(
-        tool=tool,
-        installed=installed,
-        scope=scope,
-        summary={},
-    )
-
-
-def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
-    """Read rtk's lifetime stats using the configured gain scope."""
-
-    from headroom.rtk import get_rtk_path
-
-    scope = _rtk_gain_scope()
-    rtk_path = get_rtk_path()
-    if not rtk_path:
-        return _context_tool_zero_payload(
-            tool=_CONTEXT_TOOL_RTK,
-            installed=False,
-            scope=scope,
-        )
-
-    try:
-        result = run(
-            _rtk_gain_command(rtk_path, scope),
-            capture_output=True,
-            text=True,
-            # rtk output is UTF-8 (emoji etc.); without this, Windows decodes
-            # with cp1252 and the reader thread dies with UnicodeDecodeError.
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            summary = data.get("summary", {})
-            payload = _context_tool_summary_payload(
-                tool=_CONTEXT_TOOL_RTK,
-                installed=True,
-                scope=scope,
-                summary=summary if isinstance(summary, dict) else {},
-            )
-        else:
-            # A failed read is "no data", never a zero counter — a synthetic
-            # zero here re-pins the session baseline and inflates session
-            # savings by the tool's whole lifetime on recovery.
-            stderr_excerpt = (result.stderr or "")[:200]
-            logger.warning(
-                "event=rtk_stats_subprocess_failed reason=non_zero_exit rc=%s stderr=%r",
-                result.returncode,
-                stderr_excerpt,
-            )
-            return None
-    except Exception as exc:
-        # Reason is the exception class name (without payload — RTK
-        # exceptions can carry filesystem paths).
-        logger.warning(
-            "event=rtk_stats_subprocess_failed reason=%s error=%s",
-            type(exc).__name__,
-            exc,
-        )
-        return None
-
-    return payload
-
-
-def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
-    """Read lean-ctx's current project-level lifetime stats."""
-
-    from headroom.lean_ctx import get_lean_ctx_path
-
-    lean_ctx_path = get_lean_ctx_path()
-    if not lean_ctx_path:
-        return _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=False)
-
-    try:
-        result = run(
-            [str(lean_ctx_path), "gain", "--json"],
-            capture_output=True,
-            text=True,
-            # UTF-8 regardless of the Windows console code page (cp1252).
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        # Failed reads return None ("no data") — mirrors the rtk reader so
-        # the baseline logic never sees synthetic zeros from either tool.
-        if result.returncode != 0 or not result.stdout.strip():
-            logger.warning(
-                "event=lean_ctx_stats_subprocess_failed reason=non_zero_exit rc=%s",
-                result.returncode,
-            )
-            return None
-
-        data = json.loads(result.stdout)
-        summary = data.get("summary", data) if isinstance(data, dict) else {}
-        if not isinstance(summary, dict):
-            logger.warning("event=lean_ctx_stats_subprocess_failed reason=bad_payload")
-            return None
-
-        return _context_tool_summary_payload(
-            tool=_CONTEXT_TOOL_LEAN_CTX,
-            installed=True,
-            summary=summary,
-        )
-    except Exception as exc:
-        logger.warning(
-            "event=lean_ctx_stats_subprocess_failed reason=%s",
-            type(exc).__name__,
-        )
-        return None
-
-
-def _read_context_tool_lifetime_stats(tool: str) -> dict[str, Any] | None:
-    if tool == _CONTEXT_TOOL_LEAN_CTX:
-        return _read_lean_ctx_lifetime_stats()
-    return _read_rtk_lifetime_stats()
-
-
-async def initialize_context_tool_session_baseline() -> None:
-    """Pin the current context-tool counters as the proxy-session baseline."""
-
-    tool = _selected_context_tool()
-    payload = await asyncio.to_thread(_read_context_tool_lifetime_stats, tool)
-    with _context_tool_stats_cache_lock:
-        if payload is None or not payload.get("installed", False):
-            # Failed or tool-absent read: defer the pin to the first
-            # successful read (guarded lazy-init) — pinning zeros here would
-            # inflate session savings by the tool's whole lifetime once it
-            # recovers or gets installed.
-            _context_tool_session_baseline.update(
-                {
-                    "initialized": False,
-                    "tool": tool,
-                    "total_commands": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "tokens_saved": 0,
-                    "total_time_ms": 0,
-                    "captured_at": time.time(),
-                }
-            )
-        else:
-            _context_tool_session_baseline.update(
-                {
-                    "initialized": True,
-                    "tool": tool,
-                    "total_commands": int(payload.get("total_commands", 0) or 0),
-                    "input_tokens": int(payload.get("input_tokens", 0) or 0),
-                    "output_tokens": int(payload.get("output_tokens", 0) or 0),
-                    "tokens_saved": int(payload.get("tokens_saved", 0) or 0),
-                    "total_time_ms": int(payload.get("total_time_ms", 0) or 0),
-                    "captured_at": time.time(),
-                }
-            )
-        _context_tool_stats_cache.update(
-            {
-                "expires_at": 0.0,
-                "has_value": False,
-                "tool": None,
-                "value": None,
-            }
-        )
-
-
-async def initialize_rtk_session_baseline() -> None:
-    """Backward-compatible alias for initialize_context_tool_session_baseline."""
-
-    await initialize_context_tool_session_baseline()
-
-
-def _get_context_tool_stats() -> dict[str, Any] | None:
-    """Get context-tool savings for the current Headroom proxy session.
-
-    RTK and lean-ctx persist project-level lifetime counters. Dashboard stats
-    should be session-local, so we subtract the counter snapshot captured at
-    proxy startup instead of resetting the tool's own history.
-    """
-
-    tool = _selected_context_tool()
-    now = time.monotonic()
-    with _context_tool_stats_cache_lock:
-        cached_value = cast(dict[str, Any] | None, _context_tool_stats_cache["value"])
-        if (
-            _context_tool_stats_cache["has_value"]
-            and now < float(_context_tool_stats_cache["expires_at"])
-            and _context_tool_stats_cache.get("tool") == tool
-        ):
-            return cached_value
-
-    payload = _read_context_tool_lifetime_stats(tool)
-    with _context_tool_stats_cache_lock:
-        # Baseline mutations only happen on successful reads from an
-        # installed tool — a failed read (None) or a tool-absent zero payload
-        # must never pin or re-pin, or session deltas inflate by the whole
-        # lifetime when the tool comes back.
-        tool_installed = payload is not None and bool(payload.get("installed", False))
-        if (
-            payload is not None
-            and tool_installed
-            and (
-                not _context_tool_session_baseline["initialized"]
-                or _context_tool_session_baseline.get("tool") != tool
-            )
-        ):
-            _context_tool_session_baseline.update(
-                {
-                    "initialized": True,
-                    "tool": tool,
-                    "total_commands": int(payload.get("total_commands", 0) or 0),
-                    "input_tokens": int(payload.get("input_tokens", 0) or 0),
-                    "output_tokens": int(payload.get("output_tokens", 0) or 0),
-                    "tokens_saved": int(payload.get("tokens_saved", 0) or 0),
-                    "total_time_ms": int(payload.get("total_time_ms", 0) or 0),
-                    "captured_at": time.time(),
-                }
-            )
-
-        if payload is not None:
-            lifetime_total_commands = int(payload.get("total_commands", 0) or 0)
-            lifetime_input_tokens = int(payload.get("input_tokens", 0) or 0)
-            lifetime_output_tokens = int(payload.get("output_tokens", 0) or 0)
-            lifetime_tokens_saved = int(payload.get("tokens_saved", 0) or 0)
-            lifetime_total_time_ms = int(payload.get("total_time_ms", 0) or 0)
-            baseline_total_commands = int(_context_tool_session_baseline["total_commands"])
-            baseline_input_tokens = int(_context_tool_session_baseline["input_tokens"])
-            baseline_output_tokens = int(_context_tool_session_baseline["output_tokens"])
-            baseline_tokens_saved = int(_context_tool_session_baseline["tokens_saved"])
-            baseline_total_time_ms = int(_context_tool_session_baseline["total_time_ms"])
-            # A tool-absent payload carries zero counters that are not a
-            # genuine external reset — only successful installed reads may
-            # re-pin the baseline.
-            counter_reset_detected = tool_installed and (
-                lifetime_total_commands < baseline_total_commands
-                or lifetime_input_tokens < baseline_input_tokens
-                or lifetime_output_tokens < baseline_output_tokens
-                or lifetime_tokens_saved < baseline_tokens_saved
-                or lifetime_total_time_ms < baseline_total_time_ms
-            )
-            if counter_reset_detected:
-                baseline_total_commands = lifetime_total_commands
-                baseline_input_tokens = lifetime_input_tokens
-                baseline_output_tokens = lifetime_output_tokens
-                baseline_tokens_saved = lifetime_tokens_saved
-                baseline_total_time_ms = lifetime_total_time_ms
-                _context_tool_session_baseline.update(
-                    {
-                        "total_commands": baseline_total_commands,
-                        "input_tokens": baseline_input_tokens,
-                        "output_tokens": baseline_output_tokens,
-                        "tokens_saved": baseline_tokens_saved,
-                        "total_time_ms": baseline_total_time_ms,
-                        "captured_at": time.time(),
-                    }
-                )
-
-            session_total_commands = max(lifetime_total_commands - baseline_total_commands, 0)
-            session_input_tokens = max(lifetime_input_tokens - baseline_input_tokens, 0)
-            session_output_tokens = max(lifetime_output_tokens - baseline_output_tokens, 0)
-            session_tokens_saved = max(lifetime_tokens_saved - baseline_tokens_saved, 0)
-            session_total_time_ms = max(lifetime_total_time_ms - baseline_total_time_ms, 0)
-            session_savings_pct = (
-                round(session_tokens_saved / session_input_tokens * 100.0, 4)
-                if session_input_tokens > 0
-                else None
-            )
-            session_avg_time_ms = (
-                round(session_total_time_ms / session_total_commands, 2)
-                if session_total_commands > 0 and session_total_time_ms > 0
-                else None
-            )
-            lifetime_savings_pct = float(payload.get("lifetime_avg_savings_pct", 0.0) or 0.0)
-
-            payload = {
-                **payload,
-                "tool": tool,
-                "label": _context_tool_label(tool),
-                # Backward-compatible session-delta fields.
-                "total_commands": session_total_commands,
-                "input_tokens": session_input_tokens,
-                "output_tokens": session_output_tokens,
-                "tokens_saved": session_tokens_saved,
-                "total_time_ms": session_total_time_ms,
-                "session_savings_pct": session_savings_pct,
-                "session_avg_time_ms": session_avg_time_ms,
-                # Keep old field for compatibility, but declare its scope.
-                "avg_savings_pct": lifetime_savings_pct,
-                "avg_savings_pct_scope": "lifetime",
-                "lifetime_avg_savings_pct": lifetime_savings_pct,
-                "lifetime_total_commands": lifetime_total_commands,
-                "lifetime_input_tokens": lifetime_input_tokens,
-                "lifetime_output_tokens": lifetime_output_tokens,
-                "lifetime_tokens_saved": lifetime_tokens_saved,
-                "lifetime_total_time_ms": lifetime_total_time_ms,
-                "session_baseline_total_commands": baseline_total_commands,
-                "session_baseline_input_tokens": baseline_input_tokens,
-                "session_baseline_output_tokens": baseline_output_tokens,
-                "session_baseline_tokens_saved": baseline_tokens_saved,
-                "session_baseline_total_time_ms": baseline_total_time_ms,
-                "session_baseline_captured_at": _context_tool_session_baseline.get(
-                    "captured_at", 0.0
-                ),
-                "session": {
-                    "commands": session_total_commands,
-                    "input_tokens": session_input_tokens,
-                    "output_tokens": session_output_tokens,
-                    "tokens_saved": session_tokens_saved,
-                    "savings_pct": session_savings_pct,
-                    "total_time_ms": session_total_time_ms,
-                    "avg_time_ms": session_avg_time_ms,
-                },
-                "lifetime": {
-                    "commands": lifetime_total_commands,
-                    "input_tokens": lifetime_input_tokens,
-                    "output_tokens": lifetime_output_tokens,
-                    "tokens_saved": lifetime_tokens_saved,
-                    "savings_pct": lifetime_savings_pct,
-                    "total_time_ms": lifetime_total_time_ms,
-                },
-                "baseline": {
-                    "commands": baseline_total_commands,
-                    "input_tokens": baseline_input_tokens,
-                    "output_tokens": baseline_output_tokens,
-                    "tokens_saved": baseline_tokens_saved,
-                    "total_time_ms": baseline_total_time_ms,
-                    "captured_at": _context_tool_session_baseline.get("captured_at", 0.0),
-                },
-                "sampled_at": time.time(),
-                "sample_ttl_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
-                "refresh_interval_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
-                "counter_reset_detected": counter_reset_detected,
-            }
-
-        _context_tool_stats_cache.update(
-            {
-                "expires_at": time.monotonic() + CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
-                "has_value": True,
-                "tool": tool,
-                "value": payload,
-            }
-        )
-    return payload
-
-
-def _get_rtk_stats() -> dict[str, Any] | None:
-    """Backward-compatible alias for selected context-tool stats."""
-
-    return _get_context_tool_stats()
 
 
 def is_anthropic_auth(headers: dict[str, str]) -> bool:
@@ -2270,35 +1712,6 @@ def has_new_ccr_markers(
     )
 
 
-def should_inject_ccr_tool(
-    *,
-    configured_inject_tool: bool,
-    frozen_message_count: int,
-    has_compressed_content: bool,
-) -> tuple[bool, bool]:
-    """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
-
-    This is the decision the Anthropic handler used to inline. It is extracted
-    so the #1006 regression can be pinned at the decision point itself.
-
-    Tool injection is normally deferred when there is a frozen message prefix
-    (``frozen_message_count > 0``) to preserve the prompt cache. But if
-    compression emitted fresh markers this turn, deferring would hand the agent
-    a ``<<ccr:hash>>`` marker with no tool to redeem it — silent data loss. In
-    that case we override the deferral and inject anyway (one cache miss is
-    cheaper than dropped content).
-
-    Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
-    True only when injection happens *because* of new markers despite a deferral,
-    so the caller can log the override distinctly.
-    """
-    return _should_inject_ccr_tool(
-        configured_inject_tool=configured_inject_tool,
-        frozen_message_count=frozen_message_count,
-        has_compressed_content=has_compressed_content,
-    )
-
-
 def apply_session_sticky_ccr_tool(
     *,
     provider: Literal["anthropic", "openai", "google"],
@@ -2857,6 +2270,11 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "webfetch",
         "question",
         "skill",
+        # A client's own tool-search/schema-fetch tool (Claude Code's ``ToolSearch``).
+        # It resolves tools the client keeps in its local registry and never puts in
+        # the request body (TaskCreate, WebFetch, …), so deferring it hides the only
+        # tool that can load them and they become permanently unreachable.
+        "toolsearch",
     }
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
@@ -2897,11 +2315,22 @@ def inject_tool_search_deferral(
     out: list[Any] = [search_tool]
     deferred = 0
     dropped_cache_control = False
+    dropped_marker: dict[str, Any] | None = None
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
+    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
+    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
+    # the exemption applies to both — an exact match silently deferred *every*
+    # tool for PascalCase clients, including their own tool-search tool.
+    core_lower = {name.lower() for name in core_tools}
+
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") or tool.get("name") in core_tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type")
+            or str(tool.get("name") or "").lower() in core_lower
+        ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)
@@ -2913,8 +2342,13 @@ def inject_tool_search_deferral(
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        if new_tool.pop("cache_control", None) is not None:
+        _dropped = new_tool.pop("cache_control", None)
+        if _dropped is not None:
             dropped_cache_control = True
+            # Keep the marker itself, not just the fact of it: re-placing a bare
+            # ephemeral would downgrade a 1h breakpoint to the 5m default.
+            if isinstance(_dropped, dict):
+                dropped_marker = _dropped
         out.append(new_tool)
         deferred += 1
 
@@ -2924,8 +2358,121 @@ def inject_tool_search_deferral(
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).
     if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
-        last_resident_real["cache_control"] = {"type": "ephemeral"}
+        last_resident_real["cache_control"] = (
+            dict(dropped_marker) if dropped_marker else {"type": "ephemeral"}
+        )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Tool-search history repair (issue #2805).
+#
+# Once the deferral above is active, Anthropic answers with ``server_tool_use``
+# (the search) + ``tool_search_tool_result`` (a list of ``tool_reference``
+# entries) blocks, and the client writes them into its transcript permanently.
+# Anthropic validates every ``tool_reference`` in the history against the
+# request's ``tools`` array and 400s with
+# ``Tool reference 'X' not found in available tools`` when one is missing.
+#
+# That is fine for a client's main loop — the proxy re-injects the same tools
+# array every turn — but Claude Code also replays the SAME transcript on
+# side-requests that carry a different, smaller tools array (the prompt-type
+# Stop hook evaluator, /compact, …). The proxy cannot predict those tool sets,
+# so instead we repair the history: when the outbound request cannot support
+# the tool-search blocks, drop them. Deterministic (same request → same output,
+# so the prefix still caches), stateless (no session bookkeeping), and
+# self-healing for transcripts already poisoned before the fix.
+# ---------------------------------------------------------------------------
+
+_TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
+
+
+def _tool_search_reference_names(content: Any) -> list[str]:
+    """Return the ``tool_reference`` names carried by a tool-search result block.
+
+    Server-side results nest them (``content.tool_references``); a client-side
+    tool-search implementation returns the bare list. Accept both.
+    """
+    entries = content.get("tool_references") if isinstance(content, dict) else content
+    if not isinstance(entries, list):
+        return []
+    names = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("type") == "tool_reference":
+            # Server-side blocks use ``tool_name``; be liberal about ``name``.
+            name = entry.get("tool_name") or entry.get("name")
+            if name:
+                names.append(str(name))
+    return names
+
+
+def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Drop tool-search blocks this request's ``tools`` array cannot support.
+
+    A block pair is unsupportable when the request carries no ``tool_search_tool_*``
+    tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
+    shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
+    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
+    message left with no content blocks is dropped rather than sent empty.
+
+    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
+    when nothing was removed — callers rely on identity to skip the write-back.
+    """
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    has_search_tool = any(
+        isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        for t in tool_list
+    )
+
+    out: list[Any] = []
+    removed = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        drop_indexes: set[int] = set()
+        orphaned_ids: set[str] = set()
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
+                continue
+            names = _tool_search_reference_names(block.get("content"))
+            if has_search_tool and all(name in available for name in names):
+                continue
+            drop_indexes.add(index)
+            use_id = block.get("tool_use_id")
+            if use_id:
+                orphaned_ids.add(str(use_id))
+        # The search call itself precedes its result, so pair it up in a second
+        # pass. Only tool-search server calls are eligible — web_search and code
+        # execution use the same block type and must survive untouched.
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != "server_tool_use":
+                continue
+            is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
+                drop_indexes.add(index)
+
+        if not drop_indexes:
+            out.append(message)
+            continue
+
+        changed = True
+        removed += len(drop_indexes)
+        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
+        if not kept:
+            continue  # the whole turn was tool-search bookkeeping
+        repaired = dict(message)
+        repaired["content"] = kept
+        out.append(repaired)
+
+    return (out, removed) if changed else (messages, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2953,6 +2500,7 @@ def inject_tool_search_deferral(
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
@@ -2983,24 +2531,34 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     return (major, minor) >= _OPENAI_TOOL_SEARCH_MIN_VERSION
 
 
+def openai_tool_search_client_supported(client: str | None) -> bool:
+    """Return whether OpenAI tool search deferral is safe for this client."""
+    normalized = client.strip().lower() if client else ""
+    return normalized not in _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS
+
+
 def inject_tool_search_deferral_openai(
     tools: Any,
     model: str | None,
     *,
+    client: str | None = None,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    No-op for Codex, whose round-trip structs drop deferred-call namespaces. Also
+    no-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
     is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
     tool_search tool is already present (client already defers), or nothing would
     be deferred. Core coding tools and hosted/typed tools (web_search,
-    file_search, code_interpreter, computer, …) stay resident and unchanged, so
-    routine edit/read/run loops never pay a search round-trip and the request
+    file_search, code_interpreter, computer, ...) stay resident and unchanged,
+    so routine edit/read/run loops never pay a search round-trip and the request
     stays valid; the injected search tool is itself resident.
     """
+    if not openai_tool_search_client_supported(client):
+        return tools
     if not _model_supports_openai_tool_search(model):
         return tools
     if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
@@ -3011,6 +2569,11 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
+    # Case-insensitive for the same reason as the Anthropic path above: the
+    # resident-name sets are lowercase, clients are not required to be.
+    resident_lower = {name.lower() for name in core_tools} | {
+        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    }
     for tool in tools:
         if not isinstance(tool, dict):
             out.append(tool)
@@ -3020,9 +2583,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function"
-            and tool.get("name") not in core_tools
-            and tool.get("name") not in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

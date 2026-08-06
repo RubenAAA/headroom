@@ -852,6 +852,9 @@ class _CostTrackerBlock:
     def check_budget(self):
         return False, 0
 
+    def budget_denial_detail(self):
+        return "Budget exceeded for daily period"
+
     def record_tokens(self, *a, **k):
         return None
 

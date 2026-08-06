@@ -69,10 +69,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub"
 
 # ---------------------------------------------------------------------------
 
-_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
-_CONTEXT_TOOL_RTK = "rtk"
-_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
 _PYTHON_PROXY_ENV = "HEADROOM_USE_PYTHON_PROXY"
 _RUST_PROXY_BINARY_ENV = "HEADROOM_PROXY_BINARY"
 
@@ -120,19 +116,6 @@ def _get_env_float_optional(name: str) -> float | None:
         return float(val)
     except ValueError:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
-
-
-def _selected_context_tool() -> str:
-    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
-    if not raw:
-        return _CONTEXT_TOOL_RTK
-    if raw == "leanctx":
-        raw = _CONTEXT_TOOL_LEAN_CTX
-    if raw not in _VALID_CONTEXT_TOOLS:
-        raise click.ClickException(
-            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
-        )
-    return raw
 
 
 def _use_python_proxy() -> bool:
@@ -874,6 +857,20 @@ def dashboard(port: int, no_open: bool) -> None:
         "Env: HEADROOM_BUDGET_PERIOD."
     ),
 )
+@click.option(
+    "--budget-estimated-basis",
+    type=click.Choice(["count", "ignore", "block"]),
+    default="count",
+    envvar="HEADROOM_BUDGET_ESTIMATED_BASIS",
+    help=(
+        "What to do with spend booked from Headroom's own token estimate, which "
+        "happens when a provider response carries no input-token breakdown. "
+        "count: it consumes the budget like measured spend (default). "
+        "ignore: only provider-reported spend consumes the budget. "
+        "block: refuse requests rather than enforce a hard limit on an estimate. "
+        "Env: HEADROOM_BUDGET_ESTIMATED_BASIS."
+    ),
+)
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
 # Pair of flags so users can override the env-var default in either direction.
 # We resolve HEADROOM_CODE_AWARE_ENABLED in the body (not via Click's envvar=),
@@ -1281,6 +1278,7 @@ def proxy(
     codex_wire_debug_dir: str | None,
     budget: float | None,
     budget_period: str,
+    budget_estimated_basis: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
     disable_kompress_fallback: bool,
@@ -1583,6 +1581,7 @@ def proxy(
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
         budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
+        budget_estimated_basis=cast(Literal["count", "ignore", "block"], budget_estimated_basis),
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
@@ -1790,7 +1789,6 @@ Memory (Multi-Provider):
     from headroom.proxy.server import _get_code_aware_banner_status
 
     code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
-    context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
@@ -1820,7 +1818,6 @@ Starting proxy server...
   Memory:       {memory_status}
   License:      {license_status}
 {code_aware_line}
-{context_tool_line}
 {extensions_line}
 {security_line}
 {stateless_line}{telemetry_line}

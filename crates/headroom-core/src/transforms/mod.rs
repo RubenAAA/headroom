@@ -32,6 +32,7 @@ pub mod cross_turn_dedup;
 pub mod detection;
 pub mod diff_compressor;
 pub mod html_extractor;
+#[cfg(feature = "ml")]
 pub mod kompress;
 pub mod kompress_remote;
 pub mod live_zone;
@@ -76,6 +77,7 @@ pub use diff_compressor::{
 pub use html_extractor::{
     is_html_content, HtmlExtractionResult, HtmlExtractor, HtmlExtractorConfig,
 };
+#[cfg(feature = "ml")]
 pub use kompress::{
     Kompress, KompressConfig, KompressError, KompressResult, DEFAULT_MODEL_ID,
     DEFAULT_TOKENIZER_REPO,

@@ -689,6 +689,51 @@ impl TransformComparator for ContentDetectorComparator {
     }
 }
 
+/// Real comparator for the `text_crusher` transform. The fixture `input` is an
+/// object rather than a bare string, mirroring the recorder's three arguments
+/// (`tests/parity/record_text_crusher.py`), and `config` is always `null` — the
+/// recorder drove the Python default config, so the Rust side uses
+/// `TextCrusherConfig::default()` to match.
+pub struct TextCrusherComparator;
+
+impl TransformComparator for TextCrusherComparator {
+    fn name(&self) -> &str {
+        "text_crusher"
+    }
+
+    fn run(
+        &self,
+        input: &serde_json::Value,
+        _config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use headroom_core::transforms::{TextCrusher, TextCrusherConfig};
+
+        let content = input
+            .get("content")
+            .and_then(|v| v.as_str())
+            .context("text_crusher fixture input needs a string `content`")?;
+        let context = input
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        // Null in the `short_passthrough` fixture, where the recorder passed no
+        // ratio at all — `Option<f64>` carries that through to the same default
+        // the Python call used.
+        let target_ratio = input.get("target_ratio").and_then(|v| v.as_f64());
+
+        let result =
+            TextCrusher::new(TextCrusherConfig::default()).compress(content, context, target_ratio);
+        Ok(serde_json::json!({
+            "compressed": result.compressed,
+            "original_tokens": result.original_tokens,
+            "compressed_tokens": result.compressed_tokens,
+            "compression_ratio": result.compression_ratio,
+            "kept_segments": result.kept_segments,
+            "total_segments": result.total_segments,
+        }))
+    }
+}
+
 /// Kompress comparator — runs the ML prose compressor against fixtures
 /// recorded from the Python reference.
 ///
@@ -906,51 +951,6 @@ impl TransformComparator for CodeCompressorComparator {
     }
 }
 
-/// Real comparator for the `text_crusher` transform. The fixture `input` is an
-/// object rather than a bare string, mirroring the recorder's three arguments
-/// (`tests/parity/record_text_crusher.py`), and `config` is always `null` — the
-/// recorder drove the Python default config, so the Rust side uses
-/// `TextCrusherConfig::default()` to match.
-pub struct TextCrusherComparator;
-
-impl TransformComparator for TextCrusherComparator {
-    fn name(&self) -> &str {
-        "text_crusher"
-    }
-
-    fn run(
-        &self,
-        input: &serde_json::Value,
-        _config: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        use headroom_core::transforms::{TextCrusher, TextCrusherConfig};
-
-        let content = input
-            .get("content")
-            .and_then(|v| v.as_str())
-            .context("text_crusher fixture input needs a string `content`")?;
-        let context = input
-            .get("context")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        // Null in the `short_passthrough` fixture, where the recorder passed no
-        // ratio at all — `Option<f64>` carries that through to the same default
-        // the Python call used.
-        let target_ratio = input.get("target_ratio").and_then(|v| v.as_f64());
-
-        let result =
-            TextCrusher::new(TextCrusherConfig::default()).compress(content, context, target_ratio);
-        Ok(serde_json::json!({
-            "compressed": result.compressed,
-            "original_tokens": result.original_tokens,
-            "compressed_tokens": result.compressed_tokens,
-            "compression_ratio": result.compression_ratio,
-            "kept_segments": result.kept_segments,
-            "total_segments": result.total_segments,
-        }))
-    }
-}
-
 /// Every built-in comparator, in a stable order.
 pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
     vec![
@@ -961,9 +961,9 @@ pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
         Box::new(CcrComparator),
         Box::new(SmartCrusherComparator),
         Box::new(ContentDetectorComparator),
+        Box::new(TextCrusherComparator),
         Box::new(KompressComparator::new()),
         Box::new(CodeCompressorComparator),
-        Box::new(TextCrusherComparator),
     ]
 }
 

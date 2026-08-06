@@ -443,72 +443,15 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     return report
 
 
-def _context_tool_lifetime_savings() -> dict | None:
-    """Lifetime savings from the configured CLI context tool (RTK / lean-ctx).
-
-    ``perf`` reports a windowed view of the proxy's *compression* logs. The CLI
-    context tool (RTK) keeps its own lifetime counter that never lands in
-    ``proxy.log``, so without this it stays invisible in ``headroom perf`` even
-    when it dwarfs proxy-side savings. Lifetime (not session) is the right scope
-    here: ``perf`` is a one-shot CLI, so the proxy-session baseline ``/stats``
-    subtracts is meaningless out of process.
-
-    Best-effort: returns ``None`` when no tool is installed or its stats cannot
-    be read, so the report degrades to proxy-only rather than erroring.
-    """
-    try:
-        from headroom.proxy.helpers import _get_context_tool_stats
-
-        stats = _get_context_tool_stats()
-    except Exception:
-        return None
-    if not stats or not stats.get("installed", False):
-        return None
-    lifetime = stats.get("lifetime") or {}
-    tokens_saved = int(lifetime.get("tokens_saved", 0) or 0)
-    if tokens_saved <= 0:
-        return None
-    return {
-        "tool": str(stats.get("tool", "rtk")),
-        "label": str(stats.get("label", "RTK")),
-        "tokens_saved": tokens_saved,
-        "commands": int(lifetime.get("commands", 0) or 0),
-        "savings_pct": round(float(lifetime.get("savings_pct", 0.0) or 0.0), 1),
-    }
-
-
-def _cli_filtering_report_lines() -> list[str]:
-    """Render the context-tool (RTK) lifetime savings section, or [] if absent."""
-    cli = _context_tool_lifetime_savings()
-    if not cli:
-        return []
-    return [
-        f"{cli['label']} CLI Filtering (lifetime, all-time)",
-        "-" * 40,
-        f"  Tokens saved:  {cli['tokens_saved']:,} ({cli['savings_pct']:.1f}%)",
-        f"  Commands:      {cli['commands']:,}",
-        f"  Note: {cli['label']}'s own lifetime counter — not limited to the --hours window.",
-        "",
-    ]
-
-
 def format_report(report: PerfReport) -> str:
     """Format a PerfReport into a human-readable string."""
     lines: list[str] = []
-    cli_filtering_lines = _cli_filtering_report_lines()
 
     if not report.perf_records and not report.router_records:
-        if cli_filtering_lines:
-            # RTK savings are independent of proxy logs — surface them even when
-            # there is no proxy traffic in the window.
-            lines.append("No proxy performance data in ~/.headroom/logs/ for this window.")
-            lines.append("")
-            lines.extend(cli_filtering_lines)
-        else:
-            lines.append("No performance data found in ~/.headroom/logs/")
-            lines.append("")
-            lines.append("Start the proxy to begin collecting data:")
-            lines.append("  headroom proxy")
+        lines.append("No performance data found in ~/.headroom/logs/")
+        lines.append("")
+        lines.append("Start the proxy to begin collecting data:")
+        lines.append("  headroom proxy")
         return "\n".join(lines)
 
     # Header
@@ -540,16 +483,25 @@ def format_report(report: PerfReport) -> str:
         total_after = sum(r.tokens_after for r in records)
         total_saved = sum(r.tokens_saved for r in records)
         total_tool_saved = sum(r.tool_saved for r in records)
+        total_headline_saved = total_saved + total_tool_saved
         pct = (total_saved / total_before * 100) if total_before > 0 else 0
+        # All-layers denominator: deferred tool schemas were never in tok_before (they
+        # don't reach count_messages), so the pre-Headroom world is tok_before + them.
+        # Same construction the proxy's /api/stats uses for total_before_compression —
+        # the headline number and the headline percent must share a numerator, or the
+        # tile reads "60,920 saved (0.1%)" off two different definitions of saved.
+        headline_before = total_before + total_tool_saved
+        headline_pct = (total_headline_saved / headline_before * 100) if headline_before > 0 else 0
 
         lines.append(f"Requests:     {len(records)}")
-        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% reduction)")
-        lines.append(f"Total saved:  {total_saved:,} tokens (messages)")
-        # Tool-schema savings (deferral + turn-hook tool shrink) are counted apart
-        # from message compression — messages never include tool bytes — so surface
-        # them explicitly instead of hiding a tool-heavy turn's win behind tok_saved=0.
+        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% messages)")
+        # ONE headline. Tool-schema deferral can't move tok_before/after (messages never
+        # include tool bytes), so it used to render as a rival "Tool saved" line — which
+        # read as a side metric and hid the win on tool-heavy turns where tok_saved=0.
+        lines.append(f"Tokens saved: {total_headline_saved:,} ({headline_pct:.1f}% reduction)")
         if total_tool_saved > 0:
-            lines.append(f"Tool saved:   {total_tool_saved:,} tokens (tool schemas, deferral)")
+            lines.append(f"  · messages       {max(0, total_saved):,}")
+            lines.append(f"  · tool schemas   {total_tool_saved:,}")
         lines.append("")
 
         # Per-model breakdown with list prices
@@ -758,10 +710,6 @@ def format_report(report: PerfReport) -> str:
         for i, rec in enumerate(recommendations, 1):
             lines.append(f"  {i}. {rec}")
         lines.append("")
-
-    # CLI context-tool (RTK) lifetime savings — its own counter never reaches
-    # proxy.log, so surface it here or it stays invisible in `headroom perf`.
-    lines.extend(cli_filtering_lines)
 
     # Footer
     lines.append(
@@ -1039,6 +987,7 @@ def build_perf_summary(report: PerfReport) -> dict:
     total_after = sum(r.tokens_after for r in records)
     total_saved = sum(r.tokens_saved for r in records)
     total_tool_saved = sum(r.tool_saved for r in records)
+    total_headline_saved = total_saved + total_tool_saved
 
     total_cr = sum(r.cache_read for r in records)
     total_cw = sum(r.cache_write for r in records)
@@ -1094,6 +1043,11 @@ def build_perf_summary(report: PerfReport) -> dict:
         "total_requests": len(records),
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
+        # total_tokens_saved is the headline (messages + tool-schema deferral); the two
+        # components stay for consumers that break the number down. See
+        # headroom.proxy.tool_schema_savings_policy.
+        "total_tokens_saved": total_headline_saved,
+        "total_savings_pct": _pct(total_headline_saved, total_before + total_tool_saved),
         "tokens_saved": total_saved,
         "tool_saved": total_tool_saved,
         "savings_pct": _pct(total_saved, total_before),
@@ -1106,9 +1060,6 @@ def build_perf_summary(report: PerfReport) -> dict:
         "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,
         "total_lines_parsed": report.total_lines_parsed,
-        # RTK/CLI context-tool lifetime savings (its own counter, not in
-        # proxy.log) — None when no tool is installed. Mirrors the text report.
-        "cli_filtering": _context_tool_lifetime_savings(),
     }
 
 

@@ -9,9 +9,25 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.proxy.helpers import _reset_session_ccr_tracker_for_test
 from headroom.proxy.server import ProxyConfig, create_app
 
 _RAW_TRANSCRIPT = "\n".join(f"row {idx}: payload payload payload" for idx in range(80))
+
+
+@pytest.fixture(autouse=True)
+def _reset_ccr_tracker():
+    """Isolate the process-global ``SessionCcrTracker`` between tests.
+
+    Several tests here share ``session_id="stable-session"``, and the tracker's
+    ``has_done_ccr`` flag is monotonic per session. Without this, a test that
+    injects the tool leaves the flag set and the next test sees a sticky replay
+    it never set up — order-dependent, and only visible in file order, not when
+    run alone. Mirrors the fixture in ``tests/test_ccr_tool_always_on.py``.
+    """
+    _reset_session_ccr_tracker_for_test()
+    yield
+    _reset_session_ccr_tracker_for_test()
 
 
 class _FakePrefixTracker:

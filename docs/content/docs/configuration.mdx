@@ -5,26 +5,7 @@ description: All configuration options for the Headroom Python and TypeScript SD
 
 Headroom can be configured via the SDK constructor, proxy command line, environment variables, or per-request overrides.
 
-## CLI Context Tool
-
-`headroom wrap ...` uses RTK for local shell-output filtering by default.
-Set `HEADROOM_CONTEXT_TOOL=lean-ctx` to have wrap commands install or reuse
-`lean-ctx` and run `lean-ctx init --agent <tool>` instead of RTK setup.
-
-```bash
-export HEADROOM_CONTEXT_TOOL=lean-ctx
-headroom wrap claude
-headroom wrap codex --prepare-only
-```
-
-Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
-
 If Codex history disappeared after using an older wrapper, see [Recover Codex State](/docs/codex-recovery) before wrapping Codex again.
-
-The proxy reads RTK lifetime savings with global scope by default so a shared
-daemon reports savings across the operator's projects. Set
-`HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
-proxy process working directory.
 
 ## SDK Modes (`default_mode` / `headroom_mode`)
 
@@ -418,7 +399,7 @@ precedence rules: explicit argument > per-resource env var > derived
 from canonical root > default. Every legacy env var continues to work
 unchanged.
 
-See the **[Filesystem Contract](https://github.com/headroomlabs-ai/headroom/blob/main/wiki/filesystem-contract.md)**
+See the **[Filesystem Contract](/docs/filesystem-contract)**
 page for the full bucket table, plugin-author guidance, and the Docker
 naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
 `HEADROOM_WORKSPACE_DIR`).

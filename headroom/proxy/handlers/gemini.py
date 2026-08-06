@@ -22,6 +22,7 @@ from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.token_counting import gemini_output_tokens
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -462,7 +463,9 @@ class GeminiHandlerMixin:
                     # output_tokens) would then raise TypeError on the non-error
                     # path. Mirrors the streaming _usage_int guard.
                     total_input_tokens = _usage_int(usage.get("promptTokenCount"))
-                    output_tokens = _usage_int(usage.get("candidatesTokenCount"))
+                    output_tokens = gemini_output_tokens(
+                        usage
+                    )  # includes thinking tokens (2.5-family)
                     cache_read_tokens = _usage_int(usage.get("cachedContentTokenCount"))
                 except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
                     pass
@@ -714,7 +717,9 @@ class GeminiHandlerMixin:
                         if usage.get("promptTokenCount") is None
                         else usage["promptTokenCount"]
                     )
-                    output_tokens = _usage_int(usage.get("candidatesTokenCount"))
+                    output_tokens = gemini_output_tokens(
+                        usage
+                    )  # includes thinking tokens (2.5-family)
                     # Gemini returns cachedContentTokenCount for context-cached tokens
                     # These are charged at 10-25% of the input price depending on model
                     cache_read_tokens = _usage_int(usage.get("cachedContentTokenCount"))

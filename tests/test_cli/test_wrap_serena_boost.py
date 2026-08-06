@@ -23,8 +23,8 @@ def _opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable the opt-in gate so injection actually writes.
 
     Instruction injection rewrites the user's CLAUDE.md/AGENTS.md, so it is
-    off by default (mirrors RTK). Tests that exercise the write path must opt
-    in via ``HEADROOM_SERENA_INSTRUCTIONS``.
+    off by default. Tests that exercise the write path must opt in via
+    ``HEADROOM_SERENA_INSTRUCTIONS``.
     """
     monkeypatch.setenv("HEADROOM_SERENA_INSTRUCTIONS", "1")
 
@@ -92,111 +92,6 @@ def test_instruction_file_target_per_agent(tmp_path: Path, monkeypatch: pytest.M
     assert wrap_cli._serena_instruction_file(_Reg("claude")).name == "CLAUDE.md"
     assert wrap_cli._serena_instruction_file(_Reg("codex")).name == "AGENTS.md"
     assert wrap_cli._serena_instruction_file(_Reg("grok")).name == "AGENTS.md"
-
-
-# ---------------------------------------------------------------------------
-# _detect_repo_languages
-# ---------------------------------------------------------------------------
-
-
-def test_detect_maps_extensions_to_serena_languages(tmp_path: Path) -> None:
-    (tmp_path / "app.py").write_text("print(1)\n")
-    (tmp_path / "web.ts").write_text("export const x = 1\n")
-    (tmp_path / "main.go").write_text("package main\n")
-
-    assert set(wrap_cli._detect_repo_languages(tmp_path)) == {"python", "typescript", "go"}
-
-
-def test_detect_ignores_deps_and_venv(tmp_path: Path) -> None:
-    (tmp_path / "app.py").write_text("print(1)\n")
-    # Languages that appear ONLY inside ignored dirs must not be reported.
-    (tmp_path / "node_modules").mkdir()
-    (tmp_path / "node_modules" / "dep.rs").write_text("fn main() {}\n")
-    (tmp_path / ".venv").mkdir()
-    (tmp_path / ".venv" / "lib.rb").write_text("puts 1\n")
-
-    detected = set(wrap_cli._detect_repo_languages(tmp_path))
-    assert detected == {"python"}
-    assert "rust" not in detected
-    assert "ruby" not in detected
-
-
-def test_detect_orders_by_file_count(tmp_path: Path) -> None:
-    for i in range(3):
-        (tmp_path / f"m{i}.py").write_text("x = 1\n")
-    (tmp_path / "main.go").write_text("package main\n")
-
-    ordered = wrap_cli._detect_repo_languages(tmp_path)
-    assert ordered[0] == "python"  # most files → default/fallback language first
-
-
-def test_detect_empty_when_no_source(tmp_path: Path) -> None:
-    (tmp_path / "README.md").write_text("# hi\n")  # markup, not mapped
-    assert wrap_cli._detect_repo_languages(tmp_path) == []
-
-
-# ---------------------------------------------------------------------------
-# _scope_serena_languages — pins languages into .serena/project.yml
-# ---------------------------------------------------------------------------
-
-
-def test_scope_creates_project_yml_when_absent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "app.py").write_text("print(1)\n")
-
-    wrap_cli._scope_serena_languages()
-
-    cfg = tmp_path / ".serena" / "project.yml"
-    assert cfg.exists()
-    text = cfg.read_text()
-    assert 'languages: ["python"]' in text
-    assert "project_name:" in text  # required field written too
-
-
-def test_scope_updates_existing_inline_languages(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "app.py").write_text("print(1)\n")
-    (tmp_path / "main.go").write_text("package main\n")
-    cfg = tmp_path / ".serena" / "project.yml"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text('project_name: "demo"\nlanguages: ["python"]\nencoding: "utf-8"\n')
-
-    wrap_cli._scope_serena_languages()
-
-    text = cfg.read_text()
-    # go + python (one file each → alphabetical tie-break), inline flow list.
-    assert 'languages: ["go", "python"]' in text
-    assert 'encoding: "utf-8"' in text  # other keys preserved
-
-
-def test_scope_leaves_block_style_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "app.py").write_text("print(1)\n")
-    cfg = tmp_path / ".serena" / "project.yml"
-    cfg.parent.mkdir(parents=True)
-    original = 'project_name: "demo"\nlanguages:\n- typescript\n'
-    cfg.write_text(original)
-
-    wrap_cli._scope_serena_languages()
-
-    # Block-style list is not something our single-line edit can safely touch,
-    # so it is left exactly as-is rather than corrupted.
-    assert cfg.read_text() == original
-
-
-def test_scope_noop_when_no_languages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "README.md").write_text("# hi\n")
-
-    wrap_cli._scope_serena_languages()
-
-    assert not (tmp_path / ".serena" / "project.yml").exists()
 
 
 # ---------------------------------------------------------------------------

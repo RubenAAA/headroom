@@ -690,8 +690,17 @@ class PrometheusMetrics:
         project: str | None = None,
         client: str | None = None,
         tool_search_saved: int = 0,
+        local_input_tokens: int | None = None,
     ):
-        """Record metrics for a request."""
+        """Record metrics for a request.
+
+        ``input_tokens`` is the billed/volume figure and may be the provider's own
+        count. ``local_input_tokens`` is the same request measured with the SAME
+        tokenizer as ``tokens_saved``; it is used wherever a delta is derived, so
+        reduction/yield/ledger math never straddles two rulers. Defaults to
+        ``input_tokens`` when omitted, preserving pre-split behaviour.
+        """
+        ledger_input_tokens = input_tokens if local_input_tokens is None else local_input_tokens
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original — handlers revert any inflation before sending
         # (verified clean on the wire). So compression savings are >= 0; a negative
@@ -848,8 +857,14 @@ class PrometheusMetrics:
             # Reconstruct the original as forwarded + saved.
             await asyncio.to_thread(
                 savings_ledger.record_savings_event,
-                tokens_before=input_tokens + tokens_saved,
-                tokens_after=input_tokens,
+                # The ledger stores a DELTA, so both ends must be on one ruler.
+                # `input_tokens` is the billed/volume figure and may be the
+                # provider's own count; pairing it with a locally-counted
+                # `tokens_saved` yields a mixed-ruler before/after (local 10->6
+                # with the provider reporting 8 would record 12->8). Use the
+                # caller's local count when supplied.
+                tokens_before=ledger_input_tokens + tokens_saved,
+                tokens_after=ledger_input_tokens,
                 model=model,
                 client=client or "proxy",
                 source="proxy",
@@ -1553,33 +1568,5 @@ class PrometheusMetrics:
                 ),
                 value=redactions_total(),
             )
-
-            # Phase G PR-G3 remediation (C4): RTK invocations counter
-            # also lives Python-side. RTK is wrapped by the
-            # `headroom wrap` CLI (headroom.cli.wrap); the proxy
-            # observes invocation counts via a process-local tracker
-            # the wrap tail bumps. The Rust proxy previously held a
-            # dead counter for this; that's been removed.
-            from headroom.cli.wrap_rtk_metrics import rtk_invocation_counts
-
-            counts = rtk_invocation_counts()
-            lines.extend(
-                [
-                    "# HELP wrap_rtk_invocations_total RTK invocations observed via the wrap CLI tail",
-                    "# TYPE wrap_rtk_invocations_total counter",
-                ]
-            )
-            if not counts:
-                # Emit a zero-row under the sentinel tool name so
-                # the family advertises HELP/TYPE on a fresh boot
-                # and dashboards can probe it before any RTK
-                # invocation has happened. Matches the Rust side's
-                # H3 force-zero contract.
-                lines.append('wrap_rtk_invocations_total{tool="__init__"} 0')
-            else:
-                for tool, count in counts.items():
-                    safe_tool = _escape_label_value(str(tool))
-                    lines.append(f'wrap_rtk_invocations_total{{tool="{safe_tool}"}} {count}')
-            lines.append("")
 
             return "\n".join(lines)

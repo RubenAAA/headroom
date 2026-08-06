@@ -288,6 +288,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **code:** fix two `CodeAwareCompressor` AST-reassembly bugs: an exported JS/TS function or class (`export function foo() {`) produced a duplicated `export export` keyword and invalid syntax, because line-based node slicing (used to preserve indentation) pulled in the preceding `export` sibling's text on top of the `export_statement` handler's own prefix reconstruction. Separately, in every supported language, a doc comment immediately above a top-level function, class, or type was detached from its declaration during extraction and re-emitted in a cluster at the end of the compressed output instead of staying attached to what it documents.
 - * **proxy:** Buffered upstream responses containing a `server_tool_use` (or any other unrecognized Anthropic content block) no longer turn a fully-generated response into an HTTP 502. `StreamingMixin._response_to_sse` raised `ValueError` on unknown block types after the entire upstream generation had already been buffered, so a slow-but-successful response failed and the client retried the whole multi-minute request. Unknown blocks are now emitted verbatim in `content_block_start` (following the existing redacted_thinking` pattern), so `server_tool_use`, `server_tool_result`, `mcp_tool_use`, and future block types round-trip ([#1806](https://github.com/headroomlabs-ai/headroom/issues/1806)).
 
+## [0.34.0](https://github.com/headroomlabs-ai/headroom/compare/v0.33.0...v0.34.0) (2026-08-05)
+
+
+### Features
+
+* **claude:** support Claude Code in VS Code ([#2752](https://github.com/headroomlabs-ai/headroom/issues/2752)) ([13a310a](https://github.com/headroomlabs-ai/headroom/commit/13a310a00de8e967ebe09502c6b715ef577c5926))
+* **code:** add PHP support to CodeAwareCompressor ([#2423](https://github.com/headroomlabs-ai/headroom/issues/2423)) ([6d5516d](https://github.com/headroomlabs-ai/headroom/commit/6d5516dcb878b6ffd139a1c7b3d480a1c8c1beb9))
+* **compress:** accept config.frozen_message_count on /v1/compress ([#2718](https://github.com/headroomlabs-ai/headroom/issues/2718)) ([2797099](https://github.com/headroomlabs-ai/headroom/commit/2797099becbd078e55b8a73cf904d2e3cb0d6889))
+* **compress:** reach the lossless provider seam on the general path and default /v1/compress to marker-free output ([#2691](https://github.com/headroomlabs-ai/headroom/issues/2691)) ([f2c48e2](https://github.com/headroomlabs-ai/headroom/commit/f2c48e26c684a31e2802de9f49ce2075ef9cbf4b))
+* **copilot:** proxy VS Code models transparently ([#2687](https://github.com/headroomlabs-ai/headroom/issues/2687)) ([007446c](https://github.com/headroomlabs-ai/headroom/commit/007446c73a26efa729bf6d6903c828adef730089))
+
+
+### Bug Fixes
+
+* **ccr:** stop persisting retrieval markers as original content ([#2694](https://github.com/headroomlabs-ai/headroom/issues/2694)) ([#2703](https://github.com/headroomlabs-ai/headroom/issues/2703)) ([3e348f3](https://github.com/headroomlabs-ai/headroom/commit/3e348f327f05921204329b72a57d3113cf5101c4))
+* **ci:** restrict Codecov shard uploads ([#2745](https://github.com/headroomlabs-ai/headroom/issues/2745)) ([3f2ca99](https://github.com/headroomlabs-ai/headroom/commit/3f2ca99fe16668e3d50b8e1706182ec7b226c352))
+* **compression:** honor qualified CCR names across integrations ([#2698](https://github.com/headroomlabs-ai/headroom/issues/2698)) ([dcb674b](https://github.com/headroomlabs-ai/headroom/commit/dcb674b5e4e0d29d52672118ba3cf5062b16d280))
+* **compress:** resolve the /v1/compress tokenizer per model, and document the real contract ([#2743](https://github.com/headroomlabs-ai/headroom/issues/2743)) ([6422a80](https://github.com/headroomlabs-ai/headroom/commit/6422a80a58010da805d4001e83265300aa716d8a))
+* **cost:** send litellm the total prompt so --budget stops seeing $0 ([#2757](https://github.com/headroomlabs-ai/headroom/issues/2757)) ([a033ac4](https://github.com/headroomlabs-ai/headroom/commit/a033ac4176b09c716905aa0f45ae317e954f0eb9))
+* **deps:** bump aiohttp and cryptography to clear the CVEs blocking 0.34.0 ([#2753](https://github.com/headroomlabs-ai/headroom/issues/2753)) ([0221e7f](https://github.com/headroomlabs-ai/headroom/commit/0221e7f240cf470628650d749dc0ab5f3f0135f3))
+* **kompress:** let orgs run Kompress on their own inference stack ([#2736](https://github.com/headroomlabs-ai/headroom/issues/2736)) ([3d23d76](https://github.com/headroomlabs-ai/headroom/commit/3d23d76248d2052b846a84b70be87c8c95bad9ac))
+* **kompress:** load merged.pt for the v2 checkpoint instead of the unmerged PEFT safetensors ([#2716](https://github.com/headroomlabs-ai/headroom/issues/2716)) ([46da91b](https://github.com/headroomlabs-ai/headroom/commit/46da91b2f1370b6b4910ae8a4ad0613929803887))
+* **kompress:** reject artifacts that fail at run, and prefetch model files at startup ([#2740](https://github.com/headroomlabs-ai/headroom/issues/2740)) ([224578e](https://github.com/headroomlabs-ai/headroom/commit/224578e80b4abbe1e16f1952efc24af5fdee106a))
+* **learn:** filter ambient user-role scaffolding ([#2275](https://github.com/headroomlabs-ai/headroom/issues/2275)) ([3eb0122](https://github.com/headroomlabs-ai/headroom/commit/3eb01220683d65660544c07631b1efb4781e1d53))
+* **learn:** run project discovery off the event loop ([#2731](https://github.com/headroomlabs-ai/headroom/issues/2731)) ([a70e5ff](https://github.com/headroomlabs-ai/headroom/commit/a70e5ff78dc9486e63a6563f122d392469ceef38))
+* normalize /p/&lt;project&gt; prefix on WebSocket upgrades so the Responses WS route is not rejected with 403 ([#2379](https://github.com/headroomlabs-ai/headroom/issues/2379)) ([789a4f3](https://github.com/headroomlabs-ai/headroom/commit/789a4f3060aa33a5bae82680968c3e367fa2db83))
+* **providers:** give every model exactly one tokenizer ([#2761](https://github.com/headroomlabs-ai/headroom/issues/2761)) ([cd92ed5](https://github.com/headroomlabs-ai/headroom/commit/cd92ed52ff80ee7932600306349fd5d6601b5404))
+* **providers:** stop a shorter model family shadowing a longer one ([#2762](https://github.com/headroomlabs-ai/headroom/issues/2762)) ([0cb72f4](https://github.com/headroomlabs-ai/headroom/commit/0cb72f45b23bdf7129822b16dd1d4cb7d6e0b062))
+* **providers:** stop pricing modern content blocks at zero ([#2760](https://github.com/headroomlabs-ai/headroom/issues/2760)) ([06add9e](https://github.com/headroomlabs-ai/headroom/commit/06add9e9d833783c1144316c0cb3cb142377d897))
+* **proxy/cost:** mark estimated-basis budget records and add an enforcement policy ([#2713](https://github.com/headroomlabs-ai/headroom/issues/2713)) ([#2725](https://github.com/headroomlabs-ai/headroom/issues/2725)) ([01df245](https://github.com/headroomlabs-ai/headroom/commit/01df2452529a86c689cf226fecd5918cc5d19676))
+* **proxy/debug:** reconcile Kompress warmup state in /debug/warmup ([#2711](https://github.com/headroomlabs-ai/headroom/issues/2711)) ([3a27c4d](https://github.com/headroomlabs-ai/headroom/commit/3a27c4dacb08a006ca5aa71e8e7728b230c7283f))
+* **proxy/openai:** run tool-description compaction on chat-completions ([#2741](https://github.com/headroomlabs-ai/headroom/issues/2741)) ([f9db5b5](https://github.com/headroomlabs-ai/headroom/commit/f9db5b506030a0e8557af8a350f3806464f8ff15))
+* **proxy:** route Codex Live voice through a dedicated /v1/live transport ([#2709](https://github.com/headroomlabs-ai/headroom/issues/2709)) ([232fb49](https://github.com/headroomlabs-ai/headroom/commit/232fb49c733122652528edcf3c500f365df265c4))
+* **proxy:** skip OpenAI tool_search deferral for Codex client ([#2729](https://github.com/headroomlabs-ai/headroom/issues/2729)) ([56b3e4c](https://github.com/headroomlabs-ai/headroom/commit/56b3e4c1b1e3513c409242b30e7712514f2624d5))
+* **proxy:** stop toggling headroom_retrieve in the Anthropic tools array ([#2672](https://github.com/headroomlabs-ai/headroom/issues/2672)) ([08fce29](https://github.com/headroomlabs-ai/headroom/commit/08fce29b4750a79fb2fbc3969847bb38f35e29b3))
+* remove rtk and lean-ctx CLI context tools ([#2677](https://github.com/headroomlabs-ai/headroom/issues/2677)) ([e0ce4b1](https://github.com/headroomlabs-ai/headroom/commit/e0ce4b1d4817e1b352e68e8b316273d863260ba7))
+* **router:** stop counting an image's base64 payload as suffix tokens ([#2778](https://github.com/headroomlabs-ai/headroom/issues/2778)) ([f03cc6d](https://github.com/headroomlabs-ai/headroom/commit/f03cc6d88b826c2752b20bdce944f9ad1e507e83))
+* **savings:** surface request growth the tok_saved clamp swallows ([#2708](https://github.com/headroomlabs-ai/headroom/issues/2708)) ([184146b](https://github.com/headroomlabs-ai/headroom/commit/184146b6884b7b0e4c589c5ee414f96bf56d867f))
+* **stats:** report one "Tokens Saved" headline across every harness ([#2737](https://github.com/headroomlabs-ai/headroom/issues/2737)) ([8262a4a](https://github.com/headroomlabs-ai/headroom/commit/8262a4a3217bf6125f293bacc1df9ae21f63264d))
+* **telemetry:** anonymous compression stats — no prompts, no data ([#2728](https://github.com/headroomlabs-ai/headroom/issues/2728)) ([9cfb008](https://github.com/headroomlabs-ai/headroom/commit/9cfb00838a197159d94aa52bc042df1a754b7984))
+* **telemetry:** stop mixing tokenizer scales in RequestOutcome, and fix the overhead framing ([#2756](https://github.com/headroomlabs-ai/headroom/issues/2756)) ([04e1517](https://github.com/headroomlabs-ai/headroom/commit/04e1517ede0a17ffa950a9531f210e31d236c660))
+* **tokenizers:** count HuggingFace chat templates, and resolve gpt-5 / gateway-wrapped names ([#2758](https://github.com/headroomlabs-ai/headroom/issues/2758)) ([0ed306b](https://github.com/headroomlabs-ai/headroom/commit/0ed306b22bf61bfaa421991aea0bd562fc97d910))
+* **tokenizers:** resolve gpt-5 and mixed-case model names to the right encoding ([#2776](https://github.com/headroomlabs-ai/headroom/issues/2776)) ([fc4680b](https://github.com/headroomlabs-ai/headroom/commit/fc4680b37af1d522fdbeba8e5d3228769dc49ba4))
+* **transforms:** stop ContentRouter recompressing headroom_retrieve results ([#2654](https://github.com/headroomlabs-ai/headroom/issues/2654)) ([677e097](https://github.com/headroomlabs-ai/headroom/commit/677e09735a41f6c37dedc842ab3c214b5bddeafc))
+* **wrap/serena:** stop creating serena_config.yml, unbricking Serena on fresh installs ([#2676](https://github.com/headroomlabs-ai/headroom/issues/2676)) ([759209c](https://github.com/headroomlabs-ai/headroom/commit/759209cff3daa72dd9d47e57568e731d10573d63))
+
+
+### Code Refactoring
+
+* **pricing:** make LiteLLM the source of truth, not the hardcoded table ([#2779](https://github.com/headroomlabs-ai/headroom/issues/2779)) ([0e1d6bf](https://github.com/headroomlabs-ai/headroom/commit/0e1d6bfa797d865834cc247989115a11949ce3f5))
+* remove the dead headroom/prediction module ([#2692](https://github.com/headroomlabs-ai/headroom/issues/2692)) ([b7a79ac](https://github.com/headroomlabs-ai/headroom/commit/b7a79ac31a99ec67dc5fbe7bd15e7b96f8c040ec))
+
+## [0.33.0](https://github.com/headroomlabs-ai/headroom/compare/v0.32.0...v0.33.0) (2026-07-29)
+
+
+### Features
+
+* **lossless:** factor shared directory prefix in the grep search fold ([#2547](https://github.com/headroomlabs-ai/headroom/issues/2547)) ([7dc9a97](https://github.com/headroomlabs-ai/headroom/commit/7dc9a978ca974a2ed264bb585b187dd11e0a04f2))
+* **metrics:** record per-extension token savings ([#2371](https://github.com/headroomlabs-ai/headroom/issues/2371)) ([02eb90f](https://github.com/headroomlabs-ai/headroom/commit/02eb90f24318abdfb05438e873c8f2af7023ab91))
+* **opencode:** ship the transport plugin in pip installs ([#2601](https://github.com/headroomlabs-ai/headroom/issues/2601)) ([f54f04f](https://github.com/headroomlabs-ai/headroom/commit/f54f04f5bfff9ff9f9ec83b452f580447c06254a))
+* **opencode:** support Copilot subscription backend for headroom models ([#2441](https://github.com/headroomlabs-ai/headroom/issues/2441)) ([#2445](https://github.com/headroomlabs-ai/headroom/issues/2445)) ([9089e7f](https://github.com/headroomlabs-ai/headroom/commit/9089e7f7d394b5a474cc99503b0197c0172f4c9c))
+* **proxy/hooks:** run fold-only (stream-safe) turn hooks on streaming OpenAI chat ([#2549](https://github.com/headroomlabs-ai/headroom/issues/2549)) ([a6d4921](https://github.com/headroomlabs-ai/headroom/commit/a6d4921e82c1e9fe1a5ca8b90ffd16aa84a698d4))
+* **proxy/savings:** aggregate tool-schema savings into Metrics + all reporting sinks ([#2546](https://github.com/headroomlabs-ai/headroom/issues/2546)) ([9f1ffef](https://github.com/headroomlabs-ai/headroom/commit/9f1ffefe83845a3af0ecd8013daa732c3cd56b7c))
+* **proxy:** label GitHub Copilot traffic as "copilot" in the outcome… ([#2377](https://github.com/headroomlabs-ai/headroom/issues/2377)) ([d7a8cdb](https://github.com/headroomlabs-ai/headroom/commit/d7a8cdbee1c500be35b87c9da8395087a37ff8b9))
+* **proxy:** make /v1/compress usable as a gateway/Kong sidecar ([#2458](https://github.com/headroomlabs-ai/headroom/issues/2458)) ([1329ed7](https://github.com/headroomlabs-ai/headroom/commit/1329ed7f1a8d7a018042ecbe41804b0be971792e))
+* **proxy:** model-aware cold-prefix hook — reasoning compaction (Kimi/GLM) + cold recompaction (CC) ([#2555](https://github.com/headroomlabs-ai/headroom/issues/2555)) ([cb8f4b6](https://github.com/headroomlabs-ai/headroom/commit/cb8f4b64367f8b034315db33e451bdbe87af61f2))
+* **proxy:** route selected external compressors through the content router ([#2388](https://github.com/headroomlabs-ai/headroom/issues/2388)) ([e3c7964](https://github.com/headroomlabs-ai/headroom/commit/e3c7964038116a8df4675840896712e1aa967c45))
+* **proxy:** select built-in compressors via --compressor + registry inventory ([#2373](https://github.com/headroomlabs-ai/headroom/issues/2373)) ([56c7d4a](https://github.com/headroomlabs-ai/headroom/commit/56c7d4a59e67655cd24040ecf729382c81cdec23))
+* **rust:** add structured prose offload plumbing ([#334](https://github.com/headroomlabs-ai/headroom/issues/334)) ([#2378](https://github.com/headroomlabs-ai/headroom/issues/2378)) ([9e07785](https://github.com/headroomlabs-ai/headroom/commit/9e0778553fc505edb2c5bc949b7277f9ffdf3bda))
+* **rust:** port CodeCompressor AST compressor to Rust (parity-only) ([#1154](https://github.com/headroomlabs-ai/headroom/issues/1154)) ([e530de5](https://github.com/headroomlabs-ai/headroom/commit/e530de5ad22100bcfaa12a463961dcb08d9671c8))
+* **rust:** port Kompress ML prose compressor to Rust (parity-only) ([#1153](https://github.com/headroomlabs-ai/headroom/issues/1153)) ([83e27e5](https://github.com/headroomlabs-ai/headroom/commit/83e27e50360753cf472acb99f1de992574fa80ae))
+* **telemetry:** record provider cache read/write/uncached tokens per request ([#2450](https://github.com/headroomlabs-ai/headroom/issues/2450)) ([bec4cce](https://github.com/headroomlabs-ai/headroom/commit/bec4cce8a9f5623e63dba0a847719a652b47d5dc))
+* **transforms:** add compressed signal + dispatch code_aware/html/diff via registry ([#2400](https://github.com/headroomlabs-ai/headroom/issues/2400)) ([7ebda67](https://github.com/headroomlabs-ai/headroom/commit/7ebda67ef65fe82803c7fb729c509a1451165f26))
+* **transforms:** add pluggable compressor registry + headroom.compressor entry point ([#2370](https://github.com/headroomlabs-ai/headroom/issues/2370)) ([a02073e](https://github.com/headroomlabs-ai/headroom/commit/a02073e3327365a0220ba04eeb10039f12d61684))
+* **transforms:** dispatch kompress/text via the compressor registry + forward question ([#2411](https://github.com/headroomlabs-ai/headroom/issues/2411)) ([446ec26](https://github.com/headroomlabs-ai/headroom/commit/446ec26003c8f661cec175a69e0ab8be0ae9cdea))
+* **transforms:** dispatch smart_crusher via the compressor registry (defer kompress/text ML boundary) ([#2404](https://github.com/headroomlabs-ai/headroom/issues/2404)) ([7c7bf43](https://github.com/headroomlabs-ai/headroom/commit/7c7bf430576541d0fffdb8fc727b76f3dd038f55))
+* **transforms:** make built-in compressors real Compressor implementations (adapters) ([#2391](https://github.com/headroomlabs-ai/headroom/issues/2391)) ([981616c](https://github.com/headroomlabs-ai/headroom/commit/981616c60ef04c32b3eb5b51c4f0f4a7ef297ef1))
+* **wrap:** boost Serena — symbol-first guidance, wrap-time pre-index, repo-language scoping ([#2425](https://github.com/headroomlabs-ai/headroom/issues/2425)) ([fd0e1a8](https://github.com/headroomlabs-ai/headroom/commit/fd0e1a8afeb60748f65fef8b9197ec95e23b335a))
+* **wrap:** default code-memory to Serena (dashboard browser off) behind unified --code-memory ([#2413](https://github.com/headroomlabs-ai/headroom/issues/2413)) ([6e4425a](https://github.com/headroomlabs-ai/headroom/commit/6e4425a6bdb2bfc49e1633a24b9c9e96e705e1ff))
+* **wrap:** reduce-at-source — SAFE quiet-CLI env defaults for the launched agent ([#2548](https://github.com/headroomlabs-ai/headroom/issues/2548)) ([c990cfb](https://github.com/headroomlabs-ai/headroom/commit/c990cfb8037e8f355c82eb1cef87f5c4297b612d))
+
+
+### Bug Fixes
+
+* **backends/litellm:** guard None completion_tokens in usage mapping ([#2322](https://github.com/headroomlabs-ai/headroom/issues/2322)) ([44a174f](https://github.com/headroomlabs-ai/headroom/commit/44a174fef4d514eceed20a767dc87d00cfde0eaa))
+* **backends:** don't crash the OpenAI-&gt;Anthropic converter on empty choices ([#2484](https://github.com/headroomlabs-ai/headroom/issues/2484)) ([43a7b57](https://github.com/headroomlabs-ai/headroom/commit/43a7b578a1377ad34d8a78ba3bcef1c276db0b4d))
+* **cache:** preserve cache_control ttl when re-anchoring a breakpoint ([#2651](https://github.com/headroomlabs-ai/headroom/issues/2651)) ([e0d2cd0](https://github.com/headroomlabs-ai/headroom/commit/e0d2cd0c5a1c3ee813ac225252c9fd8db7c77c12))
+* **cache:** preserve client cache_control ttl when consolidating breakpoints ([#2382](https://github.com/headroomlabs-ai/headroom/issues/2382)) ([8906d3a](https://github.com/headroomlabs-ai/headroom/commit/8906d3a6761c097bbc9d92a0b41f8c982afc633b))
+* **ccr:** guard empty/malformed OpenAI choices in _extract_assistant_message ([#2389](https://github.com/headroomlabs-ai/headroom/issues/2389)) ([89319fb](https://github.com/headroomlabs-ai/headroom/commit/89319fbcaddb4be2ea11e87858ed3bd0fcf9dca5))
+* **ccr:** sliding idle-window TTL with max-lifetime ceiling in the Rust core backends ([#2604](https://github.com/headroomlabs-ai/headroom/issues/2604)) ([#2631](https://github.com/headroomlabs-ai/headroom/issues/2631)) ([e825588](https://github.com/headroomlabs-ai/headroom/commit/e825588bfbc59fa9e86085e23b4a078e9a0038ba))
+* **ci:** align Ruff tooling versions ([#2406](https://github.com/headroomlabs-ai/headroom/issues/2406)) ([2bb14d1](https://github.com/headroomlabs-ai/headroom/commit/2bb14d1ab24617971a657b71ead567479021119d))
+* **cli:** warn when Headroom proxy URL leaks into the shell after unwrap claude ([#2238](https://github.com/headroomlabs-ai/headroom/issues/2238)) ([#2571](https://github.com/headroomlabs-ai/headroom/issues/2571)) ([904bc67](https://github.com/headroomlabs-ai/headroom/commit/904bc675b35072dc61191963cbe485fa692927d1))
+* **codex:** detect keyring-backed ChatGPT auth ([#2478](https://github.com/headroomlabs-ai/headroom/issues/2478)) ([46293f4](https://github.com/headroomlabs-ai/headroom/commit/46293f4daf4d217ab6f8a83f7c571571b79bae0c))
+* **compression:** report source-line span in CCR compression marker ([#2597](https://github.com/headroomlabs-ai/headroom/issues/2597)) ([18e1c3c](https://github.com/headroomlabs-ai/headroom/commit/18e1c3c9badc5169466b7f76ae08e0639f4ba104))
+* **copilot:** derive GHE credential host from API URL ([#800](https://github.com/headroomlabs-ai/headroom/issues/800)) ([#2511](https://github.com/headroomlabs-ai/headroom/issues/2511)) ([4a8157f](https://github.com/headroomlabs-ai/headroom/commit/4a8157fa0a3f1d07699f1071ceb653f8902f10a4))
+* **copilot:** normalize subscription API routing ([#2441](https://github.com/headroomlabs-ai/headroom/issues/2441)) ([#2455](https://github.com/headroomlabs-ai/headroom/issues/2455)) ([2eca5ee](https://github.com/headroomlabs-ai/headroom/commit/2eca5ee1140c9ce0a5fee05e604d3198f7f86026))
+* **copilot:** preserve /v1 for the Anthropic /v1/messages endpoint ([#2409](https://github.com/headroomlabs-ai/headroom/issues/2409)) ([#2414](https://github.com/headroomlabs-ai/headroom/issues/2414)) ([c400f90](https://github.com/headroomlabs-ai/headroom/commit/c400f9081052f633e4e64ad70b95a0230dc6fb3d))
+* **deps:** bump mcp to 1.28.1 to clear 3 high-severity CVEs ([#2348](https://github.com/headroomlabs-ai/headroom/issues/2348)) ([a90be94](https://github.com/headroomlabs-ai/headroom/commit/a90be94e32c393332d37db4fb439e0c776b89f27))
+* **grok:** preserve business-seat auth while routing only inference ([#2514](https://github.com/headroomlabs-ai/headroom/issues/2514)) ([e4076bb](https://github.com/headroomlabs-ai/headroom/commit/e4076bbe99d500982b51444fe37f8f467cd6abe2))
+* **image:** reuse image models instead of rebuilding them per request ([#2513](https://github.com/headroomlabs-ai/headroom/issues/2513)) ([#2536](https://github.com/headroomlabs-ai/headroom/issues/2536)) ([2a63ec7](https://github.com/headroomlabs-ai/headroom/commit/2a63ec70b65605dfcff1b0afc292ab0298459f20))
+* **install:** carry upstream-routing env overrides into supervised deployments ([#2429](https://github.com/headroomlabs-ai/headroom/issues/2429)) ([170b04a](https://github.com/headroomlabs-ai/headroom/commit/170b04a74d5361cdfac4a6e265f5ea0dfecbd841))
+* **install:** default to cache mode, matching `headroom proxy` ([#1893](https://github.com/headroomlabs-ai/headroom/issues/1893) follow-up) ([#2563](https://github.com/headroomlabs-ai/headroom/issues/2563)) ([b121223](https://github.com/headroomlabs-ai/headroom/commit/b121223ec97e95c5a7a4c2c5e06a4655c7328e88))
+* **install:** migrate deployments off the retired chopratejas image repo ([#2427](https://github.com/headroomlabs-ai/headroom/issues/2427)) ([17ff13c](https://github.com/headroomlabs-ai/headroom/commit/17ff13ccbe274e831d5d9327740cd6d506ea8c1c))
+* **install:** use CREATE_NO_WINDOW instead of DETACHED_PROCESS on Windows ([#2527](https://github.com/headroomlabs-ai/headroom/issues/2527)) ([045f3df](https://github.com/headroomlabs-ai/headroom/commit/045f3dfe6fd9f4e39e4cdd8c0c529a815d925c7e))
+* **kompress:** raise the default execution-slot wait ([#2456](https://github.com/headroomlabs-ai/headroom/issues/2456)) ([5bd2266](https://github.com/headroomlabs-ai/headroom/commit/5bd2266f16bb351a7a7334e1c29c598d28187b1d))
+* **learn:** detect the active OpenCode database ([#2587](https://github.com/headroomlabs-ai/headroom/issues/2587)) ([f74d874](https://github.com/headroomlabs-ai/headroom/commit/f74d87477701f1f95bd4709c4727f3d3890a4e22))
+* **learn:** keep traceback tail in tool-error digest preview ([#2596](https://github.com/headroomlabs-ai/headroom/issues/2596)) ([85e8699](https://github.com/headroomlabs-ai/headroom/commit/85e869945138f06471501046c5725eac119dea58))
+* **learn:** treat unreadable candidate paths as absent in project decode ([#2446](https://github.com/headroomlabs-ai/headroom/issues/2446)) ([a09ba6c](https://github.com/headroomlabs-ai/headroom/commit/a09ba6c08723618dba5f282a9beac78c9406edbf))
+* **mcp:** pin mcp dependency to &lt;2.0.0 to prevent server startup crash ([#2642](https://github.com/headroomlabs-ai/headroom/issues/2642)) ([b3f016b](https://github.com/headroomlabs-ai/headroom/commit/b3f016b866375cfe2ff8518055ab93844e11ec27))
+* **proxy/cost:** count Gemini thinking tokens in output usage ([#2639](https://github.com/headroomlabs-ai/headroom/issues/2639)) ([22b707f](https://github.com/headroomlabs-ai/headroom/commit/22b707fd31d75914e1677290d2a8011727eb74f5))
+* **proxy/cost:** record each request's savings exactly once (drop 3 double-counts) ([#2545](https://github.com/headroomlabs-ai/headroom/issues/2545)) ([0845b26](https://github.com/headroomlabs-ai/headroom/commit/0845b26ee61c507487cd8476cfabe8284f59402b))
+* **proxy/cost:** warn once per model when pricing lookup fails ([#2504](https://github.com/headroomlabs-ai/headroom/issues/2504)) ([#2535](https://github.com/headroomlabs-ai/headroom/issues/2535)) ([fa47637](https://github.com/headroomlabs-ai/headroom/commit/fa4763761b5912cccde95903f4b9a681b555465b))
+* **proxy/gemini:** None-guard token counts from usageMetadata ([#2347](https://github.com/headroomlabs-ai/headroom/issues/2347)) ([f64aac9](https://github.com/headroomlabs-ai/headroom/commit/f64aac9733d5e314f381644eaea62e2c28b6dc65))
+* **proxy/gemini:** tolerate malformed parts on the compression path ([#2486](https://github.com/headroomlabs-ai/headroom/issues/2486)) ([07cf547](https://github.com/headroomlabs-ai/headroom/commit/07cf5476072a45bac7dd94386de126234a8049e7))
+* **proxy/metrics:** move the savings-ledger append off the event loop ([#2439](https://github.com/headroomlabs-ai/headroom/issues/2439)) ([4aac068](https://github.com/headroomlabs-ai/headroom/commit/4aac068814246db3fa250c48f5c916aa2561d8c8))
+* **proxy/openai:** cache under looked-up messages ([#2420](https://github.com/headroomlabs-ai/headroom/issues/2420)) ([7052d52](https://github.com/headroomlabs-ai/headroom/commit/7052d52dcbb2fd97b756c9b60a096cdfeee32c94))
+* **proxy/openai:** don't record Codex WS savings without input accounting ([#2493](https://github.com/headroomlabs-ai/headroom/issues/2493)) ([2195ba7](https://github.com/headroomlabs-ai/headroom/commit/2195ba7d917649ba2ac647fdefa661cf598e3028))
+* **proxy/openai:** feed chat/completions traffic into the traffic learner ([#2333](https://github.com/headroomlabs-ai/headroom/issues/2333)) ([6cdfd3f](https://github.com/headroomlabs-ai/headroom/commit/6cdfd3f64d2f64d50ed47644126df71872a21050))
+* **proxy/openai:** None-guard usage token counts on the chat path ([#2431](https://github.com/headroomlabs-ai/headroom/issues/2431)) ([313c290](https://github.com/headroomlabs-ai/headroom/commit/313c290df96ca58a19ea0f79c67f5b71bb5f4d60))
+* **proxy/openai:** replay incremental events in buffered Responses SSE ([#2410](https://github.com/headroomlabs-ai/headroom/issues/2410)) ([#2415](https://github.com/headroomlabs-ai/headroom/issues/2415)) ([0cbc0e8](https://github.com/headroomlabs-ai/headroom/commit/0cbc0e8e5435cd8d743ae537cdbaa70787bfc5b4))
+* **proxy/output-shaping:** tolerate a non-string system block text in steering ([#2435](https://github.com/headroomlabs-ai/headroom/issues/2435)) ([3e97671](https://github.com/headroomlabs-ai/headroom/commit/3e976712e717a53ab6aea73120ae6ffacea74250))
+* **proxy/perf:** count turn-hook message folds in token accounting ([#2520](https://github.com/headroomlabs-ai/headroom/issues/2520)) ([c371d5a](https://github.com/headroomlabs-ai/headroom/commit/c371d5ad602f5ab93645b2db4673ae2c5e9f0575))
+* **proxy/perf:** tokenizer-consistent token accounting + surface tool-schema savings ([#2542](https://github.com/headroomlabs-ai/headroom/issues/2542)) ([1cc53c9](https://github.com/headroomlabs-ai/headroom/commit/1cc53c9c92cd4dffaf048dc806cb8c570bdb86b6))
+* **proxy/streaming:** tolerate malformed content in _response_to_sse ([#2481](https://github.com/headroomlabs-ai/headroom/issues/2481)) ([77b26c0](https://github.com/headroomlabs-ai/headroom/commit/77b26c093cfb7b5c71a46d5156cb774a2ae889b1))
+* **proxy:** keep buffered CCR streams alive ([#2479](https://github.com/headroomlabs-ai/headroom/issues/2479)) ([a2e42fb](https://github.com/headroomlabs-ai/headroom/commit/a2e42fb877642e7eacfcc77655183244823d969e))
+* **proxy:** keep core tools and the client's ToolSearch resident for PascalCase clients ([#2647](https://github.com/headroomlabs-ai/headroom/issues/2647)) ([1d29738](https://github.com/headroomlabs-ai/headroom/commit/1d29738818bb40e00847dba46e2f9acce773d3eb))
+* **proxy:** offload OpenAI and Gemini tokenizer counting off the event loop ([#2498](https://github.com/headroomlabs-ai/headroom/issues/2498)) ([806d2e4](https://github.com/headroomlabs-ai/headroom/commit/806d2e468ace012ebfa1a0907a679781b5004c72))
+* **proxy:** promote Kompress health after runtime load ([#2402](https://github.com/headroomlabs-ai/headroom/issues/2402)) ([54526bc](https://github.com/headroomlabs-ai/headroom/commit/54526bc8586cdeb248d6257dc497136a21b971c0))
+* **proxy:** reassemble server_tool_use.input from streamed partial_json ([#2449](https://github.com/headroomlabs-ai/headroom/issues/2449)) ([8c8fae0](https://github.com/headroomlabs-ai/headroom/commit/8c8fae0d0bca75f7f2561136910e40f716be57ab))
+* **proxy:** report deferred Kompress status and promote health from cache ([#2564](https://github.com/headroomlabs-ai/headroom/issues/2564)) ([d50cfab](https://github.com/headroomlabs-ai/headroom/commit/d50cfabedca2c4b7d83751adaa8aa7b317f13c7b))
+* **proxy:** skip max_tokens rename for backend-routed openai chat ([#2401](https://github.com/headroomlabs-ai/headroom/issues/2401)) ([d6a1af4](https://github.com/headroomlabs-ai/headroom/commit/d6a1af40d5a18f4440a45e342c2d05fee7a642e3))
+* **release:** publish Windows wheel + sdist (disable PyPI attestations, [#112](https://github.com/headroomlabs-ai/headroom/issues/112)) ([#2405](https://github.com/headroomlabs-ai/headroom/issues/2405)) ([f9cbdd6](https://github.com/headroomlabs-ai/headroom/commit/f9cbdd6e390714e037832f78c59d00907a26b612))
+* **release:** sync generated version metadata on the release branch ([#2659](https://github.com/headroomlabs-ai/headroom/issues/2659)) ([5383c6b](https://github.com/headroomlabs-ai/headroom/commit/5383c6bf2f5209ddfe33cb9bf1c36c0b2e431bcd))
+* **rust:** port CJK-aware relevance-query matching to CodeCompressor ([#2634](https://github.com/headroomlabs-ai/headroom/issues/2634)) ([e86c639](https://github.com/headroomlabs-ai/headroom/commit/e86c6390cec4fc0f932b006b36d5b924511a5b0b))
+* **security:** exclude compromised ast-grep-cli 0.44.1 (supply-chain trojan) ([#2342](https://github.com/headroomlabs-ai/headroom/issues/2342)) ([494fb5a](https://github.com/headroomlabs-ai/headroom/commit/494fb5a60e15ae1ce425f79f1432827b42923c73))
+* **tokenizers:** price Claude against a real BPE (tiktoken o200k) not a char estimate ([#2543](https://github.com/headroomlabs-ai/headroom/issues/2543)) ([285176b](https://github.com/headroomlabs-ai/headroom/commit/285176be54e1d179676dcf205de44d5893f8efa5))
+* **transforms/cross-turn-dedup:** don't renumber-fold zero-padded line prefixes ([#2369](https://github.com/headroomlabs-ai/headroom/issues/2369)) ([f4070c4](https://github.com/headroomlabs-ai/headroom/commit/f4070c44cbd65ecf49f2ae81ad26a95296ef552b))
+* **transforms/kompress-remote:** keep compress fail-open on malformed 200 ([#2320](https://github.com/headroomlabs-ai/headroom/issues/2320)) ([b759990](https://github.com/headroomlabs-ai/headroom/commit/b75999017fc060a4617077ef86c21ce3249d0842))
+* **wrap:** emit bare dotted keys for Codex --config overrides ([#2383](https://github.com/headroomlabs-ai/headroom/issues/2383)) ([f57e959](https://github.com/headroomlabs-ai/headroom/commit/f57e959a506f87f14143d595cae24a1fd6084f66))
+* **wrap:** make RTK opt-in (off by default) across wrap subcommands ([#2344](https://github.com/headroomlabs-ai/headroom/issues/2344)) ([44136ed](https://github.com/headroomlabs-ai/headroom/commit/44136ed0427edff338c5d7979b589f8540c9b967))
+* **wrap:** skip Serena project setup outside real project roots ([#2574](https://github.com/headroomlabs-ai/headroom/issues/2574)) ([0994ea0](https://github.com/headroomlabs-ai/headroom/commit/0994ea04c869939946b91cbe52ceaf46740786be))
+* **wrap:** stop same-port persistent routing during claude unwrap ([#2340](https://github.com/headroomlabs-ai/headroom/issues/2340)) ([#2350](https://github.com/headroomlabs-ai/headroom/issues/2350)) ([cf5fa64](https://github.com/headroomlabs-ai/headroom/commit/cf5fa644b6e019a3ea31b4f48509a63921055253))
+
+
+### Performance Improvements
+
+* **content_router:** dedupe content detection ([#2419](https://github.com/headroomlabs-ai/headroom/issues/2419)) ([9b016f2](https://github.com/headroomlabs-ai/headroom/commit/9b016f2b64cb50cd50ab68711ab2abdf7d74c8ec))
+
+
+### Dependencies
+
+* bump the cargo-minor-patch group with 10 updates ([#2284](https://github.com/headroomlabs-ai/headroom/issues/2284)) ([3266ed7](https://github.com/headroomlabs-ai/headroom/commit/3266ed7641cc92f5cae79b1befeb6bee7c96242e))
+* bump the npm-minor-patch group across 3 directories with 7 updates ([#2276](https://github.com/headroomlabs-ai/headroom/issues/2276)) ([961866b](https://github.com/headroomlabs-ai/headroom/commit/961866ba7c277b59ccdd51e784de9547a09198af))
+
+
+### Code Refactoring
+
+* **transforms:** dispatch simple built-in strategies via the compressor registry ([#2399](https://github.com/headroomlabs-ai/headroom/issues/2399)) ([fc9c63f](https://github.com/headroomlabs-ai/headroom/commit/fc9c63f18c1a8414b62ced8b2dd54ad1fe4d1c14))
+* **wrap:** retire tokensave; Serena is the code-memory MCP ([#2499](https://github.com/headroomlabs-ai/headroom/issues/2499)) ([5d23a0a](https://github.com/headroomlabs-ai/headroom/commit/5d23a0aec22dacdbd7bf221dafbb17bcf9f10c63))
+
 ## [0.32.0](https://github.com/headroomlabs-ai/headroom/compare/v0.31.0...v0.32.0) (2026-07-17)
 
 

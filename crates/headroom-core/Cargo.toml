@@ -219,7 +219,8 @@ fastembed = { version = "5", default-features = false, optional = true, features
 # unifies to a single ORT instance (no second runtime, no extra binary
 # download). EP selection (CPU/OpenVINO/CUDA) is libloading-based at runtime,
 # which `load-dynamic` is what enables; there are no compile-time EP flags.
-# Kompress therefore only builds under the `ml` feature (on by default).
+# Kept optional so `default-features = false` consumers can still build without
+# ONNX Runtime; Kompress therefore only builds under `ml` (on by default).
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
 tree-sitter-c-sharp = "=0.23.5"
 

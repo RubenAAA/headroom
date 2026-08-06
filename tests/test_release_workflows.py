@@ -1219,3 +1219,66 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
         "release-please must bump plugins/openclaw/package.json so the "
         "openclaw npm publish stays in sync."
     )
+
+
+def test_release_metadata_sync_runs_on_release_please_branch() -> None:
+    """The release branch must self-heal the versions release-please does not bump.
+
+    release-please rewrites `pyproject.toml` plus its configured `extra-files` only.
+    `server.json` is asserted byte-for-byte against `render_server_json()`, which
+    reads the version from `pyproject.toml`, so a bump without a sync fails
+    `test_root_server_json_matches_builder` on the release PR — that is what blocked
+    v0.33.0 (#2339). `release.yml` syncs in-workspace before its own gate, but the
+    regular CI test job does not, so the sync has to be committed to the branch.
+    """
+    content = (ROOT / ".github" / "workflows" / "release-metadata-sync.yml").read_text(
+        encoding="utf-8"
+    )
+
+    # Keyed off a push to the release branch: release-please force-regenerates that
+    # branch on every merge to main, which is what wiped the hand-pushed fixes.
+    assert '"release-please--branches--**"' in content
+    assert "contents: write" in content
+
+    # Sync, then gate on the verifier, then commit — in that order.
+    sync = content.index("python scripts/version-sync.py")
+    verify = content.index("python scripts/verify-versions.py", sync)
+    commit = content.index("git commit", verify)
+    assert sync < verify < commit
+
+    # Must no-op rather than loop when the branch is already in sync.
+    assert "git diff --quiet" in content
+
+    # A GITHUB_TOKEN push would not re-trigger the release PR's checks.
+    assert "RELEASE_PLEASE_TOKEN" in content
+
+
+def test_version_sync_covers_every_file_the_verifier_gates() -> None:
+    """version-sync.py must write every version location verify-versions.py checks.
+
+    These two scripts drifting apart is the root cause of the stuck release: the
+    verifier gated files nothing propagated a version to.
+    """
+    sync = (ROOT / "scripts" / "version-sync.py").read_text(encoding="utf-8")
+    verify = (ROOT / "scripts" / "verify-versions.py").read_text(encoding="utf-8")
+
+    gated = [
+        "pyproject.toml",
+        "plugins/openclaw/package.json",
+        "sdk/typescript/package.json",
+        "plugins/headroom-agent-hooks/.claude-plugin/plugin.json",
+        "plugins/headroom-agent-hooks/.github/plugin/plugin.json",
+        "marketplace.json",
+    ]
+    for path in gated:
+        assert path in verify, f"{path} unexpectedly no longer gated by verify-versions.py"
+
+    # version-sync builds paths piecewise, so match on the distinctive components.
+    for fragment in [
+        "openclaw",
+        "typescript",
+        "headroom-agent-hooks",
+        "marketplace.json",
+        "server.json",
+    ]:
+        assert fragment in sync, f"version-sync.py no longer propagates a version to {fragment}"
