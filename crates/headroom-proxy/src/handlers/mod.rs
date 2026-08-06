@@ -14,5 +14,6 @@ pub mod chat_completions;
 pub mod conversations;
 pub mod gemini;
 pub mod local_model;
+pub mod reasoning_signature;
 pub mod responses;
 pub mod stats;

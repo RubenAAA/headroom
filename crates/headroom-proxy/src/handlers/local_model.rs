@@ -15,6 +15,11 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 
 use crate::proxy::{forward_http, AppState};
+use headroom_core::parser::extract_tool_result_text;
+
+use super::reasoning_signature::{
+    decode_reasoning_signature, encode_reasoning_signature, reasoning_input_item, PendingReasoning,
+};
 
 /// Values mirrored from the Codex CLI source (codex-rs/login/src/auth):
 /// the codex backend gates and buckets traffic by originator/user-agent,
@@ -79,98 +84,10 @@ fn turn_state_map() -> &'static std::sync::Mutex<std::collections::HashMap<Strin
     CODEX_TURN_STATE.get_or_init(Default::default)
 }
 
-/// Encrypted reasoning items captured from codex responses, keyed by session
-/// then by the call_id of the function call that followed them. The real CLI
-/// replays these in the next request's `input` so the model resumes its chain
-/// of thought across tool calls; Claude Code's history can't carry them, so
-/// we cache proxy-side and re-inject during translation.
-type ReasoningCache =
-    std::collections::HashMap<String, std::collections::HashMap<String, Vec<Value>>>;
-
-static CODEX_REASONING_CACHE: std::sync::OnceLock<std::sync::Mutex<ReasoningCache>> =
-    std::sync::OnceLock::new();
-
-const REASONING_CACHE_MAX_SESSIONS: usize = 64;
-const REASONING_CACHE_MAX_ANCHORS: usize = 512;
-
-fn reasoning_cache() -> &'static std::sync::Mutex<ReasoningCache> {
-    CODEX_REASONING_CACHE.get_or_init(Default::default)
-}
-
-fn store_reasoning_items(session_key: &str, call_id: &str, items: Vec<Value>) {
-    if items.is_empty() || call_id.is_empty() {
-        return;
-    }
-    if let Ok(mut cache) = reasoning_cache().lock() {
-        // Session-level cap: evict one *other* session rather than clearing
-        // all, so an unrelated codex conversation keeps its replay intact.
-        if cache.len() >= REASONING_CACHE_MAX_SESSIONS && !cache.contains_key(session_key) {
-            if let Some(victim) = cache.keys().find(|k| *k != session_key).cloned() {
-                cache.remove(&victim);
-            }
-        }
-        let session = cache.entry(session_key.to_string()).or_default();
-        // Anchor-level cap: once full, STOP caching new anchors instead of
-        // clearing. Clearing would drop items we still replay mid-history,
-        // changing already-cached prefix bytes and busting the codex prompt
-        // cache. Skipping keeps every existing anchor byte-stable; the only
-        // cost is no reasoning replay for brand-new calls in a very long
-        // session, which is cache-neutral.
-        if session.len() >= REASONING_CACHE_MAX_ANCHORS && !session.contains_key(call_id) {
-            return;
-        }
-        let item_count = items.len();
-        session.insert(call_id.to_string(), items);
-        tracing::debug!(
-            event = "codex_reasoning_capture",
-            session = %session_key,
-            call_id = %call_id,
-            items = item_count,
-            cached_anchors = session.len(),
-            "cached encrypted reasoning items for replay"
-        );
-    }
-}
-
-/// Insert cached reasoning items ahead of the function_call entries they
-/// preceded in the original response, restoring the CLI's input shape.
-fn reinject_reasoning_items(session_key: &str, input: Vec<Value>) -> Vec<Value> {
-    let Ok(cache) = reasoning_cache().lock() else {
-        return input;
-    };
-    let Some(session) = cache.get(session_key) else {
-        return input;
-    };
-    let mut out = Vec::with_capacity(input.len());
-    let mut hits = 0usize;
-    let mut misses = 0usize;
-    let mut replayed_items = 0usize;
-    for item in input {
-        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-            if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
-                match session.get(call_id) {
-                    Some(items) => {
-                        hits += 1;
-                        replayed_items += items.len();
-                        out.extend(items.iter().cloned());
-                    }
-                    None => misses += 1,
-                }
-            }
-        }
-        out.push(item);
-    }
-    tracing::debug!(
-        event = "codex_reasoning_replay",
-        session = %session_key,
-        anchor_hits = hits,
-        anchor_misses = misses,
-        replayed_items,
-        cached_anchors = session.len(),
-        "replaying cached encrypted reasoning items into codex request"
-    );
-    out
-}
+// Encrypted reasoning items used to be cached here, keyed by session and
+// anchored to the call_id that followed them. That cache is gone: the items now
+// ride back to us inside the `thinking` block signature we hand the client.
+// See `super::reasoning_signature` for why.
 
 /// Derive a stable UUID-shaped session id from Claude Code's metadata.user_id
 /// so `session-id`/`thread-id` headers stay constant within a session.
@@ -1017,16 +934,8 @@ fn anthropic_to_openai_responses_request(
         }
     }
 
-    // Replay cached encrypted reasoning items ahead of their function calls,
-    // restoring the reasoning continuity the real Codex CLI maintains.
-    let session_key = anthropic
-        .get("metadata")
-        .and_then(|m| m.get("user_id"))
-        .and_then(|v| v.as_str());
-    let input = match session_key {
-        Some(key) => reinject_reasoning_items(key, input),
-        None => input,
-    };
+    // Reasoning items are already back in `input`: they were decoded from the
+    // thinking blocks the client echoed, in the position they originally held.
 
     // Responses API uses a flat tool shape, unlike Chat Completions where
     // the fields are nested under `function`.
@@ -1192,7 +1101,9 @@ fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
                     .get("tool_use_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let result_content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                // `content` is a plain string OR a list of blocks; the naive
+                // `as_str()` silently blanked every array-shaped result.
+                let result_content = extract_tool_result_text(block);
                 let is_error = block
                     .get("is_error")
                     .and_then(|v| v.as_bool())
@@ -1263,6 +1174,31 @@ fn translate_assistant_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
                     "arguments": arguments
                 }));
             }
+            // A thinking block carrying our envelope is a reasoning item on the
+            // way home. Anything else in that signature slot — a genuine
+            // Anthropic signature, another proxy's envelope — decodes to None
+            // and the block is dropped, which is what the client would expect
+            // of history the backend never produced.
+            Some("thinking") => {
+                let Some(replay) = block
+                    .get("signature")
+                    .and_then(|v| v.as_str())
+                    .and_then(decode_reasoning_signature)
+                else {
+                    continue;
+                };
+                // Reasoning must sit ahead of the text it preceded, so flush
+                // first rather than letting the message swallow the ordering.
+                if !text_parts.is_empty() {
+                    out.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": text_parts.join("\n")
+                    }));
+                    text_parts.clear();
+                }
+                out.push(reasoning_input_item(replay));
+            }
             _ => {}
         }
     }
@@ -1297,7 +1233,7 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
                     .get("tool_use_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let result_content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let result_content = extract_tool_result_text(block);
                 let is_error = block
                     .get("is_error")
                     .and_then(|v| v.as_bool())
@@ -1339,7 +1275,7 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
 
     for tr in tool_results {
         let tool_use_id = tr.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-        let result_content = tr.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let result_content = extract_tool_result_text(tr);
         let is_error = tr
             .get("is_error")
             .and_then(|v| v.as_bool())
@@ -1968,15 +1904,8 @@ async fn handle_streaming_response(upstream_resp: reqwest::Response, original: &
         .unwrap_or("unknown")
         .to_string();
 
-    let session_key = original
-        .get("metadata")
-        .and_then(|m| m.get("user_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
     let stream = upstream_resp.bytes_stream();
-    let translated_stream =
-        translate_openai_stream_to_anthropic(stream, original_model, session_key);
+    let translated_stream = translate_openai_stream_to_anthropic(stream, original_model);
 
     let body = axum::body::Body::from_stream(translated_stream);
 
@@ -2000,10 +1929,9 @@ struct StreamTranslator {
     current_tool_name: String,
     total_output_tokens: u64,
     saw_tool_use: bool,
-    session_key: Option<String>,
-    /// Completed encrypted reasoning items awaiting their anchor (the next
-    /// function_call item in the stream).
-    pending_reasoning: Vec<Value>,
+    /// Identity of the reasoning item currently streaming, assembled from the
+    /// `output_item.added`/`.done` pair that describes it.
+    pending_reasoning: PendingReasoning,
 }
 
 impl StreamTranslator {
@@ -2019,14 +1947,8 @@ impl StreamTranslator {
             current_tool_name: String::new(),
             total_output_tokens: 0,
             saw_tool_use: false,
-            session_key: None,
-            pending_reasoning: Vec::new(),
+            pending_reasoning: PendingReasoning::default(),
         }
-    }
-
-    fn with_session_key(mut self, session_key: Option<String>) -> Self {
-        self.session_key = session_key;
-        self
     }
 
     #[cfg(test)]
@@ -2331,19 +2253,12 @@ impl StreamTranslator {
                     ));
                     self.in_tool_block = true;
                     self.saw_tool_use = true;
-
-                    // Anchor any reasoning items that streamed just before
-                    // this call so they can be replayed on the next turn.
-                    if !self.pending_reasoning.is_empty() {
-                        if let Some(key) = &self.session_key {
-                            store_reasoning_items(
-                                key,
-                                &self.current_tool_id.clone(),
-                                std::mem::take(&mut self.pending_reasoning),
-                            );
-                        } else {
-                            self.pending_reasoning.clear();
-                        }
+                }
+                // A reasoning item may announce its id here and carry the blob
+                // on `.done`, so start assembling as soon as it appears.
+                if item_type == Some("reasoning") {
+                    if let Some(item) = item {
+                        self.pending_reasoning.capture(item);
                     }
                 }
             }
@@ -2366,17 +2281,44 @@ impl StreamTranslator {
                     self.in_tool_block = false;
                     self.content_block_index += 1;
                 }
-                // Buffer completed encrypted reasoning items until the next
-                // function_call anchors them (they always precede it).
+                // The reasoning item is complete: seal its identity into the
+                // thinking block's signature so the client hands it back next
+                // turn. Without a usable pair there is nothing to replay and
+                // the block stays a plain summary.
                 if item_type == Some("reasoning") {
                     if let Some(item) = chunk.get("item") {
-                        if item
-                            .get("encrypted_content")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|s| !s.is_empty())
-                        {
-                            self.pending_reasoning.push(item.clone());
+                        self.pending_reasoning.capture(item);
+                    }
+                    let signature = self
+                        .pending_reasoning
+                        .replay()
+                        .as_ref()
+                        .and_then(encode_reasoning_signature);
+                    self.pending_reasoning.reset();
+                    if let Some(signature) = signature {
+                        if !self.in_thinking_block {
+                            // Reasoning summaries can be off entirely, in which
+                            // case no block was ever opened. Open an empty one
+                            // rather than drop the only copy of the item — but
+                            // only once whatever else is open has been closed,
+                            // or two blocks would share an index.
+                            if self.in_text_block {
+                                events.push(self.emit_content_block_stop());
+                                self.in_text_block = false;
+                                self.content_block_index += 1;
+                            }
+                            if self.in_tool_block {
+                                events.push(self.emit_content_block_stop());
+                                self.in_tool_block = false;
+                                self.content_block_index += 1;
+                            }
+                            events.push(self.emit_content_block_start_thinking());
+                            self.in_thinking_block = true;
                         }
+                        events.push(self.emit_signature_delta(&signature));
+                        events.push(self.emit_content_block_stop());
+                        self.in_thinking_block = false;
+                        self.content_block_index += 1;
                     }
                 }
             }
@@ -2542,6 +2484,17 @@ impl StreamTranslator {
         format!("event: content_block_delta\ndata: {event}\n\n")
     }
 
+    /// Closes a thinking block by handing the client the reasoning envelope it
+    /// will echo back to us next turn.
+    fn emit_signature_delta(&self, signature: &str) -> String {
+        let event = json!({
+            "type": "content_block_delta",
+            "index": self.content_block_index,
+            "delta": {"type": "signature_delta", "signature": signature}
+        });
+        format!("event: content_block_delta\ndata: {event}\n\n")
+    }
+
     fn emit_input_json_delta(&self, json_str: &str) -> String {
         let event = json!({
             "type": "content_block_delta",
@@ -2576,11 +2529,10 @@ impl StreamTranslator {
 fn translate_openai_stream_to_anthropic(
     stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
-    session_key: Option<String>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::StreamExt;
 
-    let mut translator = StreamTranslator::new(model).with_session_key(session_key);
+    let mut translator = StreamTranslator::new(model);
     let mut buffer = String::new();
     let mut current_event: Option<String> = None;
     let mut current_data: Vec<String> = Vec::new();
@@ -2715,6 +2667,312 @@ mod tests {
             .any(|item| item["role"] == "system"));
     }
 
+    /// Anthropic sends `tool_result.content` as a plain string *or* a list of
+    /// blocks. Reading it with `as_str()` blanked every array-shaped result,
+    /// so the model saw each tool call answered by an empty string.
+    #[test]
+    fn anthropic_to_openai_responses_request_preserves_block_shaped_tool_result() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "ls"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                        {"type": "text", "text": "file1"},
+                        {"type": "image", "source": {"type": "base64", "data": "aGk="}},
+                        {"type": "text", "text": "file2"}
+                    ]}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        assert_eq!(output["input"][1]["type"], "function_call_output");
+        assert_eq!(output["input"][1]["call_id"], "call_1");
+        // Text survives and keeps its order; the image block is skipped.
+        assert_eq!(output["input"][1]["output"], "file1\nfile2");
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_request_marks_block_shaped_tool_error() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "is_error": true, "content": [
+                        {"type": "text", "text": "boom"}
+                    ]}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        assert_eq!(output["input"][1]["output"], "Error: boom");
+    }
+
+    /// Same bug, Chat Completions path — both the single-block fast path and
+    /// the mixed text+tool_result path read `content` with `as_str()`.
+    #[test]
+    fn anthropic_to_openai_request_preserves_block_shaped_tool_result() {
+        let sole = json!({
+            "model": "local",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                        {"type": "text", "text": "only"}
+                    ]}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_request(&sole, true, true).unwrap();
+        let tool_msg = output["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool message");
+        assert_eq!(tool_msg["tool_call_id"], "call_1");
+        assert_eq!(tool_msg["content"], "only");
+
+        let mixed = json!({
+            "model": "local",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "context"},
+                    {"type": "tool_result", "tool_use_id": "call_2", "content": [
+                        {"type": "text", "text": "mixed"}
+                    ]}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_request(&mixed, true, true).unwrap();
+        let tool_msg = output["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool message");
+        assert_eq!(tool_msg["tool_call_id"], "call_2");
+        assert_eq!(tool_msg["content"], "mixed");
+    }
+
+    /// Pull the signature out of whatever SSE the translator emitted.
+    fn signature_from_stream(sse: &str) -> Option<String> {
+        for line in sse.lines() {
+            // Skip the `event:` and blank lines that frame each SSE record.
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            if event["delta"]["type"] == "signature_delta" {
+                return event["delta"]["signature"].as_str().map(String::from);
+            }
+        }
+        None
+    }
+
+    fn drive(t: &mut StreamTranslator, frames: &[(&str, &str)]) -> String {
+        let mut all = String::new();
+        for (event, data) in frames {
+            for e in t.process_frame(Some(event), data) {
+                all.push_str(&e);
+            }
+        }
+        all
+    }
+
+    /// The whole point of the envelope: a reasoning item leaves in the thinking
+    /// block's signature and comes back from the client's own history, with no
+    /// proxy-side state in between.
+    #[test]
+    fn reasoning_envelope_round_trips_through_the_client() {
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        let sse = drive(
+            &mut t,
+            &[
+                (
+                    "response.reasoning_summary_text.delta",
+                    r#"{"delta":"weighing it"}"#,
+                ),
+                (
+                    "response.output_item.done",
+                    r#"{"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENC_BLOB"}}"#,
+                ),
+            ],
+        );
+        assert!(sse.contains(r#""thinking":"weighing it""#));
+        let signature = signature_from_stream(&sse).expect("signature delta emitted");
+
+        // Next turn: the client echoes that thinking block back verbatim.
+        let request = json!({
+            "model": "claude-codex-5.6",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "weighing it", "signature": signature},
+                    {"type": "tool_use", "id": "call_1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}
+                ]}
+            ]
+        });
+        let out = anthropic_to_openai_responses_request(&request, true).unwrap();
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "ENC_BLOB");
+        assert_eq!(input[0]["summary"], json!([]));
+        // Reasoning has to stay ahead of the call it preceded.
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+    }
+
+    /// With reasoning summaries disabled no thinking block is ever opened by a
+    /// summary delta, so the item's only carrier is a signature-only block.
+    #[test]
+    fn reasoning_envelope_survives_when_summaries_are_disabled() {
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        let sse = drive(
+            &mut t,
+            &[(
+                "response.output_item.done",
+                r#"{"item":{"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"ENC_2"}}"#,
+            )],
+        );
+        assert!(sse.contains(r#""type":"thinking","thinking":"""#));
+        let signature = signature_from_stream(&sse).expect("signature emitted without summary");
+
+        let request = json!({
+            "model": "claude-codex-5.6",
+            "max_tokens": 100,
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": signature}
+            ]}]
+        });
+        let out = anthropic_to_openai_responses_request(&request, true).unwrap();
+        assert_eq!(out["input"][0]["type"], "reasoning");
+        assert_eq!(out["input"][0]["encrypted_content"], "ENC_2");
+    }
+
+    /// A signature-only block must not collide with a block already open, or
+    /// two content blocks share an index and the client sees a torn stream.
+    #[test]
+    fn signature_only_block_closes_open_text_first() {
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        let sse = drive(
+            &mut t,
+            &[
+                ("response.output_text.delta", r#"{"delta":"partial"}"#),
+                (
+                    "response.output_item.done",
+                    r#"{"item":{"type":"reasoning","id":"rs_4","summary":[],"encrypted_content":"ENC_4"}}"#,
+                ),
+            ],
+        );
+        assert!(signature_from_stream(&sse).is_some());
+        let indices: Vec<i64> = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .filter(|e| e["type"] == "content_block_start")
+            .filter_map(|e| e["index"].as_i64())
+            .collect();
+        let mut unique = indices.clone();
+        unique.dedup();
+        assert_eq!(indices, unique, "two content blocks opened on one index");
+    }
+
+    /// An id with no blob (or the reverse) is not replayable, so no signature
+    /// is minted and the summary stays a plain thinking block.
+    #[test]
+    fn incomplete_reasoning_item_emits_no_signature() {
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        let sse = drive(
+            &mut t,
+            &[(
+                "response.output_item.done",
+                r#"{"item":{"type":"reasoning","id":"rs_3","summary":[]}}"#,
+            )],
+        );
+        assert!(signature_from_stream(&sse).is_none());
+    }
+
+    /// Thinking blocks we did not mint must never become reasoning items: a
+    /// real Anthropic signature, or none at all, is dropped on the way out.
+    #[test]
+    fn foreign_thinking_blocks_are_dropped_not_replayed() {
+        for block in [
+            json!({"type": "thinking", "thinking": "hm", "signature": "ErUBCkYIBRgCKkDzS1nT"}),
+            json!({"type": "thinking", "thinking": "hm"}),
+            json!({"type": "redacted_thinking", "data": "opaque"}),
+        ] {
+            let request = json!({
+                "model": "claude-codex-5.6",
+                "max_tokens": 100,
+                "messages": [{"role": "assistant", "content": [
+                    block, json!({"type": "text", "text": "answer"})
+                ]}]
+            });
+            let out = anthropic_to_openai_responses_request(&request, true).unwrap();
+            let input = out["input"].as_array().unwrap();
+            assert!(
+                !input.iter().any(|i| i["type"] == "reasoning"),
+                "foreign thinking block became a reasoning item"
+            );
+            assert_eq!(input[0]["content"], "answer");
+        }
+    }
+
+    /// Reasoning now travels with the conversation, so a `/model` switch cannot
+    /// leak one model's items into another's request — there is no shared store
+    /// to leak through. Only what the client echoes is replayed.
+    #[test]
+    fn reasoning_does_not_leak_across_models() {
+        let mut first = StreamTranslator::new("model-a".to_string());
+        let sse = drive(
+            &mut first,
+            &[(
+                "response.output_item.done",
+                r#"{"item":{"type":"reasoning","id":"rs_a","summary":[],"encrypted_content":"ENC_A"}}"#,
+            )],
+        );
+        let signature = signature_from_stream(&sse).unwrap();
+
+        // A turn on another model that does not echo the block gets nothing.
+        let clean = json!({
+            "model": "model-b",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "next"}]
+        });
+        let out = anthropic_to_openai_responses_request(&clean, true).unwrap();
+        assert!(!out["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["type"] == "reasoning"));
+
+        // And what is echoed is carried by the request itself, not a cache.
+        let echoed = json!({
+            "model": "model-a",
+            "max_tokens": 100,
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": signature}
+            ]}]
+        });
+        let out = anthropic_to_openai_responses_request(&echoed, true).unwrap();
+        assert_eq!(out["input"][0]["encrypted_content"], "ENC_A");
+    }
+
     #[test]
     fn anthropic_to_openai_responses_request_forwards_tools() {
         let input = json!({
@@ -2788,40 +3046,34 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_items_round_trip_through_cache() {
-        let session = "test-reasoning-session";
-        let mut t = StreamTranslator::new("claude-codex-5.6".to_string())
-            .with_session_key(Some(session.to_string()));
-        for (event, data) in [
-            (
-                "response.output_item.done",
-                r#"{"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENC_BLOB"}}"#,
-            ),
-            (
-                "response.output_item.added",
-                r#"{"item":{"type":"function_call","call_id":"call_r1","name":"Bash","arguments":""}}"#,
-            ),
-        ] {
-            t.process_frame(Some(event), data);
-        }
-
-        let input = vec![
-            json!({"type": "message", "role": "user", "content": [{"type":"input_text","text":"hi"}]}),
-            json!({"type": "function_call", "call_id": "call_r1", "name": "Bash", "arguments": "{}"}),
-            json!({"type": "function_call_output", "call_id": "call_r1", "output": "ok"}),
-        ];
-        let out = reinject_reasoning_items(session, input);
-        assert_eq!(out.len(), 4);
-        assert_eq!(out[1]["type"], "reasoning");
-        assert_eq!(out[1]["encrypted_content"], "ENC_BLOB");
-        assert_eq!(out[2]["type"], "function_call");
-
-        // Unknown session leaves input untouched.
-        let untouched = reinject_reasoning_items(
-            "other-session",
-            vec![json!({"type": "function_call", "call_id": "call_r1"})],
+    fn reasoning_item_id_and_blob_may_arrive_on_separate_events() {
+        // `added` announces the id, `done` carries the blob; neither event is
+        // complete on its own but the pair is.
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        let sse = drive(
+            &mut t,
+            &[
+                (
+                    "response.output_item.added",
+                    r#"{"item":{"type":"reasoning","id":"rs_split","summary":[]}}"#,
+                ),
+                (
+                    "response.output_item.done",
+                    r#"{"item":{"type":"reasoning","summary":[],"encrypted_content":"ENC_SPLIT"}}"#,
+                ),
+            ],
         );
-        assert_eq!(untouched.len(), 1);
+        let signature = signature_from_stream(&sse).expect("signature from the merged pair");
+        let request = json!({
+            "model": "claude-codex-5.6",
+            "max_tokens": 100,
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": signature}
+            ]}]
+        });
+        let out = anthropic_to_openai_responses_request(&request, true).unwrap();
+        assert_eq!(out["input"][0]["id"], "rs_split");
+        assert_eq!(out["input"][0]["encrypted_content"], "ENC_SPLIT");
     }
 
     #[test]
