@@ -414,10 +414,14 @@ fn extract_cd_target(cmd: &str) -> Option<String> {
     for i in 0..words.len() {
         if words[i] == "cd" && i + 1 < words.len() {
             let arg = words[i + 1];
-            // Strip quotes
-            let dir = if (arg.starts_with('"') && arg.ends_with('"'))
-                || (arg.starts_with('\'') && arg.ends_with('\''))
-            {
+            // Strip a matched pair of surrounding quotes. The length check is
+            // what makes it a *pair*: a lone `"` both starts and ends with a
+            // quote, so without it `cd "` slices `[1..0]` and panics the
+            // capture worker.
+            let quoted = arg.len() >= 2
+                && ((arg.starts_with('"') && arg.ends_with('"'))
+                    || (arg.starts_with('\'') && arg.ends_with('\'')));
+            let dir = if quoted {
                 &arg[1..arg.len() - 1]
             } else {
                 arg
@@ -815,6 +819,25 @@ mod tests {
             "context should contain the matched pattern, got {:?}",
             out[0].data
         );
+    }
+
+    /// A lone quote satisfies both `starts_with` and `ends_with`, so the
+    /// quote-stripping slice ran `[1..0]` and panicked the capture worker.
+    #[test]
+    fn cd_target_survives_an_unmatched_quote() {
+        assert_eq!(extract_cd_target("cd \""), Some("\"".into()));
+        assert_eq!(extract_cd_target("cd '"), Some("'".into()));
+        // A quoted path containing a space is split by the whitespace tokenizer
+        // before it gets here, so only the opening fragment is seen and the
+        // quote is not a matched pair. Pre-existing behaviour, asserted so the
+        // change above is visibly scoped to the panic.
+        assert_eq!(extract_cd_target("cd \"a b\""), Some("\"a".into()));
+        assert_eq!(extract_cd_target("cd \"src\""), Some("src".into()));
+        assert_eq!(extract_cd_target("cd 'src'"), Some("src".into()));
+        assert_eq!(extract_cd_target("cd src"), Some("src".into()));
+        assert_eq!(extract_cd_target("cd"), None);
+        // Multi-byte paths must not be sliced apart either.
+        assert_eq!(extract_cd_target("cd \"тест\""), Some("тест".into()));
     }
 
     #[test]

@@ -109,6 +109,22 @@ pub struct SessionsStore {
 }
 
 impl SessionsStore {
+    /// Lock the connection, recovering a poisoned mutex instead of propagating
+    /// it.
+    ///
+    /// A panic while the lock was held used to make every later call panic too,
+    /// for the rest of the process — one bad request took the whole store down
+    /// and kept it down. Recovery is sound here because no operation spans a
+    /// transaction: each is a single statement, so the connection is still
+    /// usable and the earlier panic cost at most its own query.
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl SessionsStore {
     /// Open or create the DB at `db_path`, creating the schema if missing.
     /// Tolerates a DB created by the TypeScript `SessionDB` (identical schema)
     /// and adds the `conv_prefix_chain` table if absent.
@@ -236,7 +252,7 @@ impl SessionsStore {
         } else {
             ev.data_hash.clone()
         };
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO session_events (
                session_id, type, category, priority, data,
@@ -274,7 +290,7 @@ impl SessionsStore {
         project_dir: &str,
         category: Option<&str>,
     ) -> rusqlite::Result<Vec<StoredEvent>> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, type, category, priority, data,
                     project_dir, attribution_source, attribution_confidence,
@@ -299,7 +315,7 @@ impl SessionsStore {
 
     /// All events for a session, ordered by id ascending. Mirrors `getEvents`.
     pub fn get_events(&self, session_id: &str, limit: usize) -> rusqlite::Result<Vec<StoredEvent>> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, type, category, priority, data,
                     project_dir, attribution_source, attribution_confidence,
@@ -323,7 +339,7 @@ impl SessionsStore {
         turn_n: u64,
         prefix_hash: &str,
     ) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO conv_prefix_chain (conv_id, turn_n, prefix_hash)
              VALUES (?1, ?2, ?3)
@@ -337,7 +353,7 @@ impl SessionsStore {
 
     /// The newest recorded turn for a conversation, if any.
     pub fn last_prefix(&self, conv_id: &str) -> rusqlite::Result<Option<PrefixTurn>> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         conn.query_row(
             "SELECT turn_n, prefix_hash FROM conv_prefix_chain
              WHERE conv_id = ?1 ORDER BY turn_n DESC LIMIT 1",
@@ -354,7 +370,7 @@ impl SessionsStore {
 
     /// The recorded prefix hash at a specific turn, if any.
     pub fn prefix_at(&self, conv_id: &str, turn_n: u64) -> rusqlite::Result<Option<String>> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         conn.query_row(
             "SELECT prefix_hash FROM conv_prefix_chain WHERE conv_id = ?1 AND turn_n = ?2",
             params![conv_id, turn_n as i64],
@@ -368,7 +384,7 @@ impl SessionsStore {
     /// Record that `conv_id` was seen under `session_key`, refreshing its
     /// recency. Upsert so a long-running conversation keeps floating to the top.
     pub fn record_conversation(&self, session_key: &str, conv_id: &str) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO conv_by_session_key (session_key, conv_id, seq)
              VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM conv_by_session_key))
@@ -389,7 +405,7 @@ impl SessionsStore {
         exclude: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT conv_id FROM conv_by_session_key
              WHERE session_key = ?1 AND conv_id <> ?2
@@ -411,7 +427,7 @@ impl SessionsStore {
     /// call for the same `conv_id` is a no-op (never overwrites), so the
     /// replayed prefix can never oscillate.
     pub fn put_injection(&self, conv_id: &str, injected_text: &str) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO conv_injection (conv_id, injected_text)
              VALUES (?1, ?2)
@@ -423,7 +439,7 @@ impl SessionsStore {
 
     /// The injection bytes previously decided for a conversation, if any.
     pub fn get_injection(&self, conv_id: &str) -> rusqlite::Result<Option<String>> {
-        let conn = self.conn.lock().expect("sessions mutex poisoned");
+        let conn = self.conn();
         conn.query_row(
             "SELECT injected_text FROM conv_injection WHERE conv_id = ?1",
             params![conv_id],

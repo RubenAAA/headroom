@@ -183,6 +183,22 @@ pub struct CtxStore {
 }
 
 impl CtxStore {
+    /// Lock the connection, recovering a poisoned mutex instead of propagating
+    /// it.
+    ///
+    /// A panic while the lock was held used to make every later call panic too,
+    /// for the rest of the process — one bad request took the whole store down
+    /// and kept it down. Recovery is sound here because no operation spans a
+    /// transaction: each is a single statement, so the connection is still
+    /// usable and the earlier panic cost at most its own query.
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl CtxStore {
     /// Open or create the DB at `db_path`, creating the schema if missing.
     /// Tolerates a DB created by the TypeScript `ContentStore` (identical
     /// schema), so existing per-project content DBs open cleanly.
@@ -212,7 +228,7 @@ impl CtxStore {
     /// removed (from the porter FTS table). Used by the CTX-6 `/ctx/purge`
     /// endpoint.
     pub fn purge_all(&self) -> rusqlite::Result<usize> {
-        let conn = self.conn.lock().expect("ctx store mutex poisoned");
+        let conn = self.conn();
         let chunks_deleted: usize = conn.execute("DELETE FROM chunks", []).unwrap_or(0);
         conn.execute("DELETE FROM chunks_trigram", [])?;
         conn.execute("DELETE FROM sources", [])?;
@@ -224,7 +240,7 @@ impl CtxStore {
     /// indexed_at timestamp, or `None` if the source doesn't exist. Used by
     /// CTX-5 fetch to check disk-cache freshness.
     pub fn source_meta(&self, label: &str) -> rusqlite::Result<Option<SourceMeta>> {
-        let conn = self.conn.lock().expect("ctx store mutex poisoned");
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT chunk_count, indexed_at FROM sources WHERE label = ?1 LIMIT 1")?;
         let mut rows = stmt.query_map(params![label], |row| {
@@ -309,7 +325,7 @@ impl CtxStore {
         let session_id = opts.session_id.clone().unwrap_or_default();
         let event_id = opts.event_id.clone().unwrap_or_default();
 
-        let mut conn = self.conn.lock().expect("ctx store mutex poisoned");
+        let mut conn = self.conn();
 
         // ISO-ish timestamp from SQLite so it matches the format TS wrote and
         // sorts lexicographically. Seconds precision (TS used millis) — same
@@ -420,7 +436,7 @@ impl CtxStore {
         queries: &[String],
         opts: &SearchOpts,
     ) -> rusqlite::Result<Vec<SearchHit>> {
-        let conn = self.conn.lock().expect("ctx store mutex poisoned");
+        let conn = self.conn();
 
         let mut merged: HashMap<String, SearchHit> = HashMap::new();
         let mut order: Vec<String> = Vec::new();

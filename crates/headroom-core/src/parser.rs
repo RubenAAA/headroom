@@ -377,7 +377,7 @@ pub fn canonical_call_key(name: &str, arguments: &Value) -> String {
 /// list of `{"type": "text"}` blocks) and the Strands/Bedrock `toolResult`
 /// payload (items keyed `{"text": ...}` or `{"json": ...}` with no `type`
 /// field). Non-text inner blocks such as images are skipped.
-fn extract_tool_result_text(payload: &Value) -> String {
+pub fn extract_tool_result_text(payload: &Value) -> String {
     let Some(inner) = get(payload, "content") else {
         return String::new();
     };

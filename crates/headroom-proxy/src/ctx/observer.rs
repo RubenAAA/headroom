@@ -57,7 +57,28 @@ impl CtxObserver {
             .spawn(move || {
                 // Blocks until the channel closes (all senders dropped).
                 for job in rx {
-                    process(&worker_store, &job.parsed, &job.session_key);
+                    // One bad request must not end capture for the process.
+                    //
+                    // Restarting the thread would be the wrong shape: the
+                    // channel receiver lives here, so a replacement thread
+                    // could not be handed the queue, and every job still in
+                    // flight would be lost. Containing the panic per job keeps
+                    // the worker and its backlog intact, and costs one capture.
+                    //
+                    // `AssertUnwindSafe` is sound because nothing here has to
+                    // be consistent across jobs: each one is an independent
+                    // read-then-write against SQLite with no transaction
+                    // spanning them, and the store recovers a poisoned lock
+                    // rather than propagating it.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        process(&worker_store, &job.parsed, &job.session_key);
+                    }));
+                    if outcome.is_err() {
+                        tracing::error!(
+                            event = "ctx_observe_job_panicked",
+                            "CTX-2 capture panicked on one request; worker continues"
+                        );
+                    }
                 }
             })?;
 
