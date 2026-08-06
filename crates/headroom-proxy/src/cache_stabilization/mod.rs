@@ -49,6 +49,14 @@
 //!   `(model, system, tools)` and inject it so the upstream pins
 //!   cache lookup to a tenant-stable identity. **Mutates the body**
 //!   (only on PAYG) — see its docs for the gating contract.
+//! - [`tool_order`] — B2: replays the tool order we forwarded last
+//!   turn and appends genuinely-new tools at the end, so a late MCP
+//!   handshake splicing definitions into the middle of `tools[]` does
+//!   not invalidate every tool after it plus the whole system prompt
+//!   and message history. **Reorders the body's `tools` array**
+//!   (lossless — same definitions, byte for byte); declines whenever a
+//!   tool carries a `cache_control` marker, which is what keeps it out
+//!   of PR-E1/PR-E3's way on PAYG.
 //!
 //! Sibling PRs hang additional submodules off this `mod.rs`. Conflict
 //! resolution between parallel Phase E PRs is intentionally trivial:
@@ -61,6 +69,7 @@ pub mod drift_detector;
 pub mod openai_cache_key;
 pub mod prefix_replay;
 pub mod tool_def_normalize;
+pub mod tool_order;
 pub mod tool_prune;
 pub mod usage_observer;
 pub mod volatile_detector;

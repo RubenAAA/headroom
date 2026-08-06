@@ -68,6 +68,10 @@ pub struct AppState {
     /// request body — so this can be cloned freely into every handler
     /// path that buffers the body.
     pub drift_state: DriftState,
+    /// B2: per-session record of the tool order last forwarded upstream,
+    /// bounded to 1000 sessions. Read and written once per Anthropic
+    /// request, after tools are final.
+    pub tool_order_state: cache_stabilization::tool_order::ToolOrderStore,
     /// PR-D4: GCP ADC bearer-token source for Vertex routes. Default:
     /// [`crate::vertex::adc::GcpAdcTokenSource`] constructed lazily;
     /// the actual ADC chain is only resolved when the first Vertex
@@ -485,6 +489,7 @@ impl AppState {
             client,
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
+            tool_order_state: cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store: SessionReplayStore::new(REPLAY_STORE_CAPACITY),
             vertex_token_source,
             usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
@@ -1533,6 +1538,63 @@ fn maybe_compact_tool_schemas(body: bytes::Bytes, request_id: &str) -> bytes::By
                 tools_before_bytes = before_bytes,
                 tools_after_bytes = after_bytes,
                 "tool schema compaction"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
+/// B2: reorder `tools[]` to lead with the order forwarded on this session's
+/// previous turn, appending genuinely-new tools at the end.
+///
+/// Runs last, once tools are final — after routing, memory/CCR injection,
+/// pruning and schema compaction — so the recorded order is the order the
+/// provider actually caches. See
+/// [`cache_stabilization::tool_order`] for the guards and the measured effect.
+///
+/// Forwards the original bytes untouched when there is no `tools` array, when
+/// the stabilizer declines, or on any parse/serialize failure.
+///
+/// An empty `session_key` is also a passthrough. It should not happen on this
+/// branch (the drift detector populates it for every buffered Anthropic
+/// request), but the failure mode if it ever did is every conversation on the
+/// box collapsing into one store slot and replaying each other's tool order.
+fn maybe_stabilize_tool_order(
+    body: bytes::Bytes,
+    store: &cache_stabilization::tool_order::ToolOrderStore,
+    session_key: &str,
+    request_id: &str,
+) -> bytes::Bytes {
+    if session_key.is_empty() {
+        return body;
+    }
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let model = value
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reordered = match value
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(tools) => store.stabilize(session_key, &model, tools),
+        None => return body,
+    };
+    if !reordered {
+        return body;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::debug!(
+                request_id = %request_id,
+                model = %model,
+                event = "cache_stable_tool_order",
+                "replayed previous tool order; new tools appended at the end"
             );
             bytes::Bytes::from(bytes)
         }
@@ -3007,6 +3069,23 @@ pub(crate) async fn forward_http(
         // done), so what goes on the wire is what gets compacted. Byte-
         // identical passthrough when there is nothing to strip.
         let body_to_send = maybe_compact_tool_schemas(body_to_send, &request_id);
+
+        // B2 tool-order stabilization. Must follow every other tool mutation
+        // above, so the order we record is the order the provider caches.
+        let body_to_send = if state.config.cache_stable_tool_order
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            ) {
+            maybe_stabilize_tool_order(
+                body_to_send,
+                &state.tool_order_state,
+                &request_session_key,
+                &request_id,
+            )
+        } else {
+            body_to_send
+        };
 
         // Context-editing: when injecting `context_management` directives we
         // must also advertise the beta so the upstream honours them.
@@ -5138,6 +5217,111 @@ mod tests {
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "Read");
+    }
+
+    /// B2 end to end through the wiring function: turn one records, turn two
+    /// pushes a late-arriving tool to the tail. The rest of the body must
+    /// survive the reserialize untouched.
+    #[test]
+    fn maybe_stabilize_tool_order_replays_then_appends() {
+        use crate::cache_stabilization::tool_order::ToolOrderStore;
+        let store = ToolOrderStore::default();
+        let body = |tools: serde_json::Value| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-opus-4-8",
+                    "system": "s",
+                    "max_tokens": 64,
+                    "tools": tools,
+                }))
+                .unwrap(),
+            )
+        };
+        let names = |b: &bytes::Bytes| {
+            let v: serde_json::Value = serde_json::from_slice(b).unwrap();
+            v["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let first = body(serde_json::json!([{"name": "a"}, {"name": "b"}]));
+        let out = maybe_stabilize_tool_order(first.clone(), &store, "sess", "req-test");
+        assert_eq!(out, first, "first turn only records; bytes must not move");
+
+        let second = body(serde_json::json!([{"name": "a"}, {"name": "late"}, {"name": "b"}]));
+        let out = maybe_stabilize_tool_order(second, &store, "sess", "req-test");
+        assert_eq!(names(&out), ["a", "b", "late"]);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["max_tokens"], 64);
+        assert_eq!(v["system"], "s");
+    }
+
+    /// A different model on the same session key must not inherit the other
+    /// model's order — the credential-derived session key is shared between a
+    /// main agent and its subagents.
+    #[test]
+    fn maybe_stabilize_tool_order_keys_on_model() {
+        use crate::cache_stabilization::tool_order::ToolOrderStore;
+        let store = ToolOrderStore::default();
+        let body = |model: &str, tools: serde_json::Value| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"model": model, "tools": tools})).unwrap(),
+            )
+        };
+        let sub = body(
+            "claude-sonnet-4-6",
+            serde_json::json!([{"name": "b"}, {"name": "a"}]),
+        );
+        maybe_stabilize_tool_order(sub, &store, "sess", "req-test");
+
+        let main = body(
+            "claude-opus-4-8",
+            serde_json::json!([{"name": "a"}, {"name": "b"}, {"name": "c"}]),
+        );
+        let out = maybe_stabilize_tool_order(main.clone(), &store, "sess", "req-test");
+        assert_eq!(out, main, "subagent order must not leak across models");
+    }
+
+    /// No `tools` array — nothing to stabilize, and the body must not even be
+    /// reserialized.
+    #[test]
+    fn maybe_stabilize_tool_order_passthrough_without_tools() {
+        use crate::cache_stabilization::tool_order::ToolOrderStore;
+        let store = ToolOrderStore::default();
+        let original = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"model": "m", "messages": []})).unwrap(),
+        );
+        assert_eq!(
+            maybe_stabilize_tool_order(original.clone(), &store, "sess", "req-test"),
+            original
+        );
+    }
+
+    /// Without a session key every conversation would share one store slot and
+    /// replay each other's tool order. Passthrough instead.
+    #[test]
+    fn maybe_stabilize_tool_order_needs_a_session_key() {
+        use crate::cache_stabilization::tool_order::ToolOrderStore;
+        let store = ToolOrderStore::default();
+        let body = |tools: serde_json::Value| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"model": "m", "tools": tools})).unwrap(),
+            )
+        };
+        maybe_stabilize_tool_order(
+            body(serde_json::json!([{"name": "a"}, {"name": "b"}])),
+            &store,
+            "",
+            "req-test",
+        );
+        let shuffled = body(serde_json::json!([{"name": "b"}, {"name": "a"}]));
+        assert_eq!(
+            maybe_stabilize_tool_order(shuffled.clone(), &store, "", "req-test"),
+            shuffled
+        );
     }
 
     #[test]

@@ -63,7 +63,7 @@ subscription `unified` window is inferred to mirror it — confirm via
 | # | lever | mechanism | risk | status |
 |---|---|---|---|---|
 | B1 | force 1h cache TTL | pin `ttl:'1h'` so the prefix survives >5min gaps instead of full re-creation | low | not started |
-| B2 | cache-bust prevention | pin system/tools/cache_control/betas/effort stable so client churn doesn't re-create the ~180k prefix | low (lossless) | not started |
+| B2 | cache-bust prevention | pin system/tools/cache_control/betas/effort stable so client churn doesn't re-create the ~180k prefix | low (lossless) | **tools axis BUILT + WIRED** (−21.3% cache-creation on the corpus); other axes measured stable, see below |
 
 ## Results (data-backed, real captures, 8-request conversation)
 
@@ -80,6 +80,57 @@ ON−OFF delta is the clean signal (absolute numbers drift via cache warming).
 | **all_messages, kompress off (A2)** | **+4.3%** | first real win; cache-stable |
 | **clear_tool_uses keep2/20k (A1, idealized warm)** | **+28%** | big; some warming inflation |
 | economics ceiling (tool_results @ 50% consistent) | +34.8% | upper bound for A2 at 2× ratio |
+
+### B2 — what actually drifts (39 real captures)
+
+Before building anything, every axis B2 names was measured across the corpus:
+two conversations (21 opus turns, 18 sonnet) under one credential-derived
+session key, 37 within-conversation transitions.
+
+| axis | drift events | verdict |
+|---|---|---|
+| `system` | 0 | already stable — nothing to pin |
+| `thinking`, `temperature`, `max_tokens`, `output_config`, `metadata` | 0 | already stable |
+| `cache_control` | 0 | client places 3 of 4 breakpoints at fixed positions (`system[1]`, `system[2]`, last message) every turn |
+| `betas` | n/a | header only, never a body field; `append_anthropic_beta` preserves client order and dedupes, so it is deterministic given the same config |
+| `effort` | 0 | `output_shaper::shape_request` mutates `system` / `output_config.effort` / `thinking.budget_tokens` but its inputs are 4 hard-coded strings selected by config — no timestamps, ids or counters |
+| **`tools`** | **1** | an MCP server finished its handshake on turn 38 and the client spliced 2 definitions into index 33 of 97 |
+
+So B2's five axes reduce to one. The client is well-behaved about the rest, and
+so are we — nothing on the Anthropic request path injects per-request-varying
+bytes into the cached prefix.
+
+**Cost of the one event.** Anthropic caches the longest byte-identical prefix of
+`[tools, system, messages]`, so the first moved tool invalidates every tool
+behind it *plus* all of system and all of messages: 364,658 of 460,526 chars,
+**79.2% of the request, ~104k tokens re-created at full price** — for two tools
+nobody asked for at that position.
+
+**Three orderings, measured on that event:**
+
+| ordering | cache-creation |
+|---|---|
+| client as-is | 104,188 tok |
+| sorted by name (PR-E1) | 120,794 tok |
+| **replay previous order, append new at tail (B2)** | **83,643 tok** |
+
+Sorting is *worse than doing nothing* here. PR-E1 fixes clients whose order is
+unstable, where any fixed order beats none; against a client that is already
+stable it relocates tools relative to what the provider cached. Replay wins
+because it optimizes against what the provider actually holds. PR-E1 stays
+PAYG-only and B2 self-disables whenever a tool carries a `cache_control` marker,
+so the two never both run.
+
+**Corpus total**, replaying all 39 captures through the shipped Rust
+implementation (`cache_stabilization::tool_order`): baseline 95,937 tokens of
+cache creation, with B2 75,495 — **20,442 saved, −21.3%**. Every turn asserts the
+forwarded tool multiset is byte-identical to the client's, so the win is
+lossless by construction.
+
+Caveat on generality: one corpus, one operator, one MCP server arriving late.
+The per-event mechanics are structural (they follow from Anthropic's prefix
+rule), but the *frequency* of late-arriving tools is not something 39 captures
+can establish. Sessions with more MCP servers should see it more often.
 
 ## Sequential validation plan (each step measured, confirm/deny)
 

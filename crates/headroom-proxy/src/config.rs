@@ -541,6 +541,26 @@ pub struct CliArgs {
     )]
     pub prefix_replay: bool,
 
+    /// B2: replay the tool order forwarded last turn and append genuinely-new
+    /// tools at the end, so a late MCP handshake splicing definitions into the
+    /// middle of `tools[]` does not invalidate the cached prefix behind them.
+    /// Anthropic only. Lossless — the same definitions go out, byte for byte,
+    /// in a different order. Default `true`; self-disables whenever a tool
+    /// carries a `cache_control` marker, which on PAYG hands ordering back to
+    /// PR-E1's alphabetic sort.
+    ///
+    /// Only runs when the proxy is already buffering the body (`compression`
+    /// or any of the ctx flags). A pure-passthrough proxy never parses the
+    /// request, so there is nothing to stabilize and the client's bytes go out
+    /// untouched.
+    #[arg(
+        long = "cache-stable-tool-order",
+        env = "HEADROOM_PROXY_CACHE_STABLE_TOOL_ORDER",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub cache_stable_tool_order: bool,
+
     /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
     /// to be offloaded. Static per invariant I3 (never changes mid-session).
     /// Default `50_000` (mirrors context-mode's Read threshold).
@@ -1386,6 +1406,9 @@ pub struct Config {
     pub ctx_offload: bool,
     /// Freeze-replay: byte-identical prefix replay across turns. Default `false`.
     pub prefix_replay: bool,
+    /// B2: replay last turn's tool order, appending new tools at the end.
+    /// Default `true`.
+    pub cache_stable_tool_order: bool,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
@@ -1619,6 +1642,7 @@ impl Config {
             ctx_store_dir: args.ctx_store_dir,
             ctx_offload: args.ctx_offload,
             prefix_replay: args.prefix_replay,
+            cache_stable_tool_order: args.cache_stable_tool_order,
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
@@ -1841,6 +1865,9 @@ impl Config {
             ctx_store_dir: None,
             ctx_offload: false,
             prefix_replay: false,
+            // B2 off in the test default so existing request-path tests keep
+            // asserting byte-identical tool arrays; production defaults to on.
+            cache_stable_tool_order: false,
             ctx_offload_min_bytes: 50_000,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,

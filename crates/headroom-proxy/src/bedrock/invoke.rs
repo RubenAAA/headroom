@@ -653,6 +653,7 @@ mod tests {
             client: reqwest::Client::new(),
             bedrock_credentials: None,
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
@@ -744,6 +745,7 @@ mod tests {
             // PR-E6: see above — drift detector is unused by this
             // test; we just satisfy the struct shape.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
