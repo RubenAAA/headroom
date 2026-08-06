@@ -1478,6 +1478,41 @@ fn maybe_prune_tools(
     }
 }
 
+/// Strip annotation keys (`$schema`, `title`, `examples`, …) from `tools[]`
+/// and normalise description whitespace, then re-serialize.
+///
+/// Mirrors the pass both Python handlers apply after tools are finalised
+/// (`headroom/proxy/handlers/anthropic.py`, `.../openai.py`). Shape-agnostic:
+/// it walks the whole `tools` array, so Anthropic's `input_schema` and
+/// OpenAI's `function.parameters` are both covered.
+///
+/// Forwards the original bytes untouched when there is no `tools` array, when
+/// compaction saves nothing, or on any parse/serialize failure — a
+/// cache-stable request is never perturbed for zero gain.
+fn maybe_compact_tool_schemas(body: bytes::Bytes, request_id: &str) -> bytes::Bytes {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let (compacted, modified, before_bytes, after_bytes) =
+        crate::tool_schema_compaction::compact_tools(value);
+    if !modified {
+        return body;
+    }
+    match serde_json::to_vec(&compacted) {
+        Ok(bytes) => {
+            tracing::debug!(
+                request_id = %request_id,
+                tools_before_bytes = before_bytes,
+                tools_after_bytes = after_bytes,
+                "tool schema compaction"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
 /// Whether an upstream `reqwest` send error is a transient transport
 /// failure worth retrying on a fresh connection.
 ///
@@ -2938,6 +2973,12 @@ pub(crate) async fn forward_http(
                 }
             }
         };
+
+        // Tool schema compaction. Runs last, once tools are final for every
+        // endpoint (routing, sanitising, pruning and CCR injection are all
+        // done), so what goes on the wire is what gets compacted. Byte-
+        // identical passthrough when there is nothing to strip.
+        let body_to_send = maybe_compact_tool_schemas(body_to_send, &request_id);
 
         // Context-editing: when injecting `context_management` directives we
         // must also advertise the beta so the upstream honours them.
@@ -4982,6 +5023,69 @@ mod tests {
         let uri: Uri = "/v1/messages?stream=true".parse().unwrap();
         let out = build_upstream_url(&base, &uri).unwrap();
         assert_eq!(out.as_str(), "http://up:8080/v1/messages?stream=true");
+    }
+
+    /// Annotation keys are billed on every turn because tools are resent
+    /// each request. Compaction strips them before the body goes upstream.
+    #[test]
+    fn compact_tool_schemas_strips_annotation_keys() {
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "m",
+                "tools": [{
+                    "name": "search",
+                    "description": "Search  the\tweb.",
+                    "input_schema": {
+                        "type": "object",
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "title": "SearchArgs",
+                        "properties": {
+                            "query": {"type": "string", "title": "Query", "examples": ["a"]}
+                        }
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        let out = maybe_compact_tool_schemas(body.clone(), "req-test");
+        assert!(out.len() < body.len(), "compaction must shrink the body");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let schema = &v["tools"][0]["input_schema"];
+        assert!(schema.get("$schema").is_none(), "$schema must be stripped");
+        assert!(schema.get("title").is_none(), "title must be stripped");
+        assert!(schema["properties"]["query"].get("examples").is_none());
+        // Non-tool fields are untouched.
+        assert_eq!(v["model"], "m");
+    }
+
+    /// A request with nothing to strip must forward the ORIGINAL bytes, not a
+    /// re-serialized equivalent — re-serializing perturbs the cache prefix.
+    #[test]
+    fn compact_tool_schemas_is_byte_identical_passthrough_when_clean() {
+        for payload in [
+            serde_json::json!({"model": "m", "messages": []}),
+            serde_json::json!({
+                "model": "m",
+                "tools": [{
+                    "name": "x",
+                    "description": "Clean desc.",
+                    "input_schema": {"type": "object"}
+                }]
+            }),
+        ] {
+            let original = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap());
+            let out = maybe_compact_tool_schemas(original.clone(), "req-test");
+            assert_eq!(out, original, "clean body must pass through byte-identical");
+        }
+    }
+
+    #[test]
+    fn compact_tool_schemas_passthrough_on_unparseable_body() {
+        let original = bytes::Bytes::from(b"not json at all".to_vec());
+        assert_eq!(
+            maybe_compact_tool_schemas(original.clone(), "req-test"),
+            original
+        );
     }
 
     #[test]
