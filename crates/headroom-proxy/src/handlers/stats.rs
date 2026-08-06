@@ -24,6 +24,13 @@ pub async fn handle_stats(State(state): State<AppState>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "cost": cost_stats,
         "persistent_savings": savings_preview,
+        // Durable cache counters, and the one derived number that says whether
+        // the proxy is worth running. Unlike `/cache-health`, these survive a
+        // restart.
+        "lifetime_metrics": state.savings_tracker.metrics_snapshot(&serde_json::json!({
+            "path": state.savings_tracker.storage_path().display().to_string(),
+        })),
+        "savings_verdict": state.savings_tracker.savings_verdict(),
         "recent_requests": recent,
         "total_logged": state.request_logger.len(),
         "codex_rate_limits": state

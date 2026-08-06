@@ -252,6 +252,37 @@ impl Default for UsageObserver {
     }
 }
 
+/// What [`UsageObserver::complete`] decided about a turn, handed back so the
+/// caller can persist it. The observer's own counters live in memory and reset
+/// on restart; these are the ones worth keeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionClass {
+    /// Idle gap exceeded the cache TTL. Benign — nothing was wasted that
+    /// staying warm could have saved.
+    TtlExpiry,
+    /// Bytes inside the cached prefix changed and the provider re-created it.
+    /// This is the one that means we (or the client) moved something.
+    PrefixChange { wasted_tokens: u64 },
+    /// A re-cache with no structural drift to blame — usually a session reset.
+    Unknown,
+}
+
+impl CompletionClass {
+    /// `(reason, wasted_tokens)` in the vocabulary the durable metrics use.
+    /// Only a structural bust reports waste: a TTL expiry cost nothing that
+    /// staying warm could have saved, and an unattributed re-cache is counted
+    /// but not charged.
+    pub fn as_record(self) -> (&'static str, i64) {
+        match self {
+            CompletionClass::TtlExpiry => ("ttl_expiry", 0),
+            CompletionClass::PrefixChange { wasted_tokens } => {
+                ("prefix_change", wasted_tokens.min(i64::MAX as u64) as i64)
+            }
+            CompletionClass::Unknown => ("unknown", 0),
+        }
+    }
+}
+
 impl UsageObserver {
     pub fn new() -> Self {
         Self {
@@ -305,13 +336,17 @@ impl UsageObserver {
     /// conversation's previous turn. Call ONLY for cleanly completed
     /// streams (`message_stop`) — half-finished usage would classify
     /// garbage.
+    /// Returns what this turn was classified as, so a caller that can reach
+    /// durable storage can persist it. The observer deliberately holds no
+    /// reference to the savings tracker — it is a pure in-process watchdog,
+    /// and its counters reset on restart — so the caller does the writing.
     pub fn complete(
         &self,
         request_id: &str,
         input_tokens: u64,
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
-    ) {
+    ) -> Option<CompletionClass> {
         let now = SystemTime::now();
         let mut inner = self.lock();
 
@@ -333,7 +368,7 @@ impl UsageObserver {
             // (compression off, non-JSON, …) — no conversation
             // identity, so no per-turn classification. The rolling
             // rate above still counted it.
-            return;
+            return None;
         };
 
         let class = match inner.conversations.get(&pending.conversation_key) {
@@ -363,7 +398,7 @@ impl UsageObserver {
         );
 
         match class {
-            TurnClass::FirstTurn | TurnClass::Healthy => {}
+            TurnClass::FirstTurn | TurnClass::Healthy => None,
             TurnClass::TtlExpiry => {
                 inner.ttl_expiries_total += 1;
                 record_cache_miss_attribution(MISS_ATTRIBUTION_PROVIDER, "ttl_expiry");
@@ -374,6 +409,7 @@ impl UsageObserver {
                     cache_creation_input_tokens = cache_creation_input_tokens,
                     "prefix re-written after cache TTL expiry (idle > 5 min); expected, not a defect"
                 );
+                Some(CompletionClass::TtlExpiry)
             }
             TurnClass::Recache { wasted_tokens } => {
                 inner.recache_events_total += 1;
@@ -441,6 +477,14 @@ impl UsageObserver {
                     wasted_tokens,
                 );
                 inner.last_event = Some(event);
+                Some(match event_kind {
+                    // A structural bust: bytes inside the cached prefix moved,
+                    // and `wasted_tokens` is what that cost.
+                    RecacheEventKind::Drift => CompletionClass::PrefixChange { wasted_tokens },
+                    // A re-cache we cannot attribute to drift — usually a
+                    // session reset. Counted, but not charged as waste.
+                    RecacheEventKind::Expected => CompletionClass::Unknown,
+                })
             }
         }
     }
@@ -743,6 +787,70 @@ mod tests {
 
         assert_eq!(miss_count("unknown"), b0 + 1);
         assert_eq!(miss_count("prefix_change"), b1);
+    }
+
+    /// `complete` has to hand the classification back, or the caller — which
+    /// is the only thing that can reach durable storage — has nothing to
+    /// persist and cache busts die with the process.
+    #[test]
+    fn complete_reports_a_structural_bust_to_the_caller() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        {
+            let mut inner = obs.lock();
+            inner.conversations.put(
+                "conv-drift".to_string(),
+                TurnRecord {
+                    cache_read_input_tokens: 10_000,
+                    cache_creation_input_tokens: 2_000,
+                    at: SystemTime::now(),
+                },
+            );
+        }
+        // Drift dims present → the detector saw bytes move.
+        obs.begin_request("m-d1", "conv-drift".into(), Some("tools".to_string()));
+        let class = obs.complete("m-d1", 200, 0, 12_500);
+
+        assert_eq!(
+            class,
+            Some(CompletionClass::PrefixChange {
+                wasted_tokens: 12_000
+            })
+        );
+        assert_eq!(class.unwrap().as_record(), ("prefix_change", 12_000));
+    }
+
+    /// A TTL expiry is reported too, but charges no waste — time passing is
+    /// not something the proxy did.
+    #[test]
+    fn complete_reports_ttl_expiry_without_charging_waste() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        {
+            let mut inner = obs.lock();
+            inner.conversations.put(
+                "conv-ttl2".to_string(),
+                TurnRecord {
+                    cache_read_input_tokens: 10_000,
+                    cache_creation_input_tokens: 2_000,
+                    at: SystemTime::now() - (ANTHROPIC_CACHE_TTL + Duration::from_secs(10)),
+                },
+            );
+        }
+        obs.begin_request("m-t9", "conv-ttl2".into(), None);
+        let class = obs.complete("m-t9", 200, 0, 12_500);
+        assert_eq!(class, Some(CompletionClass::TtlExpiry));
+        assert_eq!(class.unwrap().as_record(), ("ttl_expiry", 0));
+    }
+
+    /// A healthy turn reports nothing, so the caller does no disk work on the
+    /// common path.
+    #[test]
+    fn complete_reports_nothing_on_a_healthy_turn() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("m-h1", "conv-healthy".into(), None);
+        assert_eq!(obs.complete("m-h1", 200, 10_000, 0), None);
     }
 
     /// An idle gap past the TTL is a real miss, bucketed `ttl_expiry`.

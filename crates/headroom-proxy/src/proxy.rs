@@ -642,6 +642,16 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             // the ledger mutation, so the two compose without double-counting.
             output_tokens_saved: headroom_core::output_savings::get_recorder()
                 .estimate_request_savings(&outcome.transforms_applied, outcome.output_tokens),
+            // Durable lifetime metrics only. The outcome has carried these all
+            // along; forwarding them is what lets the persisted blob say
+            // whether the cache is working, not just whether we compressed.
+            output_tokens: outcome.output_tokens,
+            attempted_input_tokens: outcome.attempted_input_tokens,
+            cache_write_5m_tokens: outcome.cache_write_5m_tokens,
+            cache_write_1h_tokens: outcome.cache_write_1h_tokens,
+            cached: outcome.cache_hit(),
+            stack: outcome.client.as_deref(),
+            waste_signals: outcome.waste_signals.clone(),
         };
         self.savings_tracker.record_request(&rec);
 
@@ -724,6 +734,14 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
 
     fn record_failed(&self, _outcome: &headroom_core::request_outcome::RequestOutcome) {
         crate::observability::proxy_counters::record_failed();
+    }
+
+    fn record_cache_outcome(&self, provider: &str, reason: &str, wasted_tokens: i64) {
+        self.savings_tracker
+            .record_cache_miss(Some(provider), Some(reason));
+        if wasted_tokens > 0 {
+            self.savings_tracker.record_cache_bust(wasted_tokens);
+        }
     }
 
     fn record_savings_ledger(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
@@ -4195,12 +4213,21 @@ async fn run_sse_state_machine(
             // a cleanly completed stream (`message_stop`) carries
             // trustworthy final usage.
             if state.status == crate::sse::anthropic::StreamStatus::MessageStop {
-                usage_observer.complete(
+                let class = usage_observer.complete(
                     &request_id,
                     state.usage.input_tokens,
                     state.usage.cache_read_input_tokens,
                     state.usage.cache_creation_input_tokens,
                 );
+                // The observer's counters reset on restart, so persist the
+                // classification here where the savings tracker is reachable.
+                // Without this there is no way to answer "is the proxy paying
+                // for itself" across sessions.
+                if let (Some(class), Some(ctx)) = (class, outcome_ctx.as_ref()) {
+                    use headroom_core::request_outcome::OutcomeSink as _;
+                    let (reason, wasted) = class.as_record();
+                    ctx.sink.record_cache_outcome("anthropic", reason, wasted);
+                }
             }
             // Freeze-replay: feed the completed turn's cache tokens
             // back into the session tracker so the next turn can

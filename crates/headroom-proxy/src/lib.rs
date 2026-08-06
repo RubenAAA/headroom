@@ -32,7 +32,6 @@ pub mod model_sanitize;
 pub mod modes;
 pub mod observability;
 pub mod output_shaper;
-pub mod persistent_metrics;
 pub mod probe_recorder;
 pub mod project_context;
 pub mod proxy;

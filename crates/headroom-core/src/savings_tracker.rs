@@ -277,6 +277,11 @@ struct State {
     display_session: DisplaySession,
     history: Vec<HistoryEntry>,
     projects: BTreeMap<String, ProjectEntry>,
+    /// Durable cache-behaviour counters. The tracker owns loading and saving
+    /// these, per `persistent_metrics`'s own contract; without a home here
+    /// they were a finished port with no call site, and nothing about cache
+    /// busts survived a proxy restart.
+    metrics: crate::persistent_metrics::PersistentMetricsState,
 }
 
 /// Persist bounded proxy compression savings history.
@@ -310,6 +315,26 @@ pub struct RequestRecord<'a> {
     /// Priced at the model's OUTPUT rate, and kept separate from
     /// `tokens_saved` (an input-side figure) so the two never mix.
     pub output_tokens_saved: i64,
+
+    // ── Fields below feed the durable lifetime metrics only ──────────────
+    // `RequestOutcome` has carried these all along; the tracker used to drop
+    // them on the floor, which is why the persisted blob could say nothing
+    // about cache behaviour.
+    /// Output tokens the model actually generated.
+    pub output_tokens: i64,
+    /// Input tokens before compression — the denominator for "did compression
+    /// do anything".
+    pub attempted_input_tokens: i64,
+    /// Cache writes billed at the 5-minute TTL.
+    pub cache_write_5m_tokens: i64,
+    /// Cache writes billed at the 1-hour TTL.
+    pub cache_write_1h_tokens: i64,
+    /// Whether this request read anything from the prefix cache.
+    pub cached: bool,
+    /// Calling stack label (`claude-code`, `codex`, …).
+    pub stack: Option<&'a str>,
+    /// Waste-signal token counts, keyed by signal name.
+    pub waste_signals: Option<Vec<(String, i64)>>,
 }
 
 impl SavingsTracker {
@@ -513,8 +538,72 @@ impl SavingsTracker {
             self.trim_history(&mut st, ts);
         }
 
+        // Durable lifetime counters. These are what make the savings question
+        // answerable across restarts: compression savings on their own can
+        // look good while cache busts quietly cost more than they save, so
+        // both sides go into the same persisted blob.
+        st.metrics
+            .record_request(&crate::persistent_metrics::RecordRequest {
+                provider: rec.provider.map(str::to_string),
+                stack: rec.stack.map(str::to_string),
+                model: Some(rec.model.to_string()),
+                input_tokens: delta_input_tokens,
+                output_tokens: coerce_int(rec.output_tokens),
+                attempted_input_tokens: coerce_int(rec.attempted_input_tokens),
+                tokens_saved: delta_tokens_saved,
+                cached: rec.cached,
+                record_stack: true,
+                cache_read_tokens: coerce_int(rec.cache_read_tokens),
+                cache_write_tokens: coerce_int(rec.cache_write_tokens),
+                cache_write_5m_tokens: coerce_int(rec.cache_write_5m_tokens),
+                cache_write_1h_tokens: coerce_int(rec.cache_write_1h_tokens),
+                uncached_input_tokens: coerce_int(rec.uncached_input_tokens),
+                input_usd: delta_input_cost_usd,
+                compression_savings_usd: delta_savings_usd,
+                cache_savings_usd: 0.0,
+                waste_signals: rec.waste_signals.as_ref().map(|pairs| {
+                    pairs
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                        .collect()
+                }),
+            });
+
         self.save(&st);
         true
+    }
+
+    /// Record a prefix-cache bust: `tokens_lost` had to be re-created because
+    /// something inside the cached prefix changed.
+    ///
+    /// Separate from [`Self::record_request`] because the bust is detected on
+    /// the response side, one turn after the request that caused it.
+    pub fn record_cache_bust(&self, tokens_lost: i64) {
+        let mut st = self.state.lock().unwrap();
+        st.metrics.record_cache_bust(tokens_lost);
+        self.save(&st);
+    }
+
+    /// Record why the prefix cache missed (`ttl_expiry`, `prefix_change`, or
+    /// `unknown`). `prefix_change` is the one that means we moved bytes.
+    pub fn record_cache_miss(&self, provider: Option<&str>, reason: Option<&str>) {
+        let mut st = self.state.lock().unwrap();
+        st.metrics.record_cache_miss(provider, reason);
+        self.save(&st);
+    }
+
+    /// The durable lifetime metrics, in API-safe form.
+    pub fn metrics_snapshot(&self, persistence: &Value) -> Value {
+        let st = self.state.lock().unwrap();
+        st.metrics.snapshot(persistence)
+    }
+
+    /// Whether the proxy is paying for itself — compression savings net of the
+    /// cache the proxy busted. See
+    /// [`crate::persistent_metrics::PersistentMetricsState::savings_verdict`].
+    pub fn savings_verdict(&self) -> Value {
+        let st = self.state.lock().unwrap();
+        st.metrics.savings_verdict()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -999,6 +1088,12 @@ impl SavingsTracker {
             display_session: normalize_display_session(raw.get("display_session")),
             history,
             projects: normalize_projects(raw.get("projects")),
+            // Absent on files written before the metrics landed; `new`
+            // treats a missing blob as a fresh zeroed state, so an older
+            // savings file upgrades in place rather than being rejected.
+            metrics: crate::persistent_metrics::PersistentMetricsState::new(
+                raw.get("lifetime_metrics"),
+            ),
         };
         if let Some(last) = st.history.last() {
             let reference = parse_timestamp(&last.timestamp).unwrap_or_else(utc_now);
@@ -1023,6 +1118,7 @@ impl SavingsTracker {
             "display_session": display_session_value(&st.display_session),
             "history": st.history.iter().map(history_entry_value).collect::<Vec<_>>(),
             "projects": projects_persist_value(&st.projects),
+            "lifetime_metrics": st.metrics.to_dict(),
         });
         let Ok(json_data) = serde_json::to_string_pretty(&payload) else {
             return;
@@ -1440,6 +1536,87 @@ mod tests {
 
     fn tracker(path: &Path) -> SavingsTracker {
         SavingsTracker::new(Some(path.to_path_buf()), false)
+    }
+
+    /// The whole point of the durable metrics: an in-process watchdog resets
+    /// on restart, so cache behaviour has to survive a reload or there is no
+    /// baseline to compare against.
+    #[test]
+    fn cache_counters_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            t.record_request(&RequestRecord {
+                model: "claude-sonnet-4",
+                input_tokens: 1_000,
+                tokens_saved: 400,
+                attempted_input_tokens: 1_400,
+                cache_read_tokens: 5_000,
+                cache_write_tokens: 900,
+                cache_write_1h_tokens: 900,
+                cached: true,
+                ..Default::default()
+            });
+            t.record_cache_miss(Some("anthropic"), Some("prefix_change"));
+            t.record_cache_bust(2_500);
+        }
+
+        // Fresh tracker over the same file — this is the restart.
+        let t = tracker(&path);
+        let v = t.savings_verdict();
+        assert_eq!(v["tokens_saved_by_compression"], 400);
+        assert_eq!(v["tokens_lost_to_cache_busts"], 2_500);
+        assert_eq!(v["bust_count"], 1);
+        assert_eq!(v["prefix_change_misses"], 1);
+        assert_eq!(v["cache_read_tokens"], 5_000);
+        // Saved 400, made the provider rebuild 2,500. That is a loss, and the
+        // verdict has to say so rather than reporting the 400 alone.
+        assert_eq!(v["net_tokens_saved"], -2_100);
+        assert_eq!(v["verdict"], "costing more than it saves");
+    }
+
+    /// A savings file written before the metrics existed must load, not throw
+    /// the user's history away.
+    #[test]
+    fn a_file_without_metrics_upgrades_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":3,"lifetime":{"requests":7,"tokens_saved":123},
+                "display_session":{},"history":[],"projects":{}}"#,
+        )
+        .unwrap();
+
+        let t = tracker(&path);
+        let v = t.savings_verdict();
+        assert_eq!(v["verdict"], "no data yet");
+        assert_eq!(v["net_tokens_saved"], 0);
+        // The pre-existing lifetime block is untouched.
+        assert_eq!(t.snapshot()["lifetime"]["requests"], 7);
+    }
+
+    /// Compression that never busts anything is the shape we want reported as
+    /// a win.
+    #[test]
+    fn clean_compression_reads_as_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let t = tracker(&path);
+        t.record_request(&RequestRecord {
+            model: "claude-sonnet-4",
+            input_tokens: 1_000,
+            tokens_saved: 900,
+            attempted_input_tokens: 1_900,
+            cache_read_tokens: 50_000,
+            cached: true,
+            ..Default::default()
+        });
+        let v = t.savings_verdict();
+        assert_eq!(v["net_tokens_saved"], 900);
+        assert_eq!(v["verdict"], "saving");
+        assert_eq!(v["tokens_lost_to_cache_busts"], 0);
     }
 
     #[test]

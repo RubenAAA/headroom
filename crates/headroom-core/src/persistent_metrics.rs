@@ -571,6 +571,7 @@ fn clamp_float(value: f64) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// In-memory Lifetime aggregate with deterministic, bounded dimensions.
+#[derive(Clone)]
 pub struct PersistentMetricsState {
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     state: MetricsSnapshotState,
@@ -592,6 +593,55 @@ impl Default for PersistentMetricsState {
 }
 
 impl PersistentMetricsState {
+    /// The bottom line: is the proxy paying for itself?
+    ///
+    /// Compression savings on their own are a half-answer. Every token
+    /// compression removes is a token saved, but every byte the proxy moves
+    /// inside a cached prefix costs a full re-creation of everything after it
+    /// — and on a subscription, cache reads are free while creations are not.
+    /// A proxy can therefore report a healthy compression ratio while costing
+    /// more than it saves.
+    ///
+    /// `net_tokens_saved` is `tokens.saved` minus `prefix_cache.bust_tokens`:
+    /// what we removed, less what we made the provider rebuild. Negative means
+    /// the proxy is losing, and `misses_by_reason.prefix_change` says whose
+    /// fault it is — that bucket is drift the detector attributed to bytes
+    /// moving, as opposed to `ttl_expiry` (time passing, nothing to do with
+    /// us).
+    ///
+    /// Reported alongside the raw inputs rather than on its own so the number
+    /// can be checked rather than believed.
+    pub fn savings_verdict(&self) -> Value {
+        let saved = self.state.tokens.saved;
+        let busted = self.state.prefix_cache.bust_tokens;
+        let net = saved - busted;
+        let pc = &self.state.prefix_cache;
+        serde_json::json!({
+            "net_tokens_saved": net,
+            "tokens_saved_by_compression": saved,
+            "tokens_lost_to_cache_busts": busted,
+            "bust_count": pc.bust_count,
+            "prefix_change_misses": pc.misses_by_reason.get("prefix_change"),
+            "ttl_expiry_misses": pc.misses_by_reason.get("ttl_expiry"),
+            "unknown_misses": pc.misses_by_reason.get("unknown"),
+            "cache_read_tokens": pc.cache_read_tokens,
+            "cache_write_tokens": pc.cache_write_tokens,
+            "uncached_input_tokens": pc.uncached_input_tokens,
+            "attempted_input_tokens": self.state.tokens.attempted_input,
+            // Free on a subscription, so a high read count against a low write
+            // count is the shape you want.
+            "verdict": if saved == 0 && busted == 0 {
+                "no data yet"
+            } else if net > 0 {
+                "saving"
+            } else if net < 0 {
+                "costing more than it saves"
+            } else {
+                "break-even"
+            },
+        })
+    }
+
     /// Build from a previously persisted blob, normalising every field.
     ///
     /// Anything unreadable — a missing key, the wrong type, a negative or

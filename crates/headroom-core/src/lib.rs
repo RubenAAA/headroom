@@ -13,6 +13,7 @@ pub mod output_savings;
 pub mod parser;
 pub mod paths;
 pub mod perf_analyzer;
+pub mod persistent_metrics;
 pub mod pricing;
 pub mod proxy;
 pub mod relevance;

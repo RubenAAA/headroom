@@ -641,6 +641,14 @@ impl OutcomeSink for CodexWsOutcomeSink {
             // Same read-only estimate as the HTTP sink.
             output_tokens_saved: headroom_core::output_savings::get_recorder()
                 .estimate_request_savings(&outcome.transforms_applied, outcome.output_tokens),
+            // Durable lifetime metrics, as on the HTTP sink.
+            output_tokens: outcome.output_tokens,
+            attempted_input_tokens: outcome.attempted_input_tokens,
+            cache_write_5m_tokens: outcome.cache_write_5m_tokens,
+            cache_write_1h_tokens: outcome.cache_write_1h_tokens,
+            cached: outcome.cache_hit(),
+            stack: outcome.client.as_deref(),
+            waste_signals: outcome.waste_signals.clone(),
         };
         self.savings_tracker.record_request(&rec);
     }

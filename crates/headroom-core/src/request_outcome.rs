@@ -335,6 +335,15 @@ pub trait OutcomeSink {
     /// tracker) because the ledger is a flocked disk append: sinks that own a
     /// runtime should push it off the request path. Default no-op.
     fn record_savings_ledger(&self, _outcome: &RequestOutcome) {}
+    /// Persist a prefix-cache outcome observed on the response side.
+    ///
+    /// `reason` is one of `ttl_expiry`, `prefix_change` or `unknown`;
+    /// `wasted_tokens` is the re-created prefix and is non-zero only for
+    /// `prefix_change`. Separate from [`OutcomeSink::record_request`] because
+    /// a bust is detected a turn after the request that caused it, and it is
+    /// spelled in primitives so the detector's own types can stay in the proxy
+    /// crate. Default no-op.
+    fn record_cache_outcome(&self, _provider: &str, _reason: &str, _wasted_tokens: i64) {}
 }
 
 /// Single funnel for per-request bookkeeping. Preserves Python's ordering:

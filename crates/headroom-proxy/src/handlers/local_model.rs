@@ -2949,12 +2949,19 @@ impl StreamTranslator {
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        observer.complete(
+        let class = observer.complete(
             &ctx.request_id,
             get("input_tokens").max(get("prompt_tokens")),
             cache_read,
             0,
         );
+        // Persist it, same as the Claude path: the observer's counters are
+        // in-memory and reset on restart.
+        if let Some(class) = class {
+            use headroom_core::request_outcome::OutcomeSink as _;
+            let (reason, wasted) = class.as_record();
+            ctx.sink.record_cache_outcome("routed", reason, wasted);
+        }
     }
 
     /// Hand the turn's cache-token counts to the prefix-replay store, which
