@@ -961,6 +961,10 @@ pub fn compress_anthropic_live_zone_with_ccr(
 /// - `body_raw`: the buffered request body as bytes. Must be valid JSON.
 /// - `auth_mode`: reserved for future use (PR-F2).
 /// - `model`: the upstream model name for tokenizer routing.
+/// - `dispatch_config`: per-request dispatch knobs. Only fields that are a
+///   pure function of the request (notably `exclude_tools`) may be set here —
+///   anything that varies turn-to-turn for the same content would break the
+///   identical-content → identical-bytes property this mode exists for.
 ///
 /// # Returns
 ///
@@ -970,6 +974,7 @@ pub fn compress_anthropic_all_messages(
     body_raw: &[u8],
     _auth_mode: AuthMode,
     model: &str,
+    dispatch_config: &DispatchConfig,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
@@ -985,9 +990,10 @@ pub fn compress_anthropic_all_messages(
 
     let messages_total = messages.len();
     let tokenizer = get_tokenizer(model);
-    // Subscription mode takes no `DispatchConfig`, so `--exclude-tools`
-    // does not reach here; only the unconditional CCR guard applies.
-    let tool_guards = collect_tool_guards(messages, &[]);
+    // `--exclude-tools` guards apply here exactly as they do on the
+    // live-zone path; the unconditional CCR guard rides along inside
+    // `collect_tool_guards`.
+    let tool_guards = collect_tool_guards(messages, &dispatch_config.exclude_tools);
     let mut block_outcomes: Vec<BlockOutcome> = Vec::new();
     let mut replacements: Vec<Replacement> = Vec::new();
 
@@ -1027,7 +1033,7 @@ pub fn compress_anthropic_all_messages(
                         tokenizer.as_ref(),
                         &mut replacements,
                         None, // No CCR store for all-messages mode yet.
-                        &DispatchConfig::default(),
+                        dispatch_config,
                     )
                 }
                 SlotKind::LosslessOnly {
@@ -1058,7 +1064,7 @@ pub fn compress_anthropic_all_messages(
                         tokenizer.as_ref(),
                         &mut replacements,
                         None,
-                        &DispatchConfig::default(),
+                        dispatch_config,
                     )
                 }
             };
@@ -2571,7 +2577,13 @@ mod tests {
                 ]},
             ]
         }));
-        let out = compress_anthropic_all_messages(&b, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+        let out = compress_anthropic_all_messages(
+            &b,
+            AuthMode::Payg,
+            DEFAULT_MODEL,
+            &DispatchConfig::default(),
+        )
+        .unwrap();
         let manifest = match &out {
             LiveZoneOutcome::NoChange { manifest } => manifest,
             LiveZoneOutcome::Modified { manifest, .. } => manifest,

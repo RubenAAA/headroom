@@ -269,22 +269,25 @@ pub struct CliArgs {
 
     /// Compression mode policy for `/v1/messages`.
     ///
-    /// `off` (default): byte-faithful passthrough on every request.
-    /// `live_zone`: PR-B2 wired the dispatcher; PR-B2's per-type
-    /// compressors are no-ops, so the body still round-trips
-    /// byte-equal until PR-B3+ (which fills the per-type table).
-    /// The flag exists so the default can flip in one config
-    /// change once `live_zone` is the safer choice on real traffic.
+    /// `off`: byte-faithful passthrough on every request.
+    /// `live_zone`: compress blocks in the latest user message only.
+    /// `all_messages`: compress eligible blocks in every user message,
+    /// deterministically, so identical content yields identical bytes
+    /// wherever it sits in the history.
+    ///
+    /// Unset is not the same as `off`. When left unset the mode is
+    /// resolved in [`Config::from_cli`]: `all_messages` if the
+    /// interception path is on at all, `off` otherwise. Passing
+    /// `--compression-mode off` explicitly always wins.
     ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_COMPRESSION_MODE`
-    /// env var → default (`off`).
+    /// env var → resolved default.
     #[arg(
         long = "compression-mode",
         env = "HEADROOM_PROXY_COMPRESSION_MODE",
-        value_enum,
-        default_value_t = CompressionMode::Off,
+        value_enum
     )]
-    pub compression_mode: CompressionMode,
+    pub compression_mode: Option<CompressionMode>,
 
     /// Cross-turn (whole-conversation) verbatim de-dup for tool
     /// outputs. When a span in a later tool output already appeared
@@ -1561,6 +1564,21 @@ impl Config {
         // transforms themselves.
         let compression =
             args.compression || args.ctx_capture || args.ctx_offload || args.ctx_inject;
+        // An unset `--compression-mode` means "whatever the enabling
+        // flags imply", not `off`. Turning interception on and leaving
+        // the mode at `off` buffers every body and mutates nothing —
+        // which is what the proxy did for its whole life so far. The
+        // Python launcher always passed `--compression
+        // --compression-mode all_messages` together; match that.
+        // An explicit `off` still forces `off`, and a proxy started
+        // with no flags at all stays `off`.
+        let compression_mode = args.compression_mode.unwrap_or({
+            if compression {
+                CompressionMode::AllMessages
+            } else {
+                CompressionMode::Off
+            }
+        });
         Self {
             listen: args.listen,
             upstream: args.upstream,
@@ -1573,7 +1591,7 @@ impl Config {
             graceful_shutdown_timeout: args.graceful_shutdown_timeout,
             compression,
             compression_max_body_bytes,
-            compression_mode: args.compression_mode,
+            compression_mode,
             enable_cross_turn_dedup: args.enable_cross_turn_dedup,
             context_edit: args.context_edit,
             context_edit_keep_tool_uses: args.context_edit_keep_tool_uses,
@@ -2057,8 +2075,14 @@ mod ctx_implies_interception_tests {
         ] {
             let c = cfg(&[flag]);
             assert!(c.compression, "{flag} must imply interception");
-            // The imply flips buffering only, never a byte-mutating mode.
-            assert!(matches!(c.compression_mode, CompressionMode::Off));
+            // Interception on with an unset mode resolves to
+            // all_messages — buffering every body and then compressing
+            // nothing was the bug this replaces.
+            assert!(
+                matches!(c.compression_mode, CompressionMode::AllMessages),
+                "{flag} must resolve the mode to all_messages, got {:?}",
+                c.compression_mode
+            );
         }
     }
 
@@ -2066,6 +2090,44 @@ mod ctx_implies_interception_tests {
     fn no_ctx_flags_keeps_interception_off() {
         assert!(!cfg(&[]).compression);
         assert!(!cfg(&["--ctx-capture=false"]).compression);
+    }
+
+    #[test]
+    fn bare_args_resolve_mode_off() {
+        assert!(matches!(cfg(&[]).compression_mode, CompressionMode::Off));
+    }
+
+    #[test]
+    fn users_ctx_flag_set_resolves_to_all_messages() {
+        let c = cfg(&[
+            "--ctx-capture=true",
+            "--ctx-offload=true",
+            "--ctx-inject=true",
+        ]);
+        assert!(c.compression);
+        assert!(matches!(c.compression_mode, CompressionMode::AllMessages));
+    }
+
+    #[test]
+    fn explicit_off_wins_over_ctx_flags() {
+        let c = cfg(&[
+            "--ctx-capture=true",
+            "--ctx-offload=true",
+            "--ctx-inject=true",
+            "--compression-mode",
+            "off",
+        ]);
+        assert!(c.compression, "ctx flags still turn interception on");
+        assert!(
+            matches!(c.compression_mode, CompressionMode::Off),
+            "an explicit --compression-mode off must never be overridden"
+        );
+    }
+
+    #[test]
+    fn explicit_mode_survives_resolution() {
+        let c = cfg(&["--compression", "--compression-mode", "live_zone"]);
+        assert!(matches!(c.compression_mode, CompressionMode::LiveZone));
     }
 }
 

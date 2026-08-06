@@ -133,7 +133,9 @@ pub enum PassthroughReason {
 ///   lifetime of the upstream request — we only borrow.
 /// - `mode`: configured compression mode. `Off` short-circuits to
 ///   [`Outcome::Passthrough { reason: ModeOff }`]; `LiveZone` runs
-///   the dispatcher.
+///   the live-zone dispatcher; `AllMessages` runs the all-messages
+///   dispatcher, which compresses eligible blocks in every user
+///   message rather than only the latest.
 /// - `cache_control_policy`: gates auto-derivation of
 ///   `frozen_message_count` from explicit `cache_control` markers
 ///   in the body. Disabled → floor=0 (everything is in the live
@@ -175,7 +177,8 @@ pub fn compress_anthropic_request(
         };
     }
 
-    // Mode is LiveZone. Resolve the cache-hot floor first; this is
+    // Mode is LiveZone or AllMessages. Resolve the cache-hot floor
+    // first (AllMessages ignores it); this is
     // the only place the body is parsed at all when the policy is
     // Disabled (resolve_frozen_count short-circuits).
     let mut parsed: serde_json::Value = match serde_json::from_slice(body) {
@@ -367,14 +370,31 @@ pub fn compress_anthropic_request(
         exclude_tools: exclude_tools.to_vec(),
         ..DispatchConfig::default()
     };
-    match compress_anthropic_live_zone_with_ccr(
-        &dispatch_body,
-        frozen_count,
-        auth_mode.into(),
-        model,
-        None,
-        &dispatch_config,
-    ) {
+    // `AllMessages` compresses every eligible block in every user
+    // message, not just the live zone. It deliberately ignores
+    // `frozen_count`: the point of the mode is that identical content
+    // yields identical bytes wherever it sits in the history, so
+    // Anthropic's cache forms over the compressed history instead of
+    // being invalidated each time a block ages out of the live zone.
+    // Everything the mode is handed here is a pure function of the
+    // request body, so that property survives the plumbing.
+    let dispatch_result = match mode {
+        CompressionMode::AllMessages => headroom_core::transforms::compress_anthropic_all_messages(
+            &dispatch_body,
+            auth_mode.into(),
+            model,
+            &dispatch_config,
+        ),
+        _ => compress_anthropic_live_zone_with_ccr(
+            &dispatch_body,
+            frozen_count,
+            auth_mode.into(),
+            model,
+            None,
+            &dispatch_config,
+        ),
+    };
+    match dispatch_result {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest
@@ -1345,5 +1365,242 @@ mod tests {
                 panic!("expected Compressed (E3 fires) for already-sorted tools, got {other:?}")
             }
         }
+    }
+
+    // ── AllMessages mode dispatch ─────────────────────────────────
+
+    /// 200 homogeneous dicts — SmartCrusher's bread-and-butter.
+    /// `salt` makes two payloads distinct content.
+    fn compressible_payload(salt: &str) -> String {
+        let array: Vec<serde_json::Value> = (0..200)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i,
+                    "status": "ok",
+                    "value": format!("repeat-pattern-{salt}-{}", i % 3),
+                })
+            })
+            .collect();
+        serde_json::to_string(&array).unwrap()
+    }
+
+    /// user(tool_result) → assistant → user(tool_result). Message 0 has
+    /// aged out of the live zone; message 2 is the latest user message.
+    fn two_user_messages_body() -> Bytes {
+        body_of(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_old",
+                        "content": compressible_payload("old"),
+                    }],
+                },
+                { "role": "assistant", "content": "acknowledged" },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_new",
+                        "content": compressible_payload("new"),
+                    }],
+                },
+            ],
+        }))
+    }
+
+    fn compressed_body(out: Outcome) -> Bytes {
+        match out {
+            Outcome::Compressed { body, .. } => body,
+            other => panic!("expected Compressed, got {other:?}"),
+        }
+    }
+
+    /// Pull `messages[idx].content[0].content` out of a request body.
+    fn block_text(bytes: &Bytes, idx: usize) -> String {
+        let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        parsed["messages"][idx]["content"][0]["content"]
+            .as_str()
+            .expect("tool_result content stays a string")
+            .to_string()
+    }
+
+    /// The observable difference between the two modes: `all_messages`
+    /// rewrites the aged-out message 0, `live_zone` leaves it alone.
+    #[test]
+    fn all_messages_mode_rewrites_blocks_outside_the_latest_user_message() {
+        let body = two_user_messages_body();
+        let old_payload = compressible_payload("old");
+
+        let all = compressed_body(compress_anthropic_request(
+            &body,
+            CompressionMode::AllMessages,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-all",
+            &[],
+        ));
+        assert_ne!(
+            block_text(&all, 0),
+            old_payload,
+            "all_messages must rewrite the aged-out message 0"
+        );
+
+        let live = compressed_body(compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-live",
+            &[],
+        ));
+        assert_eq!(
+            block_text(&live, 0),
+            old_payload,
+            "live_zone must leave the aged-out message 0 verbatim — if this \
+             fails the two modes are no longer distinguishable"
+        );
+        assert_ne!(
+            block_text(&live, 2),
+            compressible_payload("new"),
+            "live_zone still rewrites the latest user message"
+        );
+    }
+
+    /// `--exclude-tools` must reach the all-messages path, not just the
+    /// live-zone one. The excluded tool's result is kept away from the
+    /// lossy compressors in BOTH user messages.
+    #[test]
+    fn exclude_tools_reaches_the_all_messages_path() {
+        let payload = compressible_payload("secret");
+        let body = body_of(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t_old", "name": "Vault", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "t_old",
+                        "content": payload.clone(),
+                    }],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t_new", "name": "Vault", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "t_new",
+                        "content": payload.clone(),
+                    }],
+                },
+            ],
+        }));
+
+        // Without the exclusion, both copies are compressed away.
+        let plain = compressed_body(compress_anthropic_request(
+            &body,
+            CompressionMode::AllMessages,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-plain",
+            &[],
+        ));
+        assert_ne!(
+            block_text(&plain, 1),
+            payload,
+            "baseline: all_messages compresses this payload when nothing is excluded"
+        );
+
+        // With `--exclude-tools Vault` no lossy compressor may touch it,
+        // in the aged-out message or the latest one.
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::AllMessages,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-excluded",
+            &["Vault".to_string()],
+        );
+        let bytes = match out {
+            Outcome::NoCompression | Outcome::Passthrough { .. } => body.clone(),
+            Outcome::Compressed { body, .. } => body,
+        };
+        assert_eq!(
+            block_text(&bytes, 1),
+            payload,
+            "excluded tool_result must survive in the aged-out message"
+        );
+        assert_eq!(
+            block_text(&bytes, 3),
+            payload,
+            "excluded tool_result must survive in the latest message"
+        );
+    }
+
+    /// The point of the mode: identical content in two different
+    /// messages must compress to identical bytes, or Anthropic's cache
+    /// cascades instead of forming.
+    #[test]
+    fn all_messages_compresses_identical_content_to_identical_bytes() {
+        let payload = compressible_payload("same");
+        let body = body_of(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_a",
+                        "content": payload.clone(),
+                    }],
+                },
+                { "role": "assistant", "content": "acknowledged" },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_b",
+                        "content": payload,
+                    }],
+                },
+            ],
+        }));
+
+        let out = compressed_body(compress_anthropic_request(
+            &body,
+            CompressionMode::AllMessages,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-det",
+            &[],
+        ));
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let content_of = |idx: usize| {
+            parsed["messages"][idx]["content"][0]["content"]
+                .as_str()
+                .expect("tool_result content stays a string")
+                .to_string()
+        };
+        assert_eq!(
+            content_of(0),
+            content_of(2),
+            "identical content in two messages must yield identical bytes"
+        );
     }
 }
