@@ -1220,7 +1220,7 @@ fn header_map_to_lowercase_strings(
 /// `x-headroom-cwd` → system-prompt `cwd:` line. Returns `None` when no
 /// stable workspace is available; callers fail closed rather than tracking
 /// under a shared empty workspace.
-fn resolve_ccr_workspace(
+pub(crate) fn resolve_ccr_workspace(
     headers: Option<&HeaderMap>,
     body: &serde_json::Value,
 ) -> Option<(String, Option<String>)> {
@@ -1234,7 +1234,7 @@ fn resolve_ccr_workspace(
     crate::memory::router::ProjectResolver::resolve(&ctx).map(|(key, display)| (key, Some(display)))
 }
 
-fn latest_user_query(body: &serde_json::Value) -> String {
+pub(crate) fn latest_user_query(body: &serde_json::Value) -> String {
     body.get("messages")
         .and_then(serde_json::Value::as_array)
         .and_then(|messages| {
@@ -1261,7 +1261,7 @@ fn latest_user_query(body: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-fn anthropic_turn_number(body: &serde_json::Value) -> u32 {
+pub(crate) fn anthropic_turn_number(body: &serde_json::Value) -> u32 {
     body.get("messages")
         .and_then(serde_json::Value::as_array)
         .map(|messages| messages.len().min(u32::MAX as usize) as u32)
@@ -1309,7 +1309,7 @@ fn append_context_to_latest_user_turn(
     }
 }
 
-fn maybe_append_ccr_proactive_expansion(
+pub(crate) fn maybe_append_ccr_proactive_expansion(
     state: &AppState,
     body: &mut serde_json::Value,
     user_query: &str,
@@ -1378,7 +1378,7 @@ fn maybe_append_ccr_proactive_expansion(
     changed
 }
 
-fn track_ccr_context_records(
+pub(crate) fn track_ccr_context_records(
     state: &AppState,
     records: &[crate::compression::ctx_offload::OffloadRecord],
     workspace_key: &str,
@@ -1479,7 +1479,7 @@ fn maybe_inject_context_management(
 /// (cache reads are free per Anthropic's rate-limit docs). No-op (returns the
 /// original bytes untouched) when the body has no tools array or nothing is
 /// removed, so a cache-stable request is never perturbed.
-fn maybe_prune_tools(
+pub(crate) fn maybe_prune_tools(
     body: bytes::Bytes,
     policy: &crate::cache_stabilization::tool_prune::PrunePolicy,
     request_id: &str,
@@ -1560,7 +1560,7 @@ fn maybe_compact_tool_schemas(body: bytes::Bytes, request_id: &str) -> bytes::By
 /// branch (the drift detector populates it for every buffered Anthropic
 /// request), but the failure mode if it ever did is every conversation on the
 /// box collapsing into one store slot and replaying each other's tool order.
-fn maybe_stabilize_tool_order(
+pub(crate) fn maybe_stabilize_tool_order(
     body: bytes::Bytes,
     store: &cache_stabilization::tool_order::ToolOrderStore,
     session_key: &str,
@@ -3944,7 +3944,7 @@ pub(crate) fn apply_prefix_replay(
 /// (never the full key, which is identifying material).
 ///
 /// [`KEY_PREFIX_LOG_LEN`]: cache_stabilization::openai_cache_key::KEY_PREFIX_LOG_LEN
-fn maybe_inject_openai_prompt_cache_key(
+pub(crate) fn maybe_inject_openai_prompt_cache_key(
     body: bytes::Bytes,
     shape: cache_stabilization::openai_cache_key::OpenAiShape,
     auth_mode: AuthMode,

@@ -292,11 +292,26 @@ async fn apply_ctx_request_transforms(
     parsed: &mut Value,
     headers: &HeaderMap,
     client_addr: &SocketAddr,
+    request_id: &str,
 ) -> CtxTransformReport {
     let mut report = CtxTransformReport::default();
     use crate::cache_stabilization::drift_detector::{
         compute_structural_hash, derive_session_key, observe_drift, ApiKind,
     };
+
+    // PR-E5: volatile-content detector. Pure observer — one WARN per finding
+    // for content that busts the cache (timestamps, UUIDs, ID-named fields).
+    // Runs on the body as received so the warning names what the client sent,
+    // not what our own transforms left behind.
+    let findings = crate::cache_stabilization::volatile_detector::detect_volatile_content(
+        parsed,
+        crate::cache_stabilization::volatile_detector::ApiKind::Anthropic,
+    );
+    if !findings.is_empty() {
+        crate::cache_stabilization::volatile_detector::emit_volatile_warnings(
+            &findings, request_id,
+        );
+    }
 
     // Derived from the body as received — this runs before any transform
     // mutates `parsed`, which matters because `derive_session_key`
@@ -311,12 +326,49 @@ async fn apply_ctx_request_transforms(
     // changed turn-to-turn) is available regardless of which CTX flags are on.
     // A drift means the codex prompt-cache prefix moved this turn.
     let hash = compute_structural_hash(parsed, ApiKind::Anthropic);
-    let rebuild_boundary = observe_drift(&state.drift_state, &session_key, hash).is_some();
+    let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
+    let rebuild_boundary = drift_dims.is_some();
+
+    // CTX-7: park conversation identity + drift dims under the request id so
+    // the response side can classify this turn's billed usage against the
+    // conversation's previous turn. This is what feeds the re-cache watchdog
+    // that `scripts/statusline-cache-health.sh` renders — without it the cache
+    // segment simply has nothing to say about routed turns.
+    state.usage_observer.begin_request(
+        request_id,
+        crate::cache_stabilization::usage_observer::conversation_key(parsed, &session_key),
+        drift_dims,
+    );
 
     // CTX-2: passive session capture. Read-only — clones the body onto a
     // detached worker; never mutates and never blocks.
     if let Some(observer) = state.ctx_observer.as_ref() {
         observer.observe(parsed, &session_key);
+    }
+
+    // CCR identity for this turn. All three helpers read the Anthropic
+    // `messages` shape, which is exactly what `parsed` still is here.
+    let ccr_workspace = crate::proxy::resolve_ccr_workspace(Some(headers), parsed);
+    let user_query = crate::proxy::latest_user_query(parsed);
+    let turn_number = crate::proxy::anthropic_turn_number(parsed);
+
+    // CCR proactive expansion: pull back previously-offloaded content the
+    // query looks like it needs, before anything else touches the body. First
+    // in the block on the Claude path too.
+    if let Some((workspace_key, workspace_label)) = ccr_workspace.as_ref() {
+        if crate::proxy::maybe_append_ccr_proactive_expansion(
+            state,
+            parsed,
+            &user_query,
+            workspace_key,
+            workspace_label.as_deref(),
+            turn_number,
+            request_id,
+        ) {
+            report
+                .transforms_applied
+                .push("ccr_proactive_expansion".to_string());
+        }
     }
 
     // CTX-4: recall/resume injection. Runs BEFORE offload (matching the
@@ -359,6 +411,24 @@ async fn apply_ctx_request_transforms(
                 rebuild_boundary,
                 "offloaded tool_result blocks on routed-model request"
             );
+            // Record what was offloaded against the workspace so a later turn's
+            // proactive expansion can find it. Without this the expansion above
+            // has an empty index to consult and can never fire.
+            if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
+                crate::proxy::track_ccr_context_records(
+                    state,
+                    &out.records,
+                    workspace_key,
+                    &user_query,
+                    turn_number,
+                    request_id,
+                );
+            } else if state.ccr_context_tracker.is_some() {
+                tracing::info!(
+                    event = "codex_ccr_workspace_unresolved",
+                    "CCR: workspace unresolved; skipping compression tracking"
+                );
+            }
             runtime.store.persist(out.records);
         }
     }
@@ -488,6 +558,27 @@ async fn apply_ctx_request_transforms(
     }
 
     report
+}
+
+/// Run a `forward_http` stage that works on serialized bytes against the
+/// routed path's parsed body.
+///
+/// The Claude path threads `Bytes` from stage to stage; this one carries a
+/// `Value` because it has to hand the body to the translator at the end.
+/// Rather than fork each stage, adapt around them — they stay the single
+/// implementation, which is what keeps the two paths honest.
+///
+/// Any serialize/parse failure leaves `parsed` untouched. Every one of these
+/// stages already returns its input unchanged when it cannot parse, so
+/// preserving that is the same contract.
+fn apply_bytes_stage(parsed: &mut Value, stage: impl FnOnce(bytes::Bytes) -> bytes::Bytes) {
+    let Ok(body) = serde_json::to_vec(parsed) else {
+        return;
+    };
+    let out = stage(bytes::Bytes::from(body));
+    if let Ok(v) = serde_json::from_slice::<Value>(&out) {
+        *parsed = v;
+    }
 }
 
 /// Tool schema compaction: strips `$schema`/`title`/examples from tool
@@ -721,6 +812,7 @@ fn build_routed_outcome_context(
         sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink::from_state(state)),
         request_id,
         replay_store,
+        usage_observer: Some(state.usage_observer.clone()),
         session_key: report.session_key,
         // The upstream model. `body_model` is the client-facing alias, which is
         // deliberately named `claude-*` so Claude Code will offer it in
@@ -997,7 +1089,8 @@ pub async fn handle_messages(
     // flags. Mutates `parsed` before translation.
     let transform_started = std::time::Instant::now();
     let mut ctx_report =
-        apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr).await;
+        apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr, &request_id)
+            .await;
 
     // Live-zone compression + freeze-replay, on the same flags as the Claude
     // path and in the same order (compress, then replay the cached prefix).
@@ -1009,8 +1102,24 @@ pub async fn handle_messages(
         .transforms_applied
         .extend(compression_report.transforms_applied);
 
-    // Last, as on the Claude path: after compression and after everything that
-    // injects a tool.
+    // Tool pruning, schema compaction, then order stabilization — the Claude
+    // path's closing sequence, and order matters within it: compaction runs
+    // once tools are final, and stabilization must follow every other tool
+    // mutation so the order recorded is the order the provider caches.
+    //
+    // Both prune and stabilize are shape-agnostic (they match a tool by name
+    // in either the Anthropic or the OpenAI wrapper) and run here on the
+    // pre-translation body, which is Anthropic-shaped. `forward_http` gates
+    // them to `AnthropicMessages`, but that is a call-site choice rather than
+    // a limitation of either function.
+    apply_bytes_stage(&mut parsed, |body| {
+        if state.config.tool_prune_policy.is_noop() {
+            body
+        } else {
+            crate::proxy::maybe_prune_tools(body, &state.config.tool_prune_policy, &request_id)
+        }
+    });
+
     let (compacted, compaction_saved) = apply_tool_schema_compaction(&mut parsed);
     if compacted {
         ctx_report
@@ -1018,6 +1127,30 @@ pub async fn handle_messages(
             .push("tool_schema_compaction".to_string());
         ctx_report.tokens_saved += compaction_saved;
     }
+
+    if state.config.cache_stable_tool_order {
+        apply_bytes_stage(&mut parsed, |body| {
+            crate::proxy::maybe_stabilize_tool_order(
+                body,
+                &state.tool_order_state,
+                &session_key,
+                &request_id,
+            )
+        });
+    }
+
+    // Two stages from the Claude path's closing sequence are deliberately
+    // absent, because they do not apply rather than because they were missed:
+    //
+    // - `--context-edit` injects Anthropic's `context_management` block and its
+    //   `context-management-2025-06-27` beta header. That is a server-side
+    //   feature of the Anthropic API; this path always talks to OpenAI, which
+    //   has no equivalent to translate it into.
+    // - `--force-1h-cache-ttl` rewrites `cache_control.ttl`, an Anthropic
+    //   prompt-caching control. The Responses API has no TTL knob.
+    //
+    // The OpenAI-side counterpart, `prompt_cache_key`, is injected after
+    // translation instead — see below.
     let overhead_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
 
     // Translation path: Anthropic → OpenAI.
@@ -1044,6 +1177,36 @@ pub async fn handle_messages(
                 .expect("static response");
         }
     };
+
+    // PR-E4: OpenAI `prompt_cache_key`. Injected *after* translation, because
+    // the field belongs to the OpenAI request shape — before translation there
+    // is nowhere valid to put it, and Anthropic has no equivalent. This is the
+    // one cache-stabilization stage whose natural home on this path is the
+    // post-translation body.
+    //
+    // Same gating as the Claude path's OpenAI arm: PAYG only, and it self-skips
+    // when the caller already set a key. A ChatGPT-subscription codex route
+    // classifies as subscription, not PAYG, so this is a no-op there by
+    // design — those clients are fingerprinted upstream and a synthesised key
+    // works against them.
+    let mut openai_body = openai_body;
+    apply_bytes_stage(&mut openai_body, |body| {
+        crate::proxy::maybe_inject_openai_prompt_cache_key(
+            body,
+            if target_model.is_some() {
+                crate::cache_stabilization::openai_cache_key::OpenAiShape::Responses
+            } else {
+                crate::cache_stabilization::openai_cache_key::OpenAiShape::ChatCompletions
+            },
+            headroom_core::auth_mode::classify(&headers),
+            &request_id,
+            if target_model.is_some() {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            },
+        )
+    });
 
     let is_stream = parsed
         .get("stream")
@@ -1973,6 +2136,15 @@ fn translate_assistant_message(msg: &Value, out: &mut Vec<Value>, include_tool_c
 // Response translation: OpenAI → Anthropic (non-streaming)
 // ---------------------------------------------------------------------------
 
+/// Buffered (non-streaming) Chat Completions reply, translated back to the
+/// Anthropic response shape.
+///
+/// Deliberately no server-side CCR retrieval here. `forward_http` runs
+/// `handle_ccr_response` only inside its `!is_sse` branch, so a
+/// `headroom_retrieve` call in a *streaming* reply is handed to the client on
+/// every provider, Anthropic included — and Claude Code always streams. Wiring
+/// it into this buffered arm would give routed models behaviour the Claude path
+/// does not have, on a path Claude Code never takes.
 async fn handle_buffered_response(
     upstream_resp: reqwest::Response,
     original: &Value,
@@ -2601,6 +2773,9 @@ struct RoutedOutcomeContext {
     /// provider actually held, so a parked turn must be completed.
     replay_store: Option<crate::cache_stabilization::prefix_replay::SessionReplayStore>,
     session_key: String,
+    /// CTX-7 observer, to close out the entry parked at request time.
+    usage_observer:
+        Option<std::sync::Arc<crate::cache_stabilization::usage_observer::UsageObserver>>,
 }
 
 /// Safety net for turns that never reach a terminal event — a client
@@ -2742,6 +2917,44 @@ impl StreamTranslator {
     fn with_outcome(mut self, ctx: Option<RoutedOutcomeContext>) -> Self {
         self.outcome = ctx;
         self
+    }
+
+    /// Close out the CTX-7 usage observation parked at request time.
+    ///
+    /// `begin_request` leaves a pending entry keyed by request id; without a
+    /// matching `complete` the turn is never classified and the re-cache
+    /// watchdog (and the cache-health statusline segment) stays blank.
+    ///
+    /// The observer takes Anthropic-named counters. The Responses API reports
+    /// cache reads but has no cache-creation counter, so zero goes in for
+    /// writes — the same mapping used elsewhere on this path.
+    fn complete_usage_observation(&self, usage: Option<&Value>) {
+        let Some(ctx) = self.outcome.as_ref() else {
+            return;
+        };
+        let Some(observer) = ctx.usage_observer.as_ref() else {
+            return;
+        };
+        let get = |key: &str| -> u64 {
+            usage
+                .and_then(|u| u.get(key))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        let cache_read = usage
+            .and_then(|u| {
+                u.get("input_tokens_details")
+                    .or_else(|| u.get("prompt_tokens_details"))
+            })
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        observer.complete(
+            &ctx.request_id,
+            get("input_tokens").max(get("prompt_tokens")),
+            cache_read,
+            0,
+        );
     }
 
     /// Hand the turn's cache-token counts to the prefix-replay store, which
@@ -3227,6 +3440,7 @@ impl StreamTranslator {
                 }
                 let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
                 self.complete_replay(usage.as_ref());
+                self.complete_usage_observation(usage.as_ref());
                 self.emit_outcome(usage.as_ref(), 200);
                 if self.in_thinking_block {
                     events.push(self.emit_content_block_stop());
@@ -3743,7 +3957,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        apply_ctx_request_transforms(&state, &mut with_tools, &headers, &addr).await;
+        apply_ctx_request_transforms(&state, &mut with_tools, &headers, &addr, "req-test").await;
         let names: Vec<&str> = with_tools["tools"]
             .as_array()
             .unwrap()
@@ -3756,7 +3970,7 @@ mod tests {
             "model": "claude-codex-5.6",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        apply_ctx_request_transforms(&state, &mut without_tools, &headers, &addr).await;
+        apply_ctx_request_transforms(&state, &mut without_tools, &headers, &addr, "req-test").await;
         assert!(
             without_tools.get("tools").is_none(),
             "a request with no tools array must not grow one"
@@ -3775,8 +3989,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        apply_ctx_request_transforms(&state, &mut body, &headers, &addr).await;
-        apply_ctx_request_transforms(&state, &mut body, &headers, &addr).await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test").await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test").await;
         let count = body["tools"]
             .as_array()
             .unwrap()
@@ -3803,7 +4017,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        let report = apply_ctx_request_transforms(&state, &mut body, &headers, &addr).await;
+        let report =
+            apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test").await;
         assert_eq!(report.transforms_applied, vec!["ccr_tool".to_string()]);
         assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
@@ -3832,6 +4047,90 @@ mod tests {
         assert!(schema.get("$schema").is_none());
         assert!(schema.get("title").is_none());
         assert_eq!(schema["properties"]["hash"]["type"], "string");
+    }
+
+    /// A late MCP handshake splicing tools into the middle of the array moves
+    /// the cached prefix. Stabilization replays last turn's order and appends
+    /// genuinely-new tools at the end.
+    #[test]
+    fn tool_order_is_stable_when_a_late_tool_appears() {
+        let store = crate::cache_stabilization::tool_order::ToolOrderStore::default();
+        let tools = |names: &[&str]| {
+            json!({
+                "model": "claude-codex-5.6",
+                "tools": names
+                    .iter()
+                    .map(|n| json!({"name": n, "input_schema": {"type": "object"}}))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let order_of = |v: &Value| -> Vec<String> {
+            v["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let mut turn1 = tools(&["Read", "Write"]);
+        apply_bytes_stage(&mut turn1, |b| {
+            crate::proxy::maybe_stabilize_tool_order(b, &store, "sess-order", "r1")
+        });
+        assert_eq!(order_of(&turn1), vec!["Read", "Write"]);
+
+        // An MCP server registers and the client splices its tool in first.
+        let mut turn2 = tools(&["mcp__late__tool", "Read", "Write"]);
+        apply_bytes_stage(&mut turn2, |b| {
+            crate::proxy::maybe_stabilize_tool_order(b, &store, "sess-order", "r2")
+        });
+        assert_eq!(
+            order_of(&turn2),
+            vec!["Read", "Write", "mcp__late__tool"],
+            "the established prefix must keep its order, new tools go last"
+        );
+    }
+
+    /// `prompt_cache_key` belongs to the OpenAI request shape, so it is
+    /// injected after translation — and only for PAYG callers.
+    #[test]
+    fn prompt_cache_key_is_injected_only_for_payg() {
+        use crate::cache_stabilization::openai_cache_key::OpenAiShape;
+        let inject = |auth| {
+            let mut body = json!({"model": "gpt-5.6-luna", "input": [], "store": false});
+            apply_bytes_stage(&mut body, |b| {
+                crate::proxy::maybe_inject_openai_prompt_cache_key(
+                    b,
+                    OpenAiShape::Responses,
+                    auth,
+                    "r1",
+                    "/v1/responses",
+                )
+            });
+            body
+        };
+        assert!(
+            inject(headroom_core::auth_mode::AuthMode::Payg)
+                .get("prompt_cache_key")
+                .is_some(),
+            "a PAYG caller should get a synthesised key"
+        );
+        assert!(
+            inject(headroom_core::auth_mode::AuthMode::Subscription)
+                .get("prompt_cache_key")
+                .is_none(),
+            "a subscription caller is fingerprinted upstream; injecting would work against them"
+        );
+    }
+
+    /// The bytes adapter must leave the body alone when a stage hands back
+    /// something unparseable, rather than dropping the request on the floor.
+    #[test]
+    fn bytes_stage_adapter_preserves_the_body_on_failure() {
+        let mut body = json!({"model": "m", "messages": []});
+        let before = body.clone();
+        apply_bytes_stage(&mut body, |_| bytes::Bytes::from_static(b"not json"));
+        assert_eq!(body, before);
     }
 
     /// Compression is wired to a live dispatcher, not just gated correctly:
@@ -3916,6 +4215,7 @@ mod tests {
             }),
             request_id: "req-test".to_string(),
             replay_store: None,
+            usage_observer: None,
             session_key: "sess-test".to_string(),
             model: model.to_string(),
             provider: "openai_responses".to_string(),
