@@ -3678,8 +3678,12 @@ mod live_zone_size_gate_tests {
         let _lock = env_lock();
         let _guard = CeilingGuard::set("10");
 
-        assert!(!super::super::content_router::kompress_size_gate_exceeded(&"x".repeat(40)));
-        assert!(super::super::content_router::kompress_size_gate_exceeded(&"x".repeat(41)));
+        assert!(!super::super::content_router::kompress_size_gate_exceeded(
+            &"x".repeat(40)
+        ));
+        assert!(super::super::content_router::kompress_size_gate_exceeded(
+            &"x".repeat(41)
+        ));
     }
 
     /// A zero ceiling disables the gate, so even a huge block takes the normal
@@ -3689,6 +3693,8 @@ mod live_zone_size_gate_tests {
         let _lock = env_lock();
         let _guard = CeilingGuard::set("0");
 
-        assert!(!super::super::content_router::kompress_size_gate_exceeded(&"x".repeat(1_000_000)));
+        assert!(!super::super::content_router::kompress_size_gate_exceeded(
+            &"x".repeat(1_000_000)
+        ));
     }
 }

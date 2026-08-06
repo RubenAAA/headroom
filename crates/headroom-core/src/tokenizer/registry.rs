@@ -449,5 +449,4 @@ mod tests {
         let text = "ERROR connection refused to upstream after 3 retries";
         assert_eq!(wrapped.count_text(text), bare.count_text(text));
     }
-
 }

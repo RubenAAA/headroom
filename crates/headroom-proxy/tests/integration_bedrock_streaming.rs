@@ -279,11 +279,19 @@ async fn eventstream_translated_to_sse() {
     let body = resp.bytes().await.unwrap();
     let body_str = std::str::from_utf8(&body).unwrap();
 
+    // A synthetic ping leads the stream so clients arm their mid-turn
+    // steering state before message_start (issue #902).
+    assert!(
+        body_str.starts_with("event: ping\ndata: {}\n\n"),
+        "translated stream must open with a ping; got {body_str}"
+    );
+
     // Each message becomes its own `data: ...\n\n` frame.
     let frame_count = body_str.matches("data: ").count();
     assert_eq!(
-        frame_count, 6,
-        "expected 6 SSE frames (one per upstream chunk message); got {frame_count}: {body_str}"
+        frame_count, 7,
+        "expected 7 SSE frames (the ping plus one per upstream chunk message); \
+         got {frame_count}: {body_str}"
     );
 
     // Frame ordering: message_start first, message_stop last.

@@ -50,6 +50,7 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::proxy::{forward_http, AppState};
+use crate::tool_schema_compaction::{compact_tool_descriptions, tool_desc_max_chars};
 
 /// Translate the legacy OpenAI `max_tokens` field to
 /// `max_completion_tokens` in a buffered chat-completions body.
@@ -90,6 +91,52 @@ pub(crate) fn normalize_openai_max_tokens(body: Bytes) -> Bytes {
     }
     match serde_json::to_vec(&parsed) {
         Ok(v) => Bytes::from(v),
+        Err(_) => body,
+    }
+}
+
+/// Truncate over-long tool descriptions in a buffered chat-completions body.
+///
+/// Layer 2 of tool-schema compaction, opt-in via
+/// `HEADROOM_TOOL_DESC_MAX_CHARS` (0 — the default — disables it). The
+/// implementation already existed in [`crate::tool_schema_compaction`]; no
+/// handler called it, so the env var was a silent no-op for every chat client
+/// (opencode, Cline, Aider, Roo, LiteLLM-routed). Nothing else covers it
+/// either: descriptions live on the `tools` array, and the live-zone
+/// dispatcher only walks `messages[*].content`.
+///
+/// `compact_tool_descriptions` understands both the nested chat shape
+/// (`{"function": {"description": …}}`) and the flat Responses shape, so the
+/// whole body can be handed to it as-is.
+///
+/// A parse or serialize failure returns the original bytes, so the
+/// passthrough invariant holds.
+pub(crate) fn compact_chat_tool_descriptions(body: Bytes) -> Bytes {
+    // Checked before parsing: this runs on every chat request and the
+    // feature is off by default.
+    let max_chars = tool_desc_max_chars();
+    if max_chars <= 0 {
+        return body;
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let (compacted, modified, before, after) = compact_tool_descriptions(parsed, max_chars);
+    if !modified {
+        return body;
+    }
+    match serde_json::to_vec(&compacted) {
+        Ok(v) => {
+            tracing::debug!(
+                event = "openai_chat_tool_desc_compaction",
+                before_chars = before,
+                after_chars = after,
+                max_chars,
+                "compacted tool descriptions"
+            );
+            Bytes::from(v)
+        }
         Err(_) => body,
     }
 }
@@ -143,6 +190,11 @@ pub async fn handle_chat_completions(
     // forwarding. Runs on the always-buffered chat body regardless of
     // whether compression later intercepts it downstream.
     let body = normalize_openai_max_tokens(body);
+
+    // Tool-description compaction. Off unless HEADROOM_TOOL_DESC_MAX_CHARS
+    // is set; runs here because the `tools` array never reaches the
+    // live-zone dispatcher inside forward_http.
+    let body = compact_chat_tool_descriptions(body);
 
     // Reconstruct the Request<Body> shape forward_http expects.
     // Cloning the headers into a fresh builder keeps the original
@@ -228,5 +280,63 @@ mod tests {
     fn invalid_json_untouched() {
         let bytes = Bytes::from_static(b"not json");
         assert_eq!(normalize_openai_max_tokens(bytes.clone()), bytes);
+    }
+
+    fn chat_body_with_tools() -> Value {
+        json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search the web and return the ten most relevant results \
+                                    together with a short summary of each one.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        })
+    }
+
+    fn desc_of(body: &Bytes) -> String {
+        let v: Value = serde_json::from_slice(body).unwrap();
+        v["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn chat_tool_descriptions_are_compacted() {
+        use crate::tool_schema_compaction::{
+            compaction_test_lock, invalidate_cache, reset_env_cache,
+        };
+        let _guard = compaction_test_lock();
+
+        let body = Bytes::from(serde_json::to_vec(&chat_body_with_tools()).unwrap());
+
+        // Default (unset) leaves the body byte-identical.
+        std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS");
+        reset_env_cache();
+        invalidate_cache();
+        assert_eq!(compact_chat_tool_descriptions(body.clone()), body);
+
+        std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "20");
+        reset_env_cache();
+        invalidate_cache();
+        let out = compact_chat_tool_descriptions(body.clone());
+        assert!(
+            desc_of(&out).chars().count() < desc_of(&body).chars().count(),
+            "description not truncated: {}",
+            desc_of(&out)
+        );
+        // Everything else round-trips.
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], json!("gpt-4o"));
+        assert_eq!(v["messages"], chat_body_with_tools()["messages"]);
+
+        std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS");
+        reset_env_cache();
+        invalidate_cache();
     }
 }

@@ -24,6 +24,7 @@ pub mod session_sticky;
 pub mod signals;
 pub mod subscription;
 pub mod tokenizer;
+pub mod tool_exclusion;
 pub mod transforms;
 pub mod turn_id;
 pub mod waste_signals;

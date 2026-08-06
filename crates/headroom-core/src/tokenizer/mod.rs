@@ -38,10 +38,10 @@ mod tiktoken_impl;
 pub use estimator::EstimatingCounter;
 pub use hf_impl::{HfTokenizer, HfTokenizerError};
 pub use mistral::{mistral_hf_repo, mistral_tokenizer_version, try_register_default_mistral};
+pub(crate) use registry::name_candidates;
 pub use registry::{
     clear_hf_registrations, detect_backend, get_tokenizer, register_hf, try_register_hf, Backend,
 };
-pub(crate) use registry::name_candidates;
 pub use tiktoken_impl::{TiktokenCounter, TiktokenError};
 
 /// Token overhead per message (role, formatting, etc.).
@@ -569,5 +569,4 @@ mod tests {
         let calls = serde_json::json!([{"id": null, "function": {"name": null}}]);
         assert_eq!(count_tool_calls(&t, calls.as_array().unwrap()), 4);
     }
-
 }

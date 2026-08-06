@@ -1211,5 +1211,4 @@ mod tests {
         let junk = serde_json::json!({"candidatesTokenCount": null, "thoughtsTokenCount": "x"});
         assert_eq!(gemini_output_tokens(&junk), 0);
     }
-
 }

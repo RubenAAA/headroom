@@ -695,5 +695,4 @@ mod tests {
         };
         assert_eq!(shrank.tokens_inflated(), 0);
     }
-
 }

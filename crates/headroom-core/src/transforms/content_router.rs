@@ -4510,5 +4510,4 @@ mod kompress_size_gate_tests {
         assert_eq!(netcost_message_tokens(&blocks), 5);
         assert_eq!(netcost_message_tokens(&serde_json::json!("a b c")), 3);
     }
-
 }

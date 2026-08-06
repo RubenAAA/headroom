@@ -44,6 +44,27 @@ const CCR_RATIO_GATE: f64 = 0.8;
 /// remote client is a drop-in replacement, not a second entry in the registry.
 const COMPRESSOR_NAME: &str = "kompress_compressor";
 
+/// Appended to the configured endpoint unless [`RemoteKompressCompressor::with_path`]
+/// says otherwise. An operator whose stack already serves a full path
+/// (`/v1/models/kompress:predict`) passes `""` and gives the complete URL instead.
+pub const DEFAULT_ENDPOINT_PATH: &str = "/compress";
+
+/// Parse a `k=v,k2=v2` header string into ordered pairs.
+///
+/// Same format as `HEADROOM_OTEL_METRICS_HEADERS`, so operators meet one
+/// convention. Blank items, items without `=`, and items with an empty key or
+/// value are dropped rather than rejected — a malformed entry must not take the
+/// endpoint down with it.
+pub fn parse_endpoint_headers(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|item| {
+            let (key, value) = item.trim().split_once('=')?;
+            let (key, value) = (key.trim(), value.trim());
+            (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 // ─── Transport seam ─────────────────────────────────────────────────────
 
 /// The single HTTP hop this module needs.
@@ -115,6 +136,8 @@ pub enum RemoteOutcome {
 /// `/compress` endpoint.
 pub struct RemoteKompressCompressor {
     config: RemoteKompressConfig,
+    /// Base URL as configured, kept so [`Self::with_path`] can re-resolve `url`.
+    endpoint: String,
     url: String,
     headers: Vec<(String, String)>,
     transport: Arc<dyn KompressTransport>,
@@ -123,7 +146,8 @@ pub struct RemoteKompressCompressor {
 }
 
 impl RemoteKompressCompressor {
-    /// Build a client for `endpoint` (the base URL; `/compress` is appended).
+    /// Build a client for `endpoint` (the base URL; [`DEFAULT_ENDPOINT_PATH`]
+    /// is appended — see [`Self::with_path`] to override).
     ///
     /// `token`, when present, becomes an `authorization: Bearer …` header —
     /// wired from `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` by the caller.
@@ -139,7 +163,8 @@ impl RemoteKompressCompressor {
         }
         Self {
             config,
-            url: format!("{}/compress", endpoint.trim_end_matches('/')),
+            endpoint: endpoint.to_string(),
+            url: resolve_url(endpoint, DEFAULT_ENDPOINT_PATH),
             headers,
             transport,
             store: None,
@@ -151,6 +176,47 @@ impl RemoteKompressCompressor {
                 recoverable: true,
             },
         }
+    }
+
+    /// Override the path appended to the endpoint; `""` uses the endpoint
+    /// verbatim.
+    ///
+    /// Real inference servers do not serve at `/compress` — TorchServe uses
+    /// `/predictions/<model>`, KServe `/v1/models/<name>:predict`, SageMaker
+    /// `/invocations` — and appending to those 404s. Because remote Kompress
+    /// fails open, that 404 is invisible: compression silently stops instead of
+    /// erroring, so the only prior workaround was a reverse proxy that existed
+    /// purely to rename a path.
+    ///
+    /// Not calling this keeps [`DEFAULT_ENDPOINT_PATH`], so an existing Modal
+    /// deployment sees a byte-identical request.
+    pub fn with_path(mut self, path: &str) -> Self {
+        self.url = resolve_url(&self.endpoint, path);
+        self
+    }
+
+    /// Merge extra request headers, replacing any already set under the same
+    /// name (ASCII case-insensitively).
+    ///
+    /// Applied after the Bearer token on purpose: it lets an operator replace
+    /// `authorization` with whatever their gateway wants (`x-api-key`, a signed
+    /// header, a tenant id) without a separate auth-scheme setting.
+    ///
+    /// **Divergence:** Python does a plain `dict.update`, so its replacement is
+    /// exact-key. Matching header names case-insensitively here avoids emitting
+    /// both `authorization` and `Authorization` on the wire.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        for (key, value) in headers {
+            match self
+                .headers
+                .iter_mut()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+            {
+                Some(slot) => *slot = (key, value),
+                None => self.headers.push((key, value)),
+            }
+        }
+        self
     }
 
     /// Attach the proxy-local CCR store hook. Without it the retrieval marker
@@ -182,7 +248,9 @@ impl RemoteKompressCompressor {
         &self.config
     }
 
-    /// The resolved POST target (base endpoint + `/compress`).
+    /// The resolved POST target. Worth logging where the router builds this:
+    /// under the fail-open contract a mistyped path never surfaces as an
+    /// error, only as compression quietly doing nothing.
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -247,6 +315,7 @@ impl RemoteKompressCompressor {
                     result.compressed.push_str(&ccr_marker(
                         result.original_tokens,
                         result.compressed_tokens,
+                        content,
                         &cache_key,
                     ));
                     return (result, RemoteOutcome::Compressed(Some(cache_key)));
@@ -294,12 +363,39 @@ impl RemoteKompressCompressor {
     }
 }
 
+/// Join `endpoint` and `path`. An empty `path` means the caller supplied a
+/// complete URL and it is used verbatim.
+fn resolve_url(endpoint: &str, path: &str) -> String {
+    if path.is_empty() {
+        return endpoint.to_string();
+    }
+    let endpoint = endpoint.trim_end_matches('/');
+    if path.starts_with('/') {
+        format!("{endpoint}{path}")
+    } else {
+        format!("{endpoint}/{path}")
+    }
+}
+
 /// The retrieval marker appended to a CCR-stored result. Byte-identical to the
 /// Python reference's f-string, including the leading newline.
-fn ccr_marker(original_tokens: usize, compressed_tokens: usize, cache_key: &str) -> String {
+///
+/// `source` is the pre-compression text: the marker reports its line span so a
+/// reader can tell content was compressed away rather than absent. "items"
+/// counts words, which does not map to lines and reads as evidence of absence
+/// (#2586).
+fn ccr_marker(
+    original_tokens: usize,
+    compressed_tokens: usize,
+    source: &str,
+    cache_key: &str,
+) -> String {
+    let source_lines = source.matches('\n').count() + 1;
+    let line_word = if source_lines == 1 { "line" } else { "lines" };
     format!(
         "\n[{original_tokens} items compressed to \
-         {compressed_tokens}. Retrieve more: hash={cache_key}]"
+         {compressed_tokens} (from {source_lines} source {line_word}). \
+         Retrieve more: hash={cache_key}]"
     )
 }
 
@@ -425,6 +521,7 @@ impl Compressor for RemoteKompressCompressor {
                 markers.push(ccr_marker(
                     result.original_tokens,
                     result.compressed_tokens,
+                    &result.original,
                     &cache_key,
                 ));
                 recoverable.insert(cache_key, result.original.clone());
@@ -515,6 +612,66 @@ mod tests {
             StubTransport::ok("{}"),
         );
         assert_eq!(c.url(), "https://kompress.example.com/compress");
+    }
+
+    #[test]
+    fn a_path_override_retargets_the_endpoint() {
+        // TorchServe / KServe style paths, which 404 under a hardcoded
+        // /compress — and fail-open makes that 404 invisible.
+        let c = client(StubTransport::ok("{}")).with_path("/predictions/kompress");
+        assert_eq!(c.url(), "https://kompress.example.com/predictions/kompress");
+
+        // A leading slash is optional.
+        let c = client(StubTransport::ok("{}")).with_path("v1/models/kompress:predict");
+        assert_eq!(
+            c.url(),
+            "https://kompress.example.com/v1/models/kompress:predict"
+        );
+
+        // Empty means the operator already gave a complete URL.
+        let c = RemoteKompressCompressor::new(
+            "https://ml.acme.com/invocations",
+            None,
+            RemoteKompressConfig::default(),
+            StubTransport::ok("{}"),
+        )
+        .with_path("");
+        assert_eq!(c.url(), "https://ml.acme.com/invocations");
+    }
+
+    #[test]
+    fn extra_headers_are_applied_after_the_bearer_token() {
+        // Applied last on purpose, so a gateway wanting x-api-key can drop
+        // the Authorization header without a separate auth-scheme setting.
+        let c = client(StubTransport::ok("{}")).with_headers(parse_endpoint_headers(
+            "Authorization=Token abc, x-tenant-id=acme",
+        ));
+        assert!(c
+            .headers
+            .contains(&("Authorization".to_string(), "Token abc".to_string())));
+        assert!(c
+            .headers
+            .contains(&("x-tenant-id".to_string(), "acme".to_string())));
+        // Replaced, not duplicated — one authorization header on the wire.
+        assert_eq!(
+            c.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn header_parsing_drops_malformed_items() {
+        assert_eq!(parse_endpoint_headers(""), vec![]);
+        assert_eq!(
+            parse_endpoint_headers(" a=1 , junk, =2, b= , c=3 "),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("c".to_string(), "3".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -693,9 +850,31 @@ mod tests {
             outcome,
             RemoteOutcome::Compressed(Some("abc123def456".to_string()))
         );
+        // LONG is a single line, hence the singular "source line".
         assert_eq!(
             r.compressed,
-            "alpha bravo\n[12 items compressed to 2. Retrieve more: hash=abc123def456]"
+            "alpha bravo\n[12 items compressed to 2 (from 1 source line). \
+             Retrieve more: hash=abc123def456]"
+        );
+    }
+
+    #[test]
+    fn the_marker_reports_the_source_line_span() {
+        let c = client(StubTransport::ok(
+            r#"{"compressed": "alpha bravo", "original_tokens": 12,
+                "compressed_tokens": 2, "compression_ratio": 0.17}"#,
+        ))
+        .with_ccr_store(Arc::new(|_, _, _| Some("abc123def456".to_string())));
+        // 12 words over 3 lines: the marker must report lines, not words.
+        let source = "alpha bravo charlie delta\necho foxtrot golf hotel\nindia juliett kilo lima";
+        let (r, _) = c.compress_remote(source, None);
+        assert!(
+            r.compressed.ends_with(
+                "[12 items compressed to 2 (from 3 source lines). \
+                 Retrieve more: hash=abc123def456]"
+            ),
+            "{}",
+            r.compressed
         );
     }
 

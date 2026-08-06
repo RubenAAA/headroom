@@ -58,6 +58,7 @@ pub enum CodeLanguage {
     Cpp,
     Perl,
     CSharp,
+    Php,
     Unknown,
 }
 
@@ -74,6 +75,7 @@ impl CodeLanguage {
             CodeLanguage::Cpp => "cpp",
             CodeLanguage::Perl => "perl",
             CodeLanguage::CSharp => "csharp",
+            CodeLanguage::Php => "php",
             CodeLanguage::Unknown => "unknown",
         }
     }
@@ -93,6 +95,7 @@ impl CodeLanguage {
             "cpp" => CodeLanguage::Cpp,
             "perl" => CodeLanguage::Perl,
             "csharp" => CodeLanguage::CSharp,
+            "php" => CodeLanguage::Php,
             "unknown" => CodeLanguage::Unknown,
             _ => return None,
         })
@@ -122,6 +125,7 @@ impl CodeLanguage {
             "rs" => CodeLanguage::Rust,
             "c++" | "cxx" | "cc" | "hpp" => CodeLanguage::Cpp,
             "pl" => CodeLanguage::Perl,
+            "phtml" | "php5" | "php7" | "php8" => CodeLanguage::Php,
             _ => CodeLanguage::Unknown,
         }
     }
@@ -139,6 +143,9 @@ impl CodeLanguage {
             CodeLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             CodeLanguage::Perl => ts_parser_perl::LANGUAGE.into(),
             CodeLanguage::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            // The mixed HTML + `<?php` grammar, matching what Python's
+            // `tree-sitter-language-pack` returns for `php`.
+            CodeLanguage::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             CodeLanguage::Unknown => return None,
         })
     }
@@ -376,6 +383,29 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             container_node_types: &["namespace_declaration"],
             opaque_node_types: &["preproc_if"],
         },
+        CodeLanguage::Php => LangConfig {
+            import_nodes: &["namespace_use_declaration"],
+            function_nodes: &["function_definition", "method_declaration"],
+            class_nodes: &[
+                "class_declaration",
+                "interface_declaration",
+                "trait_declaration",
+            ],
+            type_nodes: &["enum_declaration"],
+            body_node_types: &["compound_statement"],
+            class_body_node_types: Some(&["declaration_list"]),
+            decorator_node: None,
+            comment_prefix: "//",
+            uses_colon_after_signature: false,
+            // Statement-scoped `namespace App;` hoists to the top of the output
+            // (ahead of the use declarations), which is the ordering PHP
+            // requires. The rarer block-scoped `namespace A { ... }` form takes
+            // the same path and is preserved verbatim — valid output, just no
+            // compression inside the block.
+            package_node: Some("namespace_definition"),
+            container_node_types: &[],
+            opaque_node_types: &[],
+        },
         CodeLanguage::Unknown => return None,
     })
 }
@@ -471,6 +501,13 @@ type AstCompression = (String, CodeStructure, Vec<(String, f64)>);
 
 #[derive(Default)]
 struct CodeStructure {
+    /// Uncaptured top-level nodes that precede the first captured one: file
+    /// headers (license banners, module comments, a PHP `<?php` open tag).
+    /// They are emitted first, in original order, rather than swept to the end
+    /// with the rest of the uncaptured nodes — PHP code after the closing of
+    /// the file is plain HTML text, and C# rejects a `#region` that follows a
+    /// type declaration, so relocating a header forfeits the compression.
+    header_code: Vec<String>,
     imports: Vec<String>,
     type_definitions: Vec<String>,
     class_definitions: Vec<String>,
@@ -819,6 +856,19 @@ mod prefilter {
                             r"(class|struct|record|interface|enum)\b"
                         )),
                         c(r"(?m)\bget;\s*set;"),
+                    ],
+                ),
+                (
+                    CodeLanguage::Php,
+                    vec![
+                        c(r"<\?php\b"),
+                        c(r"(?m)^\s*namespace\s+[\w\\]+\s*;"),
+                        c(r"(?m)^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;"),
+                        c(concat!(
+                            r"(?m)^\s*(public|private|protected|static|abstract|final)?",
+                            r"\s*function\s+\w+\s*\("
+                        )),
+                        c(r"(?m)\$this->|->\w+\s*\("),
                     ],
                 ),
             ]
@@ -1220,6 +1270,7 @@ fn assemble_compressed(structure: &CodeStructure) -> String {
             parts.push(String::new());
         }
     };
+    push_section(&mut parts, &structure.header_code);
     push_section(&mut parts, &structure.imports);
     push_section(&mut parts, &structure.type_definitions);
     push_section(&mut parts, &structure.class_definitions);
@@ -1582,14 +1633,21 @@ impl<'a> Ctx<'a> {
             std::collections::HashSet::new();
         self.visit(root, &mut structure, &mut captured);
 
-        // Top-level children not captured → top_level_code.
+        // Top-level children not captured → top_level_code, except those that
+        // end before the first captured node: those are file headers and keep
+        // their place at the top (see `CodeStructure::header_code`).
+        let first_captured = captured.iter().map(|&(s, _)| s).min();
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             let range = (child.start_byte(), child.end_byte());
             if !captured.contains(&range) {
                 let text = self.node_text(child).trim();
                 if !text.is_empty() {
-                    structure.top_level_code.push(text.to_string());
+                    if first_captured.is_some_and(|f| child.end_byte() <= f) {
+                        structure.header_code.push(text.to_string());
+                    } else {
+                        structure.top_level_code.push(text.to_string());
+                    }
                 }
             }
         }
@@ -2348,7 +2406,12 @@ mod tests {
             ("cc", CodeLanguage::Cpp),
             ("hpp", CodeLanguage::Cpp),
             ("pl", CodeLanguage::Perl),
+            ("phtml", CodeLanguage::Php),
+            ("php5", CodeLanguage::Php),
+            ("php7", CodeLanguage::Php),
+            ("php8", CodeLanguage::Php),
             // Canonical names still work, case-insensitively and trimmed.
+            ("php", CodeLanguage::Php),
             ("python", CodeLanguage::Python),
             ("JavaScript", CodeLanguage::Javascript),
             ("  TS  ", CodeLanguage::Typescript),
@@ -2576,5 +2639,97 @@ mod tests {
         let (jlang, jconf) = detect_language(java);
         assert_eq!(jlang, CodeLanguage::Java, "C# must not steal Java");
         assert!((jconf - 1.0).abs() < 1e-9, "got {jconf}");
+    }
+
+    /// A namespaced service class with two long method bodies — the shape the
+    /// PHP `LangConfig` is built around (statement-scoped namespace, `use`
+    /// imports, `declaration_list` class body, `compound_statement` bodies).
+    fn php_service_sample() -> String {
+        let body: String = (0..20)
+            .map(|i| format!("        $step{i} = $this->compute($value{i}, {i});\n"))
+            .collect();
+        format!(
+            "<?php\n\nnamespace Acme\\Widgets;\n\nuse Acme\\Support\\Logger;\nuse Acme\\Support\\Cache;\n\nclass WidgetService\n{{\n    public function process(int $input): int\n    {{\n{body}        return $step0;\n    }}\n\n    public function describe(): string\n    {{\n{body}        return 'widget';\n    }}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn php_compresses_byte_identically_to_python() {
+        let code = php_service_sample();
+        let cfg = CodeCompressorConfig {
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            semantic_analysis: false,
+            max_body_lines: 2,
+            language_hint: Some("php".to_string()),
+            ..Default::default()
+        };
+        let r = CodeAwareCompressor::new(cfg).compress(&code);
+        assert_eq!(r.language, CodeLanguage::Php);
+        assert!(r.syntax_valid, "compressed PHP must re-parse");
+        // Recorded from the Python reference on this exact input. The `<?php`
+        // tag keeps its place as header code; the blank line between
+        // `namespace` and the `use` block does not survive, because the
+        // namespace is hoisted through `package_node` and re-emitted
+        // immediately ahead of the imports.
+        let expected = concat!(
+            "<?php\n",
+            "\n",
+            "namespace Acme\\Widgets;\n",
+            "use Acme\\Support\\Logger;\n",
+            "use Acme\\Support\\Cache;\n",
+            "\n",
+            "class WidgetService\n",
+            "{\n",
+            "    public function process(int $input): int\n",
+            "    {\n",
+            "        $step0 = $this->compute($value0, 0);\n",
+            "        $step1 = $this->compute($value1, 1);\n",
+            "        // [19 lines omitted]\n",
+            "    }\n",
+            "    public function describe(): string\n",
+            "    {\n",
+            "        $step0 = $this->compute($value0, 0);\n",
+            "        $step1 = $this->compute($value1, 1);\n",
+            "        // [19 lines omitted]\n",
+            "    }\n",
+            "}",
+        );
+        assert_eq!(r.compressed, expected);
+    }
+
+    #[test]
+    fn php_is_detected_without_a_hint() {
+        // PHP's `$sigil` variables also match the Perl prefilter, so this is
+        // the case that regressed to Unknown in Python before the `<?php`
+        // disambiguation landed.
+        let code = php_service_sample();
+        let (lang, conf) = detect_language(&code);
+        assert_eq!(lang, CodeLanguage::Php, "confidence {conf}");
+        assert!(
+            (conf - 1.0).abs() < 1e-9,
+            "Python reports 1.000, got {conf}"
+        );
+
+        // And PHP must not steal Perl, whose sigils it shares.
+        let perl = "package Acme::Widget;\n\nuse strict;\nuse warnings;\n\nsub run {\n    my ($self) = @_;\n    return $self->{id};\n}\n\n1;\n";
+        let (plang, _) = detect_language(perl);
+        assert_eq!(plang, CodeLanguage::Perl, "PHP must not steal Perl");
+    }
+
+    #[test]
+    fn php_falls_back_to_verbatim_on_malformed_input() {
+        // Unparseable PHP must come back unchanged rather than half-elided.
+        let code = "<?php\nclass Broken {\n    public function oops( {\n".repeat(8);
+        let cfg = CodeCompressorConfig {
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            semantic_analysis: false,
+            max_body_lines: 2,
+            language_hint: Some("php".to_string()),
+            ..Default::default()
+        };
+        let r = CodeAwareCompressor::new(cfg).compress(&code);
+        assert_eq!(r.compressed.trim_end(), code.trim_end());
     }
 }

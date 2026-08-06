@@ -223,6 +223,11 @@ fastembed = { version = "5", default-features = false, optional = true, features
 # ONNX Runtime; Kompress therefore only builds under `ml` (on by default).
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
 tree-sitter-c-sharp = "=0.23.5"
+# PHP, like Perl, has no PyPI wheel pin — Python loads it from
+# `tree-sitter-language-pack`. The crate exports two grammars: `LANGUAGE_PHP`
+# (mixed HTML + `<?php` islands) and `LANGUAGE_PHP_ONLY` (no surrounding HTML).
+# The language pack's `php` parser is the mixed one, so that is what we use.
+tree-sitter-php = "=0.24.2"
 
 [features]
 # `ml` is ON by default, so a stock build is byte-for-byte what it was before:

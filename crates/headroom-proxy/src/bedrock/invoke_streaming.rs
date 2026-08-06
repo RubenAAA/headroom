@@ -481,7 +481,16 @@ where
     // grouping these into a tuple of owned Strings keeps the
     // closure readable.
     let init = (parser, upstream, false, request_id, model_id, region);
-    stream::unfold(
+    // Synthetic ping ahead of the first translated frame, so downstream
+    // clients (Claude Code) arm their mid-turn steering / interruptible
+    // state before `message_start` arrives. The Bedrock-to-Anthropic
+    // translation never produces SSE-level keepalives of its own; this
+    // matches the real Anthropic wire format (issue #902). Emitted
+    // unconditionally, exactly where the Python reference yields it —
+    // ahead of the upstream loop, so a stream that errors immediately
+    // still gets one.
+    let ping = stream::once(async { Ok(Bytes::from_static(b"event: ping\ndata: {}\n\n")) });
+    ping.chain(stream::unfold(
         init,
         |(mut parser, mut upstream, mut done, request_id, model_id, region)| {
             Box::pin(async move {
@@ -716,7 +725,7 @@ where
                 }
             })
         },
-    )
+    ))
 }
 
 /// Tee the translated SSE stream into an `AnthropicStreamState` task
@@ -1040,6 +1049,63 @@ mod tests {
         ));
         assert!(!is_eventstream_content_type("application/json"));
         assert!(!is_eventstream_content_type("text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn a_ping_precedes_the_first_translated_frame() {
+        use crate::bedrock::eventstream::MessageBuilder;
+
+        let payload = serde_json::json!({
+            "type": "message_start",
+            "message": {"id": "msg_01", "type": "message", "role": "assistant",
+                        "model": "claude-3-haiku-20240307", "content": [],
+                        "usage": {"input_tokens": 7, "output_tokens": 1}}
+        })
+        .to_string();
+        let frame = MessageBuilder::new()
+            .header_string(":event-type", "chunk")
+            .header_string(":content-type", "application/json")
+            .header_string(":message-type", "event")
+            .payload(Bytes::from(payload))
+            .build();
+
+        let upstream = stream::once(async move { Ok(frame) });
+        let out: Vec<Bytes> = translate_stream(
+            upstream,
+            true,
+            "req-1".to_string(),
+            "anthropic.claude-3-haiku-20240307-v1:0".to_string(),
+            "us-east-1".to_string(),
+        )
+        .map(|r| r.expect("no io error"))
+        .collect()
+        .await;
+
+        assert_eq!(&out[0][..], b"event: ping\ndata: {}\n\n");
+        assert!(
+            String::from_utf8_lossy(&out[1]).contains("message_start"),
+            "ping must come before message_start, got {:?}",
+            String::from_utf8_lossy(&out[1])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ping_is_emitted_on_an_empty_upstream() {
+        // Matches Python, which yields the ping ahead of the upstream loop:
+        // a client that gets nothing back still sees a well-formed stream.
+        let upstream = stream::empty::<Result<Bytes, std::io::Error>>();
+        let out: Vec<Bytes> = translate_stream(
+            upstream,
+            true,
+            "req-2".to_string(),
+            "m".to_string(),
+            "us-east-1".to_string(),
+        )
+        .map(|r| r.expect("no io error"))
+        .collect()
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0][..], b"event: ping\ndata: {}\n\n");
     }
 
     #[test]

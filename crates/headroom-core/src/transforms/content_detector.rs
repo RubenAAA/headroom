@@ -171,6 +171,22 @@ static CODE_PATTERNS: LazyLock<Vec<CodePatterns>> = LazyLock::new(|| {
                 Regex::new(r"^\s*package\s+[\w.]+;").unwrap(),
             ],
         },
+        CodePatterns {
+            name: "php",
+            patterns: vec![
+                // Python `.match()` is start-anchored, so these two only ever
+                // fire on a line that literally begins with the token — same
+                // `^` treatment as the typescript pattern above.
+                Regex::new(r"^<\?php\b").unwrap(),
+                Regex::new(r"^\s*namespace\s+[\w\\]+\s*;").unwrap(),
+                Regex::new(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;").unwrap(),
+                Regex::new(
+                    r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\(",
+                )
+                .unwrap(),
+                Regex::new(r"^\$this->").unwrap(),
+            ],
+        },
     ]
 });
 
@@ -1115,6 +1131,43 @@ if __name__ == '__main__':
         let r = detect_content_type(content);
         assert_eq!(r.content_type, ContentType::SourceCode);
         assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("python"));
+    }
+
+    #[test]
+    fn php_code_detected() {
+        // Without a `php` entry here, raw PHP fell through to plain text and
+        // never reached the code-aware route.
+        let content = "\
+<?php
+
+namespace Acme\\Widgets;
+
+use Acme\\Support\\Logger;
+
+class WidgetService
+{
+    private $logger;
+
+    public function process(int $input): int
+    {
+        return $input + 1;
+    }
+
+    public function describe(): string
+    {
+        return 'widget';
+    }
+}
+";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("php"));
+        // Python reports 0.6333… on this exact input.
+        assert!(
+            (r.confidence - 0.633_333_333_333_333_3).abs() < 1e-9,
+            "got {}",
+            r.confidence
+        );
     }
 
     #[test]

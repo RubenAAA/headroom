@@ -407,8 +407,8 @@ impl ReadMaturationManager {
 /// Park the trailing message-level cache breakpoint before held Reads.
 ///
 /// Strips `cache_control` from every block at or after the earliest
-/// holding message, and places one ephemeral breakpoint on the last
-/// block of the latest *eligible* message before it.
+/// holding message, and re-places that breakpoint — marker and all — on
+/// the last block of the latest *eligible* message before it.
 pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usize]) -> Vec<Value> {
     if holding_msg_indices.is_empty() {
         return messages.to_vec();
@@ -417,6 +417,12 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
     let earliest = *holding_msg_indices.iter().min().unwrap();
     let mut out: Vec<Value> = messages.to_vec();
     let mut stripped_any = false;
+    // The marker we strip, kept whole. Re-anchoring with a bare
+    // `{"type": "ephemeral"}` would silently downgrade a client's
+    // `ttl: "1h"` breakpoint to the 5m default — the request still
+    // succeeds, so the only symptom is a full prefix re-write on every
+    // idle gap past five minutes.
+    let mut held_marker: Option<Value> = None;
 
     // 1. Strip breakpoints from the held region [earliest:].
     for i in earliest..out.len() {
@@ -430,6 +436,13 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
             .any(|b| b.is_object() && b.get("cache_control").is_some());
 
         if has_bp {
+            for b in content {
+                if let Some(cc) = b.get("cache_control") {
+                    if cc.is_object() {
+                        held_marker = Some(cc.clone());
+                    }
+                }
+            }
             let new_content: Vec<Value> = content
                 .iter()
                 .map(|b| {
@@ -453,8 +466,9 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
         return out;
     }
 
-    // 2. Re-anchor: ephemeral breakpoint on the last block of the latest
-    //    block-style message before the held region.
+    // 2. Re-anchor: put the stripped breakpoint back on the last block of
+    //    the latest block-style message before the held region. Fall back
+    //    to a bare ephemeral only when the client sent no marker of its own.
     for i in (0..earliest).rev() {
         if let Some(content) = out[i].get("content").and_then(Value::as_array) {
             if let Some(last) = content.last() {
@@ -462,7 +476,10 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
                     let mut new_content = content.clone();
                     let last_idx = new_content.len() - 1;
                     if let Some(obj) = new_content[last_idx].as_object_mut() {
-                        obj.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+                        let marker = held_marker
+                            .clone()
+                            .unwrap_or_else(|| json!({"type": "ephemeral"}));
+                        obj.insert("cache_control".to_string(), marker);
                     }
                     out[i]["content"] = Value::Array(new_content);
                     break;
@@ -872,6 +889,33 @@ mod tests {
             Some(&json!({"type": "ephemeral"}))
         );
         assert!(breakpoint_indices(&out).len() <= breakpoint_indices(&msgs).len());
+    }
+
+    #[test]
+    fn relocate_preserves_cache_control_ttl() {
+        let mut msgs = msgs_with_tail_breakpoint();
+        // Client asked for the 1h cache tier on the breakpoint we relocate.
+        let last = msgs.len() - 1;
+        let mut content = msgs[last]["content"].as_array().unwrap().clone();
+        *content
+            .last_mut()
+            .unwrap()
+            .get_mut("cache_control")
+            .unwrap() = json!({"type": "ephemeral", "ttl": "1h"});
+        msgs[last]["content"] = Value::Array(content);
+
+        let out = relocate_cache_breakpoint(&msgs, &[2]);
+
+        assert_eq!(breakpoint_indices(&out), vec![1]);
+        assert_eq!(
+            out[1]["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .get("cache_control"),
+            Some(&json!({"type": "ephemeral", "ttl": "1h"}))
+        );
     }
 
     #[test]

@@ -282,5 +282,4 @@ mod tests {
         assert!(lookup("test-model").is_none());
         assert!(lookup("bedrock/some-unlisted-vendor.mystery-model").is_none());
     }
-
 }
