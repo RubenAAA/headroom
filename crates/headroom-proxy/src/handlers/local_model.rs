@@ -287,7 +287,7 @@ struct CtxTransformReport {
 ///
 /// Note: offload rewrites frozen history only on rebuild boundaries (the gate
 /// prevents cache thrash), exactly as the Claude path does.
-fn apply_ctx_request_transforms(
+async fn apply_ctx_request_transforms(
     state: &AppState,
     parsed: &mut Value,
     headers: &HeaderMap,
@@ -335,33 +335,6 @@ fn apply_ctx_request_transforms(
         }
     }
 
-    // Tool schema compaction: strips `$schema`/`title`/examples from tool
-    // definitions. The Claude path runs this on every request; a routed model
-    // pays for the same bulk on every turn, and the tool block sits in the
-    // cached prefix so shrinking it once is stable across the conversation.
-    //
-    // Token counts are taken around the call rather than derived from the byte
-    // deltas it reports: a bytes/4 rule of thumb is wrong by enough on JSON
-    // (punctuation-dense, so tokens run well ahead of bytes/4) that the savings
-    // figure would be fiction. Only the `tools` array is counted, not the whole
-    // body, and only when the request actually carries tools.
-    let tools_tokens_before = count_tools_tokens(parsed);
-    let (compacted, modified, before_bytes, after_bytes) =
-        crate::tool_schema_compaction::compact_tools(std::mem::take(parsed));
-    *parsed = compacted;
-    if modified {
-        report
-            .transforms_applied
-            .push("tool_schema_compaction".to_string());
-        report.tokens_saved += (tools_tokens_before - count_tools_tokens(parsed)).max(0);
-        tracing::debug!(
-            event = "codex_tool_schema_compaction",
-            tools_before_bytes = before_bytes,
-            tools_after_bytes = after_bytes,
-            "compacted tool schemas on routed-model request"
-        );
-    }
-
     // CTX-3: tool_result offload. Feeds the FTS search store and shrinks the
     // body. Gated on the same `ctx_offload` flag as the Claude path.
     if let Some(runtime) = state.ctx_offload.as_ref() {
@@ -390,7 +363,166 @@ fn apply_ctx_request_transforms(
         }
     }
 
+    // The routed body is still Anthropic-shaped here — translation runs after
+    // — so every stage below uses the Anthropic provider and the Anthropic
+    // tool shape, exactly as `forward_http` does for `/v1/messages`.
+    const PROVIDER: crate::memory::tool_adapter::Provider =
+        crate::memory::tool_adapter::Provider::Anthropic;
+
+    // Memory: inject tool definitions. Without this, a routed model has no way
+    // to write memories at all — `--memory` looked enabled and silently did
+    // nothing.
+    if let Some(handler) = state.memory_handler.as_ref() {
+        let handler = handler.lock().await;
+        if handler.is_initialized() {
+            // A request with no `tools` array still gets the memory tools; the
+            // array is created on demand, matching the Claude path.
+            let existing: Vec<Value> = parsed
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let (new_tools, injected) = handler.inject_memory_tools(Some(&existing), PROVIDER);
+            if injected {
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tools".to_string(), Value::Array(new_tools));
+                    report
+                        .transforms_applied
+                        .push("memory_tools".to_string());
+                    tracing::debug!(
+                        event = "codex_memory_tools",
+                        "injected memory tool definitions into routed-model request"
+                    );
+                }
+            }
+        }
+    }
+
+    // CCR: the `headroom_retrieve` tool, so the model can pull back original
+    // content by hash from a compression marker. Only extends an existing
+    // `tools` array — same as the Claude path, which does not create one here.
+    if state.config.ccr_inject_tool {
+        if let Some(tools) = parsed.get_mut("tools").and_then(|v| v.as_array_mut()) {
+            let already_has = tools
+                .iter()
+                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve"));
+            if !already_has {
+                tools.push(json!({
+                    "name": "headroom_retrieve",
+                    "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. The hash is provided in compression markers like [N items compressed... hash=abc123].",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "hash": {
+                                "type": "string",
+                                "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                            }
+                        },
+                        "required": ["hash"]
+                    }
+                }));
+                report.transforms_applied.push("ccr_tool".to_string());
+                tracing::debug!(
+                    event = "codex_ccr_tool",
+                    "injected headroom_retrieve tool into routed-model request"
+                );
+            }
+        }
+    }
+
+    // Output shaping: verbosity steering and effort routing. Idempotent — the
+    // steering text carries a sentinel prefix — so replaying a prefix that
+    // already contains it does not stack.
+    if state.config.output_shaper_enabled {
+        let shaped = crate::output_shaper::shape_request(
+            parsed,
+            true,
+            state.config.verbosity_level,
+            true,
+            &state.config.mechanical_effort,
+        );
+        if shaped.changed {
+            report.transforms_applied.extend(shaped.labels.clone());
+            tracing::debug!(
+                event = "codex_output_shaper",
+                labels = ?shaped.labels,
+                "shaped routed-model request"
+            );
+        }
+    }
+
+    // Memory: search and append recalled context to the latest user message.
+    if let Some(handler) = state.memory_handler.as_ref() {
+        let handler = handler.lock().await;
+        if handler.is_initialized() {
+            if let Some(messages) = parsed.get("messages").and_then(|v| v.as_array()).cloned() {
+                let user_id = headers
+                    .get("x-headroom-user-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("default");
+                if let Some(context) = handler
+                    .search_and_format_context(user_id, &messages, None, None, None, None)
+                    .await
+                {
+                    let frozen = parsed
+                        .get("system")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let (new_msgs, bytes) =
+                        crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
+                            &messages, &context, PROVIDER, frozen,
+                        );
+                    if bytes > 0 {
+                        if let Some(msgs) = parsed.get_mut("messages") {
+                            *msgs = Value::Array(new_msgs);
+                            report
+                                .transforms_applied
+                                .push("memory_context".to_string());
+                            tracing::debug!(
+                                event = "codex_memory_context",
+                                bytes_appended = bytes,
+                                "injected recalled memory into routed-model request"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     report
+}
+
+/// Tool schema compaction: strips `$schema`/`title`/examples from tool
+/// definitions.
+///
+/// Runs after compression and after every tool-injecting stage, which is where
+/// the Claude path runs it — so the memory and CCR tools get compacted too
+/// rather than being added behind its back.
+///
+/// Token counts are taken around the call rather than derived from the byte
+/// deltas it reports: a bytes/4 rule of thumb is wrong by enough on JSON
+/// (punctuation-dense, so tokens run well ahead of bytes/4) that the savings
+/// figure would be fiction. Only the `tools` array is counted, not the whole
+/// body, and only when the request actually carries tools.
+fn apply_tool_schema_compaction(parsed: &mut Value) -> (bool, i64) {
+    let tools_tokens_before = count_tools_tokens(parsed);
+    let (compacted, modified, before_bytes, after_bytes) =
+        crate::tool_schema_compaction::compact_tools(std::mem::take(parsed));
+    *parsed = compacted;
+    if !modified {
+        return (false, 0);
+    }
+    let saved = (tools_tokens_before - count_tools_tokens(parsed)).max(0);
+    tracing::debug!(
+        event = "codex_tool_schema_compaction",
+        tools_before_bytes = before_bytes,
+        tools_after_bytes = after_bytes,
+        tokens_saved = saved,
+        "compacted tool schemas on routed-model request"
+    );
+    (true, saved)
 }
 
 /// What the compression + replay stage did, for the request outcome.
@@ -871,7 +1003,8 @@ pub async fn handle_messages(
     // searchable archive as the Claude passthrough path, gated on the same
     // flags. Mutates `parsed` before translation.
     let transform_started = std::time::Instant::now();
-    let mut ctx_report = apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr);
+    let mut ctx_report =
+        apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr).await;
 
     // Live-zone compression + freeze-replay, on the same flags as the Claude
     // path and in the same order (compress, then replay the cached prefix).
@@ -882,6 +1015,16 @@ pub async fn handle_messages(
     ctx_report
         .transforms_applied
         .extend(compression_report.transforms_applied);
+
+    // Last, as on the Claude path: after compression and after everything that
+    // injects a tool.
+    let (compacted, compaction_saved) = apply_tool_schema_compaction(&mut parsed);
+    if compacted {
+        ctx_report
+            .transforms_applied
+            .push("tool_schema_compaction".to_string());
+        ctx_report.tokens_saved += compaction_saved;
+    }
     let overhead_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
 
     // Translation path: Anthropic → OpenAI.
@@ -3607,6 +3750,110 @@ mod tests {
             turn2["messages"][0]["content"][0]["text"], expected_tail["content"][0]["text"],
             "the client's own first message must survive, not turn one's"
         );
+    }
+
+    /// CCR's retrieve tool only extends an existing `tools` array — the Claude
+    /// path does not create one here, and a routed request must not either.
+    #[tokio::test]
+    async fn ccr_tool_is_injected_only_when_the_request_carries_tools() {
+        let state = test_state(|c| c.ccr_inject_tool = true);
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let mut with_tools = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        apply_ctx_request_transforms(&state, &mut with_tools, &headers, &addr).await;
+        let names: Vec<&str> = with_tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"headroom_retrieve"), "got {names:?}");
+
+        let mut without_tools = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        apply_ctx_request_transforms(&state, &mut without_tools, &headers, &addr).await;
+        assert!(
+            without_tools.get("tools").is_none(),
+            "a request with no tools array must not grow one"
+        );
+    }
+
+    /// Injecting the same tool twice would send the model a duplicate
+    /// definition and move the cached prefix every turn.
+    #[tokio::test]
+    async fn ccr_tool_injection_is_idempotent() {
+        let state = test_state(|c| c.ccr_inject_tool = true);
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr).await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr).await;
+        let count = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["name"] == "headroom_retrieve")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    /// `--ccr-inject-tool` defaults to *true*, so the retrieve tool is the one
+    /// stage that lands without being asked for — on both paths. Everything
+    /// else here stays dormant until its flag is set.
+    #[tokio::test]
+    async fn only_ccr_injects_under_default_config() {
+        let state = test_state(|_| {});
+        assert!(
+            state.config.ccr_inject_tool,
+            "guard: this test encodes the shipped default"
+        );
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        let report = apply_ctx_request_transforms(&state, &mut body, &headers, &addr).await;
+        assert_eq!(report.transforms_applied, vec!["ccr_tool".to_string()]);
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+    }
+
+    /// Ordering guarantee: compaction runs after injection, so an injected
+    /// tool is compacted like any other rather than slipping in behind it.
+    #[test]
+    fn tool_schema_compaction_strips_injected_tool_noise() {
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "tools": [{
+                "name": "headroom_retrieve",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "Retrieve",
+                    "type": "object",
+                    "properties": {"hash": {"type": "string"}}
+                }
+            }]
+        });
+        let (changed, saved) = apply_tool_schema_compaction(&mut body);
+        assert!(changed);
+        assert!(saved > 0, "stripping schema noise should save tokens");
+        let schema = &body["tools"][0]["input_schema"];
+        assert!(schema.get("$schema").is_none());
+        assert!(schema.get("title").is_none());
+        assert_eq!(schema["properties"]["hash"]["type"], "string");
     }
 
     /// Compression is wired to a live dispatcher, not just gated correctly:
