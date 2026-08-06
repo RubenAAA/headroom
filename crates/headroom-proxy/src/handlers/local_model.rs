@@ -317,6 +317,22 @@ fn apply_ctx_request_transforms(
         }
     }
 
+    // Tool schema compaction: strips `$schema`/`title`/examples from tool
+    // definitions. The Claude path runs this on every request; a routed model
+    // pays for the same bulk on every turn, and the tool block sits in the
+    // cached prefix so shrinking it once is stable across the conversation.
+    let (compacted, modified, before_bytes, after_bytes) =
+        crate::tool_schema_compaction::compact_tools(std::mem::take(parsed));
+    *parsed = compacted;
+    if modified {
+        tracing::debug!(
+            event = "codex_tool_schema_compaction",
+            tools_before_bytes = before_bytes,
+            tools_after_bytes = after_bytes,
+            "compacted tool schemas on routed-model request"
+        );
+    }
+
     // CTX-3: tool_result offload. Feeds the FTS search store and shrinks the
     // body. Gated on the same `ctx_offload` flag as the Claude path.
     if let Some(runtime) = state.ctx_offload.as_ref() {
@@ -673,7 +689,19 @@ pub async fn handle_messages(
 
     // Send with retry: refresh the OAuth token once on 401, back off on
     // 429/5xx/transport errors (honoring Retry-After), like the Codex CLI.
-    const MAX_ATTEMPTS: u32 = 3;
+    //
+    // Bounds come from the same config the Claude path uses, so
+    // `--retry-max-attempts` and the backoff window mean one thing across both
+    // paths. The 401-refresh is codex-specific and sits outside the budget:
+    // it is a credential fix, not a transient failure, and always gets its one
+    // shot regardless of how retries are configured.
+    let max_attempts = if state.config.retry_enabled {
+        state.config.retry_max_attempts.max(1)
+    } else {
+        1
+    };
+    let base_delay_ms = state.config.retry_base_delay_ms;
+    let max_delay_ms = state.config.retry_max_delay_ms;
     let mut refreshed = false;
     let mut attempt: u32 = 0;
     let upstream_resp = loop {
@@ -702,7 +730,7 @@ pub async fn handle_messages(
                     }
                     break r;
                 }
-                if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_ATTEMPTS {
+                if (status.as_u16() == 429 || status.is_server_error()) && attempt < max_attempts {
                     let retry_after = r
                         .headers()
                         .get(http::header::RETRY_AFTER)
@@ -711,8 +739,11 @@ pub async fn handle_messages(
                     let backoff = retry_after
                         .map(std::time::Duration::from_secs)
                         .unwrap_or_else(|| {
-                            std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1))
-                        });
+                            std::time::Duration::from_millis(
+                                base_delay_ms.saturating_mul(2u64.saturating_pow(attempt - 1)),
+                            )
+                        })
+                        .min(std::time::Duration::from_millis(max_delay_ms));
                     tracing::warn!(
                         event = "local_model_upstream_retry",
                         status = status.as_u16(),
@@ -726,7 +757,7 @@ pub async fn handle_messages(
                 break r;
             }
             Err(e) => {
-                if attempt < MAX_ATTEMPTS {
+                if attempt < max_attempts {
                     let backoff = std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1));
                     tracing::warn!(
                         event = "local_model_upstream_retry",
