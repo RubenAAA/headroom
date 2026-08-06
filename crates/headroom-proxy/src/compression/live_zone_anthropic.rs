@@ -42,7 +42,8 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_live_zone, BlockAction, ExclusionReason, LiveZoneError, LiveZoneOutcome,
+    compress_anthropic_live_zone_with_ccr, BlockAction, DispatchConfig, ExclusionReason,
+    LiveZoneError, LiveZoneOutcome,
 };
 use serde_json::Value;
 
@@ -146,12 +147,17 @@ pub enum PassthroughReason {
 ///   upstream. The live-zone dispatcher itself still runs on every
 ///   mode in PR-B/C; the auth-mode gate is local to Phase E.
 /// - `request_id`: per-request id used for log correlation.
+/// - `exclude_tools`: `--exclude-tools` names. Results from a matching
+///   tool are kept away from every lossy compressor; they still get a
+///   self-verified reversible fold where their shape allows one. Empty
+///   (the default) leaves dispatch byte-identical.
 pub fn compress_anthropic_request(
     body: &Bytes,
     mode: CompressionMode,
     cache_control_policy: CacheControlAutoFrozen,
     auth_mode: RequestAuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> Outcome {
     if matches!(mode, CompressionMode::Off) {
         tracing::info!(
@@ -355,7 +361,20 @@ pub fn compress_anthropic_request(
     // getting compression, not losing it). The plumbing here lets
     // F2.2 vary per-block thresholds by mode without touching this
     // call site again.
-    match compress_anthropic_live_zone(&dispatch_body, frozen_count, auth_mode.into(), model) {
+    // `--exclude-tools` rides in on the DispatchConfig; no CCR store on
+    // this path, so `None` here matches what the 4-arg shim passed.
+    let dispatch_config = DispatchConfig {
+        exclude_tools: exclude_tools.to_vec(),
+        ..DispatchConfig::default()
+    };
+    match compress_anthropic_live_zone_with_ccr(
+        &dispatch_body,
+        frozen_count,
+        auth_mode.into(),
+        model,
+        None,
+        &dispatch_config,
+    ) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest
@@ -731,6 +750,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-1",
+            &[],
         );
         match out {
             Outcome::Passthrough {
@@ -749,6 +769,7 @@ mod tests {
             CacheControlAutoFrozen::Enabled,
             RequestAuthMode::Payg,
             "req-2",
+            &[],
         );
         match out {
             Outcome::Passthrough {
@@ -767,6 +788,7 @@ mod tests {
             CacheControlAutoFrozen::Enabled,
             RequestAuthMode::Payg,
             "req-3",
+            &[],
         );
         match out {
             Outcome::Passthrough {
@@ -793,6 +815,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-4",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -809,6 +832,7 @@ mod tests {
             CacheControlAutoFrozen::Enabled,
             RequestAuthMode::Payg,
             "req-5",
+            &[],
         );
         match out {
             Outcome::Passthrough {
@@ -846,6 +870,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-6",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -877,6 +902,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e3-1",
+            &[],
         );
         match out {
             Outcome::Compressed {
@@ -918,6 +944,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::OAuth,
             "req-e3-2",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -938,6 +965,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Subscription,
             "req-e3-3",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -965,6 +993,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e3-4",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -986,6 +1015,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e3-5",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -1022,6 +1052,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e1-1",
+            &[],
         );
         match out {
             Outcome::Compressed {
@@ -1066,6 +1097,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::OAuth,
             "req-e1-2",
+            &[],
         );
         // Non-PAYG → no normalization → live-zone dispatcher sees
         // no compressible block → NoCompression.
@@ -1095,6 +1127,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Subscription,
             "req-e1-3",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -1124,6 +1157,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e1-4",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -1149,6 +1183,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e1-5",
+            &[],
         );
         match out {
             Outcome::NoCompression => {}
@@ -1187,6 +1222,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e2-1",
+            &[],
         );
         match out {
             Outcome::Compressed {
@@ -1246,6 +1282,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e2-2",
+            &[],
         );
         match out {
             Outcome::Compressed {
@@ -1287,6 +1324,7 @@ mod tests {
             CacheControlAutoFrozen::Disabled,
             RequestAuthMode::Payg,
             "req-e1-6",
+            &[],
         );
         match out {
             Outcome::Compressed {

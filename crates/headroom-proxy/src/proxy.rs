@@ -2574,6 +2574,7 @@ pub(crate) async fn forward_http(
                         state.config.cache_control_auto_frozen,
                         effective_auth_mode,
                         &request_id,
+                        &state.config.exclude_tools,
                     );
                     // Cross-turn verbatim de-dup post-pass over the final
                     // block forms (no-op unless

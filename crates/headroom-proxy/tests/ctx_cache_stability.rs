@@ -81,6 +81,7 @@ fn transform_full_pipeline(request: &Value) -> Value {
         CacheControlAutoFrozen::Enabled,
         AuthMode::Payg,
         "test-ctx-stability",
+        &[],
     );
     let final_bytes = match outcome {
         Outcome::Compressed { body, .. } => body.to_vec(),
@@ -144,6 +145,7 @@ fn transform_all(engine: &InjectEngine, request: &Value, session_key: &str) -> V
         CacheControlAutoFrozen::Enabled,
         AuthMode::Payg,
         "test-ctx-all",
+        &[],
     );
     let final_bytes = match outcome {
         Outcome::Compressed { body, .. } => body.to_vec(),

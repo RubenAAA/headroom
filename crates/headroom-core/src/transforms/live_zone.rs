@@ -95,7 +95,10 @@
 //! implementation swaps, not signature redesigns.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::HashSet, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+};
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -112,7 +115,7 @@ use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
 use crate::tokenizer::get_tokenizer;
-use crate::tool_exclusion::is_ccr_retrieve_tool;
+use crate::tool_exclusion::{is_ccr_retrieve_tool, is_tool_excluded, is_verbatim_excluded};
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────
 
@@ -132,6 +135,11 @@ const STRATEGY_KOMPRESS: &str = "kompress";
 /// The comment-elision tier (which mints a CCR marker) and the schema fold are
 /// NOT ported — `headroom/transforms/config_compressor.py` still owns those.
 const STRATEGY_CONFIG_LOSSLESS: &str = "config_lossless";
+/// Strategy tag emitted when a block belonging to an `--exclude-tools` tool was
+/// folded losslessly instead of compressed. Distinct from
+/// [`STRATEGY_CONFIG_LOSSLESS`] so the manifest shows *why* the cheaper fold
+/// ran.
+const STRATEGY_EXCLUDED_TOOL_LOSSLESS: &str = "excluded_tool_lossless";
 
 /// Empty query context passed to compressors that take a relevance
 /// query string. PR-B3 dispatcher does not yet plumb the user's last
@@ -375,6 +383,11 @@ pub enum ExclusionReason {
     /// Compressing them again writes a fresh `<<ccr:hash>>` marker
     /// nobody can redeem.
     CcrRetrieveResult,
+    /// Block is the result of a tool the operator named in
+    /// `--exclude-tools`. Lossy compression is off for it; the block
+    /// still gets a byte-reversible fold when its shape supports one,
+    /// so this reason means "nothing shrank it", not "never touched".
+    ExcludedTool,
 }
 
 /// Aggregated per-request manifest. Always populated, regardless of
@@ -786,9 +799,9 @@ pub fn compress_anthropic_live_zone_with_ccr(
     // the body via `RawValue` borrowed slices. The Vec<Replacement>
     // produced here is the surgery plan; we do *not* mutate `body_raw`
     // while computing it.
-    let ccr_retrieve_tool_ids = collect_ccr_retrieve_tool_ids(messages);
+    let tool_guards = collect_tool_guards(messages, &dispatch_config.exclude_tools);
 
-    let plan = match plan_block_replacements(body_raw, target_idx, &ccr_retrieve_tool_ids) {
+    let plan = match plan_block_replacements(body_raw, target_idx, &tool_guards) {
         Ok(p) => p,
         Err(_) => {
             // Body shape doesn't match what we expect (e.g. content
@@ -847,6 +860,19 @@ pub fn compress_anthropic_live_zone_with_ccr(
                 );
                 outcome
             }
+            SlotKind::LosslessOnly {
+                block_type,
+                content_text,
+                content_byte_range,
+            } => compact_one_block_lossless(
+                &content_text,
+                content_byte_range,
+                target_idx,
+                Some(slot.block_index),
+                block_type,
+                tokenizer.as_ref(),
+                &mut replacements,
+            ),
             SlotKind::StringContent {
                 content_text,
                 content_byte_range,
@@ -959,7 +985,9 @@ pub fn compress_anthropic_all_messages(
 
     let messages_total = messages.len();
     let tokenizer = get_tokenizer(model);
-    let ccr_retrieve_tool_ids = collect_ccr_retrieve_tool_ids(messages);
+    // Subscription mode takes no `DispatchConfig`, so `--exclude-tools`
+    // does not reach here; only the unconditional CCR guard applies.
+    let tool_guards = collect_tool_guards(messages, &[]);
     let mut block_outcomes: Vec<BlockOutcome> = Vec::new();
     let mut replacements: Vec<Replacement> = Vec::new();
 
@@ -970,7 +998,7 @@ pub fn compress_anthropic_all_messages(
         }
 
         // Plan block replacements for this message.
-        let plan = match plan_block_replacements(body_raw, msg_idx, &ccr_retrieve_tool_ids) {
+        let plan = match plan_block_replacements(body_raw, msg_idx, &tool_guards) {
             Ok(p) => p,
             Err(_) => continue, // Skip messages with unexpected shape.
         };
@@ -1002,6 +1030,19 @@ pub fn compress_anthropic_all_messages(
                         &DispatchConfig::default(),
                     )
                 }
+                SlotKind::LosslessOnly {
+                    block_type,
+                    content_text,
+                    content_byte_range,
+                } => compact_one_block_lossless(
+                    &content_text,
+                    content_byte_range,
+                    msg_idx,
+                    Some(slot.block_index),
+                    block_type,
+                    tokenizer.as_ref(),
+                    &mut replacements,
+                ),
                 SlotKind::StringContent {
                     content_text,
                     content_byte_range,
@@ -1202,6 +1243,94 @@ fn compress_one_block(
     }
 }
 
+/// The `compact_lossless` kind that fits a detected content type, or
+/// `None` when no byte-reversible fold covers that shape.
+///
+/// Deliberately narrow: every kind listed here verifies its own inverse
+/// and returns the input untouched when the round-trip fails, so a
+/// mismatch costs a wasted fold rather than mangled content. Shapes with
+/// no entry — source code, diffs, JSON arrays, prose, HTML — are passed
+/// through whole. There is no lossy fallback: that is the point of the
+/// exclusion.
+fn lossless_kind_for(content_type: ContentType) -> Option<&'static str> {
+    match content_type {
+        ContentType::BuildOutput => Some("log"),
+        ContentType::SearchResults => Some("search"),
+        ContentType::StructuredConfig => Some("config"),
+        _ => None,
+    }
+}
+
+/// Handle one block belonging to an excluded tool: fold it losslessly if
+/// its shape allows, otherwise forward it unchanged.
+///
+/// No CCR marker is minted here. A marker exists so the model can ask
+/// for bytes the compressor dropped; a reversible fold drops nothing, so
+/// there is nothing to retrieve.
+#[allow(clippy::too_many_arguments)]
+fn compact_one_block_lossless(
+    content_text: &str,
+    content_byte_range: (usize, usize),
+    message_index: usize,
+    block_index: Option<usize>,
+    block_type: String,
+    tokenizer: &dyn crate::tokenizer::Tokenizer,
+    replacements: &mut Vec<Replacement>,
+) -> BlockOutcome {
+    let unchanged = |block_type: String| BlockOutcome {
+        message_index,
+        block_index,
+        block_type,
+        action: BlockAction::Excluded {
+            reason: ExclusionReason::ExcludedTool,
+        },
+    };
+
+    let Some(kind) = lossless_kind_for(detect_content_native(content_text)) else {
+        return unchanged(block_type);
+    };
+    let compacted = super::lossless_compaction::compact_lossless(content_text, kind);
+    if compacted.len() >= content_text.len() {
+        return unchanged(block_type);
+    }
+
+    // Same tokenizer-validated gate the lossy path uses: fewer bytes can
+    // still mean more tokens, and shipping a bigger payload helps nobody.
+    let original_tokens = tokenizer.count_text(content_text);
+    let compressed_tokens = tokenizer.count_text(&compacted);
+    if compressed_tokens >= original_tokens {
+        return BlockOutcome {
+            message_index,
+            block_index,
+            block_type,
+            action: BlockAction::RejectedNotSmaller {
+                strategy: STRATEGY_EXCLUDED_TOOL_LOSSLESS,
+                original_bytes: content_text.len(),
+                compressed_bytes: compacted.len(),
+                original_tokens,
+                compressed_tokens,
+            },
+        };
+    }
+
+    replacements.push(Replacement {
+        range: content_byte_range,
+        replacement: serde_json::to_vec(&compacted).expect("string is always JSON-encodable"),
+    });
+    BlockOutcome {
+        message_index,
+        block_index,
+        block_type,
+        action: BlockAction::Compressed {
+            strategy: STRATEGY_EXCLUDED_TOOL_LOSSLESS,
+            original_bytes: content_text.len(),
+            compressed_bytes: compacted.len(),
+            original_tokens,
+            compressed_tokens,
+        },
+    }
+}
+
 /// Walk `messages` from the back, returning the index of the latest
 /// `role == "user"` message. Restricted to indices `>= floor`; if
 /// the latest user message lies in the cache hot zone we return
@@ -1269,6 +1398,14 @@ enum SlotKind {
         content_text: String,
         content_byte_range: (usize, usize),
     },
+    /// Content is a JSON string the dispatcher may only fold
+    /// losslessly — the block answers a tool the operator excluded, so
+    /// no lossy compressor may see it.
+    LosslessOnly {
+        block_type: String,
+        content_text: String,
+        content_byte_range: (usize, usize),
+    },
     /// Block is ineligible for compression — record but do not
     /// dispatch. Carries the reason so the manifest can report why.
     Excluded {
@@ -1277,17 +1414,32 @@ enum SlotKind {
     },
 }
 
-/// Ids of assistant `tool_use` blocks that called the CCR retrieval
-/// tool, in any of its client spellings.
+/// What the planner must do with a `tool_result` because of the tool
+/// that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolGuard {
+    /// Result of a CCR retrieval call — forward byte-for-byte.
+    CcrRetrieve,
+    /// Excluded tool whose output breaks if rewritten at all, even
+    /// reversibly (see `DEFAULT_VERBATIM_EXCLUDE_TOOLS`).
+    Verbatim,
+    /// Excluded tool: no lossy compressor, but a self-verified
+    /// reversible fold may still shrink it.
+    LosslessOnly,
+}
+
+/// Map assistant `tool_use` ids to the guard their `tool_result` needs.
 ///
-/// A `tool_result` answering one of these carries content the model
+/// Only guarded ids are inserted, so an empty `exclude_tools` yields
+/// exactly the CCR-only map the planner saw before the flag existed.
+///
+/// A `tool_result` answering a CCR retrieval carries content the model
 /// just asked to have restored from the CCR store. Compressing it
 /// again writes a new `<<ccr:hash>>` marker the agent can never
-/// redeem — an unresolvable retrieval loop. The planner consults this
-/// set unconditionally and ahead of every other classification: an
-/// aged-out marker is exactly as unredeemable as a fresh one, so this
-/// must never decay into compression the way an ordinary excluded
-/// tool does.
+/// redeem — an unresolvable retrieval loop. That check runs first and
+/// unconditionally: an aged-out marker is exactly as unredeemable as a
+/// fresh one, so it must never decay into compression, and no operator
+/// setting can turn it off.
 ///
 /// Known, accepted tradeoff: `is_ccr_retrieve_tool`'s alias matching
 /// strips ANY `mcp__<server>__` prefix before comparing, so a
@@ -1296,8 +1448,8 @@ enum SlotKind {
 /// own server would need a bespoke check inconsistent with every
 /// other excluded-tool entry; given how specific the name is, the
 /// collision risk is accepted rather than special-cased.
-fn collect_ccr_retrieve_tool_ids(messages: &[Value]) -> HashSet<String> {
-    let mut ids = HashSet::new();
+fn collect_tool_guards(messages: &[Value], exclude_tools: &[String]) -> HashMap<String, ToolGuard> {
+    let mut guards = HashMap::new();
     for msg in messages {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
@@ -1312,12 +1464,19 @@ fn collect_ccr_retrieve_tool_ids(messages: &[Value]) -> HashSet<String> {
             ) else {
                 continue;
             };
-            if is_ccr_retrieve_tool(name) {
-                ids.insert(id.to_string());
-            }
+            let guard = if is_ccr_retrieve_tool(name) {
+                ToolGuard::CcrRetrieve
+            } else if !is_tool_excluded(name, exclude_tools.iter().map(String::as_str)) {
+                continue;
+            } else if is_verbatim_excluded(name) {
+                ToolGuard::Verbatim
+            } else {
+                ToolGuard::LosslessOnly
+            };
+            guards.insert(id.to_string(), guard);
         }
     }
-    ids
+    guards
 }
 
 /// Walk the buffered body, return one `PlanSlot` per block in the
@@ -1344,7 +1503,7 @@ fn block_has_string_text_field(block_json: &str) -> bool {
 fn plan_block_replacements(
     body_raw: &[u8],
     target_msg_idx: usize,
-    ccr_retrieve_tool_ids: &HashSet<String>,
+    tool_guards: &HashMap<String, ToolGuard>,
 ) -> Result<Vec<PlanSlot>, PlanError> {
     // `serde_json::from_slice` requires UTF-8; we re-validate here
     // explicitly so the pointer-arithmetic helper can take a `&str`
@@ -1418,23 +1577,42 @@ fn plan_block_replacements(
             None => "unknown".to_string(),
         };
 
-        // Ahead of every other classification: a tool_result answering a
-        // headroom_retrieve call is already-retrieved original content and
-        // must never be compressed. See `collect_ccr_retrieve_tool_ids`.
-        if block_type == "tool_result"
-            && header
+        // Ahead of every other classification: a tool_result may answer a
+        // tool whose output must not be compressed. See
+        // `collect_tool_guards`. The CCR case in particular is
+        // already-retrieved original content and must never be rewritten.
+        let tool_guard = if block_type == "tool_result" {
+            header
                 .tool_use_id
-                .is_some_and(|id| ccr_retrieve_tool_ids.contains(id))
-        {
-            slots.push(PlanSlot {
-                block_index: block_idx,
-                kind: SlotKind::Excluded {
-                    block_type,
-                    reason: ExclusionReason::CcrRetrieveResult,
-                },
-            });
-            continue;
+                .and_then(|id| tool_guards.get(id))
+                .copied()
+        } else {
+            None
+        };
+        match tool_guard {
+            Some(ToolGuard::CcrRetrieve) => {
+                slots.push(PlanSlot {
+                    block_index: block_idx,
+                    kind: SlotKind::Excluded {
+                        block_type,
+                        reason: ExclusionReason::CcrRetrieveResult,
+                    },
+                });
+                continue;
+            }
+            Some(ToolGuard::Verbatim) => {
+                slots.push(PlanSlot {
+                    block_index: block_idx,
+                    kind: SlotKind::Excluded {
+                        block_type,
+                        reason: ExclusionReason::ExcludedTool,
+                    },
+                });
+                continue;
+            }
+            Some(ToolGuard::LosslessOnly) | None => {}
         }
+        let lossless_only = tool_guard == Some(ToolGuard::LosslessOnly);
 
         if HOT_ZONE_BLOCK_TYPES.iter().any(|t| *t == block_type) {
             slots.push(PlanSlot {
@@ -1529,12 +1707,21 @@ fn plan_block_replacements(
         let inner_field_start_in_body = block_offset_in_body + inner_field_offset_in_block;
         let inner_field_end_in_body = inner_field_start_in_body + inner_field_str.len();
 
+        let content_byte_range = (inner_field_start_in_body, inner_field_end_in_body);
         slots.push(PlanSlot {
             block_index: block_idx,
-            kind: SlotKind::Compressible {
-                block_type,
-                content_text: unescaped,
-                content_byte_range: (inner_field_start_in_body, inner_field_end_in_body),
+            kind: if lossless_only {
+                SlotKind::LosslessOnly {
+                    block_type,
+                    content_text: unescaped,
+                    content_byte_range,
+                }
+            } else {
+                SlotKind::Compressible {
+                    block_type,
+                    content_text: unescaped,
+                    content_byte_range,
+                }
             },
         });
     }
@@ -1678,6 +1865,11 @@ pub struct DispatchConfig {
     pub compress_user_messages: Option<bool>,
     /// Compress system-role messages.
     pub compress_system_messages: Option<bool>,
+    /// Tool names (`--exclude-tools`) whose `tool_result` blocks must not
+    /// reach a lossy compressor. Matched by [`is_tool_excluded`], so exact
+    /// names, globs and MCP spellings all work. Empty — the default — leaves
+    /// dispatch exactly as it was before the flag was wired.
+    pub exclude_tools: Vec<String>,
 }
 
 fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
@@ -1706,7 +1898,8 @@ fn dispatch_cache() -> &'static super::content_router::CompressionCache {
 /// Every input that can change the output is included: the text, the content
 /// type that selects the compressor, `target_ratio` — the only
 /// [`DispatchConfig`] field this function reads (the rest are role gates applied
-/// by callers) — and the global Kompress enable flag. This extends Python's
+/// by callers, and `exclude_tools`, which the planner consumes before a block
+/// ever reaches this cache) — and the global Kompress enable flag. This extends Python's
 /// `hash((content, _runtime_target_ratio))`.
 ///
 /// The Kompress flag has to be part of the key even though it is not an
@@ -2404,6 +2597,263 @@ mod tests {
             matches!(by_msg(3), Some(BlockAction::Compressed { .. })),
             "the ordinary aged-out tool_result must still compress; got {:?}",
             by_msg(3)
+        );
+    }
+
+    // ─── `--exclude-tools` ────────────────────────────────────────────
+
+    /// One `tool_use` + one `tool_result` carrying `payload`.
+    fn tool_result_body(tool_name: &str, payload: &str) -> Vec<u8> {
+        body(json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": tool_name, "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": payload}
+                ]},
+            ]
+        }))
+    }
+
+    fn run_excluding(b: &[u8], exclude: &[&str]) -> LiveZoneOutcome {
+        let config = DispatchConfig {
+            exclude_tools: exclude.iter().map(|s| s.to_string()).collect(),
+            ..DispatchConfig::default()
+        };
+        compress_anthropic_live_zone_with_ccr(b, 0, AuthMode::Payg, DEFAULT_MODEL, None, &config)
+            .unwrap()
+    }
+
+    fn outcome_bytes(o: &LiveZoneOutcome) -> Option<String> {
+        match o {
+            LiveZoneOutcome::NoChange { .. } => None,
+            LiveZoneOutcome::Modified { new_body, .. } => Some(new_body.get().to_string()),
+        }
+    }
+
+    /// The rewritten `tool_result` content of a Modified outcome.
+    fn rewritten_tool_result(o: &LiveZoneOutcome) -> String {
+        let raw = outcome_bytes(o).expect("outcome must be Modified");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        v["messages"][1]["content"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A build log whose repeated lines `collapse_runs` folds exactly.
+    fn repeated_log_payload() -> String {
+        format!(
+            "2024-01-01 12:00:00 INFO  worker: starting up\n{}",
+            "2024-01-01 12:00:01 WARN  worker: retrying connection\n".repeat(200)
+        )
+    }
+
+    /// The non-negotiable default: with no `--exclude-tools`, every byte
+    /// the dispatcher writes must match what it wrote before the flag was
+    /// wired. Tools listed in Python's `DEFAULT_EXCLUDE_TOOLS` are the
+    /// tripwire — if that set ever leaks in as the Rust default, `Read`
+    /// stops compressing and this fails.
+    #[test]
+    fn empty_exclude_list_is_byte_identical_to_the_default_path() {
+        assert!(DispatchConfig::default().exclude_tools.is_empty());
+        for tool in ["Read", "Grep", "WebFetch", "Bash"] {
+            let b = tool_result_body(tool, &compressible_payload());
+            let baseline =
+                compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+            let with_empty_list = run_excluding(&b, &[]);
+            assert_eq!(
+                outcome_bytes(&baseline),
+                outcome_bytes(&with_empty_list),
+                "{tool}: empty exclusion list changed the output bytes"
+            );
+            assert!(
+                matches!(
+                    outcome_block_actions(&with_empty_list).as_slice(),
+                    [BlockAction::Compressed { .. }]
+                ),
+                "{tool}: must still compress by default; got {:?}",
+                outcome_block_actions(&with_empty_list)
+            );
+        }
+    }
+
+    /// An excluded tool's result must not reach a lossy compressor. This
+    /// payload is a JSON array, which no reversible fold covers, so the
+    /// block is forwarded whole rather than degraded.
+    #[test]
+    fn excluded_tool_result_is_not_lossily_compressed() {
+        let b = tool_result_body("Bash", &compressible_payload());
+        let out = run_excluding(&b, &["Bash"]);
+        assert!(
+            matches!(out, LiveZoneOutcome::NoChange { .. }),
+            "excluded tool_result must not rewrite the body"
+        );
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Excluded {
+                    reason: ExclusionReason::ExcludedTool
+                }]
+            ),
+            "got {:?}",
+            outcome_block_actions(&out)
+        );
+    }
+
+    /// Excluded does not mean untouched: a shape a reversible fold covers
+    /// still gets folded, and the fold round-trips exactly.
+    #[test]
+    fn excluded_tool_result_is_losslessly_compacted_and_round_trips() {
+        let payload = repeated_log_payload();
+        let b = tool_result_body("Bash", &payload);
+
+        // Without the exclusion the same block goes to the lossy log
+        // compressor — so this test measures a swap, not a no-op.
+        let lossy = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+        assert!(
+            matches!(
+                outcome_block_actions(&lossy).as_slice(),
+                [BlockAction::Compressed {
+                    strategy: STRATEGY_LOG_COMPRESSOR,
+                    ..
+                }]
+            ),
+            "control: got {:?}",
+            outcome_block_actions(&lossy)
+        );
+
+        let out = run_excluding(&b, &["Bash"]);
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Compressed {
+                    strategy: STRATEGY_EXCLUDED_TOOL_LOSSLESS,
+                    ..
+                }]
+            ),
+            "got {:?}",
+            outcome_block_actions(&out)
+        );
+        let compacted = rewritten_tool_result(&out);
+        assert!(compacted.len() < payload.len(), "fold must shrink");
+        assert_eq!(
+            super::super::lossless_compaction::expand_runs(&compacted),
+            payload,
+            "the fold must invert exactly"
+        );
+    }
+
+    /// Search output takes the `search` fold rather than the `log` one.
+    #[test]
+    fn excluded_tool_result_picks_the_fold_matching_its_shape() {
+        let payload: String = (0..200)
+            .map(|i| format!("src/lib.rs:{i}: fn thing_{i}() {{}}\n"))
+            .collect();
+        let b = tool_result_body("Bash", &payload);
+        let out = run_excluding(&b, &["Bash"]);
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Compressed {
+                    strategy: STRATEGY_EXCLUDED_TOOL_LOSSLESS,
+                    ..
+                }]
+            ),
+            "got {:?}",
+            outcome_block_actions(&out)
+        );
+        assert_eq!(
+            super::super::lossless_compaction::search_unheading(&rewritten_tool_result(&out)),
+            payload,
+            "the search fold must invert exactly"
+        );
+    }
+
+    /// Excluding one tool must not disarm the compressor for the rest.
+    #[test]
+    fn non_excluded_tool_result_still_compresses() {
+        let b = tool_result_body("Bash", &compressible_payload());
+        let out = run_excluding(&b, &["Read", "Grep"]);
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Compressed { .. }]
+            ),
+            "got {:?}",
+            outcome_block_actions(&out)
+        );
+    }
+
+    /// Glob and MCP spellings must reach through from the flag to the
+    /// planner — `tool_exclusion` resolves them, this pins the wiring.
+    #[test]
+    fn glob_and_mcp_alias_forms_reach_the_planner() {
+        let cases: [(&str, &[&str]); 4] = [
+            ("mcp__github__create_issue", &["mcp__*"]),
+            ("mcp__github__create_issue", &["mcp__github__create_issue"]),
+            ("mcp__github__create_issue", &["mcp_github_create_issue"]),
+            ("Bash", &["Ba*h"]),
+        ];
+        for (tool, patterns) in cases {
+            let b = tool_result_body(tool, &compressible_payload());
+            let out = run_excluding(&b, patterns);
+            assert!(
+                matches!(
+                    outcome_block_actions(&out).as_slice(),
+                    [BlockAction::Excluded {
+                        reason: ExclusionReason::ExcludedTool
+                    }]
+                ),
+                "{tool} vs {patterns:?}: got {:?}",
+                outcome_block_actions(&out)
+            );
+        }
+    }
+
+    /// A tool in the verbatim set must not even be folded reversibly —
+    /// its output breaks on any rewrite.
+    #[test]
+    fn verbatim_excluded_tool_result_is_not_even_folded() {
+        let b = tool_result_body("WebFetch", &repeated_log_payload());
+        let out = run_excluding(&b, &["WebFetch"]);
+        assert!(
+            matches!(out, LiveZoneOutcome::NoChange { .. }),
+            "verbatim-excluded tool_result must not rewrite the body"
+        );
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Excluded {
+                    reason: ExclusionReason::ExcludedTool
+                }]
+            ),
+            "got {:?}",
+            outcome_block_actions(&out)
+        );
+    }
+
+    /// The CCR guard is about unredeemable markers, not fidelity, so it
+    /// outranks the operator's list: a retrieve result stays fully
+    /// excluded even when a pattern would have routed it to the fold.
+    #[test]
+    fn ccr_guard_outranks_the_exclusion_list() {
+        let b = tool_result_body("mcp__Headroom__headroom_retrieve", &repeated_log_payload());
+        let out = run_excluding(&b, &["mcp__*"]);
+        assert!(
+            matches!(out, LiveZoneOutcome::NoChange { .. }),
+            "retrieve result must be forwarded unmodified"
+        );
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Excluded {
+                    reason: ExclusionReason::CcrRetrieveResult
+                }]
+            ),
+            "got {:?}",
+            outcome_block_actions(&out)
         );
     }
 

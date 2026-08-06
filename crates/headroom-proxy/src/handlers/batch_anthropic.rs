@@ -279,6 +279,7 @@ fn compress_batch_item(
         state.config.cache_control_auto_frozen,
         auth_mode,
         &item_request_id,
+        &state.config.exclude_tools,
     ) {
         Some((msgs, before, after)) => (msgs, before.saturating_sub(after)),
         None => (messages.to_vec(), 0),
@@ -330,6 +331,7 @@ fn compress_item_messages(
     cache_control_policy: crate::config::CacheControlAutoFrozen,
     auth_mode: AuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> Option<(Vec<Value>, usize, usize)> {
     let mut synth = Map::new();
     synth.insert("model".to_string(), json!(model));
@@ -342,7 +344,14 @@ fn compress_item_messages(
     }
     let bytes = Bytes::from(serde_json::to_vec(&Value::Object(synth)).ok()?);
 
-    match compress_anthropic_request(&bytes, mode, cache_control_policy, auth_mode, request_id) {
+    match compress_anthropic_request(
+        &bytes,
+        mode,
+        cache_control_policy,
+        auth_mode,
+        request_id,
+        exclude_tools,
+    ) {
         Outcome::Compressed {
             body,
             tokens_before,

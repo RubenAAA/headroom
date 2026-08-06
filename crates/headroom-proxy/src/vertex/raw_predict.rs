@@ -145,6 +145,7 @@ pub(crate) async fn forward_vertex_request(
             state.config.cache_control_auto_frozen,
             headroom_core::auth_mode::AuthMode::OAuth,
             &request_id,
+            &state.config.exclude_tools,
         );
         // Cross-turn verbatim de-dup post-pass (no-op unless
         // `--enable-cross-turn-dedup` is set).
