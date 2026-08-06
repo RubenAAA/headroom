@@ -82,6 +82,7 @@ fn transform_full_pipeline(request: &Value) -> Value {
         AuthMode::Payg,
         "test-ctx-stability",
         &[],
+        None,
     );
     let final_bytes = match outcome {
         Outcome::Compressed { body, .. } => body.to_vec(),
@@ -146,6 +147,7 @@ fn transform_all(engine: &InjectEngine, request: &Value, session_key: &str) -> V
         AuthMode::Payg,
         "test-ctx-all",
         &[],
+        None,
     );
     let final_bytes = match outcome {
         Outcome::Compressed { body, .. } => body.to_vec(),
@@ -247,6 +249,7 @@ fn transform_in_mode(request: &Value, mode: CompressionMode, auth: AuthMode) -> 
         auth,
         "test-ctx-mode",
         &[],
+        None,
     );
     let (final_bytes, fired) = match outcome {
         Outcome::Compressed { body, .. } => (body.to_vec(), true),
@@ -314,6 +317,7 @@ fn all_messages_prefix_is_stable_without_offload() {
                     auth,
                     "test-ctx-am",
                     &[],
+                    None,
                 );
                 let (final_bytes, fired) = match outcome {
                     Outcome::Compressed { body, .. } => (body.to_vec(), true),

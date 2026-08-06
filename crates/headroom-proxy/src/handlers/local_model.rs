@@ -695,6 +695,7 @@ fn apply_compression_and_replay(
         } else {
             headroom_core::auth_mode::AuthMode::Payg
         };
+        let routed_ccr_store = state.ccr_store();
         let outcome = crate::compression::compress_anthropic_request(
             &body,
             state.config.compression_mode,
@@ -702,6 +703,9 @@ fn apply_compression_and_replay(
             auth_mode,
             request_id,
             &state.config.exclude_tools,
+            // This path injects headroom_retrieve and resolves it, so the
+            // marker is actionable here.
+            routed_ccr_store.as_deref(),
         );
         let outcome = crate::compression::apply_cross_turn_dedup(
             outcome,

@@ -160,6 +160,7 @@ pub fn compress_anthropic_request(
     auth_mode: RequestAuthMode,
     request_id: &str,
     exclude_tools: &[String],
+    ccr_store: Option<&dyn headroom_core::ccr::CcrStore>,
 ) -> Outcome {
     if matches!(mode, CompressionMode::Off) {
         tracing::info!(
@@ -383,6 +384,7 @@ pub fn compress_anthropic_request(
             &dispatch_body,
             auth_mode.into(),
             model,
+            ccr_store,
             &dispatch_config,
         ),
         _ => compress_anthropic_live_zone_with_ccr(
@@ -390,7 +392,7 @@ pub fn compress_anthropic_request(
             frozen_count,
             auth_mode.into(),
             model,
-            None,
+            ccr_store,
             &dispatch_config,
         ),
     };
@@ -771,6 +773,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-1",
             &[],
+            None,
         );
         match out {
             Outcome::Passthrough {
@@ -790,6 +793,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-2",
             &[],
+            None,
         );
         match out {
             Outcome::Passthrough {
@@ -809,6 +813,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-3",
             &[],
+            None,
         );
         match out {
             Outcome::Passthrough {
@@ -836,6 +841,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-4",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -853,6 +859,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-5",
             &[],
+            None,
         );
         match out {
             Outcome::Passthrough {
@@ -891,6 +898,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-6",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -923,6 +931,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e3-1",
             &[],
+            None,
         );
         match out {
             Outcome::Compressed {
@@ -965,6 +974,7 @@ mod tests {
             RequestAuthMode::OAuth,
             "req-e3-2",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -986,6 +996,7 @@ mod tests {
             RequestAuthMode::Subscription,
             "req-e3-3",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -1014,6 +1025,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e3-4",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -1036,6 +1048,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e3-5",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -1073,6 +1086,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e1-1",
             &[],
+            None,
         );
         match out {
             Outcome::Compressed {
@@ -1118,6 +1132,7 @@ mod tests {
             RequestAuthMode::OAuth,
             "req-e1-2",
             &[],
+            None,
         );
         // Non-PAYG → no normalization → live-zone dispatcher sees
         // no compressible block → NoCompression.
@@ -1148,6 +1163,7 @@ mod tests {
             RequestAuthMode::Subscription,
             "req-e1-3",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -1178,6 +1194,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e1-4",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -1204,6 +1221,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e1-5",
             &[],
+            None,
         );
         match out {
             Outcome::NoCompression => {}
@@ -1243,6 +1261,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e2-1",
             &[],
+            None,
         );
         match out {
             Outcome::Compressed {
@@ -1303,6 +1322,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e2-2",
             &[],
+            None,
         );
         match out {
             Outcome::Compressed {
@@ -1345,6 +1365,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-e1-6",
             &[],
+            None,
         );
         match out {
             Outcome::Compressed {
@@ -1442,6 +1463,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-all",
             &[],
+            None,
         ));
         assert_ne!(
             block_text(&all, 0),
@@ -1456,6 +1478,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-live",
             &[],
+            None,
         ));
         assert_eq!(
             block_text(&live, 0),
@@ -1519,6 +1542,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-plain",
             &[],
+            None,
         ));
         assert_ne!(
             block_text(&plain, 1),
@@ -1535,6 +1559,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-excluded",
             &["Vault".to_string()],
+            None,
         );
         let bytes = match out {
             Outcome::NoCompression | Outcome::Passthrough { .. } => body.clone(),
@@ -1589,6 +1614,7 @@ mod tests {
             RequestAuthMode::Payg,
             "req-det",
             &[],
+            None,
         ));
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let content_of = |idx: usize| {

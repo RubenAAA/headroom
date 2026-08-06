@@ -270,6 +270,7 @@ fn compress_batch_item(
     let original_tools = params_obj.get("tools").and_then(Value::as_array).cloned();
 
     let item_request_id = format!("{request_id}:item:{idx}");
+    let batch_ccr_store = state.ccr_store();
     let (optimized_messages, tokens_saved) = match compress_item_messages(
         messages,
         model,
@@ -280,6 +281,9 @@ fn compress_batch_item(
         auth_mode,
         &item_request_id,
         &state.config.exclude_tools,
+        // The batch results path already resolves headroom_retrieve calls
+        // against this store, so a marker here is actionable.
+        batch_ccr_store.as_deref(),
     ) {
         Some((msgs, before, after)) => (msgs, before.saturating_sub(after)),
         None => (messages.to_vec(), 0),
@@ -332,6 +336,7 @@ fn compress_item_messages(
     auth_mode: AuthMode,
     request_id: &str,
     exclude_tools: &[String],
+    ccr_store: Option<&dyn CcrStore>,
 ) -> Option<(Vec<Value>, usize, usize)> {
     let mut synth = Map::new();
     synth.insert("model".to_string(), json!(model));
@@ -351,6 +356,7 @@ fn compress_item_messages(
         auth_mode,
         request_id,
         exclude_tools,
+        ccr_store,
     ) {
         Outcome::Compressed {
             body,

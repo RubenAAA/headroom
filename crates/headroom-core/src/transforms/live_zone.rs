@@ -974,6 +974,7 @@ pub fn compress_anthropic_all_messages(
     body_raw: &[u8],
     _auth_mode: AuthMode,
     model: &str,
+    ccr_store: Option<&dyn CcrStore>,
     dispatch_config: &DispatchConfig,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
@@ -1032,7 +1033,7 @@ pub fn compress_anthropic_all_messages(
                         block_type,
                         tokenizer.as_ref(),
                         &mut replacements,
-                        None, // No CCR store for all-messages mode yet.
+                        ccr_store,
                         dispatch_config,
                     )
                 }
@@ -2581,6 +2582,7 @@ mod tests {
             &b,
             AuthMode::Payg,
             DEFAULT_MODEL,
+            None,
             &DispatchConfig::default(),
         )
         .unwrap();

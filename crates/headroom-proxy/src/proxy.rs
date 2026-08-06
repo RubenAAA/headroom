@@ -196,6 +196,16 @@ const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 const MAX_MESSAGE_ARRAY_LENGTH: usize = 10_000;
 
 impl AppState {
+    /// The CCR store, when offload is configured.
+    ///
+    /// Compression emits a `<<ccr:HASH>>` marker only when handed one of
+    /// these, so passing `None` makes compression one-way. Pass it only on
+    /// paths that also inject `headroom_retrieve` — a marker the model cannot
+    /// act on is worse than no marker, since it spends tokens advertising a
+    /// recovery route that does not exist.
+    pub(crate) fn ccr_store(&self) -> Option<std::sync::Arc<dyn headroom_core::ccr::CcrStore>> {
+        self.ctx_offload.as_ref().map(|r| r.store.ccr())
+    }
     pub fn new(config: Config) -> Result<Self, ProxyError> {
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(config.upstream_connect_timeout)
@@ -2702,6 +2712,7 @@ pub(crate) async fn forward_http(
             );
             compression::Outcome::NoCompression
         } else {
+            let ccr_store_for_compression = state.ccr_store();
             match endpoint {
                 compression::CompressibleEndpoint::AnthropicMessages => {
                     // PR-E3: thread the F1-classified auth_mode into the
@@ -2718,6 +2729,10 @@ pub(crate) async fn forward_http(
                         effective_auth_mode,
                         &request_id,
                         &state.config.exclude_tools,
+                        // Compression stores the original here, so a
+                        // `headroom_retrieve` call can bring it back. Without
+                        // it the lossy path is one-way.
+                        ccr_store_for_compression.as_deref(),
                     );
                     // Cross-turn verbatim de-dup post-pass over the final
                     // block forms (no-op unless

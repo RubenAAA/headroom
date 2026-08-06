@@ -909,6 +909,10 @@ fn run_anthropic_compression(
         headroom_core::auth_mode::AuthMode::OAuth,
         request_id,
         &state.config.exclude_tools,
+        // No CCR store: this path never injects `headroom_retrieve`, so a
+        // marker here would advertise a recovery route the model cannot
+        // take.
+        None,
     );
     // Cross-turn verbatim de-dup post-pass (no-op unless
     // `--enable-cross-turn-dedup` is set).

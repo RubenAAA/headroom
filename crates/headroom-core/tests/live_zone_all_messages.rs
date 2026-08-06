@@ -73,6 +73,7 @@ fn compresses_tool_results_in_all_user_messages_not_just_latest() {
         &body,
         AuthMode::Payg,
         DEFAULT_MODEL,
+        None,
         &DispatchConfig::default(),
     )
     .expect("dispatcher returns Ok on valid bodies");
@@ -129,7 +130,7 @@ fn exclude_tools_keeps_named_tool_results_off_the_lossy_path() {
         exclude_tools: vec!["Vault".to_string()],
         ..DispatchConfig::default()
     };
-    let out = compress_anthropic_all_messages(&body, AuthMode::Payg, DEFAULT_MODEL, &config)
+    let out = compress_anthropic_all_messages(&body, AuthMode::Payg, DEFAULT_MODEL, None, &config)
         .expect("dispatcher returns Ok on valid bodies");
 
     let manifest = match &out {
@@ -185,6 +186,7 @@ fn identical_content_compresses_to_identical_bytes() {
         &body,
         AuthMode::Payg,
         DEFAULT_MODEL,
+        None,
         &DispatchConfig::default(),
     )
     .expect("dispatcher returns Ok on valid bodies");
@@ -208,4 +210,95 @@ fn identical_content_compresses_to_identical_bytes() {
         text_at(2),
         "identical content must yield identical bytes in every message"
     );
+}
+
+// ── CCR retrieval on the all-messages path ──────────────────────────────────
+
+/// `all_messages` compresses content inside the cached prefix, so without a
+/// store the lossy rewrite is one-way: the model sees a summary of a file and
+/// has no route back to the file. Wiring the store makes it recoverable.
+#[test]
+fn ccr_marker_and_original_are_stored_for_every_message() {
+    use headroom_core::ccr::backends::InMemoryCcrStore;
+    use headroom_core::ccr::{compute_key, CcrStore};
+
+    let payload = compressible_payload("old");
+    let body = two_user_messages_body();
+    let store = InMemoryCcrStore::new();
+
+    let out = compress_anthropic_all_messages(
+        &body,
+        AuthMode::Payg,
+        DEFAULT_MODEL,
+        Some(&store),
+        &DispatchConfig::default(),
+    )
+    .expect("dispatcher returns Ok on valid bodies");
+
+    let compressed = match &out {
+        LiveZoneOutcome::Modified { new_body, .. } => new_body.get().to_string(),
+        LiveZoneOutcome::NoChange { .. } => panic!("expected compression to fire"),
+    };
+
+    let hash = compute_key(payload.as_bytes());
+    assert!(
+        compressed.contains(&format!("<<ccr:{hash}")),
+        "compressed body must carry the retrieval marker"
+    );
+    // The original has to actually be there, or the marker points at nothing.
+    assert_eq!(
+        store.get(&hash).as_deref(),
+        Some(payload.as_str()),
+        "the original must be retrievable by the marker's hash"
+    );
+}
+
+/// Without a store the path stays exactly as it was — no marker, nothing
+/// stored. This is what the other providers still get.
+#[test]
+fn no_store_means_no_marker() {
+    let payload = compressible_payload("old");
+    let body = two_user_messages_body();
+
+    let out = compress_anthropic_all_messages(
+        &body,
+        AuthMode::Payg,
+        DEFAULT_MODEL,
+        None,
+        &DispatchConfig::default(),
+    )
+    .expect("dispatcher returns Ok on valid bodies");
+
+    let compressed = match &out {
+        LiveZoneOutcome::Modified { new_body, .. } => new_body.get().to_string(),
+        LiveZoneOutcome::NoChange { .. } => panic!("expected compression to fire"),
+    };
+    assert!(!compressed.contains("<<ccr:"));
+}
+
+/// The marker's hash is BLAKE3 of the original content, so the same block
+/// yields the same marker on every turn. If it did not, the marker itself
+/// would move the cached prefix — the exact bust the mode exists to avoid.
+#[test]
+fn marker_is_stable_across_turns() {
+    use headroom_core::ccr::backends::InMemoryCcrStore;
+
+    let payload = compressible_payload("old");
+    let _ = &payload;
+    let run = || {
+        let store = InMemoryCcrStore::new();
+        let out = compress_anthropic_all_messages(
+            &two_user_messages_body(),
+            AuthMode::Payg,
+            DEFAULT_MODEL,
+            Some(&store),
+            &DispatchConfig::default(),
+        )
+        .expect("ok");
+        match out {
+            LiveZoneOutcome::Modified { new_body, .. } => new_body.get().to_string(),
+            LiveZoneOutcome::NoChange { .. } => panic!("expected compression"),
+        }
+    };
+    assert_eq!(run(), run(), "marker must be a pure function of content");
 }
