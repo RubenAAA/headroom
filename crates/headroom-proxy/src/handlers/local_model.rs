@@ -9,7 +9,8 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -966,7 +967,16 @@ fn anthropic_to_openai_responses_request(
                         "type": "function",
                         "name": name,
                         "description": description.unwrap_or(""),
-                        "parameters": params
+                        "parameters": params,
+                        // Must be present and false, not merely absent: codex
+                        // turns on strict constrained decoding for translated
+                        // function tools that omit the field, which forces
+                        // every optional parameter into every call. That is
+                        // the same "fills every optional field" behaviour the
+                        // `Agent`/`mode` strip above works around, so the
+                        // strip may be redundant once this is live.
+                        // Behaviour confirmed in raine/claude-code-proxy.
+                        "strict": false
                     }))
                 })
                 .collect::<Vec<_>>()
@@ -1101,9 +1111,10 @@ fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
                     .get("tool_use_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                // `content` is a plain string OR a list of blocks; the naive
-                // `as_str()` silently blanked every array-shaped result.
-                let result_content = extract_tool_result_text(block);
+                // `content` is a plain string OR a list of blocks. Images that
+                // the backend accepts survive as `input_image`; everything
+                // else collapses to text, with a placeholder where a block
+                // could not be carried.
                 let is_error = block
                     .get("is_error")
                     .and_then(|v| v.as_bool())
@@ -1111,7 +1122,7 @@ fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
                 out.push(json!({
                     "type": "function_call_output",
                     "call_id": tool_use_id,
-                    "output": if is_error { format!("Error: {result_content}") } else { result_content.to_string() }
+                    "output": tool_result_output_value(block.get("content"), is_error)
                 }));
             }
             _ => {}
@@ -1125,6 +1136,123 @@ fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
             "content": text_parts.join("\n")
         }));
     }
+}
+
+/// One piece of a rendered tool result: either text, or an image the Responses
+/// API can actually accept.
+enum ToolResultPart {
+    Text(String),
+    Image(String),
+}
+
+/// Media types the Responses API accepts as `input_image`.
+const RESPONSES_IMAGE_MEDIA_TYPES: [&str; 4] =
+    ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Turn an Anthropic `image` block into a data URL, or `None` if the Responses
+/// API could not accept it.
+///
+/// The payload is decoded and re-encoded rather than passed through: Anthropic
+/// tolerates whitespace and missing padding in base64 where the data-URL form
+/// does not, and shipping a blob the backend rejects loses the whole turn.
+fn image_block_to_data_url(block: &Value) -> Option<String> {
+    let source = block.get("source")?;
+    if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
+        return None;
+    }
+    let media_type = source.get("media_type").and_then(|v| v.as_str())?;
+    if !RESPONSES_IMAGE_MEDIA_TYPES.contains(&media_type) {
+        return None;
+    }
+    let data = source.get("data").and_then(|v| v.as_str())?;
+    let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    let decoded = STANDARD
+        .decode(&compact)
+        .or_else(|_| STANDARD_NO_PAD.decode(&compact))
+        .ok()?;
+    Some(format!("data:{media_type};base64,{}", STANDARD.encode(decoded)))
+}
+
+/// Render `tool_result.content` into ordered parts.
+///
+/// Anything that cannot be carried leaves a placeholder in the position it
+/// occupied, so the model is told something was there. A silent drop reads to
+/// the model as if the tool returned less than it did.
+fn render_tool_result_parts(content: Option<&Value>) -> Vec<ToolResultPart> {
+    match content {
+        Some(Value::String(s)) => vec![ToolResultPart::Text(s.clone())],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .map(|block| match block.get("type").and_then(|v| v.as_str()) {
+                Some("text") => ToolResultPart::Text(
+                    block
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                Some("image") => match image_block_to_data_url(block) {
+                    Some(url) => ToolResultPart::Image(url),
+                    None => ToolResultPart::Text(
+                        "[unsupported content block omitted: image]".to_string(),
+                    ),
+                },
+                Some(other) => ToolResultPart::Text(format!(
+                    "[unsupported content block omitted: {other}]"
+                )),
+                None => ToolResultPart::Text(
+                    "[unsupported content block omitted: unknown]".to_string(),
+                ),
+            })
+            .collect(),
+        Some(other) => vec![ToolResultPart::Text(other.to_string())],
+        None => Vec::new(),
+    }
+}
+
+/// Build the `function_call_output.output` value.
+///
+/// Stays a plain string unless an image survived — the string form is what the
+/// backend sees for the overwhelming majority of turns, and switching shape
+/// only when necessary keeps those bytes identical to before.
+fn tool_result_output_value(content: Option<&Value>, is_error: bool) -> Value {
+    let parts = render_tool_result_parts(content);
+    let has_image = parts
+        .iter()
+        .any(|p| matches!(p, ToolResultPart::Image(_)));
+
+    if !has_image {
+        let joined = parts
+            .iter()
+            .filter_map(|p| match p {
+                ToolResultPart::Text(t) => Some(t.as_str()),
+                ToolResultPart::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Value::String(if is_error {
+            format!("Error: {joined}")
+        } else {
+            joined
+        });
+    }
+
+    let mut items: Vec<Value> = parts
+        .into_iter()
+        .map(|p| match p {
+            ToolResultPart::Text(text) => json!({"type": "input_text", "text": text}),
+            ToolResultPart::Image(image_url) => {
+                json!({"type": "input_image", "image_url": image_url})
+            }
+        })
+        .collect();
+    if is_error {
+        items.insert(0, json!({"type": "input_text", "text": "Error:"}));
+    }
+    Value::Array(items)
 }
 
 fn translate_assistant_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
@@ -2364,7 +2492,18 @@ impl StreamTranslator {
                     events.push(self.emit_content_block_stop());
                     self.in_tool_block = false;
                 }
-                let stop_reason = if self.saw_tool_use {
+                // A completed response can still carry `incomplete_details`,
+                // and truncation outranks a tool call: a `tool_use` stop on a
+                // cut-off turn would have the client run a half-streamed call.
+                let truncated = chunk
+                    .get("response")
+                    .and_then(|v| v.get("incomplete_details"))
+                    .and_then(|v| v.get("reason"))
+                    .and_then(|v| v.as_str())
+                    == Some("max_output_tokens");
+                let stop_reason = if truncated {
+                    "max_tokens"
+                } else if self.saw_tool_use {
                     "tool_use"
                 } else {
                     "end_turn"
@@ -2691,8 +2830,12 @@ mod tests {
         let output = anthropic_to_openai_responses_request(&input, true).unwrap();
         assert_eq!(output["input"][1]["type"], "function_call_output");
         assert_eq!(output["input"][1]["call_id"], "call_1");
-        // Text survives and keeps its order; the image block is skipped.
-        assert_eq!(output["input"][1]["output"], "file1\nfile2");
+        // Text survives and keeps its order. This image has no media_type so
+        // it cannot be carried, and leaves a marker where it stood.
+        assert_eq!(
+            output["input"][1]["output"],
+            "file1\n[unsupported content block omitted: image]\nfile2"
+        );
     }
 
     #[test]
@@ -2713,6 +2856,103 @@ mod tests {
         });
         let output = anthropic_to_openai_responses_request(&input, true).unwrap();
         assert_eq!(output["input"][1]["output"], "Error: boom");
+    }
+
+    /// A base64 image the backend accepts becomes a real `input_image`, and the
+    /// surrounding text keeps its position around it.
+    #[test]
+    fn tool_result_images_become_input_image_in_place() {
+        let out = tool_result_output_value(
+            Some(&json!([
+                {"type": "text", "text": "before"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                }},
+                {"type": "text", "text": "after"}
+            ])),
+            false,
+        );
+        assert_eq!(
+            out,
+            json!([
+                {"type": "input_text", "text": "before"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                {"type": "input_text", "text": "after"}
+            ])
+        );
+    }
+
+    /// Whitespace and missing padding are legal on the way in but not in a data
+    /// URL, so the payload is normalized rather than forwarded as-is.
+    #[test]
+    fn tool_result_image_payload_is_normalized() {
+        let out = tool_result_output_value(
+            Some(&json!([{"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "iVBOR w0KGgo"
+            }}])),
+            false,
+        );
+        assert_eq!(out[0]["image_url"], "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    /// What cannot be carried leaves a marker where it stood, so the model is
+    /// not told the tool returned less than it did.
+    #[test]
+    fn uncarriable_tool_result_blocks_leave_placeholders() {
+        let out = tool_result_output_value(
+            Some(&json!([
+                {"type": "text", "text": "before"},
+                {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
+                {"type": "image", "source": {"type": "base64", "media_type": "text/plain", "data": "aGk="}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not base64!"}},
+                {"type": "tool_reference", "tool_name": "TaskCreate"},
+                {"type": "text", "text": "after"}
+            ])),
+            false,
+        );
+        // No image survived, so the output stays a plain string.
+        assert_eq!(
+            out,
+            json!(
+                "before\n[unsupported content block omitted: image]\n[unsupported content block omitted: image]\n[unsupported content block omitted: image]\n[unsupported content block omitted: tool_reference]\nafter"
+            )
+        );
+    }
+
+    #[test]
+    fn tool_result_error_marker_survives_both_shapes() {
+        assert_eq!(
+            tool_result_output_value(Some(&json!([{"type": "text", "text": "boom"}])), true),
+            json!("Error: boom")
+        );
+        let with_image = tool_result_output_value(
+            Some(&json!([
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                }}
+            ])),
+            true,
+        );
+        assert_eq!(with_image[0], json!({"type": "input_text", "text": "Error:"}));
+        assert_eq!(with_image[1]["type"], "input_image");
+    }
+
+    /// The string shape must be byte-identical to before for the common case,
+    /// or every cached prefix moves.
+    #[test]
+    fn text_only_tool_results_keep_the_plain_string_shape() {
+        assert_eq!(
+            tool_result_output_value(Some(&json!("plain")), false),
+            json!("plain")
+        );
+        assert_eq!(
+            tool_result_output_value(
+                Some(&json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])),
+                false
+            ),
+            json!("a\nb")
+        );
+        assert_eq!(tool_result_output_value(None, false), json!(""));
     }
 
     /// Same bug, Chat Completions path — both the single-block fast path and
@@ -2864,6 +3104,61 @@ mod tests {
         assert_eq!(out["input"][0]["encrypted_content"], "ENC_2");
     }
 
+    /// A turn cut off at the token ceiling must say so, even when it completed
+    /// and even when it had started a tool call.
+    #[test]
+    fn truncated_completion_reports_max_tokens() {
+        for (frames, expected) in [
+            (
+                vec![(
+                    "response.completed",
+                    r#"{"response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"output_tokens":9}}}"#,
+                )],
+                "max_tokens",
+            ),
+            (
+                vec![
+                    (
+                        "response.output_item.added",
+                        r#"{"item":{"type":"function_call","call_id":"c1","name":"Bash"}}"#,
+                    ),
+                    (
+                        "response.completed",
+                        r#"{"response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"output_tokens":9}}}"#,
+                    ),
+                ],
+                "max_tokens",
+            ),
+            (
+                vec![
+                    (
+                        "response.output_item.added",
+                        r#"{"item":{"type":"function_call","call_id":"c1","name":"Bash"}}"#,
+                    ),
+                    (
+                        "response.completed",
+                        r#"{"response":{"usage":{"output_tokens":9}}}"#,
+                    ),
+                ],
+                "tool_use",
+            ),
+            (
+                vec![(
+                    "response.completed",
+                    r#"{"response":{"usage":{"output_tokens":9}}}"#,
+                )],
+                "end_turn",
+            ),
+        ] {
+            let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+            let sse = drive(&mut t, &frames);
+            assert!(
+                sse.contains(&format!(r#""stop_reason":"{expected}""#)),
+                "expected {expected}, got: {sse}"
+            );
+        }
+    }
+
     /// A signature-only block must not collide with a block already open, or
     /// two content blocks share an index and the client sees a torn stream.
     #[test]
@@ -3000,6 +3295,16 @@ mod tests {
         assert!(tools[0].get("function").is_none());
         assert_eq!(tools[1]["name"], "Read");
         assert_eq!(output["tool_choice"], "auto");
+        // Present and false on every tool. Omitting it lets codex turn on
+        // strict constrained decoding, which fills every optional parameter.
+        for tool in tools {
+            assert_eq!(
+                tool["strict"],
+                json!(false),
+                "tool {} must pin strict=false",
+                tool["name"]
+            );
+        }
     }
 
     #[test]
