@@ -1576,6 +1576,45 @@ mod tests {
         assert_eq!(v["verdict"], "costing more than it saves");
     }
 
+    /// The cost of lossy compression that per-request token counts miss: the
+    /// model got a summary, could not work with it, and made the client resend
+    /// the full file. That shows up as extra turns, not as extra tokens on any
+    /// one turn, so `net_tokens_saved` alone would call it a win.
+    ///
+    /// `parse_messages` detects it as `reread_compressed`, and the signal has
+    /// to survive all the way to the persisted blob to be worth anything.
+    #[test]
+    fn reread_of_compressed_content_is_counted_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            t.record_request(&RequestRecord {
+                model: "claude-sonnet-4",
+                input_tokens: 1_000,
+                tokens_saved: 900,
+                waste_signals: Some(vec![
+                    ("reread".to_string(), 5_000),
+                    ("reread_compressed".to_string(), 4_000),
+                ]),
+                ..Default::default()
+            });
+        }
+
+        // Restart, then read it back off disk.
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["lifetime_metrics"]["waste_signals"]["reread_compressed"],
+            4_000
+        );
+        assert_eq!(raw["lifetime_metrics"]["waste_signals"]["reread"], 5_000);
+
+        // And it is still there through a fresh tracker's load path.
+        let t = tracker(&path);
+        let snap = t.metrics_snapshot(&serde_json::json!({}));
+        assert_eq!(snap["waste_signals"]["reread_compressed"], 4_000);
+    }
+
     /// A savings file written before the metrics existed must load, not throw
     /// the user's history away.
     #[test]

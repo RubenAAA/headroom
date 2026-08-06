@@ -8,17 +8,22 @@
 //!
 //! # Scope
 //!
-//! Python's `WasteSignals` carries eight fields, but `detect_waste_signals`
-//! only ever populates four — the ones this module computes. Of the rest:
+//! `WasteSignals` carries eight fields; `detect_waste_signals` populates the
+//! four this module computes from a single block's text. The other four need
+//! the whole conversation, so [`crate::parser::parse_messages`] fills them and
+//! this module leaves them zero:
 //!
-//! - `reread_tokens` / `reread_compressed_tokens` are computed in Python's
-//!   `parse_messages`, which needs the `Block` message-parsing layer that has no
-//!   Rust equivalent. They stay zero here.
-//! - `dynamic_date_tokens` and `repetition_tokens` are declared in Python but
-//!   never assigned anywhere in the codebase.
+//! - `reread_tokens` / `reread_compressed_tokens` — content the model asked to
+//!   see again, and the subset whose first serve we had compressed away. The
+//!   second is the only measurement of what lossy compression costs in extra
+//!   turns rather than extra tokens, so it is the counter-signal to read
+//!   alongside `net_tokens_saved`. See `docs/measurement.md`.
+//! - `dynamic_date_tokens` / `repetition_tokens` — summed by `parse_messages`
+//!   from per-block detection that nothing currently produces, so they stay
+//!   zero in practice.
 //!
-//! The fields are kept so the serialised shape matches Python's `to_dict()`,
-//! and so a later parser port can fill them in without changing this contract.
+//! All eight are kept here so the serialised shape matches Python's
+//! `to_dict()`.
 
 use std::collections::BTreeMap;
 
