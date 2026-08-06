@@ -264,6 +264,17 @@ fn resolve_codex_routing_headers(
     (upstream_headers, false)
 }
 
+/// What [`apply_ctx_request_transforms`] did, for the request outcome.
+///
+/// `transforms_applied` uses the same label strings the Claude path feeds to
+/// `RequestOutcome`, so one transform reads identically in `/stats` whichever
+/// path served it.
+#[derive(Debug, Default)]
+struct CtxTransformReport {
+    transforms_applied: Vec<String>,
+    tokens_saved: i64,
+}
+
 /// Apply headroom's CTX request-side transforms to a routed model's parsed
 /// Anthropic body, reusing the same flags/state as the Claude passthrough path
 /// (`forward_http`). Runs the passive session capture (read-only) and, when
@@ -277,7 +288,8 @@ fn apply_ctx_request_transforms(
     parsed: &mut Value,
     headers: &HeaderMap,
     client_addr: &SocketAddr,
-) {
+) -> CtxTransformReport {
+    let mut report = CtxTransformReport::default();
     use crate::cache_stabilization::drift_detector::{
         compute_structural_hash, derive_session_key, observe_drift, ApiKind,
     };
@@ -310,6 +322,7 @@ fn apply_ctx_request_transforms(
     // It never touches `system`/`tools`.
     if let Some(engine) = state.ctx_inject.as_ref() {
         if engine.maybe_inject(parsed, &session_key) {
+            report.transforms_applied.push("ctx_inject".to_string());
             tracing::debug!(
                 event = "codex_ctx_inject",
                 "injected recall/resume block into routed-model request"
@@ -321,10 +334,21 @@ fn apply_ctx_request_transforms(
     // definitions. The Claude path runs this on every request; a routed model
     // pays for the same bulk on every turn, and the tool block sits in the
     // cached prefix so shrinking it once is stable across the conversation.
+    //
+    // Token counts are taken around the call rather than derived from the byte
+    // deltas it reports: a bytes/4 rule of thumb is wrong by enough on JSON
+    // (punctuation-dense, so tokens run well ahead of bytes/4) that the savings
+    // figure would be fiction. Only the `tools` array is counted, not the whole
+    // body, and only when the request actually carries tools.
+    let tools_tokens_before = count_tools_tokens(parsed);
     let (compacted, modified, before_bytes, after_bytes) =
         crate::tool_schema_compaction::compact_tools(std::mem::take(parsed));
     *parsed = compacted;
     if modified {
+        report
+            .transforms_applied
+            .push("tool_schema_compaction".to_string());
+        report.tokens_saved += (tools_tokens_before - count_tools_tokens(parsed)).max(0);
         tracing::debug!(
             event = "codex_tool_schema_compaction",
             tools_before_bytes = before_bytes,
@@ -347,16 +371,100 @@ fn apply_ctx_request_transforms(
             Some(&policy),
         );
         if out.changed() {
+            report.transforms_applied.push("ctx_offload".to_string());
+            report.tokens_saved += out.tokens_saved;
             tracing::debug!(
                 event = "codex_ctx_offload",
                 blocks_offloaded = out.blocks_offloaded,
                 blocks_deferred = out.blocks_deferred,
+                tokens_saved = out.tokens_saved,
                 rebuild_boundary,
                 "offloaded tool_result blocks on routed-model request"
             );
             runtime.store.persist(out.records);
         }
     }
+
+    report
+}
+
+/// Assemble the outcome context for a routed request.
+///
+/// `target_model` present means the Responses API; absent means Chat
+/// Completions. The provider labels match the ones `forward_http` uses for the
+/// same two wire formats, so a `/stats` filter behaves the same either way.
+#[allow(clippy::too_many_arguments)]
+fn build_routed_outcome_context(
+    state: &AppState,
+    parsed: &Value,
+    headers: &HeaderMap,
+    target_model: Option<&str>,
+    body_model: &str,
+    report: CtxTransformReport,
+    overhead_ms: f64,
+    started_at: std::time::Instant,
+) -> Option<RoutedOutcomeContext> {
+    // Resolve the project the same way the Claude path does, so routed turns
+    // land in the same per-project buckets rather than an "unknown" pile.
+    let hdrs = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_lowercase(), val.to_string()))
+        })
+        .collect();
+    let project_ctx = crate::memory::router::RequestContext {
+        headers: hdrs,
+        system_prompt: crate::memory::router::extract_system_prompt(parsed),
+        base_user_id: String::new(),
+        project_root_override: None,
+    };
+    let project = crate::memory::router::ProjectResolver::resolve(&project_ctx)
+        .map(|(key, _display)| key);
+
+    Some(RoutedOutcomeContext {
+        sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink::from_state(state)),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        // The upstream model. `body_model` is the client-facing alias, which is
+        // deliberately named `claude-*` so Claude Code will offer it in
+        // `/model` — booking that would price OpenAI tokens off the `claude-`
+        // row in the pricing table.
+        model: target_model.unwrap_or(body_model).to_string(),
+        provider: if target_model.is_some() {
+            "openai_responses".to_string()
+        } else {
+            "openai_chat".to_string()
+        },
+        // `None`, matching the Claude path — neither identifies the client
+        // today, and inventing a value here would make the two paths report
+        // differently for the same caller.
+        client: None,
+        project,
+        tokens_saved: report.tokens_saved,
+        transforms_applied: report.transforms_applied,
+        num_messages: parsed
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len() as i64)
+            .unwrap_or(0),
+        started_at,
+        overhead_ms,
+    })
+}
+
+/// Tokens in the request's `tools` array, or 0 when it carries none.
+fn count_tools_tokens(body: &Value) -> i64 {
+    let Some(tools) = body.get("tools").filter(|t| !t.is_null()) else {
+        return 0;
+    };
+    let Ok(text) = serde_json::to_string(tools) else {
+        return 0;
+    };
+    headroom_core::tokenizer::get_tokenizer(
+        body.get("model").and_then(|m| m.as_str()).unwrap_or(""),
+    )
+    .count_text(&text) as i64
 }
 
 fn apply_target_model_override(
@@ -437,6 +545,9 @@ pub async fn handle_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Clock for the request outcome, started before any work so the recorded
+    // latency covers what the client actually waited for.
+    let request_started = std::time::Instant::now();
     // Parse body to extract model name.
     let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -584,7 +695,9 @@ pub async fn handle_messages(
     // tool_result offload) so routed models get the same optimizations and
     // searchable archive as the Claude passthrough path, gated on the same
     // flags. Mutates `parsed` before translation.
-    apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr);
+    let transform_started = std::time::Instant::now();
+    let ctx_report = apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr);
+    let overhead_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
 
     // Translation path: Anthropic → OpenAI.
     let openai_body = match if target_model.is_some() {
@@ -642,6 +755,20 @@ pub async fn handle_messages(
         upstream = %upstream_url,
         stream = upstream_is_stream,
         "routing to upstream with format translation"
+    );
+
+    // Book this turn through the same outcome funnel `forward_http` uses, so
+    // routed spend shows up in /stats, /stats-history, and the dashboard
+    // alongside Claude traffic.
+    let outcome_ctx = build_routed_outcome_context(
+        &state,
+        &parsed,
+        &headers,
+        target_model.as_deref(),
+        body_model,
+        ctx_report,
+        overhead_ms,
+        request_started,
     );
 
     let openai_body_bytes = match serde_json::to_vec(&openai_body) {
@@ -799,11 +926,18 @@ pub async fn handle_messages(
     let upstream_status = upstream_resp.status();
 
     if downstream_is_stream {
-        handle_streaming_response(upstream_resp, &parsed, state.codex_rate_limits.clone()).await
+        handle_streaming_response(
+            upstream_resp,
+            &parsed,
+            state.codex_rate_limits.clone(),
+            outcome_ctx,
+        )
+        .await
     } else if target_model.is_some() {
-        handle_buffered_responses_response(upstream_resp, &parsed, upstream_status).await
+        handle_buffered_responses_response(upstream_resp, &parsed, upstream_status, outcome_ctx)
+            .await
     } else {
-        handle_buffered_response(upstream_resp, &parsed, upstream_status).await
+        handle_buffered_response(upstream_resp, &parsed, upstream_status, outcome_ctx).await
     }
 }
 
@@ -1514,11 +1648,15 @@ async fn handle_buffered_response(
     upstream_resp: reqwest::Response,
     original: &Value,
     upstream_status: StatusCode,
+    outcome: Option<RoutedOutcomeContext>,
 ) -> Response {
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     if status != StatusCode::OK {
         let body_text = upstream_resp.text().await.unwrap_or_default();
+        if let Some(ctx) = outcome.as_ref() {
+            book_routed_outcome(ctx, None, 0, 0.0, status.as_u16() as i64);
+        }
         tracing::warn!(
             event = "local_model_upstream_error",
             status = status.as_u16(),
@@ -1560,6 +1698,10 @@ async fn handle_buffered_response(
         }
     };
 
+    if let Some(ctx) = outcome.as_ref() {
+        book_routed_outcome(ctx, openai_body.get("usage"), 0, 0.0, 200);
+    }
+
     let anthropic_response = openai_to_anthropic_response(&openai_body, original);
 
     let body_bytes = match serde_json::to_vec(&anthropic_response) {
@@ -1588,11 +1730,15 @@ async fn handle_buffered_responses_response(
     upstream_resp: reqwest::Response,
     original: &Value,
     upstream_status: StatusCode,
+    outcome: Option<RoutedOutcomeContext>,
 ) -> Response {
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     if status != StatusCode::OK {
         let body_text = upstream_resp.text().await.unwrap_or_default();
+        if let Some(ctx) = outcome.as_ref() {
+            book_routed_outcome(ctx, None, 0, 0.0, status.as_u16() as i64);
+        }
         tracing::warn!(
             event = "local_model_upstream_error",
             status = status.as_u16(),
@@ -1625,6 +1771,9 @@ async fn handle_buffered_responses_response(
     let mut assistant_text = String::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    // The whole usage block, kept for the request outcome — the two counters
+    // above drop the cache details the funnel wants.
+    let mut usage_seen: Option<Value> = None;
 
     let mut flush_frame = |event_name: Option<&str>, data: &str| {
         if data.trim().is_empty() {
@@ -1658,6 +1807,7 @@ async fn handle_buffered_responses_response(
                     if let Some(tokens) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                         output_tokens = tokens;
                     }
+                    usage_seen = Some(usage.clone());
                 }
             }
             _ => {}
@@ -1686,6 +1836,10 @@ async fn handle_buffered_responses_response(
     }
     let data = current_data.join("\n");
     flush_frame(current_event.as_deref(), &data);
+
+    if let Some(ctx) = outcome.as_ref() {
+        book_routed_outcome(ctx, usage_seen.as_ref(), output_tokens as i64, 0.0, 200);
+    }
 
     let model_name = original
         .get("model")
@@ -2060,6 +2214,7 @@ async fn handle_streaming_response(
     upstream_resp: reqwest::Response,
     original: &Value,
     codex_limits: crate::codex_rate_limits::CodexRateLimitStore,
+    outcome: Option<RoutedOutcomeContext>,
 ) -> Response {
     let original_model = original
         .get("model")
@@ -2073,7 +2228,7 @@ async fn handle_streaming_response(
 
     let stream = upstream_resp.bytes_stream();
     let translated_stream =
-        translate_openai_stream_to_anthropic(stream, original_model, codex_limits);
+        translate_openai_stream_to_anthropic(stream, original_model, codex_limits, outcome);
 
     let body = axum::body::Body::from_stream(translated_stream);
 
@@ -2084,6 +2239,110 @@ async fn handle_streaming_response(
         .header("connection", "keep-alive")
         .body(body)
         .expect("static response")
+}
+
+/// Metadata threaded into [`StreamTranslator`] so a completed routed turn books
+/// the same [`RequestOutcome`] a Claude turn does.
+///
+/// Without this the translate path never touches the cost tracker, savings
+/// tracker, or request logger, so codex traffic is absent from `/stats`,
+/// `/stats-history`, and the dashboard — the spend is real but invisible.
+#[derive(Clone)]
+struct RoutedOutcomeContext {
+    sink: std::sync::Arc<crate::proxy::ProxyOutcomeSink>,
+    request_id: String,
+    /// The *upstream* model, never the client-facing alias. Pricing resolves by
+    /// name prefix alone, so booking `claude-codex-5.6` would silently bill
+    /// OpenAI tokens at Sonnet rates via the `claude-` family fallback.
+    model: String,
+    /// `openai_responses` or `openai_chat`, matching the labels `forward_http`
+    /// uses for the same wire formats.
+    provider: String,
+    client: Option<String>,
+    project: Option<String>,
+    tokens_saved: i64,
+    transforms_applied: Vec<String>,
+    num_messages: i64,
+    started_at: std::time::Instant,
+    /// Time spent in headroom's own transforms, as distinct from waiting on
+    /// upstream.
+    overhead_ms: f64,
+}
+
+/// Safety net for turns that never reach a terminal event — a client
+/// disconnect, or an upstream that drops the connection mid-stream. Those
+/// tokens were still spent and still cost money, and the Claude path books
+/// them too (its state machine emits when the channel closes, however it
+/// closed). `emit_outcome` is idempotent, so this is a no-op for the ordinary
+/// case where `response.completed` or `[DONE]` already booked the turn.
+impl Drop for StreamTranslator {
+    fn drop(&mut self) {
+        if self.outcome.is_some() && !self.outcome_emitted {
+            let usage = self.last_usage.clone();
+            self.emit_outcome(usage.as_ref(), 200);
+        }
+    }
+}
+
+/// Book a finished routed turn through the shared outcome funnel.
+///
+/// `usage` is the provider's own block, in whichever shape the endpoint uses.
+/// Cache accounting follows the OpenAI convention the Claude path already
+/// encodes for these providers: `input_tokens` *includes* the cached prefix,
+/// so uncached is the difference. (Anthropic's own `input_tokens` already
+/// excludes it — getting this backwards would double-count the prefix.)
+fn book_routed_outcome(
+    ctx: &RoutedOutcomeContext,
+    usage: Option<&Value>,
+    fallback_output_tokens: i64,
+    ttfb_ms: f64,
+    status_code: i64,
+) {
+    let get = |key: &str| -> i64 {
+        usage
+            .and_then(|u| u.get(key))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    // Responses uses `input_tokens`/`output_tokens`; Chat Completions uses
+    // `prompt_tokens`/`completion_tokens`. Take whichever is present.
+    let input_tokens = get("input_tokens").max(get("prompt_tokens"));
+    let output_tokens = get("output_tokens")
+        .max(get("completion_tokens"))
+        .max(fallback_output_tokens);
+    let cached = usage
+        .and_then(|u| {
+            u.get("input_tokens_details")
+                .or_else(|| u.get("prompt_tokens_details"))
+        })
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let outcome = headroom_core::request_outcome::RequestOutcome {
+        request_id: ctx.request_id.clone(),
+        provider: ctx.provider.clone(),
+        model: ctx.model.clone(),
+        status_code,
+        // What we forwarded is what upstream counted; the pre-transform size is
+        // that plus whatever the transforms removed.
+        original_tokens: input_tokens + ctx.tokens_saved.max(0),
+        optimized_tokens: input_tokens,
+        output_tokens,
+        tokens_saved: ctx.tokens_saved.max(0),
+        attempted_input_tokens: input_tokens,
+        cache_read_tokens: cached,
+        uncached_input_tokens: (input_tokens - cached).max(0),
+        total_latency_ms: ctx.started_at.elapsed().as_secs_f64() * 1000.0,
+        overhead_ms: ctx.overhead_ms,
+        ttfb_ms,
+        transforms_applied: ctx.transforms_applied.clone(),
+        num_messages: ctx.num_messages,
+        client: ctx.client.clone(),
+        project: ctx.project.clone(),
+        ..Default::default()
+    };
+    headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
 }
 
 struct StreamTranslator {
@@ -2103,6 +2362,20 @@ struct StreamTranslator {
     /// Where to file a `rate_limits` object if one appears in the stream.
     /// `None` in unit tests, which do not exercise quota reporting.
     codex_limits: Option<crate::codex_rate_limits::CodexRateLimitStore>,
+    /// Where to book the turn once usage arrives. `None` in unit tests, which
+    /// assert on translated events rather than metrics.
+    outcome: Option<RoutedOutcomeContext>,
+    /// Guards against booking one turn twice. A stream can carry a terminal
+    /// event *and* a trailing `[DONE]`, and the buffered fallback can fire on
+    /// top of that.
+    outcome_emitted: bool,
+    /// Latched on the first upstream frame — the only point where TTFB is
+    /// observable.
+    ttfb_ms: f64,
+    /// Most recent provider `usage` block seen. Chat Completions delivers it on
+    /// a chunk of its own rather than a terminal event, so it has to be held
+    /// until the stream ends.
+    last_usage: Option<Value>,
 }
 
 impl StreamTranslator {
@@ -2120,12 +2393,56 @@ impl StreamTranslator {
             saw_tool_use: false,
             pending_reasoning: PendingReasoning::default(),
             codex_limits: None,
+            outcome: None,
+            outcome_emitted: false,
+            ttfb_ms: 0.0,
+            last_usage: None,
         }
     }
 
     fn with_codex_limits(mut self, store: crate::codex_rate_limits::CodexRateLimitStore) -> Self {
         self.codex_limits = Some(store);
         self
+    }
+
+    fn with_outcome(mut self, ctx: Option<RoutedOutcomeContext>) -> Self {
+        self.outcome = ctx;
+        self
+    }
+
+    /// Latch time-to-first-byte. Written once and never overwritten, mirroring
+    /// `latch_ttfb` on the Claude path.
+    fn latch_ttfb(&mut self) {
+        if self.ttfb_ms == 0.0 {
+            if let Some(ctx) = self.outcome.as_ref() {
+                self.ttfb_ms = ctx.started_at.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+    }
+
+    /// Book the finished turn through the shared outcome funnel.
+    ///
+    /// `usage` is the provider's own block, in whichever shape the endpoint
+    /// uses. Cache accounting follows the OpenAI convention the Claude path
+    /// already encodes for these providers: `input_tokens` *includes* the
+    /// cached prefix, so uncached is the difference. (Anthropic's own
+    /// `input_tokens` already excludes it — getting this backwards would
+    /// double-count the prefix.)
+    fn emit_outcome(&mut self, usage: Option<&Value>, status_code: i64) {
+        if self.outcome_emitted {
+            return;
+        }
+        let Some(ctx) = self.outcome.as_ref() else {
+            return;
+        };
+        self.outcome_emitted = true;
+        book_routed_outcome(
+            ctx,
+            usage,
+            self.total_output_tokens as i64,
+            self.ttfb_ms,
+            status_code,
+        );
     }
 
     #[cfg(test)]
@@ -2135,8 +2452,16 @@ impl StreamTranslator {
 
     fn process_frame(&mut self, event_name: Option<&str>, data: &str) -> Vec<String> {
         let mut events = Vec::new();
+        self.latch_ttfb();
 
         if data.trim().is_empty() || data.trim() == "[DONE]" {
+            if data.trim() == "[DONE]" {
+                // Last chance to book the turn: Chat Completions has no
+                // terminal event, and a Responses stream can be cut off before
+                // one arrives. No-op when a terminal event already booked it.
+                let usage = self.last_usage.clone();
+                self.emit_outcome(usage.as_ref(), 200);
+            }
             if data.trim() == "[DONE]"
                 && (self.in_text_block || self.in_tool_block || self.in_thinking_block)
             {
@@ -2196,6 +2521,9 @@ impl StreamTranslator {
         if let Some(usage) = chunk.get("usage") {
             if let Some(tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
                 self.total_output_tokens = tokens;
+            }
+            if !usage.is_null() {
+                self.last_usage = Some(usage.clone());
             }
         }
 
@@ -2537,6 +2865,11 @@ impl StreamTranslator {
                         "codex prompt-cache effectiveness for this turn"
                     );
                 }
+                let usage = chunk
+                    .get("response")
+                    .and_then(|v| v.get("usage"))
+                    .cloned();
+                self.emit_outcome(usage.as_ref(), 200);
                 if self.in_thinking_block {
                     events.push(self.emit_content_block_stop());
                     self.in_thinking_block = false;
@@ -2581,6 +2914,13 @@ impl StreamTranslator {
                     events.push(self.emit_content_block_stop());
                     self.in_tool_block = false;
                 }
+                // Booked as a 500 so the outcome funnel routes it to
+                // `record_failed` — a failed turn must not feed the save-rate.
+                let usage = chunk
+                    .get("response")
+                    .and_then(|v| v.get("usage"))
+                    .cloned();
+                self.emit_outcome(usage.as_ref(), 500);
             }
             "response.incomplete" => {
                 if let Some(reason) = chunk
@@ -2609,6 +2949,13 @@ impl StreamTranslator {
                     events.push(self.emit_message_delta(stop_reason));
                     events.push(self.emit_message_stop());
                 }
+                // Outside the `if let`: a response that stopped short still
+                // spent tokens, whether or not it said why.
+                let usage = chunk
+                    .get("response")
+                    .and_then(|v| v.get("usage"))
+                    .cloned();
+                self.emit_outcome(usage.as_ref(), 200);
             }
             _ => {}
         }
@@ -2726,10 +3073,13 @@ fn translate_openai_stream_to_anthropic(
     stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     codex_limits: crate::codex_rate_limits::CodexRateLimitStore,
+    outcome: Option<RoutedOutcomeContext>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::StreamExt;
 
-    let mut translator = StreamTranslator::new(model).with_codex_limits(codex_limits);
+    let mut translator = StreamTranslator::new(model)
+        .with_codex_limits(codex_limits)
+        .with_outcome(outcome);
     let mut buffer = String::new();
     let mut current_event: Option<String> = None;
     let mut current_data: Vec<String> = Vec::new();
@@ -2792,6 +3142,174 @@ mod tests {
     use axum::http::HeaderValue;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;
+
+    /// Point the durable savings ledger at a throwaway file.
+    ///
+    /// `emit_request_outcome` appends to it whenever a turn saved tokens, and
+    /// it resolves to `~/.headroom/savings_events.jsonl` by default — so
+    /// without this the tests below write fake savings into the developer's
+    /// real ledger, which `headroom savings` then reports. The temp dir is
+    /// leaked deliberately: the path has to stay valid for the whole test
+    /// binary, and the OS reclaims it.
+    fn redirect_savings_ledger() {
+        static LEDGER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let path = LEDGER.get_or_init(|| {
+            let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
+            dir.path().join("savings_events.jsonl")
+        });
+        std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path);
+    }
+
+    /// Translator wired to real trackers, so a test can assert on what the
+    /// outcome funnel recorded rather than on the events it emitted.
+    fn translator_with_outcome(
+        model: &str,
+        tokens_saved: i64,
+    ) -> (
+        StreamTranslator,
+        std::sync::Arc<crate::request_logger::RequestLogger>,
+        std::sync::Arc<headroom_core::cost_tracker::CostTracker>,
+    ) {
+        redirect_savings_ledger();
+        let cost_tracker = std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+            None, "monthly",
+        ));
+        let request_logger = std::sync::Arc::new(crate::request_logger::RequestLogger::new(None));
+        let ctx = RoutedOutcomeContext {
+            sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink {
+                cost_tracker: cost_tracker.clone(),
+                savings_tracker: std::sync::Arc::new(
+                    headroom_core::savings_tracker::SavingsTracker::new(None, false),
+                ),
+                request_logger: request_logger.clone(),
+            }),
+            request_id: "req-test".to_string(),
+            model: model.to_string(),
+            provider: "openai_responses".to_string(),
+            client: None,
+            project: None,
+            tokens_saved,
+            transforms_applied: vec!["ctx_offload".to_string()],
+            num_messages: 3,
+            started_at: std::time::Instant::now(),
+            overhead_ms: 1.5,
+        };
+        let t = StreamTranslator::new(model.to_string()).with_outcome(Some(ctx));
+        (t, request_logger, cost_tracker)
+    }
+
+    /// The gap this closes: routed traffic used to reach no tracker at all, so
+    /// codex spend was invisible in /stats and the dashboard.
+    // Async because a saving > 0 reaches `record_savings_ledger`, which pushes
+    // the flocked disk append onto a blocking thread.
+    #[tokio::test]
+    async fn completed_responses_stream_books_a_request_outcome() {
+        let (mut t, logger, _cost) = translator_with_outcome("gpt-5.6-luna", 400);
+        t.process_frame(
+            Some("response.completed"),
+            &json!({
+                "response": {
+                    "usage": {
+                        "input_tokens": 10_000,
+                        "output_tokens": 250,
+                        "input_tokens_details": {"cached_tokens": 9_000}
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let entries = logger.get_recent(10);
+        assert_eq!(entries.len(), 1, "the turn should be booked exactly once");
+        let e = &entries[0];
+        assert_eq!(e.model, "gpt-5.6-luna");
+        assert_eq!(e.provider, "openai_responses");
+        assert_eq!(e.output_tokens, 250);
+        // Forwarded size is what upstream counted; the original is that plus
+        // what the transforms removed.
+        assert_eq!(e.input_tokens_optimized, 10_000);
+        assert_eq!(e.input_tokens_original, 10_400);
+        assert_eq!(e.tokens_saved, 400);
+        assert!(e.cache_hit, "9k of 10k input tokens were served from cache");
+        assert_eq!(e.transforms_applied, vec!["ctx_offload".to_string()]);
+    }
+
+    /// A stream carrying both a terminal event and a trailing `[DONE]`, plus
+    /// the drop at the end, must still book exactly one turn.
+    #[test]
+    fn a_turn_is_booked_only_once() {
+        let (mut t, logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        t.process_frame(
+            Some("response.completed"),
+            &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 1}}}).to_string(),
+        );
+        t.process_frame(None, "[DONE]");
+        drop(t);
+        assert_eq!(logger.get_recent(10).len(), 1);
+    }
+
+    /// A turn cut off before any terminal event still spent tokens, and the
+    /// Claude path books those too.
+    #[test]
+    fn dropped_stream_still_books_the_turn() {
+        let (mut t, logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        t.process_frame(
+            Some("response.output_text.delta"),
+            &json!({"delta": "partial"}).to_string(),
+        );
+        assert_eq!(logger.get_recent(10).len(), 0, "not booked mid-stream");
+        drop(t);
+        assert_eq!(
+            logger.get_recent(10).len(),
+            1,
+            "dropping the translator books the interrupted turn"
+        );
+    }
+
+    /// `response.failed` routes to `record_failed`, which deliberately skips
+    /// the success funnel — a failed turn must not inflate the save rate.
+    #[test]
+    fn failed_response_is_not_logged_as_a_served_request() {
+        let (mut t, logger, _cost) = translator_with_outcome("gpt-5.6-luna", 100);
+        t.process_frame(
+            Some("response.failed"),
+            &json!({"response": {"error": {"message": "boom"}}}).to_string(),
+        );
+        assert_eq!(logger.get_recent(10).len(), 0);
+    }
+
+    /// Chat Completions delivers usage on its own chunk rather than a terminal
+    /// event, so the numbers have to survive until the stream ends.
+    #[test]
+    fn chat_completions_usage_is_booked_at_stream_end() {
+        let (mut t, logger, _cost) = translator_with_outcome("qwen-local", 0);
+        t.process_frame(
+            None,
+            &json!({
+                "choices": [{"delta": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 700, "completion_tokens": 20,
+                          "prompt_tokens_details": {"cached_tokens": 500}}
+            })
+            .to_string(),
+        );
+        t.process_frame(None, "[DONE]");
+
+        let entries = logger.get_recent(10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].input_tokens_optimized, 700);
+        assert_eq!(entries[0].output_tokens, 20);
+    }
+
+    /// Unit tests elsewhere in this file build translators with no outcome
+    /// context; that must stay a no-op rather than panicking on drop.
+    #[test]
+    fn translator_without_outcome_context_books_nothing() {
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
+        t.process_frame(
+            Some("response.completed"),
+            &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 1}}}).to_string(),
+        );
+    }
 
     #[test]
     fn apply_target_model_override_rewrites_model() {

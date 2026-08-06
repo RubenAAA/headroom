@@ -11,9 +11,9 @@
 # a codex turn, or the snapshot has gone stale — zero statusline space unless
 # you are actually using a codex model.
 #
-# Shows: codex 7d:3%(5d02h)          one window
-#    or: codex 5h:12%(1h20m) 7d:3%   both windows
-#    or: codex 7d:3% ⚠ limited       when the backend reports a limit hit
+# Shows: codex 7d:3%(5d02h)                  one window
+#    or: codex 5h:12%(1h20m) 7d:3%(4d23h)    both, shortest window first
+#    or: codex 7d:3% ⚠ limited               when the backend reports a limit hit
 #
 # Optional first argument after --segment is the active model name; when given,
 # nothing prints unless it looks like a codex model. Without it the segment
@@ -79,6 +79,10 @@ fmt_reset() {
     fi
 }
 
+# Prints "<window_minutes> <rendered>", so callers can order windows by length.
+# Codex puts the weekly bucket in `primary`, the reverse of how Claude Code
+# renders its own quota (five_hour then seven_day), so the slot name is not a
+# usable sort key.
 window_part() {
     local which=$1 pct minutes resets label out
     pct=$(printf '%s' "$snapshot" | jq -r ".rate_limits.${which}.used_percent // empty" 2>/dev/null)
@@ -90,14 +94,23 @@ window_part() {
     local r
     r=$(fmt_reset "$resets")
     [ -n "$r" ] && out="${out}(${r})"
-    printf '%s' "$out"
+    # Unknown window length sorts last rather than ahead of everything.
+    case "$minutes" in
+    '' | null | *[!0-9]*) minutes=999999 ;;
+    esac
+    printf '%s %s' "$minutes" "$out"
 }
 
+# Shortest window first, matching the 5h-then-7d order Claude Code uses.
 parts=()
-for which in primary secondary; do
-    p=$(window_part "$which")
-    [ -n "$p" ] && parts+=("$p")
-done
+while read -r _minutes rendered; do
+    [ -n "$rendered" ] && parts+=("$rendered")
+done < <(
+    for which in primary secondary; do
+        p=$(window_part "$which")
+        [ -n "$p" ] && printf '%s\n' "$p"
+    done | sort -n -k1,1
+)
 
 # No parsed windows: fall back to the raw header the backend does send, so the
 # segment degrades to something rather than nothing if the payload shape moves.

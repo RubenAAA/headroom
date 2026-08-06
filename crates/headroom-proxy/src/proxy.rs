@@ -597,10 +597,26 @@ impl AppState {
 /// Phase 2: proxy-side implementation of [`headroom_core::request_outcome::OutcomeSink`].
 /// Fans out per-request bookkeeping to the cost tracker, savings tracker,
 /// and output-savings recorder.
-struct ProxyOutcomeSink {
-    cost_tracker: Arc<headroom_core::cost_tracker::CostTracker>,
-    savings_tracker: Arc<headroom_core::savings_tracker::SavingsTracker>,
-    request_logger: Arc<crate::request_logger::RequestLogger>,
+///
+/// Visible crate-wide so handlers that run outside `forward_http` (the routed
+/// model translate path) book their traffic through the same funnel rather
+/// than a private near-copy. A second sink was easy to let drift: the one in
+/// `websocket_codex` silently omits the Prometheus families below.
+pub(crate) struct ProxyOutcomeSink {
+    pub(crate) cost_tracker: Arc<headroom_core::cost_tracker::CostTracker>,
+    pub(crate) savings_tracker: Arc<headroom_core::savings_tracker::SavingsTracker>,
+    pub(crate) request_logger: Arc<crate::request_logger::RequestLogger>,
+}
+
+impl ProxyOutcomeSink {
+    /// Build a sink from the shared trackers on [`AppState`].
+    pub(crate) fn from_state(state: &AppState) -> Self {
+        Self {
+            cost_tracker: state.cost_tracker.clone(),
+            savings_tracker: state.savings_tracker.clone(),
+            request_logger: state.request_logger.clone(),
+        }
+    }
 }
 
 impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {

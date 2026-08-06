@@ -95,6 +95,13 @@ pub struct OffloadOutcome {
     /// session's offload set. Non-zero on a non-boundary turn means the I4
     /// invariant was violated (a cache-thrash bug) — the caller warns loudly.
     pub frozen_new_offloads: usize,
+    /// Tokens removed from the body, summed over the offloaded blocks.
+    ///
+    /// Free to collect: the per-block tokenizer gate already counts both the
+    /// original and the digest to decide whether the swap is worth making, so
+    /// this only keeps a difference it was throwing away. Lets callers report
+    /// a real `tokens_saved` instead of estimating one from byte counts.
+    pub tokens_saved: i64,
     /// Originals to persist off the request path (may be empty).
     pub records: Vec<OffloadRecord>,
 }
@@ -242,11 +249,16 @@ pub fn offload_anthropic_request(
                 .to_string();
             let title = tool_titles.get(&tool_use_id).cloned().unwrap_or_default();
             match offload_tool_result(block, config, &title, policy, is_live) {
-                BlockOutcome::Offloaded { record, prior } => {
+                BlockOutcome::Offloaded {
+                    record,
+                    prior,
+                    tokens_saved,
+                } => {
                     outcome.blocks_offloaded += 1;
                     if !prior && !is_live {
                         outcome.frozen_new_offloads += 1;
                     }
+                    outcome.tokens_saved += tokens_saved;
                     outcome.records.push(record);
                 }
                 BlockOutcome::Deferred => outcome.blocks_deferred += 1,
@@ -262,7 +274,12 @@ pub fn offload_anthropic_request(
 enum BlockOutcome {
     /// Block was rewritten to a digest. `prior` = its hash was already in the
     /// session's offload set (a re-application, not a first conversion).
-    Offloaded { record: OffloadRecord, prior: bool },
+    Offloaded {
+        record: OffloadRecord,
+        prior: bool,
+        /// Original minus digest, from the counts the gate already took.
+        tokens_saved: i64,
+    },
     /// Block qualified but the PR-J4 gate deferred it to the next boundary.
     Deferred,
     /// Block did not qualify (too small / already a digest / no text).
@@ -326,9 +343,13 @@ fn offload_tool_result(
     // Tokenizer gate (I6): keep the original unless the digest is strictly
     // smaller in tokens. Deterministic — pure function of the two strings.
     let tokenizer = get_tokenizer(DEFAULT_MODEL);
-    if tokenizer.count_text(&digest) >= tokenizer.count_text(&original) {
+    let digest_tokens = tokenizer.count_text(&digest);
+    let original_tokens = tokenizer.count_text(&original);
+    if digest_tokens >= original_tokens {
         return BlockOutcome::Skipped;
     }
+    // Strictly positive: the gate above returned on `>=`.
+    let tokens_saved = (original_tokens - digest_tokens) as i64;
 
     // Replace content, preserving the client's shape: string stays string,
     // array becomes a single text block. Both are deterministic.
@@ -357,6 +378,7 @@ fn offload_tool_result(
             title: title.to_string(),
         },
         prior,
+        tokens_saved,
     }
 }
 
