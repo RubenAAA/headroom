@@ -66,11 +66,11 @@ const SAMPLE_CHUNK: usize = 2_000;
 
 /// Image token estimate (max after auto-resize).
 /// Matches Python `_count_content_parts` image cost.
-const IMAGE_TOKENS: usize = 1600;
+pub(crate) const IMAGE_TOKENS: usize = 1600;
 
 /// Audio token estimate.
 /// Matches Python `_count_content_parts` audio cost.
-const AUDIO_TOKENS: usize = 200;
+pub(crate) const AUDIO_TOKENS: usize = 200;
 
 /// Counts tokens. Implementations must be thread-safe (`Send + Sync`).
 ///

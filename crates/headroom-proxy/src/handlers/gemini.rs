@@ -22,6 +22,31 @@ use crate::config::CompressionMode;
 use crate::error::ProxyError;
 use crate::proxy::AppState;
 
+/// Output-token count for a Gemini `usageMetadata`, including thinking tokens.
+///
+/// Gemini reports `candidatesTokenCount` sometimes inclusive of the
+/// `thoughtsTokenCount` (2.5-family reasoning) and sometimes exclusive of it.
+/// When `promptTokenCount + candidatesTokenCount != totalTokenCount` the
+/// thinking tokens are a separate bucket and must be added, or the output cost
+/// (billed at the output rate) is undercounted. Mirrors litellm's
+/// `is_candidate_token_count_inclusive` rule. Robust to missing/null fields.
+pub(crate) fn gemini_output_tokens(usage_meta: &Value) -> u64 {
+    let field = |key: &str| usage_meta.get(key).and_then(Value::as_u64).unwrap_or(0);
+
+    let candidates = field("candidatesTokenCount");
+    let thoughts = field("thoughtsTokenCount");
+    if thoughts == 0 {
+        return candidates;
+    }
+    // Inclusive iff prompt + candidates already equals total; otherwise the
+    // thinking tokens are a separate bucket that belongs in the output count.
+    if field("promptTokenCount") + candidates == field("totalTokenCount") {
+        candidates
+    } else {
+        candidates + thoughts
+    }
+}
+
 /// Parse a `model:action` path segment (e.g. `"gemini-2.0-flash:generateContent"`)
 /// into `(model, action)`. Returns `None` if there is no `:` separator.
 pub(crate) fn split_model_action(model_action: &str) -> Option<(&str, &str)> {
@@ -512,10 +537,7 @@ async fn handle_generate_content_inner(
         .get("promptTokenCount")
         .and_then(Value::as_u64)
         .unwrap_or(original_tokens as u64) as usize;
-    let output_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let output_tokens = gemini_output_tokens(&usage) as usize;
     let cache_read_tokens = usage
         .get("cachedContentTokenCount")
         .and_then(Value::as_u64)
@@ -1153,4 +1175,41 @@ mod tests {
         assert!(result.contains_key("authorization"));
         assert!(!result.contains_key("host"));
     }
+
+    /// Gemini 2.5 reasoning: thinking tokens are billed at the output rate but
+    /// are sometimes a separate bucket from `candidatesTokenCount`.
+    #[test]
+    fn gemini_thinking_tokens_counted_when_exclusive() {
+        // prompt + candidates != total → thoughts are separate, so add them.
+        let usage = serde_json::json!({
+            "promptTokenCount": 1000,
+            "candidatesTokenCount": 200,
+            "thoughtsTokenCount": 500,
+            "totalTokenCount": 1700,
+        });
+        assert_eq!(gemini_output_tokens(&usage), 700);
+    }
+
+    #[test]
+    fn gemini_thinking_tokens_not_double_counted_when_inclusive() {
+        // prompt + candidates == total → candidates already includes thoughts.
+        let usage = serde_json::json!({
+            "promptTokenCount": 1000,
+            "candidatesTokenCount": 700,
+            "thoughtsTokenCount": 500,
+            "totalTokenCount": 1700,
+        });
+        assert_eq!(gemini_output_tokens(&usage), 700);
+    }
+
+    #[test]
+    fn gemini_output_tokens_without_thinking_or_fields() {
+        let plain = serde_json::json!({"candidatesTokenCount": 42});
+        assert_eq!(gemini_output_tokens(&plain), 42);
+        assert_eq!(gemini_output_tokens(&serde_json::json!({})), 0);
+        // Null / wrong-typed fields must not panic or poison the count.
+        let junk = serde_json::json!({"candidatesTokenCount": null, "thoughtsTokenCount": "x"});
+        assert_eq!(gemini_output_tokens(&junk), 0);
+    }
+
 }

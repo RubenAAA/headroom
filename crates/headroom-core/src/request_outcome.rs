@@ -98,6 +98,25 @@ impl RequestOutcome {
         }
         self.tokens_saved as f64 / self.original_tokens as f64 * 100.0
     }
+
+    /// Tokens the forwarded request grew by, if it ended up larger.
+    ///
+    /// `tokens_saved` is clamped at zero, so a request that leaves the proxy
+    /// *bigger* than it arrived is indistinguishable from one the proxy simply
+    /// could not compress: both report `tok_saved=0`. That ambiguity hides real
+    /// regressions — anything that adds to the body after compression
+    /// (proactive context expansion, memory injection) can outweigh the
+    /// compression it sits on top of and still look like a neutral turn.
+    ///
+    /// Diagnostic only: it deliberately does not feed `tokens_saved` or
+    /// `attempted_input_tokens`, because `attempted_input_tokens =
+    /// optimized_tokens + tokens_saved` is a size, not a signed delta, and
+    /// because injection paths already book their own cost through the
+    /// retrieval-drawback channel — letting a negative land here too would
+    /// count it twice.
+    pub fn tokens_inflated(&self) -> i64 {
+        (self.optimized_tokens - self.original_tokens).max(0)
+    }
 }
 
 /// Inputs to [`RequestOutcome::from_stream`], mirroring the Python classmethod's
@@ -358,6 +377,7 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
     tracing::info!(
         target: "headroom.proxy",
         "[{}] PERF model={} msgs={} tok_before={} tok_after={} tok_saved={} \
+         tok_inflated={} \
          cache_read={} cache_write={} cache_hit_pct={} opt_ms={:.0} total_ms={:.0} \
          tok_out={} ttfb_ms={:.0} transforms={}{}",
         outcome.request_id,
@@ -366,6 +386,7 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
         outcome.original_tokens,
         outcome.optimized_tokens,
         outcome.tokens_saved,
+        outcome.tokens_inflated(),
         outcome.cache_read_tokens,
         outcome.cache_write_tokens,
         outcome.cache_hit_pct(),
@@ -642,4 +663,37 @@ mod tests {
         }
         emit_request_outcome(&Minimal, &RequestOutcome::default());
     }
+
+    /// A request that leaves the proxy bigger than it arrived reports
+    /// `tok_saved=0`, same as one that simply could not be compressed. The
+    /// inflation amount distinguishes them.
+    #[test]
+    fn tokens_inflated_surfaces_what_the_clamp_swallows() {
+        let grew = RequestOutcome {
+            original_tokens: 1000,
+            optimized_tokens: 1200,
+            tokens_saved: 0,
+            ..Default::default()
+        };
+        assert_eq!(grew.tokens_inflated(), 200);
+
+        // Incompressible: same tok_saved=0, but nothing was added.
+        let flat = RequestOutcome {
+            original_tokens: 1000,
+            optimized_tokens: 1000,
+            tokens_saved: 0,
+            ..Default::default()
+        };
+        assert_eq!(flat.tokens_inflated(), 0);
+
+        // A genuinely compressed request never reports inflation.
+        let shrank = RequestOutcome {
+            original_tokens: 1000,
+            optimized_tokens: 750,
+            tokens_saved: 250,
+            ..Default::default()
+        };
+        assert_eq!(shrank.tokens_inflated(), 0);
+    }
+
 }

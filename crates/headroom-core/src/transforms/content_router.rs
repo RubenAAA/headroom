@@ -1376,6 +1376,20 @@ pub fn netcost_message_tokens(content: &Value) -> usize {
                                     }
                                 }
                             }
+                            // Price media blocks at the canonical flat cost.
+                            // Falling through to `block.to_string()` embeds the
+                            // whole base64 payload, so one screenshot counted
+                            // ~100,000 tokens instead of ~1,600 (57x-146x over,
+                            // growing with image size). S is the cache-bust
+                            // cost, so an image inflated S for *every message
+                            // before it* and the break-even gate then refused to
+                            // compress any of them.
+                            "image" | "image_url" | "input_image" => {
+                                total += crate::tokenizer::IMAGE_TOKENS;
+                            }
+                            "input_audio" | "audio" => {
+                                total += crate::tokenizer::AUDIO_TOKENS;
+                            }
                             _ => {
                                 total += block.to_string().split_whitespace().count();
                             }
@@ -4466,4 +4480,35 @@ mod kompress_size_gate_tests {
 
         assert!(!chain.contains(&"kompress_size_gate".to_string()));
     }
+
+    /// An image block used to be stringified, embedding its whole base64
+    /// payload in the count. S is the cache-bust cost, so that inflated S for
+    /// every message before it and the break-even gate refused to compress
+    /// any of them.
+    #[test]
+    fn image_blocks_are_not_counted_as_their_base64_payload() {
+        let big_payload = "A".repeat(80_000);
+        let with_image = serde_json::json!([
+            {"type": "text", "text": "look at this"},
+            {"type": "image", "source": {"type": "base64", "data": big_payload}},
+        ]);
+        let counted = netcost_message_tokens(&with_image);
+        // text words + the flat image cost, nowhere near the payload size.
+        assert!(
+            counted < 2_000,
+            "image priced at {counted} tokens; base64 payload leaked into the count"
+        );
+        assert!(counted >= crate::tokenizer::IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn text_and_tool_result_counting_is_unchanged() {
+        let blocks = serde_json::json!([
+            {"type": "text", "text": "one two three"},
+            {"type": "tool_result", "content": "four five"},
+        ]);
+        assert_eq!(netcost_message_tokens(&blocks), 5);
+        assert_eq!(netcost_message_tokens(&serde_json::json!("a b c")), 3);
+    }
+
 }
