@@ -1,0 +1,43 @@
+{
+  "config": {
+    "provider": "openai"
+  },
+  "input": [
+    {
+      "description": "desc 1",
+      "name": "other_tool_1"
+    }
+  ],
+  "input_sha256": "8f536feecd2685fd94c5d3404f0da4c8bfabe0b39167479ee868c281a3246287",
+  "label": "inject_1",
+  "output": [
+    [
+      {
+        "description": "desc 1",
+        "name": "other_tool_1"
+      },
+      {
+        "function": {
+          "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. The hash is provided in compression markers like [N items compressed... hash=abc123].",
+          "name": "headroom_retrieve",
+          "parameters": {
+            "properties": {
+              "hash": {
+                "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "hash"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ],
+    true
+  ],
+  "recorded_at": "2026-07-05T18:47:44.931050+00:00",
+  "transform": "ccr"
+}

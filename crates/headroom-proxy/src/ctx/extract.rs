@@ -82,10 +82,7 @@ fn content_blocks(msg: &Value) -> Vec<Value> {
 
 /// Null-safe string extraction.
 fn safe_str(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
 /// Tool input as a Value.
@@ -260,7 +257,11 @@ fn matches_error_pattern(s: &str) -> bool {
     let mut hay = lower.as_str();
     while let Some(pos) = hay.find("exit code ") {
         let rest = hay[pos + "exit code ".len()..].trim_start();
-        if rest.chars().next().is_some_and(|c| ('1'..='9').contains(&c)) {
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| ('1'..='9').contains(&c))
+        {
             return true;
         }
         hay = &hay[pos + "exit code ".len()..];
@@ -317,7 +318,12 @@ fn extract_git(block: &Value, out: &mut Vec<ExtractedEvent>) {
     let Some(op) = git_operation(command) else {
         return;
     };
-    out.push(ExtractedEvent::new("git", "git", format!("{op}: {command}"), 2));
+    out.push(ExtractedEvent::new(
+        "git",
+        "git",
+        format!("{op}: {command}"),
+        2,
+    ));
 }
 
 fn git_operation(command: &str) -> Option<&'static str> {
@@ -489,17 +495,9 @@ fn extract_plan(block: &Value, out: &mut Vec<ExtractedEvent>) {
         }
         "Write" | "Edit" => {
             // Check if writing to a plan file
-            let path = input
-                .get("file_path")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let path = input.get("file_path").and_then(Value::as_str).unwrap_or("");
             if path.contains("plans/") && path.ends_with(".md") {
-                out.push(ExtractedEvent::new(
-                    "plan",
-                    "plan_file_write",
-                    path,
-                    2,
-                ));
+                out.push(ExtractedEvent::new("plan", "plan_file_write", path, 2));
             }
         }
         _ => {}
@@ -660,7 +658,12 @@ fn extract_decision(block: &Value, out: &mut Vec<ExtractedEvent>) {
         format!("Q: {question}")
     };
 
-    out.push(ExtractedEvent::new("decision", "decision_question", summary, 2));
+    out.push(ExtractedEvent::new(
+        "decision",
+        "decision_question",
+        summary,
+        2,
+    ));
 }
 
 // ─────────────────────────────────────────────────────────
@@ -760,7 +763,12 @@ mod tests {
 
     #[test]
     fn error_from_bash_pattern() {
-        for body in ["command failed", "exit code 1", "Error: nope", "tests FAILED"] {
+        for body in [
+            "command failed",
+            "exit code 1",
+            "Error: nope",
+            "tests FAILED",
+        ] {
             let req = json!({"messages":[
                 {"role":"user","content":[
                     {"type":"tool_result","tool_use_id":"t","content": body}
@@ -907,7 +915,10 @@ mod tests {
             ]}
         ]});
         let events = extract_new_messages(&req, 0);
-        let constraints: Vec<_> = events.iter().filter(|e| e.category == "constraint").collect();
+        let constraints: Vec<_> = events
+            .iter()
+            .filter(|e| e.category == "constraint")
+            .collect();
         assert_eq!(constraints.len(), 1);
         assert_eq!(constraints[0].type_, "constraint_discovered");
     }

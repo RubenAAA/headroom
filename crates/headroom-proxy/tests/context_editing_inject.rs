@@ -25,7 +25,10 @@ fn injects_clear_tool_uses_into_body_without_context_management() {
         .iter()
         .find(|e| e["type"] == json!("clear_tool_uses_20250919"))
         .expect("clear_tool_uses edit present");
-    assert_eq!(tu["trigger"], json!({ "type": "input_tokens", "value": 60_000 }));
+    assert_eq!(
+        tu["trigger"],
+        json!({ "type": "input_tokens", "value": 60_000 })
+    );
     assert_eq!(tu["keep"], json!({ "type": "tool_uses", "value": 6 }));
 }
 
@@ -72,6 +75,12 @@ fn does_not_duplicate_an_edit_type_already_present() {
         .iter()
         .filter(|e| e["type"] == json!("clear_tool_uses_20250919"))
         .count();
-    assert_eq!(count, 1, "must not duplicate an existing clear_tool_uses edit");
-    assert!(!changed, "no modification when the edit type is already present");
+    assert_eq!(
+        count, 1,
+        "must not duplicate an existing clear_tool_uses edit"
+    );
+    assert!(
+        !changed,
+        "no modification when the edit type is already present"
+    );
 }

@@ -108,6 +108,25 @@ pub struct SmartCrusherConfig {
     /// means the discriminator is too granular (e.g. an ID column).
     /// Mirrors `CompactConfig::max_buckets`. Default 8.
     pub compaction_max_buckets: usize,
+    /// Audit-safe mode (#1705). Opt-in. When `true` and
+    /// `protected_patterns` is non-empty, rows whose canonical JSON text
+    /// matches any pattern are scanned before compression and guaranteed
+    /// to survive in the compressed output verbatim — never dropped by
+    /// statistical row-selection. Default `false` (no behavior change).
+    pub audit_safe: bool,
+    /// Strings or regexes. A row is "protected" if any pattern matches
+    /// its canonical JSON text. Compiled once at construction; an invalid
+    /// regex is a caller bug and panics at construction time. Rust idiom:
+    /// empty `Vec` (Python's `None`) means "nothing protected". Default
+    /// empty.
+    pub protected_patterns: Vec<String>,
+    /// If protected rows still can't be preserved after the splice-back
+    /// pass (defensive — should only trip on an internal bug), fail
+    /// closed by returning the original uncompressed content instead of a
+    /// result with fewer protected-pattern matches than the input had.
+    /// When `false`, ship the best-effort result with a logged warning.
+    /// Default `true`.
+    pub fail_closed_on_protected_loss: bool,
 }
 
 impl SmartCrusherConfig {
@@ -156,6 +175,11 @@ impl Default for SmartCrusherConfig {
             compaction_max_flatten_inner_keys: 6,
             compaction_min_buckets: 2,
             compaction_max_buckets: 8,
+            // Audit-safe mode (#1705) — opt-in, defaults preserve
+            // existing behavior byte-for-byte.
+            audit_safe: false,
+            protected_patterns: Vec::new(),
+            fail_closed_on_protected_loss: true,
         }
     }
 }
@@ -194,5 +218,8 @@ mod tests {
         assert_eq!(c.compaction_max_flatten_inner_keys, 6);
         assert_eq!(c.compaction_min_buckets, 2);
         assert_eq!(c.compaction_max_buckets, 8);
+        assert!(!c.audit_safe);
+        assert!(c.protected_patterns.is_empty());
+        assert!(c.fail_closed_on_protected_loss);
     }
 }

@@ -53,9 +53,14 @@
 //! composes with this transform: after offload, `clear_tool_uses` simply fires
 //! on already-small digests, which is harmless. Both-on is the default posture.
 
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
+
 use headroom_core::ccr::compute_key;
 use headroom_core::tokenizer::get_tokenizer;
 use headroom_core::transforms::{compress_block_for_offload, DEFAULT_MODEL};
+use lru::LruCache;
 use serde_json::Value;
 
 /// Static per-request offload settings (I3: never changes mid-session).
@@ -83,6 +88,13 @@ pub struct OffloadRecord {
 pub struct OffloadOutcome {
     /// Number of blocks replaced with a digest.
     pub blocks_offloaded: usize,
+    /// PR-J4: qualifying frozen blocks left raw because the turn is not a
+    /// rebuild boundary (they will convert at the next boundary).
+    pub blocks_deferred: usize,
+    /// PR-J5 thrash guard: conversions of frozen blocks not previously in the
+    /// session's offload set. Non-zero on a non-boundary turn means the I4
+    /// invariant was violated (a cache-thrash bug) — the caller warns loudly.
+    pub frozen_new_offloads: usize,
     /// Originals to persist off the request path (may be empty).
     pub records: Vec<OffloadRecord>,
 }
@@ -98,6 +110,74 @@ impl OffloadOutcome {
 /// (idempotency fast path).
 const MARKER_PREFIX: &str = "<<ctx:";
 
+/// PR-J4 — boundary-gated offload policy (invariant I4 of
+/// `REALIGNMENT/13-phase-J-history-offload.md`).
+///
+/// The digest itself is a pure function of the block bytes, so *re-applying*
+/// an offload is always cache-stable. The one remaining cache-bust risk is
+/// the **first** conversion of a block that already sits inside the client's
+/// cached frozen prefix (e.g. the proxy joins a session mid-flight): rewriting
+/// it on a steady-state turn pays a fresh cache write for no reason. The gate
+/// therefore permits a first conversion only when:
+///
+/// - the block is in the **live tail** (the last message) — it has never been
+///   cached, so converting it before its first cache write is free; or
+/// - the drift detector reported a **rebuild boundary** this turn — the client
+///   is re-writing the cache anyway, so the conversion rides that write.
+///
+/// Once converted, the block's hash enters a per-session **monotonic set**
+/// (invariant I3): subsequent turns re-apply the offload unconditionally, so
+/// the digest never flip-flops back to raw bytes on a steady-state turn.
+pub struct OffloadGate {
+    /// session key → hashes already offloaded in that session. Bounded LRU so
+    /// abandoned sessions age out; evicting a live session merely defers its
+    /// frozen-history offloads to the next rebuild boundary (safe).
+    sessions: Mutex<LruCache<String, HashSet<String>>>,
+}
+
+impl OffloadGate {
+    /// # Panics
+    /// Panics if `capacity == 0`.
+    pub fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity).expect("OffloadGate capacity must be > 0");
+        Self {
+            sessions: Mutex::new(LruCache::new(cap)),
+        }
+    }
+
+    fn contains(&self, session: &str, hash: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        sessions
+            .get(session)
+            .map(|set| set.contains(hash))
+            .unwrap_or(false)
+    }
+
+    fn record(&self, session: &str, hash: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        match sessions.get_mut(session) {
+            Some(set) => {
+                set.insert(hash.to_string());
+            }
+            None => {
+                let mut set = HashSet::new();
+                set.insert(hash.to_string());
+                sessions.put(session.to_string(), set);
+            }
+        }
+    }
+}
+
+/// Per-turn inputs to the [`OffloadGate`] decision. `None` policy = ungated
+/// (pre-J4 behavior; used by tests and as the explicit kill path).
+pub struct OffloadPolicy<'a> {
+    pub gate: &'a OffloadGate,
+    /// Opaque per-session key (same derivation as the drift detector).
+    pub session_key: &'a str,
+    /// Whether the drift detector observed a hot-zone rebuild on this turn.
+    pub rebuild_boundary: bool,
+}
+
 /// Preview budget for the no-compressor fallback, in bytes. Matches
 /// context-mode's `FETCH_PREVIEW_LIMIT` (3072): enough to orient the model,
 /// small enough that offload always shrinks a qualifying (>50KB) block.
@@ -111,10 +191,7 @@ fn preview(text: &str, max_bytes: usize) -> String {
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!(
-        "{}\n…[truncated — retrieval pointer below]",
-        &text[..end]
-    )
+    format!("{}\n…[truncated — retrieval pointer below]", &text[..end])
 }
 
 /// Build the deterministic footer appended to a digest. Pure function of
@@ -129,7 +206,11 @@ fn footer(hash: &str, orig_len: usize) -> String {
 /// Walk every message's `tool_result` blocks and replace qualifying ones with
 /// a digest. Mutates `parsed` in place; returns what changed + records to
 /// persist. Pure function of `parsed` + `config` (I1/I2).
-pub fn offload_anthropic_request(parsed: &mut Value, config: &CtxOffloadConfig) -> OffloadOutcome {
+pub fn offload_anthropic_request(
+    parsed: &mut Value,
+    config: &CtxOffloadConfig,
+    policy: Option<&OffloadPolicy>,
+) -> OffloadOutcome {
     let mut outcome = OffloadOutcome::default();
 
     // First pass (immutable borrow): map tool_use_id → command/tool title so
@@ -141,10 +222,15 @@ pub fn offload_anthropic_request(parsed: &mut Value, config: &CtxOffloadConfig) 
         return outcome;
     };
 
-    for message in messages.iter_mut() {
+    let last_idx = messages.len().saturating_sub(1);
+    for (msg_idx, message) in messages.iter_mut().enumerate() {
         let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
+        // PR-J4: the last message is the live tail — never yet cached, so a
+        // first conversion there is free. Everything earlier is (potentially)
+        // inside the cached prefix and gated on a rebuild boundary.
+        let is_live = msg_idx == last_idx;
         for block in blocks.iter_mut() {
             if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
@@ -155,14 +241,32 @@ pub fn offload_anthropic_request(parsed: &mut Value, config: &CtxOffloadConfig) 
                 .unwrap_or("")
                 .to_string();
             let title = tool_titles.get(&tool_use_id).cloned().unwrap_or_default();
-            if let Some(record) = offload_tool_result(block, config, &title) {
-                outcome.blocks_offloaded += 1;
-                outcome.records.push(record);
+            match offload_tool_result(block, config, &title, policy, is_live) {
+                BlockOutcome::Offloaded { record, prior } => {
+                    outcome.blocks_offloaded += 1;
+                    if !prior && !is_live {
+                        outcome.frozen_new_offloads += 1;
+                    }
+                    outcome.records.push(record);
+                }
+                BlockOutcome::Deferred => outcome.blocks_deferred += 1,
+                BlockOutcome::Skipped => {}
             }
         }
     }
 
     outcome
+}
+
+/// Per-block result of [`offload_tool_result`].
+enum BlockOutcome {
+    /// Block was rewritten to a digest. `prior` = its hash was already in the
+    /// session's offload set (a re-application, not a first conversion).
+    Offloaded { record: OffloadRecord, prior: bool },
+    /// Block qualified but the PR-J4 gate deferred it to the next boundary.
+    Deferred,
+    /// Block did not qualify (too small / already a digest / no text).
+    Skipped,
 }
 
 /// Extract, digest, and replace one `tool_result` block's content. Returns the
@@ -172,23 +276,40 @@ fn offload_tool_result(
     block: &mut Value,
     config: &CtxOffloadConfig,
     title: &str,
-) -> Option<OffloadRecord> {
-    let content = block.get("content")?;
-    let original = tool_result_text(content)?;
+    policy: Option<&OffloadPolicy>,
+    is_live: bool,
+) -> BlockOutcome {
+    let Some(original) = block.get("content").and_then(|c| tool_result_text(c)) else {
+        return BlockOutcome::Skipped;
+    };
 
     // Idempotency fast path (I2): a block that already carries our marker is a
     // digest — pass through untouched. (Re-processing the raw block would yield
     // identical bytes anyway; this just avoids re-hashing.)
     if original.contains(MARKER_PREFIX) {
-        return None;
+        return BlockOutcome::Skipped;
     }
 
     // Qualify on serialized byte length (I3: static threshold).
     if original.len() <= config.min_bytes {
-        return None;
+        return BlockOutcome::Skipped;
     }
 
     let hash = compute_key(original.as_bytes());
+
+    // PR-J4 boundary gate: a frozen block's *first* conversion only rides a
+    // rebuild boundary; re-applications (hash already in the session set) and
+    // live-tail blocks always pass. See [`OffloadGate`].
+    let prior = match policy {
+        Some(p) => {
+            let prior = p.gate.contains(p.session_key, &hash);
+            if !prior && !is_live && !p.rebuild_boundary {
+                return BlockOutcome::Deferred;
+            }
+            prior
+        }
+        None => false,
+    };
     // Structural compressor when one applies; otherwise a plain preview cut,
     // mirroring context-mode's behaviour (charSafePrefix + pointer). The
     // original is always retrievable by hash, so the digest only needs to
@@ -206,7 +327,7 @@ fn offload_tool_result(
     // smaller in tokens. Deterministic — pure function of the two strings.
     let tokenizer = get_tokenizer(DEFAULT_MODEL);
     if tokenizer.count_text(&digest) >= tokenizer.count_text(&original) {
-        return None;
+        return BlockOutcome::Skipped;
     }
 
     // Replace content, preserving the client's shape: string stays string,
@@ -223,11 +344,20 @@ fn offload_tool_result(
         }
     }
 
-    Some(OffloadRecord {
-        hash,
-        original,
-        title: title.to_string(),
-    })
+    // PR-J4 (I3, monotonicity): once converted, the hash stays in the session
+    // set so every later turn re-applies the offload without re-gating.
+    if let Some(p) = policy {
+        p.gate.record(p.session_key, &hash);
+    }
+
+    BlockOutcome::Offloaded {
+        record: OffloadRecord {
+            hash,
+            original,
+            title: title.to_string(),
+        },
+        prior,
+    }
 }
 
 /// Concatenated text of a `tool_result` `content` field. `content` is either a
@@ -325,7 +455,7 @@ mod tests {
         // Repetitive log content compresses well and is comfortably > 200 B.
         let body = "ERROR: disk full\n".repeat(50);
         let mut parsed = req(&body);
-        let out = offload_anthropic_request(&mut parsed, &cfg(200));
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), None);
         assert_eq!(out.blocks_offloaded, 1);
         assert_eq!(out.records.len(), 1);
         let text = first_tool_result_text(&parsed);
@@ -351,13 +481,20 @@ mod tests {
         }
         assert!(body.len() > 50_000);
         let mut parsed = req(&body);
-        let out = offload_anthropic_request(&mut parsed, &cfg(50_000));
+        let out = offload_anthropic_request(&mut parsed, &cfg(50_000), None);
         assert_eq!(out.blocks_offloaded, 1);
         let text = first_tool_result_text(&parsed);
-        assert!(text.len() < 4096, "digest must be small, got {}", text.len());
+        assert!(
+            text.len() < 4096,
+            "digest must be small, got {}",
+            text.len()
+        );
         assert!(text.starts_with("1\t[[package]]"), "preview keeps the head");
         assert!(text.contains("truncated"));
-        assert!(text.contains(&format!("retrieve: headroom ctx get {}", out.records[0].hash)));
+        assert!(text.contains(&format!(
+            "retrieve: headroom ctx get {}",
+            out.records[0].hash
+        )));
         assert_eq!(out.records[0].original, body);
     }
 
@@ -375,7 +512,7 @@ mod tests {
     fn below_threshold_is_untouched() {
         let body = "small output";
         let mut parsed = req(body);
-        let out = offload_anthropic_request(&mut parsed, &cfg(50_000));
+        let out = offload_anthropic_request(&mut parsed, &cfg(50_000), None);
         assert_eq!(out.blocks_offloaded, 0);
         assert_eq!(first_tool_result_text(&parsed), body);
     }
@@ -385,8 +522,8 @@ mod tests {
         let body = "ERROR: disk full\n".repeat(50);
         let mut a = req(&body);
         let mut b = req(&body);
-        offload_anthropic_request(&mut a, &cfg(200));
-        offload_anthropic_request(&mut b, &cfg(200));
+        offload_anthropic_request(&mut a, &cfg(200), None);
+        offload_anthropic_request(&mut b, &cfg(200), None);
         assert_eq!(a, b, "same input bytes must produce identical output bytes");
     }
 
@@ -394,11 +531,11 @@ mod tests {
     fn already_offloaded_block_passes_through() {
         let body = "ERROR: disk full\n".repeat(50);
         let mut parsed = req(&body);
-        offload_anthropic_request(&mut parsed, &cfg(200));
+        offload_anthropic_request(&mut parsed, &cfg(200), None);
         let after_first = parsed.clone();
         // Re-running must be a no-op (idempotent): the digest already carries
         // the marker.
-        let out = offload_anthropic_request(&mut parsed, &cfg(200));
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), None);
         assert_eq!(out.blocks_offloaded, 0);
         assert_eq!(parsed, after_first);
     }
@@ -406,7 +543,10 @@ mod tests {
     #[test]
     fn marker_format_is_pinned() {
         let f = footer("abc123", 1234);
-        assert_eq!(f, "\n<<ctx:abc123>> (1234 bytes offloaded; retrieve: headroom ctx get abc123)");
+        assert_eq!(
+            f,
+            "\n<<ctx:abc123>> (1234 bytes offloaded; retrieve: headroom ctx get abc123)"
+        );
     }
 
     #[test]
@@ -424,11 +564,133 @@ mod tests {
                 ]}
             ]
         });
-        let out = offload_anthropic_request(&mut parsed, &cfg(200));
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), None);
         assert_eq!(out.blocks_offloaded, 1);
         let content = &parsed["messages"][1]["content"][0]["content"];
         assert!(content.is_array());
         assert_eq!(content[0]["type"], "text");
         assert!(content[0]["text"].as_str().unwrap().contains("<<ctx:"));
+    }
+
+    // ── PR-J4: boundary gate ──
+
+    /// Request with a large tool_result in FROZEN history (not the last
+    /// message) plus a trailing small live message.
+    fn req_frozen(body: &str) -> Value {
+        json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"tu_1","name":"Bash",
+                     "input":{"command":"cat big.log"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"tu_1","content": body}
+                ]},
+                {"role":"assistant","content":[{"type":"text","text":"ok"}]},
+                {"role":"user","content":[{"type":"text","text":"next question"}]}
+            ]
+        })
+    }
+
+    #[test]
+    fn gate_defers_frozen_block_on_steady_state_turn() {
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        let mut parsed = req_frozen(&body);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess",
+            rebuild_boundary: false,
+        };
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), Some(&policy));
+        assert_eq!(out.blocks_offloaded, 0);
+        assert_eq!(out.blocks_deferred, 1);
+        assert_eq!(out.frozen_new_offloads, 0);
+        // Bytes untouched — the cached prefix is preserved (I4).
+        assert_eq!(parsed["messages"][1]["content"][0]["content"], json!(body));
+    }
+
+    #[test]
+    fn gate_permits_frozen_block_on_rebuild_boundary_then_stays_offloaded() {
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+
+        // Boundary turn: frozen block converts (riding the client's rebuild).
+        let mut parsed = req_frozen(&body);
+        let boundary = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess",
+            rebuild_boundary: true,
+        };
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), Some(&boundary));
+        assert_eq!(out.blocks_offloaded, 1);
+        assert_eq!(out.frozen_new_offloads, 1);
+
+        // Next steady-state turn: client resends raw history; the monotonic
+        // set re-applies the identical offload (I3 — no flip-flop).
+        let mut resent = req_frozen(&body);
+        let steady = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess",
+            rebuild_boundary: false,
+        };
+        let out2 = offload_anthropic_request(&mut resent, &cfg(200), Some(&steady));
+        assert_eq!(out2.blocks_offloaded, 1);
+        assert_eq!(out2.blocks_deferred, 0);
+        assert_eq!(
+            out2.frozen_new_offloads, 0,
+            "re-application is not a new frozen conversion"
+        );
+        assert_eq!(
+            parsed, resent,
+            "boundary turn and re-application produce identical bytes"
+        );
+    }
+
+    #[test]
+    fn gate_permits_live_tail_block_without_boundary() {
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        // `req` puts the tool_result in the LAST message (live tail).
+        let mut parsed = req(&body);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess",
+            rebuild_boundary: false,
+        };
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), Some(&policy));
+        assert_eq!(out.blocks_offloaded, 1);
+        assert_eq!(out.frozen_new_offloads, 0);
+        assert!(first_tool_result_text(&parsed).contains("<<ctx:"));
+    }
+
+    #[test]
+    fn gate_offload_set_is_session_scoped() {
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+
+        // Session A converts on a boundary.
+        let mut a = req_frozen(&body);
+        let pa = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess-A",
+            rebuild_boundary: true,
+        };
+        assert_eq!(
+            offload_anthropic_request(&mut a, &cfg(200), Some(&pa)).blocks_offloaded,
+            1
+        );
+
+        // Session B on a steady-state turn must NOT inherit A's set.
+        let mut b = req_frozen(&body);
+        let pb = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess-B",
+            rebuild_boundary: false,
+        };
+        let out = offload_anthropic_request(&mut b, &cfg(200), Some(&pb));
+        assert_eq!(out.blocks_offloaded, 0);
+        assert_eq!(out.blocks_deferred, 1);
     }
 }

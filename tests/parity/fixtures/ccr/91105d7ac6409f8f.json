@@ -1,0 +1,40 @@
+{
+  "config": {
+    "provider": "anthropic"
+  },
+  "input": [
+    {
+      "description": "desc 0",
+      "name": "other_tool_0"
+    }
+  ],
+  "input_sha256": "91105d7ac6409f8f53a3cf130f5be806ba875fbb872f5ac74bcf451d031e1d94",
+  "label": "inject_0",
+  "output": [
+    [
+      {
+        "description": "desc 0",
+        "name": "other_tool_0"
+      },
+      {
+        "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. The hash is provided in compression markers like [N items compressed... hash=abc123].",
+        "input_schema": {
+          "properties": {
+            "hash": {
+              "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "hash"
+          ],
+          "type": "object"
+        },
+        "name": "headroom_retrieve"
+      }
+    ],
+    true
+  ],
+  "recorded_at": "2026-07-05T18:47:44.930912+00:00",
+  "transform": "ccr"
+}

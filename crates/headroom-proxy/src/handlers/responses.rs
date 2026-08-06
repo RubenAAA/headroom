@@ -80,6 +80,11 @@ pub async fn handle_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Rate-limit gate: check before buffering the body.
+    if let Some(rejected) = super::chat_completions::check_rate_limit(&state, &headers) {
+        return rejected;
+    }
+
     // PR-C4: streaming pipeline confirmation. When the client asks
     // for SSE, log a structured breadcrumb so dashboards can confirm
     // the streaming pipeline is engaged (the SSE framer +

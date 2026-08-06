@@ -21,6 +21,7 @@ token breakdowns per window that enable:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -146,6 +147,16 @@ def _get_persist_path() -> Path:
     return _paths.subscription_state_path()
 
 
+def _token_id(raw: str) -> str:
+    """PR-F3: one-way token identifier — ``sha256:<16 hex>…<last 4 chars>``.
+
+    Enough to correlate "same token?" across log lines and eyeball the tail
+    against a credentials file, while unrecoverable as a bearer.
+    """
+    digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return f"sha256:{digest}\u2026{raw[-4:]}"
+
+
 class SubscriptionTracker(QuotaTracker):
     """Background tracker for Anthropic Claude Code subscription windows.
 
@@ -183,7 +194,10 @@ class SubscriptionTracker(QuotaTracker):
 
         self._lock = threading.Lock()
         self._state = SubscriptionState()
-        self._current_token: str | None = None
+        # PR-F3: one-way hash + last-4 of the most recent OAuth bearer, for
+        # debugging only. The raw token is never stored (token-leak
+        # hardening); polling reads the credentials file at poll time.
+        self._current_token_id: str | None = None
         self._full_tokens: dict[str, int] = {}  # token_prefix -> count of requests
 
         # PR-G2 (Realignment) — most recent session-incremental ``tokens_saved``
@@ -270,8 +284,10 @@ class SubscriptionTracker(QuotaTracker):
     def notify_active(self, token: str) -> None:
         """Called by the proxy handler when an OAuth request comes through.
 
-        Stores the token for polling and marks the tracker as recently active.
-        Only processes Bearer tokens that look like OAuth (not API keys).
+        Marks the tracker as recently active. Only processes Bearer tokens
+        that look like OAuth (not API keys). PR-F3: retains only a one-way
+        hash + last-4 of the token; the raw bearer never persists past this
+        call.
         """
         if not token or not token.startswith("Bearer "):
             return
@@ -280,7 +296,7 @@ class SubscriptionTracker(QuotaTracker):
         if raw.startswith("sk-ant-api"):
             return
         with self._lock:
-            self._current_token = raw
+            self._current_token_id = _token_id(raw)
             self._state.last_active_at = _utc_now()
             prefix = raw[:8]
             self._full_tokens[prefix] = self._full_tokens.get(prefix, 0) + 1
@@ -721,18 +737,13 @@ class SubscriptionTracker(QuotaTracker):
                 pass  # normal: poll interval elapsed
 
     async def _maybe_poll(self) -> None:
-        with self._lock:
-            is_active = self._state.is_active(active_window_s=self._active_window_s)
-            token = self._current_token
+        # PR-F3: the tracker holds no raw bearer copy; always read the token
+        # from the credentials file / env var at poll time.
+        from headroom.subscription.client import read_cached_oauth_token
 
-        if not is_active:
-            # Try background poll using credentials file token
-            from headroom.subscription.client import read_cached_oauth_token
-
-            bg_token = read_cached_oauth_token()
-            if not bg_token:
-                return
-            token = token or bg_token
+        token = read_cached_oauth_token()
+        if not token:
+            return
 
         snapshot = await self._client.fetch(token)
         if snapshot is None:

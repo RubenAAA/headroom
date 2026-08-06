@@ -104,6 +104,7 @@ use thiserror::Error;
 
 use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
+use super::content_router::detect_content_native;
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
@@ -126,6 +127,10 @@ const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 const STRATEGY_CODE_COMPRESSOR: &str = "code_aware_compressor";
 /// Strategy tag emitted when Kompress rewrote a plain-text block.
 const STRATEGY_KOMPRESS: &str = "kompress";
+/// Tier 1 of Python's `config_compressor`: the self-verified reversible fold.
+/// The comment-elision tier (which mints a CCR marker) and the schema fold are
+/// NOT ported — `headroom/transforms/config_compressor.py` still owns those.
+const STRATEGY_CONFIG_LOSSLESS: &str = "config_lossless";
 
 /// Empty query context passed to compressors that take a relevance
 /// query string. PR-B3 dispatcher does not yet plumb the user's last
@@ -189,6 +194,11 @@ fn threshold_for(content_type: ContentType) -> usize {
         ContentType::SourceCode => THRESHOLD_SOURCE_CODE,
         ContentType::PlainText => THRESHOLD_PLAIN_TEXT,
         ContentType::Html => THRESHOLD_HTML,
+        ContentType::Tabular => THRESHOLD_PLAIN_TEXT,
+        // Config payloads are prose-shaped enough that the plain-text
+        // threshold is the right floor; the `config` lossless fold does the
+        // work once the block is big enough to bother with.
+        ContentType::StructuredConfig => THRESHOLD_PLAIN_TEXT,
     }
 }
 
@@ -703,7 +713,14 @@ pub fn compress_anthropic_live_zone(
     auth_mode: AuthMode,
     model: &str,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
-    compress_anthropic_live_zone_with_ccr(body_raw, frozen_message_count, auth_mode, model, None)
+    compress_anthropic_live_zone_with_ccr(
+        body_raw,
+        frozen_message_count,
+        auth_mode,
+        model,
+        None,
+        &DispatchConfig::default(),
+    )
 }
 
 /// Same as [`compress_anthropic_live_zone`] but with an optional
@@ -728,6 +745,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
     _auth_mode: AuthMode,
     model: &str,
     ccr_store: Option<&dyn CcrStore>,
+    dispatch_config: &DispatchConfig,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
@@ -808,10 +826,10 @@ pub fn compress_anthropic_live_zone_with_ccr(
                 content_text,
                 content_byte_range,
             } => {
-                let detected = detect_content_type(&content_text);
+                let detected = detect_content_native(&content_text);
                 let outcome: BlockOutcome = compress_one_block(
                     &content_text,
-                    detected.content_type,
+                    detected,
                     content_byte_range,
                     target_idx,
                     Some(slot.block_index),
@@ -819,6 +837,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     tokenizer.as_ref(),
                     &mut replacements,
                     ccr_store,
+                    dispatch_config,
                 );
                 outcome
             }
@@ -826,10 +845,10 @@ pub fn compress_anthropic_live_zone_with_ccr(
                 content_text,
                 content_byte_range,
             } => {
-                let detected = detect_content_type(&content_text);
+                let detected = detect_content_native(&content_text);
                 compress_one_block(
                     &content_text,
-                    detected.content_type,
+                    detected,
                     content_byte_range,
                     target_idx,
                     None,
@@ -837,6 +856,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     tokenizer.as_ref(),
                     &mut replacements,
                     ccr_store,
+                    dispatch_config,
                 )
             }
         };
@@ -887,6 +907,157 @@ pub fn compress_anthropic_live_zone_with_ccr(
     })
 }
 
+// ─── All-messages dispatcher (subscription mode) ───────────────────────
+
+/// Compress ALL eligible blocks across ALL user messages in the request.
+///
+/// This is the subscription-mode variant: on a subscription with prompt
+/// caching, repeated history is re-sent every turn and cached at 0.1x.
+/// To actually reduce consumption the proxy must compress the SAME
+/// content identically wherever it appears — not just the latest user
+/// message — so Anthropic's cache forms over the compressed bytes
+/// (stable, no cascade).
+///
+/// The legacy `compress_anthropic_live_zone` only ever rewrites the
+/// latest user message, so a tool_result that has aged into history is
+/// sent full, then re-compressed when newest → byte oscillation → cache
+/// cascade. This function compresses every eligible block
+/// deterministically so identical content always yields identical bytes.
+///
+/// # Arguments
+///
+/// - `body_raw`: the buffered request body as bytes. Must be valid JSON.
+/// - `auth_mode`: reserved for future use (PR-F2).
+/// - `model`: the upstream model name for tokenizer routing.
+///
+/// # Returns
+///
+/// - [`LiveZoneOutcome::NoChange`] when no block was rewritten.
+/// - [`LiveZoneOutcome::Modified`] when at least one block was rewritten.
+pub fn compress_anthropic_all_messages(
+    body_raw: &[u8],
+    _auth_mode: AuthMode,
+    model: &str,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
+    let messages = parsed
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or(LiveZoneError::NoMessagesArray)?;
+
+    if messages.is_empty() {
+        return Ok(LiveZoneOutcome::NoChange {
+            manifest: CompressionManifest::empty(),
+        });
+    }
+
+    let messages_total = messages.len();
+    let tokenizer = get_tokenizer(model);
+    let mut block_outcomes: Vec<BlockOutcome> = Vec::new();
+    let mut replacements: Vec<Replacement> = Vec::new();
+
+    // Walk ALL user messages and compress eligible blocks in each.
+    for (msg_idx, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+
+        // Plan block replacements for this message.
+        let plan = match plan_block_replacements(body_raw, msg_idx) {
+            Ok(p) => p,
+            Err(_) => continue, // Skip messages with unexpected shape.
+        };
+
+        for slot in plan {
+            let outcome = match slot.kind {
+                SlotKind::HotZone(block_type) => BlockOutcome {
+                    message_index: msg_idx,
+                    block_index: Some(slot.block_index),
+                    block_type,
+                    action: BlockAction::Excluded {
+                        reason: ExclusionReason::HotZoneBlockType,
+                    },
+                },
+                SlotKind::Compressible {
+                    block_type,
+                    content_text,
+                    content_byte_range,
+                } => {
+                    let detected = detect_content_native(&content_text);
+                    compress_one_block(
+                        &content_text,
+                        detected,
+                        content_byte_range,
+                        msg_idx,
+                        Some(slot.block_index),
+                        block_type,
+                        tokenizer.as_ref(),
+                        &mut replacements,
+                        None, // No CCR store for all-messages mode yet.
+                        &DispatchConfig::default(),
+                    )
+                }
+                SlotKind::StringContent {
+                    content_text,
+                    content_byte_range,
+                } => {
+                    let detected = detect_content_native(&content_text);
+                    compress_one_block(
+                        &content_text,
+                        detected,
+                        content_byte_range,
+                        msg_idx,
+                        None,
+                        "string_content".to_string(),
+                        tokenizer.as_ref(),
+                        &mut replacements,
+                        None,
+                        &DispatchConfig::default(),
+                    )
+                }
+            };
+            block_outcomes.push(outcome);
+        }
+    }
+
+    // Find the latest user message index for the manifest.
+    let latest_user_message_index = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, msg)| msg.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|(idx, _)| idx);
+
+    let manifest = CompressionManifest {
+        messages_total,
+        messages_below_frozen_floor: 0, // All messages are eligible in this mode.
+        latest_user_message_index,
+        block_outcomes,
+    };
+
+    if !manifest.has_compressed_block() || replacements.is_empty() {
+        return Ok(LiveZoneOutcome::NoChange { manifest });
+    }
+
+    // Apply all replacements. Replacements are from different messages
+    // at different byte offsets — apply_replacements sorts them.
+    let new_bytes = apply_replacements(body_raw, &mut replacements);
+
+    let new_body_str = match std::str::from_utf8(&new_bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(LiveZoneOutcome::NoChange { manifest }),
+    };
+    let raw = match RawValue::from_string(new_body_str.to_string()) {
+        Ok(r) => r,
+        Err(_) => return Ok(LiveZoneOutcome::NoChange { manifest }),
+    };
+
+    Ok(LiveZoneOutcome::Modified {
+        new_body: raw,
+        manifest,
+    })
+}
+
 // ─── Internal helpers ──────────────────────────────────────────────────
 
 /// Per-block dispatch shared by the array-of-blocks slot and the
@@ -911,6 +1082,7 @@ fn compress_one_block(
     tokenizer: &dyn crate::tokenizer::Tokenizer,
     replacements: &mut Vec<Replacement>,
     ccr_store: Option<&dyn CcrStore>,
+    dispatch_config: &DispatchConfig,
 ) -> BlockOutcome {
     // 1. Byte-threshold gate. Empty content always falls through to
     //    `dispatch_compressor` (which short-circuits on empty), so
@@ -929,7 +1101,7 @@ fn compress_one_block(
         };
     }
 
-    match dispatch_compressor(content_text, content_type) {
+    match dispatch_compressor_with_config(content_text, content_type, dispatch_config) {
         DispatchResult::NoOp { content_type } => BlockOutcome {
             message_index,
             block_index,
@@ -1416,7 +1588,163 @@ enum DispatchResult {
 /// - `PlainText` → Kompress (cache-only; passthrough when the model is
 ///   not in the local HF cache — never downloads on the dispatch thread)
 /// - `Html` → no-op (no compressor)
+/// Configuration for the compressor dispatch logic.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchConfig {
+    /// Target compression ratio for Kompress (None = auto).
+    pub target_ratio: Option<f64>,
+    /// Disable Kompress for specific providers.
+    pub disable_kompress_per_provider: std::collections::HashMap<String, bool>,
+    /// When Kompress is disabled, route to passthrough instead of fallback.
+    pub disable_kompress_fallback: bool,
+    /// Compress user-role messages (overrides skip_user_messages when Some(true)).
+    pub compress_user_messages: Option<bool>,
+    /// Compress system-role messages.
+    pub compress_system_messages: Option<bool>,
+}
+
 fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
+    dispatch_compressor_with_config(text, content_type, &DispatchConfig::default())
+}
+
+/// How long a memoised dispatch result stays valid. Matches Python's
+/// `CompressionCache` default TTL.
+const DISPATCH_CACHE_TTL_SECS: u64 = 1800;
+
+/// Process-global memo for [`dispatch_compressor_with_config`].
+///
+/// Python hangs its `CompressionCache` off the `ContentRouter` instance, but the
+/// Rust live-zone entry points are free functions with no session object to hold
+/// one, so the cache is process-global. That is sound here because what it
+/// memoises is a *pure* function — see [`dispatch_compressor_with_config`].
+static DISPATCH_CACHE: OnceLock<super::content_router::CompressionCache> = OnceLock::new();
+
+fn dispatch_cache() -> &'static super::content_router::CompressionCache {
+    DISPATCH_CACHE
+        .get_or_init(|| super::content_router::CompressionCache::new(DISPATCH_CACHE_TTL_SECS))
+}
+
+/// Key for a dispatch memo entry.
+///
+/// Every input that can change the output is included: the text, the content
+/// type that selects the compressor, `target_ratio` — the only
+/// [`DispatchConfig`] field this function reads (the rest are role gates applied
+/// by callers) — and the global Kompress enable flag. This extends Python's
+/// `hash((content, _runtime_target_ratio))`.
+///
+/// The Kompress flag has to be part of the key even though it is not an
+/// argument: [`set_kompress_enabled`] flips it at runtime and it decides whether
+/// `PlainText` compresses at all, so a key without it would serve a
+/// Kompress-disabled result after Kompress was switched on.
+///
+/// Like Python's, this is a 64-bit key with no stored copy of the input to
+/// verify against, so a hash collision would serve another block's bytes. The
+/// exposure is identical to the Python implementation's.
+fn dispatch_cache_key(text: &str, content_type: ContentType, target_ratio: Option<f64>) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    content_type.as_str().hash(&mut hasher);
+    // `f64` is not `Hash`; its bit pattern is, and is exact for this purpose.
+    target_ratio.map(f64::to_bits).hash(&mut hasher);
+    KOMPRESS_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+/// Map a cached strategy name back to the `&'static str` [`DispatchResult`] needs.
+///
+/// Returns `None` for anything not produced by this function, in which case the
+/// caller recompresses rather than inventing a leaked string.
+fn intern_dispatch_strategy(strategy: &str) -> Option<&'static str> {
+    [
+        STRATEGY_SMART_CRUSHER,
+        STRATEGY_LOG_COMPRESSOR,
+        STRATEGY_SEARCH_COMPRESSOR,
+        STRATEGY_DIFF_COMPRESSOR,
+        STRATEGY_CODE_COMPRESSOR,
+        STRATEGY_CONFIG_LOSSLESS,
+        STRATEGY_KOMPRESS,
+    ]
+    .into_iter()
+    .find(|known| *known == strategy)
+}
+
+/// Dispatch `text` to the compressor for `content_type`, memoising the result.
+///
+/// This is a pure function of `(text, content_type, config.target_ratio)`, which
+/// is what makes the process-global memo safe: identical inputs always produce
+/// identical output, so a hit cannot be stale.
+///
+/// The memo deliberately sits *below* the accept/reject decision in
+/// [`compress_one_block`], not above it. Python caches a compressed result
+/// alongside the ratio it achieved, then has to re-check that ratio against the
+/// live `min_ratio` on every hit — and demote the entry via `move_to_skip` when
+/// the threshold tightens. Caching only the raw compression output sidesteps
+/// that entirely: acceptance is recomputed from scratch each call, so a
+/// threshold change is picked up immediately and no stale verdict can survive.
+///
+/// A `NoOp` is cached as a skip entry, which is what Python's skip tier is for —
+/// content that compressors already declined once should not be re-run. `Error`
+/// results are never cached, since a failure may be transient.
+fn dispatch_compressor_with_config(
+    text: &str,
+    content_type: ContentType,
+    config: &DispatchConfig,
+) -> DispatchResult {
+    if text.is_empty() {
+        return DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+        };
+    }
+
+    let cache = dispatch_cache();
+    let key = dispatch_cache_key(text, content_type, config.target_ratio);
+    match cache.get(key) {
+        super::content_router::CacheLookup::Skip => {
+            return DispatchResult::NoOp {
+                content_type: content_type.as_str(),
+            };
+        }
+        super::content_router::CacheLookup::Hit {
+            compressed,
+            strategy,
+            ..
+        } => {
+            // An unrecognised strategy means the entry predates a rename; fall
+            // through and recompress rather than fabricate a static string.
+            if let Some(strategy) = intern_dispatch_strategy(&strategy) {
+                return DispatchResult::Compressed {
+                    strategy,
+                    compressed,
+                };
+            }
+        }
+        super::content_router::CacheLookup::Miss => {}
+    }
+
+    let result = dispatch_compressor_uncached(text, content_type, config);
+    match &result {
+        DispatchResult::Compressed {
+            strategy,
+            compressed,
+        } => {
+            let ratio = compressed.len() as f64 / text.len() as f64;
+            cache.put(key, compressed, ratio, strategy);
+        }
+        DispatchResult::NoOp { .. } => cache.mark_skip(key),
+        // Transient by assumption — caching it would pin a failure for the TTL.
+        DispatchResult::Error { .. } => {}
+    }
+    result
+}
+
+fn dispatch_compressor_uncached(
+    text: &str,
+    content_type: ContentType,
+    config: &DispatchConfig,
+) -> DispatchResult {
     if text.is_empty() {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
@@ -1491,12 +1819,45 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
+        ContentType::StructuredConfig => {
+            // Byte-reversible fold only: `compact_lossless` self-verifies the
+            // round-trip and returns the input unchanged when it cannot, so a
+            // config block is never mangled — at worst it passes through.
+            let compressed = super::lossless_compaction::compact_lossless(text, "config");
+            if compressed.len() >= text.len() {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
+            }
+            DispatchResult::Compressed {
+                strategy: STRATEGY_CONFIG_LOSSLESS,
+                compressed,
+            }
+        }
+        ContentType::PlainText if super::content_router::kompress_size_gate_exceeded(text) => {
+            // Size gate (#1171). ONNX inference is O(tokens) and runs
+            // synchronously on the request thread; on a large or cold context
+            // it blows the request budget and leaks a worker that cannot be
+            // preempted. This is the ML boundary the live-zone path actually
+            // uses, so the ceiling has to be enforced here — gating only
+            // `content_router::try_kompress` would leave this path unprotected.
+            super::observability::observe_kompress_size_gate("exceeded");
+            tracing::info!(
+                approx_tokens = text.len() / 4,
+                ceiling = super::content_router::kompress_max_tokens(),
+                "kompress size-gate fired; skipping ML for this block"
+            );
+            DispatchResult::NoOp {
+                content_type: content_type.as_str(),
+            }
+        }
         ContentType::PlainText => match kompress() {
             // Cache-only model present → let it score the prose. Passes
             // through (NoOp) when the model keeps everything or the input is
             // too short (engine returns the input unchanged).
             Some(model) => {
-                let result = model.compress(text);
+                super::observability::observe_kompress_size_gate("within");
+                let result = model.compress_with_ratio(text, config.target_ratio);
                 if result.compressed == text {
                     return DispatchResult::NoOp {
                         content_type: content_type.as_str(),
@@ -1518,6 +1879,10 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
         ContentType::Html => DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+        },
+        // Tabular data: treat like plain text — Kompress passthrough.
+        ContentType::Tabular => DispatchResult::NoOp {
             content_type: content_type.as_str(),
         },
     }
@@ -2100,6 +2465,7 @@ pub fn compress_openai_chat_live_zone(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C2: no CCR store yet on the OpenAI path.
+            &DispatchConfig::default(),
         );
         block_outcomes.push(outcome);
     }
@@ -2610,6 +2976,7 @@ pub fn compress_openai_responses_live_zone(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C3: no CCR store on the Responses path yet.
+            &DispatchConfig::default(),
         );
         block_outcomes.push(outcome);
     }
@@ -3109,5 +3476,219 @@ mod openai_responses_tests {
             summarize_openai_responses_no_change_reason(&manifest),
             "below_output_floor"
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_cache_tests {
+    use super::*;
+
+    /// A log payload the log compressor reliably shrinks.
+    fn sample_log() -> String {
+        (0..40)
+            .map(|i| format!("2026-07-27T10:00:{i:02}Z INFO worker handled request id={i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn compressed_of(result: &DispatchResult) -> Option<(&str, &str)> {
+        match result {
+            DispatchResult::Compressed {
+                strategy,
+                compressed,
+            } => Some((strategy, compressed.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The property that makes the memo safe to add to the hot path: a second
+    /// call returns exactly what an uncached call would.
+    #[test]
+    fn a_cache_hit_matches_the_uncached_result() {
+        let text = sample_log();
+        let config = DispatchConfig::default();
+
+        let uncached = dispatch_compressor_uncached(&text, ContentType::BuildOutput, &config);
+        // First call populates, second call reads back through the memo.
+        let _ = dispatch_compressor_with_config(&text, ContentType::BuildOutput, &config);
+        let hit = dispatch_compressor_with_config(&text, ContentType::BuildOutput, &config);
+
+        assert_eq!(compressed_of(&hit), compressed_of(&uncached));
+    }
+
+    /// `target_ratio` changes Kompress output, so it must not alias.
+    #[test]
+    fn the_key_separates_different_target_ratios() {
+        let text = sample_log();
+        let a = dispatch_cache_key(&text, ContentType::BuildOutput, Some(0.3));
+        let b = dispatch_cache_key(&text, ContentType::BuildOutput, Some(0.7));
+        let none = dispatch_cache_key(&text, ContentType::BuildOutput, None);
+
+        assert_ne!(a, b);
+        assert_ne!(a, none);
+        assert_ne!(b, none);
+    }
+
+    /// The same bytes routed as a different content type pick a different
+    /// compressor, so those must not share an entry either.
+    #[test]
+    fn the_key_separates_different_content_types() {
+        let text = sample_log();
+        assert_ne!(
+            dispatch_cache_key(&text, ContentType::BuildOutput, None),
+            dispatch_cache_key(&text, ContentType::PlainText, None),
+        );
+    }
+
+    #[test]
+    fn the_key_separates_different_content() {
+        assert_ne!(
+            dispatch_cache_key("alpha", ContentType::BuildOutput, None),
+            dispatch_cache_key("bravo", ContentType::BuildOutput, None),
+        );
+    }
+
+    /// Only strategies this module actually emits may be revived from a cache
+    /// entry; anything else must force a recompress rather than be leaked.
+    #[test]
+    fn only_known_strategies_are_interned() {
+        for known in [
+            STRATEGY_SMART_CRUSHER,
+            STRATEGY_LOG_COMPRESSOR,
+            STRATEGY_SEARCH_COMPRESSOR,
+            STRATEGY_DIFF_COMPRESSOR,
+            STRATEGY_CODE_COMPRESSOR,
+            STRATEGY_CONFIG_LOSSLESS,
+            STRATEGY_KOMPRESS,
+        ] {
+            assert_eq!(intern_dispatch_strategy(known), Some(known));
+        }
+        assert_eq!(
+            intern_dispatch_strategy("strategy_from_a_future_version"),
+            None
+        );
+        assert_eq!(intern_dispatch_strategy(""), None);
+    }
+
+    /// Empty input short-circuits before the cache is touched.
+    #[test]
+    fn empty_content_is_a_noop_without_caching() {
+        let result = dispatch_compressor_with_config(
+            "",
+            ContentType::BuildOutput,
+            &DispatchConfig::default(),
+        );
+        assert!(matches!(result, DispatchResult::NoOp { .. }));
+    }
+
+    /// A declined block is remembered as a skip, and replaying it still reports
+    /// NoOp rather than resurrecting a bogus compressed result.
+    #[test]
+    fn a_declined_block_stays_declined() {
+        // Html has no compressor, so dispatch always declines it.
+        let text = "<p>hello</p>";
+        let config = DispatchConfig::default();
+
+        let first = dispatch_compressor_with_config(text, ContentType::Html, &config);
+        let second = dispatch_compressor_with_config(text, ContentType::Html, &config);
+
+        assert!(matches!(first, DispatchResult::NoOp { .. }));
+        assert!(matches!(second, DispatchResult::NoOp { .. }));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_cache_kompress_flag_tests {
+    use super::*;
+
+    /// Regression: `set_kompress_enabled` is a runtime toggle that changes what
+    /// dispatch produces for `PlainText`. It is not a function argument, so it
+    /// has to be folded into the key explicitly — otherwise a result computed
+    /// while Kompress was off would be replayed after it was switched on.
+    #[test]
+    fn the_key_separates_the_kompress_enabled_flag() {
+        let text = "some plain prose that kompress would consider compressing";
+        let before = set_kompress_enabled_for_test(false);
+        let key_disabled = dispatch_cache_key(text, ContentType::PlainText, None);
+        set_kompress_enabled_for_test(true);
+        let key_enabled = dispatch_cache_key(text, ContentType::PlainText, None);
+        set_kompress_enabled_for_test(before);
+
+        assert_ne!(key_disabled, key_enabled);
+    }
+
+    /// Sets the flag and returns its previous value, so a test can restore it.
+    fn set_kompress_enabled_for_test(enabled: bool) -> bool {
+        KOMPRESS_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod live_zone_size_gate_tests {
+    use super::*;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct CeilingGuard(Option<String>);
+
+    impl CeilingGuard {
+        fn set(value: &str) -> Self {
+            let prior = std::env::var("HEADROOM_KOMPRESS_MAX_TOKENS").ok();
+            std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", value);
+            Self(prior)
+        }
+    }
+
+    impl Drop for CeilingGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", v),
+                None => std::env::remove_var("HEADROOM_KOMPRESS_MAX_TOKENS"),
+            }
+        }
+    }
+
+    /// The gate has to live on the path the proxy actually uses. `live_zone`
+    /// dispatch is that path — `content_router::apply_strategy` is not called
+    /// by the proxy at all, so gating only there protects nothing in
+    /// production.
+    #[test]
+    fn an_oversized_plaintext_block_never_reaches_ml() {
+        let _lock = env_lock();
+        let _guard = CeilingGuard::set("10");
+
+        // 41 chars > 10 tokens * 4.
+        let text = "x".repeat(41);
+        let result =
+            dispatch_compressor_uncached(&text, ContentType::PlainText, &DispatchConfig::default());
+
+        assert!(
+            matches!(result, DispatchResult::NoOp { .. }),
+            "an oversized block must be skipped without reaching the model"
+        );
+    }
+
+    /// Exactly at the ceiling is within it — the comparison is strictly
+    /// greater-than, matching Python.
+    #[test]
+    fn a_block_at_the_ceiling_is_not_gated() {
+        let _lock = env_lock();
+        let _guard = CeilingGuard::set("10");
+
+        assert!(!super::super::content_router::kompress_size_gate_exceeded(&"x".repeat(40)));
+        assert!(super::super::content_router::kompress_size_gate_exceeded(&"x".repeat(41)));
+    }
+
+    /// A zero ceiling disables the gate, so even a huge block takes the normal
+    /// path (which then passes through when no model is cached).
+    #[test]
+    fn a_zero_ceiling_disables_the_gate_here_too() {
+        let _lock = env_lock();
+        let _guard = CeilingGuard::set("0");
+
+        assert!(!super::super::content_router::kompress_size_gate_exceeded(&"x".repeat(1_000_000)));
     }
 }

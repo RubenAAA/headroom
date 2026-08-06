@@ -57,10 +57,13 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     tracker.notify_active("")
     tracker.notify_active("Basic token")
     tracker.notify_active("Bearer sk-ant-api-key")
-    assert tracker._current_token is None
+    assert tracker._current_token_id is None
 
     tracker.notify_active("Bearer oauth-token-123")
-    assert tracker._current_token == "oauth-token-123"
+    # PR-F3: only a one-way hash + last-4 is retained, never the raw bearer.
+    assert tracker._current_token_id.startswith("sha256:")
+    assert tracker._current_token_id.endswith("-123")
+    assert "oauth-token" not in tracker._current_token_id
     assert tracker._full_tokens["oauth-to"] == 1
     assert tracker.is_active() is True
 
@@ -187,7 +190,10 @@ async def test_maybe_poll_success_updates_state_and_metrics(
 ) -> None:
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer live-oauth-token")
+    # PR-F3: polling reads the token from the credentials file, not memory.
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "live-oauth-token"
+    )
 
     snapshot = _make_snapshot()
     discrepancies = [WindowDiscrepancy(kind="cache_miss", description="miss", severity="warning")]
@@ -233,7 +239,9 @@ async def test_maybe_poll_runs_transcript_scan_off_event_loop(
     multi-second ~/.claude/projects scan wedges the proxy every poll interval."""
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer live-oauth-token")
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "live-oauth-token"
+    )
 
     snapshot = _make_snapshot()
 

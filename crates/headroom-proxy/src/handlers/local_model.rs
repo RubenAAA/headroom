@@ -71,8 +71,9 @@ fn generate_traceparent() -> String {
 /// Last `x-codex-turn-state` value per session key. The codex backend uses
 /// this for sticky routing within a turn; the real CLI echoes it back on
 /// follow-up requests, so we do the same across our stateless proxy calls.
-static CODEX_TURN_STATE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-    std::sync::OnceLock::new();
+static CODEX_TURN_STATE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
 
 fn turn_state_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     CODEX_TURN_STATE.get_or_init(Default::default)
@@ -83,7 +84,8 @@ fn turn_state_map() -> &'static std::sync::Mutex<std::collections::HashMap<Strin
 /// replays these in the next request's `input` so the model resumes its chain
 /// of thought across tool calls; Claude Code's history can't carry them, so
 /// we cache proxy-side and re-inject during translation.
-type ReasoningCache = std::collections::HashMap<String, std::collections::HashMap<String, Vec<Value>>>;
+type ReasoningCache =
+    std::collections::HashMap<String, std::collections::HashMap<String, Vec<Value>>>;
 
 static CODEX_REASONING_CACHE: std::sync::OnceLock<std::sync::Mutex<ReasoningCache>> =
     std::sync::OnceLock::new();
@@ -362,7 +364,11 @@ fn apply_ctx_request_transforms(
         compute_structural_hash, derive_session_key, observe_drift, ApiKind,
     };
 
-    let session_key = derive_session_key(headers, client_addr);
+    // Derived from the body as received — this runs before any transform
+    // mutates `parsed`, which matters because `derive_session_key`
+    // fingerprints the conversation's first message when no
+    // `x-headroom-session-id` header is present.
+    let session_key = derive_session_key(headers, client_addr, parsed, ApiKind::Anthropic);
 
     // Observe cache-prefix drift on the incoming body (before any transform),
     // matching the Claude path's ordering. Runs unconditionally so the
@@ -768,8 +774,7 @@ pub async fn handle_messages(
                 if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed && is_chatgpt_auth {
                     if let Some(auth_file) = state.config.codex_auth_file.as_deref() {
                         if let Some(token) = refresh_codex_token(&state.client, auth_file).await {
-                            if let Ok(val) =
-                                http::HeaderValue::from_str(&format!("Bearer {token}"))
+                            if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}"))
                             {
                                 upstream_headers.insert(http::header::AUTHORIZATION, val);
                             }
@@ -779,9 +784,7 @@ pub async fn handle_messages(
                     }
                     break r;
                 }
-                if (status.as_u16() == 429 || status.is_server_error())
-                    && attempt < MAX_ATTEMPTS
-                {
+                if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_ATTEMPTS {
                     let retry_after = r
                         .headers()
                         .get(http::header::RETRY_AFTER)
@@ -806,8 +809,7 @@ pub async fn handle_messages(
             }
             Err(e) => {
                 if attempt < MAX_ATTEMPTS {
-                    let backoff =
-                        std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1));
+                    let backoff = std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1));
                     tracing::warn!(
                         event = "local_model_upstream_retry",
                         error = %e,
@@ -1045,9 +1047,8 @@ fn anthropic_to_openai_responses_request(
                     // inherit the session's permission mode instead of
                     // getting an explicit override.
                     if name == "Agent" {
-                        if let Some(props) = params
-                            .get_mut("properties")
-                            .and_then(|p| p.as_object_mut())
+                        if let Some(props) =
+                            params.get_mut("properties").and_then(|p| p.as_object_mut())
                         {
                             props.remove("mode");
                         }
@@ -1119,8 +1120,7 @@ fn anthropic_to_openai_responses_request(
             // `summary: auto` + sequential delivery makes the backend stream
             // reasoning summaries, which we translate into thinking blocks.
             openai["reasoning"] = json!({"effort": effort, "summary": "auto"});
-            openai["stream_options"] =
-                json!({"reasoning_summary_delivery": "sequential_cutoff"});
+            openai["stream_options"] = json!({"reasoning_summary_delivery": "sequential_cutoff"});
         }
     }
     // Stable per-session cache key enables upstream prompt caching; Claude
@@ -1975,7 +1975,8 @@ async fn handle_streaming_response(upstream_resp: reqwest::Response, original: &
         .map(String::from);
 
     let stream = upstream_resp.bytes_stream();
-    let translated_stream = translate_openai_stream_to_anthropic(stream, original_model, session_key);
+    let translated_stream =
+        translate_openai_stream_to_anthropic(stream, original_model, session_key);
 
     let body = axum::body::Body::from_stream(translated_stream);
 
@@ -2295,9 +2296,7 @@ impl StreamTranslator {
             }
             "response.output_item.added" => {
                 let item = chunk.get("item");
-                let item_type = item
-                    .and_then(|i| i.get("type"))
-                    .and_then(|t| t.as_str());
+                let item_type = item.and_then(|i| i.get("type")).and_then(|t| t.as_str());
                 if item_type == Some("function_call") {
                     if self.in_thinking_block {
                         events.push(self.emit_content_block_stop());
@@ -2388,8 +2387,10 @@ impl StreamTranslator {
                     }
                     // Ground-truth cache effectiveness: how many input tokens
                     // the codex backend served from its prompt cache this turn.
-                    let input_tokens =
-                        usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let cached = usage
                         .get("input_tokens_details")
                         .and_then(|d| d.get("cached_tokens"))
@@ -2789,8 +2790,8 @@ mod tests {
     #[test]
     fn reasoning_items_round_trip_through_cache() {
         let session = "test-reasoning-session";
-        let mut t =
-            StreamTranslator::new("claude-codex-5.6".to_string()).with_session_key(Some(session.to_string()));
+        let mut t = StreamTranslator::new("claude-codex-5.6".to_string())
+            .with_session_key(Some(session.to_string()));
         for (event, data) in [
             (
                 "response.output_item.done",
@@ -2867,12 +2868,16 @@ mod tests {
             ]
         });
         let cfg = crate::compression::ctx_offload::CtxOffloadConfig { min_bytes: 50_000 };
-        let out = crate::compression::ctx_offload::offload_anthropic_request(&mut parsed, &cfg, None);
+        let out =
+            crate::compression::ctx_offload::offload_anthropic_request(&mut parsed, &cfg, None);
         assert!(out.changed(), "expected a large tool_result to offload");
         let translated = anthropic_to_openai_responses_request(&parsed, false).unwrap();
         let serialized = serde_json::to_string(&translated).unwrap();
         assert!(!serialized.contains(&big), "raw payload must not survive");
-        assert!(serialized.contains("headroom ctx get"), "digest pointer expected");
+        assert!(
+            serialized.contains("headroom ctx get"),
+            "digest pointer expected"
+        );
     }
 
     #[test]
@@ -2995,7 +3000,10 @@ mod tests {
         let mut t = StreamTranslator::new("claude-codex-5.6".to_string());
         let mut all = String::new();
         for (event, data) in [
-            ("response.created", r#"{"response":{"model":"gpt-5.6-terra"}}"#),
+            (
+                "response.created",
+                r#"{"response":{"model":"gpt-5.6-terra"}}"#,
+            ),
             (
                 "response.output_item.added",
                 r#"{"item":{"type":"function_call","call_id":"call_1","name":"Bash","arguments":""}}"#,

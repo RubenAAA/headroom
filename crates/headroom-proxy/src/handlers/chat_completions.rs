@@ -51,6 +51,76 @@ use std::net::SocketAddr;
 
 use crate::proxy::{forward_http, AppState};
 
+/// Translate the legacy OpenAI `max_tokens` field to
+/// `max_completion_tokens` in a buffered chat-completions body.
+///
+/// GPT-5 / o-series chat models REJECT `max_tokens`
+/// ("Unsupported parameter … Use 'max_completion_tokens' instead");
+/// gpt-4o/4.1 accept `max_completion_tokens` too. openai-compatible
+/// clients (opencode, older SDKs) still send `max_tokens`, so translate
+/// it here — the proxy already owns the outbound body — and those
+/// requests work unchanged. The rename is one-way and safe for current
+/// OpenAI models; it is a no-op when the caller already set
+/// `max_completion_tokens`, when there is no `max_tokens`, or when the
+/// body is not a JSON object. On any parse/serialize failure the
+/// original bytes are returned untouched so the passthrough invariant
+/// holds.
+pub(crate) fn normalize_openai_max_tokens(body: Bytes) -> Bytes {
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let Some(obj) = parsed.as_object_mut() else {
+        return body;
+    };
+    if !obj.contains_key("max_tokens") {
+        return body;
+    }
+    let legacy = obj.remove("max_tokens");
+    if let Some(legacy) = legacy {
+        // Preserve an already-set `max_completion_tokens`; only fill it
+        // from the legacy key when absent or explicitly null.
+        let needs_fill = matches!(
+            obj.get("max_completion_tokens"),
+            None | Some(serde_json::Value::Null)
+        );
+        if !legacy.is_null() && needs_fill {
+            obj.insert("max_completion_tokens".to_string(), legacy);
+        }
+    }
+    match serde_json::to_vec(&parsed) {
+        Ok(v) => Bytes::from(v),
+        Err(_) => body,
+    }
+}
+
+/// Rate-limit check: extracts the API key from `Authorization` header
+/// and checks against the per-key token bucket. Returns 429 when denied.
+pub(crate) fn check_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let limiter = state.rate_limiter.as_ref()?;
+    let key = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anonymous")
+        .to_string();
+    let result = limiter.check_request(&key);
+    if result.allowed {
+        None
+    } else {
+        let wait = std::time::Duration::from_secs_f64(result.wait_seconds);
+        Some(
+            Response::builder()
+                .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", format!("{:.0}", wait.as_secs()))
+                .body(Body::from(format!(
+                    "rate limit exceeded; retry after {:.1}s",
+                    result.wait_seconds
+                )))
+                .expect("static response"),
+        )
+    }
+}
+
 /// Axum POST handler for `/v1/chat/completions`. Buffers the body,
 /// stitches a fresh `Request<Body>` together, and forwards via
 /// [`forward_http`]. Compression dispatch + SSE telemetry is handled
@@ -63,6 +133,17 @@ pub async fn handle_chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Rate-limit gate: check before buffering the body.
+    if let Some(rejected) = check_rate_limit(&state, &headers) {
+        return rejected;
+    }
+
+    // Compatibility shim: GPT-5 / o-series chat models reject the legacy
+    // `max_tokens`; translate it to `max_completion_tokens` before
+    // forwarding. Runs on the always-buffered chat body regardless of
+    // whether compression later intercepts it downstream.
+    let body = normalize_openai_max_tokens(body);
+
     // Reconstruct the Request<Body> shape forward_http expects.
     // Cloning the headers into a fresh builder keeps the original
     // method/uri/version intact. `axum::body::Body::from(Bytes)` is
@@ -97,4 +178,55 @@ pub async fn handle_chat_completions(
             use axum::response::IntoResponse;
             e.into_response()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn norm(v: Value) -> Value {
+        let out = normalize_openai_max_tokens(Bytes::from(serde_json::to_vec(&v).unwrap()));
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn renames_legacy_max_tokens() {
+        let out = norm(json!({"model": "gpt-5", "max_tokens": 256}));
+        assert_eq!(out.get("max_tokens"), None);
+        assert_eq!(out["max_completion_tokens"], json!(256));
+    }
+
+    #[test]
+    fn keeps_existing_max_completion_tokens_and_drops_legacy() {
+        let out = norm(json!({"max_tokens": 256, "max_completion_tokens": 512}));
+        assert_eq!(out.get("max_tokens"), None);
+        assert_eq!(out["max_completion_tokens"], json!(512));
+    }
+
+    #[test]
+    fn noop_without_max_tokens() {
+        let out = norm(json!({"model": "gpt-4o", "max_completion_tokens": 128}));
+        assert_eq!(out.get("max_tokens"), None);
+        assert_eq!(out["max_completion_tokens"], json!(128));
+    }
+
+    #[test]
+    fn null_legacy_drops_without_filling() {
+        let out = norm(json!({"max_tokens": Value::Null}));
+        assert_eq!(out.get("max_tokens"), None);
+        assert_eq!(out.get("max_completion_tokens"), None);
+    }
+
+    #[test]
+    fn non_object_body_untouched() {
+        let bytes = Bytes::from_static(b"[1,2,3]");
+        assert_eq!(normalize_openai_max_tokens(bytes.clone()), bytes);
+    }
+
+    #[test]
+    fn invalid_json_untouched() {
+        let bytes = Bytes::from_static(b"not json");
+        assert_eq!(normalize_openai_max_tokens(bytes.clone()), bytes);
+    }
 }

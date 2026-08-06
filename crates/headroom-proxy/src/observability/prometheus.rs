@@ -282,6 +282,9 @@ pub async fn handle_metrics() -> Response {
     super::ctx_metrics::recall_injections_get(reg);
     super::ctx_metrics::search_queries_get(reg);
 
+    // General proxy counters: force-touch so HELP/TYPE appears on fresh boot.
+    super::proxy_counters::force_register_all(reg);
+
     let metric_families = registry().gather();
     let mut buffer = Vec::with_capacity(2048);
     let encoder = TextEncoder::new();

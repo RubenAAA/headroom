@@ -155,13 +155,18 @@ fn lookup_hf(model: &str) -> Option<HfTokenizer> {
         .map(|(_, t)| t.clone())
 }
 
+/// Test-only helpers shared by every module whose tests touch the
+/// process-global HF table (this file and `mistral.rs`). `cargo test` runs
+/// tests in parallel, including across modules, so all of them must
+/// serialize behind the same mutex — a per-module lock would let one
+/// module's `clear` wipe another module's registrations mid-assertion.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::clear_hf_registrations;
 
     /// Same minimal tokenizer.json used by hf_impl tests; inlined here so we
     /// can register it without depending on a fixture file.
-    const TINY_TOKENIZER_JSON: &str = r#"{
+    pub(crate) const TINY_TOKENIZER_JSON: &str = r#"{
         "version": "1.0",
         "truncation": null,
         "padding": null,
@@ -177,21 +182,13 @@ mod tests {
         }
     }"#;
 
-    fn tiny(name: &str) -> HfTokenizer {
-        HfTokenizer::from_bytes(name, TINY_TOKENIZER_JSON.as_bytes()).unwrap()
-    }
-
-    /// Tests share a process-global table. `cargo test` runs them in parallel
-    /// by default, so without serialization one test's `clear` would wipe
-    /// another test's registrations mid-assertion. We serialize the tests
-    /// that touch the registry behind a single mutex.
     static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct RegistryGuard<'a> {
+    pub(crate) struct RegistryGuard<'a> {
         _g: std::sync::MutexGuard<'a, ()>,
     }
     impl<'a> RegistryGuard<'a> {
-        fn acquire() -> Self {
+        pub(crate) fn acquire() -> Self {
             // Recover from a poisoned lock — a panic in one test should not
             // break every subsequent test in the file.
             let g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -203,6 +200,16 @@ mod tests {
         fn drop(&mut self) {
             clear_hf_registrations();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{RegistryGuard, TINY_TOKENIZER_JSON};
+    use super::*;
+
+    fn tiny(name: &str) -> HfTokenizer {
+        HfTokenizer::from_bytes(name, TINY_TOKENIZER_JSON.as_bytes()).unwrap()
     }
 
     #[test]

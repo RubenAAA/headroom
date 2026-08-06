@@ -146,6 +146,15 @@ pub(crate) async fn forward_vertex_request(
             headroom_core::auth_mode::AuthMode::OAuth,
             &request_id,
         );
+        // Cross-turn verbatim de-dup post-pass (no-op unless
+        // `--enable-cross-turn-dedup` is set).
+        let outcome = compression::apply_cross_turn_dedup(
+            outcome,
+            &buffered,
+            &state.config,
+            "/vertex/rawPredict",
+            &request_id,
+        );
         match outcome {
             compression::Outcome::NoCompression => {
                 tracing::info!(
@@ -265,6 +274,8 @@ pub(crate) async fn forward_vertex_request(
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("http");
+    // PR-F4 (P5-53): Vertex is always ADC/OAuth downstream (see the
+    // compression call above), and OAuth keeps X-Forwarded-* per spec.
     let mut outgoing_headers = build_forward_request_headers(
         &headers,
         client_addr.ip(),
@@ -272,6 +283,7 @@ pub(crate) async fn forward_vertex_request(
         forwarded_host.as_deref(),
         &request_id,
         strip_internal,
+        headroom_core::auth_mode::AuthMode::OAuth,
     );
     if !state.config.rewrite_host {
         if let Some(h) = headers.get(http::header::HOST) {

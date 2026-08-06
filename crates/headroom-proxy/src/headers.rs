@@ -2,8 +2,92 @@
 //!
 //! Hop-by-hop headers per RFC 7230 §6.1 must not be forwarded.
 
+use headroom_core::auth_mode::AuthMode;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
+use std::collections::HashMap;
 use std::net::IpAddr;
+
+/// Return true when inbound headers request full Headroom passthrough.
+///
+/// Checks `x-headroom-bypass: true` or `x-headroom-mode: passthrough`
+/// (case-insensitive value match). Port of Python
+/// `helpers._headroom_bypass_enabled`. Non-UTF-8 header values are treated
+/// as absent.
+pub fn headroom_bypass_enabled(headers: &HeaderMap) -> bool {
+    let val = |name: &str| -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_ascii_lowercase())
+    };
+    let bypass = val("x-headroom-bypass").as_deref() == Some("true");
+    let passthrough = val("x-headroom-mode").as_deref() == Some("passthrough");
+    bypass || passthrough
+}
+
+/// Extract `x-headroom-*` tags from inbound headers into a map with the
+/// `x-headroom-` prefix stripped (lowercased key). Port of Python
+/// `helpers.extract_tags`. Pure function, no I/O. Non-UTF-8 header values are
+/// skipped.
+pub fn extract_tags(headers: &HeaderMap) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_ascii_lowercase();
+        if let Some(stripped) = key.strip_prefix(INTERNAL_HEADER_PREFIX) {
+            if let Ok(v) = value.to_str() {
+                out.insert(stripped.to_string(), v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Split a comma-separated beta-header value into trimmed, non-empty tokens.
+/// Port of Python `helpers._split_beta_tokens`.
+fn split_beta_tokens(value: Option<&str>) -> Vec<&str> {
+    match value {
+        None => Vec::new(),
+        Some(v) => v
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    }
+}
+
+/// Deterministic merge for `anthropic-beta` / `OpenAI-Beta` tokens.
+///
+/// Port of Python `helpers._merge_beta_tokens`. Client tokens come first in
+/// original order; `headroom_required` tokens append in order, skipping any
+/// already present. Dedupe is case-insensitive but the FIRST occurrence's
+/// casing wins. Returns `""` when both inputs are empty.
+pub fn merge_beta_tokens(client_value: Option<&str>, headroom_required: &[&str]) -> String {
+    let mut seen_lower = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for token in split_beta_tokens(client_value) {
+        let lower = token.to_ascii_lowercase();
+        if seen_lower.insert(lower) {
+            out.push(token.to_string());
+        }
+    }
+    for token in headroom_required {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if seen_lower.insert(lower) {
+            out.push(token.to_string());
+        }
+    }
+    out.join(",")
+}
+
+/// Merge client `anthropic-beta` value with Headroom-required tokens. Thin
+/// wrapper over [`merge_beta_tokens`] mirroring `helpers.merge_anthropic_beta`.
+pub fn merge_anthropic_beta(client_value: Option<&str>, headroom_required: &[&str]) -> String {
+    merge_beta_tokens(client_value, headroom_required)
+}
 
 /// Hop-by-hop header names that must be stripped (RFC 7230 §6.1).
 /// Note: `Upgrade` is hop-by-hop in general, but for WebSocket the upgrade is
@@ -33,6 +117,14 @@ const CLIENT_MANAGED: &[&str] = &["host", "content-length"];
 /// is intentionally untouched — that direction is the proxy describing its
 /// own work to the client and never crosses an upstream boundary.
 pub const INTERNAL_HEADER_PREFIX: &str = "x-headroom-";
+
+/// Per-request upstream override header. When present (after trimming
+/// whitespace and stripping a trailing `/`), the proxy forwards this
+/// request to the given base URL instead of the configured upstream.
+/// Mirrors the Python proxy's `x-headroom-base-url` handling on the
+/// OpenAI-compatible, Anthropic Messages (`/v1/messages`), and generic
+/// passthrough routes.
+pub const UPSTREAM_OVERRIDE_HEADER: &str = "x-headroom-base-url";
 
 /// Returns true if `name` is hop-by-hop and must be stripped.
 pub fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -129,6 +221,11 @@ pub fn strip_internal_headers(headers: &mut HeaderMap) -> usize {
 ///     (PR-A5, fixes P5-49). Operators can disable via
 ///     `HEADROOM_PROXY_STRIP_INTERNAL_HEADERS=disabled` for diagnostic
 ///     shadow tracing.
+///
+/// PR-F4 (P5-53): the `X-Forwarded-*` / `X-Request-Id` injections are
+/// skipped for [`AuthMode::Subscription`] — synthetic proxy headers on
+/// subscription CLI traffic are a programmatic-fingerprint signal that
+/// risks account revocation. PAYG and OAuth keep them.
 pub fn build_forward_request_headers(
     incoming: &HeaderMap,
     client_addr: IpAddr,
@@ -136,6 +233,7 @@ pub fn build_forward_request_headers(
     forwarded_host: Option<&str>,
     request_id: &str,
     strip_internal: bool,
+    auth_mode: AuthMode,
 ) -> HeaderMap {
     let connection_listed = connection_listed_headers(incoming);
     let mut out = HeaderMap::new();
@@ -151,20 +249,22 @@ pub fn build_forward_request_headers(
         }
         out.append(name.clone(), value.clone());
     }
-    append_xff(&mut out, client_addr);
-    set_single(
-        &mut out,
-        HeaderName::from_static("x-forwarded-proto"),
-        forwarded_proto,
-    );
-    if let Some(host) = forwarded_host {
-        set_single(&mut out, HeaderName::from_static("x-forwarded-host"), host);
+    if auth_mode != AuthMode::Subscription {
+        append_xff(&mut out, client_addr);
+        set_single(
+            &mut out,
+            HeaderName::from_static("x-forwarded-proto"),
+            forwarded_proto,
+        );
+        if let Some(host) = forwarded_host {
+            set_single(&mut out, HeaderName::from_static("x-forwarded-host"), host);
+        }
+        set_single(
+            &mut out,
+            HeaderName::from_static("x-request-id"),
+            request_id,
+        );
     }
-    set_single(
-        &mut out,
-        HeaderName::from_static("x-request-id"),
-        request_id,
-    );
     out
 }
 
@@ -264,6 +364,7 @@ mod tests {
             Some("h"),
             "req-1",
             true,
+            AuthMode::Payg,
         );
         assert!(out.get("authorization").is_some());
         assert!(out.get("x-headroom-bypass").is_none());
@@ -281,8 +382,157 @@ mod tests {
             Some("h"),
             "req-1",
             false,
+            AuthMode::Payg,
         );
         assert!(out.get("authorization").is_some());
         assert!(out.get("x-headroom-bypass").is_some());
+    }
+
+    // ── PR-F4 (P5-53): X-Forwarded-* conditional on auth mode ────
+
+    fn forward_for_mode(auth_mode: AuthMode) -> HeaderMap {
+        let mut incoming = HeaderMap::new();
+        incoming.insert("authorization", HeaderValue::from_static("Bearer x"));
+        build_forward_request_headers(
+            &incoming,
+            "127.0.0.1".parse().unwrap(),
+            "http",
+            Some("h"),
+            "req-1",
+            true,
+            auth_mode,
+        )
+    }
+
+    #[test]
+    fn payg_adds_xfwd() {
+        let out = forward_for_mode(AuthMode::Payg);
+        assert!(out.get("x-forwarded-for").is_some());
+        assert!(out.get("x-forwarded-proto").is_some());
+        assert!(out.get("x-forwarded-host").is_some());
+        assert!(out.get("x-request-id").is_some());
+    }
+
+    #[test]
+    fn oauth_adds_xfwd() {
+        let out = forward_for_mode(AuthMode::OAuth);
+        assert!(out.get("x-forwarded-for").is_some());
+        assert!(out.get("x-forwarded-proto").is_some());
+        assert!(out.get("x-forwarded-host").is_some());
+        assert!(out.get("x-request-id").is_some());
+    }
+
+    #[test]
+    fn subscription_no_xfwd() {
+        let out = forward_for_mode(AuthMode::Subscription);
+        assert!(out.get("x-forwarded-for").is_none());
+        assert!(out.get("x-forwarded-proto").is_none());
+        assert!(out.get("x-forwarded-host").is_none());
+        assert!(out.get("x-request-id").is_none());
+        // Non-synthetic headers still forwarded.
+        assert!(out.get("authorization").is_some());
+    }
+
+    #[test]
+    fn subscription_preserves_client_sent_xff() {
+        // A client-sent X-Forwarded-For is forwarded as-is (copy loop);
+        // Subscription mode only skips APPENDING our own hop.
+        let mut incoming = HeaderMap::new();
+        incoming.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        let out = build_forward_request_headers(
+            &incoming,
+            "5.6.7.8".parse().unwrap(),
+            "http",
+            None,
+            "req-1",
+            true,
+            AuthMode::Subscription,
+        );
+        assert_eq!(out.get("x-forwarded-for").unwrap(), "1.2.3.4");
+    }
+
+    // ── headroom_bypass_enabled ──────────────────────────────────
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn test_headroom_bypass_helper_is_transport_neutral() {
+        assert!(headroom_bypass_enabled(&hm(&[(
+            "x-headroom-bypass",
+            "true"
+        )])));
+        assert!(headroom_bypass_enabled(&hm(&[(
+            "x-headroom-mode",
+            "passthrough"
+        )])));
+        assert!(headroom_bypass_enabled(&hm(&[(
+            "x-headroom-bypass",
+            "TRUE"
+        )])));
+        assert!(!headroom_bypass_enabled(&hm(&[("x-headroom-bypass", "1")])));
+        assert!(!headroom_bypass_enabled(&HeaderMap::new()));
+    }
+
+    // ── extract_tags ─────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_tags_strips_prefix_and_lowercases_key() {
+        let h = hm(&[
+            ("x-headroom-client", "codex"),
+            ("X-Headroom-Project", "acme"),
+            ("authorization", "Bearer x"),
+        ]);
+        let tags = extract_tags(&h);
+        assert_eq!(tags.get("client").map(String::as_str), Some("codex"));
+        assert_eq!(tags.get("project").map(String::as_str), Some("acme"));
+        assert!(!tags.contains_key("authorization"));
+        assert_eq!(tags.len(), 2);
+    }
+
+    // ── merge_beta_tokens / merge_anthropic_beta ─────────────────
+
+    #[test]
+    fn test_merge_helper_empty_inputs_returns_empty_string() {
+        assert_eq!(merge_beta_tokens(None, &[]), "");
+        assert_eq!(merge_beta_tokens(Some(""), &[]), "");
+    }
+
+    #[test]
+    fn test_merge_helper_only_client() {
+        assert_eq!(merge_beta_tokens(Some("a,b"), &[]), "a,b");
+    }
+
+    #[test]
+    fn test_merge_helper_only_headroom() {
+        assert_eq!(merge_beta_tokens(None, &["a", "b"]), "a,b");
+    }
+
+    #[test]
+    fn test_merge_helper_preserves_client_order_and_appends_headroom() {
+        assert_eq!(merge_beta_tokens(Some("z,a"), &["a", "m"]), "z,a,m");
+    }
+
+    #[test]
+    fn test_dedupe_case_insensitive_preserves_first_casing() {
+        assert_eq!(merge_beta_tokens(Some("Foo"), &["foo", "bar"]), "Foo,bar");
+    }
+
+    #[test]
+    fn test_merge_helper_skips_empty_tokens() {
+        assert_eq!(merge_beta_tokens(Some("a,,b, ,c"), &["", " "]), "a,b,c");
+    }
+
+    #[test]
+    fn test_merge_helper_no_double_inject_when_already_present() {
+        assert_eq!(merge_anthropic_beta(Some("a,b"), &["b"]), "a,b");
     }
 }

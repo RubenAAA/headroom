@@ -70,7 +70,11 @@ pub fn build_resume_snapshot(events: &[StoredEvent], compact_count: u64) -> Stri
 pub fn build_recall(hits: &[SearchHit], queries: &[String]) -> String {
     let mut lines = String::new();
     for hit in hits.iter().take(MAX_PER_SECTION) {
-        lines.push_str(&format!("- [{}] {}\n", hit.source, one_line(&hit.content, 200)));
+        lines.push_str(&format!(
+            "- [{}] {}\n",
+            hit.source,
+            one_line(&hit.content, 200)
+        ));
     }
     let body = if lines.is_empty() {
         "(no prior context found)".to_string()
@@ -152,7 +156,10 @@ fn render_recent_user_messages(events: &[StoredEvent]) -> Option<String> {
 
     let mut lines = String::new();
     for e in &msgs {
-        lines.push_str(&format!("- {}\n", one_line(&e.data, RECENT_MESSAGE_MAX_CHARS)));
+        lines.push_str(&format!(
+            "- {}\n",
+            one_line(&e.data, RECENT_MESSAGE_MAX_CHARS)
+        ));
     }
     Some(format!(
         "<recent_user_messages>\n{}</recent_user_messages>",

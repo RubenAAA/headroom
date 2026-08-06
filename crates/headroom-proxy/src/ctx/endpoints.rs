@@ -146,8 +146,12 @@ async fn handle_get(
     let ccr = store.ccr();
     let content = tokio::task::spawn_blocking(move || ccr.get(&hash_str))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // PR-J5: retrieval hit/miss counters. A miss is an information-loss
+    // signal (expired/evicted offload original) — count before returning 404.
+    crate::observability::ctx_metrics::observe_retrieval(content.is_some());
+    let content = content.ok_or(StatusCode::NOT_FOUND)?;
 
     let bytes = content.len();
     Ok(Json(GetResponse {
@@ -235,18 +239,13 @@ async fn handle_fetch(
     let content = store.content();
 
     let ttl = req.ttl.map(std::time::Duration::from_secs);
-    let result = super::fetch::fetch_and_index(
-        &req.url,
-        req.source.as_deref(),
-        &content,
-        req.force,
-        ttl,
-    )
-    .await
-    .map_err(|e| {
-        tracing::warn!(event = "ctx_fetch_failed", error = %e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    let result =
+        super::fetch::fetch_and_index(&req.url, req.source.as_deref(), &content, req.force, ttl)
+            .await
+            .map_err(|e| {
+                tracing::warn!(event = "ctx_fetch_failed", error = %e);
+                StatusCode::BAD_GATEWAY
+            })?;
 
     Ok(Json(FetchResponse {
         label: result.label,
@@ -265,12 +264,12 @@ struct StatsResponse {
     offloaded_blocks: u64,
     recall_injections: u64,
     search_queries: u64,
+    retrieval_hits: u64,
+    retrieval_misses: u64,
     ccr_entries: usize,
 }
 
-async fn handle_stats(
-    State(state): State<AppState>,
-) -> Result<Json<StatsResponse>, StatusCode> {
+async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, StatusCode> {
     let store = clone_store(&state)?;
 
     let ccr = store.ccr();
@@ -283,12 +282,16 @@ async fn handle_stats(
     let offloaded_blocks = crate::observability::ctx_metrics::offloaded_blocks_get(registry);
     let recall_injections = crate::observability::ctx_metrics::recall_injections_get(registry);
     let search_queries = crate::observability::ctx_metrics::search_queries_get(registry);
+    let retrieval_hits = crate::observability::ctx_metrics::retrieval_hits_get(registry);
+    let retrieval_misses = crate::observability::ctx_metrics::retrieval_misses_get(registry);
 
     Ok(Json(StatsResponse {
         offloaded_bytes,
         offloaded_blocks,
         recall_injections,
         search_queries,
+        retrieval_hits,
+        retrieval_misses,
         ccr_entries,
     }))
 }
@@ -308,9 +311,7 @@ struct DoctorCheck {
     detail: String,
 }
 
-async fn handle_doctor(
-    State(state): State<AppState>,
-) -> Result<Json<DoctorResponse>, StatusCode> {
+async fn handle_doctor(State(state): State<AppState>) -> Result<Json<DoctorResponse>, StatusCode> {
     let mut checks = Vec::new();
 
     match state.ctx_offload.as_ref() {

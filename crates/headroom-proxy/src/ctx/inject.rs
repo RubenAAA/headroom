@@ -241,10 +241,8 @@ fn apply(parsed: &mut Value, decision: &Decision) -> bool {
     match msg.get_mut("content") {
         Some(Value::String(s)) => {
             let original = std::mem::take(s);
-            msg["content"] = Value::Array(vec![
-                injected,
-                json!({ "type": "text", "text": original }),
-            ]);
+            msg["content"] =
+                Value::Array(vec![injected, json!({ "type": "text", "text": original })]);
         }
         Some(Value::Array(blocks)) => {
             blocks.insert(0, injected);
@@ -297,7 +295,10 @@ mod tests {
         // The first user message is now an array whose first block is ours.
         let block0 = &r1["messages"][0]["content"][0];
         assert_eq!(block0["type"], "text");
-        assert!(block0["text"].as_str().unwrap().starts_with(INJECT_SENTINEL));
+        assert!(block0["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(INJECT_SENTINEL));
 
         // A second, later turn of the SAME conversation replays identical bytes.
         let injected_text = block0["text"].as_str().unwrap().to_string();
@@ -360,7 +361,12 @@ mod tests {
         eng.sessions.record_conversation("sk", prior).unwrap();
         eng.sessions
             .insert_event(&headroom_core::ctx::NewEvent::new(
-                prior, "intent", "intent", "implement the widget", 2, "ctx-observer",
+                prior,
+                "intent",
+                "intent",
+                "implement the widget",
+                2,
+                "ctx-observer",
             ))
             .unwrap();
 
@@ -373,7 +379,9 @@ mod tests {
             }]
         });
         assert!(eng.maybe_inject(&mut resume, "sk"));
-        let text = resume["messages"][0]["content"][0]["text"].as_str().unwrap();
+        let text = resume["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(text.contains("<session_resume"));
         assert!(text.contains("implement the widget"));
     }

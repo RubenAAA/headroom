@@ -213,9 +213,7 @@ impl CtxStore {
     /// endpoint.
     pub fn purge_all(&self) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().expect("ctx store mutex poisoned");
-        let chunks_deleted: usize = conn
-            .execute("DELETE FROM chunks", [])
-            .unwrap_or(0);
+        let chunks_deleted: usize = conn.execute("DELETE FROM chunks", []).unwrap_or(0);
         conn.execute("DELETE FROM chunks_trigram", [])?;
         conn.execute("DELETE FROM sources", [])?;
         conn.execute("DELETE FROM vocabulary", [])?;
@@ -227,9 +225,8 @@ impl CtxStore {
     /// CTX-5 fetch to check disk-cache freshness.
     pub fn source_meta(&self, label: &str) -> rusqlite::Result<Option<SourceMeta>> {
         let conn = self.conn.lock().expect("ctx store mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT chunk_count, indexed_at FROM sources WHERE label = ?1 LIMIT 1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT chunk_count, indexed_at FROM sources WHERE label = ?1 LIMIT 1")?;
         let mut rows = stmt.query_map(params![label], |row| {
             Ok(SourceMeta {
                 chunk_count: row.get(0)?,
@@ -317,11 +314,10 @@ impl CtxStore {
         // ISO-ish timestamp from SQLite so it matches the format TS wrote and
         // sorts lexicographically. Seconds precision (TS used millis) — same
         // ordering for our purposes.
-        let now: String = conn.query_row(
-            "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-            [],
-            |r| r.get(0),
-        )?;
+        let now: String =
+            conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| {
+                r.get(0)
+            })?;
 
         let tx = conn.transaction()?;
 
@@ -370,10 +366,22 @@ impl CtxStore {
                 for chunk in &chunks {
                     let ct = if chunk.has_code { "code" } else { "prose" };
                     ins_porter.execute(params![
-                        chunk.title, chunk.content, source_id, ct, session_id, event_id, now
+                        chunk.title,
+                        chunk.content,
+                        source_id,
+                        ct,
+                        session_id,
+                        event_id,
+                        now
                     ])?;
                     ins_trigram.execute(params![
-                        chunk.title, chunk.content, source_id, ct, session_id, event_id, now
+                        chunk.title,
+                        chunk.content,
+                        source_id,
+                        ct,
+                        session_id,
+                        event_id,
+                        now
                     ])?;
                 }
             }
@@ -407,7 +415,11 @@ impl CtxStore {
     /// RRF). Multiple queries are merged by `source::title` key (best rank
     /// wins), then sorted per `opts.sort`. A single query reproduces the TS
     /// `searchAllSources` ContentStore path exactly.
-    pub fn search(&self, queries: &[String], opts: &SearchOpts) -> rusqlite::Result<Vec<SearchHit>> {
+    pub fn search(
+        &self,
+        queries: &[String],
+        opts: &SearchOpts,
+    ) -> rusqlite::Result<Vec<SearchHit>> {
         let conn = self.conn.lock().expect("ctx store mutex poisoned");
 
         let mut merged: HashMap<String, SearchHit> = HashMap::new();
@@ -560,8 +572,10 @@ fn rrf_search(
         }
     }
 
-    let mut scored: Vec<(SearchHit, f64)> =
-        order.into_iter().filter_map(|k| score_map.remove(&k)).collect();
+    let mut scored: Vec<(SearchHit, f64)> = order
+        .into_iter()
+        .filter_map(|k| score_map.remove(&k))
+        .collect();
 
     // Sort by score descending. Rust's sort is stable, so equal scores keep
     // insertion order — matching the JS `.sort((a,b)=>b.score-a.score)` on a
@@ -615,8 +629,7 @@ fn fts_search(
          WHERE {t} MATCH ?1",
         t = table_name
     );
-    let mut vals: Vec<rusqlite::types::Value> =
-        vec![rusqlite::types::Value::Text(match_expr)];
+    let mut vals: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(match_expr)];
 
     let mut next_idx = 2;
     if let Some(src) = &opts.source {
@@ -786,8 +799,10 @@ fn apply_proximity_reranking(results: &mut [SearchHit], query: &str) {
             let mut phrase_boost = 0.0;
             if terms.len() >= 2 {
                 let content = r.content.to_lowercase();
-                let positions: Vec<Vec<usize>> =
-                    terms.iter().map(|t| find_all_positions(&content, t)).collect();
+                let positions: Vec<Vec<usize>> = terms
+                    .iter()
+                    .map(|t| find_all_positions(&content, t))
+                    .collect();
                 if !positions.iter().any(|p| p.is_empty()) {
                     let min_span = find_min_span(&positions);
                     proximity_boost = 1.0 / (1.0 + min_span as f64 / content.len().max(1) as f64);
@@ -933,7 +948,11 @@ pub fn sanitize_query(query: &str, or_mode: bool) -> String {
         .filter(|w| !is_stopword(&w.to_lowercase()))
         .cloned()
         .collect();
-    let final_words = if meaningful.is_empty() { words } else { meaningful };
+    let final_words = if meaningful.is_empty() {
+        words
+    } else {
+        meaningful
+    };
     join_quoted(&final_words, or_mode)
 }
 
@@ -943,7 +962,12 @@ pub fn sanitize_trigram_query(query: &str, or_mode: bool) -> String {
     // Remove ["'(){}[]*:^~] entirely (no space substitution), then trim.
     let cleaned: String = query
         .chars()
-        .filter(|c| !matches!(c, '"' | '\'' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | ':' | '^' | '~'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '"' | '\'' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | ':' | '^' | '~'
+            )
+        })
         .collect();
     let cleaned = cleaned.trim();
     if cleaned.chars().count() < 3 {
@@ -964,7 +988,11 @@ pub fn sanitize_trigram_query(query: &str, or_mode: bool) -> String {
         .filter(|w| !is_stopword(&w.to_lowercase()))
         .cloned()
         .collect();
-    let final_words = if meaningful.is_empty() { words } else { meaningful };
+    let final_words = if meaningful.is_empty() {
+        words
+    } else {
+        meaningful
+    };
     join_quoted(&final_words, or_mode)
 }
 
@@ -1254,11 +1282,7 @@ fn split_oversized_plain_chunk(
 /// Chunk plain (non-markdown) text. Tries a blank-line section strategy for
 /// naturally-sectioned output, else fixed-size line groups with 2-line overlap.
 /// Port of `#chunkPlainText` (store.ts:1858). All emitted chunks are `prose`.
-fn chunk_plain_text(
-    text: &str,
-    lines_per_chunk: usize,
-    max_chunk_bytes: usize,
-) -> Vec<Chunk> {
+fn chunk_plain_text(text: &str, lines_per_chunk: usize, max_chunk_bytes: usize) -> Vec<Chunk> {
     // Blank-line splitting: \n\s*\n (a newline, optional inline whitespace, newline).
     let sections = split_blank_line_sections(text);
     if sections.len() >= MIN_BLANK_LINE_SECTIONS
@@ -1289,7 +1313,11 @@ fn chunk_plain_text(
             } else {
                 let lines: Vec<&str> = trimmed.split('\n').collect();
                 for (t, c) in split_oversized_plain_chunk(&lines, &title, max_chunk_bytes) {
-                    out.push(Chunk { title: t, content: c, has_code: false });
+                    out.push(Chunk {
+                        title: t,
+                        content: c,
+                        has_code: false,
+                    });
                 }
             }
         }
@@ -1308,7 +1336,11 @@ fn chunk_plain_text(
         }
         return split_oversized_plain_chunk(&lines, "Output", max_chunk_bytes)
             .into_iter()
-            .map(|(t, c)| Chunk { title: t, content: c, has_code: false })
+            .map(|(t, c)| Chunk {
+                title: t,
+                content: c,
+                has_code: false,
+            })
             .collect();
     }
 
@@ -1328,13 +1360,29 @@ fn chunk_plain_text(
         let first_line = take_chars(slice[0].trim(), CHUNK_TITLE_MAX_CHARS);
         let joined = slice.join("\n");
         let fallback_title = format!("Lines {start_line}-{end_line}");
-        let title = if first_line.is_empty() { fallback_title.clone() } else { first_line };
-        if joined.len() <= max_chunk_bytes {
-            chunks.push(Chunk { title, content: joined, has_code: false });
+        let title = if first_line.is_empty() {
+            fallback_title.clone()
         } else {
-            let base = if title.is_empty() { fallback_title } else { title };
+            first_line
+        };
+        if joined.len() <= max_chunk_bytes {
+            chunks.push(Chunk {
+                title,
+                content: joined,
+                has_code: false,
+            });
+        } else {
+            let base = if title.is_empty() {
+                fallback_title
+            } else {
+                title
+            };
             for (t, c) in split_oversized_plain_chunk(slice, &base, max_chunk_bytes) {
-                chunks.push(Chunk { title: t, content: c, has_code: false });
+                chunks.push(Chunk {
+                    title: t,
+                    content: c,
+                    has_code: false,
+                });
             }
         }
         i += step;

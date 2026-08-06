@@ -21,6 +21,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing(&config.log_level);
     headroom_core::init_ort_ep();
 
+    // Runs after tracing is up so the warning is actually visible.
+    headroom_proxy::config::warn_on_ambiguous_codex_routes(
+        &config.model_routes,
+        config.codex_auth_file.as_deref(),
+    );
+
     tracing::info!(
         listen = %config.listen,
         upstream = %config.upstream,
@@ -81,6 +87,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         });
     }
+
+    // cc-switch reconciler (opt-in: HEADROOM_CC_SWITCH_RECONCILE=1).
+    // Watches ~/.claude/settings.json and keeps Headroom in the request
+    // path when cc-switch overwrites ANTHROPIC_BASE_URL on provider switch.
+    let _cc_reconciler = if headroom_proxy::cc_switch_reconciler::reconciler_enabled() {
+        let reconciler = headroom_proxy::cc_switch_reconciler::CCSwitchReconciler::new(
+            format!("http://{}", config.listen),
+            config.upstream.to_string(),
+            state.dynamic_upstream.clone(),
+            headroom_proxy::cc_switch_reconciler::route_official(),
+            None,
+        );
+        reconciler.start();
+        Some(reconciler)
+    } else {
+        None
+    };
 
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 

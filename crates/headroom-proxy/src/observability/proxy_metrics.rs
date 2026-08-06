@@ -14,13 +14,14 @@ use prometheus::{Gauge, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry};
 
 use super::metric_names::{
     LABEL_PATH, LABEL_PROVIDER, LABEL_STATUS, LABEL_TIER, LABEL_WINDOW,
-    METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE,
-    METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE_HELP,
-    METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS, METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP,
-    METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED, METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP,
-    METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION, METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL_HELP,
+    METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE,
+    METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE_HELP,
+    METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS,
+    METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP, METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED,
+    METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP, METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION,
+    METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP,
     METRIC_PROXY_RATE_LIMIT_REMAINING_INPUT_TOKENS,
     METRIC_PROXY_RATE_LIMIT_REMAINING_INPUT_TOKENS_HELP,
     METRIC_PROXY_RATE_LIMIT_REMAINING_OUTPUT_TOKENS,
@@ -302,12 +303,14 @@ pub fn extract_unified_rate_limit(headers: &http::HeaderMap) -> UnifiedRateLimit
                     Some((w, f)) if matches!(f, "utilization" | "status" | "reset") => (w, f),
                     _ => continue,
                 };
-                let entry = windows.entry(window.to_string()).or_insert_with(|| UnifiedWindow {
-                    window: window.to_string(),
-                    utilization: None,
-                    status: None,
-                    reset: None,
-                });
+                let entry = windows
+                    .entry(window.to_string())
+                    .or_insert_with(|| UnifiedWindow {
+                        window: window.to_string(),
+                        utilization: None,
+                        status: None,
+                        reset: None,
+                    });
                 match field {
                     "utilization" => entry.utilization = val.parse::<f64>().ok(),
                     "status" => entry.status = Some(val.to_string()),
@@ -638,9 +641,15 @@ mod tests {
             ("anthropic-ratelimit-unified-status", "allowed"),
             ("anthropic-ratelimit-unified-reset", "1781973000"),
             ("anthropic-ratelimit-unified-overage-status", "rejected"),
-            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "org_level_disabled",
+            ),
             ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
-            ("anthropic-ratelimit-unified-representative-claim", "five_hour"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
         ] {
             h.insert(k, HeaderValue::from_str(v).unwrap());
         }
@@ -659,7 +668,10 @@ mod tests {
         assert_eq!(snap.overall_status.as_deref(), Some("allowed"));
         assert_eq!(snap.overall_reset, Some(1781973000));
         assert_eq!(snap.overage_status.as_deref(), Some("rejected"));
-        assert_eq!(snap.overage_disabled_reason.as_deref(), Some("org_level_disabled"));
+        assert_eq!(
+            snap.overage_disabled_reason.as_deref(),
+            Some("org_level_disabled")
+        );
         assert_eq!(snap.fallback_percentage, Some(0.5));
         assert_eq!(snap.representative_claim.as_deref(), Some("five_hour"));
     }
@@ -680,7 +692,9 @@ mod tests {
         use prometheus::Encoder;
         let mf = super::super::prometheus::registry().gather();
         let mut buf = Vec::new();
-        prometheus::TextEncoder::new().encode(&mf, &mut buf).unwrap();
+        prometheus::TextEncoder::new()
+            .encode(&mf, &mut buf)
+            .unwrap();
         String::from_utf8(buf).unwrap()
     }
 

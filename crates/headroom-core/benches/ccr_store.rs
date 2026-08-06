@@ -59,7 +59,7 @@ impl LegacyMutexStore {
 }
 
 impl CcrStore for LegacyMutexStore {
-    fn put(&self, hash: &str, payload: &str) {
+    fn put(&self, hash: &str, payload: &str) -> bool {
         let mut g = self.inner.lock().unwrap();
         if g.map.contains_key(hash) {
             g.map.insert(
@@ -69,7 +69,7 @@ impl CcrStore for LegacyMutexStore {
                     inserted: Instant::now(),
                 },
             );
-            return;
+            return true;
         }
         while g.map.len() >= self.capacity {
             let Some(oldest) = g.order.pop_front() else {
@@ -85,6 +85,7 @@ impl CcrStore for LegacyMutexStore {
             },
         );
         g.order.push_back(hash.to_string());
+        true
     }
 
     fn get(&self, hash: &str) -> Option<String> {

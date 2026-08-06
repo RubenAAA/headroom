@@ -129,6 +129,12 @@ pub struct UsageBuilder {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// `usage.cache_creation.ephemeral_5m_input_tokens` — the 5-minute
+    /// slice of `cache_creation_input_tokens`. Absent on older wire
+    /// shapes, in which case it stays 0 and only the total is known.
+    pub cache_creation_5m_input_tokens: u64,
+    /// `usage.cache_creation.ephemeral_1h_input_tokens` — the 1-hour slice.
+    pub cache_creation_1h_input_tokens: u64,
 }
 
 /// Errors during state-machine application. Per project rules these
@@ -393,6 +399,19 @@ impl UsageBuilder {
         }
         if let Some(n) = v.get("cache_read_input_tokens").and_then(|x| x.as_u64()) {
             self.cache_read_input_tokens = self.cache_read_input_tokens.max(n);
+        }
+        // TTL split lives in a nested object, not at the usage root:
+        //   "cache_creation": {"ephemeral_5m_input_tokens": N,
+        //                      "ephemeral_1h_input_tokens": M}
+        // Same field names Python reads in
+        // `_extract_anthropic_cache_ttl_metrics`.
+        if let Some(cc) = v.get("cache_creation") {
+            if let Some(n) = cc.get("ephemeral_5m_input_tokens").and_then(|x| x.as_u64()) {
+                self.cache_creation_5m_input_tokens = self.cache_creation_5m_input_tokens.max(n);
+            }
+            if let Some(n) = cc.get("ephemeral_1h_input_tokens").and_then(|x| x.as_u64()) {
+                self.cache_creation_1h_input_tokens = self.cache_creation_1h_input_tokens.max(n);
+            }
         }
     }
 }

@@ -259,6 +259,7 @@ mod tests {
                 cache_read_input_tokens: 200,
                 output_tokens: 50,
                 cache_creation_input_tokens: 0,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -280,6 +281,7 @@ mod tests {
                 cache_read_input_tokens: 200,
                 output_tokens: 50,
                 cache_creation_input_tokens: 0,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -301,6 +303,7 @@ mod tests {
                 cache_read_input_tokens: 200,
                 output_tokens: 50,
                 cache_creation_input_tokens: 0,
+                ..Default::default()
             },
             ..Default::default()
         };

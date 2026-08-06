@@ -1,0 +1,50 @@
+{
+  "config": {
+    "enabled": true
+  },
+  "input": [
+    {
+      "content": "You are a helpful assistant. The date is 2026-07-05. Request id 2.",
+      "role": "system"
+    },
+    {
+      "content": "Question number 2: what is 2+2?",
+      "role": "user"
+    }
+  ],
+  "input_sha256": "038978366c11a99ba77576b9844fd107874ae7f093cefc3a3f48f8acb298b354",
+  "label": "align_2",
+  "output": {
+    "cache_metrics": {
+      "prefix_changed": false,
+      "previous_hash": null,
+      "stable_prefix_bytes": 66,
+      "stable_prefix_hash": "61dac72545b66dbc",
+      "stable_prefix_tokens_est": 22
+    },
+    "diff_artifact": null,
+    "markers_inserted": [
+      "stable_prefix_hash:61dac72545b66dbc"
+    ],
+    "messages": [
+      {
+        "content": "You are a helpful assistant. The date is 2026-07-05. Request id 2.",
+        "role": "system"
+      },
+      {
+        "content": "Question number 2: what is 2+2?",
+        "role": "user"
+      }
+    ],
+    "timing": {},
+    "tokens_after": 34,
+    "tokens_before": 34,
+    "transforms_applied": [],
+    "warnings": [
+      "CacheAligner: detected volatile content in system prompt (iso8601=1); cache prefix unstable. Move dynamic values out of the system prompt to recover cache hits."
+    ],
+    "waste_signals": null
+  },
+  "recorded_at": "2026-07-05T19:33:24.217918+00:00",
+  "transform": "cache_aligner"
+}

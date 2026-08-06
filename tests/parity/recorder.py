@@ -948,6 +948,11 @@ def install_individual_grammar_parsers() -> None:
     cache: dict[str, Any] = {}
 
     def _get_parser(language: str) -> Any:
+        if language not in langs:
+            # Languages without a pinned grammar wheel (e.g. perl) must raise
+            # ValueError like the production `_get_parser`, so
+            # `detect_language` skips them instead of crashing on KeyError.
+            raise ValueError(f"no pinned grammar wheel for language: {language}")
         if language not in cache:
             try:
                 cache[language] = Parser(langs[language])

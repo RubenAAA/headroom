@@ -32,6 +32,11 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _legacy_python_proxy_for_existing_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_USE_PYTHON_PROXY", "1")
+
+
 @pytest.fixture
 def mock_run_server():
     """Patch run_server to a no-op and capture the ProxyConfig passed to it."""

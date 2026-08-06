@@ -16,9 +16,7 @@
 //! the same content appearing twice, and asserts our own digests trip zero
 //! findings in the volatile-content detector.
 
-use headroom_proxy::cache_stabilization::volatile_detector::{
-    detect_volatile_content, ApiKind,
-};
+use headroom_proxy::cache_stabilization::volatile_detector::{detect_volatile_content, ApiKind};
 use headroom_proxy::compression::ctx_offload::{offload_anthropic_request, CtxOffloadConfig};
 use headroom_proxy::compression::{compress_anthropic_request, Outcome};
 use headroom_proxy::config::{CacheControlAutoFrozen, CompressionMode};
@@ -67,7 +65,7 @@ fn body(messages: &[Value]) -> Value {
 /// Apply ctx_offload only. Returns the transformed body Value.
 fn transform_offload_only(request: &Value) -> Value {
     let mut v = request.clone();
-    offload_anthropic_request(&mut v, &cfg());
+    offload_anthropic_request(&mut v, &cfg(), None);
     v
 }
 
@@ -75,7 +73,7 @@ fn transform_offload_only(request: &Value) -> Value {
 /// Anthropic compressor. Returns the final transformed body bytes as a Value.
 fn transform_full_pipeline(request: &Value) -> Value {
     let mut v = request.clone();
-    offload_anthropic_request(&mut v, &cfg());
+    offload_anthropic_request(&mut v, &cfg(), None);
     let offloaded = serde_json::to_vec(&v).unwrap();
     let outcome = compress_anthropic_request(
         &offloaded.clone().into(),
@@ -138,7 +136,7 @@ fn growing_conversation(turns: usize) -> Vec<Vec<Value>> {
 fn transform_all(engine: &InjectEngine, request: &Value, session_key: &str) -> Value {
     let mut v = request.clone();
     engine.maybe_inject(&mut v, session_key);
-    offload_anthropic_request(&mut v, &cfg());
+    offload_anthropic_request(&mut v, &cfg(), None);
     let bytes = serde_json::to_vec(&v).unwrap();
     let outcome = compress_anthropic_request(
         &bytes.clone().into(),
@@ -207,7 +205,10 @@ fn offload_prefix_is_stable_across_six_turns() {
 
     // Sanity: offload actually fired (digests present), else the test is vacuous.
     let last = serde_json::to_string(transformed.last().unwrap()).unwrap();
-    assert!(last.contains("<<ctx:"), "expected offload digests in the body");
+    assert!(
+        last.contains("<<ctx:"),
+        "expected offload digests in the body"
+    );
 }
 
 #[test]
@@ -251,8 +252,12 @@ fn identical_content_offloads_to_identical_digest() {
         ]}),
     ];
     let out = transform_offload_only(&body(&msgs));
-    let first = out["messages"][2]["content"][0]["content"].as_str().unwrap();
-    let second = out["messages"][4]["content"][0]["content"].as_str().unwrap();
+    let first = out["messages"][2]["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    let second = out["messages"][4]["content"][0]["content"]
+        .as_str()
+        .unwrap();
     // The digest content (hash + compressed body) is identical; only the
     // paired command title differs, and that is not part of the wire digest.
     assert_eq!(first, second);

@@ -174,7 +174,10 @@ mod tests {
         persist_one(ccr.as_ref(), &content, &record);
 
         // CCR round-trips the original by hash.
-        assert_eq!(ccr.get(&record.hash).as_deref(), Some(record.original.as_str()));
+        assert_eq!(
+            ccr.get(&record.hash).as_deref(),
+            Some(record.original.as_str())
+        );
         // The content is searchable by a term from the original.
         let opts = headroom_core::ctx::SearchOpts {
             limit: 5,

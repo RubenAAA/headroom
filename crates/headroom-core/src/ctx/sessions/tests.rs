@@ -16,7 +16,12 @@ fn event_round_trip() {
     let (_d, store) = open_tmp();
     let id = store
         .insert_event(&NewEvent::new(
-            "sess1", "git", "git", "git commit -m wip", 2, "ctx-observer",
+            "sess1",
+            "git",
+            "git",
+            "git commit -m wip",
+            2,
+            "ctx-observer",
         ))
         .unwrap();
     assert!(id > 0);
@@ -38,10 +43,24 @@ fn event_round_trip() {
 fn search_events_by_data_and_category() {
     let (_d, store) = open_tmp();
     store
-        .insert_event(&NewEvent::new("s", "error", "error_tool", "exit code 1: boom", 2, "h"))
+        .insert_event(&NewEvent::new(
+            "s",
+            "error",
+            "error_tool",
+            "exit code 1: boom",
+            2,
+            "h",
+        ))
         .unwrap();
     store
-        .insert_event(&NewEvent::new("s", "file", "file_edit", "src/main.rs", 1, "h"))
+        .insert_event(&NewEvent::new(
+            "s",
+            "file",
+            "file_edit",
+            "src/main.rs",
+            1,
+            "h",
+        ))
         .unwrap();
 
     // Match on data.
@@ -204,7 +223,9 @@ fn resume_linking_recent_conversations_orders_by_recency() {
     store.record_conversation("skB", "other").unwrap();
 
     // Newest-first, excluding the current conv, scoped to the session key.
-    let recent = store.recent_conversations("skA", "conv_current", 10).unwrap();
+    let recent = store
+        .recent_conversations("skA", "conv_current", 10)
+        .unwrap();
     assert_eq!(recent, vec!["conv1".to_string(), "conv2".to_string()]);
 
     // Excluding the current conversation drops it from the list.
@@ -222,9 +243,15 @@ fn injection_is_decided_once_and_never_overwritten() {
     assert_eq!(store.get_injection("conv1").unwrap(), None);
 
     store.put_injection("conv1", "FIRST").unwrap();
-    assert_eq!(store.get_injection("conv1").unwrap().as_deref(), Some("FIRST"));
+    assert_eq!(
+        store.get_injection("conv1").unwrap().as_deref(),
+        Some("FIRST")
+    );
 
     // A second put for the same conv is a no-op (I4: decided once).
     store.put_injection("conv1", "SECOND").unwrap();
-    assert_eq!(store.get_injection("conv1").unwrap().as_deref(), Some("FIRST"));
+    assert_eq!(
+        store.get_injection("conv1").unwrap().as_deref(),
+        Some("FIRST")
+    );
 }

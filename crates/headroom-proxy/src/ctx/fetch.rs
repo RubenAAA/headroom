@@ -47,7 +47,9 @@ fn is_fresh(meta: &SourceMeta, ttl: Duration) -> bool {
 /// Returns None if parsing fails.
 fn parse_sqlite_datetime(dt: &str) -> Option<Duration> {
     // Format: "YYYY-MM-DD HH:MM:SS"
-    let parts: Vec<&str> = dt.split(|c: char| c == '-' || c == ' ' || c == ':').collect();
+    let parts: Vec<&str> = dt
+        .split(|c: char| c == '-' || c == ' ' || c == ':')
+        .collect();
     if parts.len() != 6 {
         return None;
     }
@@ -101,10 +103,7 @@ async fn ssrf_check(url: &str) -> Result<(), String> {
         other => return Err(format!("unsupported scheme: {other}")),
     }
 
-    let host = parsed
-        .host_str()
-        .ok_or("URL has no host")?
-        .to_string();
+    let host = parsed.host_str().ok_or("URL has no host")?.to_string();
 
     // Skip DNS check for obvious public hostnames (fast path).
     // Only do DNS resolution for IPs or ambiguous hostnames.
@@ -183,7 +182,9 @@ pub async fn fetch_and_index(
 
     // Check cache freshness (unless forced).
     if !force {
-        let meta = store.source_meta(&label).map_err(|e| format!("DB error: {e}"))?;
+        let meta = store
+            .source_meta(&label)
+            .map_err(|e| format!("DB error: {e}"))?;
         if let Some(meta) = meta {
             if is_fresh(&meta, ttl) {
                 let age = parse_sqlite_datetime(&meta.indexed_at)

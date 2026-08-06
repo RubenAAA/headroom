@@ -239,7 +239,10 @@ mod tests {
             ]),
         );
         assert_eq!(classify(Some(&prev), &t2), Classification::Continuation);
-        assert_eq!(extract_from_index(Classification::Continuation, Some(&prev)), 2);
+        assert_eq!(
+            extract_from_index(Classification::Continuation, Some(&prev)),
+            2
+        );
     }
 
     #[test]

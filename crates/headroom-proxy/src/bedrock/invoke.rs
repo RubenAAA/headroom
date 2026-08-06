@@ -65,7 +65,7 @@ use crate::proxy::AppState;
 // would risk drift from the middleware's resolution + WARN log.
 use headroom_core::auth_mode::AuthMode;
 
-use crate::bedrock::vendor::is_anthropic_model_id;
+use crate::bedrock::vendor::{is_anthropic_model_id, resolve_bedrock_model_override};
 
 /// RAII guard that observes the `bedrock_invoke_latency_seconds`
 /// histogram on drop. Created at handler entry; observed when the
@@ -207,6 +207,31 @@ pub async fn handle_invoke(
             );
         }
     };
+
+    // Operator override (HEADROOM_BEDROCK_MODEL_MAP): redirect the
+    // inbound model_id to a pinned target — e.g. a per-user application
+    // inference profile ARN for cost attribution. Keyed by the exact
+    // model_id the client sent. ARN targets must use the converse route
+    // (the invoke route rejects ARNs with HTTP 400), so force
+    // CONVERSE_ACTION when the target is an ARN. Purely additive: no
+    // matching key leaves model_id + action untouched.
+    let (model_id, action) =
+        match resolve_bedrock_model_override(&state.config.bedrock_model_map, &model_id) {
+            Some((target, is_arn)) => {
+                let effective_action = if is_arn { CONVERSE_ACTION } else { action };
+                tracing::info!(
+                    event = "bedrock_model_override_applied",
+                    request_id = %request_id,
+                    from_model_id = %model_id,
+                    to_model_id = %target,
+                    is_arn = is_arn,
+                    action = %effective_action,
+                    "bedrock invoke: applied HEADROOM_BEDROCK_MODEL_MAP override"
+                );
+                (target, effective_action)
+            }
+            None => (model_id, action),
+        };
 
     // Build the upstream URL based on configured endpoint or
     // region-derived default.
@@ -436,6 +461,15 @@ fn run_anthropic_compression(
         headroom_core::auth_mode::AuthMode::OAuth,
         request_id,
     );
+    // Cross-turn verbatim de-dup post-pass (no-op unless
+    // `--enable-cross-turn-dedup` is set).
+    let outcome = crate::compression::apply_cross_turn_dedup(
+        outcome,
+        body,
+        &state.config,
+        "/bedrock/invoke",
+        request_id,
+    );
     match outcome {
         AnthropicOutcome::NoCompression => body.clone(),
         AnthropicOutcome::Passthrough { reason } => {
@@ -494,15 +528,18 @@ fn build_bedrock_upstream(
                 .map_err(|e| format!("bedrock derived base URL parse error: {e}"))?
         }
     };
-    // Compose the path. We trust the captured `model_id` (Axum
-    // already URL-decoded it) and append `/{action}`.
-    let path = format!(
-        "/model/{model_id}/{action}",
-        model_id = model_id,
-        action = action,
-    );
+    // Compose the path as discrete segments so the model_id is
+    // percent-encoded per-segment. This matters for application
+    // inference profile ARN overrides (`arn:aws:…/…`): the ARN's
+    // embedded `/` must be encoded to `%2F` to stay within the single
+    // `{model_id}` segment. Colons (e.g. `-v1:0`) are left literal, so
+    // plain Bedrock model ids build the same path as before.
     let mut joined = base;
-    joined.set_path(&path);
+    joined
+        .path_segments_mut()
+        .map_err(|_| "bedrock base URL cannot be a base".to_string())?
+        .clear()
+        .extend(["model", model_id, action]);
     if let Some(q) = uri.query() {
         joined.set_query(Some(q));
     }
@@ -615,57 +652,46 @@ mod tests {
             client: reqwest::Client::new(),
             bedrock_credentials: None,
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
             ctx_observer: None,
             ctx_offload: None,
             ctx_inject: None,
-            vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
-                "test".to_string(),
+            ccr_context_tracker: None,
+            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
             )),
-        };
-        let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse"
-            .parse()
-            .unwrap();
-        let action = extract_invoke_action(uri.path()).unwrap();
-        let url = build_bedrock_upstream(
-            &state,
-            "anthropic.claude-3-haiku-20240307-v1:0",
-            &uri,
-            action,
-        )
-        .unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/converse"
-        );
-    }
-
-    #[test]
-    fn build_upstream_uses_region_default() {
-        use crate::config::Config;
-        let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
-        config.bedrock_region = "us-west-2".to_string();
-        let state = AppState {
-            config: std::sync::Arc::new(config),
-            client: reqwest::Client::new(),
-            bedrock_credentials: None,
-            // PR-E6: small capacity is fine — the Bedrock URL builder
-            // unit test never observes drift, but `AppState` requires
-            // the field to be populated.
-            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
-            usage_observer: std::sync::Arc::new(
-                crate::cache_stabilization::usage_observer::UsageObserver::new(),
+            savings_tracker: std::sync::Arc::new(
+                headroom_core::savings_tracker::SavingsTracker::new(None, false),
             ),
-            ctx_observer: None,
-            ctx_offload: None,
-            ctx_inject: None,
+            request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
             // PR-D4: unit tests for the Bedrock URL builder don't
             // touch the Vertex route, but `AppState` is one struct
             // — supply a dummy token source so the test compiles.
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
+            )),
+            dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
+            ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::ws_session_registry::WebSocketSessionRegistry::new(),
+            )),
+            rate_limiter: None,
+            semantic_cache: None,
+            memory_handler: None,
+            probe_recorder: None,
+            compression_feedback: None,
+            trusted_gateway_cidrs: vec![],
+            background_compressor: None,
+            compression_failure_action: crate::compression_failure::CompressionFailureAction {
+                refuse: false,
+                reason: "test".into(),
+                frame_bytes: 0,
+            },
+            batch_context_store: std::sync::Arc::new(headroom_core::ccr::BatchContextStore::new(
+                std::time::Duration::from_secs(86_400),
+                10_000,
             )),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
@@ -682,6 +708,26 @@ mod tests {
             url.as_str(),
             "https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
         );
+
+        // Override routing: an application-inference-profile ARN target
+        // is forced onto the converse action and percent-encoded so its
+        // embedded `/` stays within the single model_id path segment.
+        let mut map = std::collections::HashMap::new();
+        let arn = "arn:aws:bedrock:ap-southeast-1:1:application-inference-profile/x57j1esjrt66";
+        map.insert("claude-sonnet-5".to_string(), arn.to_string());
+        let (target, is_arn) =
+            resolve_bedrock_model_override(&map, "claude-sonnet-5").expect("override");
+        assert!(is_arn);
+        let effective_action = if is_arn {
+            CONVERSE_ACTION
+        } else {
+            INVOKE_ACTION
+        };
+        let arn_url = build_bedrock_upstream(&state, &target, &uri, effective_action).unwrap();
+        assert_eq!(
+            arn_url.as_str(),
+            "https://bedrock-runtime.us-west-2.amazonaws.com/model/arn:aws:bedrock:ap-southeast-1:1:application-inference-profile%2Fx57j1esjrt66/converse"
+        );
     }
 
     #[test]
@@ -696,17 +742,46 @@ mod tests {
             // PR-E6: see above — drift detector is unused by this
             // test; we just satisfy the struct shape.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
             ctx_observer: None,
             ctx_offload: None,
             ctx_inject: None,
+            ccr_context_tracker: None,
+            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
+            )),
+            savings_tracker: std::sync::Arc::new(
+                headroom_core::savings_tracker::SavingsTracker::new(None, false),
+            ),
+            request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
             // PR-D4: unit tests for the Bedrock URL builder don't
             // touch the Vertex route, but `AppState` is one struct
             // — supply a dummy token source so the test compiles.
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
+            )),
+            dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
+            ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::ws_session_registry::WebSocketSessionRegistry::new(),
+            )),
+            rate_limiter: None,
+            semantic_cache: None,
+            memory_handler: None,
+            probe_recorder: None,
+            compression_feedback: None,
+            trusted_gateway_cidrs: vec![],
+            background_compressor: None,
+            compression_failure_action: crate::compression_failure::CompressionFailureAction {
+                refuse: false,
+                reason: "test".into(),
+                frame_bytes: 0,
+            },
+            batch_context_store: std::sync::Arc::new(headroom_core::ccr::BatchContextStore::new(
+                std::time::Duration::from_secs(86_400),
+                10_000,
             )),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"

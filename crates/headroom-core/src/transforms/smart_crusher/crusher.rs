@@ -33,8 +33,10 @@
 //! Python side, locking byte-equal output. The TOIN/CCR/feedback
 //! integration ports happen later (Stage 3c.2 follow-ups).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use regex::Regex;
 use serde_json::Value;
 
 use super::analyzer::SmartAnalyzer;
@@ -137,6 +139,13 @@ pub struct SmartCrusher {
     /// (e.g. the proxy server holds it for retrieval lookups while
     /// SmartCrusher writes through it).
     pub ccr_store: Option<Arc<dyn CcrStore>>,
+    /// Compiled `config.protected_patterns` (audit-safe mode, #1705).
+    /// Compiled once at construction — mirrors Python's
+    /// `self._protected_patterns = self._compile_protected_patterns(...)`
+    /// in `__init__`. Kept here rather than on the `Clone`-derived
+    /// `SmartCrusherConfig` so cloning the config never re-compiles
+    /// regexes. Empty unless `audit_safe` is enabled with patterns.
+    pub protected_patterns: Vec<Regex>,
 }
 
 impl SmartCrusher {
@@ -288,6 +297,20 @@ impl SmartCrusher {
         compaction: Option<CompactionStage>,
         ccr_store: Option<Arc<dyn CcrStore>>,
     ) -> Self {
+        // Compile protected patterns once (#1705). An invalid regex is a
+        // caller bug — panicking loudly at construction mirrors Python's
+        // `raise ValueError`; silently ignoring it would defeat the whole
+        // point of audit-safe mode (rows the caller believes are
+        // protected wouldn't be). Empty unless audit-safe is configured.
+        let protected_patterns = config
+            .protected_patterns
+            .iter()
+            .map(|p| {
+                Regex::new(p).unwrap_or_else(|e| {
+                    panic!("SmartCrusher: invalid protected_patterns regex {p:?}: {e}")
+                })
+            })
+            .collect();
         SmartCrusher {
             config,
             anchor_selector,
@@ -297,6 +320,7 @@ impl SmartCrusher {
             observers,
             compaction,
             ccr_store,
+            protected_patterns,
         }
     }
 
@@ -384,6 +408,12 @@ impl SmartCrusher {
     ///   (or `"passthrough"`).
     pub fn crush(&self, content: &str, query: &str, bias: f64) -> CrushResult {
         let start = std::time::Instant::now();
+        // Web search tools often return space-separated JSON objects
+        // (`{...} {...} {...}`) rather than a real array. The crusher only
+        // compresses JSON arrays, so normalize that shape first — otherwise it
+        // passes through at 0% compression (#1741).
+        let normalized = super::super::content_detector::normalize_concatenated_json(content);
+        let content = normalized.as_deref().unwrap_or(content);
         let (compressed, was_modified, info) = self.smart_crush_content(content, query, bias);
         let strategy = if info.is_empty() {
             "passthrough".to_string()
@@ -439,6 +469,13 @@ impl SmartCrusher {
         bias: f64,
         prose_hook: Option<&ProseHook<'_>>,
     ) -> (String, bool, String) {
+        // Audit-safe mode (#1705): scan the ORIGINAL input for protected
+        // rows BEFORE compression runs — mirrors Python's
+        // `_scan_protected_rows(content)` call at the top of
+        // `_smart_crush_content`. Empty unless audit-safe is configured.
+        let protected = self.scan_protected_rows(content);
+
+        // Parse — non-JSON content passes through unchanged.
         let Ok(parsed) = serde_json::from_str::<Value>(content) else {
             return (content.to_string(), false, String::new());
         };
@@ -452,7 +489,195 @@ impl SmartCrusher {
         // SmartCrusher output bytes the proxy writes.
         let result = crate::transforms::anchor_selector::python_safe_json_dumps(&crushed);
         let was_modified = result != content.trim();
-        (result, was_modified, info)
+
+        if protected.is_empty() {
+            return (result, was_modified, info);
+        }
+        // Guarantee protected rows survive the compressed output —
+        // mirrors Python's `_apply_audit_safe_protection_to_content`.
+        self.apply_audit_safe_protection_to_content(&protected, content, result, was_modified, info)
+    }
+
+    // ─── Audit-safe protection (#1705) ─────────────────────────────────
+    //
+    // `crush_array`'s row selection is purely statistical (variance,
+    // anomaly, position) — it has no notion of "this row is
+    // compliance-significant and must stay visible." Audit-safe mode
+    // bolts that on: scan for pattern matches before compression, then
+    // guarantee matched rows survive afterward. Rust's crush pipeline
+    // does not emit CCR markers yet (see the `smart_crush_content` doc
+    // comment — "CCR marker injection is stubbed"), so — unlike Python —
+    // this only has to guard the statistical row-drop case, never the
+    // marker-hidden case. That makes the Rust port strictly simpler.
+
+    /// Canonical JSON text for a row (sorted object keys, recursively).
+    /// Used for protected-pattern matching and identity comparison across
+    /// the crush boundary. Mirrors Python's
+    /// `json.dumps(item, sort_keys=True, default=str)`; the exact
+    /// whitespace/escaping is irrelevant since both sides of every
+    /// comparison run through this same function.
+    fn canon(value: &Value) -> String {
+        match value {
+            Value::Object(map) => {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let inner: Vec<String> = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(k).unwrap_or_default(),
+                            Self::canon(v)
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", inner.join(","))
+            }
+            Value::Array(arr) => {
+                let inner: Vec<String> = arr.iter().map(Self::canon).collect();
+                format!("[{}]", inner.join(","))
+            }
+            other => serde_json::to_string(other).unwrap_or_default(),
+        }
+    }
+
+    /// Whether a row's canonical text matches ANY compiled pattern.
+    fn row_matches_protected(&self, value: &Value) -> bool {
+        let text = Self::canon(value);
+        self.protected_patterns.iter().any(|p| p.is_match(&text))
+    }
+
+    /// Rows matching any `protected_patterns` entry, or `[]` when
+    /// audit-safe mode is off, no patterns are configured, or the input
+    /// doesn't parse as a JSON array (nothing row-shaped to protect).
+    /// Mirrors Python's `_scan_protected_rows`; called on the ORIGINAL
+    /// input before compression.
+    fn scan_protected_rows(&self, content: &str) -> Vec<Value> {
+        if !self.config.audit_safe || self.protected_patterns.is_empty() {
+            return Vec::new();
+        }
+        let Ok(Value::Array(items)) = serde_json::from_str::<Value>(content) else {
+            return Vec::new();
+        };
+        items
+            .into_iter()
+            .filter(|item| self.row_matches_protected(item))
+            .collect()
+    }
+
+    /// Append any `protected` row missing from `kept` (identity by
+    /// canonical JSON, multiplicity-aware via a count map so duplicate
+    /// protected rows are each accounted for individually). Returns
+    /// `(kept_with_splice, lost_count)`. `lost_count` is normally 0 —
+    /// non-zero only when something structural prevents an appended row
+    /// from being recognized as a survivor. Mirrors Python's
+    /// `_splice_missing_protected`.
+    fn splice_missing_protected(
+        &self,
+        protected: &[Value],
+        mut kept: Vec<Value>,
+    ) -> (Vec<Value>, usize) {
+        let mut available: HashMap<String, usize> = HashMap::new();
+        for item in &kept {
+            *available.entry(Self::canon(item)).or_insert(0) += 1;
+        }
+        let mut missing: Vec<Value> = Vec::new();
+        for item in protected {
+            let key = Self::canon(item);
+            match available.get_mut(&key) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => missing.push(item.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            kept.extend(missing);
+        }
+
+        let mut surviving: HashMap<String, usize> = HashMap::new();
+        for item in &kept {
+            *surviving.entry(Self::canon(item)).or_insert(0) += 1;
+        }
+        let mut needed: HashMap<String, usize> = HashMap::new();
+        for item in protected {
+            *needed.entry(Self::canon(item)).or_insert(0) += 1;
+        }
+        let lost = needed
+            .iter()
+            .map(|(key, count)| count.saturating_sub(surviving.get(key).copied().unwrap_or(0)))
+            .sum();
+        (kept, lost)
+    }
+
+    /// Guarantee protected rows survive `smart_crush_content`'s output.
+    /// Mirrors Python's `_apply_audit_safe_protection_to_content`.
+    ///
+    /// `crushed` is a JSON array string for the common row-drop /
+    /// passthrough paths — spliced directly. Anything else (a lossless
+    /// CSV/table render, an opaque string) has no row structure to splice
+    /// into, so verification falls back to counting protected-pattern
+    /// matches in the raw text before vs. after. A residual shortfall
+    /// either fails closed (return original content unmodified) or ships
+    /// best-effort with a logged warning, per
+    /// `fail_closed_on_protected_loss`.
+    fn apply_audit_safe_protection_to_content(
+        &self,
+        protected: &[Value],
+        original_content: &str,
+        crushed: String,
+        was_modified: bool,
+        info: String,
+    ) -> (String, bool, String) {
+        let parsed = serde_json::from_str::<Value>(&crushed).ok();
+        let (candidate, lost) = match parsed {
+            Some(Value::Array(arr)) => {
+                let before_len = arr.len();
+                let (kept, lost) = self.splice_missing_protected(protected, arr);
+                // Only reserialize when something was actually spliced in —
+                // an unmodified `kept` stays byte-identical to the crush
+                // output.
+                let candidate = if kept.len() != before_len {
+                    crate::transforms::anchor_selector::python_safe_json_dumps(&Value::Array(kept))
+                } else {
+                    crushed.clone()
+                };
+                (candidate, lost)
+            }
+            _ => {
+                let lost = self
+                    .protected_patterns
+                    .iter()
+                    .map(|p| {
+                        p.find_iter(original_content)
+                            .count()
+                            .saturating_sub(p.find_iter(&crushed).count())
+                    })
+                    .sum();
+                (crushed.clone(), lost)
+            }
+        };
+
+        if lost == 0 {
+            return (candidate, was_modified, info);
+        }
+
+        if self.config.fail_closed_on_protected_loss {
+            tracing::warn!(
+                lost,
+                "SmartCrusher audit_safe: protected pattern match(es) lost in compression; \
+                 failing closed — returning original content uncompressed."
+            );
+            return (
+                original_content.to_string(),
+                false,
+                "audit_safe:fail_closed".to_string(),
+            );
+        }
+        tracing::warn!(
+            lost,
+            "SmartCrusher audit_safe: protected pattern match(es) lost in compression; \
+             fail_closed_on_protected_loss=false — shipping best-effort result."
+        );
+        (candidate, was_modified, info)
     }
 
     /// Maximum recursion depth for nested JSON. Mirrors Python's
@@ -1198,6 +1423,7 @@ fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transforms::anchor_selector::python_safe_json_dumps;
     use serde_json::json;
 
     #[test]
@@ -2051,5 +2277,175 @@ mod tests {
             store_len_before,
             "ccr_store grew under lossless_only — invariant violated"
         );
+    }
+
+    // ---------- audit-safe mode (#1705) ----------
+
+    /// Build a large array where two rows carry an `AUDIT_FLAG` note that
+    /// statistical row-selection would otherwise be free to drop.
+    fn audit_items() -> Vec<Value> {
+        let background: Vec<Value> = (0..60).map(|i| json!({"id": i, "status": "ok"})).collect();
+        let protected = [
+            json!({"id": 25, "status": "ok", "note": "AUDIT_FLAG: rare compliance event A"}),
+            json!({"id": 35, "status": "ok", "note": "AUDIT_FLAG: rare compliance event B"}),
+        ];
+        let mut items = Vec::new();
+        items.extend_from_slice(&background[..25]);
+        items.push(protected[0].clone());
+        items.extend_from_slice(&background[25..35]);
+        items.push(protected[1].clone());
+        items.extend_from_slice(&background[35..]);
+        items
+    }
+
+    #[test]
+    fn audit_safe_disabled_by_default_no_behavior_change() {
+        // `protected_patterns` set but `audit_safe` left at its false
+        // default → byte-identical output to a crusher with no audit-safe
+        // config at all. The flag gates the whole feature.
+        let items = audit_items();
+        let content = python_safe_json_dumps(&Value::Array(items));
+
+        let baseline = SmartCrusher::without_compaction(SmartCrusherConfig::default());
+        let configured_but_off = SmartCrusher::without_compaction(SmartCrusherConfig {
+            protected_patterns: vec!["AUDIT_FLAG".to_string()],
+            ..Default::default()
+        });
+
+        let r1 = baseline.smart_crush_content(&content, "", 1.0);
+        let r2 = configured_but_off.smart_crush_content(&content, "", 1.0);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn audit_safe_with_no_patterns_is_a_no_op() {
+        let items = audit_items();
+        let content = python_safe_json_dumps(&Value::Array(items));
+
+        let baseline = SmartCrusher::without_compaction(SmartCrusherConfig::default());
+        let audit_safe_no_patterns = SmartCrusher::without_compaction(SmartCrusherConfig {
+            audit_safe: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            baseline.smart_crush_content(&content, "", 1.0),
+            audit_safe_no_patterns.smart_crush_content(&content, "", 1.0)
+        );
+    }
+
+    #[test]
+    fn audit_safe_preserves_protected_rows_end_to_end() {
+        let items = audit_items();
+        let protected_rows = [items[25].clone(), items[36].clone()];
+        let content = python_safe_json_dumps(&Value::Array(items.clone()));
+
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig {
+            audit_safe: true,
+            protected_patterns: vec!["AUDIT_FLAG".to_string()],
+            ..Default::default()
+        });
+        let (crushed, was_modified, _info) = c.smart_crush_content(&content, "", 1.0);
+        assert!(was_modified, "input should have compressed");
+        let kept: Vec<Value> = serde_json::from_str(&crushed).unwrap();
+        for row in &protected_rows {
+            assert!(
+                kept.contains(row),
+                "protected row missing from compressed output: {row:?}"
+            );
+        }
+        // Still compressed overall — protection isn't a blanket opt-out.
+        assert!(kept.len() < items.len());
+    }
+
+    #[test]
+    fn audit_safe_fails_closed_on_non_array_loss() {
+        // Non-array crushed output (e.g. a lossless CSV render) that
+        // dropped the protected pattern → verification counts a match
+        // shortfall and, with the default fail_closed=true, returns the
+        // original content unmodified with the fail-closed sentinel.
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig {
+            audit_safe: true,
+            protected_patterns: vec!["AUDIT_FLAG".to_string()],
+            ..Default::default()
+        });
+        let protected = vec![json!({"id": 1, "note": "AUDIT_FLAG"})];
+        let original = python_safe_json_dumps(&Value::Array(vec![
+            protected[0].clone(),
+            json!({"id": 2, "note": "fine"}),
+        ]));
+        let crushed = "id,note\n2,fine".to_string();
+
+        let (out, was_modified, info) = c.apply_audit_safe_protection_to_content(
+            &protected,
+            &original,
+            crushed,
+            true,
+            "lossless:table".to_string(),
+        );
+        assert_eq!(out, original);
+        assert!(!was_modified);
+        assert_eq!(info, "audit_safe:fail_closed");
+    }
+
+    #[test]
+    fn audit_safe_ships_best_effort_when_fail_closed_disabled() {
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig {
+            audit_safe: true,
+            protected_patterns: vec!["AUDIT_FLAG".to_string()],
+            fail_closed_on_protected_loss: false,
+            ..Default::default()
+        });
+        let protected = vec![json!({"id": 1, "note": "AUDIT_FLAG"})];
+        let original = python_safe_json_dumps(&Value::Array(vec![
+            protected[0].clone(),
+            json!({"id": 2, "note": "fine"}),
+        ]));
+        let crushed = "id,note\n2,fine".to_string();
+
+        let (out, was_modified, info) = c.apply_audit_safe_protection_to_content(
+            &protected,
+            &original,
+            crushed.clone(),
+            true,
+            "lossless:table".to_string(),
+        );
+        // Best-effort: ship the crushed result despite the shortfall.
+        assert_eq!(out, crushed);
+        assert!(was_modified);
+        assert_ne!(info, "audit_safe:fail_closed");
+    }
+
+    #[test]
+    fn audit_safe_non_array_no_op_when_pattern_count_preserved() {
+        let c = SmartCrusher::without_compaction(SmartCrusherConfig {
+            audit_safe: true,
+            protected_patterns: vec!["AUDIT_FLAG".to_string()],
+            ..Default::default()
+        });
+        let protected = vec![json!({"id": 1, "note": "AUDIT_FLAG"})];
+        let original = python_safe_json_dumps(&Value::Array(protected.clone()));
+        let crushed = "id,note\n1,AUDIT_FLAG".to_string();
+
+        let (out, was_modified, info) = c.apply_audit_safe_protection_to_content(
+            &protected,
+            &original,
+            crushed.clone(),
+            true,
+            "lossless:table".to_string(),
+        );
+        assert_eq!(out, crushed);
+        assert!(was_modified);
+        assert_eq!(info, "lossless:table");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid protected_patterns regex")]
+    fn invalid_protected_pattern_panics_at_construction() {
+        let _ = SmartCrusher::without_compaction(SmartCrusherConfig {
+            audit_safe: true,
+            protected_patterns: vec!["(".to_string()],
+            ..Default::default()
+        });
     }
 }

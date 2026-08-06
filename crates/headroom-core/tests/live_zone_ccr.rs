@@ -9,8 +9,8 @@
 use headroom_core::ccr::backends::InMemoryCcrStore;
 use headroom_core::ccr::{compute_key, CcrStore};
 use headroom_core::transforms::live_zone::{
-    compress_anthropic_live_zone, compress_anthropic_live_zone_with_ccr, AuthMode, LiveZoneOutcome,
-    DEFAULT_MODEL,
+    compress_anthropic_live_zone, compress_anthropic_live_zone_with_ccr, AuthMode, DispatchConfig,
+    LiveZoneOutcome, DEFAULT_MODEL,
 };
 use serde_json::{json, Value};
 
@@ -58,6 +58,7 @@ fn ccr_marker_injected_when_store_wired() {
         AuthMode::Payg,
         DEFAULT_MODEL,
         Some(&store),
+        &DispatchConfig::default(),
     )
     .expect("dispatcher must succeed");
 
@@ -113,6 +114,7 @@ fn store_only_populated_after_token_gate_admits() {
         AuthMode::Payg,
         DEFAULT_MODEL,
         Some(&store),
+        &DispatchConfig::default(),
     )
     .expect("dispatcher");
     assert_eq!(store.len(), 0, "no compression → no CCR put");

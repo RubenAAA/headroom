@@ -55,6 +55,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lru::LruCache;
 use serde::Serialize;
 
+use crate::observability::proxy_counters::record_cache_miss_attribution;
+
+/// Provider label for the cache-miss attribution metric. This observer only
+/// ever sees Anthropic usage counters (see the module docs), so the label is
+/// constant rather than threaded through every call site.
+const MISS_ATTRIBUTION_PROVIDER: &str = "anthropic";
+
 /// Anthropic prompt-cache TTL. A gap between turns longer than this
 /// makes a full cache re-write legitimate (TtlExpiry, not a bug).
 /// The default ephemeral TTL is 5 minutes; the optional 1h tier
@@ -150,9 +157,7 @@ pub fn classify_turn(
         // billed for re-caching, so there is nothing to warn about.
         return TurnClass::Healthy;
     }
-    let gap = now
-        .duration_since(prev.at)
-        .unwrap_or(Duration::ZERO);
+    let gap = now.duration_since(prev.at).unwrap_or(Duration::ZERO);
     if gap > ANTHROPIC_CACHE_TTL {
         return TurnClass::TtlExpiry;
     }
@@ -170,6 +175,23 @@ struct PendingRequest {
     drift_dims: Option<String>,
 }
 
+/// Severity classification of a re-cache event, derived from the
+/// PR-E6 drift dims (see the TODO analysis, 2026-07-07/08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecacheEventKind {
+    /// Non-empty `drift_dims`: a genuine structural change (system /
+    /// tools / early_messages) busted the cache — real waste, warn.
+    Drift,
+    /// Empty `drift_dims`: the request bytes looked stable to the
+    /// detector. Live analysis shows these are conversation-context
+    /// resets — a subagent closing, `/clear`, or volatile content
+    /// below the detector window. The "wasted" tokens were not
+    /// actually wasted; the cache was legitimately invalidated by
+    /// the session ending. Info, not a warning.
+    Expected,
+}
+
 /// One re-cache event, kept for `/cache-health` (most recent only)
 /// and the WARN log.
 #[derive(Debug, Clone, Serialize)]
@@ -182,6 +204,10 @@ pub struct RecacheEvent {
     /// means the bytes looked stable to the detector (likely a
     /// message edit / branch below the early-message window).
     pub drift_dims: Option<String>,
+    /// `Drift` when `drift_dims` is non-empty (genuine structural
+    /// bust), `Expected` otherwise (session reset — subagent close,
+    /// `/clear`, volatile content — not actually wasted tokens).
+    pub event_kind: RecacheEventKind,
     pub wasted_tokens: u64,
     pub expected_cache_read: u64,
     pub actual_cache_read: u64,
@@ -340,6 +366,7 @@ impl UsageObserver {
             TurnClass::FirstTurn | TurnClass::Healthy => {}
             TurnClass::TtlExpiry => {
                 inner.ttl_expiries_total += 1;
+                record_cache_miss_attribution(MISS_ATTRIBUTION_PROVIDER, "ttl_expiry");
                 tracing::debug!(
                     event = "cache_recache_ttl_expiry",
                     request_id = %request_id,
@@ -351,6 +378,26 @@ impl UsageObserver {
             TurnClass::Recache { wasted_tokens } => {
                 inner.recache_events_total += 1;
                 inner.recache_wasted_tokens_total += wasted_tokens;
+                let event_kind = match pending.drift_dims.as_deref() {
+                    Some(dims) if !dims.is_empty() => RecacheEventKind::Drift,
+                    _ => RecacheEventKind::Expected,
+                };
+                // Python buckets every miss on an expected-cached prefix as
+                // ttl_expiry / prefix_change / unknown, and `unknown` is the
+                // fall-through: we expected a read, the content looked stable,
+                // we cannot name the cause. `Expected` is the same measurement
+                // — the extra reading that these are usually session resets is
+                // a judgement made after the fact, and it already rides on the
+                // log level and `RecacheEvent.event_kind`. Suppressing it here
+                // would break `total = ttl_expiry + prefix_change + unknown`
+                // and make the two named buckets look like the whole story.
+                record_cache_miss_attribution(
+                    MISS_ATTRIBUTION_PROVIDER,
+                    match event_kind {
+                        RecacheEventKind::Drift => "prefix_change",
+                        RecacheEventKind::Expected => "unknown",
+                    },
+                );
                 let event = RecacheEvent {
                     at_unix: now
                         .duration_since(UNIX_EPOCH)
@@ -358,21 +405,37 @@ impl UsageObserver {
                         .as_secs(),
                     conversation_key: pending.conversation_key.clone(),
                     drift_dims: pending.drift_dims.clone(),
+                    event_kind,
                     wasted_tokens,
                     expected_cache_read,
                     actual_cache_read: cache_read_input_tokens,
                 };
-                tracing::warn!(
-                    event = "cache_recache_observed",
-                    request_id = %request_id,
-                    conversation_key = %event.conversation_key,
-                    drift_dims = event.drift_dims.as_deref().unwrap_or(""),
-                    wasted_tokens = wasted_tokens,
-                    expected_cache_read = expected_cache_read,
-                    actual_cache_read = cache_read_input_tokens,
-                    cache_creation_input_tokens = cache_creation_input_tokens,
-                    "prompt cache re-written inside the TTL window: billed tokens wasted re-caching"
-                );
+                match event_kind {
+                    RecacheEventKind::Drift => tracing::warn!(
+                        event = "cache_recache_observed",
+                        request_id = %request_id,
+                        conversation_key = %event.conversation_key,
+                        drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+                        event_kind = "drift",
+                        wasted_tokens = wasted_tokens,
+                        expected_cache_read = expected_cache_read,
+                        actual_cache_read = cache_read_input_tokens,
+                        cache_creation_input_tokens = cache_creation_input_tokens,
+                        "prompt cache re-written inside the TTL window: billed tokens wasted re-caching"
+                    ),
+                    RecacheEventKind::Expected => tracing::info!(
+                        event = "cache_recache_observed",
+                        request_id = %request_id,
+                        conversation_key = %event.conversation_key,
+                        drift_dims = "",
+                        event_kind = "expected",
+                        wasted_tokens = wasted_tokens,
+                        expected_cache_read = expected_cache_read,
+                        actual_cache_read = cache_read_input_tokens,
+                        cache_creation_input_tokens = cache_creation_input_tokens,
+                        "prompt cache re-written with no structural drift: conversation context reset (subagent close, /clear, or volatile content) — expected, tokens not actually wasted"
+                    ),
+                }
                 crate::observability::observe_recache_event(
                     event.drift_dims.as_deref(),
                     wasted_tokens,
@@ -412,6 +475,18 @@ impl UsageObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::proxy_counters::cache_miss_attribution_for_test;
+
+    /// The Prometheus registry is process-global, so tests that read a counter
+    /// delta must not run concurrently with any other test that writes it.
+    fn miss_metric_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn miss_count(reason: &str) -> u64 {
+        cache_miss_attribution_for_test(MISS_ATTRIBUTION_PROVIDER, reason)
+    }
 
     fn prev(read: u64, creation: u64, age: Duration) -> TurnRecord {
         TurnRecord {
@@ -481,6 +556,7 @@ mod tests {
 
     #[test]
     fn observer_end_to_end_flags_recache_and_snapshots() {
+        let _guard = miss_metric_test_lock();
         let obs = UsageObserver::new();
         // Turn 1.
         obs.begin_request("req-1", "conv-a".into(), None);
@@ -497,11 +573,38 @@ mod tests {
         assert_eq!(snap.recache_events_total, 1);
         let ev = snap.last_event.expect("recache event recorded");
         assert_eq!(ev.drift_dims.as_deref(), Some("tools"));
+        assert_eq!(ev.event_kind, RecacheEventKind::Drift);
         assert_eq!(ev.expected_cache_read, 10_800);
         assert_eq!(ev.wasted_tokens, 10_800);
         assert_eq!(snap.recache_wasted_tokens_total, 10_800);
         assert!(snap.recent_hit_rate.is_some());
         assert_eq!(snap.samples, 3);
+    }
+
+    #[test]
+    fn recache_without_drift_dims_is_expected_kind() {
+        // Subagent close / `/clear`: cache busted upstream but the
+        // drift detector saw stable bytes → Expected, not Drift.
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("req-1", "conv-a".into(), None);
+        obs.complete("req-1", 300, 0, 10_000);
+        obs.begin_request("req-2", "conv-a".into(), None);
+        obs.complete("req-2", 200, 0, 11_000);
+        let ev = obs.snapshot().last_event.expect("event recorded");
+        assert_eq!(ev.event_kind, RecacheEventKind::Expected);
+    }
+
+    #[test]
+    fn recache_with_empty_string_drift_dims_is_expected_kind() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("req-1", "conv-a".into(), Some(String::new()));
+        obs.complete("req-1", 300, 0, 10_000);
+        obs.begin_request("req-2", "conv-a".into(), Some(String::new()));
+        obs.complete("req-2", 200, 0, 11_000);
+        let ev = obs.snapshot().last_event.expect("event recorded");
+        assert_eq!(ev.event_kind, RecacheEventKind::Expected);
     }
 
     #[test]
@@ -542,6 +645,7 @@ mod tests {
         let mut body3 = body1.clone();
         body3["system"] = serde_json::json!("MUTATED system");
 
+        let _guard = miss_metric_test_lock();
         let obs = UsageObserver::new();
         let k = conversation_key(&body1, "sess");
         // Turn 1: cold cache — all creation.
@@ -598,6 +702,102 @@ mod tests {
         assert_ne!(
             conversation_key(&body_a, "sess"),
             conversation_key(&body_a, "sess2")
+        );
+    }
+
+    // ─── Cache-miss attribution metric ──────────────────────────────────
+
+    /// A drift-attributed re-cache is a `prefix_change` miss, and only that.
+    #[test]
+    fn drift_recache_records_prefix_change() {
+        let _guard = miss_metric_test_lock();
+        let (b0, b1, b2) = (
+            miss_count("prefix_change"),
+            miss_count("unknown"),
+            miss_count("ttl_expiry"),
+        );
+
+        let obs = UsageObserver::new();
+        obs.begin_request("m-d1", "conv-drift".into(), Some("tools".into()));
+        obs.complete("m-d1", 300, 0, 10_000);
+        obs.begin_request("m-d2", "conv-drift".into(), Some("tools".into()));
+        obs.complete("m-d2", 200, 0, 11_000);
+
+        assert_eq!(miss_count("prefix_change"), b0 + 1);
+        assert_eq!(miss_count("unknown"), b1);
+        assert_eq!(miss_count("ttl_expiry"), b2);
+    }
+
+    /// No drift dims → the fall-through `unknown` bucket, so the buckets still
+    /// sum to the total number of misses.
+    #[test]
+    fn driftless_recache_records_unknown() {
+        let _guard = miss_metric_test_lock();
+        let (b0, b1) = (miss_count("unknown"), miss_count("prefix_change"));
+
+        let obs = UsageObserver::new();
+        obs.begin_request("m-u1", "conv-unknown".into(), None);
+        obs.complete("m-u1", 300, 0, 10_000);
+        obs.begin_request("m-u2", "conv-unknown".into(), None);
+        obs.complete("m-u2", 200, 0, 11_000);
+
+        assert_eq!(miss_count("unknown"), b0 + 1);
+        assert_eq!(miss_count("prefix_change"), b1);
+    }
+
+    /// An idle gap past the TTL is a real miss, bucketed `ttl_expiry`.
+    #[test]
+    fn ttl_expiry_records_ttl_expiry() {
+        let _guard = miss_metric_test_lock();
+        let (b0, b1) = (miss_count("ttl_expiry"), miss_count("prefix_change"));
+
+        // Drive the pending/conversation state directly so the previous turn
+        // can be dated older than the TTL without sleeping.
+        let obs = UsageObserver::new();
+        {
+            let mut inner = obs.lock();
+            inner.conversations.put(
+                "conv-ttl".to_string(),
+                TurnRecord {
+                    cache_read_input_tokens: 10_000,
+                    cache_creation_input_tokens: 2_000,
+                    at: SystemTime::now() - (ANTHROPIC_CACHE_TTL + Duration::from_secs(10)),
+                },
+            );
+        }
+        obs.begin_request("m-t1", "conv-ttl".into(), None);
+        obs.complete("m-t1", 200, 0, 12_500);
+
+        assert_eq!(obs.snapshot().ttl_expiries_total, 1);
+        assert_eq!(miss_count("ttl_expiry"), b0 + 1);
+        assert_eq!(miss_count("prefix_change"), b1);
+    }
+
+    /// First turns and healthy turns are not misses and must not be counted.
+    #[test]
+    fn healthy_and_first_turns_record_nothing() {
+        let _guard = miss_metric_test_lock();
+        let before = [
+            miss_count("ttl_expiry"),
+            miss_count("prefix_change"),
+            miss_count("unknown"),
+        ];
+
+        let obs = UsageObserver::new();
+        // FirstTurn.
+        obs.begin_request("m-h1", "conv-healthy".into(), Some("tools".into()));
+        obs.complete("m-h1", 300, 0, 10_000);
+        // Healthy: reads back everything turn 1 wrote.
+        obs.begin_request("m-h2", "conv-healthy".into(), Some("tools".into()));
+        obs.complete("m-h2", 200, 10_000, 800);
+
+        assert_eq!(
+            [
+                miss_count("ttl_expiry"),
+                miss_count("prefix_change"),
+                miss_count("unknown"),
+            ],
+            before
         );
     }
 }

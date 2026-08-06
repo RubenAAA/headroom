@@ -113,8 +113,7 @@ pub const METRIC_PROXY_RATE_LIMIT_REMAINING_OUTPUT_TOKENS_HELP: &str =
 // fraction [0,1] of a window, so `1 - utilization` is the remaining
 // subscription headroom — the number a subscription operator wants.
 
-pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION: &str =
-    "proxy_ratelimit_unified_utilization";
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION: &str = "proxy_ratelimit_unified_utilization";
 pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP: &str =
     "Consumed fraction [0,1] of a Claude-subscription rate-limit window, \
      from anthropic-ratelimit-unified-<window>-utilization. `1 - value` \
@@ -128,8 +127,7 @@ pub const METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP: &str =
      resets, from anthropic-ratelimit-unified-<window>-reset. Window \
      `overall` carries the top-level anthropic-ratelimit-unified-reset.";
 
-pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED: &str =
-    "proxy_ratelimit_unified_throttled";
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED: &str = "proxy_ratelimit_unified_throttled";
 pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP: &str =
     "1 when a subscription window's status is anything other than \
      'allowed' (rejected/queueing/blocked), else 0. Boolean alarm \
@@ -192,6 +190,21 @@ pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL: &str = "ctx_recall_injections_tota
 pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL_HELP: &str =
     "CTX-5/6: count of recall/resume blocks injected into the first user \
      message of a conversation (CTX-4 injection engine).";
+
+// ---------- ctx_retrieval_hits_total ----------
+
+pub const METRIC_CTX_RETRIEVAL_HITS_TOTAL: &str = "ctx_retrieval_hits_total";
+pub const METRIC_CTX_RETRIEVAL_HITS_TOTAL_HELP: &str =
+    "PR-J5: count of /ctx/get retrievals that found the offloaded original \
+     in the CCR store.";
+
+// ---------- ctx_retrieval_misses_total ----------
+
+pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL: &str = "ctx_retrieval_misses_total";
+pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL_HELP: &str =
+    "PR-J5: count of /ctx/get retrievals for a hash absent from the CCR \
+     store (expired, evicted, or never offloaded). A rising rate flags an \
+     information-loss risk — see REALIGNMENT/13 §8.";
 
 // ---------- ctx_search_queries_total ----------
 

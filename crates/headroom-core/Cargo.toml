@@ -23,12 +23,20 @@ tokenizers = "0.22"
 # AWS deploys). `from_pretrained` is called once at startup, so blocking is
 # fine; if a tokio caller needs it later we can wrap in `spawn_blocking`.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+# `lru` powers the bounded session-sticky tracker (`session_sticky.rs`), the
+# Rust replacement for Python helpers.py SessionBetaTracker/SessionToolTracker/
+# SessionCcrTracker OrderedDict LRUs. Already in the lock tree transitively;
+# promoted to a direct dep for the `LruCache` used behind a `Mutex`.
+lru = "0.18"
 # `md5` for the CCR cache_key. Python's compression_store hashes the original
 # diff with MD5 truncated to 24 hex chars; we must match byte-for-byte.
 md-5 = "0.10"
 # `sha2` for `_hash_field_name` in smart_crusher (SHA256 truncated to 16
 # hex chars). Python uses `hashlib.sha256` so we need byte-exact parity.
 sha2 = "0.10"
+# `hex` for SHA-256 hash encoding in read_lifecycle/read_maturation.
+# Matches Python's `hashlib.sha256().hexdigest()[:24]` byte-for-byte.
+hex = { workspace = true }
 # `dashmap` for the CCR storage backend. Concurrent HashMap with sharded
 # locking — distinct keys hashed to different shards never contend, so
 # multi-worker proxy load doesn't queue on a single Mutex. Lock-free
@@ -155,6 +163,40 @@ tree-sitter-rust = "=0.24.2"
 tree-sitter-java = "=0.23.5"
 tree-sitter-c = "=0.24.2"
 tree-sitter-cpp = "=0.23.4"
+# Perl has no PyPI wheel pin — Python loads it from
+# `tree-sitter-language-pack`, so byte-parity fixtures exclude Perl and this
+# pin only needs to track the same upstream grammar (tree-sitter-perl).
+# `ts-parser-perl` republishes that grammar with a tree-sitter 0.25-compatible
+# binding (the `tree-sitter-perl` crate itself requires tree-sitter ≥0.26).
+ts-parser-perl = "=1.2.1"
+# `chrono` for UTC timestamps + RFC3339 (ISO-8601) parse/format in the
+# subscription + savings-ledger ports. Python persists timezone-aware UTC
+# datetimes rendered with a `Z` suffix; chrono round-trips the same bytes so
+# the state/ledger files stay cross-compatible with the Python implementation.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+# `uuid` for memory model IDs (matches Python's `uuid.uuid4()`).
+uuid = { version = "1", features = ["v4"] }
+# `calamine` reads `.xlsx` for `transforms/spreadsheet_ingest` — the Rust
+# equivalent of Python's openpyxl `read_only=True, data_only=True`: both
+# return the cached formula VALUES stored in the file, never formula
+# strings, and both stream without loading styles. Pure Rust (zip + quick-xml
+# under the hood), no system dep. The `dates` feature pulls chrono (already a
+# direct dep) so datetime cells render like Python's `str(datetime)`.
+calamine = { version = "0.35", features = ["dates"] }
+# `dom_smoothie` powers the HTMLExtractor (`transforms/html_extractor.rs`).
+# It is a FUNCTIONAL replacement for Python's `trafilatura` — a Rust port of
+# Mozilla Readability.js (html5ever-based DOM; html5ever is already in the
+# lock tree). Different extraction heuristics than trafilatura, so output is
+# NOT byte-identical to the Python reference; parity is behavioral only
+# (main content preserved, nav/footer/script/style boilerplate stripped,
+# identical ratio/length math). Chosen over the unmaintained `readability`
+# / `readability-rs` crates: actively developed, faster, more configurable.
+dom_smoothie = "0.18"
+# `rustix` (fs feature) for the cross-process advisory `flock` on the durable
+# savings ledger — the Rust equivalent of Python's `fcntl.flock`. Already in
+# the lock tree transitively; promoting to a direct dep for the LOCK_EX /
+# LOCK_SH the ledger needs so concurrent proxy + MCP writers don't interleave.
+rustix = { version = "1", features = ["fs"] }
 
 # Load ONNX Runtime dynamically on every platform. The alternative,
 # `ort-download-binaries-*`, statically links Microsoft's prebuilt ORT:
@@ -179,6 +221,7 @@ fastembed = { version = "5", default-features = false, optional = true, features
 # which `load-dynamic` is what enables; there are no compile-time EP flags.
 # Kompress therefore only builds under the `ml` feature (on by default).
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
+tree-sitter-c-sharp = "=0.23.5"
 
 [features]
 # `ml` is ON by default, so a stock build is byte-for-byte what it was before:

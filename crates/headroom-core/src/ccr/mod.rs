@@ -30,10 +30,23 @@
 //! [`CompressionStore`]: https://github.com/chopratejas/headroom/blob/main/headroom/cache/compression_store.py
 
 pub mod backends;
+pub mod batch_processor;
+pub mod batch_store;
+pub mod context_tracker;
+pub mod response_handler;
+pub mod tool_injection;
 
 use std::time::Duration;
 
 pub use backends::{from_config, CcrBackendConfig, CcrBackendInitError, InMemoryCcrStore};
+pub use batch_processor::{
+    BatchResultProcessor, BatchResultProcessorConfig, ContinuationRequest, ProcessedBatchResult,
+};
+pub use batch_store::{BatchContext, BatchContextStore, BatchRequestContext, BatchStoreStats};
+pub use response_handler::{
+    CCRResponseHandler, CcrToolCall, CcrToolResult, ResponseHandlerConfig, ResponseHandlerStats,
+    StreamingCcrBuffer, StreamingCcrHandler,
+};
 
 /// Pluggable CCR storage backend. `Send + Sync` so it can sit behind an
 /// `Arc` and be shared across threads in the proxy.

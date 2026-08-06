@@ -25,6 +25,11 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _legacy_python_proxy_for_existing_tests(monkeypatch):
+    monkeypatch.setenv("HEADROOM_USE_PYTHON_PROXY", "1")
+
+
 class _FakeProxyProcess:
     returncode = None
 

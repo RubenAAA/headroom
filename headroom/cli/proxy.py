@@ -2,8 +2,11 @@
 
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import warnings
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import click
@@ -70,6 +73,8 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+_PYTHON_PROXY_ENV = "HEADROOM_USE_PYTHON_PROXY"
+_RUST_PROXY_BINARY_ENV = "HEADROOM_PROXY_BINARY"
 
 
 def _get_env_bool(name: str, default: bool) -> bool:
@@ -128,6 +133,323 @@ def _selected_context_tool() -> str:
             f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
         )
     return raw
+
+
+def _use_python_proxy() -> bool:
+    """Temporary Phase-1 escape hatch for the legacy Python request path."""
+    return _get_env_bool(_PYTHON_PROXY_ENV, False)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_rust_proxy_binary() -> str:
+    """Resolve the Rust proxy binary in the mandated Phase-1 order."""
+    override = os.environ.get(_RUST_PROXY_BINARY_ENV)
+    if override:
+        return override
+
+    found = shutil.which("headroom-proxy")
+    if found:
+        return found
+
+    root = _repo_root()
+    for candidate in (
+        root / "target" / "debug" / "headroom-proxy",
+        root / "target" / "release" / "headroom-proxy",
+    ):
+        if candidate.exists():
+            return str(candidate)
+
+    raise click.ClickException(
+        "Rust proxy binary not found. Set "
+        f"{_RUST_PROXY_BINARY_ENV}=<path>, install `headroom-proxy` on PATH, "
+        "or build it with `cargo build -p headroom-proxy --bin headroom-proxy`."
+    )
+
+
+def _derive_bedrock_endpoint(region: str) -> str:
+    return f"https://bedrock-runtime.{region}.amazonaws.com"
+
+
+def _explicit_provider_targets(provider_api_overrides: Any) -> list[tuple[str, str]]:
+    return [
+        (name, value)
+        for name in ("anthropic", "openai", "gemini", "cloudcode", "vertex")
+        if (value := getattr(provider_api_overrides, name, None))
+    ]
+
+
+def _select_rust_upstream(
+    *,
+    backend: str,
+    provider_api_overrides: Any,
+    provider_api_targets: Any,
+    bedrock_region: str,
+    bedrock_api_url: str | None,
+) -> tuple[str, str]:
+    """Select the single upstream URL accepted by the Rust proxy.
+
+    The Python proxy can route different provider families to different base
+    URLs in one process. The Rust proxy is currently a single-upstream reverse
+    proxy, so Phase 1 accepts zero or one explicit provider target and rejects
+    active multi-target setups loudly.
+    """
+    if backend == "bedrock":
+        return "bedrock", (bedrock_api_url or _derive_bedrock_endpoint(bedrock_region)).rstrip("/")
+
+    explicit = _explicit_provider_targets(provider_api_overrides)
+    if len(explicit) > 1:
+        names = ", ".join(name for name, _ in explicit)
+        raise click.ClickException(
+            "Rust proxy supports one upstream per process in Phase 1; "
+            f"multiple provider target URLs are active ({names}). "
+            f"Set {_PYTHON_PROXY_ENV}=1 to use the legacy Python multiplexer, "
+            "or start one Rust proxy per provider."
+        )
+    if explicit:
+        provider, _ = explicit[0]
+        return provider, getattr(provider_api_targets, provider).rstrip("/")
+
+    return "anthropic", provider_api_targets.anthropic.rstrip("/")
+
+
+def _rust_proxy_unsupported_reasons(options: dict[str, Any]) -> list[str]:
+    """Return active Python-proxy features that the Rust launcher cannot honor."""
+    reasons: list[str] = []
+
+    if options["workers"] != 1:
+        reasons.append("--workers / HEADROOM_WORKERS")
+    if options["limit_concurrency"] != 1000:
+        reasons.append("--limit-concurrency / HEADROOM_LIMIT_CONCURRENCY")
+    if options["max_connections"] != 500:
+        reasons.append("--max-connections / HEADROOM_MAX_CONNECTIONS")
+    if options["max_keepalive_connections"] != 100:
+        reasons.append("--max-keepalive / HEADROOM_MAX_KEEPALIVE")
+    if options["http2"] is not True:
+        reasons.append("--no-http2")
+    if options["keepalive_expiry"] != 90.0:
+        reasons.append("--keepalive-expiry / HEADROOM_KEEPALIVE_EXPIRY")
+    if options["intercept_tool_results"]:
+        reasons.append("--intercept-tool-results")
+    if options["proxy_extension"]:
+        reasons.append("--proxy-extension / HEADROOM_PROXY_EXTENSIONS")
+    if options["subscription_poll_interval"] is not None:
+        reasons.append("--subscription-poll-interval")
+    if options["anthropic_buffered_request_timeout_seconds"] is not None:
+        reasons.append("--anthropic-buffered-request-timeout-seconds")
+    if options["anthropic_pre_upstream_acquire_timeout_seconds"] is not None:
+        reasons.append("--anthropic-pre-upstream-acquire-timeout-seconds")
+    if options["anthropic_pre_upstream_memory_context_timeout_seconds"] is not None:
+        reasons.append("--anthropic-pre-upstream-memory-context-timeout-seconds")
+    if options["log_file"]:
+        reasons.append("--log-file / HEADROOM_LOG_FILE")
+    if options["log_messages"]:
+        reasons.append("--log-messages / HEADROOM_LOG_MESSAGES")
+    if options["codex_wire_debug"] or options["codex_wire_debug_dir"]:
+        reasons.append("--codex-wire-debug")
+    if options["disable_kompress_anthropic"] is False:
+        reasons.append("--enable-kompress-anthropic")
+    if options["disable_kompress_openai"] is False:
+        reasons.append("--enable-kompress-openai")
+    if options["code_graph"]:
+        reasons.append("--code-graph")
+    if options["memory"]:
+        reasons.append("--memory and related memory flags")
+    if options["learn"]:
+        reasons.append("--learn")
+    if options["backend"] not in ("anthropic", "bedrock"):
+        reasons.append(f"--backend {options['backend']}")
+    if options["embedding_server"] or options["embedding_server_socket"]:
+        reasons.append("--embedding-server")
+
+    return reasons
+
+
+def _run_rust_proxy(command: list[str], env: dict[str, str]) -> int:
+    try:
+        return subprocess.run(command, env=env).returncode
+    except (FileNotFoundError, PermissionError) as exc:
+        raise click.ClickException(f"Rust proxy binary not executable: {command[0]}") from exc
+
+
+def _run_rust_proxy_from_options(options: dict[str, Any]) -> None:
+    unsupported = _rust_proxy_unsupported_reasons(options)
+    if unsupported:
+        rendered = ", ".join(unsupported)
+        raise click.ClickException(
+            "These active options are not supported by the Rust proxy in Phase 1: "
+            f"{rendered}. Set {_PYTHON_PROXY_ENV}=1 to use the legacy Python proxy "
+            "for this run."
+        )
+
+    provider_api_overrides = resolve_api_overrides(
+        anthropic_api_url=options["anthropic_api_url"],
+        openai_api_url=options["openai_api_url"],
+        gemini_api_url=options["gemini_api_url"],
+        cloudcode_api_url=options["cloudcode_api_url"],
+        vertex_api_url=options["vertex_api_url"],
+        environ=os.environ,
+    )
+    provider_api_targets = resolve_api_targets(provider_api_overrides)
+    bedrock_region = options["bedrock_region"] or options["region"]
+    provider, upstream = _select_rust_upstream(
+        backend=options["backend"],
+        provider_api_overrides=provider_api_overrides,
+        provider_api_targets=provider_api_targets,
+        bedrock_region=bedrock_region,
+        bedrock_api_url=options["bedrock_api_url"] or os.environ.get("BEDROCK_TARGET_API_URL"),
+    )
+
+    request_timeout = (
+        options["request_timeout_seconds"]
+        if options["request_timeout_seconds"] is not None and options["request_timeout_seconds"] > 0
+        else 300
+    )
+    connect_timeout = (
+        options["connect_timeout_seconds"]
+        if options["connect_timeout_seconds"] is not None
+        else 10
+    )
+    effective_mode = normalize_proxy_mode(
+        options["mode"] or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN
+    )
+
+    command = [
+        _resolve_rust_proxy_binary(),
+        "--listen",
+        f"{options['host']}:{options['port']}",
+        "--upstream",
+        upstream,
+        "--upstream-timeout",
+        f"{request_timeout}s",
+        "--upstream-connect-timeout",
+        f"{connect_timeout}s",
+        "--mode",
+        effective_mode,
+        "--log-level",
+        os.environ.get("HEADROOM_LOG_LEVEL", "info"),
+    ]
+
+    if not options["no_optimize"]:
+        command.extend(["--compression", "--compression-mode", "all_messages"])
+
+    if options["no_ccr_proactive_expansion"]:
+        command.append("--ccr-proactive-expansion=false")
+
+    if options.get("no_cache"):
+        command.append("--cache=false")
+
+    if provider == "bedrock":
+        command.extend(["--bedrock-region", bedrock_region])
+        bedrock_endpoint = options["bedrock_api_url"] or os.environ.get("BEDROCK_TARGET_API_URL")
+        if bedrock_endpoint:
+            command.extend(["--bedrock-endpoint", bedrock_endpoint.rstrip("/")])
+        if options["bedrock_profile"]:
+            command.extend(["--aws-profile", options["bedrock_profile"]])
+
+    if provider == "vertex":
+        command.extend(["--vertex-region", options["region"]])
+
+    env = os.environ.copy()
+    env["HEADROOM_MODE"] = effective_mode
+
+    # Forward CLI-derived settings to the Rust proxy via env vars so it
+    # can pick them up in Config::from_cli_without_args().
+    is_stateless = options.get("stateless", False)
+    memory_enabled = (
+        False
+        if is_stateless
+        else (
+            options.get("memory", False)
+            or (options.get("learn", False) and not options.get("no_learn", False))
+        )
+    )
+    env["HEADROOM_MEMORY_ENABLED"] = "1" if memory_enabled else "0"
+
+    # cache_ttl / cache_max_entries: forward from parent env only — no
+    # CLI flags exist for these yet; the Rust proxy uses its defaults
+    # when the env vars are absent.
+
+    # CCR tool injection: forward from CLI flags.
+    if options.get("no_ccr_inject_tool"):
+        command.append("--ccr-inject-tool=false")
+    if options.get("no_ccr_handle_responses"):
+        command.append("--ccr-handle-responses=false")
+    if options.get("ccr_max_retrieval_rounds") is not None:
+        command.extend(["--ccr-max-retrieval-rounds", str(options["ccr_max_retrieval_rounds"])])
+
+    # Retry: forward from CLI flags.
+    if options.get("no_retry"):
+        command.append("--retry=false")
+    if options.get("retry_max_attempts") is not None:
+        command.extend(["--retry-max-attempts", str(options["retry_max_attempts"])])
+
+    # Budget: forward from CLI flags.
+    if options.get("budget") is not None:
+        command.extend(["--budget-limit-usd", str(options["budget"])])
+
+    # Compression tuning: forward from CLI flags.
+    if options.get("min_tokens_to_crush") is not None:
+        command.extend(["--min-tokens-to-crush", str(options["min_tokens_to_crush"])])
+    if options.get("max_items_after_crush") is not None:
+        command.extend(["--max-items-after-crush", str(options["max_items_after_crush"])])
+    if options.get("savings_profile") is not None:
+        command.extend(["--savings-profile", options["savings_profile"]])
+    if options.get("target_ratio") is not None:
+        command.extend(["--target-ratio", str(options["target_ratio"])])
+    if options.get("code_aware_flag") or _get_env_bool("HEADROOM_CODE_AWARE_ENABLED", False):
+        command.append("--code-aware=true")
+    if options.get("disable_kompress"):
+        command.append("--disable-kompress=true")
+    if options.get("lossless"):
+        command.append("--lossless=true")
+    if options.get("exclude_tools"):
+        command.extend(["--exclude-tools", options["exclude_tools"]])
+    if options.get("protect_tool_results"):
+        command.extend(["--protect-tool-results", options["protect_tool_results"]])
+    if options.get("no_ccr_marker"):
+        command.append("--ccr-inject-marker=false")
+    if options.get("no_ccr_inject_system_instructions"):
+        command.append("--ccr-inject-system-instructions=true")
+    if options.get("read_lifecycle") and not options.get("no_read_lifecycle"):
+        command.append("--read-lifecycle=true")
+    if options.get("read_maturation"):
+        command.append("--read-maturation=true")
+    if options.get("stateless"):
+        command.append("--stateless=true")
+    if options.get("proxy_token"):
+        command.extend(["--proxy-token", options["proxy_token"]])
+    if options.get("offline"):
+        command.append("--offline=true")
+    if options.get("anthropic_pre_upstream_concurrency") is not None:
+        command.extend(["--anthropic-pre-upstream-concurrency", str(options["anthropic_pre_upstream_concurrency"])])
+    if options.get("compression_max_workers") is not None:
+        command.extend(["--compression-max-workers", str(options["compression_max_workers"])])
+
+    # Rate limiting: ensure env vars are set for the Rust proxy.
+    if options.get("rpm") is not None:
+        env["HEADROOM_RPM"] = str(options["rpm"])
+    elif "HEADROOM_RPM" not in env:
+        env["HEADROOM_RPM"] = "60"
+
+    if options.get("tpm") is not None:
+        env["HEADROOM_TPM"] = str(options["tpm"])
+    elif "HEADROOM_TPM" not in env:
+        env["HEADROOM_TPM"] = "100000"
+
+    if options.get("no_rate_limit"):
+        env["HEADROOM_RATE_LIMIT_ENABLED"] = "0"
+
+    click.echo(
+        f"Starting Rust proxy: listen=http://{options['host']}:{options['port']} "
+        f"upstream={upstream} mode={effective_mode} "
+        f"optimization={'disabled' if options['no_optimize'] else 'enabled'}"
+    )
+    exit_code = _run_rust_proxy(command, env)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 @main.command()
@@ -1020,6 +1342,14 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    if not _use_python_proxy():
+        try:
+            _run_rust_proxy_from_options(locals().copy())
+        except KeyboardInterrupt:
+            click.echo("\nShutting down...")
+            raise SystemExit(130) from None
+        return
+
     # Import here to avoid slow startup
     try:
         from headroom.proxy.server import (

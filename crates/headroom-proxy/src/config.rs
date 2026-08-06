@@ -1,6 +1,7 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
 use clap::{Parser, ValueEnum};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
@@ -214,6 +215,15 @@ pub struct CliArgs {
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub upstream_connect_timeout: Duration,
 
+    /// Optional HTTP proxy for upstream provider calls only (e.g.
+    /// http://127.0.0.1:3128). Scoped to the proxy's provider HTTP
+    /// client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY`
+    /// env vars, which would leak into tool executions inheriting the
+    /// environment. HTTP/2 is disabled for provider clients when this is
+    /// set so HTTPS provider APIs can tunnel through a CONNECT proxy.
+    #[arg(long, env = "HEADROOM_HTTP_PROXY")]
+    pub http_proxy: Option<String>,
+
     /// Max body size for buffered cases (does NOT bound streaming bodies).
     #[arg(long, default_value = "100MB", value_parser = parse_bytes)]
     pub max_body_bytes: u64,
@@ -275,6 +285,31 @@ pub struct CliArgs {
         default_value_t = CompressionMode::Off,
     )]
     pub compression_mode: CompressionMode,
+
+    /// Cross-turn (whole-conversation) verbatim de-dup for tool
+    /// outputs. When a span in a later tool output already appeared
+    /// verbatim in an earlier tool output, the later copy is replaced
+    /// with a compact in-context pointer to the original
+    /// (`[↑N L same as msg T: 'anchor']`, plus a `±D L` offset when the
+    /// re-read was renumbered by an edit).
+    /// Runs as a post-pass after the live-zone dispatcher, over the
+    /// final block forms. Prefix-monotonic: appending a turn never
+    /// rewrites an earlier turn's bytes, so the prompt-cache prefix
+    /// stays stable. Frozen-prefix and `cache_control` blocks are
+    /// reference targets only (never rewritten).
+    ///
+    /// Off by default — parity with the Python router's
+    /// `enable_cross_turn_dedup: bool = False`.
+    ///
+    /// Source priority: CLI flag →
+    /// `HEADROOM_PROXY_ENABLE_CROSS_TURN_DEDUP` env var → default
+    /// (`false`).
+    #[arg(
+        long = "enable-cross-turn-dedup",
+        env = "HEADROOM_PROXY_ENABLE_CROSS_TURN_DEDUP",
+        default_value_t = false
+    )]
+    pub enable_cross_turn_dedup: bool,
 
     /// Inject Anthropic-native context-editing (`context_management`) into
     /// `/v1/messages` so subscription users get the server-side context GC
@@ -404,6 +439,17 @@ pub struct CliArgs {
     )]
     pub enable_conversations_passthrough: bool,
 
+    /// Enable batch API routes (Google batchGenerateContent, OpenAI batch).
+    /// When `false` (default), batch requests fall through to the catch-all
+    /// and forward byte-equal to upstream without compression.
+    #[arg(
+        long = "enable-batch-api",
+        env = "HEADROOM_PROXY_ENABLE_BATCH_API",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub enable_batch_api: bool,
+
     /// Phase D PR-D1: enable the native Bedrock InvokeModel route.
     /// When `true` (default), `POST /model/{model_id}/invoke` is
     /// handled by the Rust `bedrock::invoke` handler — Anthropic-shape
@@ -479,13 +525,26 @@ pub struct CliArgs {
     )]
     pub ctx_offload: bool,
 
+    /// Freeze-replay: replay the previously-forwarded (compressed) prefix
+    /// byte-identical each turn so the provider prompt cache stays warm
+    /// (ports Python `PrefixCacheTracker` / `overlay_cached_prefix`). Anthropic
+    /// only. Default `false` — staged rollout; when off the request path is
+    /// byte-for-byte unchanged.
+    #[arg(
+        long = "prefix-replay",
+        env = "HEADROOM_PROXY_PREFIX_REPLAY",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub prefix_replay: bool,
+
     /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
     /// to be offloaded. Static per invariant I3 (never changes mid-session).
     /// Default `50_000` (mirrors context-mode's Read threshold).
     #[arg(
         long = "ctx-offload-min-bytes",
         env = "HEADROOM_PROXY_CTX_OFFLOAD_MIN_BYTES",
-        default_value_t = 50_000,
+        default_value_t = 50_000
     )]
     pub ctx_offload_min_bytes: usize,
 
@@ -494,7 +553,7 @@ pub struct CliArgs {
     #[arg(
         long = "ctx-offload-ttl-seconds",
         env = "HEADROOM_PROXY_CTX_OFFLOAD_TTL_SECONDS",
-        default_value_t = 604_800,
+        default_value_t = 604_800
     )]
     pub ctx_offload_ttl_seconds: u64,
 
@@ -513,6 +572,35 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub ctx_inject: bool,
+
+    /// CCR Phase 4: track compressed/offloaded content across turns so later
+    /// user queries can proactively retrieve relevant originals. Requires
+    /// `--ctx-offload`; when offload is unavailable this is a no-op.
+    #[arg(
+        long = "ccr-context-tracking",
+        env = "HEADROOM_PROXY_CCR_CONTEXT_TRACKING",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub ccr_context_tracking: bool,
+
+    /// CCR Phase 4: proactively append relevant previously-offloaded content
+    /// to the latest user turn before forwarding the request upstream.
+    #[arg(
+        long = "ccr-proactive-expansion",
+        env = "HEADROOM_PROXY_CCR_PROACTIVE_EXPANSION",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub ccr_proactive_expansion: bool,
+
+    /// CCR Phase 4: maximum proactive expansions appended to one request.
+    #[arg(
+        long = "ccr-max-proactive-expansions",
+        env = "HEADROOM_PROXY_CCR_MAX_PROACTIVE_EXPANSIONS",
+        default_value_t = 2
+    )]
+    pub ccr_max_proactive_expansions: usize,
 
     /// AWS region to use when signing Bedrock requests. Default
     /// `us-east-1`. The Bedrock endpoint URL derived from this
@@ -621,15 +709,25 @@ pub struct CliArgs {
     #[arg(long = "local-upstream", env = "HEADROOM_PROXY_LOCAL_UPSTREAM")]
     pub local_upstream: Option<Url>,
 
-    /// Additional model routes. Each value is `MODEL_NAME=UPSTREAM_URL[:translate]`
-    /// where `:translate` means "translate Anthropic format to OpenAI format".
-    /// Model names ending in `*` are prefix-matched. Can be specified multiple
-    /// times or set as a comma-separated list in
+    /// Additional model routes. Each value is
+    /// `MODEL_NAME=UPSTREAM_URL[:openai[:TARGET_MODEL_ID]]`, where `:openai`
+    /// (or its older spelling `:translate`) means "translate Anthropic format
+    /// to OpenAI format". Model names ending in `*` are prefix-matched. Can be
+    /// given multiple times or as a comma-separated list in
     /// `HEADROOM_PROXY_EXTRA_MODEL_ROUTES`.
+    ///
+    /// `TARGET_MODEL_ID` does two things. It overrides the model id sent
+    /// upstream, so `MODEL_NAME` can be a discoverable `claude-*` id (Claude
+    /// Code's gateway discovery only lists ids starting with `claude` or
+    /// `anthropic`) while the real upstream id differs. It ALSO selects the
+    /// endpoint: with a target the request goes to the agentic Responses API
+    /// (`/v1/responses`, or the ChatGPT Codex backend under Codex auth);
+    /// without one it goes to `/v1/chat/completions`. Codex needs the former.
     ///
     /// Examples:
     ///   --extra-model-route "MiMo-V2.5=https://api.xiaomimimo.com/anthropic"
-    ///   --extra-model-route "codex-*=https://api.openai.com/v1:translate"
+    ///   --extra-model-route "codex-*=https://api.openai.com/v1:openai"
+    ///   --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra"
     #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
     pub extra_model_routes: Vec<String>,
 
@@ -643,6 +741,352 @@ pub struct CliArgs {
     /// default (`~/.codex/auth.json` if it exists, None otherwise).
     #[arg(long = "codex-auth-file", env = "HEADROOM_PROXY_CODEX_AUTH_FILE")]
     pub codex_auth_file: Option<String>,
+
+    /// Proxy run mode: "token" (prioritize compression) or "cache"
+    /// (prioritize provider prefix cache stability). Aliases like
+    /// "token_headroom", "cost_savings" are normalized automatically.
+    #[arg(long = "mode", env = "HEADROOM_MODE", default_value = "token")]
+    pub mode: String,
+
+    /// Master switch for output-token shaping. When enabled, the proxy
+    /// appends verbosity steering to system prompts and routes effort
+    /// on mechanical tool-result continuations.
+    #[arg(
+        long = "output-shaper",
+        env = "HEADROOM_OUTPUT_SHAPER",
+        default_value_t = false
+    )]
+    pub output_shaper_enabled: bool,
+
+    /// Verbosity steering level 0-4. 0 = off, 1 = skip preamble,
+    /// 2 = default, 3 = conclusions only, 4 = minimum tokens.
+    #[arg(
+        long = "verbosity-level",
+        env = "HEADROOM_VERBOSITY_LEVEL",
+        default_value_t = 2
+    )]
+    pub verbosity_level: i32,
+
+    /// Effort value for mechanical tool-result continuations.
+    /// Only effective when output-shaper is enabled.
+    #[arg(
+        long = "mechanical-effort",
+        env = "HEADROOM_MECHANICAL_EFFORT",
+        default_value = "low"
+    )]
+    pub mechanical_effort: String,
+
+    /// Enable semantic response caching. When `true`, identical
+    /// non-streaming requests are served from an in-memory LRU cache
+    /// instead of hitting upstream. Cache keys hash `{model, messages,
+    /// system, tools, ...}` with `cache_control` annotations stripped
+    /// so moved breakpoints don't fragment keys.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_CACHE_ENABLED`
+    /// env var → default (`true`).
+    #[arg(
+        long = "cache",
+        env = "HEADROOM_PROXY_CACHE_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub cache_enabled: bool,
+
+    /// TTL for cached responses in seconds. Entries older than this
+    /// are evicted on access.
+    #[arg(
+        long = "cache-ttl",
+        env = "HEADROOM_PROXY_CACHE_TTL",
+        default_value_t = 3600
+    )]
+    pub cache_ttl_seconds: u64,
+
+    /// Maximum number of entries in the semantic response cache.
+    /// Older entries are evicted LRU when the limit is reached.
+    #[arg(
+        long = "cache-max-entries",
+        env = "HEADROOM_PROXY_CACHE_MAX_ENTRIES",
+        default_value_t = 1000
+    )]
+    pub cache_max_entries: usize,
+
+    /// CCR: inject the `headroom_retrieve` tool definition into
+    /// outgoing LLM requests. Default `true`.
+    #[arg(
+        long = "ccr-inject-tool",
+        env = "HEADROOM_CCR_INJECT_TOOL",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub ccr_inject_tool: bool,
+
+    /// CCR: auto-handle `headroom_retrieve` tool calls server-side
+    /// (retrieve context and continue the conversation). Default `true`.
+    #[arg(
+        long = "ccr-handle-responses",
+        env = "HEADROOM_CCR_HANDLE_RESPONSES",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub ccr_handle_responses: bool,
+
+    /// CCR: max rounds of retrieve-continue per response. Default `3`.
+    #[arg(
+        long = "ccr-max-retrieval-rounds",
+        env = "HEADROOM_CCR_MAX_RETRIEVAL_ROUNDS",
+        default_value_t = 3
+    )]
+    pub ccr_max_retrieval_rounds: usize,
+
+    /// Retry upstream requests on transient errors (429, 5xx).
+    /// Default `true`.
+    #[arg(
+        long = "retry",
+        env = "HEADROOM_RETRY_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub retry_enabled: bool,
+
+    /// Max retry attempts per upstream call. Default `3`.
+    #[arg(
+        long = "retry-max-attempts",
+        env = "HEADROOM_RETRY_MAX_ATTEMPTS",
+        default_value_t = 3
+    )]
+    pub retry_max_attempts: u32,
+
+    /// Base delay for exponential backoff in milliseconds. Default `1000`.
+    #[arg(
+        long = "retry-base-delay-ms",
+        env = "HEADROOM_RETRY_BASE_DELAY_MS",
+        default_value_t = 1000
+    )]
+    pub retry_base_delay_ms: u64,
+
+    /// Ceiling on backoff delay in milliseconds. Default `30000`.
+    #[arg(
+        long = "retry-max-delay-ms",
+        env = "HEADROOM_RETRY_MAX_DELAY_MS",
+        default_value_t = 30000
+    )]
+    pub retry_max_delay_ms: u64,
+
+    /// Enable cost tracking for upstream requests. Default `true`.
+    #[arg(
+        long = "cost-tracking",
+        env = "HEADROOM_COST_TRACKING_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub cost_tracking_enabled: bool,
+
+    /// Budget limit in USD. `None` (no flag) = unlimited.
+    #[arg(long = "budget-limit-usd", env = "HEADROOM_BUDGET_LIMIT_USD")]
+    pub budget_limit_usd: Option<f64>,
+
+    /// Budget aggregation period: "hourly", "daily", or "monthly".
+    /// Default "daily".
+    #[arg(
+        long = "budget-period",
+        env = "HEADROOM_BUDGET_PERIOD",
+        default_value = "daily"
+    )]
+    pub budget_period: String,
+
+    // ─── Compression tuning ──────────────────────────────────────────────
+    /// Minimum token count before a message is eligible for compression.
+    #[arg(
+        long = "min-tokens-to-crush",
+        env = "HEADROOM_MIN_TOKENS_TO_CRUSH",
+        default_value_t = 200
+    )]
+    pub min_tokens_to_crush: usize,
+
+    /// Max items to retain after SmartCrusher processing.
+    #[arg(
+        long = "max-items-after-crush",
+        env = "HEADROOM_MAX_ITEMS_AFTER_CRUSH",
+        default_value_t = 15
+    )]
+    pub max_items_after_crush: usize,
+
+    /// Compression savings profile name.
+    #[arg(
+        long = "savings-profile",
+        env = "HEADROOM_SAVINGS_PROFILE",
+        default_value = "balanced"
+    )]
+    pub savings_profile: String,
+
+    /// Target compression ratio (0.0 = auto).
+    #[arg(
+        long = "target-ratio",
+        env = "HEADROOM_TARGET_RATIO",
+        default_value_t = 0.0
+    )]
+    pub target_ratio: f64,
+
+    /// Enable code-aware compressor for source code.
+    #[arg(long = "code-aware", env = "HEADROOM_CODE_AWARE_ENABLED", default_value_t = false, action = clap::ArgAction::Set)]
+    pub code_aware_enabled: bool,
+
+    /// Disable the Kompress ML compressor entirely.
+    #[arg(long = "disable-kompress", env = "HEADROOM_DISABLE_KOMPRESS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub disable_kompress: bool,
+
+    /// When Kompress is disabled, route fall-through to passthrough.
+    #[arg(long = "disable-kompress-fallback", env = "HEADROOM_DISABLE_KOMPRESS_FALLBACK", default_value_t = true, action = clap::ArgAction::Set)]
+    pub disable_kompress_fallback: bool,
+
+    /// Disable Kompress for Anthropic provider only.
+    #[arg(long = "disable-kompress-anthropic", env = "HEADROOM_DISABLE_KOMPRESS_ANTHROPIC", default_value_t = false, action = clap::ArgAction::Set)]
+    pub disable_kompress_anthropic: bool,
+
+    /// Disable Kompress for OpenAI provider only.
+    #[arg(long = "disable-kompress-openai", env = "HEADROOM_DISABLE_KOMPRESS_OPENAI", default_value_t = false, action = clap::ArgAction::Set)]
+    pub disable_kompress_openai: bool,
+
+    /// Force all compressible content through Kompress.
+    #[arg(long = "force-kompress-all", env = "HEADROOM_FORCE_KOMPRESS_ALL", default_value_t = false, action = clap::ArgAction::Set)]
+    pub force_kompress_all: bool,
+
+    /// Enable image token optimization.
+    #[arg(long = "image-optimize", env = "HEADROOM_IMAGE_OPTIMIZE", default_value_t = true, action = clap::ArgAction::Set)]
+    pub image_optimize: bool,
+
+    /// Enable SmartCrusher compaction step.
+    #[arg(long = "smart-crusher-compaction", env = "HEADROOM_SMART_CRUSHER_WITH_COMPACTION", default_value_t = true, action = clap::ArgAction::Set)]
+    pub smart_crusher_with_compaction: bool,
+
+    /// Gate compression of user-role messages.
+    #[arg(long = "compress-user-messages", env = "HEADROOM_COMPRESS_USER_MESSAGES", default_value_t = true, action = clap::ArgAction::Set)]
+    pub compress_user_messages: bool,
+
+    /// Gate compression of system-role messages.
+    #[arg(long = "compress-system-messages", env = "HEADROOM_COMPRESS_SYSTEM_MESSAGES", default_value_t = true, action = clap::ArgAction::Set)]
+    pub compress_system_messages: bool,
+
+    /// Protect recent reads from compression.
+    #[arg(long = "protect-recent", env = "HEADROOM_PROTECT_RECENT", default_value_t = false, action = clap::ArgAction::Set)]
+    pub protect_recent: bool,
+
+    /// Protect analysis context from compression.
+    #[arg(long = "protect-analysis-context", env = "HEADROOM_PROTECT_ANALYSIS_CONTEXT", default_value_t = false, action = clap::ArgAction::Set)]
+    pub protect_analysis_context: bool,
+
+    /// Accuracy guard string for compression safety.
+    #[arg(
+        long = "accuracy-guard",
+        env = "HEADROOM_ACCURACY_GUARD",
+        default_value = ""
+    )]
+    pub accuracy_guard: String,
+
+    /// Enable lossless-only compression mode.
+    #[arg(long = "lossless", env = "HEADROOM_LOSSLESS", default_value_t = false, action = clap::ArgAction::Set)]
+    pub lossless: bool,
+
+    // ─── CCR extensions ──────────────────────────────────────────────────
+    /// CCR: inject retrieval markers into compressed output.
+    #[arg(long = "ccr-inject-marker", env = "HEADROOM_CCR_INJECT_MARKER", default_value_t = true, action = clap::ArgAction::Set)]
+    pub ccr_inject_marker: bool,
+
+    /// CCR: inject retrieval markers into system instructions.
+    #[arg(long = "ccr-inject-system-instructions", env = "HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS", default_value_t = false, action = clap::ArgAction::Set)]
+    pub ccr_inject_system_instructions: bool,
+
+    // ─── Fallback ────────────────────────────────────────────────────────
+    /// Enable fallback to another provider on failure.
+    #[arg(long = "fallback", env = "HEADROOM_FALLBACK_ENABLED", default_value_t = false, action = clap::ArgAction::Set)]
+    pub fallback_enabled: bool,
+
+    /// Provider to fall back to (e.g. "openai").
+    #[arg(
+        long = "fallback-provider",
+        env = "HEADROOM_FALLBACK_PROVIDER",
+        default_value = ""
+    )]
+    pub fallback_provider: String,
+
+    // ─── Tool filtering ──────────────────────────────────────────────────
+    /// Comma-separated tool names to exclude from compression.
+    #[arg(
+        long = "exclude-tools",
+        env = "HEADROOM_EXCLUDE_TOOLS",
+        default_value = ""
+    )]
+    pub exclude_tools: String,
+
+    /// Comma-separated tool names whose results must not be lossy-compressed.
+    #[arg(
+        long = "protect-tool-results",
+        env = "HEADROOM_PROTECT_TOOL_RESULTS",
+        default_value = ""
+    )]
+    pub protect_tool_results: String,
+
+    // ─── Read lifecycle ──────────────────────────────────────────────────
+    /// Enable read lifecycle tracking.
+    #[arg(long = "read-lifecycle", env = "HEADROOM_READ_LIFECYCLE", default_value_t = false, action = clap::ArgAction::Set)]
+    pub read_lifecycle: bool,
+
+    /// Enable read maturation (hold fresh reads out of prefix cache).
+    #[arg(long = "read-maturation", env = "HEADROOM_READ_MATURATION", default_value_t = false, action = clap::ArgAction::Set)]
+    pub read_maturation: bool,
+
+    // ─── Infrastructure ──────────────────────────────────────────────────
+    /// Stateless mode: disable filesystem writes.
+    #[arg(long = "stateless", env = "HEADROOM_STATELESS", default_value_t = false, action = clap::ArgAction::Set)]
+    pub stateless: bool,
+
+    /// Proxy auth token for inbound requests.
+    #[arg(long = "proxy-token", env = "HEADROOM_PROXY_TOKEN")]
+    pub proxy_token: Option<String>,
+
+    /// Offline mode: disable all outbound network egress.
+    #[arg(long = "offline", env = "HEADROOM_OFFLINE", default_value_t = false, action = clap::ArgAction::Set)]
+    pub offline: bool,
+
+    // ─── Concurrency ─────────────────────────────────────────────────────
+    /// Pre-upstream concurrency limit (semaphore).
+    #[arg(
+        long = "anthropic-pre-upstream-concurrency",
+        env = "HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY",
+        default_value_t = 1000
+    )]
+    pub anthropic_pre_upstream_concurrency: usize,
+
+    /// Compression worker threadpool size.
+    #[arg(
+        long = "compression-max-workers",
+        env = "HEADROOM_COMPRESSION_MAX_WORKERS",
+        default_value_t = 4
+    )]
+    pub compression_max_workers: usize,
+
+    /// Azure AI Foundry upstream base URL for `/anthropic/v1/messages`
+    /// requests (e.g. `https://{resource}.services.ai.azure.com/anthropic`).
+    /// Matches the Python proxy's `ANTHROPIC_FOUNDRY_BASE_URL` handling
+    /// (`headroom/providers/registry.py::resolve_api_overrides`). When
+    /// unset, falls back to derivation from `--foundry-resource`, then
+    /// to `--upstream`.
+    ///
+    /// Source priority: CLI flag → `ANTHROPIC_FOUNDRY_BASE_URL` env
+    /// var → derived from `--foundry-resource` → none.
+    #[arg(long = "foundry-base-url", env = "ANTHROPIC_FOUNDRY_BASE_URL")]
+    pub foundry_base_url: Option<Url>,
+
+    /// Azure AI Foundry resource name. When `--foundry-base-url` is
+    /// unset, the Foundry upstream is derived as
+    /// `https://{resource}.services.ai.azure.com/anthropic` — the same
+    /// derivation Claude Code performs internally and that the Python
+    /// side implements in `headroom/cli/wrap.py::_foundry_upstream_url`.
+    ///
+    /// Source priority: CLI flag → `ANTHROPIC_FOUNDRY_RESOURCE` env
+    /// var → none.
+    #[arg(long = "foundry-resource", env = "ANTHROPIC_FOUNDRY_RESOURCE")]
+    pub foundry_resource: Option<String>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -690,6 +1134,11 @@ pub struct ModelRoute {
     /// When set, route through `mimo run` subprocess instead of HTTP.
     /// The value is the model ID to pass to `mimo run -m`.
     pub mimo_run: Option<String>,
+    /// When set, overrides the `model` field sent to the upstream after
+    /// translation. Lets `model_prefix` be a discoverable id (e.g.
+    /// `claude-codex-5.5`, satisfying Claude Code's gateway-discovery
+    /// filter) while the real upstream model id (e.g. `gpt-5.5`) differs.
+    pub target_model: Option<String>,
 }
 
 impl ModelRoute {
@@ -702,11 +1151,94 @@ impl ModelRoute {
     }
 }
 
-/// Parse `MODEL_NAME=UPSTREAM_URL[:translate]` or `MODEL_NAME=mimo:MODEL_ID` into a `ModelRoute`.
+/// Parse `MODEL_NAME=UPSTREAM_URL[:translate[:TARGET_MODEL_ID]]` or
+/// `MODEL_NAME=mimo:MODEL_ID` into a `ModelRoute`. `TARGET_MODEL_ID` lets
+/// `MODEL_NAME` be a discoverable id (e.g. `claude-codex-5.5`, to satisfy
+/// Claude Code's gateway-discovery filter) while the real upstream model id
+/// (e.g. `gpt-5.5`) differs.
+/// Parse the `HEADROOM_BEDROCK_MODEL_MAP` operator override.
+///
+/// Comma-separated `name=target` pairs. Whitespace around each pair is
+/// trimmed; blank or malformed (no `=`) entries are skipped. Mirrors
+/// Python's `_parse_bedrock_model_overrides` (#1795) including its
+/// `partition("=")` semantics — the first `=` splits, everything after
+/// it (including further `=` chars) belongs to the value.
+pub fn parse_bedrock_model_map(raw: Option<&str>) -> HashMap<String, String> {
+    let mut overrides = HashMap::new();
+    let Some(raw) = raw else {
+        return overrides;
+    };
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((name, target)) = pair.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let target = target.trim();
+        if !name.is_empty() && !target.is_empty() {
+            overrides.insert(name.to_string(), target.to_string());
+        }
+    }
+    overrides
+}
+
+/// Warn about routes that translate to OpenAI but never reach the agentic API.
+///
+/// The endpoint family is chosen by whether a route carries a `TARGET_MODEL_ID`,
+/// not by the translate keyword:
+///
+/// - `URL:openai:TARGET` -> `/v1/responses` (or the ChatGPT Codex backend)
+/// - `URL:openai`        -> `/v1/chat/completions`
+///
+/// A Codex setup needs the first. Writing the second is easy, looks right, and
+/// fails later as an upstream auth or 404 error rather than a config error —
+/// a ChatGPT bearer token is not accepted by `api.openai.com`. Warning at
+/// startup turns a confusing runtime failure into an obvious one.
+///
+/// Only warns when Codex auth is actually configured, so operators legitimately
+/// pointing a route at a chat-completions backend are not nagged.
+pub fn warn_on_ambiguous_codex_routes(routes: &[ModelRoute], codex_auth_file: Option<&str>) {
+    if codex_auth_file.is_none() {
+        return;
+    }
+    for route in routes {
+        if route.translate && route.target_model.is_none() {
+            if let Some(upstream) = &route.upstream {
+                if upstream.host_str() == Some("api.openai.com") {
+                    tracing::warn!(
+                        model = %route.model_prefix,
+                        upstream = %upstream,
+                        "model route translates to OpenAI but has no TARGET_MODEL_ID, so it \
+                         routes to /v1/chat/completions, not the agentic Responses API. \
+                         Codex auth is configured, which suggests this was meant to be \
+                         '<url>:openai:<target-model-id>'."
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Keywords that turn on Anthropic -> OpenAI format translation in a route spec.
+///
+/// `translate` is the original spelling and stays supported forever; `openai`
+/// is the clearer synonym, since what the flag actually does is convert the
+/// request into OpenAI's format. They are exact aliases — same parsing, same
+/// behaviour.
+///
+/// Note the keyword only selects the *format*. Whether the request goes to the
+/// agentic Responses API or to chat-completions is decided by the presence of
+/// `TARGET_MODEL_ID`, not by which keyword is used. See
+/// [`warn_on_ambiguous_codex_routes`].
+const TRANSLATE_KEYWORDS: [&str; 2] = ["translate", "openai"];
+
 fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
-    let (model, rest) = spec
-        .split_once('=')
-        .ok_or_else(|| format!("expected MODEL=URL[:translate] or MODEL=mimo:ID, got: {spec}"))?;
+    let (model, rest) = spec.split_once('=').ok_or_else(|| {
+        format!("expected MODEL=URL[:translate[:TARGET_ID]] or MODEL=mimo:ID, got: {spec}")
+    })?;
     let model = model.trim().to_string();
     let prefix_match = model.ends_with('*');
 
@@ -718,16 +1250,32 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
             upstream: None,
             translate: false,
             mimo_run: Some(mimo_model.trim().to_string()),
+            target_model: None,
         });
     }
 
-    // Check if the URL ends with `:translate` (but not `://` from the scheme).
-    let (url_str, translate) = if rest.ends_with(":translate") {
-        let url_end = rest.len() - ":translate".len();
-        (&rest[..url_end], true)
-    } else {
-        (rest, false)
-    };
+    // Check for a trailing `:<kw>` or `:<kw>:TARGET_ID` suffix, where `<kw>`
+    // is any of TRANSLATE_KEYWORDS (but not `://` from the scheme).
+    let mut parsed_suffix = None;
+    for kw in TRANSLATE_KEYWORDS {
+        let with_target = format!(":{kw}:");
+        if let Some(idx) = rest.find(&with_target) {
+            let target = rest[idx + with_target.len()..].trim();
+            if target.is_empty() {
+                return Err(format!(
+                    "expected non-empty TARGET_MODEL_ID after :{kw}: in {spec}"
+                ));
+            }
+            parsed_suffix = Some((&rest[..idx], true, Some(target.to_string())));
+            break;
+        }
+        let bare = format!(":{kw}");
+        if rest.ends_with(&bare) {
+            parsed_suffix = Some((&rest[..rest.len() - bare.len()], true, None));
+            break;
+        }
+    }
+    let (url_str, translate, target_model) = parsed_suffix.unwrap_or((rest, false, None));
 
     let url_str = url_str.trim();
     let upstream: Url = url_str
@@ -740,6 +1288,7 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
         upstream: Some(upstream),
         translate,
         mimo_run: None,
+        target_model,
     })
 }
 
@@ -750,6 +1299,10 @@ pub struct Config {
     pub upstream: Url,
     pub upstream_timeout: Duration,
     pub upstream_connect_timeout: Duration,
+    /// Provider-only HTTP proxy for upstream calls. See the CLI arg of
+    /// the same name; scoped to the provider HTTP client, never exported
+    /// to the process environment.
+    pub http_proxy: Option<String>,
     pub max_body_bytes: u64,
     pub log_level: String,
     pub rewrite_host: bool,
@@ -767,6 +1320,12 @@ pub struct Config {
     /// because the dispatcher isn't implemented yet (Phase B PR-B2
     /// fills this in).
     pub compression_mode: CompressionMode,
+    /// Cross-turn verbatim de-dup post-pass over tool outputs.
+    /// Off by default (parity with Python's
+    /// `enable_cross_turn_dedup = False`). Only active when the
+    /// compression pipeline itself runs (`compression_mode` is not
+    /// `Off`).
+    pub enable_cross_turn_dedup: bool,
     /// Inject Anthropic context-editing directives into `/v1/messages`.
     pub context_edit: bool,
     /// `clear_tool_uses`: keep this many most-recent tool results.
@@ -778,6 +1337,11 @@ pub struct Config {
     /// Tool-pruning (A4) policy, parsed once from `--prune-keep-tools` /
     /// `--prune-drop-mcp`. `is_noop()` when neither flag is set (passthrough).
     pub tool_prune_policy: crate::cache_stabilization::tool_prune::PrunePolicy,
+    /// Cost-aware model routing (issue #1706). Disabled unless
+    /// `HEADROOM_MODEL_ROUTER_ENABLED` is truthy and `HEADROOM_MODEL_ROUTES`
+    /// parses. Distinct from `model_routes`, which selects an *upstream* by
+    /// model name; this rewrites the model itself based on request size.
+    pub model_router: crate::model_router::ModelRouterConfig,
     /// Whether the live-zone dispatcher derives `frozen_message_count`
     /// automatically from customer `cache_control` markers. PR-A4
     /// adds the derivation function (`compute_frozen_count`); Phase
@@ -799,6 +1363,8 @@ pub struct Config {
     /// NOT gate compression of conversation items (that's
     /// C5+/B-phase territory).
     pub enable_conversations_passthrough: bool,
+    /// Enable batch API routes (Google/OpenAI batch). Default `false`.
+    pub enable_batch_api: bool,
     /// PR-D1: enable the native Bedrock InvokeModel route. Default
     /// `true`. When disabled, the explicit Rust handlers are not
     /// mounted; operators relying on the Python LiteLLM converter
@@ -815,12 +1381,20 @@ pub struct Config {
     pub ctx_store_dir: Option<std::path::PathBuf>,
     /// CTX-3: tool_result offload transform on/off. Default `false`.
     pub ctx_offload: bool,
+    /// Freeze-replay: byte-identical prefix replay across turns. Default `false`.
+    pub prefix_replay: bool,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
     pub ctx_offload_ttl_seconds: u64,
     /// CTX-4: recall/resume injection on/off. Requires `ctx_capture`.
     pub ctx_inject: bool,
+    /// CCR Phase 4: multi-turn context tracker on/off.
+    pub ccr_context_tracking: bool,
+    /// CCR Phase 4: proactive expansion on/off.
+    pub ccr_proactive_expansion: bool,
+    /// CCR Phase 4: max expansions appended to a turn.
+    pub ccr_max_proactive_expansions: usize,
     /// PR-D1: AWS region used to sign Bedrock requests + (when no
     /// explicit endpoint is set) derive the Bedrock endpoint URL.
     pub bedrock_region: String,
@@ -833,6 +1407,14 @@ pub struct Config {
     /// PR-D2: validate prelude + message CRC32 on inbound Bedrock
     /// EventStream frames. Default `true`. Off only for debugging.
     pub bedrock_validate_eventstream_crc: bool,
+    /// Operator override map for Bedrock model ids, parsed from the
+    /// `HEADROOM_BEDROCK_MODEL_MAP` env var (`name=target,...`). Keyed
+    /// by the model_id the client sends in the inbound path; the value
+    /// is the effective model_id (or application-inference-profile ARN)
+    /// the proxy forwards to Bedrock. An ARN value forces the converse
+    /// route. Empty when unset — passthrough behaviour is unchanged.
+    /// Ports Python's `_parse_bedrock_model_overrides` (#1795).
+    pub bedrock_model_map: HashMap<String, String>,
     /// PR-D4: GCP Vertex region tag (e.g. `us-central1`). Surfaced
     /// in structured logs only — the actual upstream URL comes from
     /// `Config::upstream`. Operators set this so observability
@@ -854,6 +1436,111 @@ pub struct Config {
     /// access_token from this file and uses it as a Bearer token for
     /// OpenAI upstream requests. Re-read on each request for refresh.
     pub codex_auth_file: Option<String>,
+    /// Proxy run mode: "token" (prioritize compression) or "cache"
+    /// (prioritize provider prefix cache stability). Normalized via
+    /// `modes::normalize_proxy_mode`.
+    pub mode: String,
+    /// Master switch for output-token shaping (verbosity steering,
+    /// effort routing). Env-driven via HEADROOM_OUTPUT_SHAPER.
+    pub output_shaper_enabled: bool,
+    /// Verbosity steering level 0-4 (0 = off, 4 = minimum tokens).
+    pub verbosity_level: i32,
+    /// Effort value used on mechanical tool-result continuations.
+    pub mechanical_effort: String,
+    /// Memory system: master switch. When false, no memory operations run.
+    pub memory_enabled: bool,
+    /// Memory injection mode: "auto_tail" (append to user message) or "tool" (model calls memory_search).
+    pub memory_mode: String,
+    /// Inject memory tool definitions into requests.
+    pub memory_inject_tools: bool,
+    /// Inject memory context into user messages.
+    pub memory_inject_context: bool,
+    /// Use Anthropic's native memory_20250818 tool instead of custom tools.
+    pub memory_use_native_tool: bool,
+    /// Number of memories to retrieve for context injection.
+    pub memory_top_k: usize,
+    /// Minimum similarity score for memory retrieval.
+    pub memory_min_similarity: f64,
+    /// Enable per-key rate limiting. Defaults to `true` in `from_args`
+    /// (matching Python's `rate_limit_enabled: bool = True`); disable with
+    /// `HEADROOM_RATE_LIMIT_ENABLED=0`.
+    pub rate_limit_enabled: bool,
+    /// Requests per minute per API key (0 = unlimited).
+    pub rate_limit_rpm: u32,
+    /// Tokens per minute per API key (0 = unlimited).
+    pub rate_limit_tpm: u32,
+    /// Enable semantic response caching. When `true`, identical
+    /// non-streaming requests are served from an in-memory LRU.
+    pub cache_enabled: bool,
+    /// TTL for cached responses (seconds).
+    pub cache_ttl_seconds: u64,
+    /// Max entries in the semantic response cache (LRU eviction).
+    pub cache_max_entries: usize,
+    /// CCR: inject `headroom_retrieve` tool into LLM requests.
+    pub ccr_inject_tool: bool,
+    /// CCR: auto-handle retrieval tool calls server-side.
+    pub ccr_handle_responses: bool,
+    /// CCR: max retrieve-continue rounds per response.
+    pub ccr_max_retrieval_rounds: usize,
+    /// Retry upstream requests on transient errors.
+    pub retry_enabled: bool,
+    /// Max retry attempts per upstream call.
+    pub retry_max_attempts: u32,
+    /// Base delay for exponential backoff (ms).
+    pub retry_base_delay_ms: u64,
+    /// Ceiling on backoff delay (ms).
+    pub retry_max_delay_ms: u64,
+    /// Enable cost tracking for upstream requests.
+    pub cost_tracking_enabled: bool,
+    /// Budget limit in USD (None = unlimited).
+    pub budget_limit_usd: Option<f64>,
+    /// Budget aggregation period ("hourly", "daily", "monthly").
+    pub budget_period: String,
+    // ─── Compression tuning ──────────────────────────────────────────────
+    pub min_tokens_to_crush: usize,
+    pub max_items_after_crush: usize,
+    pub savings_profile: String,
+    pub target_ratio: f64,
+    pub code_aware_enabled: bool,
+    pub disable_kompress: bool,
+    pub disable_kompress_fallback: bool,
+    pub disable_kompress_anthropic: bool,
+    pub disable_kompress_openai: bool,
+    pub force_kompress_all: bool,
+    pub image_optimize: bool,
+    pub smart_crusher_with_compaction: bool,
+    pub compress_user_messages: bool,
+    pub compress_system_messages: bool,
+    pub protect_recent: bool,
+    pub protect_analysis_context: bool,
+    pub accuracy_guard: String,
+    pub lossless: bool,
+    // ─── CCR extensions ──────────────────────────────────────────────────
+    pub ccr_inject_marker: bool,
+    pub ccr_inject_system_instructions: bool,
+    // ─── Fallback ────────────────────────────────────────────────────────
+    pub fallback_enabled: bool,
+    pub fallback_provider: String,
+    // ─── Tool filtering ──────────────────────────────────────────────────
+    pub exclude_tools: Vec<String>,
+    pub protect_tool_results: Vec<String>,
+    // ─── Read lifecycle ──────────────────────────────────────────────────
+    pub read_lifecycle: bool,
+    pub read_maturation: bool,
+    // ─── Infrastructure ──────────────────────────────────────────────────
+    pub stateless: bool,
+    pub proxy_token: Option<String>,
+    pub offline: bool,
+    // ─── Concurrency ─────────────────────────────────────────────────────
+    pub anthropic_pre_upstream_concurrency: usize,
+    pub compression_max_workers: usize,
+
+    /// Azure AI Foundry upstream for `/anthropic/v1/messages`.
+    /// Resolved from `--foundry-base-url` / `ANTHROPIC_FOUNDRY_BASE_URL`,
+    /// or derived from `--foundry-resource` / `ANTHROPIC_FOUNDRY_RESOURCE`
+    /// (`https://{resource}.services.ai.azure.com/anthropic`). `None`
+    /// means the Foundry route forwards to `Config::upstream`.
+    pub foundry_base_url: Option<Url>,
 }
 
 impl Config {
@@ -879,6 +1566,7 @@ impl Config {
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
             upstream_connect_timeout: args.upstream_connect_timeout,
+            http_proxy: args.http_proxy,
             max_body_bytes: args.max_body_bytes,
             log_level: args.log_level,
             rewrite_host,
@@ -886,6 +1574,7 @@ impl Config {
             compression,
             compression_max_body_bytes,
             compression_mode: args.compression_mode,
+            enable_cross_turn_dedup: args.enable_cross_turn_dedup,
             context_edit: args.context_edit,
             context_edit_keep_tool_uses: args.context_edit_keep_tool_uses,
             context_edit_trigger_tokens: args.context_edit_trigger_tokens,
@@ -894,23 +1583,50 @@ impl Config {
                 args.prune_keep_tools.as_deref(),
                 args.prune_drop_mcp.as_deref(),
             ),
+            model_router: crate::model_router::ModelRouterConfig::from_env(
+                std::env::var("HEADROOM_MODEL_ROUTER_ENABLED")
+                    .ok()
+                    .as_deref(),
+                std::env::var("HEADROOM_MODEL_ROUTES").ok().as_deref(),
+            ),
             cache_control_auto_frozen: args.cache_control_auto_frozen,
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
             enable_responses_streaming: args.enable_responses_streaming,
             enable_conversations_passthrough: args.enable_conversations_passthrough,
+            enable_batch_api: args.enable_batch_api,
             enable_bedrock_native: args.enable_bedrock_native,
             enable_kompress: args.enable_kompress,
             ctx_capture: args.ctx_capture,
             ctx_store_dir: args.ctx_store_dir,
             ctx_offload: args.ctx_offload,
+            prefix_replay: args.prefix_replay,
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
+            ccr_context_tracking: args.ccr_context_tracking,
+            ccr_proactive_expansion: args.ccr_proactive_expansion,
+            ccr_max_proactive_expansions: args.ccr_max_proactive_expansions,
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
             bedrock_validate_eventstream_crc: args.bedrock_validate_eventstream_crc,
+            bedrock_model_map: {
+                let map = parse_bedrock_model_map(
+                    std::env::var("HEADROOM_BEDROCK_MODEL_MAP").ok().as_deref(),
+                );
+                if !map.is_empty() {
+                    let mut names: Vec<&String> = map.keys().collect();
+                    names.sort();
+                    tracing::info!(
+                        event = "bedrock_model_map_loaded",
+                        count = map.len(),
+                        names = ?names,
+                        "loaded Bedrock model override(s) from HEADROOM_BEDROCK_MODEL_MAP"
+                    );
+                }
+                map
+            },
             vertex_region: args.vertex_region,
             vertex_adc_scope: args.vertex_adc_scope,
             local_model: args.local_model,
@@ -943,6 +1659,106 @@ impl Config {
                     None
                 }
             }),
+            mode: crate::modes::normalize_proxy_mode(
+                Some(&args.mode),
+                crate::modes::PROXY_MODE_TOKEN,
+            ),
+            output_shaper_enabled: args.output_shaper_enabled,
+            verbosity_level: args.verbosity_level.max(0).min(4),
+            mechanical_effort: args.mechanical_effort,
+            memory_enabled: std::env::var("HEADROOM_MEMORY_ENABLED")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false),
+            memory_mode: std::env::var("HEADROOM_MEMORY_MODE")
+                .unwrap_or_else(|_| "auto_tail".to_string()),
+            memory_inject_tools: std::env::var("HEADROOM_MEMORY_INJECT_TOOLS")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
+            memory_inject_context: std::env::var("HEADROOM_MEMORY_INJECT_CONTEXT")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
+            memory_use_native_tool: std::env::var("HEADROOM_MEMORY_USE_NATIVE_TOOL")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false),
+            memory_top_k: std::env::var("HEADROOM_MEMORY_TOP_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            memory_min_similarity: std::env::var("HEADROOM_MEMORY_MIN_SIMILARITY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.3),
+            rate_limit_enabled: std::env::var("HEADROOM_RATE_LIMIT_ENABLED")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(true),
+            rate_limit_rpm: std::env::var("HEADROOM_RPM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            rate_limit_tpm: std::env::var("HEADROOM_TPM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100000),
+            cache_enabled: args.cache_enabled,
+            cache_ttl_seconds: args.cache_ttl_seconds,
+            cache_max_entries: args.cache_max_entries,
+            ccr_inject_tool: args.ccr_inject_tool,
+            ccr_handle_responses: args.ccr_handle_responses,
+            ccr_max_retrieval_rounds: args.ccr_max_retrieval_rounds,
+            retry_enabled: args.retry_enabled,
+            retry_max_attempts: args.retry_max_attempts,
+            retry_base_delay_ms: args.retry_base_delay_ms,
+            retry_max_delay_ms: args.retry_max_delay_ms,
+            cost_tracking_enabled: args.cost_tracking_enabled,
+            budget_limit_usd: args.budget_limit_usd,
+            budget_period: args.budget_period,
+            min_tokens_to_crush: args.min_tokens_to_crush,
+            max_items_after_crush: args.max_items_after_crush,
+            savings_profile: args.savings_profile,
+            target_ratio: args.target_ratio,
+            code_aware_enabled: args.code_aware_enabled,
+            disable_kompress: args.disable_kompress,
+            disable_kompress_fallback: args.disable_kompress_fallback,
+            disable_kompress_anthropic: args.disable_kompress_anthropic,
+            disable_kompress_openai: args.disable_kompress_openai,
+            force_kompress_all: args.force_kompress_all,
+            image_optimize: args.image_optimize,
+            smart_crusher_with_compaction: args.smart_crusher_with_compaction,
+            compress_user_messages: args.compress_user_messages,
+            compress_system_messages: args.compress_system_messages,
+            protect_recent: args.protect_recent,
+            protect_analysis_context: args.protect_analysis_context,
+            accuracy_guard: args.accuracy_guard,
+            lossless: args.lossless,
+            ccr_inject_marker: args.ccr_inject_marker,
+            ccr_inject_system_instructions: args.ccr_inject_system_instructions,
+            fallback_enabled: args.fallback_enabled,
+            fallback_provider: args.fallback_provider,
+            exclude_tools: args
+                .exclude_tools
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            protect_tool_results: args
+                .protect_tool_results
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            read_lifecycle: args.read_lifecycle,
+            read_maturation: args.read_maturation,
+            stateless: args.stateless,
+            proxy_token: args.proxy_token,
+            offline: args.offline,
+            anthropic_pre_upstream_concurrency: args.anthropic_pre_upstream_concurrency,
+            compression_max_workers: args.compression_max_workers,
+            foundry_base_url: crate::foundry::resolve_foundry_base_url(
+                args.foundry_base_url,
+                args.foundry_resource.as_deref(),
+            ),
         }
     }
 
@@ -954,6 +1770,7 @@ impl Config {
             upstream,
             upstream_timeout: Duration::from_secs(60),
             upstream_connect_timeout: Duration::from_secs(5),
+            http_proxy: None,
             max_body_bytes: 100 * 1024 * 1024,
             log_level: "warn".into(),
             rewrite_host: true,
@@ -961,11 +1778,15 @@ impl Config {
             compression: false,
             compression_max_body_bytes: 100 * 1024 * 1024,
             compression_mode: CompressionMode::Off,
+            // Production default: cross-turn dedup off (Python parity).
+            // Tests opt in per-case.
+            enable_cross_turn_dedup: false,
             context_edit: false,
             context_edit_keep_tool_uses: 6,
             context_edit_trigger_tokens: 60_000,
             context_edit_keep_thinking: None,
             tool_prune_policy: Default::default(),
+            model_router: Default::default(),
             // Match production default so the cache-control walker is
             // exercised under test without per-test opt-in.
             cache_control_auto_frozen: CacheControlAutoFrozen::Enabled,
@@ -987,6 +1808,7 @@ impl Config {
             // production traffic will hit.
             enable_responses_streaming: true,
             enable_conversations_passthrough: true,
+            enable_batch_api: false,
             // PR-D1: bedrock route default-on so tests exercise
             // it without per-test opt-in. Tests that set
             // `bedrock_endpoint` to a wiremock URL get the full
@@ -1000,15 +1822,20 @@ impl Config {
             ctx_capture: false,
             ctx_store_dir: None,
             ctx_offload: false,
+            prefix_replay: false,
             ctx_offload_min_bytes: 50_000,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,
+            ccr_context_tracking: true,
+            ccr_proactive_expansion: true,
+            ccr_max_proactive_expansions: 2,
             bedrock_region: "us-east-1".to_string(),
             bedrock_endpoint: None,
             aws_profile: None,
             // PR-D2: production default — validate every CRC. Tests
             // that exercise corruption paths flip this off per-case.
             bedrock_validate_eventstream_crc: true,
+            bedrock_model_map: HashMap::new(),
             // PR-D4: default Vertex region (used for log tagging
             // only; the upstream URL is `upstream`).
             vertex_region: "us-central1".to_string(),
@@ -1017,6 +1844,68 @@ impl Config {
             local_upstream: None,
             model_routes: Vec::new(),
             codex_auth_file: None,
+            mode: crate::modes::PROXY_MODE_TOKEN.to_string(),
+            output_shaper_enabled: false,
+            verbosity_level: 2,
+            mechanical_effort: "low".to_string(),
+            memory_enabled: false,
+            memory_mode: "auto_tail".to_string(),
+            memory_inject_tools: true,
+            memory_inject_context: true,
+            memory_use_native_tool: false,
+            memory_top_k: 10,
+            memory_min_similarity: 0.3,
+            rate_limit_enabled: false,
+            rate_limit_rpm: 0,
+            rate_limit_tpm: 0,
+            cache_enabled: true,
+            cache_ttl_seconds: 3600,
+            cache_max_entries: 1000,
+            ccr_inject_tool: true,
+            ccr_handle_responses: true,
+            ccr_max_retrieval_rounds: 3,
+            retry_enabled: true,
+            retry_max_attempts: 3,
+            retry_base_delay_ms: 1000,
+            retry_max_delay_ms: 30000,
+            cost_tracking_enabled: true,
+            budget_limit_usd: None,
+            budget_period: "daily".to_string(),
+            min_tokens_to_crush: 200,
+            max_items_after_crush: 15,
+            savings_profile: "balanced".to_string(),
+            target_ratio: 0.0,
+            code_aware_enabled: false,
+            disable_kompress: true,
+            disable_kompress_fallback: true,
+            disable_kompress_anthropic: false,
+            disable_kompress_openai: false,
+            force_kompress_all: false,
+            image_optimize: true,
+            smart_crusher_with_compaction: true,
+            compress_user_messages: true,
+            compress_system_messages: true,
+            protect_recent: false,
+            protect_analysis_context: false,
+            accuracy_guard: String::new(),
+            lossless: false,
+            ccr_inject_marker: true,
+            ccr_inject_system_instructions: false,
+            fallback_enabled: false,
+            fallback_provider: String::new(),
+            exclude_tools: Vec::new(),
+            protect_tool_results: Vec::new(),
+            read_lifecycle: false,
+            read_maturation: false,
+            stateless: false,
+            proxy_token: None,
+            offline: false,
+            anthropic_pre_upstream_concurrency: 1000,
+            compression_max_workers: 4,
+            // Azure AI Foundry: no dedicated upstream by default —
+            // the `/anthropic/v1/messages` route falls back to
+            // `upstream`. Foundry tests set this to a wiremock URL.
+            foundry_base_url: None,
         }
     }
 }
@@ -1050,6 +1939,49 @@ mod prune_policy_tests {
 }
 
 #[cfg(test)]
+mod bedrock_model_map_tests {
+    use super::parse_bedrock_model_map;
+
+    #[test]
+    fn none_and_empty_yield_empty() {
+        assert!(parse_bedrock_model_map(None).is_empty());
+        assert!(parse_bedrock_model_map(Some("")).is_empty());
+        assert!(parse_bedrock_model_map(Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn single_pair() {
+        let arn = "arn:aws:bedrock:ap-southeast-1:1:application-inference-profile/x57j1esjrt66";
+        let m = parse_bedrock_model_map(Some(&format!("claude-sonnet-5={arn}")));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("claude-sonnet-5").unwrap(), arn);
+    }
+
+    #[test]
+    fn multiple_pairs_and_whitespace() {
+        let m = parse_bedrock_model_map(Some(" claude-sonnet-5=arn:a , claude-opus-4-8=arn:b "));
+        assert_eq!(m.get("claude-sonnet-5").unwrap(), "arn:a");
+        assert_eq!(m.get("claude-opus-4-8").unwrap(), "arn:b");
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn skips_malformed_entries() {
+        // Missing "=" and blank/no-name segments are skipped; valid pairs survive.
+        let m = parse_bedrock_model_map(Some("garbage,,claude-sonnet-5=arn:a,=noname"));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("claude-sonnet-5").unwrap(), "arn:a");
+    }
+
+    #[test]
+    fn first_equals_wins_partition_semantics() {
+        // partition("=") — everything after the first `=` is the value.
+        let m = parse_bedrock_model_map(Some("name=arn:aws:foo=bar"));
+        assert_eq!(m.get("name").unwrap(), "arn:aws:foo=bar");
+    }
+}
+
+#[cfg(test)]
 mod model_route_tests {
     use super::*;
 
@@ -1069,9 +2001,20 @@ mod model_route_tests {
         assert_eq!(r.model_prefix, "codex-*");
         assert!(r.prefix_match);
         assert!(r.translate);
+        assert!(r.target_model.is_none());
         assert!(r.matches("codex-5.5"));
         assert!(r.matches("codex-5.4"));
         assert!(!r.matches("gpt-4o"));
+    }
+
+    #[test]
+    fn parse_translate_with_target_model() {
+        let r = parse_model_route("claude-codex-5.5=https://api.openai.com/v1:translate:gpt-5.5")
+            .unwrap();
+        assert_eq!(r.model_prefix, "claude-codex-5.5");
+        assert!(r.translate);
+        assert_eq!(r.target_model.as_deref(), Some("gpt-5.5"));
+        assert!(r.matches("claude-codex-5.5"));
     }
 
     #[test]
@@ -1090,6 +2033,7 @@ mod model_route_tests {
     fn parse_invalid_format() {
         assert!(parse_model_route("no-equals-sign").is_err());
         assert!(parse_model_route("model=not-a-url").is_err());
+        assert!(parse_model_route("model=https://api.openai.com/v1:translate:").is_err());
     }
 }
 
@@ -1106,7 +2050,11 @@ mod ctx_implies_interception_tests {
 
     #[test]
     fn ctx_flags_force_interception_on() {
-        for flag in ["--ctx-capture=true", "--ctx-offload=true", "--ctx-inject=true"] {
+        for flag in [
+            "--ctx-capture=true",
+            "--ctx-offload=true",
+            "--ctx-inject=true",
+        ] {
             let c = cfg(&[flag]);
             assert!(c.compression, "{flag} must imply interception");
             // The imply flips buffering only, never a byte-mutating mode.
@@ -1118,5 +2066,141 @@ mod ctx_implies_interception_tests {
     fn no_ctx_flags_keeps_interception_off() {
         assert!(!cfg(&[]).compression);
         assert!(!cfg(&["--ctx-capture=false"]).compression);
+    }
+}
+
+#[cfg(test)]
+mod model_route_keyword_tests {
+    use super::*;
+
+    fn route(spec: &str) -> ModelRoute {
+        parse_model_route(spec).expect("spec parses")
+    }
+
+    /// `openai` is an exact alias of `translate` — same parse, same behaviour.
+    #[test]
+    fn openai_and_translate_parse_identically() {
+        let url = "https://api.openai.com/v1";
+        for (a, b) in [
+            (format!("m={url}:translate"), format!("m={url}:openai")),
+            (
+                format!("m={url}:translate:gpt-5.6-terra"),
+                format!("m={url}:openai:gpt-5.6-terra"),
+            ),
+        ] {
+            let (left, right) = (route(&a), route(&b));
+            assert_eq!(left.translate, right.translate);
+            assert_eq!(left.target_model, right.target_model);
+            assert_eq!(left.upstream, right.upstream);
+        }
+    }
+
+    #[test]
+    fn the_alias_carries_the_target_model() {
+        let r = route("claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra");
+        assert!(r.translate);
+        assert_eq!(r.target_model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(r.model_prefix, "claude-codex-terra");
+    }
+
+    /// The keyword must not be picked up out of the URL itself — `openai`
+    /// appears in `api.openai.com`, but not preceded by a colon.
+    #[test]
+    fn a_host_containing_the_keyword_is_not_mistaken_for_it() {
+        let r = route("m=https://api.openai.com/v1");
+        assert!(!r.translate, "plain URL must not enable translation");
+        assert_eq!(r.target_model, None);
+        assert_eq!(r.upstream.unwrap().as_str(), "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn an_empty_target_is_rejected_for_either_keyword() {
+        for spec in [
+            "m=https://api.openai.com/v1:translate:",
+            "m=https://api.openai.com/v1:openai:",
+        ] {
+            assert!(
+                parse_model_route(spec).is_err(),
+                "{spec} should be rejected"
+            );
+        }
+    }
+
+    /// The original spelling must keep working — existing configs depend on it.
+    #[test]
+    fn the_original_translate_spelling_still_works() {
+        let r = route("m=https://api.openai.com/v1:translate:gpt-5.6-luna");
+        assert!(r.translate);
+        assert_eq!(r.target_model.as_deref(), Some("gpt-5.6-luna"));
+    }
+}
+
+#[cfg(test)]
+mod ambiguous_codex_route_tests {
+    use super::*;
+
+    fn routes(spec: &str) -> Vec<ModelRoute> {
+        vec![parse_model_route(spec).expect("spec parses")]
+    }
+
+    /// The warning only fires for the genuinely ambiguous shape: translating to
+    /// OpenAI, no target model, Codex auth configured. Everything else is a
+    /// legitimate configuration and must stay quiet.
+    ///
+    /// `tracing` output is not captured here, so these assert the predicate the
+    /// function branches on rather than the emitted line.
+    fn would_warn(spec: &str, codex_auth: Option<&str>) -> bool {
+        if codex_auth.is_none() {
+            return false;
+        }
+        routes(spec).iter().any(|r| {
+            r.translate
+                && r.target_model.is_none()
+                && r.upstream
+                    .as_ref()
+                    .and_then(|u| u.host_str())
+                    .is_some_and(|h| h == "api.openai.com")
+        })
+    }
+
+    #[test]
+    fn the_ambiguous_shape_warns() {
+        assert!(would_warn(
+            "m=https://api.openai.com/v1:openai",
+            Some("/home/u/.codex/auth.json")
+        ));
+    }
+
+    #[test]
+    fn a_route_with_a_target_model_does_not_warn() {
+        assert!(!would_warn(
+            "m=https://api.openai.com/v1:openai:gpt-5.6-terra",
+            Some("/home/u/.codex/auth.json")
+        ));
+    }
+
+    /// Without Codex auth, a chat-completions route is a deliberate choice.
+    #[test]
+    fn without_codex_auth_nothing_warns() {
+        assert!(!would_warn("m=https://api.openai.com/v1:openai", None));
+    }
+
+    /// A non-OpenAI upstream is someone else's gateway; not our business.
+    #[test]
+    fn a_third_party_upstream_does_not_warn() {
+        assert!(!would_warn(
+            "m=https://my-gateway.internal/v1:openai",
+            Some("/home/u/.codex/auth.json")
+        ));
+    }
+
+    /// Calling it must never panic, whatever the input.
+    #[test]
+    fn the_warning_helper_is_safe_to_call() {
+        warn_on_ambiguous_codex_routes(&[], None);
+        warn_on_ambiguous_codex_routes(
+            &routes("m=https://api.openai.com/v1:openai"),
+            Some("/home/u/.codex/auth.json"),
+        );
     }
 }

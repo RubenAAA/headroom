@@ -128,7 +128,10 @@ mod tests {
     }
 
     fn names(tools: &[Value]) -> Vec<String> {
-        tools.iter().map(|x| tool_name(x).unwrap().to_string()).collect()
+        tools
+            .iter()
+            .map(|x| tool_name(x).unwrap().to_string())
+            .collect()
     }
 
     #[test]
@@ -171,7 +174,10 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 0, "marker-bearing tool must survive even off-allowlist");
+        assert_eq!(
+            removed, 0,
+            "marker-bearing tool must survive even off-allowlist"
+        );
         assert_eq!(names(&tools), vec!["Read", "WebSearch"]);
     }
 
@@ -208,6 +214,10 @@ mod tests {
             ..Default::default()
         };
         prune_tools(&mut tools, &policy);
-        assert_eq!(tools.len(), 1, "unnamed kept, Bash dropped (not in allowlist)");
+        assert_eq!(
+            tools.len(),
+            1,
+            "unnamed kept, Bash dropped (not in allowlist)"
+        );
     }
 }

@@ -540,6 +540,9 @@ impl PySmartCrusherConfig {
                 compaction_max_flatten_inner_keys,
                 compaction_min_buckets,
                 compaction_max_buckets,
+                // Audit-safe mode (#1705) is not exposed through the Python
+                // binding's constructor; take its defaults (feature off).
+                ..Default::default()
             },
         }
     }

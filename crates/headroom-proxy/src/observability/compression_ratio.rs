@@ -187,14 +187,10 @@ mod tests {
     fn observe_ratio_increments_tokens_saved_by_delta() {
         // tokens_saved = original - compressed, accumulated per block.
         let c = tokens_saved_counter(super::super::prometheus::registry());
-        let before = c
-            .with_label_values(&["tok_saved_test", "text"])
-            .get();
+        let before = c.with_label_values(&["tok_saved_test", "text"]).get();
         observe_ratio("tok_saved_test", "text", 1000, 300);
         observe_ratio("tok_saved_test", "text", 500, 200);
-        let after = c
-            .with_label_values(&["tok_saved_test", "text"])
-            .get();
+        let after = c.with_label_values(&["tok_saved_test", "text"]).get();
         // (1000-300) + (500-200) = 700 + 300 = 1000
         assert_eq!(after - before, 1000);
     }

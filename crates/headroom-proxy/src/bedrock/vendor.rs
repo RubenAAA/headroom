@@ -36,6 +36,31 @@ pub fn is_anthropic_model_id(model_id: &str) -> bool {
     canonical_vendor(model_id) == "anthropic"
 }
 
+/// Apply an operator override (`HEADROOM_BEDROCK_MODEL_MAP`) to the
+/// inbound `model_id`. Keyed by the exact model_id the client sent in
+/// the URL path.
+///
+/// Returns `Some((effective_model_id, arn))` when an override matches:
+/// - `effective_model_id` is the override target that replaces the
+///   inbound model_id in the upstream URL path.
+/// - `arn` is `true` when the target is an application-inference-profile
+///   ARN (`arn:aws:…`). ARN targets must use the converse route — the
+///   invoke route rejects ARNs with HTTP 400 — so the caller forces the
+///   converse (or converse-stream) action when this is `true`.
+///
+/// Returns `None` when no override matches, leaving passthrough
+/// behaviour unchanged. Ports the override branch of Python's
+/// `map_model_id` (#1795); the LiteLLM `provider/` prefix branch has no
+/// Rust equivalent (this proxy has no provider-prefix concept), so a
+/// non-ARN target is forwarded verbatim as the model_id.
+pub fn resolve_bedrock_model_override(
+    map: &std::collections::HashMap<String, String>,
+    model_id: &str,
+) -> Option<(String, bool)> {
+    map.get(model_id)
+        .map(|target| (target.clone(), target.starts_with("arn:aws:")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +103,37 @@ mod tests {
         assert!(!is_anthropic_model_id("meta.llama3-70b-instruct-v1:0"));
         assert!(!is_anthropic_model_id("eu.amazon.nova-lite-v1:0"));
         assert!(!is_anthropic_model_id("mistral.voxtral-mini-3b-2507"));
+    }
+
+    #[test]
+    fn override_pins_plain_name_to_app_profile_arn() {
+        let arn = "arn:aws:bedrock:ap-southeast-1:1:application-inference-profile/x57j1esjrt66";
+        let mut map = std::collections::HashMap::new();
+        map.insert("claude-sonnet-5".to_string(), arn.to_string());
+        let (target, is_arn) =
+            resolve_bedrock_model_override(&map, "claude-sonnet-5").expect("override");
+        assert_eq!(target, arn);
+        assert!(is_arn, "arn:aws target must force the converse route");
+    }
+
+    #[test]
+    fn override_non_arn_target_forwarded_verbatim() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "claude-sonnet-5".to_string(),
+            "us.anthropic.claude-sonnet-5-v1:0".to_string(),
+        );
+        let (target, is_arn) =
+            resolve_bedrock_model_override(&map, "claude-sonnet-5").expect("override");
+        assert_eq!(target, "us.anthropic.claude-sonnet-5-v1:0");
+        assert!(!is_arn, "non-arn target keeps the inbound action");
+    }
+
+    #[test]
+    fn override_absent_returns_none() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("claude-sonnet-5".to_string(), "arn:aws:x".to_string());
+        assert!(resolve_bedrock_model_override(&map, "claude-opus-4-8").is_none());
+        assert!(resolve_bedrock_model_override(&std::collections::HashMap::new(), "x").is_none());
     }
 }

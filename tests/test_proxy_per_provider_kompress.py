@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from headroom.cli.main import main
@@ -20,6 +21,11 @@ from headroom.proxy.server import (
     _get_env_optional_bool,
     _proxy_config_from_env,
 )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_python_proxy_for_existing_cli_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_USE_PYTHON_PROXY", "1")
 
 
 def _build(**overrides: object) -> HeadroomProxy:

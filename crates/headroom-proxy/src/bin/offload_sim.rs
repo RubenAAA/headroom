@@ -199,7 +199,12 @@ struct SessionResult {
     retrievals: usize,
 }
 
-fn simulate(turns: &[Turn], cfg: &Config, tok: &dyn Tokenizer, marker_tokens: usize) -> SessionResult {
+fn simulate(
+    turns: &[Turn],
+    cfg: &Config,
+    tok: &dyn Tokenizer,
+    marker_tokens: usize,
+) -> SessionResult {
     // Monotonic offloaded set: original message content_key once offloaded
     // stays offloaded (§7 invariant I3).
     let mut offloaded: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();

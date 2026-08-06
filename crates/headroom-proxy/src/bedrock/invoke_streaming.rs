@@ -74,7 +74,7 @@ use crate::proxy::AppState;
 // `Extension<AuthMode>` extractor.
 use headroom_core::auth_mode::AuthMode;
 
-use crate::bedrock::vendor::is_anthropic_model_id;
+use crate::bedrock::vendor::{is_anthropic_model_id, resolve_bedrock_model_override};
 
 /// AWS Bedrock Runtime DNS template.
 const BEDROCK_RUNTIME_HOST_TEMPLATE: &str = "bedrock-runtime.{region}.amazonaws.com";
@@ -184,6 +184,34 @@ pub async fn handle_invoke_streaming(
             );
         }
     };
+
+    // Operator override (HEADROOM_BEDROCK_MODEL_MAP): redirect the
+    // inbound model_id to a pinned target — e.g. a per-user application
+    // inference profile ARN for cost attribution. ARN targets must use
+    // the converse route (the invoke route rejects ARNs with HTTP 400),
+    // so force CONVERSE_STREAM_ACTION when the target is an ARN. Purely
+    // additive: no matching key leaves model_id + action untouched.
+    let (model_id, action) =
+        match resolve_bedrock_model_override(&state.config.bedrock_model_map, &model_id) {
+            Some((target, is_arn)) => {
+                let effective_action = if is_arn {
+                    CONVERSE_STREAM_ACTION
+                } else {
+                    action
+                };
+                tracing::info!(
+                    event = "bedrock_model_override_applied",
+                    request_id = %request_id,
+                    from_model_id = %model_id,
+                    to_model_id = %target,
+                    is_arn = is_arn,
+                    action = %effective_action,
+                    "bedrock invoke-streaming: applied HEADROOM_BEDROCK_MODEL_MAP override"
+                );
+                (target, effective_action)
+            }
+            None => (model_id, action),
+        };
 
     let upstream_url = match build_bedrock_streaming_upstream(&state, &model_id, &uri, action) {
         Ok(u) => u,
@@ -872,6 +900,15 @@ fn run_anthropic_compression(
         headroom_core::auth_mode::AuthMode::OAuth,
         request_id,
     );
+    // Cross-turn verbatim de-dup post-pass (no-op unless
+    // `--enable-cross-turn-dedup` is set).
+    let outcome = crate::compression::apply_cross_turn_dedup(
+        outcome,
+        body,
+        &state.config,
+        "/bedrock/invoke-with-response-stream",
+        request_id,
+    );
     match outcome {
         AnthropicOutcome::NoCompression => body.clone(),
         AnthropicOutcome::Passthrough { reason } => {
@@ -920,13 +957,16 @@ fn build_bedrock_streaming_upstream(
                 .map_err(|e| format!("bedrock derived base URL parse error: {e}"))?
         }
     };
-    let path = format!(
-        "/model/{model_id}/{action}",
-        model_id = model_id,
-        action = action,
-    );
+    // Segment-based path construction so ARN overrides (embedded `/`)
+    // are percent-encoded within the single `{model_id}` segment while
+    // plain model ids (colons kept literal) build the same path as
+    // before. See `bedrock::invoke::build_bedrock_upstream`.
     let mut joined = base;
-    joined.set_path(&path);
+    joined
+        .path_segments_mut()
+        .map_err(|_| "bedrock base URL cannot be a base".to_string())?
+        .clear()
+        .extend(["model", model_id, action]);
     if let Some(q) = uri.query() {
         joined.set_query(Some(q));
     }
@@ -1014,17 +1054,46 @@ mod tests {
             // PR-E6: drift detector is unused by this URL-builder
             // unit test; small capacity to satisfy the struct shape.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
             ctx_observer: None,
             ctx_offload: None,
             ctx_inject: None,
+            ccr_context_tracker: None,
+            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
+            )),
+            savings_tracker: std::sync::Arc::new(
+                headroom_core::savings_tracker::SavingsTracker::new(None, false),
+            ),
+            request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
             // PR-D4: unit tests for the Bedrock URL builder don't
             // touch the Vertex route, but `AppState` is one struct
             // — supply a dummy token source so the test compiles.
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
+            )),
+            dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
+            ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::ws_session_registry::WebSocketSessionRegistry::new(),
+            )),
+            rate_limiter: None,
+            semantic_cache: None,
+            memory_handler: None,
+            probe_recorder: None,
+            compression_feedback: None,
+            trusted_gateway_cidrs: vec![],
+            background_compressor: None,
+            compression_failure_action: crate::compression_failure::CompressionFailureAction {
+                refuse: false,
+                reason: "test".into(),
+                frame_bytes: 0,
+            },
+            batch_context_store: std::sync::Arc::new(headroom_core::ccr::BatchContextStore::new(
+                std::time::Duration::from_secs(86_400),
+                10_000,
             )),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
@@ -1062,14 +1131,43 @@ mod tests {
             client: reqwest::Client::new(),
             bedrock_credentials: None,
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),
             ctx_observer: None,
             ctx_offload: None,
             ctx_inject: None,
+            ccr_context_tracker: None,
+            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
+            )),
+            savings_tracker: std::sync::Arc::new(
+                headroom_core::savings_tracker::SavingsTracker::new(None, false),
+            ),
+            request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
+            )),
+            dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
+            ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::ws_session_registry::WebSocketSessionRegistry::new(),
+            )),
+            rate_limiter: None,
+            semantic_cache: None,
+            memory_handler: None,
+            probe_recorder: None,
+            compression_feedback: None,
+            trusted_gateway_cidrs: vec![],
+            background_compressor: None,
+            compression_failure_action: crate::compression_failure::CompressionFailureAction {
+                refuse: false,
+                reason: "test".into(),
+                frame_bytes: 0,
+            },
+            batch_context_store: std::sync::Arc::new(headroom_core::ccr::BatchContextStore::new(
+                std::time::Duration::from_secs(86_400),
+                10_000,
             )),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"

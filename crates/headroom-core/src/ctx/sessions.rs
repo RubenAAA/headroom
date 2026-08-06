@@ -468,8 +468,10 @@ pub fn data_hash(data: &str) -> String {
 /// (`hash_project_dir_canonical`). No worktree suffix (CTX-1b: port the
 /// worktree-suffix + legacy-rename migration from session/db.ts when needed).
 pub fn session_db_path(base: &Path, project_dir: &str) -> PathBuf {
-    base.join("sessions")
-        .join(format!("{}.db", super::hash_project_dir_canonical(project_dir)))
+    base.join("sessions").join(format!(
+        "{}.db",
+        super::hash_project_dir_canonical(project_dir)
+    ))
 }
 
 #[cfg(test)]

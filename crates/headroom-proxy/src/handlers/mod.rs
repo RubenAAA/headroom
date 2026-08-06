@@ -8,7 +8,11 @@
 //! gate in `forward_http` runs the per-provider live-zone dispatcher
 //! based on `classify_compressible_path`.
 
+pub mod batch;
+pub mod batch_anthropic;
 pub mod chat_completions;
 pub mod conversations;
+pub mod gemini;
 pub mod local_model;
 pub mod responses;
+pub mod stats;

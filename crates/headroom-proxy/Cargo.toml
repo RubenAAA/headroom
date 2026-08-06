@@ -33,6 +33,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+chrono = "0.4"
 bytes = { workspace = true }
 futures = "0.3"
 futures-util = "0.3"
@@ -45,6 +47,8 @@ humantime = "2"
 bytesize = "1"
 tokio-util = { version = "0.7" }
 headroom-core = { path = "../headroom-core" }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS
 # default credential chain.
 aws-sigv4 = { workspace = true }
@@ -104,11 +108,22 @@ urlencoding = "2"
 htmd = "0.1"
 # CTX-2: lightweight regex for env-command sanitization in extract.rs.
 regex-lite = "0.1"
+# Phase 0 (body.rs): inbound request-body decompression for byte-faithful
+# forwarding. Ports Python `_read_request_body_bytes` which supports
+# gzip/deflate (flate2), zstd, and brotli (br) Content-Encodings.
+flate2 = "1"
+zstd = "0.13"
+brotli = "7"
+# Runtime ast-grep interceptor writes tool output to a temporary file before
+# invoking ast-grep. This is used outside tests, so tempfile must be a normal
+# dependency, not only a dev-dependency.
+tempfile = "3"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # CTX-2: unit tests for the passive-capture observer open a throwaway
 # sessions DB in a temp dir.
-tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
@@ -132,3 +147,4 @@ sha2 = "0.10"
 # invariants — see `feedback_realignment_build_constraints.md`.
 proptest = "1"
 headroom-simulators = { path = "../headroom-simulators" }
+filetime = "0.2"

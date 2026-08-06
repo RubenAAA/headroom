@@ -24,6 +24,12 @@ pub async fn ws_handler(
     client_addr: SocketAddr,
     req: Request<Body>,
 ) -> Response<Body> {
+    // Codex Responses WS paths get the compressing handler; everything
+    // else stays on the plain byte pump below.
+    if crate::websocket_codex::is_codex_responses_path(req.uri().path()) {
+        return crate::websocket_codex::ws_codex_handler(ws, state, client_addr, req).await;
+    }
+
     let request_id = req
         .headers()
         .get("x-request-id")
@@ -52,6 +58,13 @@ pub async fn ws_handler(
     // PR-A5: same strip policy as the HTTP path — operators flip both
     // simultaneously via the single `Config::strip_internal_headers` knob.
     let strip_internal_ws = state.config.strip_internal_headers.is_enabled();
+    // PR-F4 (P5-53): same auth-mode gate as the HTTP path — Subscription
+    // traffic gets no synthetic X-Forwarded-* / X-Request-Id headers.
+    let ws_auth_mode = if state.config.auth_mode_policy_enforcement.is_enabled() {
+        headroom_core::auth_mode::classify(req.headers())
+    } else {
+        headroom_core::auth_mode::AuthMode::Payg
+    };
     let forward_headers = build_forward_request_headers(
         req.headers(),
         client_addr.ip(),
@@ -59,6 +72,7 @@ pub async fn ws_handler(
         forwarded_host.as_deref(),
         &request_id,
         strip_internal_ws,
+        ws_auth_mode,
     );
     // Sec-WebSocket-Protocol must be propagated for subprotocol negotiation.
     let subprotocols: Option<String> = req
@@ -216,7 +230,7 @@ async fn run_ws_pump(
     Ok(())
 }
 
-fn ax_to_tg(m: AxMsg) -> Option<TgMsg> {
+pub(crate) fn ax_to_tg(m: AxMsg) -> Option<TgMsg> {
     Some(match m {
         AxMsg::Text(t) => TgMsg::Text(t.to_string()),
         AxMsg::Binary(b) => TgMsg::Binary(b.to_vec()),
@@ -230,7 +244,7 @@ fn ax_to_tg(m: AxMsg) -> Option<TgMsg> {
     })
 }
 
-fn tg_to_ax(m: TgMsg) -> Option<AxMsg> {
+pub(crate) fn tg_to_ax(m: TgMsg) -> Option<AxMsg> {
     Some(match m {
         TgMsg::Text(t) => AxMsg::Text(t.as_str().to_string()),
         TgMsg::Binary(b) => AxMsg::Binary(b.to_vec()),

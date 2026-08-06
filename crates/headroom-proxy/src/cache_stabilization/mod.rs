@@ -59,6 +59,7 @@ pub mod anthropic_cache_control;
 pub mod capture;
 pub mod drift_detector;
 pub mod openai_cache_key;
+pub mod prefix_replay;
 pub mod tool_def_normalize;
 pub mod tool_prune;
 pub mod usage_observer;

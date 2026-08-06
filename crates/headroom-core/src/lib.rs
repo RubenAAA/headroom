@@ -4,13 +4,29 @@ pub mod auth_mode;
 pub mod cache_control;
 pub mod ccr;
 pub mod compression_policy;
+pub mod cost_tracker;
 pub mod ctx;
+pub mod memory;
 #[cfg(feature = "ml")]
 mod onnx_cpu;
+pub mod output_savings;
+pub mod parser;
+pub mod paths;
+pub mod perf_analyzer;
+pub mod pricing;
+pub mod proxy;
 pub mod relevance;
+pub mod request_outcome;
+pub mod retry;
+pub mod savings_ledger;
+pub mod savings_tracker;
+pub mod session_sticky;
 pub mod signals;
+pub mod subscription;
 pub mod tokenizer;
 pub mod transforms;
+pub mod turn_id;
+pub mod waste_signals;
 
 // Re-exports for the live-zone dispatcher (Phase B PR-B2 consumes this).
 // Hoisted to the crate root so the proxy crate gets one stable import

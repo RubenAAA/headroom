@@ -22,6 +22,7 @@
 //! `tests/parity/fixtures/content_detector/` lock the output across
 //! the bridge.
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -29,7 +30,8 @@ use serde_json::{json, Map, Value};
 
 /// Content types recognized by the detector. String tags match Python's
 /// `ContentType` enum values 1:1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContentType {
     JsonArray,
     SourceCode,
@@ -37,6 +39,9 @@ pub enum ContentType {
     BuildOutput,
     GitDiff,
     Html,
+    Tabular,
+    /// YAML / TOML / INI configuration content.
+    StructuredConfig,
     PlainText,
 }
 
@@ -50,6 +55,8 @@ impl ContentType {
             ContentType::BuildOutput => "build",
             ContentType::GitDiff => "diff",
             ContentType::Html => "html",
+            ContentType::Tabular => "tabular",
+            ContentType::StructuredConfig => "structured_config",
             ContentType::PlainText => "text",
         }
     }
@@ -246,12 +253,247 @@ pub fn detect_content_type(content: &str) -> DetectionResult {
             return r;
         }
     }
+    // Tabular detection runs after search/log so those claim content first.
+    if let Some(r) = try_detect_tabular(content) {
+        if r.confidence >= 0.6 {
+            return r;
+        }
+    }
+    // Config detection runs after tabular and before code: a `key: value`
+    // config would otherwise read as source code.
+    if let Some(r) = try_detect_structured_config(content) {
+        if r.confidence >= 0.6 {
+            return r;
+        }
+    }
     if let Some(r) = try_detect_code(content) {
         if r.confidence >= 0.5 {
             return r;
         }
     }
     DetectionResult::plain_text(0.5)
+}
+
+// ─── Structured config (YAML / TOML / INI) ───────────────────────────────
+
+static CONFIG_SECTION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*\[\[?[\w.\-"' ]+\]\]?\s*$"#).expect("valid"));
+static TOML_ASSIGN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*(?:[\w.\-]+|"[^"]+"|'[^']+')\s*=\s*\S"#).expect("valid"));
+static INI_ASSIGN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*[\w.\-@ ]+?\s*[=:]\s*").expect("valid"));
+static YAML_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:-\s+)?(?:[\w.\-/]+|"[^"]+"|'[^']+')\s*:(?:\s|$)"#).expect("valid")
+});
+static YAML_LIST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*-\s+\S").expect("valid"));
+static YAML_DOC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^---\s*$|^\.\.\.\s*$").expect("valid"));
+static CONFIG_COMMENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*[#;]").expect("valid"));
+
+/// True if `content` parses as TOML.
+fn try_parse_toml(content: &str) -> bool {
+    content.parse::<toml::Table>().is_ok()
+}
+
+/// Permissive INI acceptance check, standing in for Python's
+/// `configparser.ConfigParser(interpolation=None, strict=False)`.
+///
+/// DIVERGENCE: Python confirms with the stdlib parser; Rust has no equivalent,
+/// so this reimplements the acceptance rule — at least one `[section]` header,
+/// and every non-comment line after the first section is either a section
+/// header, a `key = value` / `key: value` assignment, or an indented
+/// continuation. `strict=False` means duplicates are fine, so they are not
+/// checked. Content that reaches here has already passed the section +
+/// assignment-share gate, so this is a rejection filter for malformed input
+/// rather than a general parser; exotic INI that configparser accepts and this
+/// rejects would fall through to the YAML heuristic or plain text, never to a
+/// wrong claim.
+fn parses_as_ini(content: &str) -> bool {
+    let mut seen_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || CONFIG_COMMENT_RE.is_match(line) {
+            continue;
+        }
+        if CONFIG_SECTION_RE.is_match(line) {
+            seen_section = true;
+            continue;
+        }
+        if !seen_section {
+            // A value before any section header is a configparser error
+            // (MissingSectionHeaderError), unless it is a continuation.
+            if !line.starts_with(char::is_whitespace) {
+                return false;
+            }
+            continue;
+        }
+        if INI_ASSIGN_RE.is_match(line) || line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        return false;
+    }
+    seen_section
+}
+
+/// Disambiguate `[section]`-shaped config: TOML first, then INI.
+///
+/// Both flavors share the section-header line shape; only a real parse tells
+/// them apart. Returns `Some("toml")`, `Some("ini")`, or `None` when neither
+/// accepts the content — in which case it is not claimed as config at all.
+fn parse_config_flavor(content: &str) -> Option<&'static str> {
+    if content.len() > 1_000_000 {
+        return None;
+    }
+    if try_parse_toml(content) {
+        return Some("toml");
+    }
+    if parses_as_ini(content) {
+        return Some("ini");
+    }
+    None
+}
+
+/// Detect structured config content (YAML, TOML, INI).
+///
+/// TOML/INI claims are parser-confirmed so they carry high confidence. YAML has
+/// no parse step here, so its claim is heuristic: key/list/document-marker line
+/// share plus a structure signal, guarded against prose and markdown
+/// front-matter.
+pub fn try_detect_structured_config(content: &str) -> Option<DetectionResult> {
+    let head = content.trim_start().chars().next()?;
+    if head == '{' || head == '<' {
+        // JSON objects and markup are never config; JSON arrays and real
+        // TOML/INI `[section]` headers disambiguate below.
+        return None;
+    }
+
+    let lines: Vec<&str> = content.split('\n').take(200).collect();
+    let non_empty: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if non_empty.len() < 3 {
+        return None;
+    }
+    // Comment lines are neutral: excluded from the line-share ratio so
+    // comment-heavy configs and #-heading markdown skew it neither way.
+    let body: Vec<&str> = non_empty
+        .into_iter()
+        .filter(|l| !CONFIG_COMMENT_RE.is_match(l))
+        .collect();
+    if body.len() < 3 {
+        return None;
+    }
+    let body_len = body.len() as f64;
+
+    // TOML / INI: require a section header plus an assignment-dominant body,
+    // then let a real parse confirm and disambiguate.
+    let sections = body
+        .iter()
+        .filter(|l| CONFIG_SECTION_RE.is_match(l))
+        .count();
+    if sections >= 1 {
+        let assigns = body
+            .iter()
+            .filter(|l| TOML_ASSIGN_RE.is_match(l) || INI_ASSIGN_RE.is_match(l))
+            .count();
+        if assigns >= 2 && (sections + assigns) as f64 / body_len >= 0.6 {
+            if let Some(flavor) = parse_config_flavor(content) {
+                let share = (sections + assigns) as f64 / body_len;
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("flavor".into(), serde_json::json!(flavor));
+                metadata.insert("sections".into(), serde_json::json!(sections));
+                metadata.insert("assignments".into(), serde_json::json!(assigns));
+                return Some(DetectionResult {
+                    content_type: ContentType::StructuredConfig,
+                    confidence: (0.7 + share * 0.25).min(0.95),
+                    metadata,
+                });
+            }
+        }
+    }
+
+    // Markdown front-matter guard: a `---` fence closed within 60 lines and
+    // followed by non-YAML content is a markdown document, not standalone YAML.
+    if lines.first().map(|l| l.trim()) == Some("---") {
+        for idx in 1..lines.len().min(60) {
+            let t = lines[idx].trim();
+            if t == "---" || t == "..." {
+                let tail: Vec<&str> = lines[idx + 1..]
+                    .iter()
+                    .copied()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                let tail_yaml = tail
+                    .iter()
+                    .filter(|l| YAML_KEY_RE.is_match(l) || YAML_LIST_RE.is_match(l))
+                    .count();
+                if !tail.is_empty() && (tail_yaml as f64 / tail.len() as f64) < 0.3 {
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+
+    // YAML heuristic.
+    let yaml_keys = body.iter().filter(|l| YAML_KEY_RE.is_match(l)).count();
+    let yaml_lists = body
+        .iter()
+        .filter(|l| YAML_LIST_RE.is_match(l) && !YAML_KEY_RE.is_match(l))
+        .count();
+    let doc_marks = body
+        .iter()
+        .filter(|l| YAML_DOC_RE.is_match(l.trim()))
+        .count();
+    if yaml_keys < 3 {
+        return None;
+    }
+    let share = (yaml_keys + yaml_lists + doc_marks) as f64 / body_len;
+    if share < 0.6 {
+        return None;
+    }
+    // Prose guards: config lines are short field-ish tuples; prose reads like
+    // sentences.
+    let enders = body
+        .iter()
+        .filter(|l| {
+            let t = l.trim_end();
+            t.ends_with('.') || t.ends_with('!') || t.ends_with('?')
+        })
+        .count();
+    if enders as f64 / body_len >= 0.5 {
+        return None;
+    }
+    let avg_words = body
+        .iter()
+        .map(|l| l.split_whitespace().count())
+        .sum::<usize>() as f64
+        / body_len;
+    if avg_words > 8.0 {
+        return None;
+    }
+    // Structure signal: nested indentation, a document marker, or a real list.
+    let indents: HashSet<usize> = body
+        .iter()
+        .filter(|l| YAML_KEY_RE.is_match(l) || YAML_LIST_RE.is_match(l))
+        .map(|l| l.len() - l.trim_start_matches(' ').len())
+        .collect();
+    if indents.len() < 2 && doc_marks == 0 && yaml_lists < 3 {
+        return None;
+    }
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("flavor".into(), serde_json::json!("yaml"));
+    metadata.insert("keys".into(), serde_json::json!(yaml_keys));
+    metadata.insert("list_items".into(), serde_json::json!(yaml_lists));
+    Some(DetectionResult {
+        content_type: ContentType::StructuredConfig,
+        confidence: (0.55 + share * 0.35).min(0.9),
+        metadata,
+    })
 }
 
 /// Quick check: is `content` a JSON array of dictionaries (the format
@@ -271,27 +513,92 @@ pub fn is_json_array_of_dicts(content: &str) -> bool {
 
 // ─── Per-type detection helpers ────────────────────────────────────────
 
-fn try_detect_json(content: &str) -> Option<DetectionResult> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with('[') {
+/// Decode a run of whitespace-separated top-level JSON values.
+///
+/// Web search tools (SerpAPI, Tavily, custom backends) commonly emit
+/// back-to-back JSON objects separated only by whitespace rather than a real
+/// array: `{"title": ...} {"title": ...} {"title": ...}`. Returns the list of
+/// decoded values, or None if the text isn't a clean run of JSON values
+/// separated only by whitespace.
+fn decode_concatenated_json(content: &str) -> Option<Vec<Value>> {
+    let mut items: Vec<Value> = Vec::new();
+    let stream = serde_json::Deserializer::from_str(content).into_iter::<Value>();
+    for value in stream {
+        match value {
+            Ok(v) => items.push(v),
+            Err(_) => return None,
+        }
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
+    }
+}
+
+/// Convert whitespace-separated JSON objects into a canonical JSON array.
+///
+/// SmartCrusher only compresses JSON arrays, so this rewrites the
+/// space-separated web_search shape (`{...} {...} {...}`) into
+/// `[{...}, {...}, {...}]`. Returns None unless the content is two or more
+/// whitespace-separated JSON objects.
+pub fn normalize_concatenated_json(content: &str) -> Option<String> {
+    let stripped = content.trim();
+    if !stripped.starts_with('{') {
         return None;
     }
-    let parsed: Value = serde_json::from_str(trimmed).ok()?;
-    let arr = parsed.as_array()?;
-    let item_count = arr.len();
-    let is_dict_array = !arr.is_empty() && arr.iter().all(|v| v.is_object());
-    let confidence = if is_dict_array { 1.0 } else { 0.8 };
-    Some(DetectionResult::new(
-        ContentType::JsonArray,
-        confidence,
-        json!({
-            "item_count": item_count,
-            "is_dict_array": is_dict_array,
-        })
-        .as_object()
-        .cloned()
-        .unwrap(),
-    ))
+    let items = decode_concatenated_json(stripped)?;
+    if items.len() >= 2 && items.iter().all(|v| v.is_object()) {
+        return serde_json::to_string(&items).ok();
+    }
+    None
+}
+
+fn try_detect_json(content: &str) -> Option<DetectionResult> {
+    let trimmed = content.trim();
+
+    if trimmed.starts_with('[') {
+        let parsed: Value = serde_json::from_str(trimmed).ok()?;
+        let arr = parsed.as_array()?;
+        let item_count = arr.len();
+        let is_dict_array = !arr.is_empty() && arr.iter().all(|v| v.is_object());
+        let confidence = if is_dict_array { 1.0 } else { 0.8 };
+        return Some(DetectionResult::new(
+            ContentType::JsonArray,
+            confidence,
+            json!({
+                "item_count": item_count,
+                "is_dict_array": is_dict_array,
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        ));
+    }
+
+    // Space-separated JSON objects (typical web_search output) aren't a valid
+    // array, so they'd fall through to PLAIN_TEXT and skip SmartCrusher at 0%
+    // compression. SmartCrusher normalizes this shape to a real array before
+    // crushing (#1741).
+    if trimmed.starts_with('{') {
+        let items = decode_concatenated_json(trimmed)?;
+        if items.len() >= 2 && items.iter().all(|v| v.is_object()) {
+            return Some(DetectionResult::new(
+                ContentType::JsonArray,
+                1.0,
+                json!({
+                    "item_count": items.len(),
+                    "is_dict_array": true,
+                    "concatenated": true,
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            ));
+        }
+    }
+
+    None
 }
 
 fn try_detect_diff(content: &str) -> Option<DetectionResult> {
@@ -382,7 +689,7 @@ fn try_detect_html(content: &str) -> Option<DetectionResult> {
     ))
 }
 
-fn try_detect_search(content: &str) -> Option<DetectionResult> {
+pub fn try_detect_search(content: &str) -> Option<DetectionResult> {
     let lines: Vec<&str> = content.split('\n').take(100).collect();
     if lines.is_empty() {
         return None;
@@ -418,7 +725,7 @@ fn try_detect_search(content: &str) -> Option<DetectionResult> {
     ))
 }
 
-fn try_detect_log(content: &str) -> Option<DetectionResult> {
+pub fn try_detect_log(content: &str) -> Option<DetectionResult> {
     let lines: Vec<&str> = content.split('\n').take(200).collect();
     if lines.is_empty() {
         return None;
@@ -460,6 +767,152 @@ fn try_detect_log(content: &str) -> Option<DetectionResult> {
         .cloned()
         .unwrap(),
     ))
+}
+
+// ─── Tabular detection ──────────────────────────────────────────────────
+
+fn md_cell_count(row: &str) -> usize {
+    row.trim()
+        .trim_matches('|')
+        .split('|')
+        .filter(|c| !c.trim().is_empty())
+        .count()
+}
+
+fn is_md_separator(line: &str) -> bool {
+    let cells: Vec<&str> = line
+        .trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if cells.len() < 2 {
+        return false;
+    }
+    let re = md_sep_cell_re_static();
+    cells.iter().all(|c| re.is_match(c))
+}
+
+fn md_sep_cell_re_static() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^:?-{2,}:?$").unwrap());
+    &RE
+}
+
+fn try_detect_markdown_table(lines: &[&str]) -> Option<DetectionResult> {
+    for i in 0..lines.len().saturating_sub(1) {
+        let header = lines[i];
+        let sep = lines[i + 1];
+        if header.contains('|') && is_md_separator(sep) {
+            let cols = md_cell_count(header);
+            if cols >= 2 {
+                let mut meta = serde_json::Map::new();
+                meta.insert("format".to_string(), Value::String("markdown".to_string()));
+                meta.insert("columns".to_string(), json!(cols));
+                return Some(DetectionResult {
+                    content_type: ContentType::Tabular,
+                    confidence: 0.95,
+                    metadata: meta,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_prose(sample: &[&str], delim: &str) -> bool {
+    let enders = sample
+        .iter()
+        .filter(|r| {
+            let trimmed = r.trim_end();
+            trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?')
+        })
+        .count();
+    if sample.len() > 0 && enders as f64 / sample.len() as f64 >= 0.5 {
+        return true;
+    }
+    let cells: Vec<&str> = sample
+        .iter()
+        .flat_map(|r| r.split(delim))
+        .map(|c| c.trim())
+        .collect();
+    if cells.is_empty() {
+        return false;
+    }
+    let avg_words: f64 = cells
+        .iter()
+        .map(|c| c.split_whitespace().count())
+        .sum::<usize>() as f64
+        / cells.len() as f64;
+    avg_words > 3.0
+}
+
+fn try_detect_delimited(lines: &[&str]) -> Option<DetectionResult> {
+    let sample: Vec<&str> = lines.iter().take(20).copied().collect();
+    if sample.len() < 3 {
+        return None;
+    }
+
+    let delimiters: &[(&str, f64)] = &[(",", 0.85), ("\t", 0.7), (";", 0.85), ("|", 0.85)];
+    let mut best: Option<DetectionResult> = None;
+
+    for &(delim, min_consistency) in delimiters {
+        let counts: Vec<usize> = sample
+            .iter()
+            .map(|row| row.matches(delim).count())
+            .collect();
+        if counts[0] == 0 {
+            continue;
+        }
+
+        // Find most common count
+        let mut freq_map: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for &c in &counts {
+            *freq_map.entry(c).or_insert(0) += 1;
+        }
+        let (common_count, freq) = freq_map.iter().max_by_key(|(_, &f)| f)?;
+
+        if *common_count == 0 {
+            continue;
+        }
+        let consistency = *freq as f64 / sample.len() as f64;
+        let ncols = *common_count + 1;
+        if ncols < 2 || consistency < min_consistency {
+            continue;
+        }
+        if looks_like_prose(&sample, delim) {
+            continue;
+        }
+        let confidence = (0.5 + consistency * 0.3 + (ncols.min(5) as f64) * 0.03).min(0.95);
+        if best.as_ref().map_or(true, |b| confidence > b.confidence) {
+            let mut meta = serde_json::Map::new();
+            meta.insert("format".to_string(), Value::String("csv".to_string()));
+            meta.insert("delimiter".to_string(), Value::String(delim.to_string()));
+            meta.insert("columns".to_string(), json!(ncols));
+            best = Some(DetectionResult {
+                content_type: ContentType::Tabular,
+                confidence,
+                metadata: meta,
+            });
+        }
+    }
+    best
+}
+
+fn try_detect_tabular(content: &str) -> Option<DetectionResult> {
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|ln| !ln.trim().is_empty())
+        .take(50)
+        .collect();
+    if lines.len() < 3 {
+        return None;
+    }
+    if let Some(r) = try_detect_markdown_table(&lines) {
+        return Some(r);
+    }
+    try_detect_delimited(&lines)
 }
 
 fn try_detect_code(content: &str) -> Option<DetectionResult> {
@@ -765,5 +1218,147 @@ func helper() {}
         assert_eq!(ContentType::GitDiff.as_str(), "diff");
         assert_eq!(ContentType::Html.as_str(), "html");
         assert_eq!(ContentType::PlainText.as_str(), "text");
+    }
+
+    // --- Space-separated JSON objects (parity: 5194bdc5) ---
+
+    #[test]
+    fn space_separated_json_objects_detected_as_array() {
+        let content = r#"{"title": "Result 1", "url": "a"} {"title": "Result 2", "url": "b"} {"title": "Result 3", "url": "c"}"#;
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::JsonArray);
+        assert_eq!(r.confidence, 1.0);
+        assert_eq!(r.metadata.get("concatenated"), Some(&json!(true)));
+        assert_eq!(r.metadata.get("item_count"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn newline_separated_json_objects_detected() {
+        let content = "{\"a\": 1}\n{\"b\": 2}";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::JsonArray);
+        assert_eq!(r.metadata.get("concatenated"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn single_json_object_not_treated_as_array() {
+        // A single object isn't a >=2 run — must not be JSON_ARRAY.
+        let r = detect_content_type(r#"{"only": "one"}"#);
+        assert_ne!(r.content_type, ContentType::JsonArray);
+    }
+
+    #[test]
+    fn normalize_concatenated_json_builds_array() {
+        let content = r#"{"a": 1} {"b": 2}"#;
+        let out = normalize_concatenated_json(content).unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn normalize_concatenated_json_rejects_non_object_run() {
+        assert!(normalize_concatenated_json("[1, 2, 3]").is_none());
+        assert!(normalize_concatenated_json(r#"{"only": 1}"#).is_none());
+        assert!(normalize_concatenated_json("not json").is_none());
+    }
+
+    // ─── Structured config detection (upstream addition) ─────────────────
+    //
+    // Expected values were produced by running Python's `detect_content_type`
+    // on these exact inputs. Detection heuristics are where a port drifts
+    // silently, so the type, the confidence, and the metadata are all pinned.
+
+    const TOML: &str = "[package]\nname = \"headroom\"\nversion = \"1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\nregex = \"1\"\n";
+    const INI: &str =
+        "[server]\nhost = localhost\nport = 8080\ntimeout = 30\n\n[client]\nretries = 3\n";
+    const YAML: &str =
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  labels:\n    app: web\nspec:\n  replicas: 3\n";
+    const YAML_LIST: &str =
+        "servers:\n  - name: a\n  - name: b\n  - name: c\nport: 80\ndebug: true\n";
+
+    #[test]
+    fn detects_toml_matching_python() {
+        let r = detect_content_type(TOML);
+        assert_eq!(r.content_type, ContentType::StructuredConfig);
+        assert!((r.confidence - 0.95).abs() < 1e-9, "conf {}", r.confidence);
+        assert_eq!(r.metadata["flavor"], json!("toml"));
+        assert_eq!(r.metadata["sections"], json!(2));
+        assert_eq!(r.metadata["assignments"], json!(5));
+    }
+
+    #[test]
+    fn detects_ini_matching_python() {
+        let r = detect_content_type(INI);
+        assert_eq!(r.content_type, ContentType::StructuredConfig);
+        assert!((r.confidence - 0.95).abs() < 1e-9, "conf {}", r.confidence);
+        assert_eq!(r.metadata["flavor"], json!("ini"));
+        assert_eq!(r.metadata["sections"], json!(2));
+        assert_eq!(r.metadata["assignments"], json!(4));
+    }
+
+    #[test]
+    fn detects_yaml_matching_python() {
+        for (src, keys) in [(YAML, 8), (YAML_LIST, 6)] {
+            let r = detect_content_type(src);
+            assert_eq!(r.content_type, ContentType::StructuredConfig);
+            assert!((r.confidence - 0.9).abs() < 1e-9, "conf {}", r.confidence);
+            assert_eq!(r.metadata["flavor"], json!("yaml"));
+            assert_eq!(r.metadata["keys"], json!(keys));
+            assert_eq!(r.metadata["list_items"], json!(0));
+        }
+    }
+
+    #[test]
+    fn prose_and_code_are_not_claimed_as_config() {
+        // The prose guards (sentence-enders, average word count) exist so a
+        // paragraph never gets routed to the config fold.
+        let prose = "This is a sentence about things. Here is another one. And a third sentence follows.\nIt continues on. More prose here.\n";
+        assert_eq!(
+            detect_content_type(prose).content_type,
+            ContentType::PlainText
+        );
+        let code = "def foo():\n    return 1\n\nclass Bar:\n    pass\n";
+        assert_eq!(
+            detect_content_type(code).content_type,
+            ContentType::PlainText
+        );
+    }
+
+    #[test]
+    fn markdown_front_matter_is_not_yaml() {
+        // A `---` fence closed early and followed by prose is a markdown
+        // document, not a standalone YAML config.
+        let md = "---\ntitle: Post\nauthor: me\n---\n\nThis is the body of the post with real prose in it.\nMore paragraphs follow here naturally.\nAnd yet more text that is clearly not config.\n";
+        assert_eq!(detect_content_type(md).content_type, ContentType::PlainText);
+    }
+
+    #[test]
+    fn json_objects_are_never_config() {
+        // Scoped to what config detection guarantees: a `{`-headed body is
+        // rejected before any config heuristic runs.
+        //
+        // NOTE: Python classifies this as `json_array` with `is_object: true`,
+        // while Rust's `try_detect_json` returns PlainText. That divergence
+        // pre-dates this change and is unrelated to config detection, so it is
+        // deliberately not asserted here.
+        assert!(try_detect_structured_config(r#"{"a": 1, "b": 2, "c": 3}"#).is_none());
+        assert_ne!(
+            detect_content_type(r#"{"a": 1, "b": 2, "c": 3}"#).content_type,
+            ContentType::StructuredConfig
+        );
+    }
+
+    #[test]
+    fn config_needs_a_real_parse_to_be_claimed() {
+        // Section-shaped but neither parser accepts it: must fall through
+        // rather than be claimed with a fabricated flavor.
+        assert!(!parses_as_ini("value = 1\n[section]\nk = v\n"));
+        // A bare `v` is not a valid TOML value, so TOML rejects it and INI
+        // claims it — same answer Python's tomllib/configparser pair gives.
+        assert_eq!(parse_config_flavor("[a]\nk = v\n"), Some("ini"));
+        // Quoting the value makes it valid TOML, and TOML is tried first.
+        assert_eq!(parse_config_flavor("[a]\nk = \"v\"\n"), Some("toml"));
+        assert!(parse_config_flavor(&"x".repeat(1_000_001)).is_none());
     }
 }

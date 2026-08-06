@@ -350,7 +350,11 @@ impl std::fmt::Debug for DriftState {
 /// - Subsequent requests with any dimension drifting →
 ///   `tracing::warn!(event = "cache_drift_observed", drift_dims =
 ///   "<comma-joined>", previous_hash_prefix, current_hash_prefix, …)`.
-pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralHash) {
+pub fn observe_drift(
+    state: &DriftState,
+    session_key: &str,
+    current: StructuralHash,
+) -> Option<String> {
     let session_prefix = session_key_log_prefix(session_key);
     let mut cache = match state.cache.lock() {
         Ok(c) => c,
@@ -375,6 +379,7 @@ pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralH
                 "cache_drift detector observed a new session"
             );
             cache.put(session_key.to_string(), current);
+            None
         }
         Some(previous) => {
             let dims = drift_dims(&previous, &current);
@@ -382,6 +387,7 @@ pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralH
                 // Stable (append-only growth included). No event.
                 // Update LRU recency by reinserting.
                 cache.put(session_key.to_string(), current);
+                None
             } else {
                 tracing::warn!(
                     event = "cache_drift_observed",
@@ -392,6 +398,7 @@ pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralH
                     "cache_drift detector observed structural change between turns of the same session"
                 );
                 cache.put(session_key.to_string(), current);
+                Some(dims)
             }
         }
     }

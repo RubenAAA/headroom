@@ -34,6 +34,7 @@
 
 pub mod anthropic;
 pub mod context_editing;
+pub mod cross_turn;
 pub mod ctx_offload;
 pub mod live_zone_anthropic;
 pub mod live_zone_openai;
@@ -46,6 +47,7 @@ pub mod model_limits;
 // itself stays through B1 → B2 transition for parallel review;
 // `compress_anthropic_request` is sourced from the live-zone module.
 pub use anthropic::resolve_frozen_count;
+pub use cross_turn::apply_cross_turn_dedup;
 pub use live_zone_anthropic::{
     compress_anthropic_request, Outcome, PassthroughReason, PerStrategyTokens,
 };

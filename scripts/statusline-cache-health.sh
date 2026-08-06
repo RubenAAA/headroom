@@ -18,12 +18,16 @@
 # unreachable or has no samples yet — zero statusline space unless
 # headroom is actually running.
 #
-# The warning stays visible for RECACHE_WARN_WINDOW seconds after the
-# most recent re-cache event, then falls back to the ambient ratio.
+# Events are classified by the proxy (last_event.event_kind):
+#   drift    → ⚠ genuine structural cache bust, shown RECACHE_DRIFT_WINDOW s
+#   expected → ℹ session reset (subagent close, /clear) — tokens not
+#              actually wasted, shown RECACHE_EXPECTED_WINDOW s
+# then falls back to the ambient ratio.
 set -u
 
 HEALTH_URL="${HEADROOM_CACHE_HEALTH_URL:-http://127.0.0.1:8787/cache-health}"
-RECACHE_WARN_WINDOW="${HEADROOM_RECACHE_WARN_WINDOW:-600}"
+RECACHE_DRIFT_WINDOW="${HEADROOM_RECACHE_DRIFT_WINDOW:-180}"
+RECACHE_EXPECTED_WINDOW="${HEADROOM_RECACHE_EXPECTED_WINDOW:-60}"
 
 segment_only=0
 if [ "${1:-}" = "--segment" ]; then
@@ -48,14 +52,26 @@ if [ -z "$health" ]; then
 fi
 
 age=$(printf '%s' "$health" | jq -r '.last_event_age_seconds // empty')
-if [ -n "$age" ] && [ "$age" -lt "$RECACHE_WARN_WINDOW" ]; then
-    reason=$(printf '%s' "$health" | jq -r '.last_event.drift_dims // "unknown cause"')
-    wasted=$(printf '%s' "$health" | jq -r '.last_event.wasted_tokens // 0')
-    if [ "$wasted" -ge 1000 ]; then
-        wasted="$((wasted / 1000))K"
+if [ -n "$age" ]; then
+    kind=$(printf '%s' "$health" | jq -r '.last_event.event_kind // "drift"')
+    if [ "$kind" = "expected" ]; then
+        window="$RECACHE_EXPECTED_WINDOW"
+    else
+        window="$RECACHE_DRIFT_WINDOW"
     fi
-    printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: ${reason}, ~${wasted} tok wasted"
-    exit 0
+    if [ "$age" -lt "$window" ]; then
+        wasted=$(printf '%s' "$health" | jq -r '.last_event.wasted_tokens // 0')
+        if [ "$wasted" -ge 1000 ]; then
+            wasted="$((wasted / 1000))K"
+        fi
+        if [ "$kind" = "expected" ]; then
+            printf '%s\n' "${prefix:+$prefix | }ℹ cache drop ${age}s ago: session reset (subagent/clear), ~${wasted} tok re-cached"
+        else
+            reason=$(printf '%s' "$health" | jq -r '.last_event.drift_dims // "unknown cause"')
+            printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: ${reason}, ~${wasted} tok wasted"
+        fi
+        exit 0
+    fi
 fi
 
 rate=$(printf '%s' "$health" | jq -r 'if .recent_hit_rate == null then empty else (.recent_hit_rate * 100 | floor) end')

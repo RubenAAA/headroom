@@ -56,6 +56,8 @@ pub enum CodeLanguage {
     Java,
     C,
     Cpp,
+    Perl,
+    CSharp,
     Unknown,
 }
 
@@ -70,6 +72,8 @@ impl CodeLanguage {
             CodeLanguage::Java => "java",
             CodeLanguage::C => "c",
             CodeLanguage::Cpp => "cpp",
+            CodeLanguage::Perl => "perl",
+            CodeLanguage::CSharp => "csharp",
             CodeLanguage::Unknown => "unknown",
         }
     }
@@ -87,9 +91,39 @@ impl CodeLanguage {
             "java" => CodeLanguage::Java,
             "c" => CodeLanguage::C,
             "cpp" => CodeLanguage::Cpp,
+            "perl" => CodeLanguage::Perl,
+            "csharp" => CodeLanguage::CSharp,
             "unknown" => CodeLanguage::Unknown,
             _ => return None,
         })
+    }
+
+    /// Map a language hint or markdown fence tag to a [`CodeLanguage`].
+    ///
+    /// Accepts the canonical names and the common aliases/fence tags
+    /// (`js`/`ts`/`py`/…). An unrecognized string yields [`CodeLanguage::Unknown`]
+    /// rather than an error, so a fence tag we don't know falls back to
+    /// content-based detection instead of silently skipping code-aware
+    /// compression — which is what happened in Python when the `ValueError`
+    /// from `CodeLanguage(value)` got swallowed inside the router.
+    pub fn coerce(value: &str) -> Self {
+        let key = value.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return CodeLanguage::Unknown;
+        }
+        if let Some(lang) = Self::from_name(&key) {
+            return lang;
+        }
+        match key.as_str() {
+            "js" | "jsx" | "mjs" | "cjs" | "node" => CodeLanguage::Javascript,
+            "ts" | "tsx" => CodeLanguage::Typescript,
+            "py" | "python3" => CodeLanguage::Python,
+            "golang" => CodeLanguage::Go,
+            "rs" => CodeLanguage::Rust,
+            "c++" | "cxx" | "cc" | "hpp" => CodeLanguage::Cpp,
+            "pl" => CodeLanguage::Perl,
+            _ => CodeLanguage::Unknown,
+        }
     }
 
     /// The tree-sitter grammar for this language, or `None` for `Unknown`.
@@ -103,6 +137,8 @@ impl CodeLanguage {
             CodeLanguage::Java => tree_sitter_java::LANGUAGE.into(),
             CodeLanguage::C => tree_sitter_c::LANGUAGE.into(),
             CodeLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            CodeLanguage::Perl => ts_parser_perl::LANGUAGE.into(),
+            CodeLanguage::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             CodeLanguage::Unknown => return None,
         })
     }
@@ -149,10 +185,19 @@ struct LangConfig {
     class_nodes: &'static [&'static str],
     type_nodes: &'static [&'static str],
     body_node_types: &'static [&'static str],
+    class_body_node_types: Option<&'static [&'static str]>,
     decorator_node: Option<&'static str>,
     comment_prefix: &'static str,
     uses_colon_after_signature: bool,
     package_node: Option<&'static str>,
+    /// Nodes that merely *wrap* declarations (C# `namespace_declaration`):
+    /// recurse into them rather than treating them as leaf content, or every
+    /// declaration inside a namespace would be swept up as one opaque blob.
+    container_node_types: &'static [&'static str],
+    /// Nodes to keep verbatim rather than descend into (C# `preproc_if`):
+    /// their branches can be individually unparseable, so compressing the
+    /// pieces risks emitting code that doesn't build.
+    opaque_node_types: &'static [&'static str],
 }
 
 impl LangConfig {
@@ -183,10 +228,13 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &["class_definition"],
             type_nodes: &["type_alias_statement"],
             body_node_types: &["block"],
+            class_body_node_types: None,
             decorator_node: Some("decorated_definition"),
             comment_prefix: "#",
             uses_colon_after_signature: true,
             package_node: None,
+            container_node_types: &[],
+            opaque_node_types: &[],
         },
         CodeLanguage::Javascript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -194,10 +242,13 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &["class_declaration"],
             type_nodes: &[],
             body_node_types: &["statement_block"],
+            class_body_node_types: Some(&["class_body"]),
             decorator_node: None,
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            container_node_types: &[],
+            opaque_node_types: &[],
         },
         CodeLanguage::Typescript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -205,10 +256,13 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &["class_declaration"],
             type_nodes: &["interface_declaration", "type_alias_declaration"],
             body_node_types: &["statement_block"],
+            class_body_node_types: Some(&["class_body"]),
             decorator_node: None,
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            container_node_types: &[],
+            opaque_node_types: &[],
         },
         CodeLanguage::Go => LangConfig {
             import_nodes: &["import_declaration"],
@@ -216,10 +270,13 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &[],
             type_nodes: &["type_declaration"],
             body_node_types: &["block"],
+            class_body_node_types: None,
             decorator_node: None,
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: Some("package_clause"),
+            container_node_types: &[],
+            opaque_node_types: &[],
         },
         CodeLanguage::Rust => LangConfig {
             import_nodes: &["use_declaration"],
@@ -227,10 +284,13 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &["impl_item"],
             type_nodes: &["struct_item", "enum_item", "type_item", "trait_item"],
             body_node_types: &["block"],
+            class_body_node_types: Some(&["declaration_list"]),
             decorator_node: None,
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            container_node_types: &[],
+            opaque_node_types: &[],
         },
         CodeLanguage::Java => LangConfig {
             import_nodes: &["import_declaration"],
@@ -238,10 +298,13 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &["class_declaration", "interface_declaration"],
             type_nodes: &["enum_declaration"],
             body_node_types: &["block"],
+            class_body_node_types: Some(&["class_body"]),
             decorator_node: None,
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: Some("package_declaration"),
+            container_node_types: &[],
+            opaque_node_types: &[],
         },
         CodeLanguage::C => LangConfig {
             import_nodes: &["preproc_include"],
@@ -249,10 +312,13 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &[],
             type_nodes: &["struct_specifier", "enum_specifier", "type_definition"],
             body_node_types: &["compound_statement"],
+            class_body_node_types: None,
             decorator_node: None,
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            container_node_types: &[],
+            opaque_node_types: &[],
         },
         CodeLanguage::Cpp => LangConfig {
             import_nodes: &["preproc_include"],
@@ -260,10 +326,55 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             class_nodes: &["class_specifier"],
             type_nodes: &["struct_specifier", "enum_specifier", "type_definition"],
             body_node_types: &["compound_statement"],
+            class_body_node_types: Some(&["field_declaration_list"]),
             decorator_node: None,
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            container_node_types: &[],
+            opaque_node_types: &[],
+        },
+        CodeLanguage::Perl => LangConfig {
+            import_nodes: &["use_statement", "use_version_statement"],
+            function_nodes: &[
+                "subroutine_declaration_statement",
+                "method_declaration_statement",
+            ],
+            class_nodes: &["package_statement", "class_statement", "role_statement"],
+            type_nodes: &[],
+            body_node_types: &["block"],
+            class_body_node_types: None,
+            decorator_node: None,
+            comment_prefix: "#",
+            uses_colon_after_signature: false,
+            package_node: Some("package_statement"),
+            container_node_types: &[],
+            opaque_node_types: &[],
+        },
+        CodeLanguage::CSharp => LangConfig {
+            import_nodes: &["using_directive", "file_scoped_namespace_declaration"],
+            function_nodes: &[
+                "method_declaration",
+                "constructor_declaration",
+                "destructor_declaration",
+                "operator_declaration",
+                "local_function_statement",
+            ],
+            class_nodes: &[
+                "class_declaration",
+                "struct_declaration",
+                "record_declaration",
+                "interface_declaration",
+            ],
+            type_nodes: &["enum_declaration", "delegate_declaration"],
+            body_node_types: &["block"],
+            class_body_node_types: Some(&["declaration_list"]),
+            decorator_node: None,
+            comment_prefix: "//",
+            uses_colon_after_signature: false,
+            package_node: None,
+            container_node_types: &["namespace_declaration"],
+            opaque_node_types: &["preproc_if"],
         },
         CodeLanguage::Unknown => return None,
     })
@@ -421,6 +532,60 @@ fn is_public_symbol(name: &str, language: CodeLanguage) -> bool {
         return name.chars().next().is_some_and(|c| c.is_uppercase());
     }
     !name.starts_with('_')
+}
+
+// Symbol names are ASCII identifiers; CJK relevance queries have no spaces and
+// use CJK/full-width punctuation, so the ASCII-only delimiter class would
+// collapse the whole query into one blob and never isolate an ASCII name the
+// user asked to keep.
+static CONTEXT_DELIMS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static CJK_CHARS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+/// Tokenize a relevance query for symbol-name matching (CJK-aware).
+///
+/// Returns (word set, lowercased query, has_cjk). CJK/full-width punctuation and
+/// the ideographic space are delimiters so an ASCII symbol name wrapped in CJK
+/// is still isolated as its own token.
+fn query_context_tokens(context: &str) -> (BTreeSet<String>, String, bool) {
+    if context.is_empty() {
+        return (BTreeSet::new(), String::new(), false);
+    }
+    let lowered = context.to_lowercase();
+    let delims = CONTEXT_DELIMS.get_or_init(|| {
+        regex::Regex::new(r#"[\s,;:.()\[\]{}"'，、；：。．！？（）【】「」『』《》〈〉·…—　]+"#)
+            .unwrap()
+    });
+    let words: BTreeSet<String> = delims
+        .split(&lowered)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let cjk = CJK_CHARS.get_or_init(|| {
+        regex::Regex::new(r"[\u{3000}-\u{9fff}\u{ac00}-\u{d7af}\u{ff00}-\u{ffef}]").unwrap()
+    });
+    let has_cjk = cjk.is_match(&lowered);
+    (words, lowered, has_cjk)
+}
+
+/// Whether the relevance query names this symbol.
+///
+/// Exact token match, or a substring fallback gated by len>3 for ASCII queries
+/// (avoids spurious short-name matches) but relaxed for CJK queries -- a short
+/// ASCII name glued to CJK has no delimiter to isolate it, so exact-match can't
+/// fire and the guard would wrongly drop it.
+fn symbol_in_context(
+    name_lower: &str,
+    words: &BTreeSet<String>,
+    context_lower: &str,
+    has_cjk: bool,
+) -> bool {
+    if words.is_empty() || name_lower.is_empty() {
+        return false;
+    }
+    if words.contains(name_lower) {
+        return true;
+    }
+    context_lower.contains(name_lower) && (name_lower.chars().count() > 3 || has_cjk)
 }
 
 /// Look up the allocated body-line limit for a function. `max_body_lines`
@@ -636,6 +801,26 @@ mod prefilter {
                         c(r"(?m)::\w+"),
                     ],
                 ),
+                (
+                    CodeLanguage::Perl,
+                    vec![
+                        c(r"(?m)^\s*(sub|package|use|require)\s+[\w:]+"),
+                        c(r"(?m)^\s*(my|our|local)\s+[\$@%]"),
+                        c(r"(?m)[\$@%]\w+"),
+                    ],
+                ),
+                (
+                    CodeLanguage::CSharp,
+                    vec![
+                        c(r"(?m)^\s*using\s+[\w.]+\s*;"),
+                        c(r"(?m)^\s*namespace\s+[\w.]+"),
+                        c(concat!(
+                            r"(?m)^\s*(public|private|protected|internal|sealed|static|abstract|partial)\s+",
+                            r"(class|struct|record|interface|enum)\b"
+                        )),
+                        c(r"(?m)\bget;\s*set;"),
+                    ],
+                ),
             ]
         })
     }
@@ -763,6 +948,37 @@ struct Ctx<'a> {
     body_limits: &'a HashMap<String, i64>,
     analysis: &'a SymbolAnalysis,
     config: &'a CodeCompressorConfig,
+    /// Recovery pass: validate each candidate by splicing it back into the
+    /// module and re-parsing, reverting just that node when it doesn't parse.
+    /// Off for the first pass (the whole output is checked once at the end);
+    /// switched on only for the Python retry after a failed whole-output check.
+    recover_invalid_python_nodes: bool,
+}
+
+impl<'a> Ctx<'a> {
+    /// Return `compressed` if splicing it in place of `node` leaves the module
+    /// parseable, else the node's original text.
+    ///
+    /// Without this, one bad candidate invalidates the entire output and the
+    /// compressor discards every other saving with it.
+    fn validated_candidate(&self, node: Node, compressed: String) -> String {
+        if !self.recover_invalid_python_nodes || self.language != CodeLanguage::Python {
+            return compressed;
+        }
+        let original = &self.code[node.start_byte()..node.end_byte()];
+        if compressed == original {
+            return compressed;
+        }
+        let mut candidate_module = String::with_capacity(self.code.len() + compressed.len());
+        candidate_module.push_str(&self.code[..node.start_byte()]);
+        candidate_module.push_str(&compressed);
+        candidate_module.push_str(&self.code[node.end_byte()..]);
+        if verify_syntax_of(&candidate_module, CodeLanguage::Python) {
+            compressed
+        } else {
+            original.to_string()
+        }
+    }
 }
 
 impl CodeAwareCompressor {
@@ -795,19 +1011,21 @@ impl CodeAwareCompressor {
             return passthrough_result(code, original_tokens, CodeLanguage::Unknown, 0.0);
         }
 
-        // Detect or use specified language.
-        let (detected_lang, confidence) = if let Some(lang) = language {
-            match CodeLanguage::from_name(&lang.to_lowercase()) {
-                Some(l) => (l, 1.0),
-                None => (CodeLanguage::Unknown, 1.0),
-            }
-        } else if let Some(hint) = &self.config.language_hint {
-            match CodeLanguage::from_name(&hint.to_lowercase()) {
-                Some(l) => (l, 1.0),
-                None => (CodeLanguage::Unknown, 1.0),
-            }
-        } else {
-            detect_language(code)
+        // Detect or use the specified language. An explicit hint or fence tag
+        // may be an alias (js/ts/py/…) or something we don't recognize —
+        // `coerce` maps the aliases and yields `Unknown` for the rest, and an
+        // unknown hint then falls back to CONTENT detection. Treating an
+        // unrecognized tag as `Unknown` outright skipped code-aware compression
+        // for the whole block.
+        let explicit = language
+            .map(|l| l.to_string())
+            .or_else(|| self.config.language_hint.clone());
+        let (detected_lang, confidence) = match explicit {
+            Some(hint) => match CodeLanguage::coerce(&hint) {
+                CodeLanguage::Unknown => detect_language(code),
+                lang => (lang, 1.0),
+            },
+            None => detect_language(code),
         };
 
         // Unknown language → fallback (Kompress) or passthrough.
@@ -825,16 +1043,40 @@ impl CodeAwareCompressor {
 
         // Parse + compress (tree-sitter always available here).
         let Some((compressed, structure, symbol_scores)) =
-            self.compress_with_ast(code, detected_lang, context)
+            self.compress_with_ast(code, detected_lang, context, false)
         else {
             // AST exception path → fallback/passthrough.
             return passthrough_result(code, original_tokens, detected_lang, confidence);
         };
 
-        let compressed_tokens = estimate_tokens(&compressed);
+        let mut compressed = compressed;
+        let mut structure = structure;
+        let mut symbol_scores = symbol_scores;
+        let mut compressed_tokens = estimate_tokens(&compressed);
 
         // Verify syntax validity (ERROR + MISSING).
-        let syntax_valid = self.verify_syntax(&compressed, detected_lang);
+        let mut syntax_valid = self.verify_syntax(&compressed, detected_lang);
+
+        // Recovery retry: one bad candidate would otherwise sink the entire
+        // output and we'd serve the original uncompressed. If the SOURCE was
+        // valid Python, redo the pass validating each candidate individually so
+        // only the offending nodes revert and the rest of the saving survives.
+        // Gated on the original being valid — re-compressing already-broken
+        // input can't produce anything trustworthy.
+        if !syntax_valid
+            && detected_lang == CodeLanguage::Python
+            && self.verify_syntax(code, detected_lang)
+        {
+            if let Some((c, st, sc)) = self.compress_with_ast(code, detected_lang, context, true) {
+                compressed = c;
+                structure = st;
+                symbol_scores = sc;
+                compressed_tokens = estimate_tokens(&compressed);
+                syntax_valid = self.verify_syntax(&compressed, detected_lang);
+            }
+        }
+
+        // Still broken → never serve invalid code.
         if !syntax_valid {
             return passthrough_result(code, original_tokens, detected_lang, confidence);
         }
@@ -875,6 +1117,7 @@ impl CodeAwareCompressor {
         code: &str,
         language: CodeLanguage,
         context: &str,
+        recover_invalid_python_nodes: bool,
     ) -> Option<AstCompression> {
         let tree = parse_code(code, language)?;
         let root = tree.root_node();
@@ -893,6 +1136,7 @@ impl CodeAwareCompressor {
                 body_limits: &body_limits,
                 analysis: &analysis,
                 config: &self.config,
+                recover_invalid_python_nodes,
             };
             let structure = ctx.extract_structure(root);
             // Expose scores under short names (max per short name).
@@ -922,10 +1166,16 @@ impl CodeAwareCompressor {
 
     /// Verify that `code` re-parses without ERROR/MISSING. Mirrors `_verify_syntax`.
     fn verify_syntax(&self, code: &str, language: CodeLanguage) -> bool {
-        match parse_code(code, language) {
-            Some(tree) => !has_syntax_issues(tree.root_node()),
-            None => false,
-        }
+        verify_syntax_of(code, language)
+    }
+}
+
+/// Free-function form of [`CodeAwareCompressor::verify_syntax`], so the
+/// per-candidate validator in [`Ctx`] can reach it without a compressor handle.
+fn verify_syntax_of(code: &str, language: CodeLanguage) -> bool {
+    match parse_code(code, language) {
+        Some(tree) => !has_syntax_issues(tree.root_node()),
+        None => false,
     }
 }
 
@@ -1066,18 +1316,9 @@ impl CodeAwareCompressor {
             ref_counts.insert(qname.clone(), (count - def_count).max(0));
         }
 
-        // Context words (empty when context is "").
-        let context_lower = context.to_lowercase();
-        let context_words: BTreeSet<String> = if context.is_empty() {
-            BTreeSet::new()
-        } else {
-            static SPLIT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-            let re = SPLIT.get_or_init(|| regex::Regex::new(r#"[\s,;:.()\[\]{}"']+"#).unwrap());
-            re.split(&context_lower)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        };
+        // Context words (empty when context is ""). CJK-aware tokenization so
+        // an ASCII symbol name wrapped in CJK punctuation is still isolated.
+        let (context_words, context_lower, context_has_cjk) = query_context_tokens(context);
 
         // Raw importance signals per symbol.
         let mut raw_signals: Vec<(String, f64)> = Vec::new();
@@ -1106,13 +1347,14 @@ impl CodeAwareCompressor {
                 raw += 1.0;
             }
 
-            if !context_words.is_empty() {
-                let name_lower = short.to_lowercase();
-                if context_words.contains(&name_lower)
-                    || (name_lower.chars().count() > 3 && context_lower.contains(&name_lower))
-                {
-                    raw += 3.0;
-                }
+            // Context boost: the relevance query named this symbol.
+            if symbol_in_context(
+                &short.to_lowercase(),
+                &context_words,
+                &context_lower,
+                context_has_cjk,
+            ) {
+                raw += 3.0;
             }
             raw_signals.push((qname.clone(), raw));
         }
@@ -1354,6 +1596,53 @@ impl<'a> Ctx<'a> {
         structure
     }
 
+    /// Collect contiguous doc-comment siblings immediately preceding `node`.
+    ///
+    /// Doc comments are top-level SIBLINGS of the declaration they document,
+    /// not children of it. Left uncaptured they fall through to the leftover
+    /// top-level sweep and get grouped separately from the declaration they
+    /// describe, instead of staying attached to it. Only comments with no blank
+    /// line before the node (or before the next comment up) count as attached.
+    ///
+    /// Records the comments' byte ranges in `captured` so the sweep skips them.
+    fn leading_comment_text(
+        &self,
+        node: Node,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> String {
+        const COMMENT_NODE_TYPES: [&str; 3] = ["comment", "line_comment", "block_comment"];
+        let mut comments: Vec<Node> = Vec::new();
+        let mut sibling = node.prev_sibling();
+        let mut anchor_row = node.start_position().row;
+        while let Some(sib) = sibling {
+            if !COMMENT_NODE_TYPES.contains(&sib.kind()) {
+                break;
+            }
+            // `<= 1` means "no blank line between"; saturating because a
+            // sibling can't start after the anchor, but underflow would wrap.
+            if anchor_row.saturating_sub(sib.end_position().row) > 1 {
+                break;
+            }
+            comments.push(sib);
+            anchor_row = sib.start_position().row;
+            sibling = sib.prev_sibling();
+        }
+        if comments.is_empty() {
+            return String::new();
+        }
+        comments.reverse();
+        let mut out = String::new();
+        for c in &comments {
+            captured.insert((c.start_byte(), c.end_byte()));
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(self.node_text(*c));
+        }
+        out.push('\n');
+        out
+    }
+
     fn visit(
         &self,
         node: Node,
@@ -1365,21 +1654,22 @@ impl<'a> Ctx<'a> {
 
         // Package declarations (Go, Java).
         if self.lang.package_node == Some(nt) {
-            structure
-                .imports
-                .insert(0, self.node_text(node).to_string());
+            let leading = self.leading_comment_text(node, captured);
+            structure.imports.insert(0, leading + self.node_text(node));
             captured.insert(range);
             return;
         }
         // Import statements.
         if self.lang.is_import(nt) {
-            structure.imports.push(self.node_text(node).to_string());
+            let leading = self.leading_comment_text(node, captured);
+            structure.imports.push(leading + self.node_text(node));
             captured.insert(range);
             return;
         }
         // Export statements (JS/TS).
         if nt == "export_statement" {
-            let text = self.node_text(node).to_string();
+            let leading = self.leading_comment_text(node, captured);
+            let text = leading + self.node_text(node);
             let mut has_func_or_class = false;
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -1437,15 +1727,63 @@ impl<'a> Ctx<'a> {
         // Function/method definitions.
         if self.lang.is_function(nt) {
             let compressed = self.compress_function_ast(node);
-            structure.function_signatures.push(compressed);
+            structure
+                .function_signatures
+                .push(self.validated_candidate(node, compressed));
+            captured.insert(range);
+            return;
+        }
+        // Opaque nodes (C# `preproc_if`): keep verbatim rather than descend.
+        // Their branches can each be individually unparseable, so compressing
+        // the pieces risks emitting code that doesn't build. A block that
+        // contains ONLY imports is emitted WITH the imports — C# `using`
+        // directives must precede type declarations, so appending it as
+        // trailing top-level code would produce invalid output and lose the
+        // whole compression.
+        if self.lang.opaque_node_types.contains(&nt) {
+            let mut cursor = node.walk();
+            let child_kinds: Vec<&str> =
+                node.named_children(&mut cursor).map(|c| c.kind()).collect();
+            let has_import = child_kinds.iter().any(|t| self.lang.is_import(t));
+            let has_declaration = child_kinds.iter().any(|t| {
+                self.lang.is_class(t)
+                    || self.lang.is_type(t)
+                    || self.lang.is_function(t)
+                    || self.lang.container_node_types.contains(t)
+            });
+            let text = self.node_text(node).to_string();
+            if has_import && !has_declaration {
+                structure.imports.push(text);
+            } else {
+                structure.top_level_code.push(text);
+            }
+            captured.insert(range);
+            return;
+        }
+        // Container nodes (C# `namespace_declaration`): compressed like a
+        // class so the declarations inside are processed individually instead
+        // of the whole namespace being swept up as one blob.
+        if self.lang.container_node_types.contains(&nt) {
+            let compressed = self.compress_class_ast(node);
+            structure
+                .class_definitions
+                .push(self.validated_candidate(node, compressed));
             captured.insert(range);
             return;
         }
         // Class definitions.
         if self.lang.is_class(nt) {
             let compressed = self.compress_class_ast(node);
-            structure.class_definitions.push(compressed);
+            structure
+                .class_definitions
+                .push(self.validated_candidate(node, compressed));
             captured.insert(range);
+            // Capture trailing semicolon on the same line (e.g., C++ `class Foo {} ;`).
+            if let Some(next) = node.next_sibling() {
+                if next.kind() == ";" && next.start_position().row == node.end_position().row {
+                    captured.insert((next.start_byte(), next.end_byte()));
+                }
+            }
             return;
         }
         // Type definitions.
@@ -1526,8 +1864,12 @@ impl<'a> Ctx<'a> {
                 // opening brace already in signature line.
             } else if body_lines
                 .first()
-                .is_some_and(|l| l.trim_start().starts_with('{'))
+                .is_some_and(|l| l.trim_end().ends_with('{'))
             {
+                // Matches both a bare `{` line and a multi-line signature's
+                // closing line (e.g. Go's `) error {`), where the brace
+                // shares a line with the closing paren/return type rather
+                // than starting one of its own.
                 opening_brace_line = Some(body_lines[0]);
                 body_lines = body_lines[1..].to_vec();
             }
@@ -1617,6 +1959,21 @@ impl<'a> Ctx<'a> {
             if !child.is_named() {
                 continue;
             }
+            // Some grammars (e.g. Go) wrap all body statements in one generic
+            // list node instead of exposing them as direct siblings of the
+            // block. Treating that wrapper as a single statement makes its
+            // row range swallow the block's own closing brace line, causing
+            // a duplicated `}` later. Unwrap it into its real statements.
+            if child.kind() == "statement_list" {
+                let mut icursor = child.walk();
+                for inner in child.children(&mut icursor) {
+                    if SKIP_TYPES.contains(&inner.kind()) || !inner.is_named() {
+                        continue;
+                    }
+                    body_stmts.push((inner.start_position().row, inner.end_position().row));
+                }
+                continue;
+            }
             body_stmts.push((child.start_position().row, child.end_position().row));
         }
 
@@ -1688,10 +2045,17 @@ impl<'a> Ctx<'a> {
         let node_lines: Vec<&str> = self.code_lines[start_row..=end_row].to_vec();
         let node_text = node_lines.join("\n");
 
+        // Use class_body_node_types if set, otherwise fall back to body_node_types.
+        let effective_body_types = self
+            .lang
+            .class_body_node_types
+            .unwrap_or(self.lang.body_node_types);
+
         let mut body_node: Option<Node> = None;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if self.lang.is_body(child.kind()) {
+            let ck = child.kind();
+            if effective_body_types.contains(&ck) {
                 body_node = Some(child);
                 break;
             }
@@ -1704,7 +2068,17 @@ impl<'a> Ctx<'a> {
         let body_start_line = body_node.start_position().row;
         let sig_end = body_start_line - node_start_line;
         let header_lines: Vec<&str> = if sig_end > 0 {
-            node_lines[..sig_end].to_vec()
+            let mut header = node_lines[..sig_end].to_vec();
+            // Allman brace style (C#): the `{` sits on its own line and belongs
+            // to the BODY node, so slicing at the body's start drops it and the
+            // output no longer parses. Languages that put the brace on the
+            // signature line (Java, Go) already have it inside `header`.
+            if let Some(brace_line) = node_lines.get(sig_end) {
+                if brace_line.trim_start().starts_with('{') {
+                    header.push(brace_line);
+                }
+            }
+            header
         } else {
             vec![node_lines[0]]
         };
@@ -1712,6 +2086,9 @@ impl<'a> Ctx<'a> {
         let mut body_parts: Vec<String> = Vec::new();
         let mut bcursor = body_node.walk();
         for child in body_node.children(&mut bcursor) {
+            if !child.is_named() {
+                continue;
+            }
             let ck = child.kind();
             let child_start = child.start_position().row;
             let child_end = child.end_position().row;
@@ -1747,16 +2124,29 @@ impl<'a> Ctx<'a> {
         let mut result_parts: Vec<String> = header_lines.iter().map(|s| s.to_string()).collect();
         result_parts.extend(body_parts);
 
+        // Closing brace for brace-delimited languages: slice the body-end
+        // line up to the body's end column, re-appending a same-line trailing
+        // semicolon (C++ `class Foo {};`). Mirrors `_compress_class_ast`.
         let body_end_line = body_node.end_position().row;
         let body_end_rel = body_end_line - node_start_line + 1;
-        let after_lines: Vec<&str> = node_lines[body_end_rel..].to_vec();
-        if !after_lines.is_empty() {
-            result_parts.extend(after_lines.iter().map(|s| s.to_string()));
-        } else if !self.lang.uses_colon_after_signature {
-            let last_body_line = node_lines.last().copied().unwrap_or("");
-            if last_body_line.trim() == "}" {
-                result_parts.push(last_body_line.to_string());
+        let after_lines: Vec<&str> = node_lines[body_end_rel.min(node_lines.len())..].to_vec();
+        if !self.lang.uses_colon_after_signature {
+            if body_end_line != start_row {
+                let closing_line = self.code_lines[body_end_line];
+                let col = body_node.end_position().column.min(closing_line.len());
+                let mut closing_text = closing_line[..col].to_string();
+                let has_trailing_semi = node.next_sibling().is_some_and(|next| {
+                    next.kind() == ";" && next.start_position().row == node.end_position().row
+                });
+                if has_trailing_semi {
+                    closing_text.push(';');
+                }
+                if !closing_text.trim().is_empty() {
+                    result_parts.push(closing_text);
+                }
             }
+        } else if !after_lines.is_empty() {
+            result_parts.extend(after_lines.iter().map(|s| s.to_string()));
         }
 
         result_parts.join("\n")
@@ -1878,5 +2268,313 @@ mod tests {
         assert_eq!(r.compressed, "def f(): pass"); // < min_tokens → passthrough
         assert_eq!(r.compression_ratio, 1.0);
         assert_eq!(r.language, CodeLanguage::Unknown);
+    }
+
+    // --- CJK-aware relevance-query symbol matching (parity: b38315cf) ---
+
+    #[test]
+    fn cjk_query_isolates_wrapped_ascii_symbol() {
+        // Full-width parens around the name must still tokenize parse_config out.
+        let (words, lowered, has_cjk) =
+            query_context_tokens("请重点保留（parse_config）的解析配置");
+        assert!(has_cjk);
+        assert!(words.contains("parse_config"));
+        assert!(symbol_in_context("parse_config", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn cjk_query_matches_short_ascii_name_glued_to_cjk() {
+        // 'db' (len 2) glued to CJK has no delimiter to isolate it; the len>3
+        // guard is relaxed for CJK so the substring fallback still matches.
+        let (words, lowered, has_cjk) = query_context_tokens("请保留db相关的逻辑");
+        assert!(has_cjk);
+        assert!(symbol_in_context("db", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn english_short_name_substring_still_gated() {
+        // ASCII query unchanged: a short name that is only a substring (not a
+        // token) of an English query must NOT match.
+        let (words, lowered, has_cjk) = query_context_tokens("keep the database helper");
+        assert!(!has_cjk);
+        assert!(!symbol_in_context("db", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn english_exact_token_match_unchanged() {
+        let (words, lowered, has_cjk) = query_context_tokens("keep parse_config and helper");
+        assert!(!has_cjk);
+        assert!(symbol_in_context("parse_config", &words, &lowered, has_cjk));
+        assert!(symbol_in_context("helper", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn english_long_name_substring_fallback_unchanged() {
+        // ASCII path, len>3 substring fallback: 'parse_config' is not a
+        // standalone token but is a substring of 'parse_configs' -> still match.
+        let (words, lowered, has_cjk) = query_context_tokens("parse_configs and related helpers");
+        assert!(!has_cjk);
+        assert!(!words.contains("parse_config"));
+        assert!(symbol_in_context("parse_config", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn empty_context_matches_nothing() {
+        let (words, lowered, has_cjk) = query_context_tokens("");
+        assert!(words.is_empty());
+        assert_eq!(lowered, "");
+        assert!(!has_cjk);
+        assert!(!symbol_in_context("foo", &words, &lowered, has_cjk));
+    }
+
+    // ─── Language coercion (upstream addition) ───────────────────────────
+
+    #[test]
+    fn coerce_language_matches_python() {
+        for (input, expected) in [
+            ("js", CodeLanguage::Javascript),
+            ("jsx", CodeLanguage::Javascript),
+            ("mjs", CodeLanguage::Javascript),
+            ("cjs", CodeLanguage::Javascript),
+            ("node", CodeLanguage::Javascript),
+            ("ts", CodeLanguage::Typescript),
+            ("tsx", CodeLanguage::Typescript),
+            ("py", CodeLanguage::Python),
+            ("python3", CodeLanguage::Python),
+            ("golang", CodeLanguage::Go),
+            ("rs", CodeLanguage::Rust),
+            ("c++", CodeLanguage::Cpp),
+            ("cxx", CodeLanguage::Cpp),
+            ("cc", CodeLanguage::Cpp),
+            ("hpp", CodeLanguage::Cpp),
+            ("pl", CodeLanguage::Perl),
+            // Canonical names still work, case-insensitively and trimmed.
+            ("python", CodeLanguage::Python),
+            ("JavaScript", CodeLanguage::Javascript),
+            ("  TS  ", CodeLanguage::Typescript),
+            // Unknown yields Unknown rather than an error.
+            ("", CodeLanguage::Unknown),
+            ("zzz", CodeLanguage::Unknown),
+            ("cobol", CodeLanguage::Unknown),
+        ] {
+            assert_eq!(CodeLanguage::coerce(input), expected, "coerce({input:?})");
+        }
+    }
+
+    #[test]
+    fn an_unknown_hint_falls_back_to_content_detection() {
+        // Previously an unrecognized hint resolved to Unknown, which skipped
+        // code-aware compression for the whole block. It must now fall through
+        // to detection — Python resolves this same input to `python`.
+        let code = "def alpha():\n    return 1\n\ndef beta():\n    return 2\n".repeat(12);
+        let cfg = CodeCompressorConfig {
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            language_hint: Some("cobol".to_string()),
+            ..Default::default()
+        };
+        let r = CodeAwareCompressor::new(cfg).compress(&code);
+        assert_eq!(r.language, CodeLanguage::Python, "should detect by content");
+    }
+
+    #[test]
+    fn an_alias_hint_is_honoured_without_detection() {
+        // `py` must resolve directly, not fall through to detection. The input
+        // has to clear `min_tokens_for_compression` (100) or the compressor
+        // returns early with `Unknown` before any language resolution runs.
+        let code = "def alpha():\n    return 1\n\ndef beta():\n    return 2\n".repeat(12);
+        let cfg = CodeCompressorConfig {
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            language_hint: Some("py".to_string()),
+            ..Default::default()
+        };
+        let r = CodeAwareCompressor::new(cfg).compress(&code);
+        assert_eq!(r.language, CodeLanguage::Python);
+        assert!(
+            (r.language_confidence - 1.0).abs() < 1e-9,
+            "explicit hint is certain"
+        );
+    }
+
+    #[test]
+    fn leading_doc_comments_stay_attached_to_their_imports() {
+        // Doc comments are top-level SIBLINGS of the import they document. Left
+        // uncaptured they fall through to the leftover top-level sweep and get
+        // grouped away from the import. Byte-for-byte what Python emits for
+        // this input.
+        let body: String = (0..24)
+            .map(|i| format!("    step_{i} = compute(value_{i}, factor={i})\n"))
+            .collect();
+        let code = format!(
+            "# Standard library imports for the parser.\nimport os\nimport sys\n\n\
+             # Third-party: used by the tokenizer.\nimport regex\n\n\ndef alpha(x):\n{body}    return step_0\n"
+        );
+        let cfg = CodeCompressorConfig {
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            semantic_analysis: false,
+            max_body_lines: 3,
+            ..Default::default()
+        };
+        let r = CodeAwareCompressor::new(cfg).compress(&code);
+        // Written as explicit lines: a `\` continuation would eat the leading
+        // indentation that is part of the expected bytes.
+        let expected = concat!(
+            "# Standard library imports for the parser.\n",
+            "import os\n",
+            "import sys\n",
+            "# Third-party: used by the tokenizer.\n",
+            "import regex\n",
+            "\n",
+            "def alpha(x):\n",
+            "    step_0 = compute(value_0, factor=0)\n",
+            "    step_1 = compute(value_1, factor=1)\n",
+            "    step_2 = compute(value_2, factor=2)\n",
+            "    # [22 lines omitted]\n",
+            "    pass",
+        );
+        assert_eq!(r.compressed, expected);
+    }
+
+    #[test]
+    fn validated_candidate_reverts_only_the_offending_node() {
+        // The recovery pass exists so ONE bad candidate doesn't sink the whole
+        // output. Splice a deliberately broken candidate in place of a function
+        // and confirm the original text comes back; splice a valid one and
+        // confirm it is kept.
+        let code = "def alpha(x):\n    return x\n\ndef beta(y):\n    return y\n";
+        let tree = parse_code(code, CodeLanguage::Python).expect("parses");
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let func = root
+            .children(&mut cursor)
+            .find(|c| c.kind() == "function_definition")
+            .expect("has a function");
+
+        let lang = lang_config(CodeLanguage::Python).expect("python config");
+        let analysis = SymbolAnalysis::default();
+        let body_limits = HashMap::new();
+        let config = CodeCompressorConfig::default();
+        let ctx = Ctx {
+            code,
+            code_lines: code.split('\n').collect(),
+            language: CodeLanguage::Python,
+            lang: &lang,
+            body_limits: &body_limits,
+            analysis: &analysis,
+            config: &config,
+            recover_invalid_python_nodes: true,
+        };
+
+        // Broken candidate -> module no longer parses -> original restored.
+        let broken = "def alpha(x:\n    return".to_string();
+        assert_eq!(
+            ctx.validated_candidate(func, broken),
+            "def alpha(x):\n    return x",
+            "an unparseable candidate must revert to the node's original text"
+        );
+
+        // Valid candidate -> kept as-is.
+        let ok = "def alpha(x):\n    pass".to_string();
+        assert_eq!(ctx.validated_candidate(func, ok.clone()), ok);
+    }
+
+    #[test]
+    fn validated_candidate_is_inert_outside_the_recovery_pass() {
+        // The first pass must not pay for per-candidate re-parsing, and
+        // non-Python languages never take this path at all.
+        let code = "def alpha(x):\n    return x\n";
+        let tree = parse_code(code, CodeLanguage::Python).expect("parses");
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let func = root
+            .children(&mut cursor)
+            .find(|c| c.kind() == "function_definition")
+            .expect("has a function");
+        let lang = lang_config(CodeLanguage::Python).expect("python config");
+        let analysis = SymbolAnalysis::default();
+        let body_limits = HashMap::new();
+        let config = CodeCompressorConfig::default();
+        let ctx = Ctx {
+            code,
+            code_lines: code.split('\n').collect(),
+            language: CodeLanguage::Python,
+            lang: &lang,
+            body_limits: &body_limits,
+            analysis: &analysis,
+            config: &config,
+            recover_invalid_python_nodes: false,
+        };
+        let broken = "def alpha(x:".to_string();
+        assert_eq!(
+            ctx.validated_candidate(func, broken.clone()),
+            broken,
+            "flag off: candidate passes through untouched"
+        );
+    }
+
+    #[test]
+    fn csharp_compresses_byte_identically_to_python() {
+        let body: String = (0..20)
+            .map(|i| format!("            var step{i} = Compute(value{i}, {i});\n"))
+            .collect();
+        let code = format!(
+            "using System;\nusing System.Collections.Generic;\n\nnamespace Acme.Widgets\n{{\n    // A widget service.\n    public class WidgetService\n    {{\n        public int Process(int input)\n        {{\n{body}            return step0;\n        }}\n\n        public string Describe()\n        {{\n{body}            return \"widget\";\n        }}\n    }}\n}}\n"
+        );
+        let cfg = CodeCompressorConfig {
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            semantic_analysis: false,
+            max_body_lines: 2,
+            language_hint: Some("csharp".to_string()),
+            ..Default::default()
+        };
+        let r = CodeAwareCompressor::new(cfg).compress(&code);
+        assert_eq!(r.language, CodeLanguage::CSharp);
+        assert!(r.syntax_valid, "compressed C# must re-parse");
+        let expected = concat!(
+            "using System;\n",
+            "using System.Collections.Generic;\n",
+            "\n",
+            "namespace Acme.Widgets\n",
+            "{\n",
+            "    // A widget service.\n",
+            "    public class WidgetService\n",
+            "    {\n",
+            "        public int Process(int input)\n",
+            "        {\n",
+            "            var step0 = Compute(value0, 0);\n",
+            "            var step1 = Compute(value1, 1);\n",
+            "            // [19 lines omitted]\n",
+            "        }\n",
+            "        public string Describe()\n",
+            "        {\n",
+            "            var step0 = Compute(value0, 0);\n",
+            "            var step1 = Compute(value1, 1);\n",
+            "            // [19 lines omitted]\n",
+            "        }\n",
+            "    }\n",
+            "}",
+        );
+        assert_eq!(r.compressed, expected);
+    }
+
+    #[test]
+    fn csharp_is_detected_without_a_hint() {
+        // The prefilter must recognize C# on its own, and must not steal Java
+        // (both use `public class`, so the disambiguation matters).
+        let csharp = "using System;\nusing System.Linq;\n\nnamespace Acme.Svc\n{\n    public class Widget\n    {\n        public int Id { get; set; }\n        public void Run() { }\n    }\n}\n";
+        let (lang, conf) = detect_language(csharp);
+        assert_eq!(lang, CodeLanguage::CSharp, "confidence {conf}");
+        assert!(
+            (conf - 1.0).abs() < 1e-9,
+            "Python reports 1.000, got {conf}"
+        );
+
+        let java = "package com.acme;\n\nimport java.util.List;\n\npublic class Widget {\n    private int id;\n    public void run() { }\n}\n";
+        let (jlang, jconf) = detect_language(java);
+        assert_eq!(jlang, CodeLanguage::Java, "C# must not steal Java");
+        assert!((jconf - 1.0).abs() < 1e-9, "got {jconf}");
     }
 }

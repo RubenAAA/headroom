@@ -525,6 +525,7 @@ def test_proxy_cli_reads_agent_90_profile_env() -> None:
 
     runner = CliRunner()
     with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("HEADROOM_USE_PYTHON_PROXY", "1")
         mp.setattr("headroom.proxy.server.run_server", mock_run_server)
         result = runner.invoke(
             main,

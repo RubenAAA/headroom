@@ -60,10 +60,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use ort::session::Session;
 use ort::value::Tensor;
+use regex::Regex;
 use thiserror::Error;
 use tokenizers::tokenizer::TruncationParams;
 use tokenizers::{EncodeInput, InputSequence, Tokenizer};
@@ -85,6 +86,62 @@ pub const DEFAULT_SCORE_THRESHOLD: f32 = 0.5;
 pub const MIN_WORDS: usize = 10;
 /// Max ModernBERT sequence length per chunk (truncation bound).
 pub const MAX_SEQ_LEN: usize = 512;
+
+// ─── Must-keep regex (mirrors Python `_KOMPRESS_MUST_KEEP_RE`) ──────────
+//
+// Tokens matching this pattern are always kept regardless of model score.
+// Numbers, ALLCAPS identifiers, dotted paths, unix paths, file extensions,
+// CLI flags, and CamelCase names carry semantic meaning that agents cannot
+// reconstruct from context — dropping them degrades reasoning correctness.
+// Disable with HEADROOM_KOMPRESS_MUST_KEEP=0.
+//
+// NOTE: Python's regex uses look-around (`(?<![\w.])` / `(?![\w.])`) for
+// standalone numbers, but Rust's `regex` crate doesn't support look-around.
+// We use `\b` word boundaries instead, which is slightly less precise but
+// covers the same practical cases (numbers surrounded by whitespace/punctuation).
+fn must_keep_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?x)
+            \b0x[0-9A-Fa-f]+\b                        # hex addresses/IDs: 0x7fff2038
+            | \b\d+(?:\.\d+)?\b                        # standalone numbers: 42, 3.14
+            | [A-Z_]{2,}                                # ALLCAPS: SIGILL, HTTP, EOF, ERROR
+            | [a-z_][a-z0-9_]*\.[a-z0-9_]+             # dotted.paths: libsystem_kernel.dylib
+            | /[a-z0-9/._-]{2,}                         # unix paths: /usr/lib/python3.so
+            | \.[a-z]{2,4}\b                            # extensions: .py .so .json
+            | --?[a-z][\w-]*                            # flags: --verbose, -n
+            | \b[A-Z][a-z]+[A-Z]\w*                    # CamelCase: EXC_BAD_INSTRUCTION, IndexError
+            ",
+        )
+        .expect("MUST_KEEP_RE is a valid regex")
+    })
+}
+
+/// Env var to disable the must-keep safety net (set to "0" to disable).
+const MUST_KEEP_ENV: &str = "HEADROOM_KOMPRESS_MUST_KEEP";
+
+/// Add semantically fragile words that should never be model-dropped.
+///
+/// Mirrors Python `_add_kompress_must_keep_words`: scans `chunk_words` for
+/// patterns the model might incorrectly score as unimportant (hex addresses,
+/// file paths, CLI flags, error codes, etc.) and forces them into `kept_ids`.
+fn add_must_keep_words(kept_ids: &mut BTreeSet<usize>, chunk_words: &[&str], chunk_start: usize) {
+    let re = must_keep_re();
+    for (word_idx, word) in chunk_words.iter().enumerate() {
+        if re.is_match(word) {
+            kept_ids.insert(word_idx + chunk_start);
+        }
+    }
+}
+
+/// Returns `true` if the must-keep safety net is enabled (default) or
+/// disabled via `HEADROOM_KOMPRESS_MUST_KEEP=0`.
+fn must_keep_enabled() -> bool {
+    !std::env::var(MUST_KEEP_ENV)
+        .map(|v| v == "0")
+        .unwrap_or(false)
+}
 
 /// ONNX artifact candidates, tried in order. The first is a fp32 model whose
 /// input shape is frozen to a static `[1, MAX_SEQ_LEN]` — required by the
@@ -393,9 +450,16 @@ impl Kompress {
         let mut chunk_start = 0usize;
         while chunk_start < n_words {
             let end = (chunk_start + self.config.chunk_words).min(n_words);
-            match self.score_chunk(&words[chunk_start..end]) {
+            let chunk_words = &words[chunk_start..end];
+            match self.score_chunk(chunk_words) {
                 Ok(word_scores) => {
-                    self.select_words(&word_scores, chunk_start, target_ratio, &mut kept_ids);
+                    self.select_words(
+                        &word_scores,
+                        chunk_words,
+                        chunk_start,
+                        target_ratio,
+                        &mut kept_ids,
+                    );
                 }
                 Err(_) => {
                     // A chunk that fails inference is treated as
@@ -506,6 +570,7 @@ impl Kompress {
     fn select_words(
         &self,
         word_scores: &HashMap<usize, f32>,
+        chunk_words: &[&str],
         chunk_start: usize,
         target_ratio: Option<f64>,
         kept_ids: &mut BTreeSet<usize>,
@@ -536,6 +601,12 @@ impl Kompress {
                     }
                 }
             }
+        }
+        // Force-keep semantically fragile words (hex, paths, flags, etc.)
+        // regardless of model score. Matches Python `_add_kompress_must_keep_words`.
+        // Disable with HEADROOM_KOMPRESS_MUST_KEEP=0.
+        if must_keep_enabled() {
+            add_must_keep_words(kept_ids, chunk_words, chunk_start);
         }
     }
 
@@ -576,8 +647,76 @@ fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
     Ok(tokenizer)
 }
 
+/// Read an env var as `usize`, returning `None` when absent, empty, or
+/// non-positive. Mirrors Python `_env_int`.
+fn env_usize(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let value: usize = raw.parse().ok()?;
+    if value == 0 {
+        return None;
+    }
+    Some(value)
+}
+
 fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
-    let session = Session::builder()?.commit_from_file(path)?;
+    // `ort` is built with `load-dynamic`, so the ONNX Runtime shared library
+    // must be resolved and committed BEFORE any session is constructed. This
+    // is not a soft failure to skip: when the dylib cannot be loaded, ort
+    // 2.0.0-rc.12 deadlocks inside its API-setup error path (recursive
+    // `OnceLock` init) and the stuck thread then wedges process exit in
+    // `dl_fini` (#1715). fastembed (`relevance::embedding`) and magika both
+    // gate on this; Kompress reaches ORT by a third path and must too.
+    //
+    // Returning `Err` here degrades Kompress to passthrough, the same as a
+    // cold model cache — the caller already treats a load failure that way.
+    crate::transforms::magika_detector::dynamic_ort_loader_ready()?;
+
+    let builder = Session::builder()?;
+
+    // Apply ONNX thread configuration from env vars (mirrors Python
+    // `_onnx_session_options` which reads HEADROOM_KOMPRESS_ONNX_INTRA_THREADS
+    // and HEADROOM_KOMPRESS_ONNX_INTER_THREADS).
+    //
+    // These methods consume self and return Result. Thread configuration
+    // is a best-effort hint that should never fail in practice, so we log
+    // and continue on failure rather than aborting session creation.
+    let builder = match env_usize("HEADROOM_KOMPRESS_ONNX_INTRA_THREADS") {
+        Some(n) => match builder.with_intra_threads(n) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    event = "kompress_session_threads_failed",
+                    threads = n,
+                    error = %e,
+                    "Failed to set intra-op threads; using ONNX Runtime default"
+                );
+                Session::builder()?
+            }
+        },
+        None => builder,
+    };
+
+    let mut builder = match env_usize("HEADROOM_KOMPRESS_ONNX_INTER_THREADS") {
+        Some(n) => match builder.with_inter_threads(n) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    event = "kompress_session_threads_failed",
+                    threads = n,
+                    error = %e,
+                    "Failed to set inter-op threads; using ONNX Runtime default"
+                );
+                Session::builder()?
+            }
+        },
+        None => builder,
+    };
+
+    let session = builder.commit_from_file(path)?;
     Ok(session)
 }
 
@@ -643,6 +782,75 @@ mod tests {
         assert_eq!(c.chunk_words, 350);
         assert_eq!(c.score_threshold, 0.5);
         assert_eq!(c.min_words, 10);
+    }
+
+    #[test]
+    fn must_keep_regex_matches_expected_patterns() {
+        let re = must_keep_re();
+        // Hex addresses
+        assert!(re.is_match("0x7fff2038"));
+        assert!(re.is_match("0xDEADBEEF"));
+        // Standalone numbers
+        assert!(re.is_match("42"));
+        assert!(re.is_match("3.14"));
+        assert!(!re.is_match("abc123")); // not standalone
+                                         // ALLCAPS
+        assert!(re.is_match("SIGILL"));
+        assert!(re.is_match("HTTP"));
+        assert!(re.is_match("EOF"));
+        assert!(!re.is_match("Hi")); // too short
+                                     // Dotted paths
+        assert!(re.is_match("libsystem_kernel.dylib"));
+        assert!(re.is_match("com.example.MyClass"));
+        // Unix paths
+        assert!(re.is_match("/usr/lib/python3.so"));
+        assert!(re.is_match("/tmp/test"));
+        // Extensions
+        assert!(re.is_match(".py"));
+        assert!(re.is_match(".json"));
+        assert!(!re.is_match(".a")); // too short
+                                     // CLI flags
+        assert!(re.is_match("--verbose"));
+        assert!(re.is_match("-n"));
+        assert!(!re.is_match("--")); // no letters after
+                                     // CamelCase
+        assert!(re.is_match("EXC_BAD_INSTRUCTION"));
+        assert!(re.is_match("IndexError"));
+        // Note: "HTTPServer" contains "HTTP" which matches ALLCAPS pattern -
+        // this is correct behavior as the ALLCAPS substring is semantically
+        // significant and should be preserved.
+    }
+
+    #[test]
+    fn add_must_keep_words_forces_fragile_words() {
+        let mut kept = BTreeSet::new();
+        let words = vec!["the", "path", "/usr/lib/python3.so", "was", "0x7fff2038"];
+        add_must_keep_words(&mut kept, &words, 10);
+        // Indices 2 and 4 (relative to chunk_start=10) should be forced
+        assert!(kept.contains(&12)); // /usr/lib/python3.so
+        assert!(kept.contains(&14)); // 0x7fff2038
+        assert!(!kept.contains(&10)); // "the" not matched
+    }
+
+    #[test]
+    fn add_must_keep_words_disabled_via_env() {
+        std::env::set_var(MUST_KEEP_ENV, "0");
+        assert!(!must_keep_enabled());
+        std::env::remove_var(MUST_KEEP_ENV);
+    }
+
+    #[test]
+    fn env_usize_helper() {
+        assert_eq!(env_usize("NONEXISTENT_VAR_12345"), None);
+        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "42");
+        assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), Some(42));
+        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "0");
+        assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), None);
+        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "not_a_number");
+        assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), None);
+        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "");
+        assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), None);
+        std::env::remove_var("HEADROOM_TEST_ENV_USIZE");
     }
 
     #[test]

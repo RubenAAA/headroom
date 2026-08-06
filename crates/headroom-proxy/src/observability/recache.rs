@@ -9,8 +9,9 @@
 //!
 //! `reason` is bounded to a fixed vocabulary derived from the PR-E6
 //! drift dimensions: `system`, `tools`, `early_messages`, `multi`
-//! (more than one axis drifted), and `unknown` (drift detector saw
-//! stable bytes — likely a message edit/branch below its window).
+//! (more than one axis drifted), and `expected` (drift detector saw
+//! stable bytes — a conversation-context reset such as a subagent
+//! closing or `/clear`; not actually wasted tokens).
 
 use std::sync::OnceLock;
 
@@ -18,8 +19,7 @@ use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 
 use super::metric_names::{
     LABEL_REASON, METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL,
-    METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP,
-    METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL,
+    METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP, METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL,
     METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP,
 };
 
@@ -64,7 +64,7 @@ fn reason_label(drift_dims: Option<&str>) -> &'static str {
         Some("tools") => "tools",
         Some("early_messages") => "early_messages",
         Some(s) if s.contains(',') => "multi",
-        _ => "unknown",
+        _ => "expected",
     }
 }
 
@@ -88,8 +88,8 @@ mod tests {
         assert_eq!(reason_label(Some("system")), "system");
         assert_eq!(reason_label(Some("early_messages")), "early_messages");
         assert_eq!(reason_label(Some("system,tools")), "multi");
-        assert_eq!(reason_label(Some("weird_future_dim")), "unknown");
-        assert_eq!(reason_label(None), "unknown");
+        assert_eq!(reason_label(Some("weird_future_dim")), "expected");
+        assert_eq!(reason_label(None), "expected");
     }
 
     #[test]
@@ -97,12 +97,9 @@ mod tests {
         let registry = crate::observability::prometheus::registry();
         let before = wasted_tokens_counter(registry).get();
         observe_recache_event(Some("tools"), 1234);
-        assert_eq!(wasted_tokens_counter(registry).get(), before + 1234);
-        assert!(
-            events_counter(registry)
-                .with_label_values(&["tools"])
-                .get()
-                >= 1
-        );
+        // Other tests in this binary also drive the shared global
+        // counter concurrently, so assert a lower bound, not equality.
+        assert!(wasted_tokens_counter(registry).get() >= before + 1234);
+        assert!(events_counter(registry).with_label_values(&["tools"]).get() >= 1);
     }
 }

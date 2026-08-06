@@ -1,21 +1,57 @@
 //! headroom-proxy library: transparent reverse proxy in front of the Python
 //! Headroom proxy. Used by both `main.rs` and the integration tests.
 
+pub mod audit;
+pub mod background_compression;
 pub mod bedrock;
+pub mod body;
 pub mod cache_stabilization;
+pub mod cc_switch_reconciler;
 pub mod compression;
+pub mod compression_decision;
+pub mod compression_failure;
+pub mod compression_feedback;
+pub mod compression_quarantine;
 pub mod config;
 pub mod ctx;
+pub mod debug_introspection;
 pub mod error;
+pub mod forwarded_headers;
+pub mod foundry;
 pub mod handlers;
 pub mod headers;
 pub mod health;
+pub mod image_compression_decision;
+pub mod interceptors;
+pub mod loopback_guard;
+pub mod memory;
+pub mod memory_tail;
+pub mod model_router;
+pub mod model_sanitize;
+pub mod modes;
 pub mod observability;
+pub mod output_shaper;
+pub mod persistent_metrics;
+pub mod probe_recorder;
+pub mod project_context;
 pub mod proxy;
+pub mod request_logger;
 pub mod responses_items;
+pub mod runtime_env;
+pub mod semantic_cache;
 pub mod sse;
+pub mod ssl_context;
+pub mod stage_timer;
+pub mod subscription;
+pub mod tile_optimizer;
+pub mod tool_schema_compaction;
+pub mod turn_hooks;
+pub mod verbosity_controller;
 pub mod vertex;
+pub mod warmup;
 pub mod websocket;
+pub mod websocket_codex;
+pub mod ws_session_registry;
 
 pub use config::Config;
 pub use error::ProxyError;

@@ -92,6 +92,10 @@ class TestFormatTelemetryNotice:
 class TestProxyCLITelemetryBanner:
     """Proxy CLI startup banner must include telemetry status."""
 
+    @pytest.fixture(autouse=True)
+    def _legacy_python_proxy_for_banner_tests(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_USE_PYTHON_PROXY", "1")
+
     @pytest.fixture
     def runner(self):
         return CliRunner()

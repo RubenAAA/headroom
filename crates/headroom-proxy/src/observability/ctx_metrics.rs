@@ -71,6 +71,36 @@ fn search_queries_counter(registry: &Registry) -> &'static IntCounter {
     })
 }
 
+fn retrieval_hits_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            METRIC_CTX_RETRIEVAL_HITS_TOTAL,
+            METRIC_CTX_RETRIEVAL_HITS_TOTAL_HELP,
+        )
+        .expect("ctx_retrieval_hits_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("ctx_retrieval_hits_total registers exactly once");
+        c
+    })
+}
+
+fn retrieval_misses_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            METRIC_CTX_RETRIEVAL_MISSES_TOTAL,
+            METRIC_CTX_RETRIEVAL_MISSES_TOTAL_HELP,
+        )
+        .expect("ctx_retrieval_misses_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("ctx_retrieval_misses_total registers exactly once");
+        c
+    })
+}
+
 // ── Emit helpers (called by CTX-3/4/5 code paths) ──
 
 /// Record bytes offloaded on the request path. Called from `ctx_offload.rs`.
@@ -90,6 +120,16 @@ pub fn observe_search_query() {
     search_queries_counter(super::prometheus::registry()).inc();
 }
 
+/// PR-J5: record a /ctx/get retrieval outcome. Called from `ctx/endpoints.rs`.
+pub fn observe_retrieval(hit: bool) {
+    let reg = super::prometheus::registry();
+    if hit {
+        retrieval_hits_counter(reg).inc();
+    } else {
+        retrieval_misses_counter(reg).inc();
+    }
+}
+
 // ── Getter helpers (called by /ctx/stats endpoint) ──
 
 pub fn offloaded_bytes_get(registry: &Registry) -> u64 {
@@ -106,6 +146,14 @@ pub fn recall_injections_get(registry: &Registry) -> u64 {
 
 pub fn search_queries_get(registry: &Registry) -> u64 {
     search_queries_counter(registry).get()
+}
+
+pub fn retrieval_hits_get(registry: &Registry) -> u64 {
+    retrieval_hits_counter(registry).get()
+}
+
+pub fn retrieval_misses_get(registry: &Registry) -> u64 {
+    retrieval_misses_counter(registry).get()
 }
 
 #[cfg(test)]
@@ -128,5 +176,12 @@ mod tests {
         let before_q = search_queries_get(reg);
         observe_search_query();
         assert_eq!(search_queries_get(reg), before_q + 1);
+
+        let before_hits = retrieval_hits_get(reg);
+        let before_misses = retrieval_misses_get(reg);
+        observe_retrieval(true);
+        observe_retrieval(false);
+        assert_eq!(retrieval_hits_get(reg), before_hits + 1);
+        assert_eq!(retrieval_misses_get(reg), before_misses + 1);
     }
 }

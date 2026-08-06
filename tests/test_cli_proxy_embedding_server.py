@@ -15,6 +15,8 @@ from headroom.cli import main
 
 
 def test_embedding_server_missing_sidecar_falls_back(monkeypatch):
+    monkeypatch.setenv("HEADROOM_USE_PYTHON_PROXY", "1")
+
     # Make the optional sidecar module unimportable regardless of whether it is
     # installed, so the fallback path is exercised deterministically.
     monkeypatch.setitem(sys.modules, "headroom.memory.adapters.watchdog", None)
