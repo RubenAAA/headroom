@@ -31,6 +31,12 @@ pub async fn handle_stats(State(state): State<AppState>) -> Json<serde_json::Val
             "path": state.savings_tracker.storage_path().display().to_string(),
         })),
         "savings_verdict": state.savings_tracker.savings_verdict(),
+        // Which tools cost what, and which were never called. The cost already
+        // lands in cache_write_tokens; this says where it went.
+        "tool_inventory": state.savings_tracker.tool_inventory_report(),
+        // What the proxy itself adds to `tools` + `system`. Invisible to
+        // tokens_saved, which is measured after the injection stages run.
+        "proxy_overhead": state.savings_tracker.proxy_overhead_report(),
         "recent_requests": recent,
         "total_logged": state.request_logger.len(),
         "codex_rate_limits": state

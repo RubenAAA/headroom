@@ -28,6 +28,11 @@ pub const MAX_PROVIDER_VALUES: usize = 32;
 pub const MAX_STACK_VALUES: usize = 64;
 /// Tracked-model count that triggers pruning.
 pub const MAX_TRACKED_MODELS: usize = 200;
+/// Distinct tool names kept in the inventory. A large agentic client sends
+/// under a hundred; the cap is headroom for MCP servers coming and going.
+pub const MAX_TRACKED_TOOLS: usize = 400;
+/// Never-called tools listed in a snapshot, biggest first.
+pub const MAX_LISTED_UNUSED_TOOLS: usize = 15;
 /// Models kept after pruning, and models exposed by a snapshot.
 pub const MAX_EXPOSED_MODELS: usize = 100;
 /// Labels are truncated to this many characters before use as a map key.
@@ -182,6 +187,19 @@ impl CountMap {
             return;
         }
         self.0.push((key.to_string(), delta));
+    }
+
+    /// Record `value` for `key`, keeping the largest seen.
+    ///
+    /// Sizes that ride every request need this rather than [`Self::add`]: a
+    /// tool definition is the same bytes on every turn, so summing would
+    /// multiply it by the turn count and report a number nobody is paying.
+    pub fn observe_max(&mut self, key: &str, value: i64) {
+        if let Some(slot) = self.0.iter_mut().find(|(name, _)| name == key) {
+            slot.1 = slot.1.max(value);
+            return;
+        }
+        self.0.push((key.to_string(), value));
     }
 
     /// Remove `key` and return its count, shifting later keys up.
@@ -397,6 +415,44 @@ pub struct TokensState {
     pub saved: i64,
 }
 
+/// What the proxy itself adds to a request.
+///
+/// Compression measures `tokens_before` *after* the injection stages have run,
+/// so anything the proxy adds is baked into its own baseline and invisible to
+/// `tokens_saved`. Measured on `tools` + `system` only: those are the parts the
+/// injection stages write to and the compressors never touch, so a change there
+/// is the proxy's doing and nothing else's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProxyOverheadState {
+    /// Bytes the injection stages added to `tools` + `system`.
+    pub added_bytes: i64,
+    /// Bytes compaction and pruning gave back on the same axis.
+    ///
+    /// Kept apart from [`Self::added_bytes`] rather than netted in place for
+    /// two reasons: the persisted-state convention clamps negatives to zero, so
+    /// a single signed counter would silently lose a net shrink; and the pair
+    /// says more than the difference does — it separates "we inject a lot and
+    /// claw most of it back" from "we barely touch the request".
+    pub removed_bytes: i64,
+    /// Requests the measurement ran on.
+    pub measured_requests: i64,
+}
+
+/// Per-tool definition size and call count.
+///
+/// Tool schemas are the single largest segment of an agentic request, and a
+/// tool nobody calls costs the same as one in constant use: full price on every
+/// cold start, and again on every cache bust. The cost already lands in
+/// `prefix_cache.cache_write_tokens`, but nothing said *which* tools it went
+/// on, which is what an operator needs to aim `--prune-drop-mcp`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ToolInventoryState {
+    /// Serialized bytes of each tool definition, largest seen.
+    pub definition_bytes: CountMap,
+    /// Times the model actually called each tool.
+    pub calls: CountMap,
+}
+
 /// Prefix-cache counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PrefixCacheState {
@@ -470,6 +526,15 @@ pub struct MetricsSnapshotState {
     pub cost: CostState,
     /// Waste-signal tokens per bucket.
     pub waste_signals: CountMap,
+    /// What the proxy adds to requests. Rust-only, so it is skipped here and
+    /// persisted beside the Python-shaped blob by
+    /// [`PersistentMetricsState::footprint_to_dict`] — `to_dict` is asserted
+    /// byte-exact against Python's and must not grow.
+    #[serde(skip)]
+    pub proxy_overhead: ProxyOverheadState,
+    /// Tool definition sizes and call counts. Rust-only; see above.
+    #[serde(skip)]
+    pub tool_inventory: ToolInventoryState,
     /// Per-model totals.
     pub models: ModelsState,
     /// Save metadata.
@@ -593,6 +658,124 @@ impl Default for PersistentMetricsState {
 }
 
 impl PersistentMetricsState {
+    /// The Rust-only footprint counters, for persisting alongside
+    /// [`Self::to_dict`] rather than inside it.
+    pub fn footprint_to_dict(&self) -> Value {
+        serde_json::json!({
+            "proxy_overhead": to_value(&self.state.proxy_overhead),
+            "tool_inventory": to_value(&self.state.tool_inventory),
+        })
+    }
+
+    /// Restore what [`Self::footprint_to_dict`] wrote. A missing or unreadable
+    /// blob leaves the counters at zero, so an older savings file upgrades in
+    /// place.
+    pub fn load_footprint(&mut self, raw: Option<&Value>) {
+        let raw = raw.and_then(Value::as_object);
+        let raw_overhead = dict_or_empty(get(raw, "proxy_overhead"));
+        self.state.proxy_overhead = ProxyOverheadState {
+            added_bytes: coerce_int(get(raw_overhead, "added_bytes")),
+            removed_bytes: coerce_int(get(raw_overhead, "removed_bytes")),
+            measured_requests: coerce_int(get(raw_overhead, "measured_requests")),
+        };
+        let raw_tools = dict_or_empty(get(raw, "tool_inventory"));
+        self.state.tool_inventory = ToolInventoryState {
+            definition_bytes: normalize_count_map(
+                get(raw_tools, "definition_bytes"),
+                MAX_TRACKED_TOOLS,
+            ),
+            calls: normalize_count_map(get(raw_tools, "calls"), MAX_TRACKED_TOOLS),
+        };
+    }
+
+    /// Record what the proxy added to one request, in bytes of `tools` +
+    /// `system`. Pass the size at request entry and the size on the wire; a
+    /// shrink (compaction, pruning) nets off against the injections.
+    pub fn record_proxy_overhead(&mut self, before_bytes: i64, after_bytes: i64) {
+        let delta = after_bytes - before_bytes;
+        if delta >= 0 {
+            self.state.proxy_overhead.added_bytes += delta;
+        } else {
+            self.state.proxy_overhead.removed_bytes += -delta;
+        }
+        self.state.proxy_overhead.measured_requests += 1;
+    }
+
+    /// Record the tool definitions a request carried and the calls the model
+    /// made, so never-called definitions can be named and priced.
+    ///
+    /// Definition sizes are max-seen (the same schema rides every turn); calls
+    /// accumulate.
+    pub fn record_tools(&mut self, definitions: &[(String, i64)], calls: &[(String, i64)]) {
+        for (name, bytes) in definitions {
+            self.state
+                .tool_inventory
+                .definition_bytes
+                .observe_max(name, clamp_int(*bytes));
+        }
+        for (name, count) in calls {
+            self.state.tool_inventory.calls.add(name, clamp_int(*count));
+        }
+        self.state
+            .tool_inventory
+            .definition_bytes
+            .compact(MAX_TRACKED_TOOLS);
+        self.state.tool_inventory.calls.compact(MAX_TRACKED_TOOLS);
+    }
+
+    /// Tool definitions the model never called, biggest first, with the totals
+    /// that put them in proportion.
+    ///
+    /// Reported in bytes, not tokens: the schemas are re-serialized every turn
+    /// and tokenizing them per request would cost more than the number is
+    /// worth. Divide by roughly 3.5 for a token estimate.
+    pub fn tool_inventory_report(&self) -> Value {
+        let inv = &self.state.tool_inventory;
+        let total: i64 = inv.definition_bytes.iter().map(|(_, b)| b).sum();
+        let mut unused: Vec<(&str, i64)> = inv
+            .definition_bytes
+            .iter()
+            .filter(|(name, _)| inv.calls.get(name) == 0)
+            .collect();
+        unused.sort_by(|left, right| (right.1, left.0).cmp(&(left.1, right.0)));
+        let unused_bytes: i64 = unused.iter().map(|(_, b)| *b).sum();
+
+        serde_json::json!({
+            "definition_bytes_total": total,
+            "never_called_bytes": unused_bytes,
+            "never_called_percent": Self::percent(unused_bytes, total),
+            "tools_defined": inv.definition_bytes.len(),
+            "tools_never_called": unused.len(),
+            // Cost per cold start, not per request: on a warm cache these
+            // tokens are read for free. Every new conversation and every
+            // subagent spawn pays them again.
+            "worst_offenders": unused
+                .iter()
+                .take(MAX_LISTED_UNUSED_TOOLS)
+                .map(|(name, bytes)| serde_json::json!({"name": name, "bytes": bytes}))
+                .collect::<Vec<_>>(),
+            "drop_mcp_servers_suggestion": suggest_droppable_servers(inv),
+        })
+    }
+
+    /// What the proxy added, alongside what it saved, so the two can be read
+    /// against each other.
+    pub fn proxy_overhead_report(&self) -> Value {
+        let overhead = &self.state.proxy_overhead;
+        let net = overhead.added_bytes - overhead.removed_bytes;
+        serde_json::json!({
+            "added_bytes": overhead.added_bytes,
+            "removed_bytes": overhead.removed_bytes,
+            "net_bytes": net,
+            "measured_requests": overhead.measured_requests,
+            "net_bytes_per_request": if overhead.measured_requests > 0 {
+                net / overhead.measured_requests
+            } else {
+                0
+            },
+        })
+    }
+
     /// The bottom line: is the proxy paying for itself?
     ///
     /// Compression savings on their own are a half-answer. Every token
@@ -961,6 +1144,50 @@ fn object_of<T: Serialize>(value: &T) -> Map<String, Value> {
     }
 }
 
+/// MCP servers with tool definitions and no calls at all, as a ready-to-paste
+/// `--prune-drop-mcp` value.
+///
+/// Only whole servers: dropping an individual built-in is a different and much
+/// riskier decision, and a server that answered nothing is the case an operator
+/// can judge without guessing. Empty when there is nothing to suggest, so a
+/// healthy install shows no advice rather than a reassuring nothing.
+fn suggest_droppable_servers(inventory: &ToolInventoryState) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // server -> (has any definition, has any call)
+    let mut servers: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    for (name, _) in inventory.definition_bytes.iter() {
+        let Some(server) = mcp_server_of(name) else {
+            continue;
+        };
+        servers.entry(server).or_default().0 = true;
+    }
+    for (name, count) in inventory.calls.iter() {
+        if count == 0 {
+            continue;
+        }
+        if let Some(server) = mcp_server_of(name) {
+            servers.entry(server).or_default().1 = true;
+        }
+    }
+    servers
+        .into_iter()
+        .filter(|(_, (defined, called))| *defined && !*called)
+        .map(|(server, _)| server)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The MCP server a tool belongs to, for `mcp__<server>__<tool>`.
+fn mcp_server_of(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(server.to_string())
+}
+
 /// Add one to `label` and re-apply the cap.
 fn increment_count(values: &mut CountMap, label: &str, limit: usize) {
     values.add(label, 1);
@@ -1067,6 +1294,22 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
     };
 
     result.waste_signals = normalize_enum_map(get(source, "waste_signals"), &KNOWN_WASTE_SIGNALS);
+
+    let raw_overhead = dict_or_empty(get(source, "proxy_overhead"));
+    result.proxy_overhead = ProxyOverheadState {
+        added_bytes: coerce_int(get(raw_overhead, "added_bytes")),
+        removed_bytes: coerce_int(get(raw_overhead, "removed_bytes")),
+        measured_requests: coerce_int(get(raw_overhead, "measured_requests")),
+    };
+
+    let raw_tools = dict_or_empty(get(source, "tool_inventory"));
+    result.tool_inventory = ToolInventoryState {
+        definition_bytes: normalize_count_map(
+            get(raw_tools, "definition_bytes"),
+            MAX_TRACKED_TOOLS,
+        ),
+        calls: normalize_count_map(get(raw_tools, "calls"), MAX_TRACKED_TOOLS),
+    };
 
     let raw_models = dict_or_empty(get(source, "models"));
     if let Some(tracked) = dict_or_empty(get(raw_models, "tracked")) {

@@ -592,6 +592,41 @@ impl SavingsTracker {
         self.save(&st);
     }
 
+    /// Record what the proxy added to a request, in bytes of `tools` +
+    /// `system`. See
+    /// [`crate::persistent_metrics::PersistentMetricsState::record_proxy_overhead`].
+    pub fn record_proxy_overhead(&self, before_bytes: i64, after_bytes: i64) {
+        if before_bytes == after_bytes {
+            return; // nothing moved; skip the lock and the write
+        }
+        let mut st = self.state.lock().unwrap();
+        st.metrics.record_proxy_overhead(before_bytes, after_bytes);
+        self.save(&st);
+    }
+
+    /// Record the tool definitions a request carried and the calls the model
+    /// made, so tools nobody uses can be named and priced.
+    pub fn record_tools(&self, definitions: &[(String, i64)], calls: &[(String, i64)]) {
+        if definitions.is_empty() && calls.is_empty() {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.metrics.record_tools(definitions, calls);
+        self.save(&st);
+    }
+
+    /// What the proxy added to requests, against what compaction gave back.
+    pub fn proxy_overhead_report(&self) -> Value {
+        let st = self.state.lock().unwrap();
+        st.metrics.proxy_overhead_report()
+    }
+
+    /// Tool definitions the model never called, biggest first.
+    pub fn tool_inventory_report(&self) -> Value {
+        let st = self.state.lock().unwrap();
+        st.metrics.tool_inventory_report()
+    }
+
     /// The durable lifetime metrics, in API-safe form.
     pub fn metrics_snapshot(&self, persistence: &Value) -> Value {
         let st = self.state.lock().unwrap();
@@ -1091,9 +1126,13 @@ impl SavingsTracker {
             // Absent on files written before the metrics landed; `new`
             // treats a missing blob as a fresh zeroed state, so an older
             // savings file upgrades in place rather than being rejected.
-            metrics: crate::persistent_metrics::PersistentMetricsState::new(
-                raw.get("lifetime_metrics"),
-            ),
+            metrics: {
+                let mut m = crate::persistent_metrics::PersistentMetricsState::new(
+                    raw.get("lifetime_metrics"),
+                );
+                m.load_footprint(raw.get("lifetime_footprint"));
+                m
+            },
         };
         if let Some(last) = st.history.last() {
             let reference = parse_timestamp(&last.timestamp).unwrap_or_else(utc_now);
@@ -1119,6 +1158,10 @@ impl SavingsTracker {
             "history": st.history.iter().map(history_entry_value).collect::<Vec<_>>(),
             "projects": projects_persist_value(&st.projects),
             "lifetime_metrics": st.metrics.to_dict(),
+            // Kept out of `lifetime_metrics` because that blob's shape is
+            // asserted byte-exact against Python's and these counters are
+            // Rust-only.
+            "lifetime_footprint": st.metrics.footprint_to_dict(),
         });
         let Ok(json_data) = serde_json::to_string_pretty(&payload) else {
             return;
@@ -1613,6 +1656,101 @@ mod tests {
         let t = tracker(&path);
         let snap = t.metrics_snapshot(&serde_json::json!({}));
         assert_eq!(snap["waste_signals"]["reread_compressed"], 4_000);
+    }
+
+    /// The proxy injects a retrieval tool, steering text and memory defs
+    /// *before* compression measures its baseline, so those bytes are invisible
+    /// to `tokens_saved`. This is the only place they are counted.
+    #[test]
+    fn proxy_overhead_is_counted_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            t.record_proxy_overhead(1_000, 1_480); // injected 480 bytes
+            t.record_proxy_overhead(1_480, 1_200); // compaction gave 280 back
+        }
+        let t = tracker(&path);
+        let snap = t.proxy_overhead_report();
+        assert_eq!(snap["added_bytes"], 480);
+        assert_eq!(snap["removed_bytes"], 280);
+        assert_eq!(snap["net_bytes"], 200);
+        assert_eq!(snap["measured_requests"], 2);
+        assert_eq!(snap["net_bytes_per_request"], 100);
+    }
+
+    /// A net shrink has to survive as a negative. Reporting it as zero would
+    /// hide compaction paying for the injections.
+    #[test]
+    fn a_net_shrink_reports_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            t.record_proxy_overhead(5_000, 4_000);
+        }
+        let t = tracker(&path);
+        let snap = t.proxy_overhead_report();
+        assert_eq!(snap["added_bytes"], 0);
+        assert_eq!(snap["removed_bytes"], 1_000);
+        assert_eq!(snap["net_bytes"], -1_000);
+    }
+
+    /// The measured case: most tools defined, few called. The report has to
+    /// name the expensive never-called ones and suggest whole MCP servers to
+    /// drop, because that is the decision an operator can actually make.
+    #[test]
+    fn never_called_tools_are_named_and_priced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            let defs = vec![
+                ("Read".to_string(), 500),
+                ("Workflow".to_string(), 21_000),
+                ("mcp__chrome__click".to_string(), 4_000),
+                ("mcp__chrome__type".to_string(), 3_000),
+                ("mcp__ctx__search".to_string(), 2_000),
+            ];
+            let calls = vec![
+                ("Read".to_string(), 12),
+                ("mcp__ctx__search".to_string(), 3),
+            ];
+            // Twice: definition sizes must not accumulate across turns.
+            t.record_tools(&defs, &calls);
+            t.record_tools(&defs, &calls);
+        }
+
+        let t = tracker(&path);
+        let r = t.tool_inventory_report();
+        assert_eq!(r["definition_bytes_total"], 30_500, "sizes must not double");
+        assert_eq!(r["tools_defined"], 5);
+        assert_eq!(r["tools_never_called"], 3);
+        assert_eq!(r["never_called_bytes"], 28_000);
+        assert_eq!(r["worst_offenders"][0]["name"], "Workflow");
+        assert_eq!(r["worst_offenders"][0]["bytes"], 21_000);
+        // chrome answered nothing; ctx did, so it must not be suggested.
+        assert_eq!(
+            r["drop_mcp_servers_suggestion"],
+            serde_json::json!(["chrome"])
+        );
+    }
+
+    /// Nothing to suggest must show as nothing, not as a reassuring empty
+    /// state that looks the same as "not measured".
+    #[test]
+    fn a_fully_used_install_suggests_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let t = tracker(&path);
+        t.record_tools(
+            &[("mcp__ctx__search".to_string(), 2_000)],
+            &[("mcp__ctx__search".to_string(), 3)],
+        );
+        let r = t.tool_inventory_report();
+        assert_eq!(r["tools_never_called"], 0);
+        assert_eq!(r["never_called_bytes"], 0);
+        assert_eq!(r["drop_mcp_servers_suggestion"], serde_json::json!([]));
     }
 
     /// A savings file written before the metrics existed must load, not throw

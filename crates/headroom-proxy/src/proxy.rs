@@ -1659,6 +1659,126 @@ fn maybe_force_1h_cache_ttl(body: bytes::Bytes, request_id: &str) -> bytes::Byte
     }
 }
 
+/// Upstream usage from CCR continuation rounds the client never sees.
+///
+/// `handle_ccr_response` resolves a `headroom_retrieve` call server-side by
+/// re-POSTing to the real upstream, up to `--ccr-max-retrieval-rounds` times,
+/// and returns only the last response. Every earlier round is a real billed
+/// call whose `usage` block would otherwise be dropped on the floor — the
+/// client sees one turn, the bill has several.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CcrRoundUsage {
+    /// Continuation rounds whose usage this carries. Zero on the common path.
+    pub rounds: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+}
+
+impl CcrRoundUsage {
+    /// Fold in one response's `usage` block.
+    fn add_response(&mut self, response: &serde_json::Value) {
+        let Some(usage) = response.get("usage") else {
+            return;
+        };
+        let get = |key: &str| {
+            usage
+                .get(key)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+        };
+        self.rounds += 1;
+        self.input_tokens += get("input_tokens");
+        self.output_tokens += get("output_tokens");
+        self.cache_read_tokens += get("cache_read_input_tokens");
+        self.cache_write_tokens += get("cache_creation_input_tokens");
+    }
+
+    /// True when there is nothing extra to account for.
+    pub fn is_empty(&self) -> bool {
+        self.rounds == 0
+    }
+}
+
+/// Serialized bytes of `tools` + `system`.
+///
+/// These are the parts the injection stages write to and the message
+/// compressors never touch, so comparing the figure at request entry against
+/// the same figure on the wire isolates what the proxy *added* from what
+/// compression *removed*. Everything else in the body mixes the two.
+fn prefix_head_bytes(value: &serde_json::Value) -> i64 {
+    let of = |key: &str| {
+        value
+            .get(key)
+            .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .unwrap_or(0) as i64
+    };
+    of("tools") + of("system")
+}
+
+/// Tool definitions (name → serialized bytes) and the calls the model made
+/// (name → count), for the durable tool inventory.
+///
+/// Calls come from `tool_use` blocks in the history the client just resent, so
+/// a name accumulates across the turns it survives in that history rather than
+/// once per call — the inventory is read as "used / never used", not as an
+/// exact call count.
+fn tool_inventory_of(value: &serde_json::Value) -> (Vec<(String, i64)>, Vec<(String, i64)>) {
+    let mut definitions = Vec::new();
+    if let Some(tools) = value.get("tools").and_then(serde_json::Value::as_array) {
+        for tool in tools {
+            let name = tool
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| tool.get("function")?.get("name")?.as_str());
+            if let Some(name) = name {
+                let bytes = serde_json::to_string(tool).map(|s| s.len()).unwrap_or(0);
+                definitions.push((name.to_string(), bytes as i64));
+            }
+        }
+    }
+
+    let mut calls: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    if let Some(messages) = value.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for block in blocks {
+                if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                if let Some(name) = block.get("name").and_then(serde_json::Value::as_str) {
+                    *calls.entry(name.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    (definitions, calls.into_iter().collect())
+}
+
+/// Record what the proxy added to this request and which tools it carried.
+///
+/// Costs two JSON parses of the request body, which is why it runs once, last,
+/// and only on the buffered Anthropic path. Against an upstream call measured
+/// in seconds it does not register; on a passthrough request it never runs.
+fn record_request_footprint(
+    tracker: &headroom_core::savings_tracker::SavingsTracker,
+    original: &bytes::Bytes,
+    on_the_wire: &bytes::Bytes,
+) {
+    let Ok(before) = serde_json::from_slice::<serde_json::Value>(original) else {
+        return;
+    };
+    let Ok(after) = serde_json::from_slice::<serde_json::Value>(on_the_wire) else {
+        return;
+    };
+    tracker.record_proxy_overhead(prefix_head_bytes(&before), prefix_head_bytes(&after));
+    let (definitions, calls) = tool_inventory_of(&after);
+    tracker.record_tools(&definitions, &calls);
+}
+
 /// Whether an upstream `reqwest` send error is a transient transport
 /// failure worth retrying on a fresh connection.
 ///
@@ -3173,6 +3293,17 @@ pub(crate) async fn forward_http(
             body_to_send
         };
 
+        // Footprint accounting. Last, so `body_to_send` is what actually goes
+        // on the wire. `tokens_saved` is measured after the injection stages
+        // have already run, so without this the bytes the proxy adds are baked
+        // into its own baseline and never appear as a cost.
+        if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) {
+            record_request_footprint(&state.savings_tracker, &original_buffered, &body_to_send);
+        }
+
         // Context-editing: when injecting `context_management` directives we
         // must also advertise the beta so the upstream honours them.
         if state.config.context_edit
@@ -3532,6 +3663,10 @@ pub(crate) async fn forward_http(
         match http_body_util::BodyExt::collect(body_stream).await {
             Ok(collected) => {
                 let mut body_bytes = collected.to_bytes();
+                // Usage from CCR continuation rounds, which are billed
+                // upstream calls the client never sees. Stays zero unless
+                // the model asked for a retrieval.
+                let mut ccr_round_usage = CcrRoundUsage::default();
 
                 // CCR response handling: detect headroom_retrieve tool
                 // calls, fetch from CCR store, and continue conversation.
@@ -3554,7 +3689,7 @@ pub(crate) async fn forward_http(
                     };
                     if let Some(ccr_provider) = ccr_provider {
                         let ccr_store = state.ctx_offload.as_ref().unwrap().store.ccr();
-                        body_bytes = handle_ccr_response(
+                        let (resolved, extra) = handle_ccr_response(
                             &body_bytes,
                             &original_buffered,
                             &upstream_url,
@@ -3566,6 +3701,8 @@ pub(crate) async fn forward_http(
                             ccr_provider,
                         )
                         .await;
+                        body_bytes = resolved;
+                        ccr_round_usage = extra;
                     }
                 }
 
@@ -3715,6 +3852,27 @@ pub(crate) async fn forward_http(
                         } else {
                             attempted_input.saturating_sub(cache_read)
                         };
+                        // Fold in the CCR continuation rounds. The client saw
+                        // one turn; the upstream billed several, and only the
+                        // last one's usage is in `parsed`. Without this the
+                        // savings figures are computed against a fraction of
+                        // what the turn actually cost.
+                        if !ccr_round_usage.is_empty() {
+                            tracing::info!(
+                                request_id = %request_id,
+                                event = "ccr_continuation_usage",
+                                rounds = ccr_round_usage.rounds,
+                                input_tokens = ccr_round_usage.input_tokens,
+                                output_tokens = ccr_round_usage.output_tokens,
+                                cache_write_tokens = ccr_round_usage.cache_write_tokens,
+                                "billed CCR continuation rounds the client never saw"
+                            );
+                        }
+                        let attempted_input = attempted_input + ccr_round_usage.input_tokens;
+                        let output_tok = output_tok + ccr_round_usage.output_tokens;
+                        let cache_read = cache_read + ccr_round_usage.cache_read_tokens;
+                        let cache_write = cache_write + ccr_round_usage.cache_write_tokens;
+                        let uncached_input = uncached_input + ccr_round_usage.input_tokens;
                         let outcome = headroom_core::request_outcome::RequestOutcome {
                             request_id: request_id.clone(),
                             provider: ctx.provider.clone(),
@@ -4864,7 +5022,11 @@ async fn handle_ccr_response(
     request_id: &str,
     outgoing_headers: &http::HeaderMap,
     provider: &str,
-) -> bytes::Bytes {
+) -> (bytes::Bytes, CcrRoundUsage) {
+    // Usage from every response this function replaces. The caller parses the
+    // usage of the body we return, so accounting for that one here too would
+    // double-count it.
+    let mut round_usage = CcrRoundUsage::default();
     // The continuation-array field name varies by provider shape: Anthropic
     // and OpenAI chat-completions both use `messages`; OpenAI Responses uses
     // `input`.
@@ -4892,12 +5054,12 @@ async fn handle_ccr_response(
                 error = %e,
                 "ccr: failed to parse upstream response as JSON; skipping CCR handling"
             );
-            return body_bytes.clone();
+            return (body_bytes.clone(), round_usage);
         }
     };
 
     if !handler.has_ccr_tool_calls(&response, provider) {
-        return body_bytes.clone();
+        return (body_bytes.clone(), round_usage);
     }
 
     let mut current_response = response.clone();
@@ -4909,7 +5071,7 @@ async fn handle_ccr_response(
                 error = %e,
                 "ccr: failed to parse original request; skipping CCR handling"
             );
-            return body_bytes.clone();
+            return (body_bytes.clone(), round_usage);
         }
     };
 
@@ -5059,6 +5221,8 @@ async fn handle_ccr_response(
 
         match resp.bytes().await {
             Ok(bytes) => {
+                // The response about to be dropped was still billed.
+                round_usage.add_response(&current_response);
                 current_response = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
                     Err(e) => {
@@ -5110,8 +5274,8 @@ async fn handle_ccr_response(
     }
 
     match serde_json::to_vec(&current_response) {
-        Ok(bytes) => bytes::Bytes::from(bytes),
-        Err(_) => body_bytes.clone(),
+        Ok(bytes) => (bytes::Bytes::from(bytes), round_usage),
+        Err(_) => (body_bytes.clone(), round_usage),
     }
 }
 
@@ -5171,10 +5335,13 @@ mod tests {
         // Mock upstream: the continuation call returns a plain Responses reply
         // with no further CCR calls, so the loop terminates after one round.
         let server = MockServer::start().await;
+        // Carries usage on purpose: the caller parses the returned body for
+        // its own accounting, so counting it here too would double-bill it.
         let final_body = serde_json::json!({
             "output": [
                 {"type": "message", "content": [{"type": "output_text", "text": "done"}]}
-            ]
+            ],
+            "usage": {"input_tokens": 7_777, "output_tokens": 99}
         });
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -5191,13 +5358,21 @@ mod tests {
             .unwrap(),
         );
 
-        // Upstream's first reply: a headroom_retrieve function_call.
+        // Upstream's first reply: a headroom_retrieve function_call. It
+        // carries a usage block, because that first call was billed and the
+        // client will never see it.
         let upstream_reply = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "output": [
                     {"type": "function_call", "call_id": "call_1", "name": CCR_TOOL_NAME,
                      "arguments": format!("{{\"hash\":\"{hash}\"}}")}
-                ]
+                ],
+                "usage": {
+                    "input_tokens": 4_000,
+                    "output_tokens": 60,
+                    "cache_read_input_tokens": 30_000,
+                    "cache_creation_input_tokens": 500
+                }
             }))
             .unwrap(),
         );
@@ -5222,8 +5397,54 @@ mod tests {
 
         // The returned body is the continuation reply (no CCR calls), proving
         // interception happened rather than passing the retrieve call through.
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let (body, round_usage) = out;
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["output"][0]["content"][0]["text"], "done");
+
+        // The intercepted round was a real billed call. The caller only ever
+        // parses the body returned above, so unless these come back with it
+        // they are never accounted for anywhere.
+        assert_eq!(round_usage.rounds, 1);
+        assert_eq!(round_usage.input_tokens, 4_000);
+        assert_eq!(round_usage.output_tokens, 60);
+        assert_eq!(round_usage.cache_read_tokens, 30_000);
+        assert_eq!(round_usage.cache_write_tokens, 500);
+        // The returned body's own usage stays out of it — the caller adds that.
+        assert_eq!(parsed["usage"]["input_tokens"], 7_777);
+        assert_ne!(round_usage.input_tokens, 4_000 + 7_777);
+    }
+
+    /// No retrieval, no extra rounds — the common path must report nothing so
+    /// the accounting is untouched.
+    #[tokio::test]
+    async fn ccr_reports_no_rounds_when_nothing_was_retrieved() {
+        use headroom_core::ccr::backends::InMemoryCcrStore;
+        use wiremock::MockServer;
+
+        let store = InMemoryCcrStore::new();
+        let server = MockServer::start().await;
+        let plain = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 2}
+            }))
+            .unwrap(),
+        );
+        let config = Config::for_test(server.uri().parse().unwrap());
+        let (_body, round_usage) = handle_ccr_response(
+            &plain,
+            &plain,
+            &format!("{}/v1/responses", server.uri()).parse().unwrap(),
+            &reqwest::Client::new(),
+            &store as &dyn headroom_core::ccr::CcrStore,
+            &config,
+            "req-test",
+            &http::HeaderMap::new(),
+            "openai_responses",
+        )
+        .await;
+        assert!(round_usage.is_empty());
+        assert_eq!(round_usage.input_tokens, 0);
     }
 
     #[test]
@@ -5406,6 +5627,79 @@ mod tests {
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "Read");
+    }
+
+    /// The head is `tools` + `system` and nothing else — the parts the
+    /// injection stages write to and the compressors never touch. Including
+    /// `messages` would mix compression's savings into the overhead figure and
+    /// make it meaningless.
+    #[test]
+    fn prefix_head_bytes_covers_tools_and_system_only() {
+        let body = serde_json::json!({
+            "model": "m",
+            "system": "abc",
+            "tools": [{"name": "a"}],
+            "messages": [{"role": "user", "content": "a very long message body"}],
+        });
+        let head = prefix_head_bytes(&body);
+        let without_messages = serde_json::json!({
+            "model": "m",
+            "system": "abc",
+            "tools": [{"name": "a"}],
+        });
+        assert_eq!(head, prefix_head_bytes(&without_messages));
+        assert!(head > 0);
+    }
+
+    /// A body with neither is zero, not a panic.
+    #[test]
+    fn prefix_head_bytes_handles_an_empty_body() {
+        assert_eq!(prefix_head_bytes(&serde_json::json!({})), 0);
+    }
+
+    /// The inventory has to pair definitions with the calls the model made, in
+    /// both provider shapes, or the never-called list is wrong.
+    #[test]
+    fn tool_inventory_pairs_definitions_with_calls() {
+        let body = serde_json::json!({
+            "tools": [
+                {"name": "Read", "input_schema": {"type": "object"}},
+                {"name": "Workflow", "input_schema": {"type": "object"}},
+                {"type": "function", "function": {"name": "Legacy"}}
+            ],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "1", "name": "Read", "input": {}},
+                    {"type": "tool_use", "id": "2", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1"}]}
+            ]
+        });
+        let (defs, calls) = tool_inventory_of(&body);
+        let names: Vec<&str> = defs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Read", "Workflow", "Legacy"]);
+        assert!(defs.iter().all(|(_, b)| *b > 0));
+        assert_eq!(calls, vec![("Read".to_string(), 2)]);
+    }
+
+    /// A `tool_result` is not a call. Counting it would make every tool look
+    /// used and the never-called list would always be empty.
+    #[test]
+    fn tool_results_do_not_count_as_calls() {
+        let body = serde_json::json!({
+            "tools": [{"name": "Read"}],
+            "messages": [{"role": "user", "content": [
+                // Carries a `name` on purpose: the block *type* has to be what
+                // excludes it, not the field happening to be absent.
+                {"type": "tool_result", "tool_use_id": "1", "name": "Read", "content": "x"},
+                {"type": "text", "text": "and some prose", "name": "Read"}
+            ]}]
+        });
+        let (_, calls) = tool_inventory_of(&body);
+        assert!(
+            calls.is_empty(),
+            "only tool_use blocks are calls, got {calls:?}"
+        );
     }
 
     /// B2 end to end through the wiring function: turn one records, turn two
