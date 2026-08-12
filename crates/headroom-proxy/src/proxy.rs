@@ -2494,7 +2494,7 @@ pub(crate) async fn forward_http(
 
                     if let Some(engine) = state.ctx_inject.as_ref() {
                         let session_key = ctx_session_key.clone();
-                        if engine.maybe_inject(&mut value, &session_key) {
+                        if engine.maybe_inject_for_request(&mut value, &session_key, &request_id) {
                             changed = true;
                         }
                     }

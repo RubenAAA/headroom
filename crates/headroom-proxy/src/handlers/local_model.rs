@@ -378,7 +378,7 @@ async fn apply_ctx_request_transforms(
     // prompt-cache prefix stays byte-stable after the one-time introduction.
     // It never touches `system`/`tools`.
     if let Some(engine) = state.ctx_inject.as_ref() {
-        if engine.maybe_inject(parsed, &session_key) {
+        if engine.maybe_inject_for_request(parsed, &session_key, request_id) {
             report.transforms_applied.push("ctx_inject".to_string());
             tracing::debug!(
                 event = "codex_ctx_inject",

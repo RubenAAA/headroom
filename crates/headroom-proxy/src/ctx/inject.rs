@@ -79,6 +79,17 @@ impl InjectEngine {
     /// small sqlite read on cold conversations. Every error is logged and
     /// swallowed (injection failures must never break a request).
     pub fn maybe_inject(&self, parsed: &mut Value, session_key: &str) -> bool {
+        self.maybe_inject_for_request(parsed, session_key, "")
+    }
+
+    /// Production entry point that adds the request id to every diagnostic,
+    /// so an injection failure can be joined to the forwarded request.
+    pub fn maybe_inject_for_request(
+        &self,
+        parsed: &mut Value,
+        session_key: &str,
+        request_id: &str,
+    ) -> bool {
         let conv_id = identity::conversation_key(parsed, session_key);
 
         // Hot path: cached decision.
@@ -90,7 +101,7 @@ impl InjectEngine {
             return applied;
         }
 
-        let decision = self.decide(&conv_id, parsed, session_key);
+        let decision = self.decide(&conv_id, parsed, session_key, request_id);
         self.cache_put(&conv_id, decision.clone());
         let applied = apply(parsed, &decision);
         if applied {
@@ -116,13 +127,24 @@ impl InjectEngine {
 
     /// Resolve the injection decision for a conversation, reading (and on first
     /// sight, writing) the sessions DB.
-    fn decide(&self, conv_id: &str, parsed: &Value, session_key: &str) -> Decision {
+    fn decide(
+        &self,
+        conv_id: &str,
+        parsed: &Value,
+        session_key: &str,
+        request_id: &str,
+    ) -> Decision {
         // Already decided → replay verbatim (I4).
         match self.sessions.get_injection(conv_id) {
             Ok(Some(bytes)) => return Some(bytes),
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(event = "ctx_inject_get_failed", conv = %conv_id, error = %e);
+                tracing::warn!(
+                    event = "ctx_inject_get_failed",
+                    request_id = %request_id,
+                    conv = %conv_id,
+                    error = %e
+                );
                 return None;
             }
         }
@@ -133,6 +155,7 @@ impl InjectEngine {
         if seen_before {
             tracing::warn!(
                 event = "ctx_inject_row_miss",
+                request_id = %request_id,
                 conv = %conv_id,
                 "injection row missing for a known conversation; injecting nothing (fail-safe)"
             );
@@ -141,12 +164,18 @@ impl InjectEngine {
 
         // Genuine first sight → build synchronously, persist once, inject.
         let start = Instant::now();
-        let built = self.build(conv_id, parsed, session_key);
+        let built = self.build(conv_id, parsed, session_key, request_id);
         if let Err(e) = self.sessions.put_injection(conv_id, &built) {
-            tracing::warn!(event = "ctx_inject_persist_failed", conv = %conv_id, error = %e);
+            tracing::warn!(
+                event = "ctx_inject_persist_failed",
+                request_id = %request_id,
+                conv = %conv_id,
+                error = %e
+            );
         }
         tracing::debug!(
             event = "ctx_inject_built",
+            request_id = %request_id,
             conv = %conv_id,
             bytes = built.len(),
             build_us = start.elapsed().as_micros() as u64,
@@ -158,7 +187,13 @@ impl InjectEngine {
     /// Build the injection text: resume snapshot when the request carries a
     /// compaction/resume marker and links to a prior conversation; otherwise a
     /// fresh recall block.
-    fn build(&self, conv_id: &str, parsed: &Value, session_key: &str) -> String {
+    fn build(
+        &self,
+        conv_id: &str,
+        parsed: &Value,
+        session_key: &str,
+        request_id: &str,
+    ) -> String {
         let first_text = identity::first_user_message_text(parsed).unwrap_or_default();
 
         if identity::has_compaction_marker(&first_text) {
@@ -176,7 +211,11 @@ impl InjectEngine {
         let hits = match self.content.search(&queries, &opts) {
             Ok(h) => h,
             Err(e) => {
-                tracing::warn!(event = "ctx_inject_search_failed", error = %e);
+                tracing::warn!(
+                    event = "ctx_inject_search_failed",
+                    request_id = %request_id,
+                    error = %e
+                );
                 Vec::new()
             }
         };
@@ -269,8 +308,33 @@ fn message_has_sentinel(msg: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use tracing::field::{Field, Visit};
+            struct Visitor(String);
+            impl Visit for Visitor {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+                fn record_str(&mut self, field: &Field, value: &str) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+    }
 
     fn engine(dir: &TempDir) -> InjectEngine {
         let sessions = Arc::new(SessionsStore::open(dir.path().join("s.db")).unwrap());
@@ -338,6 +402,8 @@ mod tests {
 
     #[test]
     fn row_miss_injects_nothing_and_does_not_panic() {
+        use tracing_subscriber::layer::SubscriberExt;
+
         let dir = TempDir::new().unwrap();
         let eng = engine(&dir);
         // Simulate a known conversation (prefix recorded) with NO injection row.
@@ -346,9 +412,18 @@ mod tests {
         eng.sessions.record_prefix(&conv, 1, "h").unwrap();
 
         let mut r = req.clone();
-        // Fail-safe: nothing injected, no panic.
-        assert!(!eng.maybe_inject(&mut r, "sk"));
+        let capture = EventCapture::default();
+        let events = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!eng.maybe_inject_for_request(&mut r, "sk", "req-row-miss"));
+        });
+
+        // Fail-safe: nothing injected, no panic, and the miss is joinable.
         assert_eq!(r["messages"][0]["content"], json!("hi"));
+        let joined = events.lock().unwrap().join("\n");
+        assert!(joined.contains("event=ctx_inject_row_miss"), "{joined}");
+        assert!(joined.contains("request_id=req-row-miss"), "{joined}");
     }
 
     #[test]
