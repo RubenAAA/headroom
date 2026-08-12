@@ -47,10 +47,11 @@ fn pseudo_random_unit() -> f64 {
     ((x >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
-/// Parse an HTTP `Retry-After` header into a millisecond delay, capped at
-/// `max_ms`. Accepts numeric seconds or an HTTP-date; `None` when absent or
-/// unparseable (caller falls back to exponential backoff). Fails open.
-pub fn retry_after_ms(header_value: &str, max_ms: i64) -> Option<f64> {
+/// Parse an HTTP `Retry-After` header into its requested millisecond delay,
+/// without applying a local retry cap. Callers need the uncapped value to
+/// distinguish "safe to wait and retry" from "the server asked us to wait
+/// longer than this request is allowed to remain open".
+pub fn retry_after_ms_uncapped(header_value: &str) -> Option<f64> {
     let value = header_value.trim();
     if value.is_empty() {
         return None;
@@ -64,7 +65,22 @@ pub fn retry_after_ms(header_value: &str, max_ms: i64) -> Option<f64> {
             (retry_at.with_timezone(&Utc) - now).num_milliseconds() as f64 / 1000.0
         }
     };
-    Some((seconds.max(0.0) * 1000.0).min(max_ms as f64))
+    Some(seconds.max(0.0) * 1000.0)
+}
+
+/// Backward-compatible capped parser for callers that explicitly want a
+/// bounded sleep. New status-retry paths should inspect
+/// [`retry_after_ms_uncapped`] first and return the upstream response when it
+/// exceeds their cap, rather than retrying early.
+pub fn retry_after_ms(header_value: &str, max_ms: i64) -> Option<f64> {
+    retry_after_ms_uncapped(header_value).map(|ms| ms.min(max_ms as f64))
+}
+
+/// Whether honoring this header would exceed the caller's maximum in-request
+/// wait. Unparseable headers return `false` so the caller can use normal
+/// exponential backoff.
+pub fn retry_after_exceeds_cap(header_value: &str, max_ms: u64) -> bool {
+    retry_after_ms_uncapped(header_value).is_some_and(|ms| ms > max_ms as f64)
 }
 
 #[cfg(test)]
@@ -116,6 +132,14 @@ mod tests {
     #[test]
     fn retry_after_caps_at_max() {
         assert_eq!(retry_after_ms("100", 5000), Some(5000.0));
+        assert_eq!(retry_after_ms_uncapped("100"), Some(100_000.0));
+    }
+
+    #[test]
+    fn over_cap_retry_after_is_detectable_instead_of_silently_clamped() {
+        assert!(retry_after_exceeds_cap("31", 30_000));
+        assert!(!retry_after_exceeds_cap("30", 30_000));
+        assert!(!retry_after_exceeds_cap("garbage", 30_000));
     }
 
     #[test]
