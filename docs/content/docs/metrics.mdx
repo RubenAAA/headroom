@@ -19,6 +19,16 @@ curl http://localhost:8787/stats
     "lifetime": {
       "tokens_saved": 12500,
       "compression_savings_usd": 0.04
+    },
+    "failed_work": {
+      "requests": 1,
+      "upstream_attempts": 3,
+      "forwarded_tokens": 4000,
+      "forwarded_tokens_at_risk": 12000,
+      "provider_reported_input_tokens": 0,
+      "provider_reported_output_tokens": 0,
+      "provider_usage_observed_requests": 0,
+      "by_status": {"529": 1}
     }
   },
   "requests": {
@@ -45,6 +55,8 @@ curl http://localhost:8787/stats
 ```
 
 Persistent savings are stored at `~/.headroom/proxy_savings.json` and survive proxy restarts. Override the path with `HEADROOM_SAVINGS_PATH`.
+
+`persistent_savings.failed_work` is separate from successful savings. It counts terminal 5xx turns and retry attempts without allowing failed work to improve savings rates. `forwarded_tokens_at_risk` is the request-side token estimate multiplied by attempts; provider-reported usage remains separate and is only counted when the failure response contains a usage block.
 
 ### Historical Savings
 

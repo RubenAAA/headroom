@@ -333,7 +333,7 @@ curl http://localhost:8787/health
 
 ### `GET /stats`
 
-Live session statistics plus durable `persistent_savings` totals. Stored at `~/.headroom/proxy_savings.json` (override with `HEADROOM_SAVINGS_PATH`).
+Live session statistics plus durable `persistent_savings` totals. Stored at `~/.headroom/proxy_savings.json` (override with `HEADROOM_SAVINGS_PATH`). The nested `failed_work` aggregate records terminal 5xx requests, attempts and forwarded tokens at risk separately from successful savings; provider usage is included only when the upstream failure reports it.
 
 ```bash
 curl http://localhost:8787/stats
