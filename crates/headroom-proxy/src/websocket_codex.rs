@@ -677,6 +677,20 @@ impl OutcomeSink for CodexWsOutcomeSink {
         recorder.record_from_labels(transforms, output_tokens);
     }
 
+    fn record_failed(&self, outcome: &RequestOutcome) {
+        crate::observability::proxy_counters::record_failed();
+        self.savings_tracker.record_failed_work(
+            &headroom_core::savings_tracker::FailedWorkRecord {
+                status_code: outcome.status_code,
+                upstream_attempts: outcome.upstream_attempts,
+                forwarded_tokens: outcome.optimized_tokens,
+                provider_input_tokens: outcome.provider_input_tokens,
+                provider_output_tokens: outcome.provider_output_tokens,
+                timestamp: None,
+            },
+        );
+    }
+
     fn record_savings_ledger(&self, outcome: &RequestOutcome) {
         // Mirrors `ProxyOutcomeSink`: forwarded count in, helper reconstructs
         // the original, flocked append pushed off the request path.

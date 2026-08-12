@@ -36,6 +36,15 @@ pub struct RequestOutcome {
     /// stats, so an upstream failure can't inflate the save-rate.
     pub status_code: i64,
 
+    /// Number of times this body was transmitted upstream. Zero means the
+    /// caller did not report it and is normalized to one on the failure path.
+    pub upstream_attempts: i64,
+    /// Provider-reported usage, when an error response actually carried it.
+    /// These stay optional so the forwarded estimate below is never presented
+    /// as billed usage merely because the provider omitted a usage block.
+    pub provider_input_tokens: Option<i64>,
+    pub provider_output_tokens: Option<i64>,
+
     // ── Tokens (required — every site has these) ──
     pub original_tokens: i64,
     pub optimized_tokens: i64,
@@ -234,6 +243,9 @@ impl RequestOutcome {
             model: p.model,
             // Streaming finalize implies the upstream returned a 200 SSE stream.
             status_code: 200,
+            upstream_attempts: 1,
+            provider_input_tokens: None,
+            provider_output_tokens: None,
             original_tokens: p.original_tokens,
             optimized_tokens: p.optimized_tokens,
             output_tokens: p.output_tokens,
@@ -355,6 +367,38 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
     // 4xx stay on the normal funnel: they are client errors the proxy served.
     if outcome.status_code >= 500 {
         sink.record_failed(outcome);
+        // Item 6: the guard above is right — a failed turn must not inflate the
+        // save-rate — but returning silently made failures invisible *and*
+        // free-looking, so the reported savings improved as behaviour got
+        // worse. The turn still cost the tokens we forwarded (once per retry),
+        // so say so on its way out. Deliberately not booked into the ledger:
+        // that denominator change is a product decision, and inventing it here
+        // would corrupt the one number this line exists to let you audit.
+        tracing::warn!(
+            target: "headroom.proxy",
+            event = "request_failed_accounting",
+            request_id = %outcome.request_id,
+            provider = %outcome.provider,
+            model = %outcome.model,
+            status_code = outcome.status_code,
+            upstream_attempts = outcome.upstream_attempts.max(1),
+            num_messages = outcome.num_messages,
+            original_tokens = outcome.original_tokens,
+            forwarded_tokens = outcome.optimized_tokens,
+            forwarded_tokens_at_risk = outcome
+                .optimized_tokens
+                .max(0)
+                .saturating_mul(outcome.upstream_attempts.max(1)),
+            provider_input_tokens = ?outcome.provider_input_tokens,
+            provider_output_tokens = ?outcome.provider_output_tokens,
+            output_tokens = outcome.output_tokens,
+            tokens_saved_not_booked = outcome.tokens_saved,
+            cache_read_tokens = outcome.cache_read_tokens,
+            cache_write_tokens = outcome.cache_write_tokens,
+            total_ms = outcome.total_latency_ms,
+            transforms = %summarize_transforms(&outcome.transforms_applied),
+            "upstream failed: turn excluded from successful savings, cost and PERF stats; failed work booked separately"
+        );
         return;
     }
 
@@ -618,6 +662,69 @@ mod tests {
             // Only the failure path fires; the success funnel is skipped.
             assert_eq!(*sink.calls.borrow(), vec!["record_failed"]);
         }
+    }
+
+    /// Item 6: a failed turn must leave a trace naming what it cost. Skipping
+    /// the success funnel is correct; skipping it *silently* is what made the
+    /// savings figures improve as behaviour got worse.
+    #[test]
+    fn emit_5xx_logs_what_the_failed_turn_forwarded() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+
+        #[derive(Default)]
+        struct Sink(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Sink {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V(String);
+                impl Visit for V {
+                    fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{}={:?} ", f.name(), v));
+                    }
+                    fn record_i64(&mut self, f: &Field, v: i64) {
+                        self.0.push_str(&format!("{}={} ", f.name(), v));
+                    }
+                    fn record_str(&mut self, f: &Field, v: &str) {
+                        self.0.push_str(&format!("{}={} ", f.name(), v));
+                    }
+                }
+                let mut v = V(String::new());
+                event.record(&mut v);
+                self.0.lock().unwrap().push(v.0);
+            }
+        }
+
+        use tracing_subscriber::layer::SubscriberExt;
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::registry().with(Sink(lines.clone()));
+        tracing::subscriber::with_default(sub, || {
+            emit_request_outcome(
+                &RecordingSink::default(),
+                &RequestOutcome {
+                    status_code: 529,
+                    request_id: "failed-turn".into(),
+                    optimized_tokens: 41_000,
+                    original_tokens: 97_000,
+                    tokens_saved: 56_000,
+                    ..Default::default()
+                },
+            );
+        });
+
+        let joined = lines.lock().unwrap().join("\n");
+        let line = joined
+            .lines()
+            .find(|l| l.contains("request_failed_accounting"))
+            .unwrap_or_else(|| panic!("no failure accounting event; captured:\n{joined}"));
+        assert!(line.contains("request_id=failed-turn"), "{line}");
+        assert!(line.contains("forwarded_tokens=41000"), "{line}");
+        // The saving is reported as explicitly *not* booked, so nobody adds it
+        // to a total by reading the field name alone.
+        assert!(line.contains("tokens_saved_not_booked=56000"), "{line}");
     }
 
     #[test]

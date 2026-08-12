@@ -1,5 +1,5 @@
 //! Durable proxy savings + display-session tracking (Rust port of
-//! `headroom/proxy/savings_tracker.py`, SCHEMA_VERSION = 3).
+//! `headroom/proxy/savings_tracker.py`, SCHEMA_VERSION = 4).
 //!
 //! Persists cumulative compression savings, a canonical display-session window
 //! (60-min inactivity rollover), per-project stats (capped at 50), and a bounded
@@ -22,7 +22,7 @@ use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 pub const DEFAULT_MAX_HISTORY_POINTS: usize = 5000;
 pub const DEFAULT_MAX_PROJECTS: usize = 50;
 pub const PROJECT_NAME_MAX_LENGTH: usize = 128;
@@ -260,6 +260,25 @@ struct ProjectEntry {
     last_activity_at: Option<String>,
 }
 
+/// Failed upstream work is deliberately not part of [`Lifetime`]. A request
+/// that never completed must not improve the successful savings rate, but the
+/// attempts and tokens it exposed to the provider still need durable books.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FailedWork {
+    requests: i64,
+    upstream_attempts: i64,
+    /// One forwarded request body per failed client turn.
+    forwarded_tokens: i64,
+    /// The same body multiplied by the number of upstream transmissions.
+    forwarded_tokens_at_risk: i64,
+    /// Actual usage only when the provider supplied a usage block.
+    provider_reported_input_tokens: i64,
+    provider_reported_output_tokens: i64,
+    provider_usage_observed_requests: i64,
+    by_status: BTreeMap<String, i64>,
+    last_activity_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoryEntry {
     timestamp: String,
@@ -274,6 +293,7 @@ struct HistoryEntry {
 #[derive(Debug, Clone, Default)]
 struct State {
     lifetime: Lifetime,
+    failed_work: FailedWork,
     display_session: DisplaySession,
     history: Vec<HistoryEntry>,
     projects: BTreeMap<String, ProjectEntry>,
@@ -335,6 +355,19 @@ pub struct RequestRecord<'a> {
     pub stack: Option<&'a str>,
     /// Waste-signal token counts, keyed by signal name.
     pub waste_signals: Option<Vec<(String, i64)>>,
+}
+
+/// Inputs to [`SavingsTracker::record_failed_work`]. Provider usage stays
+/// optional so a forwarded-token estimate can never masquerade as billing
+/// reported by the upstream.
+#[derive(Default)]
+pub struct FailedWorkRecord {
+    pub status_code: i64,
+    pub upstream_attempts: i64,
+    pub forwarded_tokens: i64,
+    pub provider_input_tokens: Option<i64>,
+    pub provider_output_tokens: Option<i64>,
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 impl SavingsTracker {
@@ -573,6 +606,37 @@ impl SavingsTracker {
         true
     }
 
+    /// Persist one failed client turn in a bucket excluded from every
+    /// successful savings/session/project denominator.
+    pub fn record_failed_work(&self, rec: &FailedWorkRecord) {
+        let attempts = rec.upstream_attempts.max(1);
+        let forwarded = coerce_int(rec.forwarded_tokens);
+        let at_risk = forwarded.saturating_mul(attempts);
+        let ts = rec.timestamp.unwrap_or_else(utc_now);
+
+        let mut st = self.state.lock().unwrap();
+        let failed = &mut st.failed_work;
+        failed.requests = failed.requests.saturating_add(1);
+        failed.upstream_attempts = failed.upstream_attempts.saturating_add(attempts);
+        failed.forwarded_tokens = failed.forwarded_tokens.saturating_add(forwarded);
+        failed.forwarded_tokens_at_risk = failed.forwarded_tokens_at_risk.saturating_add(at_risk);
+        if rec.provider_input_tokens.is_some() || rec.provider_output_tokens.is_some() {
+            failed.provider_usage_observed_requests =
+                failed.provider_usage_observed_requests.saturating_add(1);
+            failed.provider_reported_input_tokens = failed
+                .provider_reported_input_tokens
+                .saturating_add(coerce_int(rec.provider_input_tokens.unwrap_or(0)));
+            failed.provider_reported_output_tokens = failed
+                .provider_reported_output_tokens
+                .saturating_add(coerce_int(rec.provider_output_tokens.unwrap_or(0)));
+        }
+        let status = rec.status_code.max(0).to_string();
+        let count = failed.by_status.entry(status).or_default();
+        *count = count.saturating_add(1);
+        failed.last_activity_at = Some(to_utc_iso(ts));
+        self.save(&mut st);
+    }
+
     /// Record a prefix-cache bust: `tokens_lost` had to be re-created because
     /// something inside the cached prefix changed.
     ///
@@ -763,6 +827,7 @@ impl SavingsTracker {
             "schema_version": SCHEMA_VERSION,
             "storage_path": self.path.to_string_lossy(),
             "lifetime": lifetime_value(&st.lifetime),
+            "failed_work": failed_work_value(&st.failed_work),
             "display_session": self.display_session_snapshot(st, None),
             "display_session_policy": {
                 "rollover_inactivity_minutes": self.display_session_inactivity_minutes,
@@ -790,6 +855,7 @@ impl SavingsTracker {
             "schema_version": snap["schema_version"],
             "storage_path": snap["storage_path"],
             "lifetime": snap["lifetime"],
+            "failed_work": snap["failed_work"],
             "display_session": snap["display_session"],
             "display_session_policy": snap["display_session_policy"],
             "history_points": history.len(),
@@ -822,6 +888,7 @@ impl SavingsTracker {
             "generated_at": to_utc_iso(utc_now()),
             "storage_path": snap["storage_path"],
             "lifetime": snap["lifetime"],
+            "failed_work": snap["failed_work"],
             "display_session": snap["display_session"],
             "display_session_policy": snap["display_session_policy"],
             "history": history,
@@ -1120,6 +1187,7 @@ impl SavingsTracker {
 
         let mut st = State {
             lifetime,
+            failed_work: normalize_failed_work(raw.get("failed_work")),
             display_session: normalize_display_session(raw.get("display_session")),
             history,
             projects: normalize_projects(raw.get("projects")),
@@ -1154,6 +1222,7 @@ impl SavingsTracker {
         let payload = json!({
             "schema_version": SCHEMA_VERSION,
             "lifetime": lifetime_value(&st.lifetime),
+            "failed_work": failed_work_value(&st.failed_work),
             "display_session": display_session_value(&st.display_session),
             "history": st.history.iter().map(history_entry_value).collect::<Vec<_>>(),
             "projects": projects_persist_value(&st.projects),
@@ -1209,6 +1278,58 @@ fn lifetime_value(l: &Lifetime) -> Value {
         "output_tokens_saved": l.output_tokens_saved,
         "output_savings_usd": l.output_savings_usd,
     })
+}
+
+fn failed_work_value(f: &FailedWork) -> Value {
+    json!({
+        "requests": f.requests,
+        "upstream_attempts": f.upstream_attempts,
+        "forwarded_tokens": f.forwarded_tokens,
+        "forwarded_tokens_at_risk": f.forwarded_tokens_at_risk,
+        "provider_reported_input_tokens": f.provider_reported_input_tokens,
+        "provider_reported_output_tokens": f.provider_reported_output_tokens,
+        "provider_usage_observed_requests": f.provider_usage_observed_requests,
+        "by_status": f.by_status,
+        "last_activity_at": f.last_activity_at,
+    })
+}
+
+fn normalize_failed_work(raw: Option<&Value>) -> FailedWork {
+    let int = |key: &str| {
+        raw.and_then(|v| v.get(key))
+            .and_then(Value::as_i64)
+            .map(coerce_int)
+            .unwrap_or(0)
+    };
+    let by_status = raw
+        .and_then(|v| v.get("by_status"))
+        .and_then(Value::as_object)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|(status, count)| {
+                    count
+                        .as_i64()
+                        .map(coerce_int)
+                        .map(|count| (status.clone(), count))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    FailedWork {
+        requests: int("requests"),
+        upstream_attempts: int("upstream_attempts"),
+        forwarded_tokens: int("forwarded_tokens"),
+        forwarded_tokens_at_risk: int("forwarded_tokens_at_risk"),
+        provider_reported_input_tokens: int("provider_reported_input_tokens"),
+        provider_reported_output_tokens: int("provider_reported_output_tokens"),
+        provider_usage_observed_requests: int("provider_usage_observed_requests"),
+        by_status,
+        last_activity_at: raw
+            .and_then(|v| v.get("last_activity_at"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
 }
 
 fn display_session_value(s: &DisplaySession) -> Value {
@@ -1929,7 +2050,7 @@ mod tests {
         // Reload from disk.
         let t2 = tracker(&path);
         let snap = t2.snapshot();
-        assert_eq!(snap["schema_version"], json!(3));
+        assert_eq!(snap["schema_version"], json!(4));
         assert_eq!(snap["lifetime"]["tokens_saved"], json!(1000));
         assert_eq!(snap["history"].as_array().unwrap().len(), 1);
         assert_eq!(snap["projects"]["proj-a"]["tokens_saved"], json!(1000));
@@ -2001,9 +2122,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = tracker(&dir.path().join("s.json"));
         let preview = t.stats_preview(20);
-        assert_eq!(preview["schema_version"], json!(3));
+        assert_eq!(preview["schema_version"], json!(SCHEMA_VERSION));
         assert_eq!(preview["projects_limit"], json!(50));
         assert_eq!(preview["history_points"], json!(0));
+    }
+
+    #[test]
+    fn failed_work_is_durable_and_excluded_from_success_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        {
+            let t = tracker(&path);
+            t.record_failed_work(&FailedWorkRecord {
+                status_code: 529,
+                upstream_attempts: 3,
+                forwarded_tokens: 41_000,
+                // Actual provider usage is intentionally a different number
+                // from the request-side exposure estimate.
+                provider_input_tokens: Some(38_500),
+                provider_output_tokens: Some(17),
+                ..Default::default()
+            });
+            t.record_failed_work(&FailedWorkRecord {
+                status_code: 503,
+                upstream_attempts: 2,
+                forwarded_tokens: 10_000,
+                // No usage block: never substitute forwarded tokens here.
+                ..Default::default()
+            });
+        }
+
+        let snap = tracker(&path).snapshot();
+        assert_eq!(snap["lifetime"]["requests"], 0);
+        assert_eq!(snap["lifetime"]["tokens_saved"], 0);
+        assert_eq!(snap["failed_work"]["requests"], 2);
+        assert_eq!(snap["failed_work"]["upstream_attempts"], 5);
+        assert_eq!(snap["failed_work"]["forwarded_tokens"], 51_000);
+        assert_eq!(snap["failed_work"]["forwarded_tokens_at_risk"], 143_000);
+        assert_eq!(
+            snap["failed_work"]["provider_reported_input_tokens"],
+            38_500
+        );
+        assert_eq!(snap["failed_work"]["provider_usage_observed_requests"], 1);
+        assert_eq!(snap["failed_work"]["by_status"]["529"], 1);
+        assert_eq!(snap["failed_work"]["by_status"]["503"], 1);
     }
 
     #[test]

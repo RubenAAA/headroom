@@ -742,8 +742,18 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         recorder.record_from_labels(transforms, output_tokens);
     }
 
-    fn record_failed(&self, _outcome: &headroom_core::request_outcome::RequestOutcome) {
+    fn record_failed(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
         crate::observability::proxy_counters::record_failed();
+        self.savings_tracker.record_failed_work(
+            &headroom_core::savings_tracker::FailedWorkRecord {
+                status_code: outcome.status_code,
+                upstream_attempts: outcome.upstream_attempts,
+                forwarded_tokens: outcome.optimized_tokens,
+                provider_input_tokens: outcome.provider_input_tokens,
+                provider_output_tokens: outcome.provider_output_tokens,
+                timestamp: None,
+            },
+        );
     }
 
     fn record_cache_outcome(&self, provider: &str, reason: &str, wasted_tokens: i64) {
