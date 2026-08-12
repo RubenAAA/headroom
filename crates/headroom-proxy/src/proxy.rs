@@ -3024,6 +3024,8 @@ pub(crate) async fn forward_http(
                 overhead_ms: 0.0,
                 started_at: start,
                 waste_signals: waste_signals_for_request(&parsed_body, &model_for_waste),
+                forwarded_tokens_estimate: 0,
+                upstream_attempts: 1,
             });
         }
 
@@ -3355,6 +3357,11 @@ pub(crate) async fn forward_http(
         } else {
             apply_request_hooks(body_to_send, endpoint, &request_id)
         };
+        if let Some(ctx) = outcome_ctx.as_mut() {
+            ctx.forwarded_tokens_estimate = headroom_core::tokenizer::get_tokenizer(&ctx.model)
+                .count_text(&String::from_utf8_lossy(&body_to_send))
+                as i64;
+        }
 
         // Forward the request with retry on transient errors (429, 529, 5xx).
         let max_attempts = if state.config.retry_enabled {
@@ -3365,7 +3372,9 @@ pub(crate) async fn forward_http(
         let mut last_err: Option<ProxyError> = None;
         {
             let mut result = None;
+            let mut attempts_made = 0i64;
             for attempt in 0..max_attempts {
+                attempts_made = i64::from(attempt + 1);
                 let resp = state
                     .client
                     .request(reqwest_method.clone(), upstream_url.clone())
@@ -3385,38 +3394,35 @@ pub(crate) async fn forward_http(
                                 .headers()
                                 .get("retry-after")
                                 .and_then(|v| v.to_str().ok())
-                                .and_then(|v| {
-                                    // Try numeric seconds first (most common)
-                                    if let Ok(secs) = v.parse::<u64>() {
-                                        return Some((secs * 1000).min(max_delay));
-                                    }
-                                    // Try HTTP-date format (RFC 7231 §7.1.3)
-                                    // e.g. "Wed, 21 Oct 2015 07:28:00 GMT"
-                                    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(v) {
-                                        let now = chrono::Utc::now();
-                                        let diff = date
-                                            .signed_duration_since(now)
-                                            .num_milliseconds()
-                                            .max(0)
-                                            as u64;
-                                        return Some(diff.min(max_delay));
-                                    }
-                                    None
+                                .and_then(headroom_core::retry::retry_after_ms_uncapped);
+                            if retry_after.is_some_and(|delay| delay > max_delay as f64) {
+                                tracing::warn!(
+                                    event = "upstream_retry_after_exceeds_cap",
+                                    request_id = %request_id,
+                                    status,
+                                    retry_after_ms = retry_after.unwrap_or_default(),
+                                    retry_max_delay_ms = max_delay,
+                                    "returning the upstream response without an early retry"
+                                );
+                                result = Some(r);
+                                break;
+                            }
+                            let delay_ms = retry_after
+                                .map(|delay| delay.ceil().min(u64::MAX as f64) as u64)
+                                .unwrap_or_else(|| {
+                                    let base = state.config.retry_base_delay_ms;
+                                    let max = state.config.retry_max_delay_ms;
+                                    let backoff = base.saturating_mul(1u64 << attempt).min(max);
+                                    // Apply 50-150% jitter to prevent thundering-herd
+                                    let jitter = 50u64
+                                        + (std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .subsec_nanos()
+                                            as u64
+                                            % 101);
+                                    backoff.saturating_mul(jitter) / 100
                                 });
-                            let delay_ms = retry_after.unwrap_or_else(|| {
-                                let base = state.config.retry_base_delay_ms;
-                                let max = state.config.retry_max_delay_ms;
-                                let backoff = base.saturating_mul(1u64 << attempt).min(max);
-                                // Apply 50-150% jitter to prevent thundering-herd
-                                let jitter = 50u64
-                                    + (std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .subsec_nanos()
-                                        as u64
-                                        % 101);
-                                backoff.saturating_mul(jitter) / 100
-                            });
                             tracing::warn!(
                                 request_id = %request_id,
                                 status = status,
@@ -3460,6 +3466,9 @@ pub(crate) async fn forward_http(
                         return Err(ProxyError::Upstream(e));
                     }
                 }
+            }
+            if let Some(ctx) = outcome_ctx.as_mut() {
+                ctx.upstream_attempts = attempts_made;
             }
             result.ok_or_else(|| {
                 last_err.unwrap_or_else(|| {
@@ -3541,6 +3550,11 @@ pub(crate) async fn forward_http(
     } else {
         SseStreamKind::None
     };
+    if !is_sse && status.is_server_error() {
+        if let Some(ctx) = outcome_ctx.as_ref() {
+            emit_failed_http_outcome(ctx, &request_id, status);
+        }
+    }
 
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
@@ -4282,6 +4296,40 @@ struct OutcomeContext {
     /// could be parsed. `None` means "not measured", which is distinct from
     /// "measured and found nothing".
     waste_signals: Option<Vec<(String, i64)>>,
+    /// Request-side estimate used only when a failure has no usage block.
+    forwarded_tokens_estimate: i64,
+    /// Number of upstream transmissions made for this client turn.
+    upstream_attempts: i64,
+}
+
+/// Book a terminal non-SSE 5xx into the failure-only bucket. The provider did
+/// not report usage, so keep the request-side estimate explicitly separate
+/// from provider-observed token counts.
+fn emit_failed_http_outcome(ctx: &OutcomeContext, request_id: &str, status: StatusCode) {
+    let (original_tokens, optimized_tokens) = ctx.sizes(ctx.forwarded_tokens_estimate);
+    let outcome = headroom_core::request_outcome::RequestOutcome {
+        request_id: request_id.to_string(),
+        provider: ctx.provider.clone(),
+        model: ctx.model.clone(),
+        status_code: i64::from(status.as_u16()),
+        upstream_attempts: ctx.upstream_attempts,
+        provider_input_tokens: None,
+        provider_output_tokens: None,
+        original_tokens,
+        optimized_tokens,
+        tokens_saved: ctx.tokens_saved,
+        attempted_input_tokens: original_tokens,
+        total_latency_ms: ctx.started_at.elapsed().as_secs_f64() * 1000.0,
+        overhead_ms: ctx.overhead_ms,
+        transforms_applied: ctx.transforms_applied.clone(),
+        waste_signals: ctx.waste_signals.clone(),
+        num_messages: ctx.num_messages,
+        tags: ctx.tags.clone(),
+        client: ctx.client.clone(),
+        project: ctx.project.clone(),
+        ..Default::default()
+    };
+    headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
 }
 
 impl OutcomeContext {
@@ -5573,6 +5621,8 @@ mod tests {
             overhead_ms: 0.0,
             started_at: Instant::now(),
             waste_signals: None,
+            forwarded_tokens_estimate: 0,
+            upstream_attempts: 1,
         }
     }
 

@@ -792,6 +792,7 @@ fn build_routed_outcome_context(
     started_at: std::time::Instant,
     request_id: String,
     replay_store: Option<crate::cache_stabilization::prefix_replay::SessionReplayStore>,
+    forwarded_tokens_estimate: i64,
 ) -> Option<RoutedOutcomeContext> {
     // Resolve the project the same way the Claude path does, so routed turns
     // land in the same per-project buckets rather than an "unknown" pile.
@@ -842,6 +843,8 @@ fn build_routed_outcome_context(
             .unwrap_or(0),
         started_at,
         overhead_ms,
+        forwarded_tokens_estimate,
+        upstream_attempts: 1,
     })
 }
 
@@ -1248,7 +1251,14 @@ pub async fn handle_messages(
     // Book this turn through the same outcome funnel `forward_http` uses, so
     // routed spend shows up in /stats, /stats-history, and the dashboard
     // alongside Claude traffic.
-    let outcome_ctx = build_routed_outcome_context(
+    let forwarded_tokens_estimate = serde_json::to_string(&openai_body)
+        .ok()
+        .map(|body| {
+            headroom_core::tokenizer::get_tokenizer(target_model.as_deref().unwrap_or(body_model))
+                .count_text(&body) as i64
+        })
+        .unwrap_or(0);
+    let mut outcome_ctx = build_routed_outcome_context(
         &state,
         &parsed,
         &headers,
@@ -1264,6 +1274,7 @@ pub async fn handle_messages(
         compression_report
             .replay_parked
             .then(|| state.replay_store.clone()),
+        forwarded_tokens_estimate,
     );
 
     let openai_body_bytes = match serde_json::to_vec(&openai_body) {
@@ -1357,15 +1368,29 @@ pub async fn handle_messages(
                         .headers()
                         .get(http::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
+                        .and_then(headroom_core::retry::retry_after_ms_uncapped);
+                    if retry_after.is_some_and(|delay| delay > max_delay_ms as f64) {
+                        tracing::warn!(
+                            event = "local_model_retry_after_exceeds_cap",
+                            request_id = %request_id,
+                            status = status.as_u16(),
+                            retry_after_ms = retry_after.unwrap_or_default(),
+                            retry_max_delay_ms = max_delay_ms,
+                            "returning the upstream response without an early retry"
+                        );
+                        break r;
+                    }
                     let backoff = retry_after
-                        .map(std::time::Duration::from_secs)
+                        .map(|delay| {
+                            std::time::Duration::from_millis(
+                                delay.ceil().min(u64::MAX as f64) as u64
+                            )
+                        })
                         .unwrap_or_else(|| {
                             std::time::Duration::from_millis(
                                 base_delay_ms.saturating_mul(2u64.saturating_pow(attempt - 1)),
                             )
-                        })
-                        .min(std::time::Duration::from_millis(max_delay_ms));
+                        });
                     tracing::warn!(
                         event = "local_model_upstream_retry",
                         status = status.as_u16(),
@@ -1404,6 +1429,9 @@ pub async fn handle_messages(
             }
         }
     };
+    if let Some(ctx) = outcome_ctx.as_mut() {
+        ctx.upstream_attempts = i64::from(attempt.max(1));
+    }
 
     // Capture the turn-state token for sticky routing on follow-up requests.
     if let Some(key) = &session_key {
@@ -1420,7 +1448,9 @@ pub async fn handle_messages(
 
     let upstream_status = upstream_resp.status();
 
-    if downstream_is_stream {
+    if upstream_status != StatusCode::OK {
+        handle_routed_error_response(upstream_resp, upstream_status, outcome_ctx).await
+    } else if downstream_is_stream {
         handle_streaming_response(
             upstream_resp,
             &parsed,
@@ -1434,6 +1464,38 @@ pub async fn handle_messages(
     } else {
         handle_buffered_response(upstream_resp, &parsed, upstream_status, outcome_ctx).await
     }
+}
+
+/// Return an upstream error without translating its status or `Retry-After`.
+/// The client can then schedule a later request instead of seeing a synthetic
+/// 200 stream after the proxy retried earlier than the provider allowed.
+async fn handle_routed_error_response(
+    upstream_resp: reqwest::Response,
+    upstream_status: StatusCode,
+    outcome: Option<RoutedOutcomeContext>,
+) -> Response {
+    let retry_after = upstream_resp
+        .headers()
+        .get(http::header::RETRY_AFTER)
+        .cloned();
+    let body_text = upstream_resp.text().await.unwrap_or_default();
+    if let Some(ctx) = outcome.as_ref() {
+        book_routed_outcome(ctx, None, 0, 0.0, upstream_status.as_u16() as i64);
+    }
+    tracing::warn!(
+        event = "local_model_upstream_error",
+        status = upstream_status.as_u16(),
+        body = %body_text,
+        retry_after_preserved = retry_after.is_some(),
+        "local model upstream returned error"
+    );
+    let mut response = Response::builder().status(upstream_status);
+    if let Some(value) = retry_after {
+        response = response.header(http::header::RETRY_AFTER, value);
+    }
+    response
+        .body(Body::from(body_text))
+        .expect("static response")
 }
 
 // ---------------------------------------------------------------------------
@@ -2778,6 +2840,9 @@ struct RoutedOutcomeContext {
     /// Time spent in headroom's own transforms, as distinct from waiting on
     /// upstream.
     overhead_ms: f64,
+    /// Request-side estimate used when an error body carries no usage block.
+    forwarded_tokens_estimate: i64,
+    upstream_attempts: i64,
     /// `Some` when the prefix-replay stage parked this turn. The store needs
     /// the response's cache-token counts to decide how much of the prefix the
     /// provider actually held, so a parked turn must be completed.
@@ -2826,7 +2891,12 @@ fn book_routed_outcome(
     };
     // Responses uses `input_tokens`/`output_tokens`; Chat Completions uses
     // `prompt_tokens`/`completion_tokens`. Take whichever is present.
-    let input_tokens = get("input_tokens").max(get("prompt_tokens"));
+    let provider_reported_input = get("input_tokens").max(get("prompt_tokens"));
+    let input_tokens = if usage.is_some() {
+        provider_reported_input
+    } else {
+        ctx.forwarded_tokens_estimate.max(0)
+    };
     let output_tokens = get("output_tokens")
         .max(get("completion_tokens"))
         .max(fallback_output_tokens);
@@ -2844,6 +2914,9 @@ fn book_routed_outcome(
         provider: ctx.provider.clone(),
         model: ctx.model.clone(),
         status_code,
+        upstream_attempts: ctx.upstream_attempts,
+        provider_input_tokens: usage.map(|_| provider_reported_input),
+        provider_output_tokens: usage.map(|_| output_tokens),
         // What we forwarded is what upstream counted; the pre-transform size is
         // that plus whatever the transforms removed.
         original_tokens: input_tokens + ctx.tokens_saved.max(0),
@@ -4306,6 +4379,8 @@ mod tests {
             num_messages: 3,
             started_at: std::time::Instant::now(),
             overhead_ms: 1.5,
+            forwarded_tokens_estimate: 777,
+            upstream_attempts: 1,
         };
         let t = StreamTranslator::new(model.to_string()).with_outcome(Some(ctx));
         (t, request_logger, cost_tracker)

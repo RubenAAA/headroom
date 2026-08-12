@@ -6,9 +6,10 @@
 
 mod common;
 
-use common::start_proxy_with;
+use common::{start_proxy_with, start_proxy_with_state};
 use headroom_proxy::config::ModelRoute;
 use serde_json::json;
+use std::sync::Arc;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -303,6 +304,204 @@ async fn codex_translate_route_buffers_non_stream_responses() {
     assert_eq!(body["usage"]["input_tokens"], 5);
     assert_eq!(body["usage"]["output_tokens"], 2);
     assert_eq!(body["content"][0]["text"], "hello from responses");
+
+    proxy.shutdown().await;
+}
+
+/// A Retry-After longer than the proxy's in-request wait cap must not be
+/// shortened into an early retry. Return the original response so the client
+/// sees both the 429 and the server's requested delay.
+#[tokio::test]
+async fn over_cap_retry_after_returns_immediately_and_preserves_header() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "31")
+                .set_body_json(json!({"error": {"message": "rate limited"}})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let upstream_url = Url::parse(&mock.uri()).unwrap();
+    let savings_dir = tempfile::tempdir().unwrap();
+    let savings_path = savings_dir.path().join("savings.json");
+    let proxy = start_proxy_with_state(
+        &mock.uri(),
+        |cfg| {
+            cfg.compression = true;
+            cfg.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            cfg.retry_enabled = true;
+            cfg.retry_max_attempts = 3;
+            cfg.retry_max_delay_ms = 30_000;
+            cfg.model_routes = vec![ModelRoute {
+                model_prefix: "claude-codex-5.5".to_string(),
+                prefix_match: false,
+                upstream: Some(upstream_url.clone()),
+                translate: true,
+                mimo_run: None,
+                target_model: Some("gpt-5.5".to_string()),
+            }];
+        },
+        move |mut state| {
+            state.savings_tracker = Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+                Some(savings_path),
+                false,
+            ));
+            state
+        },
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "31");
+    assert!(resp.text().await.unwrap().contains("rate limited"));
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_anthropic_over_cap_retry_after_is_not_retried_early() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "31")
+                .set_body_json(json!({"error": {"message": "slow down"}})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let savings_dir = tempfile::tempdir().unwrap();
+    let savings_path = savings_dir.path().join("savings.json");
+    let proxy = start_proxy_with_state(
+        &mock.uri(),
+        |cfg| {
+            cfg.retry_enabled = true;
+            cfg.retry_max_attempts = 3;
+            cfg.retry_max_delay_ms = 30_000;
+        },
+        move |mut state| {
+            state.savings_tracker = Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+                Some(savings_path),
+                false,
+            ));
+            state
+        },
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "31");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn exhausted_5xx_retries_land_only_in_failed_work() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(529).set_body_json(json!({"error": {"message": "overloaded"}})),
+        )
+        .expect(3)
+        .mount(&mock)
+        .await;
+
+    let savings_dir = tempfile::tempdir().unwrap();
+    let savings_path = savings_dir.path().join("savings.json");
+    let proxy = start_proxy_with_state(
+        &mock.uri(),
+        |cfg| {
+            cfg.compression = true;
+            cfg.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            cfg.retry_enabled = true;
+            cfg.retry_max_attempts = 3;
+            cfg.retry_base_delay_ms = 1;
+            cfg.retry_max_delay_ms = 10;
+        },
+        move |mut state| {
+            state.savings_tracker = Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+                Some(savings_path),
+                false,
+            ));
+            state
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 529);
+
+    let stats: serde_json::Value = client
+        .get(format!("{}/stats", proxy.url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let success = &stats["persistent_savings"]["lifetime"];
+    let failed = &stats["persistent_savings"]["failed_work"];
+    assert_eq!(success["requests"], 0);
+    assert_eq!(success["tokens_saved"], 0);
+    assert_eq!(failed["requests"], 1);
+    assert_eq!(failed["upstream_attempts"], 3);
+    assert!(failed["forwarded_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(
+        failed["forwarded_tokens_at_risk"].as_i64().unwrap(),
+        failed["forwarded_tokens"].as_i64().unwrap() * 3
+    );
+    assert_eq!(failed["provider_usage_observed_requests"], 0);
+    assert_eq!(failed["by_status"]["529"], 1);
 
     proxy.shutdown().await;
 }
