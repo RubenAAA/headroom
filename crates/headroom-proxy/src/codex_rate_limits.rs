@@ -57,7 +57,7 @@ impl CodexRateLimitStore {
     /// Merges rather than replaces: headers and the stream object arrive at
     /// different moments in the same turn, and a later turn that carries only
     /// one of them should not blank the other.
-    pub fn record_headers(&self, model: &str, headers: &http::HeaderMap) {
+    pub fn record_headers(&self, model: &str, headers: &http::HeaderMap) -> bool {
         let collected: BTreeMap<String, String> = headers
             .iter()
             .filter(|(name, _)| {
@@ -72,14 +72,16 @@ impl CodexRateLimitStore {
             })
             .collect();
         if collected.is_empty() {
-            return;
+            return false;
         }
         if let Ok(mut slot) = self.0.write() {
             let entry = slot.get_or_insert_with(CodexRateLimitSnapshot::default);
             entry.observed_at = now_unix();
             entry.model = model.to_string();
             entry.headers = collected;
+            return true;
         }
+        false
     }
 
     /// Record a `rate_limits` object seen in the stream.

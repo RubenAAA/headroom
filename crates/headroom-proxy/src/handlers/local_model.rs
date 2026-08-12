@@ -2729,11 +2729,17 @@ async fn handle_streaming_response(
 
     // Quota headers ride on the response envelope and are gone once the body
     // is taken, so read them first. Nothing downstream depends on this.
-    codex_limits.record_headers(&original_model, upstream_resp.headers());
+    let quota_seen_in_headers =
+        codex_limits.record_headers(&original_model, upstream_resp.headers());
 
     let stream = upstream_resp.bytes_stream();
-    let translated_stream =
-        translate_openai_stream_to_anthropic(stream, original_model, codex_limits, outcome);
+    let translated_stream = translate_openai_stream_to_anthropic(
+        stream,
+        original_model,
+        codex_limits,
+        quota_seen_in_headers,
+        outcome,
+    );
 
     let body = axum::body::Body::from_stream(translated_stream);
 
@@ -2790,6 +2796,7 @@ struct RoutedOutcomeContext {
 /// case where `response.completed` or `[DONE]` already booked the turn.
 impl Drop for StreamTranslator {
     fn drop(&mut self) {
+        self.finish_rate_limit_observation();
         if self.outcome.is_some() && !self.outcome_emitted {
             let usage = self.last_usage.clone();
             self.emit_outcome(usage.as_ref(), 200);
@@ -2875,6 +2882,11 @@ struct StreamTranslator {
     /// Where to file a `rate_limits` object if one appears in the stream.
     /// `None` in unit tests, which do not exercise quota reporting.
     codex_limits: Option<crate::codex_rate_limits::CodexRateLimitStore>,
+    /// True when either the response headers or any SSE frame carried quota.
+    /// The negative signal is emitted once from `Drop`, which is the actual end
+    /// of the upstream stream rather than one ordinary frame that lacked it.
+    codex_rate_limits_seen: bool,
+    codex_rate_limits_finished: bool,
     /// Where to book the turn once usage arrives. `None` in unit tests, which
     /// assert on translated events rather than metrics.
     outcome: Option<RoutedOutcomeContext>,
@@ -2906,6 +2918,8 @@ impl StreamTranslator {
             saw_tool_use: false,
             pending_reasoning: PendingReasoning::default(),
             codex_limits: None,
+            codex_rate_limits_seen: false,
+            codex_rate_limits_finished: false,
             outcome: None,
             outcome_emitted: false,
             ttfb_ms: 0.0,
@@ -2916,6 +2930,32 @@ impl StreamTranslator {
     fn with_codex_limits(mut self, store: crate::codex_rate_limits::CodexRateLimitStore) -> Self {
         self.codex_limits = Some(store);
         self
+    }
+
+    fn with_initial_rate_limits_seen(mut self, seen: bool) -> Self {
+        self.codex_rate_limits_seen = seen;
+        self
+    }
+
+    fn finish_rate_limit_observation(&mut self) {
+        if self.codex_limits.is_none()
+            || self.codex_rate_limits_seen
+            || self.codex_rate_limits_finished
+        {
+            return;
+        }
+        self.codex_rate_limits_finished = true;
+        let request_id = self
+            .outcome
+            .as_ref()
+            .map(|ctx| ctx.request_id.as_str())
+            .unwrap_or("unknown");
+        tracing::warn!(
+            event = "codex_rate_limits_missing",
+            request_id = %request_id,
+            model = %self.model,
+            "routed Codex stream ended without quota in response headers or SSE frames"
+        );
     }
 
     fn with_outcome(mut self, ctx: Option<RoutedOutcomeContext>) -> Self {
@@ -3249,6 +3289,7 @@ impl StreamTranslator {
         if let Some(store) = self.codex_limits.as_ref() {
             if let Some(limits) = crate::codex_rate_limits::extract_rate_limits(&chunk) {
                 store.record_rate_limits(&self.model, limits);
+                self.codex_rate_limits_seen = true;
             }
         }
 
@@ -3650,12 +3691,14 @@ fn translate_openai_stream_to_anthropic(
     stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
     codex_limits: crate::codex_rate_limits::CodexRateLimitStore,
+    quota_seen_in_headers: bool,
     outcome: Option<RoutedOutcomeContext>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::StreamExt;
 
     let mut translator = StreamTranslator::new(model)
         .with_codex_limits(codex_limits)
+        .with_initial_rate_limits_seen(quota_seen_in_headers)
         .with_outcome(outcome);
     let mut buffer = String::new();
     let mut current_event: Option<String> = None;
@@ -3719,6 +3762,32 @@ mod tests {
     use axum::http::HeaderValue;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use tracing::field::{Field, Visit};
+            struct Visitor(String);
+            impl Visit for Visitor {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+                fn record_str(&mut self, field: &Field, value: &str) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+    }
 
     /// Point the durable savings ledger at a throwaway file.
     ///
@@ -4240,6 +4309,52 @@ mod tests {
         };
         let t = StreamTranslator::new(model.to_string()).with_outcome(Some(ctx));
         (t, request_logger, cost_tracker)
+    }
+
+    #[test]
+    fn stream_end_emits_one_joinable_missing_quota_event() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        let capture = EventCapture::default();
+        let lines = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut translator =
+                translator.with_codex_limits(crate::codex_rate_limits::CodexRateLimitStore::new());
+            translator.finish_rate_limit_observation();
+            translator.finish_rate_limit_observation();
+        });
+
+        let joined = lines.lock().unwrap().join("\n");
+        let missing: Vec<_> = joined
+            .lines()
+            .filter(|line| line.contains("codex_rate_limits_missing"))
+            .collect();
+        assert_eq!(missing.len(), 1, "{joined}");
+        assert!(missing[0].contains("request_id=req-test"), "{joined}");
+    }
+
+    #[test]
+    fn observed_stream_quota_suppresses_the_missing_event() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        let capture = EventCapture::default();
+        let lines = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut translator =
+                translator.with_codex_limits(crate::codex_rate_limits::CodexRateLimitStore::new());
+            translator.process_frame(
+                Some("response.created"),
+                &json!({"rate_limits": {"primary": {"used_percent": 4}}}).to_string(),
+            );
+            translator.finish_rate_limit_observation();
+        });
+
+        let joined = lines.lock().unwrap().join("\n");
+        assert!(!joined.contains("codex_rate_limits_missing"), "{joined}");
     }
 
     /// The gap this closes: routed traffic used to reach no tracker at all, so
