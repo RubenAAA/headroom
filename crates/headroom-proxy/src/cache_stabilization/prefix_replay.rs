@@ -301,7 +301,6 @@ pub fn overlay_cached_prefix(
 /// Only block-style (list) content can carry `cache_control`; string content is
 /// left as-is. Returns the input unchanged when there is nothing to normalize.
 pub fn normalize_message_cache_control(messages: Vec<Value>) -> Vec<Value> {
-    let mut changed = false;
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     let mut last_block_idx: Option<usize> = None;
 
@@ -329,7 +328,6 @@ pub fn normalize_message_cache_control(messages: Vec<Value>) -> Vec<Value> {
                 let non_empty_last = stripped.last().map(|b| b.is_object()).unwrap_or(false);
                 m.insert("content".to_string(), Value::Array(stripped));
                 out.push(Value::Object(m));
-                changed = true;
                 if non_empty_last {
                     last_block_idx = Some(i);
                 }
@@ -353,14 +351,10 @@ pub fn normalize_message_cache_control(messages: Vec<Value>) -> Vec<Value> {
                     "cache_control".to_string(),
                     serde_json::json!({"type": "ephemeral"}),
                 );
-                changed = true;
             }
         }
     }
 
-    // `changed` is informational (parity with Python's early-return); `out`
-    // already equals the input when nothing was stripped or re-placed.
-    let _ = changed;
     out
 }
 
