@@ -88,6 +88,14 @@ fn coerce_float(value: f64) -> f64 {
     value.max(0.0)
 }
 
+fn coerce_signed_float(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 fn normalize_provider(value: Option<&str>) -> String {
     match value {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -207,6 +215,52 @@ fn estimate_input_cost_usd(
     }
 }
 
+/// Net provider-cache savings against pricing every observed input token at
+/// the model's fresh-input rate.
+///
+/// Cache reads contribute their discount while cache writes contribute their
+/// premium (and can make the result negative). Unknown models fail open: with
+/// no published rates there is no defensible cache counterfactual to book.
+fn estimate_cache_savings_usd(
+    model: &str,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    uncached_input_tokens: i64,
+) -> f64 {
+    let Some(pricing) = crate::pricing::lookup(model) else {
+        return 0.0;
+    };
+    let fresh_rate = pricing.input_cost_per_token;
+    let read_rate = pricing.cache_read_cost_per_token.unwrap_or(fresh_rate);
+    let write_rate = pricing.cache_write_cost_per_token.unwrap_or(fresh_rate);
+    let read = coerce_int(cache_read_tokens) as f64;
+    let write = coerce_int(cache_write_tokens) as f64;
+    let uncached = coerce_int(uncached_input_tokens) as f64;
+    let all_fresh = (read + write + uncached) * fresh_rate;
+    let actual = read * read_rate + write * write_rate + uncached * fresh_rate;
+    all_fresh - actual
+}
+
+/// Savings as a share of the all-fresh, uncompressed input-cost
+/// counterfactual. Actual spend is already cache-priced, so adding compression
+/// savings and *net* cache savings exactly once reconstructs that denominator.
+fn cost_savings_percent(
+    actual_input_cost_usd: f64,
+    compression_savings_usd: f64,
+    cache_savings_usd: f64,
+) -> f64 {
+    let actual = coerce_float(actual_input_cost_usd);
+    let compression = coerce_float(compression_savings_usd);
+    let cache = coerce_signed_float(cache_savings_usd);
+    let net_savings = compression + cache;
+    let counterfactual = actual + net_savings;
+    if counterfactual > 0.0 {
+        round_n(net_savings / counterfactual * 100.0, 2)
+    } else {
+        0.0
+    }
+}
+
 // ── persisted state ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +297,10 @@ struct DisplaySession {
     requests: i64,
     tokens_saved: i64,
     compression_savings_usd: f64,
+    /// Net cache discount after cache-write premiums. Added without a schema
+    /// bump: old state files deserialize/migrate this as zero.
+    #[serde(default)]
+    cache_savings_usd: f64,
     total_input_tokens: i64,
     total_input_cost_usd: f64,
     savings_percent: f64,
@@ -322,6 +380,9 @@ pub struct RequestRecord<'a> {
     pub model: &'a str,
     pub input_tokens: i64,
     pub tokens_saved: i64,
+    /// Request-scoped pricing counterfactual for `tokens_saved`. `None` keeps
+    /// the legacy fresh-input estimate for callers without cache placement.
+    pub compression_savings_cost_usd: Option<f64>,
     pub provider: Option<&'a str>,
     pub project: Option<&'a str>,
     pub cache_read_tokens: i64,
@@ -471,7 +532,10 @@ impl SavingsTracker {
         let ts = rec.timestamp.unwrap_or_else(utc_now);
         let delta_tokens_saved = coerce_int(rec.tokens_saved);
         let delta_input_tokens = coerce_int(rec.input_tokens);
-        let delta_savings_usd = estimate_compression_savings_usd(rec.model, delta_tokens_saved);
+        let delta_savings_usd = rec
+            .compression_savings_cost_usd
+            .map(|cost| cost.max(0.0))
+            .unwrap_or_else(|| estimate_compression_savings_usd(rec.model, delta_tokens_saved));
         // Output-shaping savings, priced at the OUTPUT rate and accumulated
         // separately — folding them into `tokens_saved` would mix an
         // output-side count into an input-side figure and misprice both.
@@ -481,6 +545,12 @@ impl SavingsTracker {
         let delta_input_cost_usd = estimate_input_cost_usd(
             rec.model,
             delta_input_tokens,
+            rec.cache_read_tokens,
+            rec.cache_write_tokens,
+            rec.uncached_input_tokens,
+        );
+        let delta_cache_savings_usd = estimate_cache_savings_usd(
+            rec.model,
             rec.cache_read_tokens,
             rec.cache_write_tokens,
             rec.uncached_input_tokens,
@@ -534,14 +604,14 @@ impl SavingsTracker {
         s.requests += 1;
         s.tokens_saved += delta_tokens_saved;
         s.compression_savings_usd = round_n(s.compression_savings_usd + delta_savings_usd, 6);
+        s.cache_savings_usd = round_n(s.cache_savings_usd + delta_cache_savings_usd, 6);
         s.total_input_tokens += session_tokens_delta;
         s.total_input_cost_usd = round_n(s.total_input_cost_usd + session_cost_delta, 6);
-        let total_before = s.tokens_saved + s.total_input_tokens;
-        s.savings_percent = if total_before > 0 {
-            round_n(s.tokens_saved as f64 / total_before as f64 * 100.0, 2)
-        } else {
-            0.0
-        };
+        s.savings_percent = cost_savings_percent(
+            s.total_input_cost_usd,
+            s.compression_savings_usd,
+            s.cache_savings_usd,
+        );
         s.last_activity_at = Some(to_utc_iso(ts));
         if s.started_at.is_none() {
             s.started_at = s.last_activity_at.clone();
@@ -593,7 +663,7 @@ impl SavingsTracker {
                 uncached_input_tokens: coerce_int(rec.uncached_input_tokens),
                 input_usd: delta_input_cost_usd,
                 compression_savings_usd: delta_savings_usd,
-                cache_savings_usd: 0.0,
+                cache_savings_usd: delta_cache_savings_usd,
                 waste_signals: rec.waste_signals.as_ref().map(|pairs| {
                     pairs
                         .iter()
@@ -615,6 +685,7 @@ impl SavingsTracker {
         let ts = rec.timestamp.unwrap_or_else(utc_now);
 
         let mut st = self.state.lock().unwrap();
+        st.metrics.record_failed(None, None);
         let failed = &mut st.failed_work;
         failed.requests = failed.requests.saturating_add(1);
         failed.upstream_attempts = failed.upstream_attempts.saturating_add(attempts);
@@ -794,19 +865,16 @@ impl SavingsTracker {
         if expired {
             return empty_display_session_value();
         }
-        let total_before = coerce_int(s.tokens_saved) + coerce_int(s.total_input_tokens);
-        let savings_percent = if total_before > 0 {
-            round_n(
-                coerce_int(s.tokens_saved) as f64 / total_before as f64 * 100.0,
-                2,
-            )
-        } else {
-            0.0
-        };
+        let savings_percent = cost_savings_percent(
+            s.total_input_cost_usd,
+            s.compression_savings_usd,
+            s.cache_savings_usd,
+        );
         json!({
             "requests": s.requests,
             "tokens_saved": s.tokens_saved,
             "compression_savings_usd": round_n(coerce_float(s.compression_savings_usd), 6),
+            "cache_savings_usd": round_n(coerce_signed_float(s.cache_savings_usd), 6),
             "total_input_tokens": s.total_input_tokens,
             "total_input_cost_usd": round_n(coerce_float(s.total_input_cost_usd), 6),
             "savings_percent": savings_percent,
@@ -1260,6 +1328,7 @@ fn empty_display_session_value() -> Value {
         "requests": 0,
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
         "savings_percent": 0.0,
@@ -1337,6 +1406,7 @@ fn display_session_value(s: &DisplaySession) -> Value {
         "requests": s.requests,
         "tokens_saved": s.tokens_saved,
         "compression_savings_usd": s.compression_savings_usd,
+        "cache_savings_usd": s.cache_savings_usd,
         "total_input_tokens": s.total_input_tokens,
         "total_input_cost_usd": s.total_input_cost_usd,
         "savings_percent": s.savings_percent,
@@ -1465,12 +1535,32 @@ fn normalize_display_session(entry: Option<&Value>) -> DisplaySession {
         .and_then(Value::as_i64)
         .map(coerce_int)
         .unwrap_or(0);
-    let total_before = tokens_saved + total_input_tokens;
-    let savings_percent = if total_before > 0 {
-        round_n(tokens_saved as f64 / total_before as f64 * 100.0, 2)
-    } else {
-        0.0
-    };
+    let compression_savings_usd = round_n(
+        obj.get("compression_savings_usd")
+            .and_then(Value::as_f64)
+            .map(coerce_float)
+            .unwrap_or(0.0),
+        6,
+    );
+    let cache_savings_usd = round_n(
+        obj.get("cache_savings_usd")
+            .and_then(Value::as_f64)
+            .map(coerce_signed_float)
+            .unwrap_or(0.0),
+        6,
+    );
+    let total_input_cost_usd = round_n(
+        obj.get("total_input_cost_usd")
+            .and_then(Value::as_f64)
+            .map(coerce_float)
+            .unwrap_or(0.0),
+        6,
+    );
+    let savings_percent = cost_savings_percent(
+        total_input_cost_usd,
+        compression_savings_usd,
+        cache_savings_usd,
+    );
     DisplaySession {
         requests: obj
             .get("requests")
@@ -1478,21 +1568,10 @@ fn normalize_display_session(entry: Option<&Value>) -> DisplaySession {
             .map(coerce_int)
             .unwrap_or(0),
         tokens_saved,
-        compression_savings_usd: round_n(
-            obj.get("compression_savings_usd")
-                .and_then(Value::as_f64)
-                .map(coerce_float)
-                .unwrap_or(0.0),
-            6,
-        ),
+        compression_savings_usd,
+        cache_savings_usd,
         total_input_tokens,
-        total_input_cost_usd: round_n(
-            obj.get("total_input_cost_usd")
-                .and_then(Value::as_f64)
-                .map(coerce_float)
-                .unwrap_or(0.0),
-            6,
-        ),
+        total_input_cost_usd,
         savings_percent,
         started_at: Some(to_utc_iso(started)),
         last_activity_at: Some(to_utc_iso(last)),
@@ -1941,6 +2020,134 @@ mod tests {
     }
 
     #[test]
+    fn request_scoped_savings_price_overrides_fresh_input_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let t = tracker(&path);
+        t.record_request(&RequestRecord {
+            model: "claude-opus-5",
+            input_tokens: 1_000,
+            tokens_saved: 1_000,
+            // Cache-read pricing for 1k Opus tokens. The legacy fresh-input
+            // estimate would be $0.015, ten times larger.
+            compression_savings_cost_usd: Some(0.0015),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            t.snapshot()["lifetime"]["compression_savings_usd"],
+            json!(0.0015)
+        );
+    }
+
+    #[test]
+    fn claude_cache_economics_include_read_discount_and_write_premium() {
+        // Sonnet: fresh=$3/M, read=$0.30/M, write=$3.75/M.
+        // Read discount: $0.027; write premium: $0.0015; net: $0.0255.
+        let savings = estimate_cache_savings_usd("claude-sonnet-4", 10_000, 2_000, 3_000);
+        assert!((savings - 0.0255).abs() < 1e-12, "got {savings}");
+    }
+
+    #[test]
+    fn cache_write_premium_can_make_net_savings_negative() {
+        // Four thousand fresh Sonnet tokens would cost $0.012; creating the
+        // cache entry costs $0.015, so this turn is a $0.003 cache loss.
+        let savings = estimate_cache_savings_usd("claude-sonnet-4", 0, 4_000, 0);
+        assert!((savings + 0.003).abs() < 1e-12, "got {savings}");
+    }
+
+    #[test]
+    fn unknown_model_does_not_invent_cache_savings() {
+        assert_eq!(
+            estimate_cache_savings_usd("unpriced-provider/model", 1_000_000, 0, 0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn cache_savings_survive_a_restart_in_lifetime_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            t.record_request(&RequestRecord {
+                model: "claude-sonnet-4",
+                input_tokens: 4_000,
+                cache_write_tokens: 4_000,
+                ..Default::default()
+            });
+            assert_eq!(
+                t.metrics_snapshot(&json!({}))["cost"]["cache_savings_usd"],
+                json!(-0.003)
+            );
+        }
+
+        let restarted = tracker(&path);
+        assert_eq!(
+            restarted.metrics_snapshot(&json!({}))["cost"]["cache_savings_usd"],
+            json!(-0.003)
+        );
+        assert_eq!(
+            restarted.snapshot()["display_session"]["cache_savings_usd"],
+            json!(-0.003)
+        );
+    }
+
+    #[test]
+    fn display_session_without_cache_savings_migrates_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let now = to_utc_iso(utc_now());
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "lifetime": {},
+                "display_session": {
+                    "requests": 1,
+                    "tokens_saved": 1_000,
+                    "compression_savings_usd": 0.003,
+                    "total_input_tokens": 1_000,
+                    "total_input_cost_usd": 0.003,
+                    "savings_percent": 50.0,
+                    "started_at": now,
+                    "last_activity_at": now,
+                },
+                "history": [],
+                "projects": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let display = &tracker(&path).snapshot()["display_session"];
+        assert_eq!(display["cache_savings_usd"], json!(0.0));
+        assert_eq!(display["savings_percent"], json!(50.0));
+    }
+
+    #[test]
+    fn display_session_percentage_combines_compression_and_cache_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = tracker(&dir.path().join("s.json"));
+        t.record_request(&RequestRecord {
+            model: "claude-sonnet-4",
+            // Actual: 1k read ($0.0003) + 1k uncached ($0.0030).
+            input_tokens: 2_000,
+            cache_read_tokens: 1_000,
+            uncached_input_tokens: 1_000,
+            // Compression avoided another 1k fresh tokens ($0.0030).
+            tokens_saved: 1_000,
+            ..Default::default()
+        });
+
+        let display = &t.snapshot()["display_session"];
+        assert_eq!(display["compression_savings_usd"], json!(0.003));
+        assert_eq!(display["cache_savings_usd"], json!(0.0027));
+        // ($0.003 + $0.0027) / ($0.0033 actual + those savings).
+        assert_eq!(display["savings_percent"], json!(63.33));
+    }
+
+    #[test]
     fn record_compression_savings_rejects_nonpositive() {
         let dir = tempfile::tempdir().unwrap();
         let t = tracker(&dir.path().join("s.json"));
@@ -2152,7 +2359,8 @@ mod tests {
             });
         }
 
-        let snap = tracker(&path).snapshot();
+        let restarted = tracker(&path);
+        let snap = restarted.snapshot();
         assert_eq!(snap["lifetime"]["requests"], 0);
         assert_eq!(snap["lifetime"]["tokens_saved"], 0);
         assert_eq!(snap["failed_work"]["requests"], 2);
@@ -2166,6 +2374,9 @@ mod tests {
         assert_eq!(snap["failed_work"]["provider_usage_observed_requests"], 1);
         assert_eq!(snap["failed_work"]["by_status"]["529"], 1);
         assert_eq!(snap["failed_work"]["by_status"]["503"], 1);
+        let metrics = restarted.metrics_snapshot(&json!({}));
+        assert_eq!(metrics["requests"]["total"], 0);
+        assert_eq!(metrics["requests"]["failed"], 2);
     }
 
     #[test]
@@ -2207,6 +2418,7 @@ mod tests {
             "requests",
             "tokens_saved",
             "compression_savings_usd",
+            "cache_savings_usd",
             "total_input_tokens",
             "total_input_cost_usd",
             "savings_percent",
@@ -2258,7 +2470,7 @@ mod tests {
         assert_eq!(snap["lifetime"]["requests"], json!(1));
         assert_eq!(snap["lifetime"]["tokens_saved"], json!(300));
         assert_eq!(snap["display_session"]["requests"], json!(1));
-        assert_eq!(snap["display_session"]["savings_percent"], json!(23.08));
+        assert_eq!(snap["display_session"]["savings_percent"], json!(36.92));
     }
 
     #[test]

@@ -108,6 +108,43 @@ impl RequestOutcome {
         self.tokens_saved as f64 / self.original_tokens as f64 * 100.0
     }
 
+    /// Rate class the removed input would have occupied on this request.
+    ///
+    /// Prompt caches are prefixes. `optimized_tokens` is the selected span
+    /// left after compression; if that span is larger than the request's
+    /// cache-write + uncached tail, it reaches into the cache-read prefix and
+    /// the removed tokens are priced at the cache-read rate. This deliberately
+    /// favours the proxy at the boundary: a span that fits in the fresh region
+    /// is wholly called fresh, even if some selected blocks came from earlier.
+    pub fn compression_savings_cost_basis(&self) -> &'static str {
+        let fresh_region = self
+            .cache_write_tokens
+            .max(0)
+            .saturating_add(self.uncached_input_tokens.max(0));
+        if self.cache_read_tokens > 0 && self.optimized_tokens > fresh_region {
+            "cache_read"
+        } else {
+            "fresh_input"
+        }
+    }
+
+    /// Dollar counterfactual for this turn's removed input, using the rate
+    /// class selected by [`Self::compression_savings_cost_basis`].
+    pub fn compression_savings_cost_usd(&self) -> f64 {
+        if self.tokens_saved <= 0 {
+            return 0.0;
+        }
+        let fallback = crate::savings_ledger::DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN;
+        let rate = match crate::pricing::lookup(&self.model) {
+            Some(pricing) if self.compression_savings_cost_basis() == "cache_read" => pricing
+                .cache_read_cost_per_token
+                .unwrap_or(pricing.input_cost_per_token),
+            Some(pricing) => pricing.input_cost_per_token,
+            None => fallback,
+        };
+        self.tokens_saved as f64 * rate
+    }
+
     /// Tokens the forwarded request grew by, if it ended up larger.
     ///
     /// `tokens_saved` is clamped at zero, so a request that leaves the proxy
@@ -337,8 +374,9 @@ pub trait OutcomeSink {
     /// Output-shaping counterfactual recorder, driven by `output_shaper:` labels
     /// on `transforms_applied`. Called before step 1, matching Python.
     fn record_output_savings(&self, _transforms: &[String], _output_tokens: i64) {}
-    /// Record a failed request. Invoked (instead of the success funnel) when the
-    /// outcome carries an upstream `status_code >= 500`. Default no-op so sinks
+    /// Record a failed request. Invoked (instead of the success funnel) for a
+    /// generic upstream `status_code >= 500`, or when a caller explicitly
+    /// identifies a forwarded upstream rejection. Default no-op so sinks
     /// without a metrics surface (e.g. tests) opt out.
     fn record_failed(&self, _outcome: &RequestOutcome) {}
     /// Append to the durable savings ledger that backs `headroom savings`.
@@ -358,6 +396,42 @@ pub trait OutcomeSink {
     fn record_cache_outcome(&self, _provider: &str, _reason: &str, _wasted_tokens: i64) {}
 }
 
+/// Send a caller-identified upstream failure through the failure-only sink.
+///
+/// This is deliberately status-agnostic: forwarding code knows that a 401 or
+/// 429 came from the upstream provider and represents failed work, while an
+/// arbitrary generic 4xx `RequestOutcome` can still describe a normal client
+/// error. Keeping the shared logging here also guarantees one failure record
+/// and no success/PERF/savings side effects.
+pub fn emit_failed_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &RequestOutcome) {
+    sink.record_failed(outcome);
+    tracing::warn!(
+        target: "headroom.proxy",
+        event = "request_failed_accounting",
+        request_id = %outcome.request_id,
+        provider = %outcome.provider,
+        model = %outcome.model,
+        status_code = outcome.status_code,
+        upstream_attempts = outcome.upstream_attempts.max(1),
+        num_messages = outcome.num_messages,
+        original_tokens = outcome.original_tokens,
+        forwarded_tokens = outcome.optimized_tokens,
+        forwarded_tokens_at_risk = outcome
+            .optimized_tokens
+            .max(0)
+            .saturating_mul(outcome.upstream_attempts.max(1)),
+        provider_input_tokens = ?outcome.provider_input_tokens,
+        provider_output_tokens = ?outcome.provider_output_tokens,
+        output_tokens = outcome.output_tokens,
+        tokens_saved_not_booked = outcome.tokens_saved,
+        cache_read_tokens = outcome.cache_read_tokens,
+        cache_write_tokens = outcome.cache_write_tokens,
+        total_ms = outcome.total_latency_ms,
+        transforms = %summarize_transforms(&outcome.transforms_applied),
+        "upstream failed: turn excluded from successful savings, cost and PERF stats; failed work booked separately"
+    );
+}
+
 /// Single funnel for per-request bookkeeping. Preserves Python's ordering:
 /// output-shaper hook → metrics → cost tracker → request log → PERF trace line.
 pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &RequestOutcome) {
@@ -366,39 +440,7 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
     // let a failed request inflate the save-rate. Record it as failed and stop.
     // 4xx stay on the normal funnel: they are client errors the proxy served.
     if outcome.status_code >= 500 {
-        sink.record_failed(outcome);
-        // Item 6: the guard above is right — a failed turn must not inflate the
-        // save-rate — but returning silently made failures invisible *and*
-        // free-looking, so the reported savings improved as behaviour got
-        // worse. The turn still cost the tokens we forwarded (once per retry),
-        // so say so on its way out. Deliberately not booked into the ledger:
-        // that denominator change is a product decision, and inventing it here
-        // would corrupt the one number this line exists to let you audit.
-        tracing::warn!(
-            target: "headroom.proxy",
-            event = "request_failed_accounting",
-            request_id = %outcome.request_id,
-            provider = %outcome.provider,
-            model = %outcome.model,
-            status_code = outcome.status_code,
-            upstream_attempts = outcome.upstream_attempts.max(1),
-            num_messages = outcome.num_messages,
-            original_tokens = outcome.original_tokens,
-            forwarded_tokens = outcome.optimized_tokens,
-            forwarded_tokens_at_risk = outcome
-                .optimized_tokens
-                .max(0)
-                .saturating_mul(outcome.upstream_attempts.max(1)),
-            provider_input_tokens = ?outcome.provider_input_tokens,
-            provider_output_tokens = ?outcome.provider_output_tokens,
-            output_tokens = outcome.output_tokens,
-            tokens_saved_not_booked = outcome.tokens_saved,
-            cache_read_tokens = outcome.cache_read_tokens,
-            cache_write_tokens = outcome.cache_write_tokens,
-            total_ms = outcome.total_latency_ms,
-            transforms = %summarize_transforms(&outcome.transforms_applied),
-            "upstream failed: turn excluded from successful savings, cost and PERF stats; failed work booked separately"
-        );
+        emit_failed_request_outcome(sink, outcome);
         return;
     }
 
@@ -469,6 +511,38 @@ mod tests {
         assert!(!o.cache_hit());
         o.from_response_cache = true;
         assert!(o.cache_hit());
+    }
+
+    #[test]
+    fn compression_savings_uses_cache_read_rate_inside_cached_prefix() {
+        let outcome = RequestOutcome {
+            model: "claude-opus-5".into(),
+            tokens_saved: 1_000,
+            optimized_tokens: 2_176,
+            cache_read_tokens: 480_000,
+            cache_write_tokens: 1_013,
+            uncached_input_tokens: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(outcome.compression_savings_cost_basis(), "cache_read");
+        assert!((outcome.compression_savings_cost_usd() - 0.0015).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compression_savings_uses_fresh_rate_past_cache_boundary() {
+        let outcome = RequestOutcome {
+            model: "claude-opus-5".into(),
+            tokens_saved: 1_000,
+            optimized_tokens: 900,
+            cache_read_tokens: 10_000,
+            cache_write_tokens: 4_000,
+            uncached_input_tokens: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(outcome.compression_savings_cost_basis(), "fresh_input");
+        assert!((outcome.compression_savings_cost_usd() - 0.015).abs() < 1e-12);
     }
 
     #[test]
@@ -664,6 +738,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_forwarded_rejections_record_4xx_and_5xx_once() {
+        for status in [401, 429, 503] {
+            let sink = RecordingSink::default();
+            let outcome = RequestOutcome {
+                status_code: status,
+                ..Default::default()
+            };
+            emit_failed_request_outcome(&sink, &outcome);
+            assert_eq!(
+                *sink.calls.borrow(),
+                vec!["record_failed"],
+                "status {status} must reach only the failed-work sink"
+            );
+        }
+    }
+
     /// Item 6: a failed turn must leave a trace naming what it cost. Skipping
     /// the success funnel is correct; skipping it *silently* is what made the
     /// savings figures improve as behaviour got worse.
@@ -728,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_4xx_stays_on_success_funnel() {
+    fn generic_4xx_outcome_stays_on_success_funnel() {
         let sink = RecordingSink::default();
         let o = RequestOutcome {
             status_code: 429,

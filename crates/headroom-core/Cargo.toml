@@ -251,6 +251,9 @@ redis = ["dep:redis"]
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# Failure accounting (item 6) is a log line and nothing else, so the only test
+# that can prove it works has to read the emitted event.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [[bench]]
 name = "tokenizer"

@@ -640,6 +640,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             model: &outcome.model,
             input_tokens: outcome.original_tokens,
             tokens_saved: outcome.tokens_saved,
+            compression_savings_cost_usd: Some(outcome.compression_savings_cost_usd()),
             provider: Some(&outcome.provider),
             project: outcome.project.as_deref(),
             cache_read_tokens: outcome.cache_read_tokens,
@@ -3550,7 +3551,7 @@ pub(crate) async fn forward_http(
     } else {
         SseStreamKind::None
     };
-    if !is_sse && status.is_server_error() {
+    if !is_sse && (status.is_client_error() || status.is_server_error()) {
         if let Some(ctx) = outcome_ctx.as_ref() {
             emit_failed_http_outcome(ctx, &request_id, status);
         }
@@ -4302,7 +4303,7 @@ struct OutcomeContext {
     upstream_attempts: i64,
 }
 
-/// Book a terminal non-SSE 5xx into the failure-only bucket. The provider did
+/// Book a terminal non-SSE upstream rejection into the failure-only bucket. The provider did
 /// not report usage, so keep the request-side estimate explicitly separate
 /// from provider-observed token counts.
 fn emit_failed_http_outcome(ctx: &OutcomeContext, request_id: &str, status: StatusCode) {
@@ -4329,7 +4330,7 @@ fn emit_failed_http_outcome(ctx: &OutcomeContext, request_id: &str, status: Stat
         project: ctx.project.clone(),
         ..Default::default()
     };
-    headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
+    headroom_core::request_outcome::emit_failed_request_outcome(ctx.sink.as_ref(), &outcome);
 }
 
 impl OutcomeContext {

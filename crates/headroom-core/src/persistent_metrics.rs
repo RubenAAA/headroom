@@ -125,6 +125,26 @@ fn coerce_float(value: Option<&Value>) -> f64 {
     }
 }
 
+/// Coerce an arbitrary JSON value to a finite float while preserving its sign.
+///
+/// Cache economics are net of cache-write premiums, so a write-heavy request
+/// can legitimately cost more than its all-fresh counterfactual. The other
+/// persisted dollar fields remain non-negative.
+fn coerce_signed_float(value: Option<&Value>) -> f64 {
+    let Some(value) = value else { return 0.0 };
+    let result = match value {
+        Value::Bool(flag) => f64::from(u8::from(*flag)),
+        Value::Number(num) => num.as_f64().unwrap_or(0.0),
+        Value::String(text) => text.trim().parse::<f64>().unwrap_or(0.0),
+        _ => return 0.0,
+    };
+    if result.is_finite() {
+        result
+    } else {
+        0.0
+    }
+}
+
 /// Round to 6 decimal places the way Python's `round(value, 6)` does.
 ///
 /// Both languages round the exact binary value, ties to even, so formatting
@@ -631,6 +651,15 @@ fn clamp_float(value: f64) -> f64 {
     }
 }
 
+/// Preserve a finite signed delta (used for net cache savings only).
+fn clamp_signed_float(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PersistentMetricsState
 // ---------------------------------------------------------------------------
@@ -905,7 +934,7 @@ impl PersistentMetricsState {
         cost.compression_savings_usd =
             round6(cost.compression_savings_usd + clamp_float(request.compression_savings_usd));
         cost.cache_savings_usd =
-            round6(cost.cache_savings_usd + clamp_float(request.cache_savings_usd));
+            round6(cost.cache_savings_usd + clamp_signed_float(request.cache_savings_usd));
 
         if let Some(signals) = &request.waste_signals {
             for (name, token_count) in signals {
@@ -1290,7 +1319,7 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
     result.cost = CostState {
         input_usd: round6(coerce_float(get(raw_cost, "input_usd"))),
         compression_savings_usd: round6(coerce_float(get(raw_cost, "compression_savings_usd"))),
-        cache_savings_usd: round6(coerce_float(get(raw_cost, "cache_savings_usd"))),
+        cache_savings_usd: round6(coerce_signed_float(get(raw_cost, "cache_savings_usd"))),
     };
 
     result.waste_signals = normalize_enum_map(get(source, "waste_signals"), &KNOWN_WASTE_SIGNALS);
