@@ -541,6 +541,44 @@ pub struct CliArgs {
     )]
     pub prefix_replay: bool,
 
+    /// How many `cache_control` breakpoints to place on the tail of `messages`,
+    /// counting back from the newest. Only read on the freeze-replay path, which
+    /// owns message-level placement.
+    ///
+    /// `1` is the placement this proxy has always used and the default. `2` adds
+    /// a hedge: when the newest message changes the older marker still names a
+    /// prefix the provider holds, so the read starts there instead of at
+    /// nothing. Published multipliers put two slots ~5% below one.
+    ///
+    /// Anthropic refuses more than 4 markers across `system`, `tools` and
+    /// `messages` together. Claude Code sends 2 on `system`, so `2` here reaches
+    /// that ceiling exactly — pair it with `--strip-system-cache-breakpoints`.
+    #[arg(
+        long = "cache-tail-breakpoints",
+        env = "HEADROOM_PROXY_CACHE_TAIL_BREAKPOINTS",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u8).range(1..=4),
+    )]
+    pub cache_tail_breakpoints: u8,
+
+    /// Drop the `cache_control` markers the client set on `system`. Only read on
+    /// the freeze-replay path, and only honoured once a message breakpoint is
+    /// actually placed — with none placed these are the request's only markers
+    /// and removing them turns caching off.
+    ///
+    /// A breakpoint caches everything before it and the system prompt precedes
+    /// every message, so the tail marker already covers it. Claude Code's two
+    /// ask for the 1h TTL, which writes at 2.0x against 5m's 1.25x. Default
+    /// `false`: this reaches past `messages[*]` into what the client set, which
+    /// nothing else here does.
+    #[arg(
+        long = "strip-system-cache-breakpoints",
+        env = "HEADROOM_PROXY_STRIP_SYSTEM_CACHE_BREAKPOINTS",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub strip_system_cache_breakpoints: bool,
+
     /// B2: replay the tool order forwarded last turn and append genuinely-new
     /// tools at the end, so a late MCP handshake splicing definitions into the
     /// middle of `tools[]` does not invalidate the cached prefix behind them.
@@ -1425,12 +1463,16 @@ pub struct Config {
     /// CTX-2: passive session capture on/off. Pure observer; default `false`.
     pub ctx_capture: bool,
     /// CTX-2: base dir for sessions/content DBs. `None` → default
-    /// `~/.claude-personal/context-mode`. Only used when `ctx_capture`.
+    /// `<workspace>/ctx`. Only used when `ctx_capture`.
     pub ctx_store_dir: Option<std::path::PathBuf>,
     /// CTX-3: tool_result offload transform on/off. Default `false`.
     pub ctx_offload: bool,
     /// Freeze-replay: byte-identical prefix replay across turns. Default `false`.
     pub prefix_replay: bool,
+    /// Tail `cache_control` breakpoints to place on `messages`. Default `1`.
+    pub cache_tail_breakpoints: u8,
+    /// Drop the client's `system` breakpoints. Default `false`.
+    pub strip_system_cache_breakpoints: bool,
     /// B2: replay last turn's tool order, appending new tools at the end.
     /// Default `true`.
     pub cache_stable_tool_order: bool,
@@ -1669,6 +1711,8 @@ impl Config {
             ctx_store_dir: args.ctx_store_dir,
             ctx_offload: args.ctx_offload,
             prefix_replay: args.prefix_replay,
+            cache_tail_breakpoints: args.cache_tail_breakpoints,
+            strip_system_cache_breakpoints: args.strip_system_cache_breakpoints,
             cache_stable_tool_order: args.cache_stable_tool_order,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
@@ -1893,6 +1937,8 @@ impl Config {
             ctx_store_dir: None,
             ctx_offload: false,
             prefix_replay: false,
+            cache_tail_breakpoints: 1,
+            strip_system_cache_breakpoints: false,
             // B2 off in the test default so existing request-path tests keep
             // asserting byte-identical tool arrays; production defaults to on.
             cache_stable_tool_order: false,

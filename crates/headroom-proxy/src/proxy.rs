@@ -85,6 +85,12 @@ pub struct AppState {
     /// Anthropic buffered path reads/writes it, and only when
     /// `Config::prefix_replay` is on.
     pub replay_store: SessionReplayStore,
+    /// When this process started. The replay store is in-memory, so every
+    /// restart empties it and the first turn of every live conversation then
+    /// finds no prefix. Without this, that expected gap is indistinguishable
+    /// from a session key that is not stable — a distinction five false alarms
+    /// were spent on before it was recorded here.
+    pub started_at: std::time::Instant,
     /// CTX-7: re-cache watchdog. Correlates request-side conversation
     /// identity (+ PR-E6 drift dims) with the response's billed
     /// `usage` to flag prompt-cache re-writes inside the TTL window.
@@ -501,6 +507,7 @@ impl AppState {
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             tool_order_state: cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store: SessionReplayStore::new(REPLAY_STORE_CAPACITY),
+            started_at: std::time::Instant::now(),
             vertex_token_source,
             usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
             codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
@@ -3204,6 +3211,10 @@ pub(crate) async fn forward_http(
                     &request_id,
                     original_messages,
                     body_to_send,
+                    Some(&state.usage_observer),
+                    state.started_at.elapsed().as_secs(),
+                    state.config.cache_tail_breakpoints as usize,
+                    state.config.strip_system_cache_breakpoints,
                 )
             }
             _ => body_to_send,
@@ -4027,6 +4038,183 @@ impl SseStreamKind {
     }
 }
 
+/// Apply [`relocate_ephemeral_blocks`] to a request body's `messages`.
+///
+/// Returns the bytes untouched on any parse or serialise failure, and when
+/// nothing moved — a request with no scaffolding in its history must go out
+/// byte-identical, or the transform would itself be a source of cache churn.
+///
+/// [`relocate_ephemeral_blocks`]: cache_stabilization::prefix_replay::relocate_ephemeral_blocks
+fn relocate_ephemeral_blocks_in_body(body: bytes::Bytes) -> bytes::Bytes {
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(messages) = parsed
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .filter(|m| !m.is_empty())
+        .cloned()
+    else {
+        return body;
+    };
+    let relocated =
+        cache_stabilization::prefix_replay::relocate_ephemeral_blocks(messages.clone());
+    if relocated == messages {
+        return body;
+    }
+    let moved = messages.len() - relocated.len();
+    parsed["messages"] = serde_json::Value::Array(relocated);
+    match serde_json::to_vec(&parsed) {
+        Ok(bytes) => {
+            tracing::debug!(
+                event = "ephemeral_blocks_relocated",
+                messages_dropped = moved,
+                "moved client scaffolding out of history and onto the newest message"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
+/// Which messages the proxy rewrote this turn, and which of those the provider
+/// is entitled to refuse.
+struct RewrittenMessages {
+    /// Indices whose content differs from what the client sent.
+    indices: Vec<usize>,
+    /// The subset carrying a `thinking` or `redacted_thinking` block. Anthropic
+    /// rejects a turn whose signed thinking blocks changed, so any index here is
+    /// a rejection this proxy is capable of causing.
+    with_thinking: Vec<usize>,
+    /// Indices where a signed reasoning block itself differs on the wire.
+    ///
+    /// Compared raw, not canonically: `cache_control` is the one key this proxy
+    /// rewrites on every message by design, and adding or removing it on a
+    /// signed block is still a modification of that block as far as the provider
+    /// is concerned. The canonical compare above is blind to exactly that, which
+    /// is why this list is kept separately rather than folded into it.
+    thinking_touched: Vec<usize>,
+}
+
+/// Compare what the client sent against what is about to go on the wire.
+///
+/// Uses the prefix canonicaliser, so `cache_control` placement — which this
+/// proxy owns and rewrites every turn by design — does not count as a change.
+fn rewritten_message_report(
+    original: &[serde_json::Value],
+    forwarded: &[serde_json::Value],
+) -> RewrittenMessages {
+    use cache_stabilization::prefix_replay::canonicalize_for_prefix_compare;
+    let mut indices = Vec::new();
+    let mut with_thinking = Vec::new();
+    let mut thinking_touched = Vec::new();
+    for (i, (before, after)) in original.iter().zip(forwarded.iter()).enumerate() {
+        if thinking_blocks_differ(before, after) {
+            thinking_touched.push(i);
+        }
+        if canonicalize_for_prefix_compare(before) == canonicalize_for_prefix_compare(after) {
+            continue;
+        }
+        indices.push(i);
+        if carries_thinking_block(before) || carries_thinking_block(after) {
+            with_thinking.push(i);
+        }
+    }
+    RewrittenMessages {
+        indices,
+        with_thinking,
+        thinking_touched,
+    }
+}
+
+/// True if the signed reasoning blocks of a message are not byte-identical
+/// between what the client sent and what goes on the wire.
+fn thinking_blocks_differ(before: &serde_json::Value, after: &serde_json::Value) -> bool {
+    fn reasoning_blocks(message: &serde_json::Value) -> Vec<&serde_json::Value> {
+        message
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(
+                            b.get("type").and_then(|t| t.as_str()),
+                            Some("thinking") | Some("redacted_thinking")
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    reasoning_blocks(before) != reasoning_blocks(after)
+}
+
+/// True if a message's content holds a signed reasoning block.
+fn carries_thinking_block(message: &serde_json::Value) -> bool {
+    message
+        .get("content")
+        .and_then(|c| c.as_array())
+        .is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            })
+        })
+}
+
+/// Render indices for a log field, capped so one pathological turn cannot
+/// write a thousand-entry line.
+fn join_indices(indices: &[usize]) -> String {
+    const MAX: usize = 20;
+    let head = indices
+        .iter()
+        .take(MAX)
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if indices.len() > MAX {
+        format!("{head},…+{}", indices.len() - MAX)
+    } else {
+        head
+    }
+}
+
+/// The provider's own words for why it refused a request, as
+/// `(error type, message)`.
+///
+/// Reads the two error envelopes the proxy forwards to — Anthropic's
+/// `{"error": {"type", "message"}}` and OpenAI's `{"error": {"code", "message"}}`
+/// — and returns those fields only. The raw body never reaches the log: an
+/// unrecognised shape yields empty strings rather than whatever bytes the
+/// upstream happened to send, because this runs on every failed request and the
+/// log is not a place to spill unknown payloads.
+fn describe_upstream_error(body: &[u8]) -> (String, String) {
+    const MAX_MESSAGE_CHARS: usize = 400;
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (String::from("unparsed"), String::new());
+    };
+    let Some(error) = value.get("error") else {
+        return (String::from("no_error_field"), String::new());
+    };
+    let kind = error
+        .get("type")
+        .or_else(|| error.get("code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let message: String = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(MAX_MESSAGE_CHARS)
+        .collect();
+    (kind, message)
+}
+
 /// True if the upstream response is an SSE stream. Compares
 /// `content-type` against `text/event-stream` (with optional
 /// parameters). RFC 7231 §3.1.1.1: media types compare
@@ -4076,9 +4264,21 @@ pub(crate) fn apply_prefix_replay(
     request_id: &str,
     original_messages: Vec<serde_json::Value>,
     body: bytes::Bytes,
+    // Told when the replay is declined, so a re-cache event a turn later can
+    // name the cause instead of falling through to "unattributable".
+    observer: Option<&cache_stabilization::usage_observer::UsageObserver>,
+    // Seconds since this process started, so an empty store right after a
+    // restart is not read as an unstable session key.
+    uptime_seconds: u64,
+    // How many tail breakpoints to place, and whether the client's `system`
+    // markers may go. Both come from flags so the pair can be measured against
+    // the single-marker placement it replaces.
+    tail_breakpoints: usize,
+    strip_system_breakpoints: bool,
 ) -> bytes::Bytes {
     use cache_stabilization::prefix_replay::{
-        normalize_message_cache_control, overlay_cached_prefix,
+        early_message_fingerprints, overlay_cached_prefix_reported, place_tail_cache_breakpoints,
+        strip_system_cache_control, tail_slots_within_budget, ANTHROPIC_CACHE_CONTROL_LIMIT,
     };
 
     let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
@@ -4103,28 +4303,232 @@ pub(crate) fn apply_prefix_replay(
         return body;
     };
 
-    let (prev_orig, prev_fwd) = match store.previous_turn(session_key) {
-        Some((o, f)) => (Some(o), Some(f)),
-        None => (None, None),
-    };
-    let overlaid = overlay_cached_prefix(
+    // Ask for the prefix THIS turn continues, not merely the session's last
+    // one: several streams share a session key, and handing back another
+    // stream's prefix guarantees the append-only guard rejects it and the turn
+    // forwards fresh bytes over content the provider had cached.
+    let (prev_orig, prev_fwd, prefix_miss, chain_id) =
+        match store.previous_turn_for(session_key, &original_messages) {
+            Ok((o, f, chain_id)) => (Some(o), Some(f), None, chain_id),
+            Err(miss) => (None, None, Some(miss), 0),
+        };
+    let (overlaid, skip_reason) = overlay_cached_prefix_reported(
         optimized.clone(),
         &original_messages,
         prev_orig.as_deref(),
         prev_fwd.as_deref(),
     );
     let replayed_prefix = overlaid != optimized;
-    let normalized = normalize_message_cache_control(overlaid);
-    let changed = normalized != optimized;
+    // A turn that does not replay is where the money goes: measured over the
+    // 2026-08-08/09 logs, non-replaying turns were 19% of traffic and carried
+    // 97% of booked re-cache waste. `replayed_prefix` alone cannot say which of
+    // five reasons applied, and they need opposite responses — a diverged
+    // client prefix is not our doing, while a turn shorter than the stored
+    // prefix means two streams are sharing one session slot.
+    if let Some(reason) = skip_reason {
+        if let Some(observer) = observer {
+            observer.note_replay_skip(
+                request_id,
+                cache_stabilization::usage_observer::ReplaySkipEvidence::from_inbound_original_histories(
+                    reason,
+                    prev_orig.as_deref(),
+                    &original_messages,
+                ),
+            );
+        }
+        tracing::info!(
+            event = "prefix_replay_not_replayed",
+            request_id = %request_id,
+            // Correlate replay declines with the drift and volatile-content
+            // events emitted for the same logical session.  The raw session
+            // key can contain an authorization credential or caller-supplied
+            // identifier, so this is deliberately the existing 16-hex
+            // SHA-256 log prefix rather than the key itself.
+            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+            reason = reason.as_str(),
+            // Only set when `reason` is `no_previous_turn`, and the part that
+            // makes it actionable: a first turn is free, an idle gap is already
+            // lost, a missing tracker on a live session is a defect.
+            miss_detail = prefix_miss.map(|m| m.as_str()).unwrap_or(""),
+            proxy_uptime_seconds = uptime_seconds,
+            // Which leading message first disagreed. A conversation that
+            // declines every turn while growing normally is not being edited by
+            // its client — something inside it churns per request and the
+            // canonicalizer is not neutralising it. This names where.
+            first_diff_index = match skip_reason {
+                Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                    first_diff_index,
+                }) => first_diff_index as i64,
+                _ => -1,
+            },
+            // The field that churned, named by structure alone — keys and
+            // indices, never a value. One sample of `content[0].text` on the
+            // opener says "an injected block changes per request, and we can
+            // neutralise it"; `content[3].input` says a real edit. Without it
+            // the index alone needs a distribution to say anything.
+            first_diff_path = match (skip_reason, prev_orig.as_deref()) {
+                (
+                    Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                        first_diff_index,
+                    }),
+                    Some(prev),
+                ) => cache_stabilization::prefix_replay::describe_divergence(
+                    prev,
+                    &original_messages,
+                    first_diff_index,
+                )
+                .unwrap_or_default(),
+                _ => String::new(),
+            },
+            // Which block kinds sat on each side of that difference. A
+            // `tool_result` that vanished points at something collapsing tool
+            // output in front of the client; an ordinary text change points at
+            // a real edit. Type names only, never block contents.
+            diff_shape_stored = match (skip_reason, prev_orig.as_deref()) {
+                (
+                    Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                        first_diff_index,
+                    }),
+                    Some(prev),
+                ) => prev
+                    .get(first_diff_index)
+                    .map(cache_stabilization::prefix_replay::block_type_shape)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            diff_shape_current = match skip_reason {
+                Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                    first_diff_index,
+                }) => original_messages
+                    .get(first_diff_index)
+                    .map(cache_stabilization::prefix_replay::block_type_shape)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            // What the text blocks on each side WERE. The shapes above say a
+            // `text` block came or went; these say whether it was the client's
+            // own ephemeral scaffolding or real content, which is the
+            // difference between churn we could neutralise and an edit we must
+            // respect. Closed vocabulary, never the text.
+            diff_text_kinds_stored = match (skip_reason, prev_orig.as_deref()) {
+                (
+                    Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                        first_diff_index,
+                    }),
+                    Some(prev),
+                ) => prev
+                    .get(first_diff_index)
+                    .map(cache_stabilization::prefix_replay::text_block_kinds)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            diff_text_kinds_current = match skip_reason {
+                Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                    first_diff_index,
+                }) => original_messages
+                    .get(first_diff_index)
+                    .map(cache_stabilization::prefix_replay::text_block_kinds)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            stored_prefix_msgs = prev_orig.as_deref().map(|o| o.len()).unwrap_or(0),
+            current_original_msgs = original_messages.len(),
+            optimized_msgs = optimized.len(),
+            // Which run of turns this one continues, `0` for none. Grouping by
+            // conversation key or by message count cannot separate a branch, a
+            // compaction and a second stream — three wrong conclusions came
+            // from that on 2026-08-09. This can.
+            chain_id = chain_id,
+            "prefix replay declined: forwarding this turn's own bytes"
+        );
+    }
+    // Anthropic counts `cache_control` across `system`, `tools` and `messages`
+    // together and refuses the whole request past 4. The message slots are the
+    // only ones this proxy can give up, so they yield to whatever the client set
+    // on `system` and PR-E3 set on `tools`. Counted before any system stripping
+    // below, which errs low — a slot freed there goes unused rather than risking
+    // the sum.
+    let (allowed_slots, reserved_slots) = tail_slots_within_budget(&parsed, tail_breakpoints);
+    if allowed_slots < tail_breakpoints {
+        tracing::warn!(
+            event = "cache_marker_budget_clamped",
+            request_id = %request_id,
+            requested = tail_breakpoints,
+            allowed = allowed_slots,
+            reserved_by_system_and_tools = reserved_slots,
+            limit = ANTHROPIC_CACHE_CONTROL_LIMIT,
+            "cache_control budget: placing fewer message breakpoints than asked \
+             to keep the request under the provider's limit"
+        );
+    }
+    let (normalized, breakpoints_placed) = place_tail_cache_breakpoints(overlaid, allowed_slots);
+    // Anthropic refuses a turn whose signed `thinking` blocks changed, naming a
+    // message index but not who changed it. Both the client and this proxy
+    // rewrite history, so a rejection is unattributable without knowing which
+    // messages WE altered. Report that, and single out the altered ones that
+    // carry a thinking block — if a rejection's index appears here, the proxy
+    // caused it. Indices and counts only.
+    let rewritten = rewritten_message_report(&original_messages, &normalized);
+    if !rewritten.indices.is_empty() || !rewritten.thinking_touched.is_empty() {
+        tracing::info!(
+            event = "messages_rewritten",
+            request_id = %request_id,
+            rewritten_count = rewritten.indices.len(),
+            rewritten_indices = %join_indices(&rewritten.indices),
+            // The ones that can be refused. Empty here means a thinking-block
+            // rejection came from the client's own edits, not ours.
+            rewritten_with_thinking_count = rewritten.with_thinking.len(),
+            rewritten_with_thinking_indices = %join_indices(&rewritten.with_thinking),
+            // Signed blocks altered on the wire, `cache_control` included. The
+            // provider refuses these outright, so a non-empty list is a defect
+            // regardless of how much it saves.
+            thinking_touched_count = rewritten.thinking_touched.len(),
+            thinking_touched_indices = %join_indices(&rewritten.thinking_touched),
+            total_messages = original_messages.len(),
+            // The bytes of the earliest messages exactly as forwarded, so two
+            // consecutive turns can be diffed to name the first one that moved.
+            // The drift detector cannot answer this: it filters ephemeral blocks
+            // before comparing and the provider does not, so it calls a prefix
+            // stable while the provider re-creates it.
+            early_fingerprints = %early_message_fingerprints(&normalized, 5),
+            "messages this proxy altered before forwarding"
+        );
+    }
+    // Only once a message breakpoint is in place. With none placed the client's
+    // system markers are the only ones on the request, and dropping them would
+    // turn caching off rather than move it.
+    let system_markers_dropped = if strip_system_breakpoints && breakpoints_placed > 0 {
+        strip_system_cache_control(&mut parsed)
+    } else {
+        0
+    };
+    let changed = normalized != optimized || system_markers_dropped > 0;
 
     let (final_body, forwarded_messages) = if changed {
         parsed["messages"] = serde_json::Value::Array(normalized.clone());
         match serde_json::to_vec(&parsed) {
             Ok(b) => {
+                if replayed_prefix {
+                    if let Some(observer) = observer {
+                        observer.note_replay_applied(
+                            request_id,
+                            cache_stabilization::usage_observer::ReplayAppliedEvidence::new(
+                                chain_id,
+                                breakpoints_placed,
+                                system_markers_dropped,
+                            ),
+                        );
+                    }
+                }
                 tracing::info!(
                     event = "prefix_replay_applied",
                     request_id = %request_id,
                     replayed_prefix = replayed_prefix,
+                    chain_id = chain_id,
+                    // What went out on the wire, so a run can be attributed to
+                    // its placement rather than to the flag it was started with.
+                    breakpoints_placed = breakpoints_placed,
+                    system_markers_dropped = system_markers_dropped,
                     "prefix replay: forwarded messages rewritten \
                      (prefix replay and/or cache_control normalization)"
                 );
