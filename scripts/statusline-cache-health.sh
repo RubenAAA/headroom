@@ -19,15 +19,41 @@
 # headroom is actually running.
 #
 # Events are classified by the proxy (last_event.event_kind):
-#   drift    → ⚠ genuine structural cache bust, shown RECACHE_DRIFT_WINDOW s
-#   expected → ℹ session reset (subagent close, /clear) — tokens not
-#              actually wasted, shown RECACHE_EXPECTED_WINDOW s
+#   drift    → ⚠ directly attributed cache bust, shown RECACHE_DRIFT_WINDOW s
+#   expected → ℹ no direct causal evidence; the event is unattributed, shown
+#              RECACHE_EXPECTED_WINDOW s
 # then falls back to the ambient ratio.
+#
+# Ahead of all of that: if upstream is refusing a meaningful share of forwarded
+# turns (`upstream.verdict` from the proxy), say so instead. That costs more
+# than any cache behaviour this script reports.
 set -u
 
 HEALTH_URL="${HEADROOM_CACHE_HEALTH_URL:-http://127.0.0.1:8787/cache-health}"
 RECACHE_DRIFT_WINDOW="${HEADROOM_RECACHE_DRIFT_WINDOW:-180}"
 RECACHE_EXPECTED_WINDOW="${HEADROOM_RECACHE_EXPECTED_WINDOW:-60}"
+
+# Focused in-file regression test. Keeping the fixture here lets this standalone
+# script prove its rendering without adding a test harness or touching another
+# file in a deliberately narrow patch.
+if [ "${1:-}" = "--self-test" ]; then
+    fixture='{"upstream":{"verdict":"healthy"},"last_event_age_seconds":4,"last_event":{"event_kind":"branch","attribution_reason":"inbound_tail_replaced","origin":"inbound","scope":"final_message","wasted_tokens":0,"cache_creation_input_tokens":12345}}'
+    actual=$(HEADROOM_STATUSLINE_TEST_HEALTH="$fixture" "${BASH_SOURCE[0]}" --segment)
+    expected='ℹ branch/cache build 4s ago: inbound final message replaced, ~12K tok cached (not waste)'
+    if [ "$actual" != "$expected" ]; then
+        printf 'not ok - inbound tail build\nexpected: %s\nactual:   %s\n' "$expected" "$actual" >&2
+        exit 1
+    fi
+    fixture='{"upstream":{"verdict":"healthy"},"last_event_age_seconds":13,"last_event":{"event_kind":"provider_miss","attribution_reason":"provider_miss_after_replay","origin":"provider_cache","scope":"replayed_prefix","wasted_tokens":48669,"cache_creation_input_tokens":48669,"replayed_prefix":true,"replay_chain_id":2,"breakpoints_placed":2,"system_markers_dropped":0}}'
+    actual=$(HEADROOM_STATUSLINE_TEST_HEALTH="$fixture" "${BASH_SOURCE[0]}" --segment)
+    expected='⚠ recache 13s ago: provider miss after confirmed replay, ~48K tok wasted'
+    if [ "$actual" != "$expected" ]; then
+        printf 'not ok - provider miss after replay\nexpected: %s\nactual:   %s\n' "$expected" "$actual" >&2
+        exit 1
+    fi
+    printf 'ok - branch build and provider miss evidence are rendered\n'
+    exit 0
+fi
 
 segment_only=0
 if [ "${1:-}" = "--segment" ]; then
@@ -43,7 +69,11 @@ if [ "$segment_only" -eq 0 ]; then
     [ -n "$cwd" ] && prefix="${prefix:+$prefix | }$(basename "$cwd")"
 fi
 
-health=$(curl -fsS --max-time 1 "$HEALTH_URL" 2>/dev/null)
+if [ -n "${HEADROOM_STATUSLINE_TEST_HEALTH:-}" ]; then
+    health="$HEADROOM_STATUSLINE_TEST_HEALTH"
+else
+    health=$(curl -fsS --max-time 1 "$HEALTH_URL" 2>/dev/null)
+fi
 if [ -z "$health" ]; then
     # Segment mode: headroom not running → occupy no space at all.
     [ "$segment_only" -eq 1 ] && exit 0
@@ -51,10 +81,25 @@ if [ -z "$health" ]; then
     exit 0
 fi
 
+# Refusals outrank any cache news. A re-cached prefix costs tokens; a refused
+# turn loses the work and re-caches anyway. This is the line that was missing
+# while a fifth of subagent turns were being rejected.
+verdict=$(printf '%s' "$health" | jq -r '.upstream.verdict // "healthy"')
+# An empty result means jq failed or the proxy predates this field — not a
+# refusal. Only an explicit non-healthy verdict takes over the line.
+if [ -n "$verdict" ] && [ "$verdict" != "healthy" ]; then
+    pct=$(printf '%s' "$health" | jq -r '.upstream.recent_refused_pct // 0')
+    why=$(printf '%s' "$health" | jq -r '.upstream.last_error_type // "unknown"')
+    # "elevated" is under the alert threshold — worth seeing, not worth alarm.
+    if [ "$verdict" = "elevated" ]; then mark="⚠"; else mark="✖"; fi
+    printf '%s\n' "${prefix:+$prefix | }${mark} upstream refusing ${pct}% of turns (${why})"
+    exit 0
+fi
+
 age=$(printf '%s' "$health" | jq -r '.last_event_age_seconds // empty')
 if [ -n "$age" ]; then
     kind=$(printf '%s' "$health" | jq -r '.last_event.event_kind // "drift"')
-    if [ "$kind" = "expected" ]; then
+    if [ "$kind" = "expected" ] || [ "$kind" = "branch" ]; then
         window="$RECACHE_EXPECTED_WINDOW"
     else
         window="$RECACHE_DRIFT_WINDOW"
@@ -64,10 +109,26 @@ if [ -n "$age" ]; then
         if [ "$wasted" -ge 1000 ]; then
             wasted="$((wasted / 1000))K"
         fi
-        if [ "$kind" = "expected" ]; then
-            printf '%s\n' "${prefix:+$prefix | }ℹ cache drop ${age}s ago: session reset (subagent/clear), ~${wasted} tok re-cached"
+        if [ "$kind" = "branch" ]; then
+            reason=$(printf '%s' "$health" | jq -r '.last_event.attribution_reason // empty')
+            origin=$(printf '%s' "$health" | jq -r '.last_event.origin // empty')
+            scope=$(printf '%s' "$health" | jq -r '.last_event.scope // empty')
+            created=$(printf '%s' "$health" | jq -r '.last_event.cache_creation_input_tokens // 0')
+            if [ "$created" -ge 1000 ]; then
+                created="$((created / 1000))K"
+            fi
+            if [ "$reason" = "inbound_tail_replaced" ] && [ "$origin" = "inbound" ] && [ "$scope" = "final_message" ]; then
+                printf '%s\n' "${prefix:+$prefix | }ℹ branch/cache build ${age}s ago: inbound final message replaced, ~${created} tok cached (not waste)"
+            else
+                printf '%s\n' "${prefix:+$prefix | }ℹ branch/cache build ${age}s ago: ~${created} tok cached (not waste)"
+            fi
+        elif [ "$kind" = "expected" ]; then
+            printf '%s\n' "${prefix:+$prefix | }ℹ cache drop ${age}s ago: cause unattributed, ~${wasted} tok re-cached"
+        elif [ "$kind" = "provider_miss" ]; then
+            printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: provider miss after confirmed replay, ~${wasted} tok wasted"
         else
-            reason=$(printf '%s' "$health" | jq -r '.last_event.drift_dims // "unknown cause"')
+            # `drift_dims` keeps this useful against older proxy payloads.
+            reason=$(printf '%s' "$health" | jq -r '([.last_event.attribution_reason, .last_event.drift_dims] | map(select(type == "string" and length > 0)) | first) // "unknown cause"')
             printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: ${reason}, ~${wasted} tok wasted"
         fi
         exit 0

@@ -7,11 +7,9 @@
 //!
 //! # Cardinality
 //!
-//! `reason` is bounded to a fixed vocabulary derived from the PR-E6
-//! drift dimensions: `system`, `tools`, `early_messages`, `multi`
-//! (more than one axis drifted), and `expected` (drift detector saw
-//! stable bytes — a conversation-context reset such as a subagent
-//! closing or `/clear`; not actually wasted tokens).
+//! `reason` is bounded to a fixed vocabulary derived from direct
+//! attribution evidence: structural drift dimensions, causal replay-skip
+//! reasons, and `unknown` when no such evidence exists.
 
 use std::sync::OnceLock;
 
@@ -56,26 +54,40 @@ fn wasted_tokens_counter(registry: &Registry) -> &'static IntCounter {
     })
 }
 
-/// Map PR-E6 drift dims (comma-joined, e.g. `"tools"` or
-/// `"system,tools"`) to the bounded label vocabulary.
-fn reason_label(drift_dims: Option<&str>) -> &'static str {
-    match drift_dims {
+/// Map an evidence-only attribution reason to a bounded label vocabulary.
+fn reason_label(attribution_reason: Option<&str>) -> &'static str {
+    match attribution_reason {
         Some("system") => "system",
         Some("tools") => "tools",
         Some("early_messages") => "early_messages",
+        Some("inbound_tail_replaced") => "inbound_tail_replaced",
+        Some("provider_miss_after_replay") => "provider_miss_after_replay",
+        Some("prefix_content_diverged") => "prefix_content_diverged",
+        Some("forwarded_count_mismatch") => "forwarded_count_mismatch",
+        Some("shorter_than_stored_prefix") => "shorter_than_stored_prefix",
+        Some("optimized_shorter_than_prefix") => "optimized_shorter_than_prefix",
         Some(s) if s.contains(',') => "multi",
-        _ => "expected",
+        // A non-empty structural dimension added in the future is still
+        // evidence, but must not create an unbounded label value.
+        Some(_) => "structural_drift",
+        None => "unknown",
+    }
+}
+
+fn observe_wasted_tokens(counter: &IntCounter, wasted_tokens: Option<u64>) {
+    if let Some(wasted_tokens) = wasted_tokens {
+        counter.inc_by(wasted_tokens);
     }
 }
 
 /// Record one re-cache event. Called by the usage observer off the
 /// client byte path.
-pub fn observe_recache_event(drift_dims: Option<&str>, wasted_tokens: u64) {
+pub fn observe_recache_event(attribution_reason: Option<&str>, wasted_tokens: Option<u64>) {
     let registry = super::prometheus::registry();
     events_counter(registry)
-        .with_label_values(&[reason_label(drift_dims)])
+        .with_label_values(&[reason_label(attribution_reason)])
         .inc();
-    wasted_tokens_counter(registry).inc_by(wasted_tokens);
+    observe_wasted_tokens(wasted_tokens_counter(registry), wasted_tokens);
 }
 
 #[cfg(test)]
@@ -87,19 +99,45 @@ mod tests {
         assert_eq!(reason_label(Some("tools")), "tools");
         assert_eq!(reason_label(Some("system")), "system");
         assert_eq!(reason_label(Some("early_messages")), "early_messages");
+        assert_eq!(
+            reason_label(Some("inbound_tail_replaced")),
+            "inbound_tail_replaced"
+        );
+        assert_eq!(
+            reason_label(Some("provider_miss_after_replay")),
+            "provider_miss_after_replay"
+        );
         assert_eq!(reason_label(Some("system,tools")), "multi");
-        assert_eq!(reason_label(Some("weird_future_dim")), "expected");
-        assert_eq!(reason_label(None), "expected");
+        assert_eq!(
+            reason_label(Some("prefix_content_diverged")),
+            "prefix_content_diverged"
+        );
+        assert_eq!(reason_label(Some("weird_future_dim")), "structural_drift");
+        assert_eq!(reason_label(None), "unknown");
     }
 
     #[test]
     fn counters_accumulate() {
         let registry = crate::observability::prometheus::registry();
         let before = wasted_tokens_counter(registry).get();
-        observe_recache_event(Some("tools"), 1234);
+        observe_recache_event(Some("tools"), Some(1234));
         // Other tests in this binary also drive the shared global
         // counter concurrently, so assert a lower bound, not equality.
         assert!(wasted_tokens_counter(registry).get() >= before + 1234);
         assert!(events_counter(registry).with_label_values(&["tools"]).get() >= 1);
+    }
+
+    #[test]
+    fn branch_cache_build_does_not_increment_prometheus_waste() {
+        let counter = IntCounter::new("branch_build_waste_test", "test counter").unwrap();
+        observe_wasted_tokens(&counter, None);
+        assert_eq!(counter.get(), 0);
+
+        observe_wasted_tokens(&counter, Some(123));
+        assert_eq!(
+            counter.get(),
+            123,
+            "charged events still increment normally"
+        );
     }
 }
