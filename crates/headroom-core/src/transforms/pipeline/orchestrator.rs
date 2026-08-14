@@ -52,6 +52,12 @@
 //! tool-call response and MUST NOT panic.
 
 use std::collections::HashMap;
+
+fn short_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -221,6 +227,18 @@ impl CompressionPipeline {
             }
             match transform.apply(&current) {
                 Ok(out) => {
+                    tracing::debug!(
+                        target: "headroom::pipeline",
+                        event = "transform_byte_integrity",
+                        transform = transform.name(),
+                        input_bytes = current.len(),
+                        output_bytes = out.output.len(),
+                        bytes_saved = out.bytes_saved,
+                        input_hash = %short_hash(&current),
+                        output_hash = %short_hash(&out.output),
+                        changed = current != out.output,
+                        "reformat transform output boundary"
+                    );
                     if out.bytes_saved == 0 {
                         continue;
                     }

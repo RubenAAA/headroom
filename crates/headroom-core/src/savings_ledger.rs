@@ -171,6 +171,9 @@ pub struct SavingsEvent<'a> {
     pub source: Option<&'a str>,
     pub timestamp: Option<DateTime<Utc>>,
     pub cost_usd: Option<f64>,
+    /// How `cost_usd` was priced (`fresh_input` or `cache_read`). Absent on
+    /// legacy events whose placement was not measured.
+    pub cost_basis: Option<&'a str>,
     pub fallback_rate: Option<f64>,
     pub path: Option<&'a Path>,
 }
@@ -194,6 +197,20 @@ pub fn record_from_forwarded(
     model: Option<&str>,
     client: Option<&str>,
 ) -> bool {
+    record_from_forwarded_with_cost(forwarded_tokens, tokens_saved, model, client, None, None)
+}
+
+/// As [`record_from_forwarded`], with a request-scoped price derived from the
+/// provider's cache usage. New proxy paths use this; the legacy helper remains
+/// for callers that genuinely have no placement measurement.
+pub fn record_from_forwarded_with_cost(
+    forwarded_tokens: i64,
+    tokens_saved: i64,
+    model: Option<&str>,
+    client: Option<&str>,
+    cost_usd: Option<f64>,
+    cost_basis: Option<&str>,
+) -> bool {
     if tokens_saved <= 0 {
         return false;
     }
@@ -204,7 +221,8 @@ pub fn record_from_forwarded(
         client: Some(client.unwrap_or("proxy")),
         source: Some("proxy"),
         timestamp: None,
-        cost_usd: None,
+        cost_usd,
+        cost_basis,
         fallback_rate: None,
         path: None,
     })
@@ -243,6 +261,9 @@ pub fn record_savings_event(event: SavingsEvent) -> bool {
     obj.insert("after".into(), json!(after));
     obj.insert("saved".into(), json!(saved));
     obj.insert("cost_usd".into(), json!(round_half_even(cost, 6)));
+    if let Some(basis) = event.cost_basis {
+        obj.insert("cost_basis".into(), json!(basis));
+    }
     obj.insert("model".into(), json!(model_label));
     obj.insert("client".into(), json!(label(event.client)));
     obj.insert("source".into(), json!(event.source.unwrap_or(UNKNOWN)));
@@ -652,6 +673,26 @@ mod tests {
     fn record_from_forwarded_ignores_a_non_saving_request() {
         assert!(!record_from_forwarded(600, 0, Some("m"), None));
         assert!(!record_from_forwarded(600, -5, Some("m"), None));
+    }
+
+    #[test]
+    fn request_scoped_cost_and_basis_are_written_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savings_events.jsonl");
+        assert!(record_savings_event(SavingsEvent {
+            tokens_before: 1_000,
+            tokens_after: 0,
+            model: Some("claude-opus-5"),
+            cost_usd: Some(0.0015),
+            cost_basis: Some("cache_read"),
+            path: Some(&path),
+            ..Default::default()
+        }));
+
+        let line: Value =
+            serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        assert_eq!(line["cost_usd"], json!(0.0015));
+        assert_eq!(line["cost_basis"], json!("cache_read"));
     }
 
     #[test]

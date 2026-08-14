@@ -351,7 +351,19 @@ fn main() {
 }
 
 fn client() -> reqwest::blocking::Client {
+    // The ctx stores are sharded per project, and the proxy reads the project
+    // off this header. Sending the CLI's own working directory is what makes
+    // `headroom ctx search` search the project it was run from rather than the
+    // shared bucket.
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(cwd) = std::env::current_dir()
+        .ok()
+        .and_then(|d| reqwest::header::HeaderValue::from_str(&d.to_string_lossy()).ok())
+    {
+        headers.insert("x-headroom-cwd", cwd);
+    }
     reqwest::blocking::Client::builder()
+        .default_headers(headers)
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("failed to build HTTP client")
@@ -804,20 +816,44 @@ fn cmd_perf(hours: f64, raw: bool, output_format: &str) -> Result<(), Box<dyn st
 // the Tier 1/2 checks local and explicit.
 // ---------------------------------------------------------------------------
 
+fn proxy_health_urls(proxy_url: &str) -> [String; 2] {
+    let base = proxy_url.trim_end_matches('/');
+    // The Rust proxy owns /healthz. Keep /livez as a 404-only fallback for a
+    // direct legacy Python proxy, where it remains the liveness endpoint.
+    [format!("{base}/healthz"), format!("{base}/livez")]
+}
+
+fn probe_proxy_health(proxy_url: &str) -> serde_json::Value {
+    let urls = proxy_health_urls(proxy_url);
+    for (index, url) in urls.iter().enumerate() {
+        match client().get(url).send() {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.as_u16() == 404 && index + 1 < urls.len() {
+                    continue;
+                }
+                return serde_json::json!({
+                    "url": url,
+                    "ok": status.is_success(),
+                    "status": status.as_u16(),
+                    "endpoint": if index == 0 { "healthz" } else { "livez" },
+                });
+            }
+            Err(e) => {
+                return serde_json::json!({
+                    "url": url,
+                    "ok": false,
+                    "endpoint": if index == 0 { "healthz" } else { "livez" },
+                    "error": e.to_string(),
+                });
+            }
+        }
+    }
+    unreachable!("the health probe always has a primary endpoint")
+}
+
 fn cmd_doctor(proxy_url: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let livez_url = format!("{}/livez", proxy_url.trim_end_matches('/'));
-    let proxy = match client().get(&livez_url).send() {
-        Ok(resp) => serde_json::json!({
-            "url": livez_url,
-            "ok": resp.status().is_success(),
-            "status": resp.status().as_u16(),
-        }),
-        Err(e) => serde_json::json!({
-            "url": livez_url,
-            "ok": false,
-            "error": e.to_string(),
-        }),
-    };
+    let proxy = probe_proxy_health(proxy_url);
     let path_status = |name: &str, path: std::path::PathBuf| {
         serde_json::json!({
             "name": name,
@@ -826,7 +862,7 @@ fn cmd_doctor(proxy_url: &str, json: bool) -> Result<(), Box<dyn std::error::Err
         })
     };
     let checks = serde_json::json!({
-        "proxy_livez": proxy,
+        "proxy_health": proxy,
         "paths": [
             path_status("workspace", headroom_core::paths::workspace_dir()),
             path_status("config", headroom_core::paths::config_dir()),
@@ -840,10 +876,10 @@ fn cmd_doctor(proxy_url: &str, json: bool) -> Result<(), Box<dyn std::error::Err
     if json {
         println!("{}", serde_json::to_string_pretty(&checks)?);
     } else {
-        let proxy = &checks["proxy_livez"];
+        let proxy = &checks["proxy_health"];
         println!("Headroom doctor (reduced Rust)");
         println!(
-            "proxy livez: {} ({})",
+            "proxy health: {} ({})",
             if proxy["ok"].as_bool().unwrap_or(false) {
                 "ok"
             } else {
@@ -868,7 +904,7 @@ fn cmd_doctor(proxy_url: &str, json: bool) -> Result<(), Box<dyn std::error::Err
             );
         }
     }
-    let ok = checks["proxy_livez"]["ok"].as_bool().unwrap_or(false);
+    let ok = checks["proxy_health"]["ok"].as_bool().unwrap_or(false);
     if !ok {
         std::process::exit(1);
     }
@@ -996,16 +1032,28 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
     }
 
     println!();
+    println!("Compression reduction on saving turns");
+    println!("Scope: pre-compression input selected by transforms; not all provider input.");
     println!("{}", window_line("Today", &report.windows["today"]));
     println!(
         "{}",
         window_line("Last 7 days", &report.windows["last_7_days"])
     );
-    println!("{}", window_line("All time", &report.windows["all_time"]));
+    // The ledger is capped at `MAX_RETENTION_DAYS`, so no all-time total
+    // exists to print. Asking for one returned null, which rendered as a
+    // "0 / 0 tokens" row underneath two populated ones.
+    let span = (days as i64).min(headroom_core::savings_ledger::MAX_RETENTION_DAYS);
+    println!(
+        "{}",
+        window_line(
+            &format!("Last {span} days"),
+            &report.windows["last_30_days"]
+        )
+    );
 
     if !report.by_model.is_empty() {
         println!();
-        println!("Cost avoided per model:");
+        println!("Estimated cost avoided per model:");
         for row in &report.by_model {
             let model = row
                 .get("model")
@@ -1014,6 +1062,8 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
             let cost = row.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
             println!("  {:<24} {}", model, fmt_money(cost, 4));
         }
+        println!("  Legacy note: rows without cost_basis assumed fresh-input pricing;");
+        println!("  newer proxy rows use the measured fresh/cache-read placement.");
     }
 
     if !report.by_client.is_empty() {
@@ -1059,7 +1109,7 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     format!(
-        "{:<11} {} {:>5.1}%  saved {} / {} tokens  {}",
+        "{:<11} {} {:>5.1}%  saved {} / {} selected tokens  {}",
         label,
         bar(pct),
         pct,
@@ -1217,7 +1267,18 @@ mod tests {
         let line = window_line("Today", &w);
         assert!(line.starts_with("Today      ")); // label left-justified width 11
         assert!(line.contains(" 50.0%"));
-        assert!(line.contains("saved 500 / 1,000 tokens"));
+        assert!(line.contains("saved 500 / 1,000 selected tokens"));
         assert!(line.contains("$0.0018"));
+    }
+
+    #[test]
+    fn doctor_prefers_the_rust_health_endpoint_with_legacy_fallback() {
+        assert_eq!(
+            proxy_health_urls("http://127.0.0.1:8787/"),
+            [
+                "http://127.0.0.1:8787/healthz".to_string(),
+                "http://127.0.0.1:8787/livez".to_string(),
+            ]
+        );
     }
 }

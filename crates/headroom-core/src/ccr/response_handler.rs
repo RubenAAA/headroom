@@ -228,6 +228,12 @@ impl CCRResponseHandler {
                         .unwrap_or("")
                         .to_string()
                 };
+                if tool_call_id.is_empty() {
+                    tracing::warn!(
+                        provider,
+                        "CCR tool call has no identifier; retrieval result cannot be matched"
+                    );
+                }
                 ccr_calls.push(CcrToolCall {
                     tool_call_id,
                     hash_key,
@@ -524,12 +530,25 @@ impl StreamingCcrHandler {
         events
     }
 
+    /// Append `extra` to `obj`'s string field `field`, creating it if absent.
+    fn append_str_field(obj: &mut Value, field: &str, extra: &str) {
+        if extra.is_empty() {
+            return;
+        }
+        let existing = obj.get(field).and_then(Value::as_str).unwrap_or("");
+        obj[field] = Value::String(format!("{existing}{extra}"));
+    }
+
     /// Reconstruct a full Anthropic response from stream events.
     fn reconstruct_anthropic_response(&self, events: &[Value]) -> Value {
         let mut content: Vec<Value> = Vec::new();
         let mut stop_reason: Option<Value> = None;
         let mut current_text = String::new();
         let mut current_tool: Option<Value> = None;
+        // Thinking blocks are carried through verbatim: the provider signs them
+        // and rejects the turn if a single byte differs, so the streamed block
+        // is cloned and only its own deltas are appended to it.
+        let mut current_thinking: Option<Value> = None;
 
         for event in events {
             let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
@@ -553,6 +572,9 @@ impl StreamingCcrHandler {
                                     "input": {},
                                     "_partial_json": "",
                                 }));
+                            }
+                            Some("thinking") | Some("redacted_thinking") => {
+                                current_thinking = Some(block.clone());
                             }
                             _ => {}
                         }
@@ -580,11 +602,37 @@ impl StreamingCcrHandler {
                                     }
                                 }
                             }
+                            Some("thinking_delta") => {
+                                if let Some(ref mut think) = current_thinking {
+                                    Self::append_str_field(
+                                        think,
+                                        "thinking",
+                                        delta.get("thinking").and_then(Value::as_str).unwrap_or(""),
+                                    );
+                                }
+                            }
+                            Some("signature_delta") => {
+                                if let Some(ref mut think) = current_thinking {
+                                    Self::append_str_field(
+                                        think,
+                                        "signature",
+                                        delta
+                                            .get("signature")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or(""),
+                                    );
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
                 "content_block_stop" => {
+                    // Thinking first: it is the block type the provider emits
+                    // ahead of text and tool_use in the same turn.
+                    if let Some(think) = current_thinking.take() {
+                        content.push(think);
+                    }
                     if !current_text.is_empty() {
                         content.push(serde_json::json!({
                             "type": "text",
@@ -1187,6 +1235,58 @@ mod tests {
         assert_eq!(response["content"][0]["type"], "text");
         assert_eq!(response["content"][0]["text"], "Hello world");
         assert_eq!(response["stop_reason"], "end_turn");
+    }
+
+    /// The provider signs thinking blocks and rejects the whole turn if one
+    /// byte of them differs from what it issued, so reassembly must carry the
+    /// text *and* the signature through. Dropping them silently poisoned every
+    /// continuation the handler built.
+    #[test]
+    fn streaming_handler_preserves_thinking_and_signature() {
+        let handler = CCRResponseHandler::new(None);
+        let stream_handler = StreamingCcrHandler::new(handler, "anthropic".to_string());
+
+        let sse_data = b"event: content_block_start\n\
+            data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one \"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step two\"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIGabc\"}}\n\n\
+            event: content_block_stop\n\
+            data: {\"type\":\"content_block_stop\"}\n\n\
+            event: content_block_start\n\
+            data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+            event: content_block_stop\n\
+            data: {\"type\":\"content_block_stop\"}\n\n";
+
+        let response = stream_handler.parse_sse_stream(sse_data);
+        assert_eq!(response["content"][0]["type"], "thinking");
+        assert_eq!(response["content"][0]["thinking"], "step one step two");
+        assert_eq!(response["content"][0]["signature"], "SIGabc");
+        // Thinking must not displace the rest of the turn.
+        assert_eq!(response["content"][1]["type"], "text");
+        assert_eq!(response["content"][1]["text"], "answer");
+    }
+
+    /// `redacted_thinking` carries an opaque `data` field and no deltas. It is
+    /// echoed back verbatim or the turn is refused just the same.
+    #[test]
+    fn streaming_handler_preserves_redacted_thinking() {
+        let handler = CCRResponseHandler::new(None);
+        let stream_handler = StreamingCcrHandler::new(handler, "anthropic".to_string());
+
+        let sse_data = b"event: content_block_start\n\
+            data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"OPAQUE\"}}\n\n\
+            event: content_block_stop\n\
+            data: {\"type\":\"content_block_stop\"}\n\n";
+
+        let response = stream_handler.parse_sse_stream(sse_data);
+        assert_eq!(response["content"][0]["type"], "redacted_thinking");
+        assert_eq!(response["content"][0]["data"], "OPAQUE");
     }
 
     #[test]

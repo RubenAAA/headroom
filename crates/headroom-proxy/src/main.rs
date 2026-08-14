@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config.model_routes,
         config.codex_auth_file.as_deref(),
     );
+    headroom_proxy::config::warn_on_shadowed_routes(&config.model_routes);
 
     tracing::info!(
         listen = %config.listen,

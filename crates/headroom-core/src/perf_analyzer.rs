@@ -1,8 +1,9 @@
 //! Analyze Headroom proxy logs for performance insights (Rust port of
 //! `headroom/perf/analyzer.py`).
 //!
-//! Parses PERF log lines from `~/.headroom/logs/proxy.log*` and produces
-//! reports on token savings, cache efficiency, and transform impact.
+//! Parses PERF log lines from the managed `proxy.log*` files and from the
+//! launcher-owned `~/headroom-proxy.log` (or `HEADROOM_PROXY_LOG_PATH`) and
+//! produces reports on token savings, cache efficiency, and transform impact.
 //!
 //! Deviations from Python: list prices come from the vendored
 //! [`crate::pricing`] table instead of LiteLLM; the TOIN-highlights section
@@ -11,7 +12,7 @@
 //! already renders the report without these sections when the backends are
 //! unavailable, so the degraded shape is identical.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -20,6 +21,11 @@ use regex::Regex;
 use serde::Serialize;
 
 use crate::paths;
+
+/// Explicit path to the active proxy stdout/stderr log. This is useful for
+/// launchers that redirect the Rust proxy's JSON tracing stream rather than
+/// configuring its legacy rotating `proxy.log` destination.
+pub const HEADROOM_PROXY_LOG_PATH_ENV: &str = "HEADROOM_PROXY_LOG_PATH";
 
 fn perf_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -253,7 +259,8 @@ impl Parser {
 
     fn feed_line(&mut self, raw_line: &str) {
         self.report.total_lines_parsed += 1;
-        let line = raw_line.trim_end();
+        let owned_line = normalize_json_log_line(raw_line);
+        let line = owned_line.as_deref().unwrap_or(raw_line).trim_end();
 
         if let Some(m) = stage_timings_re().captures(line) {
             let ts = &m["ts"];
@@ -395,21 +402,63 @@ impl Parser {
     }
 }
 
+/// Convert the Rust proxy's structured tracing output into the legacy textual
+/// shape the PERF parser already understands. The proxy writes JSON when its
+/// stdout is redirected by `claude-launcher` or the restart script; without
+/// this adapter `headroom perf` would find the correct file but report zero
+/// records.
+fn normalize_json_log_line(raw_line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw_line).ok()?;
+    let timestamp = value.get("timestamp")?.as_str()?;
+    let message = value.get("fields")?.get("message")?.as_str()?;
+    if !message.contains(" PERF ") {
+        return None;
+    }
+    let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()?
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S,%3f")
+        .to_string();
+    let target = value
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("headroom.proxy");
+    let level = value
+        .get("level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("INFO");
+    Some(format!("{timestamp} - {target} - {level} - {message}"))
+}
+
 /// Directory the proxy writes its logs to.
 pub fn log_dir() -> PathBuf {
     paths::workspace_dir().join("logs")
 }
 
-/// Parse all proxy log files (`proxy.log*`, oldest mtime first) and return
-/// structured records. `last_n_hours == 0` means all data.
-pub fn parse_log_files(last_n_hours: f64) -> PerfReport {
-    let mut parser = Parser::new(last_n_hours);
+fn configured_active_log() -> Option<PathBuf> {
+    let configured = std::env::var(HEADROOM_PROXY_LOG_PATH_ENV).ok();
+    if let Some(configured) = configured.map(|path| path.trim().to_string()) {
+        if !configured.is_empty() {
+            return Some(PathBuf::from(configured));
+        }
+    }
 
-    let dir = log_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return parser.report;
-    };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+    // A launcher-owned stdout log is the normal live path only under the
+    // default workspace. A workspace override is also how tests isolate their
+    // managed proxy.log fixtures, so never pull a user's live log into those.
+    if paths::env_workspace_dir_is_set() {
+        return None;
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("headroom-proxy.log"))
+}
+
+fn collect_log_files(
+    dir: &std::path::Path,
+    active_log: Option<PathBuf>,
+) -> Vec<(std::time::SystemTime, PathBuf)> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("proxy.log"))
         .filter_map(|e| {
@@ -417,7 +466,24 @@ pub fn parse_log_files(last_n_hours: f64) -> PerfReport {
             Some((mtime, e.path()))
         })
         .collect();
+    if let Some(path) = active_log {
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if let Ok(mtime) = metadata.modified() {
+                files.push((mtime, path));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    files.retain(|(_, path)| seen.insert(path.clone()));
     files.sort();
+    files
+}
+
+/// Parse managed `proxy.log*` files and the active launcher log, oldest mtime
+/// first, and return structured records. `last_n_hours == 0` means all data.
+pub fn parse_log_files(last_n_hours: f64) -> PerfReport {
+    let mut parser = Parser::new(last_n_hours);
+    let files = collect_log_files(&log_dir(), configured_active_log());
 
     for (_, path) in files {
         parser.report.log_files_read += 1;
@@ -1381,6 +1447,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_json_tracing_perf_line_from_rust_proxy() {
+        let line = r#"{"timestamp":"2026-06-10T06:00:00.000Z","level":"INFO","fields":{"message":"[rust-rid] PERF model=claude-sonnet-4 msgs=3 tok_before=1000 tok_after=80 tok_saved=920 cache_read=700 cache_write=12 cache_hit_pct=98 opt_ms=4 total_ms=9 tok_out=20 ttfb_ms=30 transforms=log_compressor"},"target":"headroom.proxy"}"#;
+        let report = parse_lines(&[line], 0.0);
+        assert_eq!(report.perf_records.len(), 1);
+        let record = &report.perf_records[0];
+        assert_eq!(record.request_id, "rust-rid");
+        assert_eq!(record.cache_read, 700);
+        assert_eq!(record.cache_write, 12);
+        assert_eq!(record.transforms, vec!["log_compressor"]);
+    }
+
+    #[test]
     fn perf_transforms_star_format_strips_counts() {
         let line = "2026-06-10 10:00:00,000 - headroom.proxy - INFO - [rid] PERF model=m \
                     msgs=1 tok_before=1 tok_after=1 tok_saved=0 transforms=router:excluded:tool*32 read_lifecycle:stale*17";
@@ -1583,5 +1661,21 @@ mod tests {
         assert_eq!(report.log_files_read, 2);
         assert_eq!(report.perf_records.len(), 2);
         assert_eq!(report.total_lines_parsed, 2);
+    }
+
+    #[test]
+    fn collect_log_files_includes_the_active_launcher_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("logs");
+        std::fs::create_dir_all(&managed).unwrap();
+        let managed_log = managed.join("proxy.log");
+        let active_log = dir.path().join("headroom-proxy.log");
+        std::fs::write(&managed_log, PERF_LINE).unwrap();
+        std::fs::write(&active_log, PERF_LINE).unwrap();
+
+        let files = collect_log_files(&managed, Some(active_log.clone()));
+        let paths: Vec<PathBuf> = files.into_iter().map(|(_, path)| path).collect();
+        assert!(paths.contains(&managed_log));
+        assert!(paths.contains(&active_log));
     }
 }

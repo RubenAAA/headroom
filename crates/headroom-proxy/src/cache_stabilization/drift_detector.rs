@@ -33,6 +33,14 @@
 //! detector is a pure observer and the proxy's "passthrough is sacred"
 //! invariant (Phase A) is preserved by construction.
 //!
+//! Each drift event also carries `early_drift`, which breaks the
+//! `early_messages` axis down to the slot and content block that moved
+//! (`0:blocks 1->2`, `0:block[1]`, `1:dropped`). Naming the dimension
+//! was never enough to find the component responsible; naming the block
+//! separates an inserted block from a rewritten one, which is the
+//! difference between an injector and a rewriter. See
+//! [`early_drift_detail`] for the vocabulary.
+//!
 //! Known trade-off: without an explicit `x-headroom-session-id`, the
 //! session identity is anchored on the conversation's first message
 //! (see [`conversation_discriminator`]), so a client that *rewrites*
@@ -71,6 +79,7 @@
 //!   (left for Phase F PR-F* when the global Prometheus registry can
 //!   accept session-scoped counters without a cardinality explosion).
 
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
@@ -113,12 +122,46 @@ pub struct StructuralHash {
     pub system: [u8; 32],
     pub tools: [u8; 32],
     pub early_messages: [Option<[u8; 32]>; EARLY_MESSAGES_WINDOW],
+    /// Block-level breakdown of the same early messages, kept so a
+    /// drift event can say *what* changed inside a slot rather than
+    /// only that the slot changed. Purely diagnostic — the drift
+    /// decision reads [`StructuralHash::early_messages`].
+    pub early_shapes: [Option<MessageShape>; EARLY_MESSAGES_WINDOW],
 }
 
 /// How many message-shaped items count as the "early" prefix that
 /// feeds [`early_message_hashes`]. Anything past this is the live zone
 /// (where mutation is expected; we deliberately ignore it).
 pub const EARLY_MESSAGES_WINDOW: usize = 3;
+
+/// How many content blocks of one early message get an individual
+/// fingerprint. Eight covers every real first message observed from
+/// Claude Code and the Codex CLI; a change past that still shows up as
+/// drift, just without a block index attached.
+pub const EARLY_BLOCKS_WINDOW: usize = 8;
+
+/// Block-level fingerprint of one early message.
+///
+/// Answers the question a bare `early_messages` drift cannot: was a
+/// block *inserted* (count moved), or was an existing one *rewritten*
+/// (count held, one hash moved)? Those two point at different
+/// components — an injector versus a rewriter — and telling them apart
+/// is the whole reason this exists.
+///
+/// Block hashes are truncated to 8 bytes. They only ever have to
+/// answer "same or different" within one session's log line, and 64
+/// bits does that without making every cached fingerprint three times
+/// larger. Blocks are canonicalized before hashing exactly as the
+/// message-level hash is, so a relocated `cache_control` breakpoint
+/// does not read as a rewritten block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageShape {
+    /// Content blocks in the message, or `None` for a plain string
+    /// body (which has no block structure to index into).
+    pub blocks: Option<usize>,
+    /// One hash per block, capped at [`EARLY_BLOCKS_WINDOW`].
+    pub block_hashes: [Option<[u8; 8]>; EARLY_BLOCKS_WINDOW],
+}
 
 /// Compute a [`StructuralHash`] for the body shape implied by `kind`.
 ///
@@ -128,11 +171,12 @@ pub const EARLY_MESSAGES_WINDOW: usize = 3;
 pub fn compute_structural_hash(body: &serde_json::Value, kind: ApiKind) -> StructuralHash {
     let system = hash_value(&canonicalize_for_hash(&extract_system(body, kind), false));
     let tools = hash_value(&canonicalize_for_hash(&extract_tools(body), false));
-    let early_messages = early_message_hashes(body, kind);
+    let (early_messages, early_shapes) = early_message_hashes(body, kind);
     StructuralHash {
         system,
         tools,
         early_messages,
+        early_shapes,
     }
 }
 
@@ -271,16 +315,84 @@ fn conversation_messages(body: &serde_json::Value, kind: ApiKind) -> Vec<&serde_
 fn early_message_hashes(
     body: &serde_json::Value,
     kind: ApiKind,
-) -> [Option<[u8; 32]>; EARLY_MESSAGES_WINDOW] {
+) -> (
+    [Option<[u8; 32]>; EARLY_MESSAGES_WINDOW],
+    [Option<MessageShape>; EARLY_MESSAGES_WINDOW],
+) {
     let mut out = [None; EARLY_MESSAGES_WINDOW];
+    let mut shapes = [None; EARLY_MESSAGES_WINDOW];
     for (slot, msg) in conversation_messages(body, kind)
         .into_iter()
         .take(EARLY_MESSAGES_WINDOW)
         .enumerate()
     {
-        out[slot] = Some(hash_value(&canonicalize_for_hash(msg, false)));
+        let msg = string_content_as_block(msg);
+        out[slot] = Some(hash_value(&canonicalize_for_hash(&msg, false)));
+        shapes[slot] = Some(message_shape(&msg));
     }
-    out
+    (out, shapes)
+}
+
+/// A message whose string content is rewritten as the one-block form
+/// every message with a breakpoint already uses.
+///
+/// Attaching a breakpoint requires blocks, so a message flips between
+/// `"hi"` and `[{"type":"text","text":"hi","cache_control":…}]` as the
+/// client moves its markers. Dropping `cache_control` in
+/// [`canonicalize_for_hash`] is not enough — the two shapes still hash
+/// differently, so the message reads as rewritten every time a marker
+/// lands on it or leaves it, and [`shape_delta`] can only answer
+/// `string` because one side has no blocks to index.
+///
+/// That noise is what made `early_drift` useless: of 41 events
+/// attributed on 2026-08-11, 34 were this flip and 2 were the real
+/// thing — a `<system-reminder>` block deleted from settled history.
+/// Both shapes carry the same text and bill the same tokens, so they
+/// are the same prefix.
+///
+/// Widening the string into a block rather than flattening the block
+/// into a string is what keeps the block *count* meaningful. Collapse
+/// the other way and a message that lost one of two blocks reports
+/// `string` instead of `blocks 2->1`, which is the one case worth
+/// naming.
+fn string_content_as_block(msg: &serde_json::Value) -> Cow<'_, serde_json::Value> {
+    let Some(text @ serde_json::Value::String(_)) = msg.get("content") else {
+        return Cow::Borrowed(msg);
+    };
+    let mut widened = msg.clone();
+    if let Some(obj) = widened.as_object_mut() {
+        obj.insert(
+            "content".to_string(),
+            serde_json::json!([{"type": "text", "text": text}]),
+        );
+    }
+    Cow::Owned(widened)
+}
+
+/// Fingerprint each content block of one message. Content that is not
+/// a block list has nothing to index, so it records `blocks: None` and
+/// no hashes — the message-level hash already covers whether it
+/// changed. String content never lands here: [`string_content_as_block`]
+/// widens it first, so the block count stays comparable across a
+/// breakpoint move.
+fn message_shape(msg: &serde_json::Value) -> MessageShape {
+    let mut block_hashes = [None; EARLY_BLOCKS_WINDOW];
+    let blocks = match msg.get("content") {
+        Some(serde_json::Value::Array(arr)) => {
+            for (i, block) in arr.iter().take(EARLY_BLOCKS_WINDOW).enumerate() {
+                let full = hash_value(&canonicalize_for_hash(block, false));
+                let mut short = [0u8; 8];
+                short.copy_from_slice(&full[..8]);
+                block_hashes[i] = Some(short);
+            }
+            Some(arr.len())
+        }
+        _ => None,
+    };
+    MessageShape {
+        blocks,
+        block_hashes,
+    }
 }
 
 /// SHA-256 over `serde_json::to_vec(value)`. Re-serializing the
@@ -349,7 +461,9 @@ impl std::fmt::Debug for DriftState {
 ///   growth into the early window included) → no event.
 /// - Subsequent requests with any dimension drifting →
 ///   `tracing::warn!(event = "cache_drift_observed", drift_dims =
-///   "<comma-joined>", previous_hash_prefix, current_hash_prefix, …)`.
+///   "<comma-joined>", early_drift = "<slot:what>", previous_hash_prefix,
+///   current_hash_prefix, …)`. `early_drift` is empty unless the early
+///   window is one of the drifted dimensions.
 pub fn observe_drift(
     state: &DriftState,
     session_key: &str,
@@ -393,6 +507,9 @@ pub fn observe_drift(
                     event = "cache_drift_observed",
                     session_key_hash = %session_prefix,
                     drift_dims = %dims,
+                    // Empty unless the early window moved; the other two
+                    // axes are single values with nothing to break down.
+                    early_drift = %early_drift_detail(&previous, &current),
                     previous_hash_prefix = %structural_hash_log_prefix(&previous),
                     current_hash_prefix = %structural_hash_log_prefix(&current),
                     "cache_drift detector observed structural change between turns of the same session"
@@ -407,7 +524,7 @@ pub fn observe_drift(
 /// 16-char hex prefix of SHA-256(session_key). Bounds the log line
 /// width and never reveals the raw key (which may be a bearer token
 /// or API key — see `derive_session_key`).
-fn session_key_log_prefix(session_key: &str) -> String {
+pub fn session_key_log_prefix(session_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(session_key.as_bytes());
     let digest = hasher.finalize();
@@ -417,7 +534,7 @@ fn session_key_log_prefix(session_key: &str) -> String {
 /// 24-char hex prefix (12 bytes) of a digest over the concatenated
 /// axis hashes. Useful as a compact "did the prefix change" indicator
 /// in logs without printing every axis digest in full.
-fn structural_hash_log_prefix(hash: &StructuralHash) -> String {
+pub fn structural_hash_log_prefix(hash: &StructuralHash) -> String {
     let mut hasher = Sha256::new();
     hasher.update(hash.system);
     hasher.update(hash.tools);
@@ -480,6 +597,77 @@ fn early_window_drifted(
         (Some(_), None) => true,
         (None, _) => false,
     })
+}
+
+/// Name what changed inside the early window, slot by slot.
+///
+/// `early_messages` on its own says the front of the conversation was
+/// rewritten but not by whom, which is where the investigation stalled:
+/// 830 findings in a day, all reading `early_messages`, none pointing
+/// at a component. This turns each drifted slot into one of:
+///
+/// - `1:blocks 3->4` — a block was inserted or removed. Someone is
+///   adding to a settled message; the count is the tell.
+/// - `1:block[0]` — block 0 was rewritten in place. Note *which*:
+///   block 0 means whatever writes the head of the message, a later
+///   index means a rewriter working further in.
+/// - `1:block[>7]` — changed past [`EARLY_BLOCKS_WINDOW`], so no index.
+/// - `1:string` — a plain string body changed; no blocks to index.
+/// - `1:dropped` — the slot is gone; the conversation was truncated or
+///   replayed shorter than it was sent.
+///
+/// Structure only. No message text reaches the log — the point is to
+/// name the component, and the shape does that without carrying user
+/// content into an operator's terminal.
+fn early_drift_detail(prev: &StructuralHash, curr: &StructuralHash) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for slot in 0..EARLY_MESSAGES_WINDOW {
+        let (Some(p), c) = (prev.early_messages[slot], curr.early_messages[slot]) else {
+            // Growth into a previously empty slot is append-only.
+            continue;
+        };
+        let Some(c) = c else {
+            parts.push(format!("{slot}:dropped"));
+            continue;
+        };
+        if p == c {
+            continue;
+        }
+        parts.push(match (prev.early_shapes[slot], curr.early_shapes[slot]) {
+            (Some(ps), Some(cs)) => format!("{slot}:{}", shape_delta(&ps, &cs)),
+            // Shapes travel with the hashes, so this is unreachable in
+            // practice; report the slot rather than inventing detail.
+            _ => format!("{slot}:changed"),
+        });
+    }
+    parts.join(",")
+}
+
+/// The block-level difference between two shapes of the same slot.
+fn shape_delta(prev: &MessageShape, curr: &MessageShape) -> String {
+    match (prev.blocks, curr.blocks) {
+        (Some(p), Some(c)) if p != c => format!("blocks {p}->{c}"),
+        (Some(_), Some(_)) => {
+            let changed: Vec<String> = prev
+                .block_hashes
+                .iter()
+                .zip(curr.block_hashes.iter())
+                .enumerate()
+                .filter(|(_, (p, c))| p != c)
+                .map(|(i, _)| i.to_string())
+                .collect();
+            if changed.is_empty() {
+                // Same count, every hashed block identical: the change
+                // sits past the window we fingerprint.
+                format!("block[>{}]", EARLY_BLOCKS_WINDOW - 1)
+            } else {
+                format!("block[{}]", changed.join(","))
+            }
+        }
+        // One side had blocks and the other a bare string, or both are
+        // strings — either way there is no index to give.
+        _ => "string".to_string(),
+    }
 }
 
 /// Derive a stable per-session key from the request headers, client
@@ -630,6 +818,111 @@ mod tests {
 
     fn make_state() -> DriftState {
         DriftState::new(8)
+    }
+
+    /// One user message whose content is an explicit block list, so the
+    /// block-level attribution has something to index.
+    fn blocks_body(blocks: serde_json::Value) -> serde_json::Value {
+        json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "system": "you are an assistant",
+            "tools": [],
+            "messages": [{"role": "user", "content": blocks}],
+        })
+    }
+
+    fn detail(prev: &serde_json::Value, curr: &serde_json::Value) -> String {
+        early_drift_detail(
+            &compute_structural_hash(prev, ApiKind::Anthropic),
+            &compute_structural_hash(curr, ApiKind::Anthropic),
+        )
+    }
+
+    /// The case the whole feature exists for: something prepends a
+    /// block to a settled message. Before this, that read as a bare
+    /// `early_messages` and named nobody.
+    #[test]
+    fn an_inserted_block_reports_the_count_move() {
+        let before = blocks_body(json!([{"type": "text", "text": "hello"}]));
+        let after = blocks_body(json!([
+            {"type": "text", "text": "injected"},
+            {"type": "text", "text": "hello"},
+        ]));
+        assert_eq!(detail(&before, &after), "0:blocks 1->2");
+    }
+
+    #[test]
+    fn a_rewritten_block_reports_its_index() {
+        let before = blocks_body(json!([
+            {"type": "text", "text": "stable"},
+            {"type": "text", "text": "original"},
+        ]));
+        let after = blocks_body(json!([
+            {"type": "text", "text": "stable"},
+            {"type": "text", "text": "rewritten"},
+        ]));
+        assert_eq!(detail(&before, &after), "0:block[1]");
+    }
+
+    /// Claude Code relocates its cache breakpoint to the newest block
+    /// every turn. That is placement, not content — if it registered as
+    /// a rewritten block the field would be noise on every request.
+    #[test]
+    fn a_relocated_breakpoint_is_not_a_block_change() {
+        let before = blocks_body(json!([
+            {"type": "text", "text": "one", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "two"},
+        ]));
+        let after = blocks_body(json!([
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}},
+        ]));
+        assert_eq!(detail(&before, &after), "", "no drift, so nothing to name");
+    }
+
+    /// A string body used to report `string` — no index, nothing named.
+    /// It reads as one text block now, which costs nothing and says
+    /// where the change landed.
+    #[test]
+    fn a_string_body_reads_as_the_one_block_it_is() {
+        let before = anthropic_body("s", json!([]), vec!["first"]);
+        let after = anthropic_body("s", json!([]), vec!["second"]);
+        assert_eq!(detail(&before, &after), "0:block[0]");
+    }
+
+    #[test]
+    fn a_lost_slot_reads_as_dropped() {
+        let before = anthropic_body("s", json!([]), vec!["a", "b"]);
+        let after = anthropic_body("s", json!([]), vec!["a"]);
+        assert_eq!(detail(&before, &after), "1:dropped");
+    }
+
+    /// Growth is append-only and benign — the drift predicate already
+    /// says so, and the detail must agree rather than blaming a slot.
+    #[test]
+    fn growing_into_the_window_names_nothing() {
+        let before = anthropic_body("s", json!([]), vec!["a"]);
+        let after = anthropic_body("s", json!([]), vec!["a", "b"]);
+        assert_eq!(detail(&before, &after), "");
+    }
+
+    /// Beyond the fingerprinted blocks there is no index to report, but
+    /// the slot must still be named — silence there would look like the
+    /// stable case.
+    #[test]
+    fn a_change_past_the_block_window_still_names_the_slot() {
+        let mut before: Vec<serde_json::Value> = (0..EARLY_BLOCKS_WINDOW + 2)
+            .map(|i| json!({"type": "text", "text": format!("block {i}")}))
+            .collect();
+        let mut after = before.clone();
+        let last = after.len() - 1;
+        after[last] = json!({"type": "text", "text": "changed"});
+        before.shrink_to_fit();
+        after.shrink_to_fit();
+        assert_eq!(
+            detail(&blocks_body(json!(before)), &blocks_body(json!(after))),
+            format!("0:block[>{}]", EARLY_BLOCKS_WINDOW - 1)
+        );
     }
 
     #[test]
@@ -996,6 +1289,77 @@ mod tests {
             drift_dims(&h1, &h2),
             "",
             "append-only growth with marker relocation must not be drift"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_arriving_on_a_settled_message_is_not_drift() {
+        // Claude Code sends a message as a bare string, then wraps the
+        // same text in a block so it can hang a breakpoint on it. Same
+        // text, same billed tokens, same prefix — the wrapper is how the
+        // marker attaches, not a rewrite.
+        let plain = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": "settled turn"},
+        ]});
+        let wrapped = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "settled turn",
+                 "cache_control": {"type": "ephemeral"}},
+            ]},
+        ]});
+        let h1 = compute_structural_hash(&plain, ApiKind::Anthropic);
+        let h2 = compute_structural_hash(&wrapped, ApiKind::Anthropic);
+        assert_eq!(
+            drift_dims(&h1, &h2),
+            "",
+            "wrapping text to carry a breakpoint must not read as a rewrite"
+        );
+        // And back again when the marker moves on.
+        assert_eq!(drift_dims(&h2, &h1), "");
+    }
+
+    #[test]
+    fn a_rewrite_under_a_breakpoint_is_still_drift() {
+        // The collapse must not blind the detector: same wrapper, new
+        // text, and that is a genuine bust.
+        let before = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": "settled turn"},
+        ]});
+        let after = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "REWRITTEN",
+                 "cache_control": {"type": "ephemeral"}},
+            ]},
+        ]});
+        let h1 = compute_structural_hash(&before, ApiKind::Anthropic);
+        let h2 = compute_structural_hash(&after, ApiKind::Anthropic);
+        assert_eq!(drift_dims(&h1, &h2), "early_messages");
+    }
+
+    #[test]
+    fn a_dropped_reminder_block_is_drift_and_names_the_slot() {
+        // The expensive case, measured live on 2026-08-11: the client
+        // deletes a <system-reminder> block from settled history and
+        // every cached token after it is rebilled. Two blocks never
+        // collapse, so this keeps its structure and its detail.
+        let with_reminder = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "opener"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "real turn"},
+                {"type": "text", "text": "<system-reminder>hook output</system-reminder>"},
+            ]},
+        ]});
+        let without = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "opener"}]},
+            {"role": "user", "content": [{"type": "text", "text": "real turn"}]},
+        ]});
+        let h1 = compute_structural_hash(&with_reminder, ApiKind::Anthropic);
+        let h2 = compute_structural_hash(&without, ApiKind::Anthropic);
+        assert_eq!(drift_dims(&h1, &h2), "early_messages");
+        assert_eq!(
+            early_drift_detail(&h1, &h2),
+            "1:blocks 2->1",
+            "the detail must name the slot and the block count that moved"
         );
     }
 

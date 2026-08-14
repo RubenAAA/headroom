@@ -44,9 +44,9 @@ if [ "${1:-}" = "--self-test" ]; then
         printf 'not ok - inbound tail build\nexpected: %s\nactual:   %s\n' "$expected" "$actual" >&2
         exit 1
     fi
-    fixture='{"upstream":{"verdict":"healthy"},"last_event_age_seconds":13,"last_event":{"event_kind":"provider_miss","attribution_reason":"provider_miss_after_replay","origin":"provider_cache","scope":"replayed_prefix","wasted_tokens":48669,"cache_creation_input_tokens":48669,"replayed_prefix":true,"replay_chain_id":2,"breakpoints_placed":2,"system_markers_dropped":0}}'
+    fixture='{"upstream":{"verdict":"healthy"},"last_event_age_seconds":13,"last_event":{"event_kind":"unexplained","attribution_reason":"unexplained_after_replay","origin":"unknown","scope":"replayed_prefix","wasted_tokens":48669,"cache_creation_input_tokens":48669,"replayed_prefix":true,"replay_chain_id":2,"breakpoints_placed":2,"system_markers_dropped":0}}'
     actual=$(HEADROOM_STATUSLINE_TEST_HEALTH="$fixture" "${BASH_SOURCE[0]}" --segment)
-    expected='⚠ recache 13s ago: provider miss after confirmed replay, ~48K tok wasted'
+    expected='⚠ recache 13s ago: replay applied, cause unexplained, ~48K tok wasted'
     if [ "$actual" != "$expected" ]; then
         printf 'not ok - provider miss after replay\nexpected: %s\nactual:   %s\n' "$expected" "$actual" >&2
         exit 1
@@ -124,8 +124,8 @@ if [ -n "$age" ]; then
             fi
         elif [ "$kind" = "expected" ]; then
             printf '%s\n' "${prefix:+$prefix | }ℹ cache drop ${age}s ago: cause unattributed, ~${wasted} tok re-cached"
-        elif [ "$kind" = "provider_miss" ]; then
-            printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: provider miss after confirmed replay, ~${wasted} tok wasted"
+        elif [ "$kind" = "unexplained" ]; then
+            printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: replay applied, cause unexplained, ~${wasted} tok wasted"
         else
             # `drift_dims` keeps this useful against older proxy payloads.
             reason=$(printf '%s' "$health" | jq -r '([.last_event.attribution_reason, .last_event.drift_dims] | map(select(type == "string" and length > 0)) | first) // "unknown cause"')

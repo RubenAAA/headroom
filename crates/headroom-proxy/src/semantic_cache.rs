@@ -81,7 +81,15 @@ impl LruCache {
         while self.map.len() >= max_entries {
             if let Some(oldest) = self.order.first().cloned() {
                 self.order.remove(0);
-                self.map.remove(&oldest);
+                let evicted = self.map.remove(&oldest);
+                tracing::info!(
+                    event = "semantic_cache_capacity_eviction",
+                    key_hash = %oldest,
+                    entries = self.map.len(),
+                    max_entries,
+                    entry_age_ms = evicted.map(|e| e.created_at.elapsed().as_millis() as u64).unwrap_or(0),
+                    "semantic cache evicted an entry at capacity"
+                );
             } else {
                 break;
             }
@@ -141,7 +149,10 @@ impl SemanticCache {
 
         let entry = match cache.get(&key) {
             Some(e) => e.clone(),
-            None => return None,
+            None => {
+                tracing::debug!(event = "semantic_cache_miss", key_hash = %key, "semantic cache miss");
+                return None;
+            }
         };
 
         // Check expiration
@@ -150,6 +161,13 @@ impl SemanticCache {
             if let Some(pos) = cache.order.iter().position(|k| *k == key) {
                 cache.order.remove(pos);
             }
+            tracing::info!(
+                event = "semantic_cache_ttl_expiry",
+                key_hash = %key,
+                ttl_seconds = entry.ttl.as_secs(),
+                age_ms = entry.created_at.elapsed().as_millis() as u64,
+                "semantic cache entry expired"
+            );
             return None;
         }
 
@@ -157,6 +175,7 @@ impl SemanticCache {
         if let Some(e) = cache.map.get_mut(&key) {
             e.hit_count += 1;
         }
+        tracing::debug!(event = "semantic_cache_hit", key_hash = %key, hit_count = entry.hit_count + 1, "semantic cache hit");
 
         Some(entry)
     }

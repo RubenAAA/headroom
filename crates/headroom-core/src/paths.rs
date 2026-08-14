@@ -120,6 +120,15 @@ pub fn workspace_dir() -> PathBuf {
         .join(WORKSPACE_DIR_DEFAULT)
 }
 
+/// Whether `$HEADROOM_WORKSPACE_DIR` is set to a non-blank value.
+///
+/// Lets a caller distinguish "the workspace was chosen" from "the workspace
+/// fell back to `$HOME`", which matters when `$HOME` itself is unset and
+/// guessing a path would be wrong.
+pub fn env_workspace_dir_is_set() -> bool {
+    env(HEADROOM_WORKSPACE_DIR_ENV).is_some()
+}
+
 /// Config (read-mostly) root.
 ///
 /// 1. `$HEADROOM_CONFIG_DIR` if set.

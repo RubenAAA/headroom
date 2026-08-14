@@ -12,7 +12,9 @@
 //! Plus the cache-safety invariant: bytes outside the rewritten
 //! block are byte-identical to the input (SHA-256 prefix + suffix).
 
+use headroom_core::tokenizer::get_tokenizer;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
+use headroom_core::transforms::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use headroom_core::transforms::{
     compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome,
 };
@@ -432,6 +434,220 @@ fn unknown_content_type_no_op() {
         matches!(action, BlockAction::NoCompressionApplied { .. }),
         "expected NoCompressionApplied, got {action:?}"
     );
+}
+
+// ─── Search results: the "did it actually help?" gate ──────────────────
+
+/// Pull the `tool_result` block's action out of either outcome shape.
+fn tool_result_action(out: &LiveZoneOutcome) -> BlockAction {
+    let manifest = match out {
+        LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+    };
+    manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present in manifest")
+        .action
+        .clone()
+}
+
+#[test]
+fn search_results_with_nothing_to_drop_never_reach_the_token_gate() {
+    // Grep output that sits under every SearchCompressor cap: 4 files
+    // (max 15), 2 matches each (max 5 per file), 8 total (max 30), and few
+    // enough that the adaptive selector keeps the lot. The selector drops
+    // nothing, so `format_output` re-emits the whole input — only
+    // re-ordered, since the compressor groups by file in `BTreeMap` order
+    // and these files are listed in reverse. Same content, same size,
+    // different bytes.
+    //
+    // No trailing newline, matching the tool_result blocks the corpus
+    // actually carries; that is what makes the rewrite exactly as long as
+    // the input rather than one byte shorter.
+    //
+    // Before the dispatch-level size gate this was the single largest source
+    // of `proxy_compression_rejected_by_token_check_total`: the rewrite is
+    // not byte-identical to the input, so the old `compressed == original`
+    // check waved it through as a compression candidate, and it took two
+    // tokenizer passes over the block to establish what its size already
+    // said. It also poisoned the dispatch memo with a `Compressed` entry, so
+    // every later request carrying the same block re-paid those two passes.
+    let mut lines: Vec<String> = Vec::new();
+    for file in [
+        "src/zeta.rs",
+        "src/yankee.rs",
+        "src/xray.rs",
+        "src/whiskey.rs",
+    ] {
+        for i in 0..2 {
+            lines.push(format!(
+                "crates/headroom-proxy/{file}:{}:    let handler = registry.lookup(name).unwrap_or_default(); // {file}-{i}",
+                (i + 1) * 13
+            ));
+        }
+    }
+    let text = lines.join("\n");
+    assert!(
+        text.len() >= 512,
+        "fixture must clear the 512-byte search threshold, got {}",
+        text.len()
+    );
+
+    let (body, _) = body_with_tool_result(&text);
+    let action = tool_result_action(&dispatch(&body));
+    assert!(
+        matches!(action, BlockAction::NoCompressionApplied { .. }),
+        "a search block with nothing to drop must be declined at dispatch, \
+         before the tokenizer runs; got {action:?}"
+    );
+}
+
+#[test]
+fn search_results_that_shrink_still_compress() {
+    // The other side of the same gate: 60 matches in one file blows past
+    // `max_matches_per_file` (5), so the compressor really does drop
+    // matches and the output really is smaller. This must keep working —
+    // the point of the gate is to stop wasted runs, not to buy a cleaner
+    // rejection count by declining work that pays.
+    let mut text = String::new();
+    for line in 1..=60 {
+        text.push_str(&format!(
+            "src/handler.rs:{line}:    tracing::warn!(target = \"dispatch\", \"retrying {line}\");\n"
+        ));
+    }
+
+    let (body, _) = body_with_tool_result(&text);
+    let action = tool_result_action(&dispatch(&body));
+    match action {
+        BlockAction::Compressed {
+            strategy,
+            original_bytes,
+            compressed_bytes,
+            original_tokens,
+            compressed_tokens,
+        } => {
+            assert_eq!(strategy, "search_compressor", "expected SearchCompressor");
+            assert!(
+                compressed_bytes < original_bytes,
+                "dispatch gate admits only byte-shrinking output \
+                 ({compressed_bytes} < {original_bytes})"
+            );
+            assert!(
+                compressed_tokens < original_tokens,
+                "tokenizer gate still has the final say \
+                 ({compressed_tokens} < {original_tokens})"
+            );
+        }
+        other => panic!("expected BlockAction::Compressed, got {other:?}"),
+    }
+}
+
+/// Pins the assumption the dispatch size gate rests on, and fails the day it
+/// stops holding.
+///
+/// The gate is byte-only: a candidate that is not smaller than its input in
+/// bytes is declined without the tokenizer ever being consulted. That is
+/// cheap and it is a sound one-way signal — but it is not free of risk. A
+/// candidate that **grew in bytes while shrinking in tokens** would now be
+/// thrown away even though the tokenizer would have accepted it. Bytes and
+/// tokens are correlated, not identical: a transform that replaced many
+/// short cheap tokens with fewer long expensive ones could in principle land
+/// there.
+///
+/// The evidence for accepting that risk is empirical, not a proof. Across 862
+/// captured production requests, no accepted compression grew in bytes —
+/// 6116 search-compressor and 1216 code-compressor acceptances, zero
+/// counter-examples. I also tried to construct one deliberately and could
+/// not: SearchCompressor's adaptive selector clamps hard enough that its
+/// output either shrinks substantially or is a same-size re-format.
+///
+/// So this test does not assert a tautology about `<`. It takes the exact
+/// input the gate declines and checks, independently, that the tokenizer
+/// would have declined it too — that the gate discarded nothing of value. If
+/// a future change to SearchCompressor makes this input compress in tokens
+/// while not shrinking in bytes, this test fails and whoever made that change
+/// has to revisit the gate rather than silently lose the saving.
+#[test]
+fn size_gate_declines_only_what_the_tokenizer_would_also_decline() {
+    let tokenizer = get_tokenizer(DEFAULT_MODEL);
+    let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+
+    // Several shapes that all land in the "nothing to drop" regime, so the
+    // conclusion rests on more than one anecdote. Each is under the per-file
+    // cap (5), the file cap (15) and the total cap (30), and — the binding
+    // constraint in practice — under whatever `compute_optimal_k` picks as
+    // the adaptive total, which starts clamping around nine matches. The
+    // `original_match_count == compressed_match_count` assertion below is
+    // what keeps that honest: change a cap and the fixture fails loudly
+    // rather than quietly testing a different regime.
+    let shapes: [(&[&str], usize); 3] = [
+        (
+            &[
+                "src/zeta.rs",
+                "src/yankee.rs",
+                "src/xray.rs",
+                "src/whiskey.rs",
+            ],
+            2,
+        ),
+        (&["lib/victor.rs", "lib/uniform.rs", "lib/tango.rs"], 2),
+        (&["app/sierra.rs", "app/romeo.rs"], 4),
+    ];
+
+    for (files, per_file) in shapes {
+        let mut lines: Vec<String> = Vec::new();
+        for file in files {
+            for i in 0..per_file {
+                lines.push(format!(
+                    "crates/headroom-proxy/{file}:{}:    let handler = registry.lookup(name).unwrap_or_default(); // {file}-{i}",
+                    (i + 1) * 13
+                ));
+            }
+        }
+        let text = lines.join("\n");
+        assert!(
+            text.len() >= 512,
+            "fixture must clear the 512-byte search threshold, got {}",
+            text.len()
+        );
+
+        // What the compressor would have handed the tokenizer.
+        let (result, _stats) = compressor.compress(&text, "", 0.0);
+        assert_eq!(
+            result.original_match_count, result.compressed_match_count,
+            "fixture must be in the nothing-to-drop regime for this test to mean anything"
+        );
+        assert!(
+            result.compressed.len() >= text.len(),
+            "fixture must be one the byte gate declines ({} >= {})",
+            result.compressed.len(),
+            text.len()
+        );
+
+        // The load-bearing claim: the tokenizer agrees. Declining on bytes
+        // alone cost us nothing here.
+        let original_tokens = tokenizer.count_text(&text);
+        let candidate_tokens = tokenizer.count_text(&result.compressed);
+        assert!(
+            candidate_tokens >= original_tokens,
+            "SIZE GATE ASSUMPTION BROKEN: a candidate the byte gate declines \
+             ({} -> {} bytes) would have SHRUNK in tokens ({original_tokens} -> \
+             {candidate_tokens}). The gate is now losing a real saving — \
+             re-examine it before touching this test.",
+            text.len(),
+            result.compressed.len()
+        );
+
+        // And end to end, that is what the dispatcher actually does.
+        let (body, _) = body_with_tool_result(&text);
+        let action = tool_result_action(&dispatch(&body));
+        assert!(
+            matches!(action, BlockAction::NoCompressionApplied { .. }),
+            "expected the size gate to decline this block; got {action:?}"
+        );
+    }
 }
 
 // ─── Cache-safety invariant ────────────────────────────────────────────

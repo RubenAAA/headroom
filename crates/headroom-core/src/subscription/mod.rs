@@ -21,6 +21,26 @@ pub mod tracker;
 
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 
+/// Serialises tests that mutate process-global environment variables.
+///
+/// `CLAUDE_CONFIG_DIR` is read by both [`client`] and [`session_tracking`], and
+/// `cargo test` runs their test modules on threads of a single process. Giving
+/// each test its own tempdir makes the *value* unique but not the *variable*:
+/// without this lock, one module's `remove_var` lands between another's
+/// `set_var` and the read it was setting up, and the reader falls back to the
+/// real `~/.claude`. Every test touching these variables must hold this guard
+/// for as long as it needs the value it set.
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    // A test that panics while holding the guard poisons the lock. Recovering
+    // the inner value keeps that one failure from cascading into every other
+    // env-dependent test, which would bury the real one.
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Current UTC time.
 pub(crate) fn utc_now() -> DateTime<Utc> {
     Utc::now()

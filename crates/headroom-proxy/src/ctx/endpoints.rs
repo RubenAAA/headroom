@@ -41,6 +41,41 @@ fn clone_store(state: &AppState) -> Result<Arc<OffloadStore>, StatusCode> {
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
+/// Which project's content index this request addresses.
+///
+/// The `headroom` CLI sends its working directory in `x-headroom-cwd`, so a
+/// search run inside a project searches that project. A caller that sends
+/// neither header gets the shared bucket — the same one every request used
+/// before the stores were sharded.
+fn request_project(headers: &axum::http::HeaderMap) -> String {
+    let ctx = crate::memory::router::RequestContext {
+        headers: headers
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|val| (k.as_str().to_lowercase(), val.to_string()))
+            })
+            .collect(),
+        system_prompt: String::new(),
+        base_user_id: String::new(),
+        project_root_override: None,
+    };
+    crate::memory::router::ProjectResolver::resolve_project_dir(&ctx)
+        .unwrap_or_else(|| super::projects::UNRESOLVED_PROJECT.to_string())
+}
+
+/// The content store for the requesting project, or 503 if it cannot be
+/// opened (the registry logs why).
+fn content_for(
+    store: &OffloadStore,
+    headers: &axum::http::HeaderMap,
+) -> Result<Arc<headroom_core::ctx::CtxStore>, StatusCode> {
+    store
+        .content_for(&request_project(headers))
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 // ── CTX-5: /ctx/search ──
 
 #[derive(Deserialize)]
@@ -77,6 +112,7 @@ struct SearchHitJson {
 
 async fn handle_search(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<SearchResponse>, StatusCode> {
     let store = clone_store(&state)?;
@@ -93,7 +129,7 @@ async fn handle_search(
     let limit = params.limit.unwrap_or(10).min(50);
     let queries = vec![params.q];
 
-    let content = store.content().clone();
+    let content = content_for(&store, &headers)?;
     let hits = tokio::task::spawn_blocking(move || {
         let opts = SearchOpts {
             limit,
@@ -182,11 +218,12 @@ struct IndexResponse {
 
 async fn handle_index(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<IndexRequest>,
 ) -> Result<Json<IndexResponse>, StatusCode> {
     let store = clone_store(&state)?;
 
-    let content = store.content().clone();
+    let content = content_for(&store, &headers)?;
     let label = req.label;
     let raw = req.content;
     let opts = headroom_core::ctx::IndexOpts {
@@ -233,10 +270,11 @@ struct FetchResponse {
 
 async fn handle_fetch(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<FetchRequest>,
 ) -> Result<Json<FetchResponse>, StatusCode> {
     let store = clone_store(&state)?;
-    let content = store.content();
+    let content = content_for(&store, &headers)?;
 
     let ttl = req.ttl.map(std::time::Duration::from_secs);
     let result =
@@ -262,6 +300,15 @@ async fn handle_fetch(
 struct StatsResponse {
     offloaded_bytes: u64,
     offloaded_blocks: u64,
+    /// Bytes offload took out and proactive expansion put back. Reported next
+    /// to `offloaded_bytes` because the saving is the difference, not the
+    /// first figure.
+    proactive_expansion_bytes: u64,
+    /// Provider-reported cache-creation tokens on requests that injected a
+    /// proactive expansion. This shows write amplification the byte count
+    /// alone cannot price.
+    proactive_expansion_cache_write_tokens: u64,
+    proactive_expansions: u64,
     recall_injections: u64,
     search_queries: u64,
     retrieval_hits: u64,
@@ -280,6 +327,12 @@ async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsRespons
     let registry = crate::observability::prometheus::registry();
     let offloaded_bytes = crate::observability::ctx_metrics::offloaded_bytes_get(registry);
     let offloaded_blocks = crate::observability::ctx_metrics::offloaded_blocks_get(registry);
+    let proactive_expansion_bytes =
+        crate::observability::ctx_metrics::proactive_expansion_bytes_get(registry);
+    let proactive_expansion_cache_write_tokens =
+        crate::observability::ctx_metrics::proactive_expansion_cache_write_tokens_get(registry);
+    let proactive_expansions =
+        crate::observability::ctx_metrics::proactive_expansions_get(registry);
     let recall_injections = crate::observability::ctx_metrics::recall_injections_get(registry);
     let search_queries = crate::observability::ctx_metrics::search_queries_get(registry);
     let retrieval_hits = crate::observability::ctx_metrics::retrieval_hits_get(registry);
@@ -288,6 +341,9 @@ async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsRespons
     Ok(Json(StatsResponse {
         offloaded_bytes,
         offloaded_blocks,
+        proactive_expansion_bytes,
+        proactive_expansion_cache_write_tokens,
+        proactive_expansions,
         recall_injections,
         search_queries,
         retrieval_hits,
@@ -311,7 +367,10 @@ struct DoctorCheck {
     detail: String,
 }
 
-async fn handle_doctor(State(state): State<AppState>) -> Result<Json<DoctorResponse>, StatusCode> {
+async fn handle_doctor(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<DoctorResponse>, StatusCode> {
     let mut checks = Vec::new();
 
     match state.ctx_offload.as_ref() {
@@ -330,7 +389,7 @@ async fn handle_doctor(State(state): State<AppState>) -> Result<Json<DoctorRespo
             });
 
             // Check: content DB accessible + FTS5 probe
-            let content = store.content().clone();
+            let content = content_for(store, &headers)?;
             let fts_ok = tokio::task::spawn_blocking(move || {
                 content
                     .search(
@@ -355,7 +414,7 @@ async fn handle_doctor(State(state): State<AppState>) -> Result<Json<DoctorRespo
             });
 
             // Check: content DB path
-            let db_path = store.content().path().display().to_string();
+            let db_path = content_for(store, &headers)?.path().display().to_string();
             checks.push(DoctorCheck {
                 name: "content_db_path".into(),
                 ok: true,
@@ -395,6 +454,7 @@ struct PurgeResponse {
 
 async fn handle_purge(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<PurgeRequest>,
 ) -> Result<Json<PurgeResponse>, StatusCode> {
     if !req.confirm {
@@ -408,7 +468,7 @@ async fn handle_purge(
     match req.scope.as_str() {
         "session" => {
             let store = clone_store(&state)?;
-            let content = store.content().clone();
+            let content = content_for(&store, &headers)?;
             let detail = tokio::task::spawn_blocking(move || match content.purge_all() {
                 Ok(n) => format!("purged {n} chunks from content DB"),
                 Err(e) => format!("purge failed: {e}"),
@@ -423,7 +483,7 @@ async fn handle_purge(
         }
         "project" => {
             let store = clone_store(&state)?;
-            let content_path = store.content().path().to_path_buf();
+            let content_path = content_for(&store, &headers)?.path().to_path_buf();
             let ccr_path = content_path
                 .parent()
                 .map(|p| p.join("ccr.db"))

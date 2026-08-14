@@ -334,13 +334,26 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
         return None;
     }
 
-    let hash_key = input_data.get("hash")?.as_str()?;
+    let Some(hash_key) = input_data.get("hash").and_then(Value::as_str) else {
+        tracing::warn!(provider, "CCR tool call is missing a string hash argument");
+        return None;
+    };
 
     // Validate hash format: 12 or 24 hex chars
     if hash_key.len() != 12 && hash_key.len() != 24 {
+        tracing::warn!(
+            provider,
+            hash_len = hash_key.len(),
+            "CCR tool call has an invalid hash length"
+        );
         return None;
     }
     if !hash_key.chars().all(|c| c.is_ascii_hexdigit()) {
+        tracing::warn!(
+            provider,
+            hash_len = hash_key.len(),
+            "CCR tool call has a non-hex hash"
+        );
         return None;
     }
 

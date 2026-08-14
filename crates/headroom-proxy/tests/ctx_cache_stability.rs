@@ -21,9 +21,9 @@ use headroom_proxy::compression::ctx_offload::{offload_anthropic_request, CtxOff
 use headroom_proxy::compression::{compress_anthropic_request, Outcome};
 use headroom_proxy::config::{CacheControlAutoFrozen, CompressionMode};
 use headroom_proxy::ctx::inject::InjectEngine;
+use headroom_proxy::ctx::projects::ProjectStores;
 
 use headroom_core::auth_mode::AuthMode;
-use headroom_core::ctx::{CtxStore, SessionsStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -33,6 +33,7 @@ const MIN_BYTES: usize = 2_000;
 fn cfg() -> CtxOffloadConfig {
     CtxOffloadConfig {
         min_bytes: MIN_BYTES,
+        exclude_tools: Vec::new(),
     }
 }
 
@@ -133,11 +134,17 @@ fn growing_conversation(turns: usize) -> Vec<Vec<Value>> {
     snapshots
 }
 
+/// The project these fixtures run as.
+const PROJECT: &str = "/home/dev/ctx-cache-stability";
+
 /// Apply the FULL context-mode pipeline: CTX-4 injection, then CTX-3 offload,
 /// then the live-zone compressor — exactly the request-path order in proxy.rs.
 fn transform_all(engine: &InjectEngine, request: &Value, session_key: &str) -> Value {
     let mut v = request.clone();
-    engine.maybe_inject(&mut v, session_key);
+    // Unbounded budget: this suite asserts byte-stability across turns, so the
+    // injection ceiling must never be the thing that changes the output.
+    let budget = headroom_proxy::injection_budget::InjectionBudget::new(usize::MAX);
+    engine.maybe_inject(&mut v, session_key, PROJECT, &budget);
     offload_anthropic_request(&mut v, &cfg(), None);
     let bytes = serde_json::to_vec(&v).unwrap();
     let outcome = compress_anthropic_request(
@@ -162,9 +169,7 @@ fn inject_offload_compression_all_on_prefix_is_stable() {
     // over a growing conversation. The injected block must appear from turn 1
     // and be byte-stable, and every consecutive prefix must be byte-identical.
     let dir = TempDir::new().unwrap();
-    let sessions = Arc::new(SessionsStore::open(dir.path().join("s.db")).unwrap());
-    let content = CtxStore::open(dir.path().join("content.db")).unwrap();
-    let engine = InjectEngine::new(sessions, content);
+    let engine = InjectEngine::new(Arc::new(ProjectStores::new(dir.path().to_path_buf())));
 
     let turns = growing_conversation(6);
     let transformed: Vec<Value> = turns

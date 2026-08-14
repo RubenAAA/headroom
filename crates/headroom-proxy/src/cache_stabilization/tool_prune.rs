@@ -52,13 +52,17 @@ pub struct PrunePolicy {
     /// is dropped when `<server>` is in this set. Used only when `keep_names`
     /// is empty (the conservative mode: never touches built-in tools).
     pub drop_mcp_servers: BTreeSet<String>,
+    /// Exact tool names to drop, whether built-in or MCP. Matching is exact —
+    /// no prefix or fuzzy matching — so the survivors are predictable. Used
+    /// only when `keep_names` is empty; composes with `drop_mcp_servers`.
+    pub drop_names: BTreeSet<String>,
 }
 
 impl PrunePolicy {
     /// True when the policy would never remove anything — the caller skips the
     /// JSON walk entirely so default-off requests are pure passthrough.
     pub fn is_noop(&self) -> bool {
-        self.keep_names.is_empty() && self.drop_mcp_servers.is_empty()
+        self.keep_names.is_empty() && self.drop_mcp_servers.is_empty() && self.drop_names.is_empty()
     }
 }
 
@@ -100,6 +104,9 @@ fn should_keep(tool: &Value, policy: &PrunePolicy) -> bool {
     };
     if !policy.keep_names.is_empty() {
         return policy.keep_names.contains(name);
+    }
+    if policy.drop_names.contains(name) {
+        return false;
     }
     !matches_dropped_mcp_server(name, &policy.drop_mcp_servers)
 }
@@ -204,6 +211,143 @@ mod tests {
         let removed = prune_tools(&mut tools, &policy);
         assert_eq!(removed, 0);
         assert_eq!(names(&tools), vec!["Read", "mcp__chrome__x"]);
+    }
+
+    #[test]
+    fn drop_names_removes_exact_builtin_matches() {
+        let mut tools = vec![
+            t("Read"),
+            t("ListMcpResourcesTool"),
+            t("Bash"),
+            t("ReadMcpResourceTool"),
+        ];
+        let policy = PrunePolicy {
+            drop_names: ["ListMcpResourcesTool", "ReadMcpResourceTool"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let removed = prune_tools(&mut tools, &policy);
+        assert_eq!(removed, 2);
+        assert_eq!(names(&tools), vec!["Read", "Bash"]);
+    }
+
+    #[test]
+    fn drop_names_is_exact_never_prefix() {
+        let mut tools = vec![
+            t("ReadMcpResourceTool"),
+            t("ReadMcpResourceDirTool"),
+            t("Read"),
+        ];
+        let policy = PrunePolicy {
+            drop_names: ["ReadMcpResourceTool"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let removed = prune_tools(&mut tools, &policy);
+        assert_eq!(removed, 1, "only the exact name goes; no prefix matching");
+        assert_eq!(names(&tools), vec!["ReadMcpResourceDirTool", "Read"]);
+    }
+
+    #[test]
+    fn drop_names_composes_with_drop_mcp_servers() {
+        let mut tools = vec![
+            t("Read"),
+            t("ListMcpResourcesTool"),
+            t("mcp__chrome__click"),
+            t("mcp__tmux__capture"),
+            t("Bash"),
+        ];
+        let policy = PrunePolicy {
+            drop_mcp_servers: ["chrome"].iter().map(|s| s.to_string()).collect(),
+            drop_names: ["ListMcpResourcesTool"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let removed = prune_tools(&mut tools, &policy);
+        assert_eq!(removed, 2, "both drop lists apply");
+        assert_eq!(names(&tools), vec!["Read", "mcp__tmux__capture", "Bash"]);
+    }
+
+    #[test]
+    fn keep_names_takes_precedence_over_drop_names() {
+        let mut tools = vec![t("Read"), t("ListMcpResourcesTool"), t("Bash")];
+        let policy = PrunePolicy {
+            keep_names: ["Read", "ListMcpResourcesTool"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            drop_names: ["ListMcpResourcesTool"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let removed = prune_tools(&mut tools, &policy);
+        assert_eq!(removed, 1, "allowlist decides alone; Bash is the only casualty");
+        assert_eq!(names(&tools), vec!["Read", "ListMcpResourcesTool"]);
+    }
+
+    #[test]
+    fn drop_names_preserves_order_of_survivors() {
+        let mut tools = vec![
+            t("Task"),
+            t("ListMcpResourcesTool"),
+            t("Bash"),
+            t("ReadMcpResourceDirTool"),
+            t("Glob"),
+            t("Read"),
+        ];
+        let policy = PrunePolicy {
+            drop_names: ["ListMcpResourcesTool", "ReadMcpResourceDirTool"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        prune_tools(&mut tools, &policy);
+        assert_eq!(names(&tools), vec!["Task", "Bash", "Glob", "Read"]);
+        // Determinism: a second pass over the same input is byte-identical.
+        let snapshot = tools.clone();
+        assert_eq!(prune_tools(&mut tools, &policy), 0);
+        assert_eq!(tools, snapshot);
+    }
+
+    #[test]
+    fn empty_drop_names_is_noop_passthrough() {
+        let policy = PrunePolicy {
+            drop_names: BTreeSet::new(),
+            ..Default::default()
+        };
+        assert!(policy.is_noop(), "empty drop list must not arm the walker");
+        let mut tools = vec![t("Read"), t("ListMcpResourcesTool")];
+        let before = serde_json::to_vec(&tools).unwrap();
+        let removed = prune_tools(&mut tools, &policy);
+        assert_eq!(removed, 0);
+        assert_eq!(
+            serde_json::to_vec(&tools).unwrap(),
+            before,
+            "passthrough must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn drop_names_never_removes_cache_control_marked_tool() {
+        let mut marked = t("ListMcpResourcesTool");
+        marked["cache_control"] = json!({"type": "ephemeral"});
+        let mut tools = vec![t("Read"), marked];
+        let policy = PrunePolicy {
+            drop_names: ["ListMcpResourcesTool"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let removed = prune_tools(&mut tools, &policy);
+        assert_eq!(removed, 0, "customer breakpoint outranks the drop list");
+        assert_eq!(names(&tools), vec!["Read", "ListMcpResourcesTool"]);
     }
 
     #[test]

@@ -821,4 +821,149 @@ mod tests {
             out[1].text
         );
     }
+
+    fn tool_result_msg(text: &str, tid: &str) -> Value {
+        serde_json::json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tid, "content": text}],
+        })
+    }
+
+    /// One block has nothing earlier to point at, so the pass must leave it
+    /// alone. Guards the entry point against a fold that references a turn
+    /// that isn't there.
+    #[test]
+    fn dedup_messages_single_block_noop() {
+        let span = code("", 12);
+        let mut messages = vec![tool_result_msg(&span, "t1")];
+        let stats = dedup_messages(&mut messages, 0);
+        assert_eq!(stats.spans_folded, 0);
+        assert_eq!(messages[0]["content"][0]["content"].as_str().unwrap(), span);
+    }
+
+    /// The same span read twice folds on the later read, and the pointer names
+    /// the message index it came from.
+    #[test]
+    fn dedup_messages_folds_reread_tool_result() {
+        let span = code("", 12);
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "fix the overdraft bug"}),
+            serde_json::json!({"role": "assistant", "content": "cat merge.py"}),
+            tool_result_msg(&format!("$ cat merge.py\n{span}\n# end"), "t1"),
+            serde_json::json!({"role": "assistant", "content": "sed -n range"}),
+            tool_result_msg(&format!("$ sed -n 1,20p merge.py\n{span}\n# more"), "t2"),
+        ];
+        let stats = dedup_messages(&mut messages, 0);
+        assert_eq!(stats.spans_folded, 1);
+
+        let earlier = messages[2]["content"][0]["content"].as_str().unwrap();
+        let later = messages[4]["content"][0]["content"].as_str().unwrap();
+        assert!(!earlier.contains("same as msg "), "earliest read is kept");
+        assert!(earlier.contains(&span));
+        assert!(later.contains("same as msg "), "re-read must fold: {later}");
+        // The pointer's turn is the referenced message's index.
+        assert!(later.contains("same as msg 2"), "wrong reference: {later}");
+    }
+
+    /// Everything inside the frozen prefix is off limits: rewriting it would
+    /// bust the prompt cache the prefix exists to protect.
+    #[test]
+    fn dedup_messages_frozen_prefix_protected() {
+        let span = code("", 12);
+        let dup = format!("head\n{span}\ntail");
+        let mut messages = vec![tool_result_msg(&dup, "t1"), tool_result_msg(&dup, "t2")];
+        let stats = dedup_messages(&mut messages, 2);
+        assert_eq!(stats.spans_folded, 0);
+        assert_eq!(messages[0]["content"][0]["content"].as_str().unwrap(), dup);
+        assert_eq!(messages[1]["content"][0]["content"].as_str().unwrap(), dup);
+    }
+
+    /// A `cache_control` block may be pointed *at* but never rewritten — same
+    /// reasoning as the frozen prefix, marked per-block instead.
+    ///
+    /// The marked block is deliberately a *later* occurrence. As the earliest
+    /// one it would survive anyway, because the first copy of a span is always
+    /// kept, and the test would pass with `cache_control` handling deleted.
+    #[test]
+    fn dedup_messages_cache_control_block_is_target_only() {
+        let span = code("", 12);
+        let cached = format!("cached:\n{span}");
+        let mut messages = vec![
+            tool_result_msg(&format!("first:\n{span}"), "t1"),
+            serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t2",
+                    "content": cached,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }),
+            tool_result_msg(&format!("later:\n{span}"), "t3"),
+        ];
+        let stats = dedup_messages(&mut messages, 0);
+
+        assert_eq!(
+            messages[1]["content"][0]["content"].as_str().unwrap(),
+            cached,
+            "a cache_control block must survive byte-for-byte even as a re-read"
+        );
+        // The unprotected re-read still folds, so protection is scoped to the
+        // marked block rather than switching the whole pass off.
+        assert_eq!(stats.spans_folded, 1);
+        assert!(messages[2]["content"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("same as msg "));
+    }
+
+    /// OpenAI-shaped `role: "tool"` messages carry their text as a plain string
+    /// rather than a content list, and must fold the same way.
+    #[test]
+    fn dedup_messages_openai_tool_role_string_content() {
+        let span = code("", 12);
+        let mut messages = vec![
+            serde_json::json!({"role": "tool", "tool_call_id": "t1", "content": format!("a\n{span}")}),
+            serde_json::json!({"role": "tool", "tool_call_id": "t2", "content": format!("b\n{span}")}),
+        ];
+        let stats = dedup_messages(&mut messages, 0);
+        assert_eq!(stats.spans_folded, 1);
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("same as msg "));
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("same as msg "));
+    }
+
+    /// Appending a turn must not change a single byte of what came before, or
+    /// every request re-writes the cached prefix it was supposed to reuse.
+    #[test]
+    fn dedup_messages_router_prefix_stability() {
+        let span = code("", 12);
+        let m1 = vec![
+            serde_json::json!({"role": "user", "content": "fix the overdraft bug"}),
+            serde_json::json!({"role": "assistant", "content": "cat merge.py"}),
+            tool_result_msg(&format!("$ cat merge.py\n{span}\n# end"), "t1"),
+        ];
+        let mut m2 = m1.clone();
+        m2.push(serde_json::json!({"role": "assistant", "content": "sed -n range"}));
+        m2.push(tool_result_msg(
+            &format!("$ sed -n 1,20p merge.py\n{span}\n# more"),
+            "t2",
+        ));
+
+        let mut out1 = m1;
+        dedup_messages(&mut out1, 0);
+        let mut out2 = m2;
+        dedup_messages(&mut out2, 0);
+
+        assert_eq!(
+            out2[..3],
+            out1[..],
+            "prompt-cache prefix must stay byte-stable"
+        );
+    }
 }

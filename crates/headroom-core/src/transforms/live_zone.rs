@@ -141,6 +141,16 @@ const STRATEGY_CONFIG_LOSSLESS: &str = "config_lossless";
 /// ran.
 const STRATEGY_EXCLUDED_TOOL_LOSSLESS: &str = "excluded_tool_lossless";
 
+/// Marker prefix written by ctx-offload when it replaces a `tool_result`
+/// block with a digest. Offload runs before this pass, so a block carrying
+/// this has already been shrunk and its original stored elsewhere.
+///
+/// Defined here rather than in the proxy crate because this pass is the one
+/// that has to *recognise* it, and a marker the writer and the reader spell
+/// differently is a silent failure — the guard would simply stop matching.
+/// `compression::ctx_offload` imports this constant instead of its own copy.
+pub const CTX_OFFLOAD_MARKER_PREFIX: &str = "<<ctx:";
+
 /// Empty query context passed to compressors that take a relevance
 /// query string. PR-B3 dispatcher does not yet plumb the user's last
 /// prompt through; PR-F3 will.
@@ -296,6 +306,16 @@ pub enum BlockAction {
         /// String form of the detected content type — `"text"`,
         /// `"source_code"`, `"html"`, `"image"`, `"unknown"`, etc.
         content_type: String,
+        /// The compressor that ran and declined because its output was not
+        /// smaller, when that is what happened. `None` covers the ordinary
+        /// case: no compressor was applicable in the first place.
+        ///
+        /// The two look identical from the outside and are not the same
+        /// thing. Without this the size gate would silently absorb the work
+        /// it declines — `proxy_compression_rejected_by_token_check_total`
+        /// drops, and there is no way to tell "we stopped wasting runs" from
+        /// "we stopped attempting compression that paid".
+        declined_by: Option<String>,
     },
     /// A compressor ran and produced a smaller output (in tokens, as
     /// counted by the model's tokenizer) that was spliced into the
@@ -383,6 +403,15 @@ pub enum ExclusionReason {
     /// Compressing them again writes a fresh `<<ccr:hash>>` marker
     /// nobody can redeem.
     CcrRetrieveResult,
+    /// Block was already replaced by a ctx-offload digest (`<<ctx:hash>>`).
+    /// Offload runs before this pass and has already stored the original
+    /// under that hash; the digest left behind is a preview plus a retrieval
+    /// pointer. Compressing it again buys almost nothing — the block is
+    /// already ~3KB against a 50KB offload floor — and writes a second
+    /// `<<ccr:hash>>` marker whose hash resolves to the digest rather than
+    /// the original, so a model following the inner pointer gets a lossy
+    /// copy back and the true bytes become unreachable.
+    CtxOffloadDigest,
     /// Block is the result of a tool the operator named in
     /// `--exclude-tools`. Lossy compression is off for it; the block
     /// still gets a byte-reversible fold when its shape supports one,
@@ -1155,12 +1184,16 @@ fn compress_one_block(
     }
 
     match dispatch_compressor_with_config(content_text, content_type, dispatch_config) {
-        DispatchResult::NoOp { content_type } => BlockOutcome {
+        DispatchResult::NoOp {
+            content_type,
+            declined_by,
+        } => BlockOutcome {
             message_index,
             block_index,
             block_type,
             action: BlockAction::NoCompressionApplied {
                 content_type: content_type.to_string(),
+                declined_by: declined_by.map(str::to_string),
             },
         },
         DispatchResult::Compressed {
@@ -1596,6 +1629,22 @@ fn plan_block_replacements(
         } else {
             None
         };
+        // A ctx-offload digest carries its marker in the content, not in a
+        // tool_use_id, so the guard map above cannot see it. Check the raw
+        // block text: offload has already shrunk this block and stored the
+        // original, and a second pass would bury that pointer under one of
+        // our own that redeems to the digest.
+        if block_raw.get().contains(CTX_OFFLOAD_MARKER_PREFIX) {
+            slots.push(PlanSlot {
+                block_index: block_idx,
+                kind: SlotKind::Excluded {
+                    block_type,
+                    reason: ExclusionReason::CtxOffloadDigest,
+                },
+            });
+            continue;
+        }
+
         match tool_guard {
             Some(ToolGuard::CcrRetrieve) => {
                 slots.push(PlanSlot {
@@ -1831,8 +1880,13 @@ fn maybe_inject_ccr_marker(
 /// Per-block dispatch result — whether any compressor ran and what
 /// it produced.
 enum DispatchResult {
-    /// No compressor was applicable for this content type.
-    NoOp { content_type: &'static str },
+    /// No compressor was applicable for this content type, or one ran and
+    /// declined because it could not shrink the block — `declined_by` tells
+    /// the two apart.
+    NoOp {
+        content_type: &'static str,
+        declined_by: Option<&'static str>,
+    },
     /// A compressor ran and produced a candidate replacement string.
     Compressed {
         strategy: &'static str,
@@ -1973,6 +2027,7 @@ fn dispatch_compressor_with_config(
     if text.is_empty() {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
+            declined_by: None,
         };
     }
 
@@ -1982,6 +2037,7 @@ fn dispatch_compressor_with_config(
         super::content_router::CacheLookup::Skip => {
             return DispatchResult::NoOp {
                 content_type: content_type.as_str(),
+                declined_by: None,
             };
         }
         super::content_router::CacheLookup::Hit {
@@ -2025,10 +2081,11 @@ fn dispatch_compressor_uncached(
     if text.is_empty() {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
+            declined_by: None,
         };
     }
 
-    match content_type {
+    let result = match content_type {
         ContentType::JsonArray => {
             // The detector classifies arrays-of-scalars as JsonArray
             // too (confidence 0.8). SmartCrusher's `crush` is safe to
@@ -2038,6 +2095,7 @@ fn dispatch_compressor_uncached(
             if !result.was_modified {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
+                    declined_by: None,
                 };
             }
             DispatchResult::Compressed {
@@ -2050,6 +2108,7 @@ fn dispatch_compressor_uncached(
             if result.compressed == result.original {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
+                    declined_by: None,
                 };
             }
             DispatchResult::Compressed {
@@ -2062,6 +2121,7 @@ fn dispatch_compressor_uncached(
             if result.compressed == result.original {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
+                    declined_by: None,
                 };
             }
             DispatchResult::Compressed {
@@ -2074,6 +2134,7 @@ fn dispatch_compressor_uncached(
             if result.compressed == text {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
+                    declined_by: None,
                 };
             }
             DispatchResult::Compressed {
@@ -2089,6 +2150,7 @@ fn dispatch_compressor_uncached(
             if result.compressed == text {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
+                    declined_by: None,
                 };
             }
             DispatchResult::Compressed {
@@ -2104,6 +2166,7 @@ fn dispatch_compressor_uncached(
             if compressed.len() >= text.len() {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
+                    declined_by: None,
                 };
             }
             DispatchResult::Compressed {
@@ -2126,6 +2189,7 @@ fn dispatch_compressor_uncached(
             );
             DispatchResult::NoOp {
                 content_type: content_type.as_str(),
+                declined_by: None,
             }
         }
         ContentType::PlainText => match kompress() {
@@ -2138,6 +2202,7 @@ fn dispatch_compressor_uncached(
                 if result.compressed == text {
                     return DispatchResult::NoOp {
                         content_type: content_type.as_str(),
+                        declined_by: None,
                     };
                 }
                 DispatchResult::Compressed {
@@ -2151,18 +2216,82 @@ fn dispatch_compressor_uncached(
             // request path.
             None => DispatchResult::NoOp {
                 content_type: content_type.as_str(),
+                declined_by: None,
             },
         },
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
         ContentType::Html => DispatchResult::NoOp {
             content_type: content_type.as_str(),
+            declined_by: None,
         },
         // Tabular data: treat like plain text — Kompress passthrough.
         ContentType::Tabular => DispatchResult::NoOp {
             content_type: content_type.as_str(),
+            declined_by: None,
         },
+    };
+
+    // ─── "Did it actually help?" gate ──────────────────────────────────
+    //
+    // Every arm above decides on its own whether the compressor helped,
+    // and most of them ask the wrong question: `compressed == original`.
+    // Byte-identity only catches a compressor that returned its input
+    // untouched. It misses the far more common failure — a compressor
+    // that *rewrote* the block without removing anything from it. The
+    // rewrite differs from the input, so it is tagged `Compressed`, and
+    // the block then travels all the way to the tokenizer gate in
+    // `compress_one_block` before being thrown away.
+    //
+    // SearchCompressor is the worst offender by construction: it parses
+    // the grep lines, selects which matches to keep, and re-formats the
+    // selection. When the caps never bite, the selection *is* the input,
+    // so `format_output` re-emits every match — same content, normalized
+    // separators, files in `BTreeMap` order. Different bytes, identical
+    // (or larger) size.
+    //
+    // Measured on 862 captured production requests: of the search-
+    // compressor blocks that the tokenizer gate rejected, 99.6% had
+    // dropped *zero* matches, and 93% were already >= the input in
+    // bytes. For the code compressor it was 100%. Meanwhile *no*
+    // accepted compression in the whole corpus — 6116 search, 1216
+    // code — grew in bytes. So bytes settle these cases on their own,
+    // and settling them here is strictly cheaper than settling them
+    // downstream: the caller skips two tokenizer passes over the block,
+    // and, because a `NoOp` lands in the dispatch memo's *skip* tier
+    // rather than as a cached `Compressed`, every later request
+    // carrying the same block short-circuits instead of re-paying the
+    // tokenizer. Conversation prefixes repeat constantly, so that
+    // repeat cost is where the waste actually accumulated.
+    //
+    // This does not soften the tokenizer gate downstream. Bytes are a
+    // one-way signal: not-smaller-in-bytes means there is nothing to
+    // win, but smaller-in-bytes does not mean smaller in tokens. Any
+    // candidate that does shrink in bytes still has to clear the
+    // tokenizer before it reaches the wire — which is what that gate is
+    // for, and it keeps catching the case it was built for (bytes down,
+    // tokens up on dense or heavily-fragmented content).
+    //
+    // The `StructuredConfig` arm has always applied exactly this rule;
+    // this just holds every compressor to it.
+    if let DispatchResult::Compressed {
+        compressed,
+        strategy,
+    } = &result
+    {
+        if compressed.len() >= text.len() {
+            // Carry which compressor declined. These blocks used to reach the
+            // tokenizer and be counted as rejections; absorbing them here
+            // without saying so would make this fix unfalsifiable — the
+            // rejection counter would fall whether the waste went away or the
+            // gate began declining work that pays.
+            return DispatchResult::NoOp {
+                content_type: content_type.as_str(),
+                declined_by: Some(strategy),
+            };
+        }
     }
+    result
 }
 
 /// CTX-3: run the content-type detection + compressor stack over a
@@ -2211,6 +2340,7 @@ fn inspect_latest_user_blocks_value(
             block_type: "string_content".to_string(),
             action: BlockAction::NoCompressionApplied {
                 content_type: "text".to_string(),
+                declined_by: None,
             },
         }]);
     }
@@ -2230,6 +2360,7 @@ fn inspect_latest_user_blocks_value(
         } else {
             BlockAction::NoCompressionApplied {
                 content_type: "unknown".to_string(),
+                declined_by: None,
             }
         };
         outcomes.push(BlockOutcome {
@@ -2614,6 +2745,55 @@ mod tests {
         );
     }
 
+    /// ctx-offload runs before this pass and leaves a digest carrying
+    /// `<<ctx:hash>>`. Compressing that digest again would append a second
+    /// `<<ccr:hash>>` marker redeeming to the digest instead of the original,
+    /// burying the pointer to the true bytes under a lossy copy.
+    #[test]
+    fn a_ctx_offload_digest_is_not_compressed_again() {
+        let digest = format!(
+            "{}\n<<ctx:deadbeef>> (60000 bytes offloaded; \
+             retrieve: headroom_retrieve(hash=\"deadbeef\"))",
+            compressible_payload()
+        );
+        let b = body(json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": digest}
+                ]},
+            ]
+        }));
+        let out = compress_anthropic_all_messages(
+            &b,
+            AuthMode::Payg,
+            DEFAULT_MODEL,
+            None,
+            &DispatchConfig::default(),
+        )
+        .unwrap();
+        let manifest = match &out {
+            LiveZoneOutcome::NoChange { manifest } => manifest,
+            LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        };
+        let action = manifest
+            .block_outcomes
+            .iter()
+            .find(|b| b.message_index == 1)
+            .map(|b| &b.action);
+        assert!(
+            matches!(
+                action,
+                Some(BlockAction::Excluded {
+                    reason: ExclusionReason::CtxOffloadDigest
+                })
+            ),
+            "an offload digest must be left alone; got {action:?}"
+        );
+    }
+
     // ─── `--exclude-tools` ────────────────────────────────────────────
 
     /// One `tool_use` + one `tool_result` carrying `payload`.
@@ -2943,6 +3123,7 @@ mod tests {
             },
             BlockAction::NoCompressionApplied {
                 content_type: "image".to_string(),
+                declined_by: None,
             },
             BlockAction::Compressed {
                 strategy: "log_compressor",

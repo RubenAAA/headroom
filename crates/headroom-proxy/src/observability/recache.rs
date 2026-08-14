@@ -61,11 +61,13 @@ fn reason_label(attribution_reason: Option<&str>) -> &'static str {
         Some("tools") => "tools",
         Some("early_messages") => "early_messages",
         Some("inbound_tail_replaced") => "inbound_tail_replaced",
-        Some("provider_miss_after_replay") => "provider_miss_after_replay",
+        Some("unexplained_after_replay") => "unexplained_after_replay",
+        Some("aftershock_of_diverged_prefix") => "aftershock_of_diverged_prefix",
         Some("prefix_content_diverged") => "prefix_content_diverged",
         Some("forwarded_count_mismatch") => "forwarded_count_mismatch",
         Some("shorter_than_stored_prefix") => "shorter_than_stored_prefix",
         Some("optimized_shorter_than_prefix") => "optimized_shorter_than_prefix",
+        Some("reminder_inside_prefix") => "reminder_inside_prefix",
         Some(s) if s.contains(',') => "multi",
         // A non-empty structural dimension added in the future is still
         // evidence, but must not create an unbounded label value.
@@ -104,13 +106,17 @@ mod tests {
             "inbound_tail_replaced"
         );
         assert_eq!(
-            reason_label(Some("provider_miss_after_replay")),
-            "provider_miss_after_replay"
+            reason_label(Some("unexplained_after_replay")),
+            "unexplained_after_replay"
         );
         assert_eq!(reason_label(Some("system,tools")), "multi");
         assert_eq!(
             reason_label(Some("prefix_content_diverged")),
             "prefix_content_diverged"
+        );
+        assert_eq!(
+            reason_label(Some("reminder_inside_prefix")),
+            "reminder_inside_prefix"
         );
         assert_eq!(reason_label(Some("weird_future_dim")), "structural_drift");
         assert_eq!(reason_label(None), "unknown");

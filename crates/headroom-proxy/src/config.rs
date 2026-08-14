@@ -341,6 +341,19 @@ pub struct CliArgs {
     #[arg(long = "prune-drop-mcp", env = "HEADROOM_PROXY_PRUNE_DROP_MCP")]
     pub prune_drop_mcp: Option<String>,
 
+    /// Tool pruning (A4): drop these exact tool names (comma-separated),
+    /// built-in ones included — the gap `--prune-drop-mcp` leaves. Matching is
+    /// exact, never by prefix, so the survivors are predictable.
+    /// Deterministic + cache-safe; composes with `--prune-drop-mcp`, and
+    /// `--prune-keep-tools` still wins over both. Off by default.
+    /// Aimed at built-ins Claude Code ships but the session never calls: over
+    /// 374 captured requests `ListMcpResourcesTool`, `ReadMcpResourceTool` and
+    /// `ReadMcpResourceDirTool` were invoked 0 times out of 21,863 tool calls,
+    /// yet whether they were present split 64% of traffic into two tools
+    /// fingerprints — and each fingerprint pays its own cache_creation.
+    #[arg(long = "prune-drop-tools", env = "HEADROOM_PROXY_PRUNE_DROP_TOOLS")]
+    pub prune_drop_tools: Option<String>,
+
     /// Tool pruning (A4): keep ONLY these tool names (comma-separated
     /// allowlist). When set, every tool not listed is dropped (most
     /// aggressive); takes precedence over --prune-drop-mcp. Off by default.
@@ -506,8 +519,10 @@ pub struct CliArgs {
     pub ctx_capture: bool,
 
     /// CTX-2: base directory for the sessions/content DBs. When unset, defaults
-    /// to `~/.claude-personal/context-mode` (matching the context-mode plugin
-    /// layout). Only consulted when `ctx_capture` is enabled.
+    /// to `<workspace>/ctx` (`~/.headroom/ctx`). Only consulted when
+    /// `ctx_capture` is enabled. Point this at
+    /// `~/.claude-personal/context-mode` to keep reading a store written before
+    /// the default moved under the workspace root.
     ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_CTX_STORE_DIR` env var →
     /// default.
@@ -527,6 +542,38 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub ctx_offload: bool,
+
+    /// Ceiling on bytes one request may gain across every injection stage —
+    /// CCR proactive expansion, ctx recall, and memory — together.
+    ///
+    /// Each stage has its own cap (expansion count, result count, entry
+    /// count), and before this flag nothing summed them: three individually
+    /// small appenders could still inflate one turn while every per-stage
+    /// counter reported success. `0` turns all three off.
+    ///
+    /// Recall is reserved against but never clipped — it is replayed
+    /// byte-for-byte into the cached prefix, so cutting it would bust the
+    /// cache. See `injection_budget.rs`.
+    #[arg(
+        long = "max-injection-bytes",
+        env = "HEADROOM_MAX_INJECTION_BYTES",
+        default_value_t = crate::injection_budget::DEFAULT_MAX_INJECTION_BYTES,
+    )]
+    pub max_injection_bytes: usize,
+
+    /// Memory system master switch. Default `false`.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_MEMORY_ENABLED` env → default.
+    /// Before this flag existed the switch was env-only, so a launcher that
+    /// passed no environment left the whole subsystem off with nothing on the
+    /// request path to say so.
+    #[arg(
+        long = "memory",
+        env = "HEADROOM_MEMORY_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub memory_enabled: bool,
 
     /// Freeze-replay: replay the previously-forwarded (compressed) prefix
     /// byte-identical each turn so the provider prompt cache stays warm
@@ -1072,22 +1119,12 @@ pub struct CliArgs {
     #[arg(long = "ccr-inject-marker", env = "HEADROOM_CCR_INJECT_MARKER", default_value_t = true, action = clap::ArgAction::Set)]
     pub ccr_inject_marker: bool,
 
-    /// CCR: inject retrieval markers into system instructions.
-    #[arg(long = "ccr-inject-system-instructions", env = "HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS", default_value_t = false, action = clap::ArgAction::Set)]
-    pub ccr_inject_system_instructions: bool,
-
-    // ─── Fallback ────────────────────────────────────────────────────────
-    /// Enable fallback to another provider on failure.
-    #[arg(long = "fallback", env = "HEADROOM_FALLBACK_ENABLED", default_value_t = false, action = clap::ArgAction::Set)]
-    pub fallback_enabled: bool,
-
-    /// Provider to fall back to (e.g. "openai").
-    #[arg(
-        long = "fallback-provider",
-        env = "HEADROOM_FALLBACK_PROVIDER",
-        default_value = ""
-    )]
-    pub fallback_provider: String,
+    // `--ccr-inject-system-instructions`, `--fallback` and
+    // `--fallback-provider` used to live here. Nothing ever read them: they
+    // were parsed, copied into `Config`, and that was the end of it. A flag
+    // that advertises a feature the binary does not have is worse than no
+    // flag, so they are gone rather than defaulted off. Cross-provider
+    // fallback needs a real implementation before it needs a switch.
 
     // ─── Tool filtering ──────────────────────────────────────────────────
     /// Comma-separated tool names to exclude from compression.
@@ -1185,12 +1222,13 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
         .map_err(|e| format!("invalid byte size `{s}`: {e}"))
 }
 
-/// Build the tool-pruning policy from the two comma-separated CLI/env flags.
+/// Build the tool-pruning policy from the three comma-separated CLI/env flags.
 /// Empty / whitespace-only entries are ignored; an absent flag is an empty set.
-/// When both are `None`, the resulting policy `is_noop()` (passthrough).
+/// When all are `None`, the resulting policy `is_noop()` (passthrough).
 fn parse_prune_policy(
     keep_tools: Option<&str>,
     drop_mcp: Option<&str>,
+    drop_tools: Option<&str>,
 ) -> crate::cache_stabilization::tool_prune::PrunePolicy {
     fn split(s: Option<&str>) -> std::collections::BTreeSet<String> {
         s.into_iter()
@@ -1203,6 +1241,7 @@ fn parse_prune_policy(
     crate::cache_stabilization::tool_prune::PrunePolicy {
         keep_names: split(keep_tools),
         drop_mcp_servers: split(drop_mcp),
+        drop_names: split(drop_tools),
     }
 }
 
@@ -1306,6 +1345,40 @@ pub fn warn_on_ambiguous_codex_routes(routes: &[ModelRoute], codex_auth_file: Op
             }
         }
     }
+}
+
+/// Warn about routes that can never match because an earlier route covers them.
+///
+/// Route lookup takes the first match, so a second route sharing a name with an
+/// earlier one — or any route already swallowed by an earlier `*` prefix — is
+/// dead config. Nothing rejects it and nothing logs it: requests just quietly
+/// go to the first route, which looks identical to the route working. Writing
+/// three variants of one model under the same name is the easy version of this
+/// mistake, and the symptom is that switching models does nothing.
+pub fn warn_on_shadowed_routes(routes: &[ModelRoute]) {
+    for (model, shadowed_by) in shadowed_routes(routes) {
+        tracing::warn!(
+            model = %model,
+            shadowed_by = %shadowed_by,
+            "model route is unreachable: an earlier route already matches this name, \
+             and the first match wins. Requests for it go to the earlier route. \
+             Give each route a distinct model name."
+        );
+    }
+}
+
+/// Pairs of `(unreachable route, the earlier route that swallows it)`.
+fn shadowed_routes(routes: &[ModelRoute]) -> Vec<(&str, &str)> {
+    routes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, route)| {
+            let shadow = routes[..i]
+                .iter()
+                .find(|earlier| earlier.matches(&route.model_prefix))?;
+            Some((route.model_prefix.as_str(), shadow.model_prefix.as_str()))
+        })
+        .collect()
 }
 
 /// Keywords that turn on Anthropic -> OpenAI format translation in a route spec.
@@ -1542,6 +1615,9 @@ pub struct Config {
     pub verbosity_level: i32,
     /// Effort value used on mechanical tool-result continuations.
     pub mechanical_effort: String,
+    /// Shared ceiling on bytes one request may gain across all injection
+    /// stages. See `injection_budget.rs`.
+    pub max_injection_bytes: usize,
     /// Memory system: master switch. When false, no memory operations run.
     pub memory_enabled: bool,
     /// Memory injection mode: "auto_tail" (append to user message) or "tool" (model calls memory_search).
@@ -1612,10 +1688,6 @@ pub struct Config {
     pub lossless: bool,
     // ─── CCR extensions ──────────────────────────────────────────────────
     pub ccr_inject_marker: bool,
-    pub ccr_inject_system_instructions: bool,
-    // ─── Fallback ────────────────────────────────────────────────────────
-    pub fallback_enabled: bool,
-    pub fallback_provider: String,
     // ─── Tool filtering ──────────────────────────────────────────────────
     pub exclude_tools: Vec<String>,
     pub protect_tool_results: Vec<String>,
@@ -1692,6 +1764,7 @@ impl Config {
             tool_prune_policy: parse_prune_policy(
                 args.prune_keep_tools.as_deref(),
                 args.prune_drop_mcp.as_deref(),
+                args.prune_drop_tools.as_deref(),
             ),
             model_router: crate::model_router::ModelRouterConfig::from_env(
                 std::env::var("HEADROOM_MODEL_ROUTER_ENABLED")
@@ -1780,9 +1853,8 @@ impl Config {
             output_shaper_enabled: args.output_shaper_enabled,
             verbosity_level: args.verbosity_level.max(0).min(4),
             mechanical_effort: args.mechanical_effort,
-            memory_enabled: std::env::var("HEADROOM_MEMORY_ENABLED")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false),
+            max_injection_bytes: args.max_injection_bytes,
+            memory_enabled: args.memory_enabled,
             memory_mode: std::env::var("HEADROOM_MEMORY_MODE")
                 .unwrap_or_else(|_| "auto_tail".to_string()),
             memory_inject_tools: std::env::var("HEADROOM_MEMORY_INJECT_TOOLS")
@@ -1845,9 +1917,6 @@ impl Config {
             accuracy_guard: args.accuracy_guard,
             lossless: args.lossless,
             ccr_inject_marker: args.ccr_inject_marker,
-            ccr_inject_system_instructions: args.ccr_inject_system_instructions,
-            fallback_enabled: args.fallback_enabled,
-            fallback_provider: args.fallback_provider,
             exclude_tools: args
                 .exclude_tools
                 .split(',')
@@ -1968,6 +2037,7 @@ impl Config {
             output_shaper_enabled: false,
             verbosity_level: 2,
             mechanical_effort: "low".to_string(),
+            max_injection_bytes: crate::injection_budget::DEFAULT_MAX_INJECTION_BYTES,
             memory_enabled: false,
             memory_mode: "auto_tail".to_string(),
             memory_inject_tools: true,
@@ -2010,9 +2080,6 @@ impl Config {
             accuracy_guard: String::new(),
             lossless: false,
             ccr_inject_marker: true,
-            ccr_inject_system_instructions: false,
-            fallback_enabled: false,
-            fallback_provider: String::new(),
             exclude_tools: Vec::new(),
             protect_tool_results: Vec::new(),
             read_lifecycle: false,
@@ -2036,13 +2103,13 @@ mod prune_policy_tests {
 
     #[test]
     fn both_none_is_noop() {
-        let p = parse_prune_policy(None, None);
+        let p = parse_prune_policy(None, None, None);
         assert!(p.is_noop());
     }
 
     #[test]
     fn parses_comma_list_trimming_and_dropping_empties() {
-        let p = parse_prune_policy(Some(" Read , Bash ,, "), None);
+        let p = parse_prune_policy(Some(" Read , Bash ,, "), None, None);
         assert_eq!(p.keep_names.len(), 2);
         assert!(p.keep_names.contains("Read"));
         assert!(p.keep_names.contains("Bash"));
@@ -2051,10 +2118,27 @@ mod prune_policy_tests {
 
     #[test]
     fn parses_drop_mcp_servers() {
-        let p = parse_prune_policy(None, Some("chrome,tmux"));
+        let p = parse_prune_policy(None, Some("chrome,tmux"), None);
         assert!(p.keep_names.is_empty());
         assert_eq!(p.drop_mcp_servers.len(), 2);
         assert!(p.drop_mcp_servers.contains("chrome"));
+    }
+
+    #[test]
+    fn parses_drop_tools_names() {
+        let p = parse_prune_policy(None, None, Some(" ListMcpResourcesTool ,,ReadMcpResourceTool"));
+        assert!(p.keep_names.is_empty());
+        assert!(p.drop_mcp_servers.is_empty());
+        assert_eq!(p.drop_names.len(), 2);
+        assert!(p.drop_names.contains("ListMcpResourcesTool"));
+        assert!(p.drop_names.contains("ReadMcpResourceTool"));
+        assert!(!p.is_noop());
+    }
+
+    #[test]
+    fn drop_tools_alone_is_not_noop_but_absent_is() {
+        assert!(!parse_prune_policy(None, None, Some("WebSearch")).is_noop());
+        assert!(parse_prune_policy(None, None, Some(" , ")).is_noop());
     }
 }
 
@@ -2332,6 +2416,73 @@ mod model_route_keyword_tests {
         let r = route("m=https://api.openai.com/v1:translate:gpt-5.6-luna");
         assert!(r.translate);
         assert_eq!(r.target_model.as_deref(), Some("gpt-5.6-luna"));
+    }
+}
+
+#[cfg(test)]
+mod shadowed_route_tests {
+    use super::*;
+
+    fn shadowed(specs: &[&str]) -> Vec<(String, String)> {
+        let routes: Vec<ModelRoute> = specs
+            .iter()
+            .map(|s| parse_model_route(s).expect("spec parses"))
+            .collect();
+        shadowed_routes(&routes)
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn distinct_names_are_all_reachable() {
+        assert!(shadowed(&[
+            "claude-codex-5.6=https://api.openai.com/:openai:gpt-5.6-luna",
+            "claude-codex-5.6-terra=https://api.openai.com/:openai:gpt-5.6-terra",
+            "claude-codex-5.6-sol=https://api.openai.com/:openai:gpt-5.6-sol",
+        ])
+        .is_empty());
+    }
+
+    /// The mistake this exists to catch: three variants of one model written
+    /// under one name, where only the first is ever reachable.
+    #[test]
+    fn a_repeated_name_reports_every_later_copy() {
+        let hits = shadowed(&[
+            "claude-codex-5.6=https://api.openai.com/:openai:gpt-5.6-luna",
+            "claude-codex-5.6=https://api.openai.com/:openai:gpt-5.6-terra",
+            "claude-codex-5.6=https://api.openai.com/:openai:gpt-5.6-sol",
+        ]);
+        assert_eq!(
+            hits,
+            vec![
+                ("claude-codex-5.6".into(), "claude-codex-5.6".into()),
+                ("claude-codex-5.6".into(), "claude-codex-5.6".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_earlier_prefix_route_swallows_a_later_exact_one() {
+        let hits = shadowed(&[
+            "claude-codex-*=https://api.openai.com/:openai:gpt-5.6-luna",
+            "claude-codex-5.6-sol=https://api.openai.com/:openai:gpt-5.6-sol",
+        ]);
+        assert_eq!(
+            hits,
+            vec![("claude-codex-5.6-sol".into(), "claude-codex-*".into())]
+        );
+    }
+
+    /// Order is what makes a route dead, so the specific-first arrangement of
+    /// the same two routes must stay quiet.
+    #[test]
+    fn the_specific_route_listed_first_is_fine() {
+        assert!(shadowed(&[
+            "claude-codex-5.6-sol=https://api.openai.com/:openai:gpt-5.6-sol",
+            "claude-codex-*=https://api.openai.com/:openai:gpt-5.6-luna",
+        ])
+        .is_empty());
     }
 }
 

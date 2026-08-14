@@ -21,7 +21,11 @@ pub struct ModelPricing {
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     pub cache_read_cost_per_token: Option<f64>,
+    /// Cache write billed at the 5-minute TTL (Anthropic: 1.25x input).
     pub cache_write_cost_per_token: Option<f64>,
+    /// Cache write billed at the 1-hour TTL (Anthropic: 2.0x input). `None`
+    /// where the family publishes no 1h rate; callers fall back to the 5m rate.
+    pub cache_write_1h_cost_per_token: Option<f64>,
 }
 
 /// Build a `ModelPricing` from USD-per-1M figures (the unit the provider
@@ -44,6 +48,29 @@ const fn per_1m(
             Some(v) => Some(v / M),
             None => None,
         },
+        cache_write_1h_cost_per_token: None,
+    }
+}
+
+/// Build a `ModelPricing` for a family that publishes both cache-write TTLs.
+/// Anthropic bills a 5-minute write at 1.25x input and a 1-hour write at 2.0x,
+/// and reports which of the two a request used in
+/// `usage.cache_creation.ephemeral_{5m,1h}_input_tokens` — so both rates are
+/// table data, not a guess from the configured TTL.
+const fn per_1m_ttl(
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write_5m: f64,
+    cache_write_1h: f64,
+) -> ModelPricing {
+    const M: f64 = 1_000_000.0;
+    ModelPricing {
+        input_cost_per_token: input / M,
+        output_cost_per_token: output / M,
+        cache_read_cost_per_token: Some(cache_read / M),
+        cache_write_cost_per_token: Some(cache_write_5m / M),
+        cache_write_1h_cost_per_token: Some(cache_write_1h / M),
     }
 }
 
@@ -52,25 +79,19 @@ const fn per_1m(
 /// versioned name like `claude-sonnet-4-5-20250929` resolves via the
 /// `claude-sonnet-4` entry, and shorter family keys (`claude-`) catch the rest.
 static TABLE: &[(&str, ModelPricing)] = &[
-    // ---- Anthropic (cache write = 5m TTL rate, 1.25x input) ----
-    ("claude-opus-4", per_1m(15.0, 75.0, Some(1.5), Some(18.75))),
-    ("claude-opus", per_1m(15.0, 75.0, Some(1.5), Some(18.75))),
-    ("claude-sonnet-4", per_1m(3.0, 15.0, Some(0.3), Some(3.75))),
-    (
-        "claude-3-7-sonnet",
-        per_1m(3.0, 15.0, Some(0.3), Some(3.75)),
-    ),
-    (
-        "claude-3-5-sonnet",
-        per_1m(3.0, 15.0, Some(0.3), Some(3.75)),
-    ),
-    ("claude-3-sonnet", per_1m(3.0, 15.0, Some(0.3), Some(3.75))),
-    ("claude-haiku-4", per_1m(1.0, 5.0, Some(0.1), Some(1.25))),
-    ("claude-3-5-haiku", per_1m(0.8, 4.0, Some(0.08), Some(1.0))),
-    ("claude-3-haiku", per_1m(0.25, 1.25, Some(0.03), Some(0.30))),
-    ("claude-3-opus", per_1m(15.0, 75.0, Some(1.5), Some(18.75))),
+    // ---- Anthropic (cache write: 5m TTL = 1.25x input, 1h TTL = 2.0x) ----
+    ("claude-opus-4", per_1m_ttl(15.0, 75.0, 1.5, 18.75, 30.0)),
+    ("claude-opus", per_1m_ttl(15.0, 75.0, 1.5, 18.75, 30.0)),
+    ("claude-sonnet-4", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    ("claude-3-7-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    ("claude-3-5-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    ("claude-3-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    ("claude-haiku-4", per_1m_ttl(1.0, 5.0, 0.1, 1.25, 2.0)),
+    ("claude-3-5-haiku", per_1m_ttl(0.8, 4.0, 0.08, 1.0, 1.6)),
+    ("claude-3-haiku", per_1m_ttl(0.25, 1.25, 0.03, 0.30, 0.50)),
+    ("claude-3-opus", per_1m_ttl(15.0, 75.0, 1.5, 18.75, 30.0)),
     // Family fallback for any other claude-* (Sonnet-class default).
-    ("claude-", per_1m(3.0, 15.0, Some(0.3), Some(3.75))),
+    ("claude-", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
     // ---- OpenAI (cache_write not published → None) ----
     ("gpt-5-mini", per_1m(0.25, 2.0, Some(0.025), None)),
     ("gpt-5-nano", per_1m(0.05, 0.4, Some(0.005), None)),

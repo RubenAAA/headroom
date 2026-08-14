@@ -257,7 +257,9 @@ fn ccr_marker_and_original_are_stored_for_every_message() {
 /// stored. This is what the other providers still get.
 #[test]
 fn no_store_means_no_marker() {
-    let payload = compressible_payload("old");
+    // No `compressible_payload` here: this test drives the dispatcher through
+    // `two_user_messages_body`, and the leftover binding it used to hold was
+    // never read.
     let body = two_user_messages_body();
 
     let out = compress_anthropic_all_messages(

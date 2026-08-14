@@ -40,6 +40,7 @@ scripts/*
 !scripts/export_kompress_v2_onnx.py
 !scripts/record_kompress_fixtures.py
 !scripts/record_code_compressor_fixtures.py
+!scripts/proxy_log_audit.py
 
 # Rust / Cargo build artifacts
 /target/

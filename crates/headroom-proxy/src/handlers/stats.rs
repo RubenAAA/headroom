@@ -31,6 +31,10 @@ pub async fn handle_stats(State(state): State<AppState>) -> Json<serde_json::Val
             "path": state.savings_tracker.storage_path().display().to_string(),
         })),
         "savings_verdict": state.savings_tracker.savings_verdict(),
+        // The only view that crosses the boundary: bytes the proxy put on the
+        // wire next to the usage Anthropic reported for those same requests.
+        // Everything above measures the proxy against itself.
+        "wire_verdict": state.savings_tracker.wire_verdict(),
         // Which tools cost what, and which were never called. The cost already
         // lands in cache_write_tokens; this says where it went.
         "tool_inventory": state.savings_tracker.tool_inventory_report(),

@@ -1119,6 +1119,7 @@ mod tests {
         let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
         config.bedrock_region = "eu-west-1".to_string();
         let state = AppState {
+            started_at: std::time::Instant::now(),
             config: std::sync::Arc::new(config),
             client: reqwest::Client::new(),
             bedrock_credentials: None,
@@ -1200,6 +1201,7 @@ mod tests {
         let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
         config.bedrock_region = "eu-west-1".to_string();
         let state = AppState {
+            started_at: std::time::Instant::now(),
             config: std::sync::Arc::new(config),
             client: reqwest::Client::new(),
             bedrock_credentials: None,

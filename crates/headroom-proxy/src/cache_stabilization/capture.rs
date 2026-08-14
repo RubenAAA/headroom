@@ -30,6 +30,21 @@ use serde_json::Value;
 /// wall-clock timestamps collide at millisecond resolution.
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Per-process filename prefix. `SEQ` restarts at zero every process, so a
+/// restart pointed at an existing corpus used to overwrite the previous run's
+/// files one for one — the earlier capture was gone before anyone read it.
+/// Ordering still comes from the `seq` field inside the envelope, so this only
+/// has to make names unique.
+fn run_id() -> u64 {
+    static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
+}
+
 /// Append `parsed` to the capture corpus when `HEADROOM_CAPTURE_DIR` is set.
 ///
 /// No-op (one cheap `env::var`) when the env var is absent — the common path.
@@ -72,7 +87,7 @@ pub fn maybe_capture(parsed: &Value, endpoint: &str, session_key: &str, request_
             "body": body,
         });
 
-        let path = std::path::Path::new(&dir).join(format!("req-{seq:08}.json"));
+        let path = std::path::Path::new(&dir).join(format!("req-{}-{seq:08}.json", run_id()));
         let write = std::fs::create_dir_all(&dir)
             .and_then(|_| serde_json::to_vec(&envelope).map_err(std::io::Error::other))
             .and_then(|bytes| std::fs::write(&path, bytes));
@@ -83,6 +98,36 @@ pub fn maybe_capture(parsed: &Value, endpoint: &str, session_key: &str, request_
                 request_id = %request_id,
                 error = %e,
                 "J0 capture: failed to write request body (continuing)"
+            );
+        }
+    });
+}
+
+/// Append the final wire bytes for `request_id` to `$HEADROOM_CAPTURE_DIR/out`.
+///
+/// Same env gate and same never-block rule as [`maybe_capture`]. Pairs with the
+/// inbound capture by `request_id`, so a request can be diffed as the client
+/// sent it against what actually went upstream.
+pub fn maybe_capture_outbound(body: &[u8], request_id: &str) {
+    let dir = match std::env::var("HEADROOM_CAPTURE_DIR") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return,
+    };
+
+    let body = body.to_vec();
+    let request_id = request_id.to_string();
+
+    std::thread::spawn(move || {
+        let dir = std::path::Path::new(&dir).join("out");
+        let path = dir.join(format!("{request_id}.json"));
+        let write = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &body));
+
+        if let Err(e) = write {
+            tracing::warn!(
+                event = "capture_outbound_write_failed",
+                request_id = %request_id,
+                error = %e,
+                "outbound capture: failed to write wire body (continuing)"
             );
         }
     });

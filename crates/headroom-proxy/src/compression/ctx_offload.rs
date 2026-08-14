@@ -64,10 +64,20 @@ use lru::LruCache;
 use serde_json::Value;
 
 /// Static per-request offload settings (I3: never changes mid-session).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CtxOffloadConfig {
     /// A block's serialized content must exceed this many bytes to qualify.
     pub min_bytes: usize,
+    /// Tools whose results the operator excluded from lossy rewriting
+    /// (`--exclude-tools`).
+    ///
+    /// Offload is lossy from the model's point of view — the block is replaced
+    /// by a preview and the rest has to be asked for — so an exclusion that
+    /// only bound the live-zone compressors left the same content being
+    /// swapped out here, one stage earlier. Honouring the list in both places
+    /// is what makes `--exclude-tools` mean what it says. The default list
+    /// covers the file and search tools for exactly this reason.
+    pub exclude_tools: Vec<String>,
 }
 
 /// One offloaded block, handed to the background worker for storage. Never
@@ -115,7 +125,10 @@ impl OffloadOutcome {
 
 /// Fixed marker prefix. A block whose text already contains this is a digest
 /// (idempotency fast path).
-const MARKER_PREFIX: &str = "<<ctx:";
+///
+/// Shared with the live-zone pass, which skips blocks carrying it — one
+/// spelling, so the writer here and the reader there cannot drift.
+use headroom_core::transforms::live_zone::CTX_OFFLOAD_MARKER_PREFIX as MARKER_PREFIX;
 
 /// PR-J4 — boundary-gated offload policy (invariant I4 of
 /// `REALIGNMENT/13-phase-J-history-offload.md`).
@@ -203,10 +216,18 @@ fn preview(text: &str, max_bytes: usize) -> String {
 
 /// Build the deterministic footer appended to a digest. Pure function of
 /// `hash` and `orig_len` — no volatile fields (I1).
+///
+/// The pointer names the `headroom_retrieve` tool, which is injected into the
+/// same request (`proxy.rs`, gated on `ccr_inject_tool`) and resolves against
+/// the same CCR store this record is persisted to. It used to read
+/// `headroom ctx get <hash>` — a shell command, which the model cannot run and
+/// which no agent has a tool for. Offload therefore looked healthy while
+/// nothing was ever retrieved: the content was reachable, but the only
+/// instruction the model ever saw pointed at a surface it could not use.
 fn footer(hash: &str, orig_len: usize) -> String {
     format!(
         "\n{MARKER_PREFIX}{hash}>> ({orig_len} bytes offloaded; \
-         retrieve: headroom ctx get {hash})"
+         retrieve: headroom_retrieve(hash=\"{hash}\"))"
     )
 }
 
@@ -247,7 +268,16 @@ pub fn offload_anthropic_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let title = tool_titles.get(&tool_use_id).cloned().unwrap_or_default();
+            let (title, tool_name) = tool_titles.get(&tool_use_id).cloned().unwrap_or_default();
+            // An operator who excluded a tool from lossy rewriting meant this
+            // stage too: offload replaces the result with a preview, which is
+            // exactly what the exclusion exists to prevent.
+            if headroom_core::tool_exclusion::is_tool_excluded(
+                &tool_name,
+                config.exclude_tools.iter().map(String::as_str),
+            ) {
+                continue;
+            }
             match offload_tool_result(block, config, &title, policy, is_live) {
                 BlockOutcome::Offloaded {
                     record,
@@ -413,7 +443,7 @@ fn tool_result_text(content: &Value) -> Option<String> {
 /// Map every `tool_use` block's id → a deterministic title (the Bash command
 /// string when present, else the tool name). Used as the FTS chunk title so it
 /// is byte-derived from the same request.
-fn collect_tool_titles(parsed: &Value) -> std::collections::HashMap<String, String> {
+fn collect_tool_titles(parsed: &Value) -> std::collections::HashMap<String, (String, String)> {
     let mut map = std::collections::HashMap::new();
     let Some(messages) = parsed.get("messages").and_then(Value::as_array) else {
         return map;
@@ -436,7 +466,10 @@ fn collect_tool_titles(parsed: &Value) -> std::collections::HashMap<String, Stri
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| name.to_string());
-            map.insert(id.to_string(), title);
+            // The title is the shell command when there is one, so it cannot
+            // answer "which tool produced this"; the exclusion check needs the
+            // tool name itself.
+            map.insert(id.to_string(), (title, name.to_string()));
         }
     }
     map
@@ -448,7 +481,10 @@ mod tests {
     use serde_json::json;
 
     fn cfg(min: usize) -> CtxOffloadConfig {
-        CtxOffloadConfig { min_bytes: min }
+        CtxOffloadConfig {
+            min_bytes: min,
+            exclude_tools: Vec::new(),
+        }
     }
 
     /// A tool_result body whose content is `body`, paired to a bash tool_use.
@@ -470,6 +506,23 @@ mod tests {
     fn first_tool_result_text(parsed: &Value) -> String {
         let content = &parsed["messages"][1]["content"][0]["content"];
         tool_result_text(content).unwrap_or_default()
+    }
+
+    /// `--exclude-tools` has to bind here too. Offload is lossy from the
+    /// model's side — the block becomes a preview it must ask to expand — so
+    /// an exclusion honoured only by the live-zone compressors still let the
+    /// same content be swapped out one stage earlier.
+    #[test]
+    fn an_excluded_tool_is_not_offloaded() {
+        let body = "ERROR: disk full\n".repeat(50);
+        let mut parsed = req(&body);
+        let config = CtxOffloadConfig {
+            min_bytes: 200,
+            exclude_tools: vec!["Bash".to_string()],
+        };
+        let out = offload_anthropic_request(&mut parsed, &config, None);
+        assert_eq!(out.blocks_offloaded, 0, "excluded tool must not offload");
+        assert_eq!(first_tool_result_text(&parsed), body, "content untouched");
     }
 
     #[test]
@@ -514,7 +567,7 @@ mod tests {
         assert!(text.starts_with("1\t[[package]]"), "preview keeps the head");
         assert!(text.contains("truncated"));
         assert!(text.contains(&format!(
-            "retrieve: headroom ctx get {}",
+            "retrieve: headroom_retrieve(hash=\"{}\")",
             out.records[0].hash
         )));
         assert_eq!(out.records[0].original, body);
@@ -562,12 +615,17 @@ mod tests {
         assert_eq!(parsed, after_first);
     }
 
+    /// The pointer has to name a tool the model can actually call. Pinned
+    /// because pointing it at a shell command is what kept retrieval at zero:
+    /// the content was stored and reachable, and the model was told to run
+    /// something it has no way to run.
     #[test]
     fn marker_format_is_pinned() {
         let f = footer("abc123", 1234);
         assert_eq!(
             f,
-            "\n<<ctx:abc123>> (1234 bytes offloaded; retrieve: headroom ctx get abc123)"
+            "\n<<ctx:abc123>> (1234 bytes offloaded; \
+             retrieve: headroom_retrieve(hash=\"abc123\"))"
         );
     }
 

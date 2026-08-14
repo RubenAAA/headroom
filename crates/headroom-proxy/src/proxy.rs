@@ -202,14 +202,24 @@ const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 const MAX_MESSAGE_ARRAY_LENGTH: usize = 10_000;
 
 impl AppState {
-    /// The CCR store, when offload is configured.
+    /// The CCR store, when offload is configured and `--ccr-inject-marker` is on.
     ///
     /// Compression emits a `<<ccr:HASH>>` marker only when handed one of
     /// these, so passing `None` makes compression one-way. Pass it only on
     /// paths that also inject `headroom_retrieve` — a marker the model cannot
     /// act on is worse than no marker, since it spends tokens advertising a
     /// recovery route that does not exist.
+    ///
+    /// `--ccr-inject-marker=false` withholds the store here rather than at the
+    /// injection site, so marker text and store writes stop together.
+    /// Suppressing only the text would offload blocks the model has no handle
+    /// to ask back — the same dangling pointer from the other end. Python
+    /// pairs them the same way: every `ccr_inject_marker=False` call site also
+    /// passes `ccr_enabled=False`.
     pub(crate) fn ccr_store(&self) -> Option<std::sync::Arc<dyn headroom_core::ccr::CcrStore>> {
+        if !self.config.ccr_inject_marker {
+            return None;
+        }
         self.ctx_offload.as_ref().map(|r| r.store.ccr())
     }
     pub fn new(config: Config) -> Result<Self, ProxyError> {
@@ -257,58 +267,64 @@ impl AppState {
             );
         }
 
-        // CTX-2: construct the passive-capture observer only when enabled.
-        // A failure to open the sessions DB is logged loudly and disables
-        // capture (a broken observer must never take down the proxy) — the
-        // request path is unaffected either way.
-        let ctx_observer = if config.ctx_capture {
+        // CTX-2b: one registry of per-project stores, shared by capture,
+        // offload and recall so all three read and write the same file for a
+        // given project. Nothing is opened here — the project is a property of
+        // a request, not of the process, so handles are opened on first sight.
+        let ctx_base = if config.ctx_capture || config.ctx_offload || config.ctx_inject {
             let base = config
                 .ctx_store_dir
                 .clone()
                 .or_else(headroom_core::ctx::default_base_dir);
-            match base {
-                Some(dir) => match crate::ctx::observer::CtxObserver::start(&dir) {
-                    Ok(obs) => Some(Arc::new(obs)),
-                    Err(e) => {
-                        tracing::warn!(
-                            event = "ctx_observer_start_failed",
-                            error = %e,
-                            "CTX-2 capture disabled: could not open sessions DB"
-                        );
-                        None
-                    }
-                },
-                None => {
+            if base.is_none() {
+                tracing::warn!(
+                    event = "ctx_no_store_dir",
+                    "ctx features enabled but no store dir and $HOME unset; disabled"
+                );
+            }
+            base
+        } else {
+            None
+        };
+        let ctx_stores = ctx_base
+            .clone()
+            .map(|dir| Arc::new(crate::ctx::projects::ProjectStores::new(dir)));
+
+        // CTX-2: construct the passive-capture observer only when enabled.
+        // A failure to spawn the worker is logged loudly and disables capture
+        // (a broken observer must never take down the proxy) — the request path
+        // is unaffected either way.
+        let ctx_observer = match (config.ctx_capture, ctx_stores.clone()) {
+            (true, Some(stores)) => match crate::ctx::observer::CtxObserver::start(stores) {
+                Ok(obs) => Some(Arc::new(obs)),
+                Err(e) => {
                     tracing::warn!(
-                        event = "ctx_observer_no_store_dir",
-                        "CTX-2 capture enabled but no store dir and $HOME unset; disabled"
+                        event = "ctx_observer_start_failed",
+                        error = %e,
+                        "CTX-2 capture disabled: could not start the capture worker"
                     );
                     None
                 }
-            }
-        } else {
-            None
+            },
+            _ => None,
         };
 
         // CTX-3: construct the offload runtime only when enabled. Independent
         // of `ctx_capture` — offload is its own flag. A failure to open the CCR
-        // / content stores is logged loudly and disables offload (a broken sink
-        // must never take down the proxy). The store dir resolution mirrors the
-        // observer above.
+        // store is logged loudly and disables offload (a broken sink must never
+        // take down the proxy).
         let ctx_offload = if config.ctx_offload {
-            let base = config
-                .ctx_store_dir
-                .clone()
-                .or_else(headroom_core::ctx::default_base_dir);
-            match base {
-                Some(dir) => {
+            match (ctx_base.clone(), ctx_stores.clone()) {
+                (Some(dir), Some(stores)) => {
                     match crate::ctx::offload_store::OffloadStore::start(
                         &dir,
                         config.ctx_offload_ttl_seconds,
+                        stores,
                     ) {
                         Ok(store) => Some(CtxOffloadRuntime {
                             config: crate::compression::ctx_offload::CtxOffloadConfig {
                                 min_bytes: config.ctx_offload_min_bytes,
+                                exclude_tools: config.exclude_tools.clone(),
                             },
                             store: Arc::new(store),
                             gate: Arc::new(crate::compression::ctx_offload::OffloadGate::new(
@@ -319,19 +335,13 @@ impl AppState {
                             tracing::warn!(
                                 event = "ctx_offload_start_failed",
                                 error = %e,
-                                "CTX-3 offload disabled: could not open CCR/content stores"
+                                "CTX-3 offload disabled: could not open the CCR store"
                             );
                             None
                         }
                     }
                 }
-                None => {
-                    tracing::warn!(
-                        event = "ctx_offload_no_store_dir",
-                        "CTX-3 offload enabled but no store dir and $HOME unset; disabled"
-                    );
-                    None
-                }
+                _ => None,
             }
         } else {
             None
@@ -339,8 +349,8 @@ impl AppState {
 
         // CTX-4: recall/resume injection. Requires ctx_capture (the identity +
         // sessions layer) — enforce loudly, no silent dependency. Shares the
-        // observer's sessions store so it reads the events/prefixes the
-        // observer writes; opens its own content-store handle for BM25 recall.
+        // store registry with capture and offload, so it recalls from the same
+        // per-project files those two write.
         let ctx_inject = if config.ctx_inject {
             if !config.ctx_capture {
                 return Err(ProxyError::Config(
@@ -349,47 +359,13 @@ impl AppState {
                         .to_string(),
                 ));
             }
-            match ctx_observer.as_ref() {
-                Some(observer) => {
-                    let base = config
-                        .ctx_store_dir
-                        .clone()
-                        .or_else(headroom_core::ctx::default_base_dir);
-                    match base {
-                        Some(dir) => {
-                            let content_path = headroom_core::ctx::content_db_path(&dir, "");
-                            if let Some(parent) = content_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            match headroom_core::ctx::CtxStore::open(&content_path) {
-                                Ok(content) => {
-                                    Some(Arc::new(crate::ctx::inject::InjectEngine::new(
-                                        observer.sessions(),
-                                        content,
-                                    )))
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        event = "ctx_inject_start_failed",
-                                        error = %e,
-                                        "CTX-4 injection disabled: could not open content store"
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        None => {
-                            tracing::warn!(
-                                event = "ctx_inject_no_store_dir",
-                                "CTX-4 injection enabled but no store dir and $HOME unset; disabled"
-                            );
-                            None
-                        }
-                    }
+            match (ctx_observer.as_ref(), ctx_stores.clone()) {
+                (Some(_), Some(stores)) => {
+                    Some(Arc::new(crate::ctx::inject::InjectEngine::new(stores)))
                 }
-                None => {
-                    // ctx_capture was on but the observer failed to open; without
-                    // the sessions store injection cannot run. Log and disable.
+                _ => {
+                    // ctx_capture was on but capture failed to start; without
+                    // the sessions layer injection cannot run. Log and disable.
                     tracing::warn!(
                         event = "ctx_inject_no_observer",
                         "CTX-4 injection disabled: sessions observer unavailable"
@@ -470,15 +446,47 @@ impl AppState {
             };
             let mut handler =
                 crate::memory::handler::MemoryHandler::new(handler_config, "rust-proxy");
-            // Wire the in-memory backend so memory operations actually work.
-            handler.set_backend(Arc::new(
-                crate::memory::local_backend::LocalMemoryBackend::new(),
-            ));
-            tracing::info!(
-                event = "memory_backend_started",
-                backend = "local",
-                "memory backend initialized (in-memory)"
-            );
+            // Prefer the FTS5-backed store: BM25 with stemming, and memories
+            // that survive a restart. The in-memory backend it replaces scored
+            // by counting overlapping words and lost everything on exit; it
+            // stays as the fallback for the case where no store dir resolves,
+            // because a degraded memory beats none.
+            let memory_dir = config
+                .ctx_store_dir
+                .clone()
+                .or_else(headroom_core::ctx::default_base_dir)
+                .map(|base| base.join("memory"));
+            match memory_dir
+                .as_deref()
+                .map(crate::memory::ctx_backend::CtxMemoryBackend::open)
+            {
+                Some(Ok(backend)) => {
+                    handler.set_backend(Arc::new(backend));
+                    tracing::info!(
+                        event = "memory_backend_started",
+                        backend = "ctx_fts",
+                        dir = ?memory_dir,
+                        "memory backend initialized (FTS5, persistent)"
+                    );
+                }
+                other => {
+                    if let Some(Err(e)) = other {
+                        tracing::warn!(
+                            event = "memory_backend_fallback",
+                            error = %e,
+                            "could not open the FTS memory store; using the in-memory backend"
+                        );
+                    } else {
+                        tracing::warn!(
+                            event = "memory_backend_fallback",
+                            "no memory store dir and $HOME unset; using the in-memory backend"
+                        );
+                    }
+                    handler.set_backend(Arc::new(
+                        crate::memory::local_backend::LocalMemoryBackend::new(),
+                    ));
+                }
+            }
             Some(Arc::new(tokio::sync::Mutex::new(handler)))
         } else {
             None
@@ -630,6 +638,28 @@ pub(crate) struct ProxyOutcomeSink {
     pub(crate) request_logger: Arc<crate::request_logger::RequestLogger>,
 }
 
+/// Tokens the upstream actually processed for billing, when its usage block
+/// supplied the cache breakdown. Anthropic reports uncached input, cache reads,
+/// and cache creation as disjoint values, so their sum is the post-transform
+/// request the proxy sent — not the pre-compression baseline used to measure
+/// savings.
+///
+/// A provider that returns no input usage leaves us without a billable source
+/// of truth. In that exceptional case use the post-transform compression
+/// estimate rather than the original pre-transform size.
+fn provider_billed_input_tokens(outcome: &headroom_core::request_outcome::RequestOutcome) -> i64 {
+    let billed = outcome
+        .uncached_input_tokens
+        .max(0)
+        .saturating_add(outcome.cache_read_tokens.max(0))
+        .saturating_add(outcome.cache_write_tokens.max(0));
+    if billed > 0 {
+        billed
+    } else {
+        outcome.optimized_tokens.max(0)
+    }
+}
+
 impl ProxyOutcomeSink {
     /// Build a sink from the shared trackers on [`AppState`].
     pub(crate) fn from_state(state: &AppState) -> Self {
@@ -643,9 +673,13 @@ impl ProxyOutcomeSink {
 
 impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
     fn record_request(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
+        let billed_input_tokens = provider_billed_input_tokens(outcome);
         let rec = headroom_core::savings_tracker::RequestRecord {
             model: &outcome.model,
-            input_tokens: outcome.original_tokens,
+            // `original_tokens` is a savings baseline. Cost and usage must
+            // instead follow the request Anthropic received after every proxy
+            // transform, as reported in the response usage breakdown.
+            input_tokens: billed_input_tokens,
             tokens_saved: outcome.tokens_saved,
             compression_savings_cost_usd: Some(outcome.compression_savings_cost_usd()),
             provider: Some(&outcome.provider),
@@ -690,22 +724,10 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // Request-level families: counts, tokens, and the latency/overhead/ttfb
         // histograms plus their min/max gauges.
         //
-        // `input_tokens` prefers `attempted_input_tokens` (the provider's own
-        // usage count, which is what Python reports) and falls back to
-        // `original_tokens`. What keeps this counter alive in passthrough is
-        // the first branch: the outcome sites set `attempted_input_tokens`
-        // straight from the provider's usage block. The fallback cannot rescue
-        // a passthrough request — `original_tokens` is only populated when
-        // compression runs, so there it is 0 as well.
-        let input_tokens = if outcome.attempted_input_tokens > 0 {
-            outcome.attempted_input_tokens
-        } else {
-            outcome.original_tokens
-        };
         crate::observability::proxy_counters::record_request(
             &outcome.provider,
             &outcome.model,
-            input_tokens.max(0) as u64,
+            billed_input_tokens as u64,
             outcome.output_tokens.max(0) as u64,
             outcome.tokens_saved.max(0) as u64,
             outcome.total_latency_ms,
@@ -729,7 +751,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
     fn record_tokens(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
         let rec = headroom_core::cost_tracker::TokenRecord {
             tokens_saved: outcome.tokens_saved,
-            tokens_sent: outcome.original_tokens,
+            tokens_sent: provider_billed_input_tokens(outcome),
             cache_read_tokens: outcome.cache_read_tokens,
             cache_write_tokens: outcome.cache_write_tokens,
             cache_write_5m_tokens: outcome.cache_write_5m_tokens,
@@ -782,12 +804,40 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         let saved = outcome.tokens_saved;
         let model = outcome.model.clone();
         let client = outcome.client.clone();
+        let priced_cost = outcome.compression_savings_cost_usd();
+        let priced_basis = outcome.compression_savings_cost_basis().to_string();
+        let pricing = headroom_core::pricing::lookup(&model);
+        let fresh_rate = pricing
+            .map(|p| p.input_cost_per_token)
+            .unwrap_or(headroom_core::savings_ledger::DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN);
+        let cache_read_rate = pricing
+            .and_then(|p| p.cache_read_cost_per_token)
+            .unwrap_or(fresh_rate);
+        let fresh_counterfactual = saved.max(0) as f64 * fresh_rate;
+        let cache_counterfactual = saved.max(0) as f64 * cache_read_rate;
+        tracing::info!(
+            event = "savings_pricing_counterfactual",
+            request_id = %outcome.request_id,
+            model = %model,
+            tokens_saved = saved,
+            cache_read_tokens = outcome.cache_read_tokens,
+            cache_write_tokens = outcome.cache_write_tokens,
+            fresh_input_rate = fresh_rate,
+            cache_read_rate,
+            fresh_input_usd = fresh_counterfactual,
+            cache_read_usd = cache_counterfactual,
+            priced_cost_basis = %priced_basis,
+            priced_cost_usd = priced_cost,
+            "savings ledger pricing counterfactuals"
+        );
         tokio::task::spawn_blocking(move || {
-            headroom_core::savings_ledger::record_from_forwarded(
+            headroom_core::savings_ledger::record_from_forwarded_with_cost(
                 forwarded,
                 saved,
                 Some(&model),
                 client.as_deref(),
+                Some(priced_cost),
+                Some(&priced_basis),
             );
         });
     }
@@ -1191,8 +1241,20 @@ async fn catch_all(
 /// bodies — multipart uploads, form-encoded posts, and binary
 /// payloads stream through untouched.
 /// CTX-7: serve the re-cache watchdog snapshot as JSON.
+///
+/// The upstream-rejection summary rides along under `upstream`. A refused turn
+/// costs more than any cache miss, so it belongs on the endpoint the statusline
+/// already polls rather than on one nobody watches.
 async fn cache_health(State(state): State<AppState>) -> impl IntoResponse {
-    axum::Json(state.usage_observer.snapshot())
+    let mut snapshot = serde_json::to_value(state.usage_observer.snapshot())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = snapshot.as_object_mut() {
+        obj.insert(
+            "upstream".to_string(),
+            crate::observability::upstream_health::snapshot(),
+        );
+    }
+    axum::Json(snapshot)
 }
 
 fn is_application_json(headers: &HeaderMap) -> bool {
@@ -1280,6 +1342,26 @@ pub(crate) fn resolve_ccr_workspace(
     crate::memory::router::ProjectResolver::resolve(&ctx).map(|(key, display)| (key, Some(display)))
 }
 
+/// Resolve the project directory used to pick this request's ctx stores.
+///
+/// Same tier order as [`resolve_ccr_workspace`], but returns the canonical
+/// directory rather than a display key, because that is what
+/// `hash_project_dir_canonical` names the DB files after.
+///
+/// Falls back to [`crate::ctx::projects::UNRESOLVED_PROJECT`] instead of
+/// failing closed: capture and recall have to go *somewhere*, and the shared
+/// bucket is where every request already landed before sharding existed.
+pub(crate) fn resolve_ctx_project(headers: Option<&HeaderMap>, body: &serde_json::Value) -> String {
+    let ctx = crate::memory::router::RequestContext {
+        headers: header_map_to_lowercase_strings(headers),
+        system_prompt: crate::memory::router::extract_system_prompt(body),
+        base_user_id: String::new(),
+        project_root_override: None,
+    };
+    crate::memory::router::ProjectResolver::resolve_project_dir(&ctx)
+        .unwrap_or_else(|| crate::ctx::projects::UNRESOLVED_PROJECT.to_string())
+}
+
 pub(crate) fn latest_user_query(body: &serde_json::Value) -> String {
     body.get("messages")
         .and_then(serde_json::Value::as_array)
@@ -1355,6 +1437,10 @@ fn append_context_to_latest_user_turn(
     }
 }
 
+// Eight parameters, one over the lint's threshold. Grouping them into a struct
+// would mean a type used at exactly two call sites, both of which pass every
+// field, so the indirection would cost more reading than it saves.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn maybe_append_ccr_proactive_expansion(
     state: &AppState,
     body: &mut serde_json::Value,
@@ -1363,6 +1449,7 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
     workspace_label: Option<&str>,
     turn_number: u32,
     request_id: &str,
+    budget: &crate::injection_budget::InjectionBudget,
 ) -> bool {
     if user_query.trim().is_empty()
         || !state.config.ccr_proactive_expansion
@@ -1413,11 +1500,24 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
             &expansions,
             workspace_label,
         );
+    // Charge the shared budget. Expansion appends to the live tail, which is
+    // re-sent every turn, so clipping it here is cache-safe.
+    let Some(expansion_text) = budget.take(
+        crate::injection_budget::InjectionStage::ProactiveExpansion,
+        expansion_text,
+    ) else {
+        return false;
+    };
+    // Measure before the move: this is what the request grows by, and it is
+    // the only number that says whether expansion is worth what offload saved.
+    let expansion_bytes = expansion_text.len() as u64;
     let changed = append_context_to_latest_user_turn(body, expansion_text);
     if changed {
+        crate::observability::ctx_metrics::observe_proactive_expansion(expansion_bytes);
         tracing::info!(
             request_id = %request_id,
             expansions = expansions.len(),
+            expansion_bytes = expansion_bytes,
             "CCR Phase 4: proactively expanded relevant offloaded context"
         );
     }
@@ -1692,6 +1792,13 @@ pub(crate) struct CcrRoundUsage {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// Usage of the first upstream response that the proxy replaced with an
+    /// internal continuation. This is the cache footprint of the client's
+    /// original request; the next client turn does not contain proxy-private
+    /// retrieval/tool-result messages and must be compared with this baseline.
+    pub client_input_tokens: u64,
+    pub client_cache_read_tokens: u64,
+    pub client_cache_write_tokens: u64,
 }
 
 impl CcrRoundUsage {
@@ -1706,6 +1813,11 @@ impl CcrRoundUsage {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0)
         };
+        if self.rounds == 0 {
+            self.client_input_tokens = get("input_tokens").max(0) as u64;
+            self.client_cache_read_tokens = get("cache_read_input_tokens").max(0) as u64;
+            self.client_cache_write_tokens = get("cache_creation_input_tokens").max(0) as u64;
+        }
         self.rounds += 1;
         self.input_tokens += get("input_tokens");
         self.output_tokens += get("output_tokens");
@@ -1713,9 +1825,43 @@ impl CcrRoundUsage {
         self.cache_write_tokens += get("cache_creation_input_tokens");
     }
 
+    /// Fold another set of rounds in. A turn can spend rounds on more than one
+    /// proxy-owned tool family, and both were billed.
+    pub fn absorb(&mut self, other: CcrRoundUsage) {
+        if self.rounds == 0 && other.rounds > 0 {
+            self.client_input_tokens = other.client_input_tokens;
+            self.client_cache_read_tokens = other.client_cache_read_tokens;
+            self.client_cache_write_tokens = other.client_cache_write_tokens;
+        }
+        self.rounds += other.rounds;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+    }
+
     /// True when there is nothing extra to account for.
     pub fn is_empty(&self) -> bool {
         self.rounds == 0
+    }
+
+    /// Cache counters that describe the request the client actually made.
+    /// Hidden continuation rounds still remain in the billing totals above.
+    fn client_cache_baseline(
+        &self,
+        final_input: u64,
+        final_cache_read: u64,
+        final_cache_write: u64,
+    ) -> (u64, u64, u64) {
+        if self.rounds > 0 {
+            (
+                self.client_input_tokens,
+                self.client_cache_read_tokens,
+                self.client_cache_write_tokens,
+            )
+        } else {
+            (final_input, final_cache_read, final_cache_write)
+        }
     }
 }
 
@@ -2253,6 +2399,20 @@ pub(crate) async fn forward_http(
             | compression::CompressibleEndpoint::OpenAiResponses => buffered,
         };
 
+        // Pin the billing header in `system[0]` to one string per proxy
+        // process. It is cached content, not a header, and Claude Code changes
+        // it on every self-update and every new process — which resets a cache
+        // we are paying to keep. This has to run here, ahead of the fingerprint
+        // below and the prefix-replay capture further down, so every stage sees
+        // the pinned form and stores the bytes we will actually forward.
+        let buffered = match endpoint {
+            compression::CompressibleEndpoint::AnthropicMessages => {
+                cache_stabilization::billing_header::pin_billing_header_in_body(buffered)
+            }
+            compression::CompressibleEndpoint::OpenAiChatCompletions
+            | compression::CompressibleEndpoint::OpenAiResponses => buffered,
+        };
+
         // PR-E5 + PR-E6: cache-stabilization observability hooks.
         // Both run READ-ONLY against the buffered body and emit
         // structured logs only — passthrough invariant from Phase A
@@ -2276,6 +2436,10 @@ pub(crate) async fn forward_http(
         // reached no metric at all, so a body that genuinely shrank still
         // showed `tok_saved=0` in /stats and the dashboard.
         let mut ctx_transform_tokens_saved: i64 = 0;
+        // The response-side usage block is the only authoritative cache-write
+        // total. Retain whether this request injected a proactive expansion so
+        // it can be attributed there without estimating from added bytes.
+        let mut proactive_expansion_applied = false;
         // One session key per request, derived here and reused by every
         // downstream consumer (ctx injection, the offload boundary gate,
         // prefix replay). `derive_session_key` fingerprints the
@@ -2298,13 +2462,6 @@ pub(crate) async fn forward_http(
                 &parsed,
                 volatile_kind,
             );
-            if !findings.is_empty() {
-                cache_stabilization::volatile_detector::emit_volatile_warnings(
-                    &findings,
-                    &request_id,
-                );
-            }
-
             // PR-E6: cache-bust drift detector. SHA-256 fingerprints
             // the cache hot zone (system / tools / first 3 messages);
             // a mismatch between consecutive turns of the same session
@@ -2319,8 +2476,40 @@ pub(crate) async fn forward_http(
                     Some(ApiKind::OpenAiResponses)
                 }
             };
-            if let (Some(kind), Some(headers)) = (drift_kind, headers_snapshot.as_ref()) {
-                let session_key = derive_session_key(headers, &client_addr, &parsed, kind);
+
+            // Derived once and shared by the volatile warnings below and the
+            // drift detector after them. `derive_session_key` costs up to six
+            // SHA-256 digests over canonicalized subtree clones, so deriving it
+            // per consumer would put that on the hot path of every request
+            // twice over — for a log field.
+            let session_identity = match (drift_kind, headers_snapshot.as_ref()) {
+                (Some(kind), Some(headers)) => {
+                    let key = derive_session_key(headers, &client_addr, &parsed, kind);
+                    let conversation =
+                        cache_stabilization::usage_observer::conversation_key(&parsed, &key);
+                    Some((kind, key, conversation))
+                }
+                _ => None,
+            };
+
+            if !findings.is_empty() {
+                // Same identity the drift and recache events carry, so a
+                // volatile finding can be joined to the bust it is suspected of
+                // causing. Item 4 cannot be settled without it: the warning
+                // fires on static sample text as readily as on real per-request
+                // churn, and only a per-conversation join tells the two apart.
+                let session_hash = session_identity.as_ref().map(|(_, key, _)| {
+                    cache_stabilization::drift_detector::session_key_log_prefix(key)
+                });
+                cache_stabilization::volatile_detector::emit_volatile_warnings(
+                    &findings,
+                    &request_id,
+                    session_hash.as_deref(),
+                    session_identity.as_ref().map(|(_, _, conv)| conv.as_str()),
+                );
+            }
+
+            if let Some((kind, session_key, conversation)) = session_identity {
                 request_session_key = session_key.clone();
                 let hash = compute_structural_hash(&parsed, kind);
                 let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
@@ -2332,8 +2521,17 @@ pub(crate) async fn forward_http(
                 // conversation's previous turn.
                 state.usage_observer.begin_request(
                     &request_id,
-                    cache_stabilization::usage_observer::conversation_key(&parsed, &session_key),
+                    conversation,
+                    // The drift detector's own hash, not a re-derivation:
+                    // a recache event is only joinable to the drift event
+                    // that explains it if both print the same value.
+                    Some(cache_stabilization::drift_detector::session_key_log_prefix(
+                        &session_key,
+                    )),
                     drift_dims,
+                    Some(cache_stabilization::usage_observer::prefix_fingerprint(
+                        &parsed,
+                    )),
                 );
 
                 // PR-J0: env-gated request-body capture for the offload
@@ -2357,7 +2555,8 @@ pub(crate) async fn forward_http(
                 // body once and hands it to a detached worker. No-op unless
                 // `ctx_capture` is enabled (then `ctx_observer` is `Some`).
                 if let Some(observer) = state.ctx_observer.as_ref() {
-                    observer.observe(&parsed, &session_key);
+                    let project_dir = resolve_ctx_project(headers_snapshot.as_ref(), &parsed);
+                    observer.observe(&parsed, &session_key, &project_dir);
                 }
             }
         }
@@ -2468,6 +2667,59 @@ pub(crate) async fn forward_http(
         // originals are persisted on a detached worker; wire bytes never depend
         // on any store.
 
+        // Freeze-replay: snapshot the ORIGINAL CLIENT messages — before the CTX
+        // stage below rewrites `buffered`, and before the dispatcher consumes
+        // it. The overlay stage needs them for the append-only guard (the
+        // previous turn's originals must be an exact canonical prefix of these)
+        // and to record this turn for the next one.
+        //
+        // Capturing this AFTER the CTX rewrite was a defect, and an expensive
+        // one: `ctx_offload` collapses and restores `tool_result` blocks, so
+        // the "originals" moved whenever our own offload decisions moved. The
+        // guard then compared our output against our output, saw a difference
+        // we had introduced, declined to replay, and busted the very cache the
+        // replay exists to protect — blaming the client for it in the log.
+        // Measured 2026-08-09: content-array length changes were 6 of 7 sampled
+        // divergences, and one such bust cost 452,172 tokens on a single turn.
+        //
+        // The invariant this restores: `original` is what the CLIENT sent and
+        // nothing else; `forwarded` is whatever we produced. Replay already
+        // guarantees the forwarded side is byte-stable turn to turn, so our own
+        // rewrites can no longer trip the guard. Both sides of the comparison
+        // are captured here, so the stored and current flavours always match.
+        // Canonicalise away the client's ephemeral scaffolding FIRST, so every
+        // stage below — the capture just after, compression, the append-only
+        // guard, and the bytes on the wire — sees one form of history that does
+        // not depend on whether a `<system-reminder>` happened to be attached
+        // this turn.
+        //
+        // It runs ahead of the capture on purpose, and that is safe here for the
+        // reason `ctx_offload` was not: this is a pure function of the body.
+        // Same input, same output, no store state, so the comparison baseline
+        // cannot drift under it. Offload decisions could, which is what made
+        // capturing after them a defect.
+        let buffered = if state.config.prefix_replay
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            ) {
+            relocate_ephemeral_blocks_in_body(buffered, &request_id)
+        } else {
+            buffered
+        };
+
+        let replay_original_messages: Option<Vec<serde_json::Value>> = if state.config.prefix_replay
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            ) {
+            serde_json::from_slice::<serde_json::Value>(&buffered)
+                .ok()
+                .and_then(|v| v.get("messages").and_then(|m| m.as_array().cloned()))
+        } else {
+            None
+        };
+
         let buffered = if matches!(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
@@ -2477,9 +2729,20 @@ pub(crate) async fn forward_http(
                 Ok(mut value) => {
                     let ctx_session_key = request_session_key.clone();
                     let mut changed = false;
+                    // Which project's stores recall reads and offload writes.
+                    let ctx_project = resolve_ctx_project(headers_snapshot.as_ref(), &value);
                     let ccr_workspace = resolve_ccr_workspace(headers_snapshot.as_ref(), &value);
                     let latest_user_query = latest_user_query(&value);
                     let turn_number = anthropic_turn_number(&value);
+
+                    // One ceiling for every stage that appends to this turn.
+                    // Drawn down in the order the stages run below; without it
+                    // three independently-capped appenders could inflate the
+                    // request while each looked small on its own counter.
+                    let injection_budget = crate::injection_budget::InjectionBudget::for_request(
+                        state.config.max_injection_bytes,
+                        &request_id,
+                    );
 
                     if let Some((workspace_key, workspace_label)) = ccr_workspace.as_ref() {
                         if maybe_append_ccr_proactive_expansion(
@@ -2490,8 +2753,10 @@ pub(crate) async fn forward_http(
                             workspace_label.as_deref(),
                             turn_number,
                             &request_id,
+                            &injection_budget,
                         ) {
                             changed = true;
+                            proactive_expansion_applied = true;
                         }
                     } else if state.ccr_context_tracker.is_some() {
                         tracing::info!(
@@ -2502,7 +2767,13 @@ pub(crate) async fn forward_http(
 
                     if let Some(engine) = state.ctx_inject.as_ref() {
                         let session_key = ctx_session_key.clone();
-                        if engine.maybe_inject_for_request(&mut value, &session_key, &request_id) {
+                        if engine.maybe_inject_for_request(
+                            &mut value,
+                            &session_key,
+                            &ctx_project,
+                            &injection_budget,
+                            &request_id,
+                        ) {
                             changed = true;
                         }
                     }
@@ -2540,7 +2811,8 @@ pub(crate) async fn forward_http(
                             // offload-store worker after persist_one confirms
                             // the record is durably recoverable, not here —
                             // see ctx/offload_store.rs.
-                            tracing::debug!(
+                            tracing::info!(
+                                event = "ctx_offload_accounting",
                                 request_id = %request_id,
                                 blocks_offloaded = out.blocks_offloaded,
                                 blocks_deferred = out.blocks_deferred,
@@ -2599,7 +2871,37 @@ pub(crate) async fn forward_http(
                     // into the request body so the LLM can retrieve original
                     // uncompressed content by hash. Only when compression
                     // has produced CCR markers and the feature is enabled.
-                    if state.config.ccr_inject_tool {
+                    //
+                    // `can_resolve` states the invariant rather than fixing a
+                    // live bug: the enclosing block already runs for Anthropic
+                    // only, so the non-Anthropic arm of the `match endpoint`
+                    // below is currently unreachable. It is kept because the
+                    // gate is what makes lifting that outer restriction safe —
+                    // whoever does it gets the OpenAI shapes excluded from
+                    // *streaming* injection for free, since only the buffered
+                    // arm of `forward_http` can answer those. Bedrock takes the
+                    // same line from the other end by passing no CCR store at
+                    // all (`bedrock/invoke.rs`).
+                    let client_streams = value
+                        .get("stream")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let can_resolve = matches!(
+                        endpoint,
+                        compression::CompressibleEndpoint::AnthropicMessages
+                    ) || !client_streams;
+                    // A request with no `tools` key still needs the retrieval
+                    // tool once its content has been offloaded, otherwise the
+                    // digest points at a tool the model was never given. The
+                    // memory injector above takes the same line.
+                    if state.config.ccr_inject_tool
+                        && can_resolve
+                        && ctx_transform_tokens_saved > 0
+                        && value.get("tools").is_none()
+                    {
+                        value["tools"] = serde_json::json!([]);
+                    }
+                    if state.config.ccr_inject_tool && can_resolve {
                         if let Some(tools) = value.get_mut("tools").and_then(|v| v.as_array_mut()) {
                             let already_has = tools.iter().any(|t| {
                                 t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve")
@@ -2697,6 +2999,10 @@ pub(crate) async fn forward_http(
                                     .and_then(|h| h.get("x-headroom-user-id"))
                                     .and_then(|v| v.to_str().ok())
                                     .unwrap_or("default");
+                                // Memory runs last, so it sees whatever the
+                                // expansion and recall stages left. Clipping
+                                // here is cache-safe: this appends to the live
+                                // tail, which is re-sent every turn anyway.
                                 if let Some(context) = handler
                                     .search_and_format_context(
                                         user_id, &msgs, None, // request_context
@@ -2705,6 +3011,12 @@ pub(crate) async fn forward_http(
                                         None, // budget
                                     )
                                     .await
+                                    .and_then(|context| {
+                                        injection_budget.take(
+                                            crate::injection_budget::InjectionStage::Memory,
+                                            context,
+                                        )
+                                    })
                                 {
                                     let frozen = value
                                         .get("system")
@@ -2752,7 +3064,7 @@ pub(crate) async fn forward_http(
                                             "CCR Phase 4: workspace unresolved; skipping compression tracking"
                                         );
                                     }
-                                    runtime.store.persist(records);
+                                    runtime.store.persist(records, &ctx_project);
                                 }
                                 axum::body::Bytes::from(bytes)
                             }
@@ -2816,24 +3128,9 @@ pub(crate) async fn forward_http(
         let mut _tags = crate::headers::extract_tags(decision_headers);
         decision.apply_to_tags(&mut _tags);
 
-        // Freeze-replay: snapshot the ORIGINAL client messages before
-        // `buffered` is consumed by the dispatcher arms below. The
-        // overlay stage after the dispatcher needs them to decide the
-        // append-only guard (previous originals must be an exact
-        // canonical prefix of these) and to record this turn for the
-        // next one. Anthropic-only, and only when the flag is on so
-        // the flag-off path pays zero parse cost.
-        let replay_original_messages: Option<Vec<serde_json::Value>> = if state.config.prefix_replay
-            && matches!(
-                endpoint,
-                compression::CompressibleEndpoint::AnthropicMessages
-            ) {
-            serde_json::from_slice::<serde_json::Value>(&buffered)
-                .ok()
-                .and_then(|v| v.get("messages").and_then(|m| m.as_array().cloned()))
-        } else {
-            None
-        };
+        // Captured above, BEFORE the CTX stage rewrote `buffered` — see the
+        // snapshot next to that reassignment for why the ordering is the whole
+        // point.
 
         let compression_start = Instant::now();
         let outcome = if !decision.should_compress {
@@ -3020,10 +3317,12 @@ pub(crate) async fn forward_http(
                 tags: _tags.clone(),
                 client: None,
                 project,
+                // Keep PERF savings scoped to the compression dispatcher. CTX
+                // offload has its own per-request accounting below; folding it
+                // into this field makes a prior offload re-application look like
+                // compression savings and can re-emit a conversation-sized value.
                 original_tokens: compress_tokens_before,
-                // Compression's own saving plus anything the CTX transforms
-                // removed before it ran.
-                tokens_saved: compress_tokens_saved + ctx_transform_tokens_saved,
+                tokens_saved: compress_tokens_saved,
                 transforms_applied: compress_strategies.clone(),
                 num_messages: num_messages as i64,
                 total_latency_ms: start.elapsed().as_millis() as f64,
@@ -3032,6 +3331,9 @@ pub(crate) async fn forward_http(
                 overhead_ms: 0.0,
                 started_at: start,
                 waste_signals: waste_signals_for_request(&parsed_body, &model_for_waste),
+                proactive_expansion_applied,
+                // Filled in at the send point, where the final body exists.
+                wire_bytes: None,
                 forwarded_tokens_estimate: 0,
                 upstream_attempts: 1,
             });
@@ -3110,6 +3412,14 @@ pub(crate) async fn forward_http(
                     strategies = ?strategies_applied,
                     markers = markers_inserted.len(),
                     "compression applied"
+                );
+                // Park the saving so the response side can price it against
+                // the billed usage — the two halves of "is this worth running"
+                // are produced on opposite sides of the request.
+                state.usage_observer.note_compression(
+                    &request_id,
+                    tokens_before as u64,
+                    tokens_after as u64,
                 );
                 // Phase G PR-G3 + H1: emit one
                 // `proxy_compression_ratio_by_strategy` sample per
@@ -3328,6 +3638,8 @@ pub(crate) async fn forward_http(
             record_request_footprint(&state.savings_tracker, &original_buffered, &body_to_send);
         }
 
+        cache_stabilization::capture::maybe_capture_outbound(&body_to_send, &request_id);
+
         // Context-editing: when injecting `context_management` directives we
         // must also advertise the beta so the upstream honours them.
         if state.config.context_edit
@@ -3369,10 +3681,47 @@ pub(crate) async fn forward_http(
         } else {
             apply_request_hooks(body_to_send, endpoint, &request_id)
         };
-        if let Some(ctx) = outcome_ctx.as_mut() {
-            ctx.forwarded_tokens_estimate = headroom_core::tokenizer::get_tokenizer(&ctx.model)
-                .count_text(&String::from_utf8_lossy(&body_to_send))
-                as i64;
+
+        // Wire footprint. The last measurement before the body leaves, so it
+        // covers every stage — compression, routing, prune, replay, TTL, hooks
+        // — not just the compression dispatcher that `tok_saved` is measured
+        // at. `tok_saved` counts tokens freed mid-pipeline and cannot answer
+        // "did fewer bytes actually reach the provider"; only these two
+        // numbers, read together, can. Logged once per request rather than
+        // per attempt, because a retry re-sends the same bytes.
+        {
+            let sent = body_to_send.len() as i64;
+            let received = original_buffered_len as i64;
+            tracing::info!(
+                target: "headroom.proxy",
+                event = "outbound_body_bytes",
+                request_id = %request_id,
+                path = %path_for_log,
+                bytes_in = received,
+                bytes_out = sent,
+                bytes_delta = sent - received,
+                "outbound body size measured on the wire"
+            );
+            // Same site, same bytes: this is what actually left the proxy, so
+            // the fingerprints describe the prefix the provider keyed on.
+            log_prefix_composition(&request_id, &body_to_send);
+            // Feed the ground-truth ledger. Sizes come off the wire, and the
+            // arm label makes a compression-on vs compression-off comparison a
+            // query instead of an argument.
+            state.usage_observer.note_wire_bytes(
+                &request_id,
+                received.max(0) as u64,
+                sent.max(0) as u64,
+                state.config.compression_mode.as_str(),
+            );
+            // Hand the pair to the outcome, which books it against the
+            // provider's usage once the response reports one.
+            if let Some(ctx) = outcome_ctx.as_mut() {
+                ctx.wire_bytes = Some((received, sent));
+                ctx.forwarded_tokens_estimate = headroom_core::tokenizer::get_tokenizer(&ctx.model)
+                    .count_text(&String::from_utf8_lossy(&body_to_send))
+                    as i64;
+            }
         }
 
         // Forward the request with retry on transient errors (429, 529, 5xx).
@@ -3402,26 +3751,35 @@ pub(crate) async fn forward_http(
                             status == 429 || status == 529 || (500..600).contains(&status);
                         if is_retryable && attempt + 1 < max_attempts {
                             let max_delay = state.config.retry_max_delay_ms;
-                            let retry_after = r
+                            let retry_after_header = r.headers().contains_key("retry-after");
+                            let retry_after_uncapped = r
                                 .headers()
                                 .get("retry-after")
                                 .and_then(|v| v.to_str().ok())
                                 .and_then(headroom_core::retry::retry_after_ms_uncapped);
-                            if retry_after.is_some_and(|delay| delay > max_delay as f64) {
+                            let retry_after_exceeds_cap =
+                                retry_after_uncapped.is_some_and(|delay| delay > max_delay as f64);
+                            if retry_after_exceeds_cap {
                                 tracing::warn!(
                                     event = "upstream_retry_after_exceeds_cap",
                                     request_id = %request_id,
                                     status,
-                                    retry_after_ms = retry_after.unwrap_or_default(),
+                                    attempt = attempt + 1,
+                                    max_attempts,
+                                    retry_after_ms = retry_after_uncapped.unwrap_or_default(),
                                     retry_max_delay_ms = max_delay,
-                                    "returning the upstream response without an early retry"
+                                    session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(&request_session_key),
+                                    "upstream Retry-After exceeds the internal wait cap; returning the response without an early retry"
                                 );
-                                result = Some(r);
-                                break;
-                            }
-                            let delay_ms = retry_after
-                                .map(|delay| delay.ceil().min(u64::MAX as f64) as u64)
-                                .unwrap_or_else(|| {
+                            } else {
+                                let retry_after = retry_after_uncapped
+                                    .map(|delay| delay.ceil().min(u64::MAX as f64) as u64);
+                                let delay_source = if retry_after.is_some() {
+                                    "header"
+                                } else {
+                                    "backoff"
+                                };
+                                let delay_ms = retry_after.unwrap_or_else(|| {
                                     let base = state.config.retry_base_delay_ms;
                                     let max = state.config.retry_max_delay_ms;
                                     let backoff = base.saturating_mul(1u64 << attempt).min(max);
@@ -3435,18 +3793,71 @@ pub(crate) async fn forward_http(
                                             % 101);
                                     backoff.saturating_mul(jitter) / 100
                                 });
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    status = status,
+                                    attempt = attempt + 1,
+                                    max_attempts = max_attempts,
+                                    delay_ms = delay_ms,
+                                    retry_after_header,
+                                    delay_source,
+                                    retry_after_clamped = false,
+                                    session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(&request_session_key),
+                                    "upstream returned retryable status; retrying"
+                                );
+                                crate::observability::record_upstream_retry(
+                                    "anthropic",
+                                    crate::observability::retry_reason::from_status(status),
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                                continue;
+                            }
+                        }
+                        // Anthropic reports rate limits and overload *inside*
+                        // a 200 body when the client asked for a stream: the
+                        // headers say success, then the first SSE event is
+                        // `{"type":"error","error":{"type":"overloaded_error"}}`.
+                        // A retry loop that only reads `r.status()` is blind to
+                        // it and hands the client a turn that never started.
+                        //
+                        // Peeking the first event is safe because nothing has
+                        // been forwarded yet — the bytes are still ours. Once
+                        // content has gone out we cannot retry without
+                        // duplicating it, so only a *leading* error qualifies;
+                        // one that arrives later ends the stream without
+                        // `message_stop` and is caught by the gate in
+                        // `run_sse_state_machine` instead.
+                        let mut r = r;
+                        let (prefix, leading_error) = peek_leading_sse_error(&mut r).await;
+                        if let Some(kind) = leading_error {
+                            if attempt + 1 < max_attempts {
+                                let base = state.config.retry_base_delay_ms;
+                                let max = state.config.retry_max_delay_ms;
+                                let delay_ms = base.saturating_mul(1u64 << attempt).min(max);
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    error_type = %kind,
+                                    attempt = attempt + 1,
+                                    max_attempts = max_attempts,
+                                    delay_ms = delay_ms,
+                                    "upstream reported an error inside a 200 stream; retrying"
+                                );
+                                crate::observability::record_upstream_retry(
+                                    "anthropic",
+                                    crate::observability::retry_reason::IN_BAND_SSE,
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                                continue;
+                            }
                             tracing::warn!(
                                 request_id = %request_id,
-                                status = status,
-                                attempt = attempt + 1,
-                                max_attempts = max_attempts,
-                                delay_ms = delay_ms,
-                                "upstream returned retryable status; retrying"
+                                error_type = %kind,
+                                "upstream error inside a 200 stream survived every retry"
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            continue;
                         }
-                        result = Some(r);
+                        result = Some((r, prefix));
                         break;
                     }
                     Err(e) => {
@@ -3471,6 +3882,10 @@ pub(crate) async fn forward_http(
                                 delay_ms = delay_ms,
                                 "upstream error retryable; retrying"
                             );
+                            crate::observability::record_upstream_retry(
+                                "anthropic",
+                                crate::observability::retry_reason::TRANSPORT,
+                            );
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                             last_err = Some(ProxyError::Upstream(e));
                             continue;
@@ -3479,28 +3894,37 @@ pub(crate) async fn forward_http(
                     }
                 }
             }
-            if let Some(ctx) = outcome_ctx.as_mut() {
-                ctx.upstream_attempts = attempts_made;
-            }
-            result.ok_or_else(|| {
+            let resolved = result.ok_or_else(|| {
                 last_err.unwrap_or_else(|| {
                     ProxyError::InvalidUpstream("retry loop exhausted".to_string())
                 })
-            })?
+            })?;
+            if let Some(ctx) = outcome_ctx.as_mut() {
+                ctx.upstream_attempts = attempts_made.max(1);
+            }
+            resolved
         }
     } else {
-        // Pure streaming path — the original passthrough behaviour.
+        // Pure streaming path — the original passthrough behaviour. No peek
+        // here: passthrough is byte-faithful by contract, and this path has no
+        // retry loop to feed anyway.
         let body_stream =
             TryStreamExt::map_err(req.into_body().into_data_stream(), std::io::Error::other);
         let reqwest_body = reqwest::Body::wrap_stream(body_stream);
-        state
-            .client
-            .request(reqwest_method, upstream_url.clone())
-            .headers(outgoing_headers.clone())
-            .body(reqwest_body)
-            .send()
-            .await?
+        (
+            state
+                .client
+                .request(reqwest_method, upstream_url.clone())
+                .headers(outgoing_headers.clone())
+                .body(reqwest_body)
+                .send()
+                .await?,
+            bytes::Bytes::new(),
+        )
     };
+    // Bytes already read off the body while checking for a leading in-band
+    // error. They lead the client's stream so nothing is lost.
+    let (upstream_resp, sse_prefix) = upstream_resp;
 
     let upstream_status = upstream_resp.status();
     let mut status =
@@ -3562,11 +3986,6 @@ pub(crate) async fn forward_http(
     } else {
         SseStreamKind::None
     };
-    if !is_sse && (status.is_client_error() || status.is_server_error()) {
-        if let Some(ctx) = outcome_ctx.as_ref() {
-            emit_failed_http_outcome(ctx, &request_id, status);
-        }
-    }
 
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
@@ -3638,7 +4057,58 @@ pub(crate) async fn forward_http(
     // bounded; if the parser falls behind, `try_send` fails and we
     // log + drop — the byte path is not affected. This is the
     // explicit "never block on parser readiness" contract.
+    // CCR retrieval on the streamed path. The proxy offers the model a
+    // `headroom_retrieve` tool on every intercepted request; on a streamed
+    // response the call used to travel straight to a client that has no such
+    // tool. `rewrite_anthropic_stream` answers it here — suppressing the
+    // block, running the continuation, splicing the result back in — so the
+    // streamed turn behaves like the buffered one.
+    //
+    // Eligibility mirrors the buffered branch below: same feature flags, same
+    // store requirement, same path. When any of them is off the upstream body
+    // is handed on untouched and this costs one boolean.
+    let ccr_stream_eligible = is_sse
+        && status.is_success()
+        && matches!(sse_kind, SseStreamKind::Anthropic)
+        && state.config.ccr_handle_responses
+        && state.ctx_offload.is_some()
+        && path_for_log.contains("/v1/messages");
+    // Put the peeked bytes back at the head of the stream. `sse_prefix` is
+    // empty on every path that did not peek, so this is a no-op there.
+    let upstream_body = {
+        let rest = upstream_resp.bytes_stream();
+        let head =
+            futures_util::stream::iter((!sse_prefix.is_empty()).then(|| Ok(sse_prefix.clone())));
+        head.chain(rest)
+    };
+    let (upstream_body, ccr_round_usage): (
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+        Option<Arc<Mutex<CcrRoundUsage>>>,
+    ) = if ccr_stream_eligible {
+        let ctx = crate::sse::ccr_stream::CcrStreamContext {
+            client: state.client.clone(),
+            upstream_url: upstream_url.clone(),
+            outgoing_headers: outgoing_headers.clone(),
+            original_request: original_buffered.clone(),
+            ccr_store: state
+                .ctx_offload
+                .as_ref()
+                .expect("ctx_offload checked above")
+                .store
+                .ccr(),
+            config: state.config.clone(),
+            request_id: request_id.clone(),
+            shape: crate::sse::ccr_stream::CcrShape::Anthropic,
+            memory: memory_tool_context(&state, &headers_snapshot, Some("anthropic")).await,
+        };
+        let (stream, usage) = crate::sse::ccr_stream::rewrite_anthropic_stream(upstream_body, ctx);
+        (Box::pin(stream), Some(usage))
+    } else {
+        (Box::pin(upstream_body), None)
+    };
+
     let rid = request_id.clone();
+    let parser_telemetry = std::sync::Arc::new(ParserTelemetry::default());
     let parser_tx = if !matches!(sse_kind, SseStreamKind::None) {
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(SSE_PARSER_QUEUE_DEPTH);
         let rid_for_parser = request_id.clone();
@@ -3653,27 +4123,79 @@ pub(crate) async fn forward_http(
         } else {
             None
         };
-        tokio::spawn(run_sse_state_machine(
+        let parser_task = tokio::spawn(run_sse_state_machine(
             sse_kind,
             rx,
-            rid_for_parser,
+            rid_for_parser.clone(),
             state.usage_observer.clone(),
             outcome_ctx.clone(),
             replay_store_for_parser,
+            ccr_round_usage.clone(),
         ));
+        // Keep the parser detached from response forwarding, but do not drop
+        // its JoinHandle: a panic would otherwise erase the only completion
+        // record for this request. The waiter preserves the streaming path and
+        // makes task panics/cancellation operator-visible.
+        let waiter_telemetry = parser_telemetry.clone();
+        tokio::spawn(async move {
+            let result = parser_task.await;
+            let sent_chunks = waiter_telemetry
+                .sent_chunks
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dropped_chunks = waiter_telemetry
+                .dropped_chunks
+                .load(std::sync::atomic::Ordering::Relaxed);
+            match result {
+                // A clean finish is already announced once per stream by
+                // `sse stream closed`, so this stays quiet unless the chunk
+                // counts say something that line cannot: a parser that missed
+                // input because its queue was full or already closed. Logging
+                // every clean finish at info would double the per-stream volume
+                // of a log that is never rotated.
+                Ok(()) if dropped_chunks > 0 => tracing::warn!(
+                    request_id = %rid_for_parser,
+                    sent_chunks,
+                    dropped_chunks,
+                    "sse state-machine task completed having missed chunks; \
+                     its usage totals are short by whatever those carried"
+                ),
+                Ok(()) => tracing::debug!(
+                    request_id = %rid_for_parser,
+                    sent_chunks,
+                    dropped_chunks,
+                    "sse state-machine task completed"
+                ),
+                Err(error) => tracing::error!(
+                    request_id = %rid_for_parser,
+                    sent_chunks,
+                    dropped_chunks,
+                    task_panic = error.is_panic(),
+                    task_cancelled = error.is_cancelled(),
+                    error = %error,
+                    "sse state-machine task failed"
+                ),
+            }
+        });
         Some(tx)
     } else {
         None
     };
-    let resp_stream = upstream_resp.bytes_stream().map(move |r| match r {
+    let resp_stream = upstream_body.map(move |r| match r {
         Ok(b) => {
             if let Some(tx) = &parser_tx {
                 if let Err(e) = tx.try_send(b.clone()) {
+                    parser_telemetry
+                        .dropped_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::debug!(
                         request_id = %rid,
                         error = %e,
                         "sse parser queue full or closed; skipping telemetry chunk"
                     );
+                } else {
+                    parser_telemetry
+                        .sent_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             Ok(b)
@@ -3691,7 +4213,63 @@ pub(crate) async fn forward_http(
     // `is_sse` — buffering an unbounded SSE stream never completes and
     // breaks client-disconnect propagation.
     let should_buffer_for_cache = !is_sse && status.is_success();
-    let body = if should_buffer_for_cache {
+    // An upstream rejection arrives as a small JSON body that streams straight
+    // through to the client, so the proxy never learns why its own request was
+    // refused. That is the most expensive blind spot here: a rejected turn is a
+    // whole turn lost, worse than any cache miss, and until now the log showed
+    // only `upstream_status=400`. Buffer the body, log the provider's reason,
+    // and hand the same bytes on unchanged.
+    let should_buffer_error = !is_sse && (status.is_client_error() || status.is_server_error());
+    let body = if should_buffer_error {
+        let body_stream = Body::from_stream(resp_stream);
+        match http_body_util::BodyExt::collect(body_stream).await {
+            Ok(collected) => {
+                let body_bytes = collected.to_bytes();
+                let (kind, detail) = describe_upstream_error(&body_bytes);
+                tracing::warn!(
+                    request_id = %request_id,
+                    event = "upstream_rejected",
+                    path = %path_for_log,
+                    upstream_status = status.as_u16(),
+                    error_type = %kind,
+                    error_message = %detail,
+                    body_bytes = body_bytes.len(),
+                    "upstream refused the forwarded request"
+                );
+                // The per-request warn above is one line among thousands. This
+                // keeps the ratio and escalates on its own when refusals stop
+                // being occasional — the signal that was missing while a
+                // splice defect refused a fifth of subagent turns for a day.
+                crate::observability::upstream_health::observe_rejection_reason(
+                    status.as_u16(),
+                    &kind,
+                    &detail,
+                );
+                if let Some(ctx) = outcome_ctx.as_ref() {
+                    emit_failed_http_outcome(ctx, &request_id, status, Some(&body_bytes));
+                }
+                Body::from(body_bytes)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    event = "upstream_rejected",
+                    upstream_status = status.as_u16(),
+                    error = %e,
+                    "upstream refused the forwarded request and the body could not be read"
+                );
+                crate::observability::upstream_health::observe_rejection_reason(
+                    status.as_u16(),
+                    "unreadable_body",
+                    &e.to_string(),
+                );
+                if let Some(ctx) = outcome_ctx.as_ref() {
+                    emit_failed_http_outcome(ctx, &request_id, status, None);
+                }
+                Body::empty()
+            }
+        }
+    } else if should_buffer_for_cache {
         // Wrap the mapped stream into a hyper Body so BodyExt::collect can
         // buffer it. This is only for non-SSE success responses where we
         // want to cache the full body.
@@ -3739,6 +4317,39 @@ pub(crate) async fn forward_http(
                         .await;
                         body_bytes = resolved;
                         ccr_round_usage = extra;
+                    }
+                }
+
+                // Memory tools: same contract as CCR above. The proxy injects
+                // `memory_search` and friends, so the proxy runs them — the
+                // client has never heard of them.
+                let memory_provider = if path_for_log.contains("/v1/messages") {
+                    Some("anthropic")
+                } else if path_for_log.contains("/v1/chat/completions") {
+                    Some("openai")
+                } else if path_for_log.contains("/v1/responses") {
+                    Some("openai_responses")
+                } else {
+                    None
+                };
+                if let Some(memory) =
+                    memory_tool_context(&state, &headers_snapshot, memory_provider).await
+                {
+                    if let Some(provider) = memory_provider {
+                        let (resolved, extra) = handle_memory_response(
+                            &body_bytes,
+                            &original_buffered,
+                            &upstream_url,
+                            &state.client,
+                            &memory,
+                            &state.config,
+                            &request_id,
+                            &outgoing_headers,
+                            provider,
+                        )
+                        .await;
+                        body_bytes = resolved;
+                        ccr_round_usage.absorb(extra);
                     }
                 }
 
@@ -3888,6 +4499,10 @@ pub(crate) async fn forward_http(
                         } else {
                             attempted_input.saturating_sub(cache_read)
                         };
+                        observe_proactive_expansion_cache_write(
+                            ctx,
+                            u64::try_from(cache_write).unwrap_or(0),
+                        );
                         // Fold in the CCR continuation rounds. The client saw
                         // one turn; the upstream billed several, and only the
                         // last one's usage is in `parsed`. Without this the
@@ -3909,18 +4524,34 @@ pub(crate) async fn forward_http(
                         let cache_read = cache_read + ccr_round_usage.cache_read_tokens;
                         let cache_write = cache_write + ccr_round_usage.cache_write_tokens;
                         let uncached_input = uncached_input + ccr_round_usage.input_tokens;
+                        // Read off the pre-CCR `usage`: continuation rounds fold
+                        // into the write total above but carry no TTL breakdown,
+                        // so the split stays a subset of it and pricing charges
+                        // the remainder at the cheaper 5m rate.
+                        let (cache_write_5m, cache_write_1h) = anthropic_cache_ttl_split(usage);
                         let outcome = headroom_core::request_outcome::RequestOutcome {
                             request_id: request_id.clone(),
                             provider: ctx.provider.clone(),
                             model: ctx.model.clone(),
                             status_code: status.as_u16() as i64,
+                            upstream_attempts: ctx.upstream_attempts,
+                            provider_input_tokens: usage.map(|_| {
+                                if ctx.provider == "anthropic" {
+                                    attempted_input + cache_read + cache_write
+                                } else {
+                                    attempted_input
+                                }
+                            }),
+                            provider_output_tokens: usage.map(|_| output_tok),
                             original_tokens: ctx.sizes(attempted_input).0,
                             optimized_tokens: ctx.sizes(attempted_input).1,
                             output_tokens: output_tok,
                             tokens_saved: ctx.tokens_saved,
-                            attempted_input_tokens: attempted_input,
+                            attempted_input_tokens: ctx.attempted(attempted_input),
                             cache_read_tokens: cache_read,
                             cache_write_tokens: cache_write,
+                            cache_write_5m_tokens: cache_write_5m,
+                            cache_write_1h_tokens: cache_write_1h,
                             uncached_input_tokens: uncached_input,
                             total_latency_ms: ctx.total_latency_ms,
                             overhead_ms: ctx.overhead_ms,
@@ -3934,6 +4565,7 @@ pub(crate) async fn forward_http(
                             project: ctx.project.clone(),
                             ..Default::default()
                         };
+                        record_wire_footprint(ctx, uncached_input, cache_read, cache_write);
                         headroom_core::request_outcome::emit_request_outcome(
                             ctx.sink.as_ref(),
                             &outcome,
@@ -3959,6 +4591,11 @@ pub(crate) async fn forward_http(
     } else {
         Body::from_stream(resp_stream)
     };
+
+    // One observation per upstream response, whatever its status. The refusal
+    // count alone is the number that let a 22.5% rejection rate pass for
+    // ordinary bad luck; the ratio is what makes it obvious.
+    crate::observability::upstream_health::observe_upstream_response(status.as_u16());
 
     let mut response = Response::builder().status(status);
     {
@@ -4045,8 +4682,10 @@ impl SseStreamKind {
 /// byte-identical, or the transform would itself be a source of cache churn.
 ///
 /// [`relocate_ephemeral_blocks`]: cache_stabilization::prefix_replay::relocate_ephemeral_blocks
-fn relocate_ephemeral_blocks_in_body(body: bytes::Bytes) -> bytes::Bytes {
+fn relocate_ephemeral_blocks_in_body(body: bytes::Bytes, request_id: &str) -> bytes::Bytes {
+    use cache_stabilization::prefix_replay::RelocationReport;
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        log_relocation(request_id, &RelocationReport::skipped("body_not_json"), 0);
         return body;
     };
     let Some(messages) = parsed
@@ -4055,25 +4694,102 @@ fn relocate_ephemeral_blocks_in_body(body: bytes::Bytes) -> bytes::Bytes {
         .filter(|m| !m.is_empty())
         .cloned()
     else {
+        log_relocation(request_id, &RelocationReport::skipped("no_messages_array"), 0);
         return body;
     };
-    let relocated =
-        cache_stabilization::prefix_replay::relocate_ephemeral_blocks(messages.clone());
+    let (relocated, report) =
+        cache_stabilization::prefix_replay::relocate_ephemeral_blocks_reported(messages.clone());
     if relocated == messages {
+        log_relocation(request_id, &report, 0);
         return body;
     }
-    let moved = messages.len() - relocated.len();
+    let messages_dropped = messages.len() - relocated.len();
     parsed["messages"] = serde_json::Value::Array(relocated);
     match serde_json::to_vec(&parsed) {
         Ok(bytes) => {
-            tracing::debug!(
-                event = "ephemeral_blocks_relocated",
-                messages_dropped = moved,
-                "moved client scaffolding out of history and onto the newest message"
-            );
+            log_relocation(request_id, &report, messages_dropped);
             bytes::Bytes::from(bytes)
         }
-        Err(_) => body,
+        // The rewritten messages are discarded here, so the client's own bytes
+        // go out whole. Report the bail rather than the pass that was thrown
+        // away, or a conservation warning would fire for spans still on the
+        // wire.
+        Err(_) => {
+            log_relocation(
+                request_id,
+                &RelocationReport::skipped("reserialize_failed"),
+                0,
+            );
+            body
+        }
+    }
+}
+
+/// One line per relocation pass, whether or not it moved anything.
+///
+/// INFO, not DEBUG: the proxy runs at INFO, so at DEBUG this never reached the
+/// log. That left no way to tell a turn where relocation ran and the prefix
+/// diverged anyway from one where it never fired — the gap hit while
+/// attributing a 210k-token divergence on 2026-08-13.
+///
+/// Emitted on the bail paths too. It used to fire only when the body changed,
+/// so a pass that gave up — no user tail, nowhere to land — looked exactly like
+/// a request with no scaffolding in it, and four reminder-loss defects were
+/// each found days later from the model's behaviour instead of from a line
+/// saying what relocation had done.
+///
+/// Without `request_id` this event joins to nothing: it can say relocation ran,
+/// but not on which turn, so it cannot be set against that turn's cache
+/// creation to show whether it helped.
+fn log_relocation(
+    request_id: &str,
+    report: &cache_stabilization::prefix_replay::RelocationReport,
+    messages_dropped: usize,
+) {
+    tracing::info!(
+        event = "ephemeral_blocks_relocated",
+        request_id = %request_id,
+        blocks_moved = report.blocks_moved,
+        messages_dropped = messages_dropped,
+        // The conservation check. Relocation moves the client's scaffolding; it
+        // must never lose it, and these two are what says so in one line.
+        spans_in = report.spans_in,
+        spans_out = report.spans_out,
+        bytes_moved = report.bytes_moved,
+        // Which messages were raided, and their roles. Only the client's `user`
+        // turns may be — an `assistant` here is the regression that lifted a
+        // reminder tag out of the model's own prose and left the block empty.
+        source_indices = %join_indices(&report.source_indices),
+        source_roles = %report.source_roles.join(","),
+        // Whether the client gave each span its own block or appended it to
+        // real text. The inline shape is the one that went out twice.
+        span_kinds = %report.span_kinds.join(","),
+        // Where the spans had to land. A string tail has to be promoted to
+        // block form first, and an `absent` shape is the case with nowhere to
+        // put them at all.
+        tail_shape = report.tail_shape,
+        tail_promoted = report.tail_promoted,
+        // Empty when something moved. Anything else names the bail.
+        skip_reason = report.skip_reason,
+        "relocation pass over request history"
+    );
+    if report.spans_out < report.spans_in {
+        // Loss has to announce itself. Every one of the four defects here was
+        // found from the model behaving oddly turns later, because the log
+        // recorded what relocation moved and never what it dropped.
+        let lost = report.spans_in - report.spans_out;
+        crate::observability::relocation::observe_reminder_spans_lost(lost as u64);
+        tracing::warn!(
+            event = "ephemeral_spans_lost",
+            request_id = %request_id,
+            spans_in = report.spans_in,
+            spans_out = report.spans_out,
+            spans_lost = lost,
+            skip_reason = report.skip_reason,
+            tail_shape = report.tail_shape,
+            source_indices = %join_indices(&report.source_indices),
+            "relocation dropped client scaffolding: the model will not see reminders the client sent"
+        );
     }
 }
 
@@ -4219,6 +4935,94 @@ fn describe_upstream_error(body: &[u8]) -> (String, String) {
 /// `content-type` against `text/event-stream` (with optional
 /// parameters). RFC 7231 §3.1.1.1: media types compare
 /// case-insensitive on the type/subtype tokens.
+/// First 12 hex chars of the SHA-256 of `value`. Enough to tell two prefixes
+/// apart in a log without carrying their bytes.
+fn short_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(digest)[..12].to_string()
+}
+
+/// Log which parts of the cacheable prefix this request carries.
+///
+/// A fan-out of subagents shares a provider cache entry only where their
+/// leading bytes are identical. Measured 2026-08-13: of 14 subagent
+/// conversations, 5 shared a 43,603-token prefix and the other 9 each read a
+/// slightly different floor, so eight cache entries were built where one would
+/// have done. Sizes alone cannot say which component differs, so hash `system`
+/// and `tools` separately — two requests whose `tools_fingerprint` matches but
+/// whose `system_fingerprint` does not are diverging in the preamble, and vice
+/// versa. `tool_names_fingerprint` isolates the common case further: the same
+/// tools in a different ORDER hash differently there but identically by name
+/// set, which names ordering as the culprit without a capture.
+fn log_prefix_composition(request_id: &str, body: &[u8]) {
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    // Read the model off the body rather than the caller: the cache is keyed
+    // per model, so an opus and a sonnet request with identical prefixes still
+    // build separate entries, and the fingerprints only mean anything when
+    // compared within one model.
+    let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let part = |value: Option<&serde_json::Value>| -> (String, usize) {
+        match value {
+            Some(value) => {
+                let text = value.to_string();
+                (short_hash(&text), text.len())
+            }
+            None => ("absent".to_string(), 0),
+        }
+    };
+    let (system_fingerprint, system_bytes) = part(parsed.get("system"));
+    let (tools_fingerprint, tools_bytes) = part(parsed.get("tools"));
+    let names: Vec<&str> = parsed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    tracing::info!(
+        target: "headroom.proxy",
+        event = "prefix_composition",
+        request_id = %request_id,
+        model = %model,
+        system_fingerprint = %system_fingerprint,
+        system_bytes = system_bytes,
+        tools_fingerprint = %tools_fingerprint,
+        tools_bytes = tools_bytes,
+        tool_names_fingerprint = %short_hash(&names.join(",")),
+        tool_names_sorted_fingerprint = %short_hash(&sorted.join(",")),
+        tool_count = names.len(),
+        "cacheable prefix composition"
+    );
+}
+
+/// Anthropic's cache-write TTL split, as `(5m, 1h)`.
+///
+/// The flat `usage.cache_creation_input_tokens` the buffered path reads is a
+/// total that says nothing about which TTL was billed, and the two differ:
+/// a 5-minute write costs 1.25x input, a 1-hour write 2.0x. The breakdown sits
+/// in a nested object, so pricing has to read it rather than assume the TTL the
+/// proxy asked for. Mirrors the streaming parser in `sse::anthropic`.
+///
+/// Returns `(0, 0)` for any other provider — no one else publishes the field.
+fn anthropic_cache_ttl_split(usage: Option<&serde_json::Value>) -> (i64, i64) {
+    let Some(cc) = usage.and_then(|u| u.get("cache_creation")) else {
+        return (0, 0);
+    };
+    let get = |key: &str| cc.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    (
+        get("ephemeral_5m_input_tokens"),
+        get("ephemeral_1h_input_tokens"),
+    )
+}
+
 fn is_sse_response(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
@@ -4326,6 +5130,25 @@ pub(crate) fn apply_prefix_replay(
     // client prefix is not our doing, while a turn shorter than the stored
     // prefix means two streams are sharing one session slot.
     if let Some(reason) = skip_reason {
+        // The two heads below share one canonical comparison, so `first_diff_path`
+        // and the text it names cannot disagree. Computed here rather than inline
+        // in the event for that reason, and only on a decline — a replaying turn
+        // never pays for it.
+        let (diff_stored_text_head, diff_current_text_head) =
+            match (skip_reason, prev_orig.as_deref()) {
+                (
+                    Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                        first_diff_index,
+                    }),
+                    Some(prev),
+                ) => cache_stabilization::prefix_replay::divergence_text_heads(
+                    prev,
+                    &original_messages,
+                    first_diff_index,
+                )
+                .unwrap_or_default(),
+                _ => (String::new(), String::new()),
+            };
         if let Some(observer) = observer {
             observer.note_replay_skip(
                 request_id,
@@ -4431,6 +5254,16 @@ pub(crate) fn apply_prefix_replay(
                     .unwrap_or_default(),
                 _ => String::new(),
             },
+            // What the differing text actually SAYS, on each side. The path
+            // above names where a mismatch is and the kinds name what sort of
+            // block held it, but neither shows the characters, so the
+            // 2026-08-13 investigation had to infer trailing whitespace from
+            // message shapes when a hundred characters of each string would
+            // have shown it outright. The one deliberate exception to logging
+            // values: head only, escaped, canonical form, and only for the
+            // message the path already names.
+            diff_stored_text_head = %diff_stored_text_head,
+            diff_current_text_head = %diff_current_text_head,
             stored_prefix_msgs = prev_orig.as_deref().map(|o| o.len()).unwrap_or(0),
             current_original_msgs = original_messages.len(),
             optimized_msgs = optimized.len(),
@@ -4701,29 +5534,136 @@ struct OutcomeContext {
     /// could be parsed. `None` means "not measured", which is distinct from
     /// "measured and found nothing".
     waste_signals: Option<Vec<(String, i64)>>,
-    /// Request-side estimate used only when a failure has no usage block.
+    /// True only on the request that inserted the one-time expansion tail.
+    /// Its provider cache creation usage is a separate cost signal from the
+    /// raw bytes injected on the request path.
+    proactive_expansion_applied: bool,
+    /// Whole-body bytes received from the client and put on the wire. Carried
+    /// here because the sizes are only knowable at the send point while the
+    /// provider's usage only arrives at stream close, and the pair is worth
+    /// nothing apart: bytes alone cannot say what the provider billed.
+    wire_bytes: Option<(i64, i64)>,
+    /// Request-side estimate used only when an error response omits provider
+    /// usage. It remains separate from `provider_*_tokens` in the failed-work
+    /// bucket so it cannot be mistaken for actual billing.
     forwarded_tokens_estimate: i64,
     /// Number of upstream transmissions made for this client turn.
     upstream_attempts: i64,
 }
 
-/// Book a terminal non-SSE upstream rejection into the failure-only bucket. The provider did
-/// not report usage, so keep the request-side estimate explicitly separate
-/// from provider-observed token counts.
-fn emit_failed_http_outcome(ctx: &OutcomeContext, request_id: &str, status: StatusCode) {
-    let (original_tokens, optimized_tokens) = ctx.sizes(ctx.forwarded_tokens_estimate);
+/// Book this request's wire bytes against the usage the provider reported for
+/// it.
+///
+/// Both halves have to come from the same request or the ratio is meaningless,
+/// which is why this takes the byte pair off the context rather than from any
+/// running total. A request whose bytes were never measured (passthrough, or a
+/// stream that ended before usage arrived) is skipped entirely: booking bytes
+/// with no tokens, or tokens with no bytes, would quietly bias the ratio in
+/// whichever direction the missing half went.
+fn record_wire_footprint(
+    ctx: &OutcomeContext,
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+) {
+    let Some((bytes_in, bytes_out)) = ctx.wire_bytes else {
+        return;
+    };
+    if input_tokens + cache_read_tokens + cache_write_tokens <= 0 {
+        return; // no usage reported; nothing to reconcile against
+    }
+    ctx.sink.savings_tracker.record_wire_footprint(
+        bytes_in,
+        bytes_out,
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    );
+}
+
+fn observe_proactive_expansion_cache_write(ctx: &OutcomeContext, write_tokens: u64) {
+    if ctx.proactive_expansion_applied {
+        crate::observability::ctx_metrics::observe_proactive_expansion_cache_write_tokens(
+            write_tokens,
+        );
+    }
+}
+
+/// Book a terminal non-SSE upstream rejection into the failure-only bucket. The ordinary
+/// success body path builds the same fields later, but upstream rejections take
+/// the small buffered-error branch and used to bypass `RequestOutcome`
+/// entirely. A usage block is accepted when present; absent usage stays
+/// `None`, distinct from the request-side forwarded-token estimate.
+fn emit_failed_http_outcome(
+    ctx: &OutcomeContext,
+    request_id: &str,
+    status: StatusCode,
+    body: Option<&bytes::Bytes>,
+) {
+    let parsed = body.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+    let usage = parsed.as_ref().and_then(|value| value.get("usage"));
+    let get = |key: &str| -> i64 {
+        usage
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0)
+    };
+    let (provider_input, output_tokens, cache_read, cache_write) = match ctx.provider.as_str() {
+        "anthropic" => (
+            get("input_tokens")
+                .saturating_add(get("cache_read_input_tokens"))
+                .saturating_add(get("cache_creation_input_tokens")),
+            get("output_tokens"),
+            get("cache_read_input_tokens"),
+            get("cache_creation_input_tokens"),
+        ),
+        "openai_responses" => (
+            get("input_tokens"),
+            get("output_tokens"),
+            usage
+                .and_then(|value| value.get("input_tokens_details"))
+                .and_then(|value| value.get("cached_tokens"))
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0),
+            0,
+        ),
+        _ => (
+            get("prompt_tokens"),
+            get("completion_tokens"),
+            usage
+                .and_then(|value| value.get("prompt_tokens_details"))
+                .and_then(|value| value.get("cached_tokens"))
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0),
+            0,
+        ),
+    };
+    let provider_input_for_sizes = if ctx.provider == "anthropic" {
+        get("input_tokens")
+    } else {
+        provider_input
+    };
+    let (original_tokens, optimized_tokens) = ctx.sizes(provider_input_for_sizes);
     let outcome = headroom_core::request_outcome::RequestOutcome {
         request_id: request_id.to_string(),
         provider: ctx.provider.clone(),
         model: ctx.model.clone(),
         status_code: i64::from(status.as_u16()),
         upstream_attempts: ctx.upstream_attempts,
-        provider_input_tokens: None,
-        provider_output_tokens: None,
+        provider_input_tokens: usage.map(|_| provider_input),
+        provider_output_tokens: usage.map(|_| output_tokens),
         original_tokens,
         optimized_tokens,
+        output_tokens,
         tokens_saved: ctx.tokens_saved,
-        attempted_input_tokens: original_tokens,
+        attempted_input_tokens: ctx.attempted(provider_input_for_sizes),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        uncached_input_tokens: if ctx.provider == "anthropic" {
+            get("input_tokens")
+        } else {
+            provider_input.saturating_sub(cache_read)
+        },
         total_latency_ms: ctx.started_at.elapsed().as_secs_f64() * 1000.0,
         overhead_ms: ctx.overhead_ms,
         transforms_applied: ctx.transforms_applied.clone(),
@@ -4755,8 +5695,31 @@ impl OutcomeContext {
                 self.original_tokens.saturating_sub(self.tokens_saved),
             );
         }
-        let forwarded = attempted_input_tokens.max(0);
+        let forwarded = if attempted_input_tokens > 0 {
+            attempted_input_tokens
+        } else {
+            self.forwarded_tokens_estimate.max(0)
+        };
         (forwarded + self.tokens_saved.max(0), forwarded)
+    }
+
+    /// The denominator `RequestOutcome::attempted_input_tokens` is documented
+    /// to carry: the size of the material compression was asked to work on.
+    ///
+    /// Every outcome site used to fill that field from the provider's
+    /// `usage.input_tokens` instead. On Anthropic that number excludes cache
+    /// reads and writes, so on a warm session it collapses to the uncached
+    /// remainder — a live session reported 8,059 against 3.66M of actual
+    /// compressible input, and the two fields `attempted_input_tokens` and
+    /// `uncached_input_tokens` held byte-identical values, which is the tell.
+    ///
+    /// The compressible portion is exactly what [`Self::sizes`] already
+    /// resolves as `original_tokens`, so read it from there. Note this is NOT
+    /// the whole prompt: the frozen cached prefix is not compression's to
+    /// touch, and folding it in would make the denominator a sum of the same
+    /// prefix re-read every turn.
+    fn attempted(&self, provider_input_tokens: i64) -> i64 {
+        self.sizes(provider_input_tokens).0
     }
 }
 
@@ -4770,6 +5733,12 @@ fn latch_ttfb(ttfb_ms: &mut f64, outcome_ctx: &Option<OutcomeContext>) {
     }
 }
 
+#[derive(Default)]
+struct ParserTelemetry {
+    sent_chunks: std::sync::atomic::AtomicU64,
+    dropped_chunks: std::sync::atomic::AtomicU64,
+}
+
 /// Drive the per-provider state machine over a stream of byte chunks.
 /// Lives in its own task; the byte path never waits on it.
 async fn run_sse_state_machine(
@@ -4779,6 +5748,10 @@ async fn run_sse_state_machine(
     usage_observer: Arc<cache_stabilization::usage_observer::UsageObserver>,
     outcome_ctx: Option<OutcomeContext>,
     replay_store: Option<SessionReplayStore>,
+    // Usage of CCR continuation rounds the client never saw, filled in by
+    // `sse::ccr_stream` before this task's channel closes. `None` when the
+    // rewriter did not run.
+    ccr_round_usage: Option<Arc<Mutex<CcrRoundUsage>>>,
 ) {
     use crate::sse::framing::SseFramer;
 
@@ -4818,12 +5791,37 @@ async fn run_sse_state_machine(
                     }
                 }
             }
+            // Snapshot hidden continuation usage before any cache observer
+            // runs. The final streamed usage belongs to the proxy's private
+            // continuation request; the first discarded response below is the
+            // cache footprint of the request the client actually sent.
+            let ccr_rounds = ccr_round_usage
+                .as_ref()
+                .and_then(|u| u.lock().ok().map(|g| *g))
+                .unwrap_or_default();
+            let (cache_baseline_input, cache_baseline_read, cache_baseline_write) = ccr_rounds
+                .client_cache_baseline(
+                    state.usage.input_tokens,
+                    state.usage.cache_read_input_tokens,
+                    state.usage.cache_creation_input_tokens,
+                );
+
             // Phase G PR-G3 + H2: emit per-session cache-hit-rate
             // ONLY when the stream completed cleanly with
             // `message_stop`. The gate is encapsulated by the
             // pure function `compute_anthropic_session_hit_rate`
             // so the H2 contract has a unit-testable surface.
-            match crate::observability::cache_hit_rate::compute_anthropic_session_hit_rate(&state) {
+            let cache_hit_rate = if state.status == crate::sse::anthropic::StreamStatus::MessageStop
+            {
+                crate::observability::cache_hit_rate::compute_hit_rate(
+                    cache_baseline_input,
+                    cache_baseline_read,
+                    cache_baseline_write,
+                )
+            } else {
+                None
+            };
+            match cache_hit_rate {
                 Some(rate) => {
                     crate::observability::observe_cache_hit_rate(
                         crate::observability::cache_hit_rate_provider::ANTHROPIC,
@@ -4837,9 +5835,9 @@ async fn run_sse_state_machine(
                         request_id = %request_id,
                         provider = "anthropic",
                         status = ?state.status,
-                        input_tokens = state.usage.input_tokens,
-                        cache_read_input_tokens = state.usage.cache_read_input_tokens,
-                        cache_creation_input_tokens = state.usage.cache_creation_input_tokens,
+                        input_tokens = cache_baseline_input,
+                        cache_read_input_tokens = cache_baseline_read,
+                        cache_creation_input_tokens = cache_baseline_write,
                         "skipping proxy_cache_hit_rate_per_session: H2 gate or zero denominator"
                     );
                 }
@@ -4849,11 +5847,22 @@ async fn run_sse_state_machine(
             // a cleanly completed stream (`message_stop`) carries
             // trustworthy final usage.
             if state.status == crate::sse::anthropic::StreamStatus::MessageStop {
+                if let Some(ctx) = outcome_ctx.as_ref() {
+                    observe_proactive_expansion_cache_write(ctx, cache_baseline_write);
+                }
                 let class = usage_observer.complete(
                     &request_id,
-                    state.usage.input_tokens,
-                    state.usage.cache_read_input_tokens,
-                    state.usage.cache_creation_input_tokens,
+                    cache_baseline_input,
+                    cache_baseline_read,
+                    cache_baseline_write,
+                    // Read off the streamed usage rather than the CCR baseline
+                    // beside it: continuation rounds carry no TTL breakdown, so
+                    // the split stays a subset of the write total, exactly as
+                    // the buffered path treats it.
+                    Some((
+                        state.usage.cache_creation_5m_input_tokens,
+                        state.usage.cache_creation_1h_input_tokens,
+                    )),
                 );
                 // The observer's counters reset on restart, so persist the
                 // classification here where the savings tracker is reachable.
@@ -4876,11 +5885,7 @@ async fn run_sse_state_machine(
             // (non-Anthropic, or the buffered path didn't run).
             if let Some(store) = &replay_store {
                 if state.status == crate::sse::anthropic::StreamStatus::MessageStop {
-                    store.complete(
-                        &request_id,
-                        state.usage.cache_read_input_tokens,
-                        state.usage.cache_creation_input_tokens,
-                    );
+                    store.complete(&request_id, cache_baseline_read, cache_baseline_write);
                 }
             }
             tracing::info!(
@@ -4894,18 +5899,71 @@ async fn run_sse_state_machine(
                 blocks = state.blocks.len(),
                 "sse stream closed"
             );
-            if let Some(ref ctx) = outcome_ctx {
+            // Same H2 gate the three consumers above use, and for the same
+            // reason. Anthropic reports the turn's final `output_tokens` in
+            // the `message_delta` that precedes `message_stop`; a stream cut
+            // short by a client disconnect carries whatever partial count had
+            // arrived by then. Booking that as final under-reported output —
+            // silently, because a truncated turn is indistinguishable from a
+            // cheap one once it is in the ledger. Dropping the turn also
+            // under-reports, but visibly: the counter says how many turns the
+            // books are missing, and the log below keeps the partial numbers.
+            let stream_completed = state.status == crate::sse::anthropic::StreamStatus::MessageStop;
+            if !stream_completed {
+                crate::observability::record_stream_incomplete("anthropic");
+                // Also booked into the persisted savings state, so the lifetime
+                // verdict can report how many turns it is missing. The
+                // Prometheus counter above resets with the process; the books
+                // do not.
+                if let Some(ref ctx) = outcome_ctx {
+                    ctx.sink.savings_tracker.record_unbooked_turn();
+                }
+                tracing::warn!(
+                    request_id = %request_id,
+                    event = "stream_incomplete",
+                    provider = "anthropic",
+                    status = ?state.status,
+                    partial_input_tokens = state.usage.input_tokens,
+                    partial_output_tokens = state.usage.output_tokens,
+                    "stream ended without message_stop; usage is partial, \
+                     so this turn is not booked into cost or savings"
+                );
+            }
+            // Fold in the CCR continuation rounds, exactly as the buffered
+            // path does. The client saw one turn; the upstream billed several,
+            // and only the last one's usage reached the stream. Without this
+            // the savings figures are computed against a fraction of what the
+            // turn cost. Reading it here is safe: the rewriter fills it in
+            // before it sends the final events, and this runs after the
+            // channel those events travelled on has closed.
+            if !ccr_rounds.is_empty() {
+                tracing::info!(
+                    request_id = %request_id,
+                    event = "ccr_continuation_usage",
+                    rounds = ccr_rounds.rounds,
+                    input_tokens = ccr_rounds.input_tokens,
+                    output_tokens = ccr_rounds.output_tokens,
+                    cache_write_tokens = ccr_rounds.cache_write_tokens,
+                    client_cache_read_tokens = cache_baseline_read,
+                    client_cache_write_tokens = cache_baseline_write,
+                    "billed CCR continuation rounds the client never saw"
+                );
+            }
+            let attempted_input = state.usage.input_tokens as i64 + ccr_rounds.input_tokens;
+            if let (Some(ref ctx), true) = (&outcome_ctx, stream_completed) {
                 let outcome = headroom_core::request_outcome::RequestOutcome {
                     request_id: request_id.clone(),
                     provider: ctx.provider.clone(),
                     model: ctx.model.clone(),
-                    original_tokens: ctx.sizes(state.usage.input_tokens as i64).0,
-                    optimized_tokens: ctx.sizes(state.usage.input_tokens as i64).1,
-                    output_tokens: state.usage.output_tokens as i64,
+                    original_tokens: ctx.sizes(attempted_input).0,
+                    optimized_tokens: ctx.sizes(attempted_input).1,
+                    output_tokens: state.usage.output_tokens as i64 + ccr_rounds.output_tokens,
                     tokens_saved: ctx.tokens_saved,
-                    attempted_input_tokens: state.usage.input_tokens as i64,
-                    cache_read_tokens: state.usage.cache_read_input_tokens as i64,
-                    cache_write_tokens: state.usage.cache_creation_input_tokens as i64,
+                    attempted_input_tokens: ctx.attempted(attempted_input),
+                    cache_read_tokens: state.usage.cache_read_input_tokens as i64
+                        + ccr_rounds.cache_read_tokens,
+                    cache_write_tokens: state.usage.cache_creation_input_tokens as i64
+                        + ccr_rounds.cache_write_tokens,
                     cache_write_5m_tokens: state.usage.cache_creation_5m_input_tokens as i64,
                     cache_write_1h_tokens: state.usage.cache_creation_1h_input_tokens as i64,
                     // Anthropic's `input_tokens` already excludes cache reads
@@ -4913,7 +5971,7 @@ async fn run_sse_state_machine(
                     // Bedrock path has to subtract instead, because there
                     // `input_tokens` is the total — do not copy that formula
                     // here.
-                    uncached_input_tokens: state.usage.input_tokens as i64,
+                    uncached_input_tokens: attempted_input,
                     waste_signals: ctx.waste_signals.clone(),
                     total_latency_ms: ctx.total_latency_ms,
                     overhead_ms: ctx.overhead_ms,
@@ -4925,6 +5983,12 @@ async fn run_sse_state_machine(
                     project: ctx.project.clone(),
                     ..Default::default()
                 };
+                record_wire_footprint(
+                    ctx,
+                    outcome.uncached_input_tokens,
+                    outcome.cache_read_tokens,
+                    outcome.cache_write_tokens,
+                );
                 headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
             }
         }
@@ -5058,7 +6122,7 @@ async fn run_sse_state_machine(
                     optimized_tokens: ctx.sizes(input_tok).1,
                     output_tokens: output_tok,
                     tokens_saved: ctx.tokens_saved,
-                    attempted_input_tokens: input_tok,
+                    attempted_input_tokens: ctx.attempted(input_tok),
                     cache_read_tokens: cached_tok,
                     // `prompt_tokens` is the total and includes the cached
                     // prefix, unlike Anthropic's `input_tokens`.
@@ -5234,7 +6298,7 @@ async fn run_sse_state_machine(
                     optimized_tokens: ctx.sizes(input_tok).1,
                     output_tokens: output_tok,
                     tokens_saved: ctx.tokens_saved,
-                    attempted_input_tokens: input_tok,
+                    attempted_input_tokens: ctx.attempted(input_tok),
                     cache_read_tokens: cached_tok,
                     // `input_tokens` here is the total and includes the cached
                     // prefix, unlike Anthropic's field of the same name.
@@ -5475,7 +6539,7 @@ fn extend_or_push(
     items.push(entry);
 }
 
-async fn handle_ccr_response(
+pub(crate) async fn handle_ccr_response(
     body_bytes: &bytes::Bytes,
     original_request: &bytes::Bytes,
     upstream_url: &url::Url,
@@ -5572,7 +6636,13 @@ async fn handle_ccr_response(
         // Fetch original content for each CCR call.
         let mut results: Vec<CcrToolResult> = Vec::new();
         for call in &ccr_calls {
-            match ccr_store.get(&call.hash_key) {
+            let fetched = ccr_store.get(&call.hash_key);
+            // Count the tool-driven retrieval here, at the only place both
+            // outcomes are known. `/ctx/get` counts the HTTP surface, which
+            // nothing on the model path uses, so counting only there left
+            // `retrieval_hits` at zero however much the model retrieved.
+            crate::observability::ctx_metrics::observe_retrieval(fetched.is_some());
+            match fetched {
                 Some(content) => {
                     results.push(CcrToolResult {
                         tool_call_id: call.tool_call_id.clone(),
@@ -5739,6 +6809,283 @@ async fn handle_ccr_response(
     match serde_json::to_vec(&current_response) {
         Ok(bytes) => (bytes::Bytes::from(bytes), round_usage),
         Err(_) => (body_bytes.clone(), round_usage),
+    }
+}
+
+/// Error types Anthropic reports in-band that a retry can plausibly clear.
+/// `invalid_request_error` and friends are excluded: resending an identical
+/// body gets an identical refusal.
+const RETRYABLE_IN_BAND_ERRORS: &[&str] = &["overloaded_error", "rate_limit_error", "api_error"];
+
+/// Read just far enough into a streamed body to see whether it opens with an
+/// error event, and hand back every byte consumed so the caller can put them
+/// in front of the rest of the stream.
+///
+/// Returns `(prefix, Some(error_type))` when the first complete SSE event is a
+/// retryable error, `(prefix, None)` otherwise. The prefix is always the exact
+/// bytes read — on the ordinary path that is one `message_start` chunk, which
+/// then leads the client's stream unchanged.
+///
+/// Bounded twice over: it stops at the first event terminator and gives up
+/// after `MAX_PEEK_BYTES`. A body that never produces a blank line is a body
+/// this proxy should not be buffering.
+async fn peek_leading_sse_error(
+    resp: &mut reqwest::Response,
+) -> (bytes::Bytes, Option<&'static str>) {
+    /// One SSE event is a few hundred bytes; 16 KiB is slack, not a budget.
+    const MAX_PEEK_BYTES: usize = 16 * 1024;
+
+    let is_sse = resp
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_sse {
+        return (bytes::Bytes::new(), None);
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    loop {
+        // A transport error here is not ours to classify — hand back what we
+        // have and let the normal stream path surface it.
+        let Ok(chunk) = resp.chunk().await else {
+            return (bytes::Bytes::from(buf), None);
+        };
+        let Some(chunk) = chunk else {
+            // Body ended before a complete event. Nothing to retry on.
+            return (bytes::Bytes::from(buf), None);
+        };
+        buf.extend_from_slice(&chunk);
+
+        if let Some(end) = find_event_end(&buf) {
+            let kind = leading_event_error_type(&buf[..end]);
+            return (bytes::Bytes::from(buf), kind);
+        }
+        if buf.len() >= MAX_PEEK_BYTES {
+            return (bytes::Bytes::from(buf), None);
+        }
+    }
+}
+
+/// Offset just past the first event terminator, tolerating CRLF.
+fn find_event_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|i| i + 2)
+        .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4))
+}
+
+/// The retryable error type carried by one framed SSE event, if any.
+fn leading_event_error_type(event: &[u8]) -> Option<&'static str> {
+    let text = std::str::from_utf8(event).ok()?;
+    let data = text
+        .lines()
+        .find_map(|l| l.strip_prefix("data:"))
+        .map(str::trim)?;
+    let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
+    if parsed.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+        return None;
+    }
+    let kind = parsed
+        .get("error")
+        .and_then(|e| e.get("type"))
+        .and_then(serde_json::Value::as_str)?;
+    RETRYABLE_IN_BAND_ERRORS
+        .iter()
+        .find(|known| **known == kind)
+        .copied()
+}
+
+/// Build the memory context for a request, or `None` when memory is off or
+/// uninitialised. Mirrors the gate on the injection site, so the proxy resolves
+/// exactly the turns it injected into.
+async fn memory_tool_context(
+    state: &AppState,
+    headers_snapshot: &Option<HeaderMap>,
+    provider: Option<&str>,
+) -> Option<MemoryToolContext> {
+    let handler = state.memory_handler.as_ref()?;
+    if !handler.lock().await.is_initialized() {
+        return None;
+    }
+    let provider = match provider? {
+        "anthropic" => crate::memory::tool_adapter::Provider::Anthropic,
+        _ => crate::memory::tool_adapter::Provider::Openai,
+    };
+    let user_id = headers_snapshot
+        .as_ref()
+        .and_then(|h| h.get("x-headroom-user-id"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("default")
+        .to_string();
+    Some(MemoryToolContext {
+        handler: handler.clone(),
+        provider,
+        user_id,
+    })
+}
+
+/// What a memory continuation needs. Assembled at the seam that has the
+/// request in scope, the same way [`crate::handlers::local_model::RoutedCcr`]
+/// is.
+pub(crate) struct MemoryToolContext {
+    pub handler: Arc<tokio::sync::Mutex<crate::memory::handler::MemoryHandler>>,
+    pub provider: crate::memory::tool_adapter::Provider,
+    pub user_id: String,
+}
+
+/// Execute `memory_*` tool calls the model made, and continue the turn.
+///
+/// The proxy injects these tools (see the injection site in `forward_http`),
+/// so the proxy has to run them: the client has never heard of `memory_search`
+/// and answers a call to it with `No such tool available`. `MemoryHandler`
+/// could already execute them — until this function existed nothing ever asked
+/// it to, on any path, streaming or buffered.
+///
+/// Deliberately shaped like [`handle_ccr_response`], down to the round cap and
+/// the mixed-tool rule: a turn that calls a memory tool *and* a client tool is
+/// left alone, because we cannot fabricate the client's half.
+pub(crate) async fn handle_memory_response(
+    body_bytes: &bytes::Bytes,
+    original_request: &bytes::Bytes,
+    upstream_url: &url::Url,
+    client: &reqwest::Client,
+    memory: &MemoryToolContext,
+    config: &Config,
+    request_id: &str,
+    outgoing_headers: &http::HeaderMap,
+    provider: &str,
+) -> (bytes::Bytes, CcrRoundUsage) {
+    use headroom_core::ccr::response_handler::CCRResponseHandler;
+
+    let mut round_usage = CcrRoundUsage::default();
+    let items_field = if provider == "openai_responses" {
+        "input"
+    } else {
+        "messages"
+    };
+
+    let Ok(response) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+        return (body_bytes.clone(), round_usage);
+    };
+    {
+        let handler = memory.handler.lock().await;
+        if !handler.is_initialized() || !handler.has_memory_tool_calls(&response, memory.provider) {
+            return (body_bytes.clone(), round_usage);
+        }
+    }
+
+    let Ok(mut current_request) = serde_json::from_slice::<serde_json::Value>(original_request)
+    else {
+        tracing::warn!(
+            request_id = %request_id,
+            "memory: failed to parse original request; skipping tool handling"
+        );
+        return (body_bytes.clone(), round_usage);
+    };
+
+    // Reused purely for its provider-aware message shaping — the CCR handler
+    // knows how each provider wants an assistant turn and a tool result
+    // expressed, and memory results go back the same way.
+    let shaper = CCRResponseHandler::new(None);
+    let mut current_response = response;
+    let mut rounds = 0;
+
+    while rounds < config.ccr_max_retrieval_rounds {
+        let results: Vec<serde_json::Value> = {
+            let handler = memory.handler.lock().await;
+            if !handler.has_memory_tool_calls(&current_response, memory.provider) {
+                break;
+            }
+            handler
+                .handle_memory_tool_calls(&current_response, &memory.user_id, memory.provider, None)
+                .await
+        };
+        if results.is_empty() {
+            break;
+        }
+
+        // `handle_memory_tool_calls` returns provider-shaped tool results
+        // already; wrap them the way the continuation array expects.
+        let assistant_msg = shaper.extract_assistant_message(&current_response, provider);
+        let tool_result_msg = memory_results_message(&results, provider);
+
+        let Some(items) = current_request
+            .get_mut(items_field)
+            .and_then(|v| v.as_array_mut())
+        else {
+            tracing::warn!(
+                request_id = %request_id,
+                field = items_field,
+                "memory: no continuation array in request; cannot continue"
+            );
+            break;
+        };
+        extend_or_push(items, assistant_msg, &["_openai_responses_output_items"]);
+        extend_or_push(
+            items,
+            tool_result_msg,
+            &["_memory_tool_results", "_openai_responses_tool_results"],
+        );
+
+        let Ok(continuation_body) = serde_json::to_vec(&current_request) else {
+            break;
+        };
+        tracing::info!(
+            request_id = %request_id,
+            round = rounds + 1,
+            results_count = results.len(),
+            "memory: sending continuation request"
+        );
+        let Ok(resp) = client
+            .post(upstream_url.clone())
+            .headers(outgoing_headers.clone())
+            .body(continuation_body)
+            .send()
+            .await
+        else {
+            tracing::warn!(
+                request_id = %request_id,
+                "memory: upstream request failed during continuation"
+            );
+            break;
+        };
+        if !resp.status().is_success() {
+            tracing::warn!(
+                request_id = %request_id,
+                status = %resp.status(),
+                "memory: upstream returned error during continuation"
+            );
+            break;
+        }
+        let Ok(bytes) = resp.bytes().await else { break };
+        round_usage.add_response(&current_response);
+        let Ok(next) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            break;
+        };
+        current_response = next;
+        rounds += 1;
+    }
+
+    match serde_json::to_vec(&current_response) {
+        Ok(bytes) => (bytes::Bytes::from(bytes), round_usage),
+        Err(_) => (body_bytes.clone(), round_usage),
+    }
+}
+
+/// Wrap provider-shaped memory tool results for the continuation array.
+///
+/// Anthropic wants one user turn holding every `tool_result` block; the OpenAI
+/// shapes want one entry per result, so those go behind a sentinel key that
+/// [`extend_or_push`] expands.
+fn memory_results_message(results: &[serde_json::Value], provider: &str) -> serde_json::Value {
+    match provider {
+        "anthropic" => serde_json::json!({"role": "user", "content": results}),
+        "openai_responses" => {
+            serde_json::json!({"_openai_responses_tool_results": results})
+        }
+        _ => serde_json::json!({"_memory_tool_results": results}),
     }
 }
 
@@ -6026,9 +7373,94 @@ mod tests {
             overhead_ms: 0.0,
             started_at: Instant::now(),
             waste_signals: None,
+            proactive_expansion_applied: false,
+            wire_bytes: None,
             forwarded_tokens_estimate: 0,
             upstream_attempts: 1,
         }
+    }
+
+    #[test]
+    fn proactive_expansion_cache_write_is_attributed_only_to_injected_requests() {
+        let registry = crate::observability::prometheus::registry();
+        let before =
+            crate::observability::ctx_metrics::proactive_expansion_cache_write_tokens_get(registry);
+
+        let untouched = outcome_ctx_for_sizes(0, 0);
+        observe_proactive_expansion_cache_write(&untouched, 100);
+        assert_eq!(
+            crate::observability::ctx_metrics::proactive_expansion_cache_write_tokens_get(registry),
+            before
+        );
+
+        let mut injected = outcome_ctx_for_sizes(0, 0);
+        injected.proactive_expansion_applied = true;
+        observe_proactive_expansion_cache_write(&injected, 100);
+        assert_eq!(
+            crate::observability::ctx_metrics::proactive_expansion_cache_write_tokens_get(registry),
+            before + 100
+        );
+    }
+
+    #[test]
+    fn forwarded_rejections_persist_each_status_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+            Some(dir.path().join("proxy_savings.json")),
+            false,
+        ));
+        let mut ctx = outcome_ctx_for_sizes(1_000, 100);
+        ctx.sink = Arc::new(ProxyOutcomeSink {
+            cost_tracker: Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
+            )),
+            savings_tracker: tracker.clone(),
+            request_logger: Arc::new(crate::request_logger::RequestLogger::new(None)),
+        });
+
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            emit_failed_http_outcome(&ctx, "rejected", status, None);
+        }
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot["lifetime"]["requests"], 0);
+        assert_eq!(snapshot["failed_work"]["requests"], 3);
+        assert_eq!(snapshot["failed_work"]["by_status"]["401"], 1);
+        assert_eq!(snapshot["failed_work"]["by_status"]["429"], 1);
+        assert_eq!(snapshot["failed_work"]["by_status"]["503"], 1);
+        let metrics = tracker.metrics_snapshot(&serde_json::json!({}));
+        assert_eq!(metrics["requests"]["total"], 0);
+        assert_eq!(metrics["requests"]["failed"], 3);
+    }
+
+    #[test]
+    fn billed_input_tokens_use_the_upstream_cache_usage_not_savings_baseline() {
+        let outcome = headroom_core::request_outcome::RequestOutcome {
+            // These are a compression comparison, not the provider bill.
+            original_tokens: 100_000,
+            optimized_tokens: 10_000,
+            // Anthropic usage from the request that actually crossed the
+            // proxy boundary: 2k uncached plus 7k cache read plus 1k write.
+            uncached_input_tokens: 2_000,
+            cache_read_tokens: 7_000,
+            cache_write_tokens: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(provider_billed_input_tokens(&outcome), 10_000);
+    }
+
+    #[test]
+    fn billed_input_tokens_fall_back_to_the_post_transform_estimate() {
+        let outcome = headroom_core::request_outcome::RequestOutcome {
+            original_tokens: 100_000,
+            optimized_tokens: 10_000,
+            ..Default::default()
+        };
+        assert_eq!(provider_billed_input_tokens(&outcome), 10_000);
     }
 
     /// When compression ran, its own pre-compression size is the baseline.
@@ -6060,6 +7492,46 @@ mod tests {
             "a real saving must report a real percentage, got {}",
             outcome.savings_pct()
         );
+    }
+
+    /// Regression guard for items 1d/1e: the booked saving is the compression
+    /// dispatcher's own per-turn figure, so `tok_after` can never go negative
+    /// by absorbing a CTX-offload total measured against a different baseline.
+    ///
+    /// The numbers are the live turn from item 1e (2026-08-08 22:40:36Z):
+    /// compression saw a 358-token live zone and freed 243, while the CTX
+    /// transforms had already removed 12,197 tokens earlier in the pipeline.
+    /// Folding that 12,197 into this subtraction was the original defect — it
+    /// reported `tok_after = 358 - 12,440 = -12,082`.
+    #[test]
+    fn sizes_books_only_the_compression_turn_so_tok_after_stays_non_negative() {
+        const COMPRESSION_TOKENS_BEFORE: i64 = 358;
+        const COMPRESSION_TOKENS_FREED: i64 = 243;
+        const CTX_TRANSFORM_TOKENS_SAVED: i64 = 12_197;
+
+        let ctx = outcome_ctx_for_sizes(COMPRESSION_TOKENS_BEFORE, COMPRESSION_TOKENS_FREED);
+        let (original, optimized) = ctx.sizes(0);
+
+        // The published subtraction matches the `compression applied` line's
+        // own arithmetic, which is the only per-turn measurement available.
+        assert_eq!(original, COMPRESSION_TOKENS_BEFORE);
+        assert_eq!(
+            optimized,
+            COMPRESSION_TOKENS_BEFORE - COMPRESSION_TOKENS_FREED
+        );
+        assert!(
+            optimized >= 0,
+            "tok_after must not go negative, got {optimized}"
+        );
+
+        // `saturating_sub` on i64 saturates at i64::MIN, not at zero, so it is
+        // not the guard it looks like. Pin the shape the defect produced so a
+        // future change that folds the CTX total back in fails here loudly.
+        let folded_in = outcome_ctx_for_sizes(
+            COMPRESSION_TOKENS_BEFORE,
+            COMPRESSION_TOKENS_FREED + CTX_TRANSFORM_TOKENS_SAVED,
+        );
+        assert_eq!(folded_in.sizes(0).1, -12_082);
     }
 
     /// A passthrough turn stays at zero rather than inventing a saving.
@@ -6544,6 +8016,135 @@ mod tests {
         assert!(is_websocket_upgrade(&h));
     }
 
+    // ── rewritten_message_report ─────────────────────────────────────
+
+    #[test]
+    fn cache_control_placement_is_not_a_rewrite() {
+        // The proxy re-places the breakpoint every turn by design; counting
+        // that as a rewrite would mark every message and say nothing.
+        let before = serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
+        let after = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]});
+        assert!(rewritten_message_report(&[before], &[after]).indices.is_empty());
+    }
+
+    #[test]
+    fn compressed_text_beside_a_thinking_block_is_flagged() {
+        let before = serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "…", "signature": "sig"},
+            {"type": "text", "text": "a long log line"}]});
+        let after = serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "…", "signature": "sig"},
+            {"type": "text", "text": "[compressed]"}]});
+        let report = rewritten_message_report(&[before], &[after]);
+        assert_eq!(report.indices, vec![0]);
+        assert_eq!(report.with_thinking, vec![0]);
+    }
+
+    #[test]
+    fn a_rewrite_without_thinking_is_not_flagged() {
+        let before = serde_json::json!({"role": "user", "content": [
+            {"type": "tool_result", "content": "a long log line"}]});
+        let after = serde_json::json!({"role": "user", "content": [
+            {"type": "tool_result", "content": "[compressed]"}]});
+        let report = rewritten_message_report(&[before], &[after]);
+        assert_eq!(report.indices, vec![0]);
+        assert!(report.with_thinking.is_empty());
+    }
+
+    #[test]
+    fn stripping_cache_control_off_a_signed_block_counts_as_touching_it() {
+        // The canonical compare is blind here on purpose, so this is the only
+        // list that can catch it. The provider judges the block as sent.
+        let before = serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "…", "signature": "sig",
+             "cache_control": {"type": "ephemeral"}}]});
+        let after = serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "…", "signature": "sig"}]});
+        let report = rewritten_message_report(&[before], &[after]);
+        assert!(report.indices.is_empty());
+        assert_eq!(report.thinking_touched, vec![0]);
+    }
+
+    #[test]
+    fn an_untouched_signed_block_is_not_reported() {
+        let msg = serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "…", "signature": "sig"},
+            {"type": "text", "text": "hello"}]});
+        let report = rewritten_message_report(&[msg.clone()], &[msg]);
+        assert!(report.thinking_touched.is_empty());
+    }
+
+    #[test]
+    fn index_lists_are_capped() {
+        let many: Vec<usize> = (0..25).collect();
+        assert_eq!(join_indices(&many[..3]), "0,1,2");
+        assert!(join_indices(&many).ends_with("…+5"));
+    }
+
+    // ── describe_upstream_error ──────────────────────────────────────
+
+    #[test]
+    fn describes_an_anthropic_rejection() {
+        let body = br#"{"type":"error","error":{"type":"invalid_request_error",
+            "message":"messages.11: unexpected block"}}"#;
+        let (kind, message) = describe_upstream_error(body);
+        assert_eq!(kind, "invalid_request_error");
+        assert_eq!(message, "messages.11: unexpected block");
+    }
+
+    #[test]
+    fn describes_an_openai_rejection() {
+        let body = br#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let (kind, message) = describe_upstream_error(body);
+        assert_eq!(kind, "context_length_exceeded");
+        assert_eq!(message, "too long");
+    }
+
+    #[test]
+    fn unknown_error_shapes_reach_the_log_as_nothing() {
+        // The point of the helper: a body the proxy does not recognise must not
+        // be forwarded into the log verbatim.
+        let (kind, message) = describe_upstream_error(b"<html>secret</html>");
+        assert_eq!(kind, "unparsed");
+        assert!(message.is_empty());
+        let (kind, message) = describe_upstream_error(br#"{"detail":"secret"}"#);
+        assert_eq!(kind, "no_error_field");
+        assert!(message.is_empty());
+    }
+
+    #[test]
+    fn long_error_messages_are_truncated() {
+        let long = "x".repeat(2_000);
+        let body = format!(r#"{{"error":{{"type":"e","message":"{long}"}}}}"#);
+        let (_, message) = describe_upstream_error(body.as_bytes());
+        assert_eq!(message.chars().count(), 400);
+    }
+
+    // ── anthropic_cache_ttl_split ────────────────────────────────────
+    #[test]
+    fn cache_ttl_split_reads_the_nested_cache_creation_object() {
+        let usage = serde_json::json!({
+            "input_tokens": 12,
+            "cache_creation_input_tokens": 4_000,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 1_000,
+                "ephemeral_1h_input_tokens": 3_000
+            }
+        });
+        assert_eq!(anthropic_cache_ttl_split(Some(&usage)), (1_000, 3_000));
+    }
+
+    #[test]
+    fn cache_ttl_split_is_zero_when_the_provider_omits_it() {
+        // OpenAI shapes, and older Anthropic bodies, carry no nested object.
+        // Pricing treats (0, 0) as "unreported" and falls back to the 5m rate
+        // rather than inventing a 1h premium.
+        let usage = serde_json::json!({"prompt_tokens": 10, "completion_tokens": 2});
+        assert_eq!(anthropic_cache_ttl_split(Some(&usage)), (0, 0));
+        assert_eq!(anthropic_cache_ttl_split(None), (0, 0));
+    }
+
     // ── is_sse_response ──────────────────────────────────────────────
 
     #[test]
@@ -6611,6 +8212,181 @@ mod tests {
             h.get("anthropic-beta").unwrap().to_str().unwrap(),
             "existing-beta,new-beta"
         );
+    }
+
+    #[test]
+    fn hidden_ccr_continuation_does_not_become_next_client_cache_baseline() {
+        use crate::cache_stabilization::usage_observer::UsageObserver;
+
+        let mut usage = CcrRoundUsage::default();
+        usage.add_response(&serde_json::json!({
+            "usage": {
+                "input_tokens": 1_025,
+                "cache_read_input_tokens": 92_100,
+                "cache_creation_input_tokens": 1_025,
+                "output_tokens": 100
+            }
+        }));
+        let baseline = usage.client_cache_baseline(0, 92_100, 129_915);
+        assert_eq!(baseline, (1_025, 92_100, 1_025));
+
+        let observer = UsageObserver::new();
+        observer.begin_request("ccr-1", "ccr-conv".into(), None, None, None);
+        observer.complete("ccr-1", baseline.0, baseline.1, baseline.2, None);
+        observer.begin_request("ccr-2", "ccr-conv".into(), None, None, None);
+        let class = observer.complete("ccr-2", 2, 93_125, 525, None);
+
+        assert_eq!(
+            class, None,
+            "93,125 exactly reuses the client-visible baseline"
+        );
+        assert!(observer.snapshot().last_event.is_none());
+    }
+
+    #[test]
+    fn replay_decline_logs_hashed_session_and_chain_identity() {
+        use crate::cache_stabilization::drift_detector::session_key_log_prefix;
+        use crate::cache_stabilization::prefix_replay::SessionReplayStore;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        struct Capture(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                struct Visitor(HashMap<String, String>);
+
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.insert(field.name().to_string(), format!("{value:?}"));
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+
+                let mut visitor = Visitor(HashMap::new());
+                event.record(&mut visitor);
+                if visitor
+                    .0
+                    .get("event")
+                    .is_some_and(|name| name == "prefix_replay_not_replayed")
+                {
+                    self.0.lock().unwrap().push(visitor.0);
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(captured.clone()));
+        let session_key = "Bearer never-log-this-session-key";
+        let expected_hash = session_key_log_prefix(session_key);
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"messages": messages.clone()})).unwrap(),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            apply_prefix_replay(
+                &SessionReplayStore::new(2),
+                session_key,
+                "replay-log-test",
+                messages,
+                body,
+                None,
+                7,
+                2,
+                false,
+            );
+        });
+
+        let captured = captured.lock().unwrap();
+        let event = captured
+            .first()
+            .expect("first turn must emit a prefix_replay_not_replayed event");
+        assert_eq!(event.get("session_key_hash"), Some(&expected_hash));
+        assert_eq!(event.get("chain_id"), Some(&"0".to_string()));
+        assert!(
+            event.values().all(|value| !value.contains(session_key)),
+            "the raw session key must never be written to the event: {event:?}"
+        );
+    }
+
+    #[test]
+    fn apply_prefix_replay_pipes_inbound_tail_evidence_to_usage_observer() {
+        use crate::cache_stabilization::prefix_replay::SessionReplayStore;
+        use crate::cache_stabilization::usage_observer::{
+            RecacheEventKind, UsageObserver,
+        };
+
+        let store = SessionReplayStore::new(2);
+        let observer = UsageObserver::new();
+        let session_key = "tail-evidence-session";
+        let prior = vec![
+            serde_json::json!({"role":"user","content":"open"}),
+            serde_json::json!({"role":"assistant","content":"answer"}),
+            serde_json::json!({"role":"user","content":"old tail"}),
+        ];
+
+        observer.begin_request("tail-1", "tail-conversation".into(), None, None, None);
+        let prior_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"messages": prior.clone()})).unwrap(),
+        );
+        apply_prefix_replay(
+            &store,
+            session_key,
+            "tail-1",
+            prior.clone(),
+            prior_body,
+            Some(&observer),
+            1,
+            2,
+            false,
+        );
+        store.complete("tail-1", 0, 50_000);
+        observer.complete("tail-1", 200, 0, 50_000, None);
+
+        let mut current = prior;
+        current[2] = serde_json::json!({"role":"user","content":"replacement tail"});
+        observer.begin_request("tail-2", "tail-conversation".into(), None, None, None);
+        let current_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"messages": current.clone()})).unwrap(),
+        );
+        apply_prefix_replay(
+            &store,
+            session_key,
+            "tail-2",
+            current,
+            current_body,
+            Some(&observer),
+            2,
+            2,
+            false,
+        );
+        let class = observer.complete("tail-2", 200, 0, 50_000, None);
+
+        assert_eq!(class, None, "a branch cache build is not a cache miss");
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.recache_wasted_tokens_total, 0);
+        let event = snapshot.last_event.expect("branch cache build recorded");
+        assert_eq!(event.event_kind, RecacheEventKind::Branch);
+        assert_eq!(
+            event.attribution_reason.as_deref(),
+            Some("inbound_tail_replaced")
+        );
+        assert_eq!(event.origin.as_deref(), Some("inbound"));
+        assert_eq!(event.scope.as_deref(), Some("final_message"));
     }
 }
 

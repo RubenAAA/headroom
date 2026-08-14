@@ -28,6 +28,27 @@ rename catches one file in code review.
 | `proxy_cache_hit_rate_per_session` | Histogram | `provider` | Per-session cache hit rate. **Phase H canary gate.** |
 | `proxy_compression_ratio_by_strategy` | Histogram | `strategy`, `content_type` | `compressed_tokens / original_tokens` per shrunk block. |
 | `proxy_compression_rejected_by_token_check_total` | Counter | `strategy` | Compressor ran but failed the shrink check. |
+| `proxy_compression_declined_no_shrink_total` | Counter | `strategy` | Compressor ran and the dispatcher declined it because the output was not smaller in bytes. |
+
+`declined_no_shrink` and `rejected_by_token_check` split what used to be one
+number. A compressor that rewrites a block without removing anything — the
+search compressor re-emitting every match in `BTreeMap` order is the common
+case — now stops at the dispatcher instead of travelling to the tokenizer, so
+it leaves the rejection counter. Without the second counter that fall would be
+unreadable: you could not tell "we stopped wasting runs" from "we stopped
+attempting compression that paid".
+
+Read the pair against `proxy_compression_ratio_by_strategy_sum`. Declines
+rising while accepted compression holds steady means the size gate is absorbing
+waste. Both falling together means it is declining work that pays.
+
+```promql
+# Share of runs the size gate absorbed, per strategy.
+sum by (strategy) (rate(proxy_compression_declined_no_shrink_total{strategy!="__init__"}[1h]))
+
+# The control: accepted compression volume must not fall with it.
+sum by (strategy) (rate(proxy_compression_ratio_by_strategy_sum{strategy!="__init__"}[1h]))
+```
 
 #### Cache-safety alarm
 
@@ -51,6 +72,34 @@ intentional byte mutations do not trip the alarm.
 | `proxy_rate_limit_remaining_tokens` | Gauge | `provider` | Last-seen remaining tokens in the current window. |
 | `proxy_rate_limit_remaining_input_tokens` | Gauge | `provider` | Anthropic-only input-token bucket. |
 | `proxy_rate_limit_remaining_output_tokens` | Gauge | `provider` | Anthropic-only output-token bucket. |
+
+#### Upstream retries and truncated streams
+
+| Name | Type | Labels | Purpose |
+|------|------|--------|---------|
+| `proxy_upstream_retries_total` | Counter | `path`, `reason` | Requests re-sent after a transient upstream failure. `path` is `anthropic` or `local_model`; `reason` is `status_429`, `status_529`, `status_5xx`, `transport` or `in_band_sse`. One increment per re-send. |
+| `proxy_stream_incomplete_total` | Counter | `provider` | SSE streams that ended without their terminal event. |
+
+Retries cost latency and re-bill the input tokens, so a rising rate
+is a bill, not just noise. Both retry loops honour `--retry-max-attempts`
+(default 3) and increment this counter next to the backoff sleep.
+
+`in_band_sse` is the reason worth watching. Anthropic answers rate limits and
+overload on a streaming request with HTTP 200 and an SSE body whose first event
+is `{"type":"error",...}`. A retry loop reading `r.status()` alone cannot see
+it, so those turns looked like success and spent none of the retry budget. The
+proxy now peeks the first event and re-sends when it opens with
+`overloaded_error`, `rate_limit_error` or `api_error`. Only a *leading* error
+qualifies — once content has been forwarded, retrying would duplicate it, and
+those streams end without `message_stop` and land in
+`proxy_stream_incomplete_total` instead.
+
+`proxy_stream_incomplete_total` counts the turns missing from the cost
+and savings books. Anthropic reports the turn's final `output_tokens`
+on the `message_delta` before `message_stop`; a stream cut short by a
+client disconnect carries a partial count, so those turns are dropped
+rather than booked at a figure that flatters them. The partial numbers
+stay in the structured log (`event="stream_incomplete"`).
 
 #### OpenAI Responses telemetry
 

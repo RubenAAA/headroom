@@ -229,8 +229,10 @@ mod tests {
         .to_string();
         std::fs::write(projects.join("a.jsonl"), format!("{line}\n")).unwrap();
 
-        // Serialize env mutation with the client tests via a coarse lock isn't
-        // needed here — CLAUDE_CONFIG_DIR is unique to this dir.
+        // Held across the read below, not just the write: `client`'s tests set
+        // and clear the same variable, and this one is only correct while the
+        // value it wrote is still there.
+        let _guard = crate::subscription::env_guard();
         std::env::set_var("CLAUDE_CONFIG_DIR", dir.path());
         let start = chrono::Utc
             .with_ymd_and_hms(2026, 6, 17, 0, 0, 0)

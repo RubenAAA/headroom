@@ -47,6 +47,11 @@
 //!   walker. Bedrock / Vertex / etc. follow in a Phase E
 //!   follow-up — this PR keeps the surface tight.
 
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
+
+use lru::LruCache;
 use serde_json::Value;
 
 use crate::compression::CompressibleEndpoint;
@@ -149,20 +154,163 @@ pub fn detect_volatile_content(body: &Value, kind: ApiKind) -> Vec<VolatileFindi
     findings
 }
 
+/// Conversations tracked for the change check below. Same bound and rationale
+/// as the drift detector's LRU: unique keys must not grow memory without limit.
+const VOLATILE_MEMORY_CONVERSATIONS: usize = 256;
+/// Locations remembered per conversation. Live traffic shows around a dozen.
+const VOLATILE_MEMORY_LOCATIONS: usize = 64;
+
+/// What each location last held, per conversation. The detector matches on
+/// *shape* — "looks like a timestamp" — and holds no history, so on its own it
+/// cannot tell per-request churn from a fixed example date in a tool
+/// docstring. This is that history.
+static VOLATILE_MEMORY: std::sync::OnceLock<Mutex<LruCache<String, LruCache<String, u64>>>> =
+    std::sync::OnceLock::new();
+
+fn volatile_memory() -> &'static Mutex<LruCache<String, LruCache<String, u64>>> {
+    VOLATILE_MEMORY.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(VOLATILE_MEMORY_CONVERSATIONS).expect("non-zero"),
+        ))
+    })
+}
+
+/// Cheap equality token for a sample. Only ever compared against another
+/// digest of the same location, so 64 bits is ample and keeps the map small.
+fn sample_digest(sample: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sample.hash(&mut h);
+    h.finish()
+}
+
 /// Emit one `tracing::warn!` per finding with a stable structured
 /// shape. Operators / customers consume `event="volatile_content_detected"`
 /// in their log search to surface cache-busting content.
-pub fn emit_volatile_warnings(findings: &[VolatileFinding], request_id: &str) {
+///
+/// **Suppressed when a location's value is unchanged from the previous request
+/// on the same conversation.** Measured 2026-08-09 on live traffic: of 37
+/// warning sites seen in two or more requests on one conversation, *none* ever
+/// changed value — 4,004 warnings, every one fired by a fixed example date or
+/// placeholder UUID in a tool docstring. Static text cannot bust a cache, and
+/// at 7 warnings per request the noise was burying the findings that matter.
+///
+/// A location's first sighting still warns: nothing has been observed to
+/// contradict it yet, and the warning is how a customer learns their prompt
+/// carries volatile-shaped content at all. That leaves roughly one warning per
+/// site per conversation instead of one per site per request — on the measured
+/// window, 37 in place of 4,004. Silencing the first sighting too was tried and
+/// dropped: it makes the detector invisible on any conversation that only ever
+/// sends one request, which is most subagent traffic.
+pub fn emit_volatile_warnings(
+    findings: &[VolatileFinding],
+    request_id: &str,
+    session_key_hash: Option<&str>,
+    conversation_key: Option<&str>,
+) {
+    // Without a conversation there is nothing to compare against, so the
+    // change check cannot run and every finding is reported as before.
+    let Some(conversation) = conversation_key.filter(|c| !c.is_empty()) else {
+        for finding in findings {
+            emit_one(
+                finding,
+                request_id,
+                session_key_hash,
+                conversation_key,
+                true,
+            );
+        }
+        return;
+    };
+
+    // One request routinely reports several findings at the same location — a
+    // tool docstring holding five example timestamps arrives as five findings
+    // under one path. They must be judged together: compared one at a time,
+    // each would differ from the one before it and every location would look
+    // like it was churning.
+    let mut order: Vec<&str> = Vec::new();
+    let mut combined: HashMap<&str, u64> = HashMap::new();
     for finding in findings {
+        let entry = combined
+            .entry(finding.location.as_str())
+            .or_insert_with(|| {
+                order.push(finding.location.as_str());
+                0
+            });
+        // XOR so the digest does not depend on the order findings arrive in.
+        *entry ^= sample_digest(&finding.sample);
+    }
+
+    let mut verdicts: HashMap<&str, Option<bool>> = HashMap::new();
+    {
+        let mut mem = match volatile_memory().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if mem.get(conversation).is_none() {
+            mem.put(
+                conversation.to_string(),
+                LruCache::new(NonZeroUsize::new(VOLATILE_MEMORY_LOCATIONS).expect("non-zero")),
+            );
+        }
+        let locations = mem.get_mut(conversation).expect("just inserted");
+        for location in &order {
+            let digest = combined[location];
+            let verdict = match locations.put((*location).to_string(), digest) {
+                // Seen here before: only interesting if the value moved.
+                Some(previous) => Some(previous != digest),
+                // First sighting on this conversation — no evidence yet.
+                None => None,
+            };
+            verdicts.insert(location, verdict);
+        }
+    }
+
+    for finding in findings {
+        // Warn unless this location is known to be holding still. A first
+        // sighting (`None`) has nothing to contradict it, so it warns.
+        let unchanged = matches!(verdicts.get(finding.location.as_str()), Some(Some(false)));
+        emit_one(
+            finding,
+            request_id,
+            session_key_hash,
+            conversation_key,
+            !unchanged,
+        );
+    }
+}
+
+fn emit_one(
+    finding: &VolatileFinding,
+    request_id: &str,
+    session_key_hash: Option<&str>,
+    conversation_key: Option<&str>,
+    changed: bool,
+) {
+    if changed {
         tracing::warn!(
             event = "volatile_content_detected",
             request_id = %request_id,
+            session_key_hash = session_key_hash.unwrap_or(""),
+            conversation_key = conversation_key.unwrap_or(""),
             kind = finding.kind.as_str(),
             location = %finding.location,
             sample = %finding.sample,
             "volatile content in cached prefix will bust prompt-cache hits; \
              move per-request IDs/timestamps to message metadata or post-prefix \
              fields"
+        );
+    } else {
+        tracing::debug!(
+            event = "volatile_content_unchanged",
+            request_id = %request_id,
+            session_key_hash = session_key_hash.unwrap_or(""),
+            conversation_key = conversation_key.unwrap_or(""),
+            kind = finding.kind.as_str(),
+            location = %finding.location,
+            sample = %finding.sample,
+            "volatile-shaped content is byte-identical to the previous request on \
+             this conversation, so it cannot be what bust the cache; not warned"
         );
     }
 }
@@ -746,5 +894,158 @@ mod tests {
             ApiKind::from_endpoint(CompressibleEndpoint::OpenAiResponses),
             ApiKind::OpenAi,
         );
+    }
+}
+
+/// Item 4: the warning fires on shape, so it cannot tell a fixed example date
+/// in a tool docstring from a genuinely per-request timestamp. These pin the
+/// change check that tells them apart.
+#[cfg(test)]
+mod change_suppression_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Default, Clone)]
+    struct Lines(Arc<StdMutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V(String);
+            impl Visit for V {
+                fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={:?} ", f.name(), v));
+                }
+                fn record_str(&mut self, f: &Field, v: &str) {
+                    self.0.push_str(&format!("{}={} ", f.name(), v));
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            let level = *event.metadata().level();
+            self.0.lock().unwrap().push(format!("{level} {}", v.0));
+        }
+    }
+
+    fn finding(location: &str, sample: &str) -> VolatileFinding {
+        VolatileFinding {
+            kind: VolatileKind::Timestamp,
+            location: location.to_string(),
+            sample: sample.to_string(),
+        }
+    }
+
+    /// Run `f` under a capturing subscriber and return the emitted lines.
+    fn captured(f: impl FnOnce()) -> Vec<String> {
+        let lines = Lines::default();
+        let sub = tracing_subscriber::registry().with(lines.clone());
+        tracing::subscriber::with_default(sub, f);
+        let out = lines.0.lock().unwrap().clone();
+        out
+    }
+
+    fn warnings(lines: &[String]) -> usize {
+        lines.iter().filter(|l| l.starts_with("WARN")).count()
+    }
+
+    /// The measured case: 4,004 of 4,004 live warnings came from values that
+    /// never changed on their conversation. Re-sending one must go quiet after
+    /// the first sighting.
+    #[test]
+    fn an_unchanged_value_warns_no_more_than_once() {
+        let f = vec![finding("system", "2026-07-14T10:05:00")];
+        let lines = captured(|| {
+            for i in 0..5 {
+                emit_volatile_warnings(&f, &format!("req-{i}"), Some("sess"), Some("conv-static"));
+            }
+        });
+        assert_eq!(
+            warnings(&lines),
+            1,
+            "the first sighting warns; the four identical repeats do not: {lines:?}"
+        );
+    }
+
+    /// The signal the warning exists for must survive the suppression.
+    #[test]
+    fn a_changing_value_still_warns() {
+        let lines = captured(|| {
+            emit_volatile_warnings(
+                &[finding("system", "2026-07-14T10:05:00")],
+                "req-1",
+                Some("sess"),
+                Some("conv-churn"),
+            );
+            emit_volatile_warnings(
+                &[finding("system", "2026-07-14T10:06:11")],
+                "req-2",
+                Some("sess"),
+                Some("conv-churn"),
+            );
+        });
+        // One for the first sighting, one for the change itself.
+        assert_eq!(warnings(&lines), 2, "the change must warn: {lines:?}");
+    }
+
+    /// One docstring holding several example timestamps arrives as several
+    /// findings under one location. Compared pairwise they would each differ
+    /// from the last and the location would look like it was churning every
+    /// request — which is exactly what the live logs showed.
+    #[test]
+    fn several_samples_at_one_location_are_judged_together() {
+        let f = vec![
+            finding("messages[6].content", "2026-08-09T00:33:54"),
+            finding("messages[6].content", "2026-08-08T18:04:26"),
+            finding("messages[6].content", "2026-08-05T16:52:14"),
+        ];
+        let lines = captured(|| {
+            emit_volatile_warnings(&f, "req-1", Some("sess"), Some("conv-multi"));
+            emit_volatile_warnings(&f, "req-2", Some("sess"), Some("conv-multi"));
+        });
+        assert_eq!(
+            warnings(&lines),
+            3,
+            "three first sightings, then the identical re-send is silent: {lines:?}"
+        );
+    }
+
+    /// Two conversations must not silence each other — the memory is per
+    /// conversation precisely so one client's static text cannot mask
+    /// another's churn.
+    #[test]
+    fn conversations_do_not_share_a_verdict() {
+        let f = vec![finding("system", "2026-07-14T10:05:00")];
+        let lines = captured(|| {
+            emit_volatile_warnings(&f, "r1", Some("s"), Some("conv-a1"));
+            emit_volatile_warnings(&f, "r2", Some("s"), Some("conv-b1"));
+            emit_volatile_warnings(
+                &[finding("system", "2026-07-14T99:99:99")],
+                "r3",
+                Some("s"),
+                Some("conv-b1"),
+            );
+        });
+        assert_eq!(
+            warnings(&lines),
+            3,
+            "a first sighting each, plus conv-b1's change; a shared verdict              would have silenced r2: {lines:?}"
+        );
+    }
+
+    /// A request that never reached the drift gate has no conversation to
+    /// compare against, so it must report findings rather than swallow them.
+    #[test]
+    fn without_a_conversation_key_every_finding_is_reported() {
+        let f = vec![finding("system", "2026-07-14T10:05:00")];
+        let lines = captured(|| {
+            emit_volatile_warnings(&f, "r1", None, None);
+            emit_volatile_warnings(&f, "r2", None, Some(""));
+        });
+        assert_eq!(warnings(&lines), 2, "no key means no evidence: {lines:?}");
     }
 }

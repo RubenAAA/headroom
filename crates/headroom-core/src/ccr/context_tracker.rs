@@ -110,6 +110,10 @@ pub struct ContextTracker {
     contexts: HashMap<String, CompressedContext>,
     turn_order: Vec<String>,
     current_turn: u32,
+    /// Hashes already sent to the model once. Their content is in the
+    /// conversation from then on, so expanding again spends context to repeat
+    /// what the model can already read.
+    expanded: HashSet<String>,
 }
 
 impl ContextTracker {
@@ -119,6 +123,7 @@ impl ContextTracker {
             contexts: HashMap::new(),
             turn_order: Vec::new(),
             current_turn: 0,
+            expanded: HashSet::new(),
         }
     }
 
@@ -138,10 +143,22 @@ impl ContextTracker {
             return;
         }
 
+        // Re-tracking is not re-capturing. The same offload record rides along
+        // with every later request while its marker sits in the history, and
+        // stamping each one afresh kept contexts permanently young:
+        // `max_context_age` could never expire anything, and the turn number
+        // climbed until a snapshot taken at turn 1 announced itself as captured
+        // at turn 200. First sighting wins.
+        let first_seen = self
+            .contexts
+            .get(hash_key)
+            .map(|prior| (prior.turn_number, prior.timestamp));
+        let (turn_number, timestamp) = first_seen.unwrap_or((turn_number, Instant::now()));
+
         let context = CompressedContext {
             hash_key: hash_key.to_string(),
             turn_number,
-            timestamp: Instant::now(),
+            timestamp,
             tool_name: tool_name.map(|s| s.to_string()),
             original_item_count: original_count,
             compressed_item_count: compressed_count,
@@ -161,7 +178,15 @@ impl ContextTracker {
         while self.contexts.len() > self.config.max_tracked_contexts {
             if let Some(oldest) = self.turn_order.first().cloned() {
                 self.turn_order.remove(0);
-                self.contexts.remove(&oldest);
+                let evicted = self.contexts.remove(&oldest);
+                tracing::info!(
+                    event = "ccr_context_tracker_eviction",
+                    hash = %oldest,
+                    tracked_contexts = self.contexts.len(),
+                    max_tracked_contexts = self.config.max_tracked_contexts,
+                    had_context = evicted.is_some(),
+                    "CCR context tracker evicted the oldest entry due to capacity"
+                );
             }
         }
 
@@ -197,6 +222,14 @@ impl ContextTracker {
                 continue;
             }
 
+            // Sent once already. The bytes are in the conversation from that
+            // point on, so a second copy buys nothing and costs the window —
+            // and it is a *snapshot*, so on an edited file the copy now
+            // contradicts what is on disk.
+            if self.expanded.contains(hash_key) {
+                continue;
+            }
+
             // Check age
             let age = now.duration_since(context.timestamp);
             if age > self.config.max_context_age {
@@ -227,6 +260,9 @@ impl ContextTracker {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         recommendations.truncate(self.config.max_proactive_expansions);
+        for rec in &recommendations {
+            self.expanded.insert(rec.hash_key.clone());
+        }
         recommendations
     }
 
@@ -364,6 +400,7 @@ impl ContextTracker {
         self.contexts.clear();
         self.turn_order.clear();
         self.current_turn = 0;
+        self.expanded.clear();
     }
 }
 
@@ -449,6 +486,96 @@ mod tests {
         assert_eq!(hashes[0], "hash_2");
         assert_eq!(hashes[1], "hash_3");
         assert_eq!(hashes[2], "hash_4");
+    }
+
+    #[test]
+    fn retracking_keeps_the_first_capture_turn() {
+        let mut tracker = ContextTracker::new(None);
+        // The same offload record is re-tracked on every later request for as
+        // long as its marker sits in the history.
+        for turn in 1..200 {
+            tracker.track_compression(
+                "abc",
+                turn,
+                Some("Read"),
+                10,
+                1,
+                "ws",
+                "auth middleware",
+                "auth middleware",
+            );
+        }
+
+        let recs = tracker.analyze_query("auth middleware", Some(200), "ws");
+        assert_eq!(recs.len(), 1);
+        assert!(
+            recs[0].reason.contains("in turn 1,"),
+            "capture turn should be the first sighting, not the latest: {}",
+            recs[0].reason
+        );
+    }
+
+    #[test]
+    fn an_expanded_context_is_not_offered_twice() {
+        let mut tracker = ContextTracker::new(None);
+        tracker.track_compression(
+            "abc",
+            1,
+            Some("Read"),
+            10,
+            1,
+            "ws",
+            "auth middleware",
+            "auth",
+        );
+
+        let first = tracker.analyze_query("auth middleware", Some(1), "ws");
+        assert_eq!(first.len(), 1);
+
+        let second = tracker.analyze_query("auth middleware", Some(2), "ws");
+        assert!(
+            second.is_empty(),
+            "already in the conversation, offered again: {second:?}"
+        );
+    }
+
+    #[test]
+    fn clear_resets_the_expanded_set() {
+        let mut tracker = ContextTracker::new(None);
+        tracker.track_compression(
+            "abc",
+            1,
+            Some("Read"),
+            10,
+            1,
+            "ws",
+            "auth middleware",
+            "auth",
+        );
+        assert_eq!(
+            tracker
+                .analyze_query("auth middleware", Some(1), "ws")
+                .len(),
+            1
+        );
+
+        tracker.clear();
+        tracker.track_compression(
+            "abc",
+            1,
+            Some("Read"),
+            10,
+            1,
+            "ws",
+            "auth middleware",
+            "auth",
+        );
+        assert_eq!(
+            tracker
+                .analyze_query("auth middleware", Some(1), "ws")
+                .len(),
+            1
+        );
     }
 
     #[test]

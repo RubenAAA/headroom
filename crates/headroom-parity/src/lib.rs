@@ -190,10 +190,10 @@ impl TransformComparator for CacheAlignerComparator {
         input: &serde_json::Value,
         config: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        use headroom_core::tokenizer::TiktokenCounter;
         use headroom_core::transforms::cache_aligner::{
             CacheAligner, CacheAlignerConfig, CacheAlignerState,
         };
-        use headroom_core::tokenizer::TiktokenCounter;
 
         let messages: Vec<serde_json::Value> = input
             .as_array()
@@ -278,14 +278,11 @@ impl TransformComparator for CcrComparator {
 
         // Check if headroom_retrieve is already present.
         for tool in &tools {
-            let tool_name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    tool.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                });
+            let tool_name = tool.get("name").and_then(|v| v.as_str()).or_else(|| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+            });
             if tool_name == Some(CCR_TOOL_NAME) {
                 return Ok(serde_json::json!([tools, false]));
             }
@@ -1093,7 +1090,11 @@ mod tests {
         f.write_all(&serde_json::to_vec_pretty(&fixture).unwrap())
             .unwrap();
         let report = run_comparator(tmp.path(), &CacheAlignerComparator).unwrap();
-        assert_eq!(report.matched, 1, "empty messages should match: {:?}", report.diffed);
+        assert_eq!(
+            report.matched, 1,
+            "empty messages should match: {:?}",
+            report.diffed
+        );
     }
 
     /// Minimal tempdir helper to avoid a dev-dependency on `tempfile`.

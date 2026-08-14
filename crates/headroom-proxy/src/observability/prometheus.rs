@@ -241,6 +241,7 @@ pub async fn handle_metrics() -> Response {
     let _ = super::compression_ratio::ratio_histogram(reg);
     let rejected_counter = super::compression_ratio::rejected_counter(reg);
     let tokens_saved_counter = super::compression_ratio::tokens_saved_counter(reg);
+    let declined_counter = super::compression_ratio::declined_no_shrink_counter(reg);
     let passthrough_counter = super::proxy_metrics::passthrough_bytes_modified_counter(reg);
     let rl_requests_gauge = super::proxy_metrics::rate_limit_remaining_requests_gauge(reg);
     let rl_tokens_gauge = super::proxy_metrics::rate_limit_remaining_tokens_gauge(reg);
@@ -251,6 +252,8 @@ pub async fn handle_metrics() -> Response {
     let unified_util = super::proxy_metrics::unified_utilization_gauge(reg);
     let unified_reset = super::proxy_metrics::unified_reset_gauge(reg);
     let unified_throttled = super::proxy_metrics::unified_throttled_gauge(reg);
+    let retries_counter = super::proxy_metrics::upstream_retries_counter(reg);
+    let stream_incomplete_counter = super::proxy_metrics::stream_incomplete_counter(reg);
     // Plain (label-less) Gauge: registering it is enough — `gather()`
     // emits a single 0 sample without needing an `__init__` row.
     let _unified_fallback = super::proxy_metrics::unified_fallback_percentage_gauge(reg);
@@ -265,6 +268,9 @@ pub async fn handle_metrics() -> Response {
     passthrough_counter
         .with_label_values(&[INIT_SENTINEL])
         .inc_by(0);
+    declined_counter
+        .with_label_values(&[INIT_SENTINEL])
+        .inc_by(0);
     rl_requests_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
     rl_tokens_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
     rl_input_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
@@ -274,11 +280,20 @@ pub async fn handle_metrics() -> Response {
     unified_util.with_label_values(&[INIT_SENTINEL]).set(0.0);
     unified_reset.with_label_values(&[INIT_SENTINEL]).set(0);
     unified_throttled.with_label_values(&[INIT_SENTINEL]).set(0);
+    retries_counter
+        .with_label_values(&[INIT_SENTINEL, INIT_SENTINEL])
+        .inc_by(0);
+    stream_incomplete_counter
+        .with_label_values(&[INIT_SENTINEL])
+        .inc_by(0);
 
     // CTX-5/6: force-touch plain IntCounter families so HELP/TYPE
     // appears in the scrape even before any ctx activity.
     super::ctx_metrics::offloaded_bytes_get(reg);
     super::ctx_metrics::offloaded_blocks_get(reg);
+    super::ctx_metrics::proactive_expansion_bytes_get(reg);
+    super::ctx_metrics::proactive_expansion_cache_write_tokens_get(reg);
+    super::ctx_metrics::proactive_expansions_get(reg);
     super::ctx_metrics::recall_injections_get(reg);
     super::ctx_metrics::search_queries_get(reg);
 

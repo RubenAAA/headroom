@@ -112,15 +112,70 @@ pub struct SearchMatch {
     pub content: String,
     /// Relevance score in [0.0, 1.0]; populated by [`SearchCompressor::score_matches`].
     pub score: f32,
+    /// The source line exactly as it arrived, before it was split into
+    /// `file` / `line_number` / `content`.
+    ///
+    /// This compressor *selects* lines; it does not get to rewrite them.
+    /// Rendering from the parsed parts broke that: `line_number` is a `u64`,
+    /// so `format!("{}:{}:{}", ..)` re-emits it unpadded, and any line whose
+    /// second colon-delimited field happened to carry a leading zero came out
+    /// with a different digit than it went in with. An ISO-8601 timestamp is
+    /// exactly that shape —
+    ///
+    /// ```text
+    /// 2026-08-08T23:02:36.174635Z  ->  file "2026-08-08T23", line 2, content "36.174635Z"
+    ///                              ->  re-rendered as 2026-08-08T23:2:36.174635Z
+    /// ```
+    ///
+    /// — and the damaged value was handed to a model as fact. Keeping the
+    /// original text means a mis-parse can still group a line oddly, which is
+    /// a ranking bug, but can no longer corrupt it, which is a data bug.
+    pub raw: String,
 }
 
 impl SearchMatch {
+    /// Build a match whose rendered form is reconstructed from its parts.
+    ///
+    /// Prefer [`SearchMatch::from_line`] anywhere the source line is in hand:
+    /// reconstruction cannot preserve digits it never saw.
     pub fn new(file: impl Into<String>, line_number: u64, content: impl Into<String>) -> Self {
+        let file = file.into();
+        let content = content.into();
+        let raw = format!("{file}:{line_number}:{content}");
+        Self {
+            file,
+            line_number,
+            content,
+            score: 0.0,
+            raw,
+        }
+    }
+
+    /// Build a match that remembers the line it was parsed from.
+    pub fn from_line(
+        file: impl Into<String>,
+        line_number: u64,
+        content: impl Into<String>,
+        raw: impl Into<String>,
+    ) -> Self {
         Self {
             file: file.into(),
             line_number,
             content: content.into(),
             score: 0.0,
+            raw: raw.into(),
+        }
+    }
+
+    /// The original line with its leading `<path><sep>` removed, for the
+    /// grouped (`rg --heading`) layout that prints the path on its own line.
+    ///
+    /// Falls back to reconstruction only when `raw` does not start with the
+    /// parsed path, which cannot happen for parser-built matches.
+    pub fn raw_without_file(&self) -> String {
+        match self.raw.get(self.file.len() + 1..) {
+            Some(rest) if self.raw.starts_with(&self.file) => rest.to_string(),
+            _ => format!("{}:{}", self.line_number, self.content),
         }
     }
 }
@@ -389,7 +444,7 @@ impl SearchCompressor {
                     out.entry(file.to_string())
                         .or_insert_with(|| FileMatches::new(file))
                         .matches
-                        .push(SearchMatch::new(file, line_no, body));
+                        .push(SearchMatch::from_line(file, line_no, body, line));
                 }
                 None => stats.lines_unparsed += 1,
             }
@@ -473,15 +528,12 @@ impl SearchCompressor {
             by_score.truncate(self.config.max_files);
         }
 
-        let all_match_strings: Vec<String> = by_score
+        // Size the adaptive budget against the text that will actually be
+        // emitted, which is each match's original line.
+        let all_refs: Vec<&str> = by_score
             .iter()
-            .flat_map(|(file, fm)| {
-                fm.matches
-                    .iter()
-                    .map(move |m| format!("{}:{}:{}", file, m.line_number, m.content))
-            })
+            .flat_map(|(_, fm)| fm.matches.iter().map(|m| m.raw.as_str()))
             .collect();
-        let all_refs: Vec<&str> = all_match_strings.iter().map(|s| s.as_str()).collect();
         let adaptive_total =
             compute_optimal_k(&all_refs, bias, 5, Some(self.config.max_total_matches));
 
@@ -587,11 +639,11 @@ impl SearchCompressor {
                 }
                 lines.push(file.clone());
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}", m.line_number, m.content));
+                    lines.push(m.raw_without_file());
                 }
             } else {
                 for m in &fm.matches {
-                    lines.push(format!("{}:{}:{}", m.file, m.line_number, m.content));
+                    lines.push(m.raw.clone());
                 }
             }
             if let Some(orig_fm) = original.get(file) {
@@ -1233,6 +1285,69 @@ src/main.py-44-context line";
         assert_eq!(parsed["src/utils.py"].matches.len(), 1);
         assert_eq!(stats.lines_unparsed, 1);
         assert_eq!(stats.lines_scanned, 5);
+    }
+
+    #[test]
+    fn selected_lines_preserve_zero_padded_colon_fields_verbatim() {
+        // Item 16's exact failure mode: these are ordinary log lines, but the
+        // permissive grep parser also accepts them as
+        // `file:line_number:content`. Reconstructing from the parsed u64 used
+        // to remove the leading zero from two of the three minute fields.
+        let content = "\
+2026-08-08T23:02:36.174635Z wasted_tokens 1965
+2026-08-08T23:04:38.372256Z wasted_tokens 143871
+2026-08-08T22:32:11.010203Z wasted_tokens 22032";
+        let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+        let mut stats = SearchCompressorStats::default();
+        let parsed = compressor.parse_search_results(content, &mut stats);
+
+        assert_eq!(stats.lines_scanned, 3);
+        assert_eq!(stats.lines_unparsed, 0);
+
+        // Quantify the regression, rather than only checking one spelling.
+        // This is the pre-fix renderer kept here as the counterfactual.
+        let legacy_output = parsed
+            .values()
+            .flat_map(|fm| {
+                fm.matches
+                    .iter()
+                    .map(|m| format!("{}:{}:{}", m.file, m.line_number, m.content))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source_lines: Vec<&str> = content.lines().collect();
+        let legacy_mutations = source_lines
+            .iter()
+            .filter(|line| !legacy_output.lines().any(|rendered| rendered == **line))
+            .count();
+
+        let (output, _) = compressor.format_output(&parsed, &parsed);
+        let current_mutations = source_lines
+            .iter()
+            .filter(|line| !output.lines().any(|rendered| rendered == **line))
+            .count();
+
+        assert_eq!(legacy_mutations, 2, "counterfactual must reproduce item 16");
+        assert_eq!(
+            current_mutations, 0,
+            "selected source lines must stay exact"
+        );
+    }
+
+    #[test]
+    fn grouped_output_preserves_zero_padded_line_field() {
+        let compressor = SearchCompressor::new(SearchCompressorConfig {
+            group_by_file: true,
+            ..Default::default()
+        });
+        let content = "2026-08-08T23:02:36.174635Z wasted_tokens 1965";
+        let mut stats = SearchCompressorStats::default();
+        let parsed = compressor.parse_search_results(content, &mut stats);
+
+        let (output, _) = compressor.format_output(&parsed, &parsed);
+
+        assert_eq!(output, "2026-08-08T23\n02:36.174635Z wasted_tokens 1965");
+        assert!(!output.contains("\n2:36.174635Z"));
     }
 
     #[test]

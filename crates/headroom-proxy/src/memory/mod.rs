@@ -3,6 +3,7 @@
 //! Mirrors `headroom.proxy.memory_*` and `headroom.memory.*`.
 
 pub mod backend;
+pub mod ctx_backend;
 pub mod decision;
 pub mod handler;
 pub mod injection;

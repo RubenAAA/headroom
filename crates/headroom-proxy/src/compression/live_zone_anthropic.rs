@@ -516,6 +516,21 @@ pub fn compress_anthropic_request(
                         // rejection in the dedicated counter.
                         crate::observability::record_compression_rejected_by_token_check(strategy);
                     }
+                    BlockAction::NoCompressionApplied {
+                        declined_by: Some(ref strategy),
+                        ..
+                    } => {
+                        // A compressor ran and could not shrink the block, so
+                        // the dispatcher declined it before the tokenizer saw
+                        // it. Counted separately because it is the work the
+                        // size gate absorbs: if this rises while accepted
+                        // compression holds steady, the gate is doing its job;
+                        // if accepted compression falls with it, the gate is
+                        // declining work that pays.
+                        crate::observability::record_compression_declined_no_shrink(
+                            strategy.as_str(),
+                        );
+                    }
                     _ => {}
                 }
             }

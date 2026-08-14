@@ -35,12 +35,13 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use headroom_core::ctx::{
-    build_recall, build_resume_snapshot, CtxStore, SearchOpts, SessionsStore, INJECT_SENTINEL,
+    build_recall, build_resume_snapshot, SearchOpts, SessionsStore, INJECT_SENTINEL,
 };
 use lru::LruCache;
 use serde_json::{json, Value};
 
 use super::identity;
+use super::projects::ProjectStores;
 
 /// Max prior conversations to consult when resume-linking.
 const RESUME_LINK_LOOKBACK: usize = 1;
@@ -54,22 +55,25 @@ const RECALL_LIMIT: usize = 5;
 /// fail-safe). Cached so the hot path is a single map lookup.
 type Decision = Option<String>;
 
-/// Recall / resume injection engine. Shares the sessions DB with the capture
-/// observer (so it reads the events/prefixes the observer wrote) and holds its
-/// own content-store handle for BM25 recall.
+/// Recall / resume injection engine. Reads the sessions DB the capture
+/// observer wrote and runs BM25 recall over the content index — both resolved
+/// per request, for the requesting project.
+///
+/// Scoping matters more here than anywhere else in the ctx layer. Recall is a
+/// relevance query, not a keyed lookup: run against a store holding several
+/// projects it will happily rank another project's tool output as the best
+/// answer and inject it (CTX-2b, observed live).
 pub struct InjectEngine {
-    sessions: std::sync::Arc<SessionsStore>,
-    content: CtxStore,
+    stores: std::sync::Arc<ProjectStores>,
     cache: Mutex<LruCache<String, Decision>>,
 }
 
 impl InjectEngine {
-    /// Build the engine over a shared sessions store and a content-store handle.
-    pub fn new(sessions: std::sync::Arc<SessionsStore>, content: CtxStore) -> Self {
+    /// Build the engine over the shared per-project store registry.
+    pub fn new(stores: std::sync::Arc<ProjectStores>) -> Self {
         let cap = NonZeroUsize::new(4096).expect("nonzero");
         Self {
-            sessions,
-            content,
+            stores,
             cache: Mutex::new(LruCache::new(cap)),
         }
     }
@@ -78,36 +82,82 @@ impl InjectEngine {
     /// returns `true` if a block was injected. Never blocks beyond a single
     /// small sqlite read on cold conversations. Every error is logged and
     /// swallowed (injection failures must never break a request).
-    pub fn maybe_inject(&self, parsed: &mut Value, session_key: &str) -> bool {
-        self.maybe_inject_for_request(parsed, session_key, "")
+    /// `budget` is the request's shared injection ceiling. Recall *reserves*
+    /// against it rather than being clipped by it: the decision is persisted
+    /// once and replayed byte-for-byte into the cached prefix (I4), so cutting
+    /// it on a later turn would rewrite bytes the provider had already cached.
+    /// Charging it here is what makes the later stages see a smaller ceiling.
+    pub fn maybe_inject(
+        &self,
+        parsed: &mut Value,
+        session_key: &str,
+        project_dir: &str,
+        budget: &crate::injection_budget::InjectionBudget,
+    ) -> bool {
+        self.maybe_inject_for_request(parsed, session_key, project_dir, budget, "")
     }
 
-    /// Production entry point that adds the request id to every diagnostic,
-    /// so an injection failure can be joined to the forwarded request.
+    /// Request-correlated production entry point. The decision and output are
+    /// identical to [`Self::maybe_inject`]; only failure observability gains the
+    /// request id needed to join it to the forwarded turn.
     pub fn maybe_inject_for_request(
         &self,
         parsed: &mut Value,
         session_key: &str,
+        project_dir: &str,
+        budget: &crate::injection_budget::InjectionBudget,
         request_id: &str,
     ) -> bool {
         let conv_id = identity::conversation_key(parsed, session_key);
+        // The cache fronts a per-project store, so it has to be keyed the same
+        // way — otherwise the first project to decide a conv_id answers for
+        // every other project that derives the same one.
+        let cache_key = format!("{project_dir}\u{0}{conv_id}");
 
         // Hot path: cached decision.
-        if let Some(decision) = self.cache_get(&conv_id) {
-            let applied = apply(parsed, &decision);
+        if let Some(decision) = self.cache_get(&cache_key) {
+            let applied = self.apply_within_budget(parsed, &decision, budget);
             if applied {
                 crate::observability::ctx_metrics::observe_recall_injection();
             }
             return applied;
         }
 
-        let decision = self.decide(&conv_id, parsed, session_key, request_id);
-        self.cache_put(&conv_id, decision.clone());
-        let applied = apply(parsed, &decision);
+        let decision = self.decide(&conv_id, parsed, session_key, project_dir, request_id);
+        self.cache_put(&cache_key, decision.clone());
+        let applied = self.apply_within_budget(parsed, &decision, budget);
         if applied {
             crate::observability::ctx_metrics::observe_recall_injection();
         }
         applied
+    }
+
+    /// Charge the decision against the budget, then apply it verbatim.
+    ///
+    /// The text handed back by `take` is discarded on purpose — recall is
+    /// non-clippable, so it always comes back whole, and `apply` has to write
+    /// the exact bytes that were persisted for this conversation. Taking the
+    /// returned copy would work today and break silently the moment the stage
+    /// became clippable.
+    fn apply_within_budget(
+        &self,
+        parsed: &mut Value,
+        decision: &Decision,
+        budget: &crate::injection_budget::InjectionBudget,
+    ) -> bool {
+        let Some(text) = decision else {
+            return false;
+        };
+        if budget
+            .take(
+                crate::injection_budget::InjectionStage::Recall,
+                text.clone(),
+            )
+            .is_none()
+        {
+            return false;
+        }
+        apply(parsed, decision)
     }
 
     fn cache_get(&self, conv_id: &str) -> Option<Decision> {
@@ -132,10 +182,16 @@ impl InjectEngine {
         conv_id: &str,
         parsed: &Value,
         session_key: &str,
+        project_dir: &str,
         request_id: &str,
     ) -> Decision {
+        // No sessions DB for this project means no history to replay and
+        // nowhere to persist a new decision. Injecting nothing is byte-stable,
+        // which is the direction the fail-safe below already chooses.
+        let sessions = self.stores.sessions(project_dir)?;
+
         // Already decided → replay verbatim (I4).
-        match self.sessions.get_injection(conv_id) {
+        match sessions.get_injection(conv_id) {
             Ok(Some(bytes)) => return Some(bytes),
             Ok(None) => {}
             Err(e) => {
@@ -149,14 +205,29 @@ impl InjectEngine {
             }
         }
 
-        // No injection row. Distinguish genuine first sight from a row-miss for
-        // a conversation we've recorded before (prefix-chain exists).
-        let seen_before = matches!(self.sessions.last_prefix(conv_id), Ok(Some(_)));
-        if seen_before {
+        // No injection row. Distinguish a genuine row-miss from this request
+        // racing its own capture: the observer writes the prefix chain from a
+        // detached worker (`ctx::observer::process`) that runs concurrently
+        // with us, keyed on `turn_n = message_count(parsed)` — the same turn we
+        // are deciding for. So "a prefix row exists" alone does not mean we saw
+        // this conversation on an earlier turn; on first sight the worker may
+        // simply have won the race and written the current turn already.
+        //
+        // Only a row strictly BEHIND the current turn proves earlier history,
+        // and that is the case the fail-safe exists for. Treating the race as a
+        // row-miss suppressed injection for genuinely-new conversations.
+        let current_turn = identity::message_count(parsed);
+        let prior_turn = match sessions.last_prefix(conv_id) {
+            Ok(Some(p)) if p.turn_n < current_turn => Some(p.turn_n),
+            _ => None,
+        };
+        if let Some(turn_n) = prior_turn {
             tracing::warn!(
                 event = "ctx_inject_row_miss",
                 request_id = %request_id,
                 conv = %conv_id,
+                last_turn = turn_n,
+                current_turn,
                 "injection row missing for a known conversation; injecting nothing (fail-safe)"
             );
             return None;
@@ -164,8 +235,15 @@ impl InjectEngine {
 
         // Genuine first sight → build synchronously, persist once, inject.
         let start = Instant::now();
-        let built = self.build(conv_id, parsed, session_key, request_id);
-        if let Err(e) = self.sessions.put_injection(conv_id, &built) {
+        let built = self.build(
+            &sessions,
+            conv_id,
+            parsed,
+            session_key,
+            project_dir,
+            request_id,
+        );
+        if let Err(e) = sessions.put_injection(conv_id, &built) {
             tracing::warn!(
                 event = "ctx_inject_persist_failed",
                 request_id = %request_id,
@@ -189,15 +267,17 @@ impl InjectEngine {
     /// fresh recall block.
     fn build(
         &self,
+        sessions: &SessionsStore,
         conv_id: &str,
         parsed: &Value,
         session_key: &str,
+        project_dir: &str,
         request_id: &str,
     ) -> String {
         let first_text = identity::first_user_message_text(parsed).unwrap_or_default();
 
         if identity::has_compaction_marker(&first_text) {
-            if let Some(snapshot) = self.try_resume_snapshot(conv_id, session_key) {
+            if let Some(snapshot) = self.try_resume_snapshot(sessions, conv_id, session_key) {
                 return snapshot;
             }
             // Resume marker but nothing linkable → fall through to fresh recall.
@@ -208,29 +288,37 @@ impl InjectEngine {
             limit: RECALL_LIMIT,
             ..Default::default()
         };
-        let hits = match self.content.search(&queries, &opts) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(
-                    event = "ctx_inject_search_failed",
-                    request_id = %request_id,
-                    error = %e
-                );
-                Vec::new()
-            }
+        // Scoped by which file we open: `SearchOpts` cannot filter by project.
+        let hits = match self.stores.content(project_dir) {
+            Some(content) => match content.search(&queries, &opts) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "ctx_inject_search_failed",
+                        request_id = %request_id,
+                        error = %e
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
         };
         build_recall(&hits, &queries)
     }
 
     /// Try to render a resume snapshot from the most recent prior conversation
     /// under this session key. `None` if there is no linkable prior with events.
-    fn try_resume_snapshot(&self, conv_id: &str, session_key: &str) -> Option<String> {
-        let recent = self
-            .sessions
+    fn try_resume_snapshot(
+        &self,
+        sessions: &SessionsStore,
+        conv_id: &str,
+        session_key: &str,
+    ) -> Option<String> {
+        let recent = sessions
             .recent_conversations(session_key, conv_id, RESUME_LINK_LOOKBACK)
             .ok()?;
         let prior = recent.first()?;
-        let events = self.sessions.get_events(prior, MAX_SNAPSHOT_EVENTS).ok()?;
+        let events = sessions.get_events(prior, MAX_SNAPSHOT_EVENTS).ok()?;
         if events.is_empty() {
             return None;
         }
@@ -311,6 +399,32 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
+    /// A budget large enough never to bind, so these tests keep exercising
+    /// injection behaviour rather than the ceiling. Budget clipping has its
+    /// own tests in `injection_budget`.
+    fn big_budget() -> crate::injection_budget::InjectionBudget {
+        crate::injection_budget::InjectionBudget::new(usize::MAX)
+    }
+
+    /// The project these tests run as. Any non-empty path works; what matters
+    /// is that the same one is used for reads and writes.
+    const PROJECT: &str = "/home/dev/alpha";
+
+    fn engine(dir: &TempDir) -> InjectEngine {
+        InjectEngine::new(Arc::new(ProjectStores::new(dir.path().to_path_buf())))
+    }
+
+    fn sessions_of(eng: &InjectEngine) -> Arc<SessionsStore> {
+        eng.stores.sessions(PROJECT).unwrap()
+    }
+
+    fn fresh_req(first: &str) -> Value {
+        json!({
+            "system": "sys",
+            "messages": [{"role":"user","content": first}]
+        })
+    }
+
     #[derive(Clone, Default)]
     struct EventCapture(Arc<Mutex<Vec<String>>>);
 
@@ -329,6 +443,9 @@ mod tests {
                 fn record_str(&mut self, field: &Field, value: &str) {
                     self.0.push_str(&format!("{}={value} ", field.name()));
                 }
+                fn record_i64(&mut self, field: &Field, value: i64) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
             }
             let mut visitor = Visitor(String::new());
             event.record(&mut visitor);
@@ -336,26 +453,12 @@ mod tests {
         }
     }
 
-    fn engine(dir: &TempDir) -> InjectEngine {
-        let sessions = Arc::new(SessionsStore::open(dir.path().join("s.db")).unwrap());
-        let content_path = dir.path().join("content.db");
-        let content = CtxStore::open(&content_path).unwrap();
-        InjectEngine::new(sessions, content)
-    }
-
-    fn fresh_req(first: &str) -> Value {
-        json!({
-            "system": "sys",
-            "messages": [{"role":"user","content": first}]
-        })
-    }
-
     #[test]
     fn injects_once_and_replays_verbatim() {
         let dir = TempDir::new().unwrap();
         let eng = engine(&dir);
         let mut r1 = fresh_req("build a parser");
-        assert!(eng.maybe_inject(&mut r1, "sk"));
+        assert!(eng.maybe_inject(&mut r1, "sk", PROJECT, &big_budget()));
         // The first user message is now an array whose first block is ours.
         let block0 = &r1["messages"][0]["content"][0];
         assert_eq!(block0["type"], "text");
@@ -374,7 +477,7 @@ mod tests {
                 {"role":"user","content":"continue"}
             ]
         });
-        assert!(eng.maybe_inject(&mut r2, "sk"));
+        assert!(eng.maybe_inject(&mut r2, "sk", PROJECT, &big_budget()));
         assert_eq!(r2["messages"][0]["content"][0]["text"], injected_text);
     }
 
@@ -383,9 +486,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let eng = engine(&dir);
         let mut r = fresh_req("do a thing");
-        assert!(eng.maybe_inject(&mut r, "sk"));
+        assert!(eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
         // Applying again to the already-injected body is a no-op.
-        assert!(!eng.maybe_inject(&mut r, "sk"));
+        assert!(!eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
         // Exactly one sentinel present.
         let blocks = r["messages"][0]["content"].as_array().unwrap();
         let count = blocks
@@ -406,24 +509,66 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let eng = engine(&dir);
-        // Simulate a known conversation (prefix recorded) with NO injection row.
-        let req = fresh_req("hi");
+        // A known conversation with NO injection row. The prefix must sit
+        // strictly BEHIND this request's turn, which is what proves we saw the
+        // conversation on an earlier turn rather than racing our own capture.
+        let req = json!({
+            "system": "sys",
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello"},
+                {"role":"user","content":"more"}
+            ]
+        });
         let conv = identity::conversation_key(&req, "sk");
-        eng.sessions.record_prefix(&conv, 1, "h").unwrap();
+        sessions_of(&eng).record_prefix(&conv, 1, "h").unwrap();
 
         let mut r = req.clone();
         let capture = EventCapture::default();
-        let events = capture.0.clone();
+        let lines = capture.0.clone();
         let subscriber = tracing_subscriber::registry().with(capture);
+        // Fail-safe: nothing injected, no panic, and the controlled miss is
+        // now joinable to its request.
         tracing::subscriber::with_default(subscriber, || {
-            assert!(!eng.maybe_inject_for_request(&mut r, "sk", "req-row-miss"));
+            assert!(!eng.maybe_inject_for_request(
+                &mut r,
+                "sk",
+                PROJECT,
+                &big_budget(),
+                "req-row-miss",
+            ));
         });
-
-        // Fail-safe: nothing injected, no panic, and the miss is joinable.
         assert_eq!(r["messages"][0]["content"], json!("hi"));
-        let joined = events.lock().unwrap().join("\n");
-        assert!(joined.contains("event=ctx_inject_row_miss"), "{joined}");
-        assert!(joined.contains("request_id=req-row-miss"), "{joined}");
+        let joined = lines.lock().unwrap().join("\n");
+        let event = joined
+            .lines()
+            .find(|line| line.contains("ctx_inject_row_miss"))
+            .unwrap_or_else(|| panic!("row-miss event missing from:\n{joined}"));
+        assert!(event.contains("request_id=req-row-miss"), "{event}");
+    }
+
+    /// The capture observer writes the prefix chain from a detached worker
+    /// keyed on the CURRENT turn, so on first sight it can land before inject
+    /// reads it. That is a race, not a lost row: treating it as a row-miss
+    /// suppressed injection for genuinely-new conversations.
+    #[test]
+    fn a_prefix_row_at_the_current_turn_is_a_race_not_a_row_miss() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        let req = fresh_req("build a parser");
+        let conv = identity::conversation_key(&req, "sk");
+        // The observer won the race and recorded THIS turn (1 message = turn 1).
+        sessions_of(&eng).record_prefix(&conv, 1, "h").unwrap();
+
+        let mut r = req.clone();
+        assert!(
+            eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()),
+            "first sight must still inject when capture wrote the current turn first"
+        );
+        assert!(r["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(INJECT_SENTINEL));
     }
 
     #[test]
@@ -433,8 +578,8 @@ mod tests {
 
         // A prior conversation with events, recorded under session key "sk".
         let prior = "prior_conv_id";
-        eng.sessions.record_conversation("sk", prior).unwrap();
-        eng.sessions
+        sessions_of(&eng).record_conversation("sk", prior).unwrap();
+        sessions_of(&eng)
             .insert_event(&headroom_core::ctx::NewEvent::new(
                 prior,
                 "intent",
@@ -453,7 +598,7 @@ mod tests {
                 "content":"This session is being continued from a previous conversation. Summary: ..."
             }]
         });
-        assert!(eng.maybe_inject(&mut resume, "sk"));
+        assert!(eng.maybe_inject(&mut resume, "sk", PROJECT, &big_budget()));
         let text = resume["messages"][0]["content"][0]["text"]
             .as_str()
             .unwrap();

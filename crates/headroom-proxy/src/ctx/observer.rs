@@ -9,7 +9,7 @@
 //! Wiring is gated by the `ctx_capture` config flag (default off). When off,
 //! `AppState` holds `None` and nothing is constructed.
 
-use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -19,11 +19,16 @@ use serde_json::Value;
 
 use super::extract::{self, ExtractedEvent};
 use super::identity;
+use super::projects::ProjectStores;
 
 /// A unit of work parked for the background worker.
 struct Job {
     parsed: Value,
     session_key: String,
+    /// The project this request belongs to — decides which sessions DB the
+    /// worker writes to. Resolved on the request path, where the headers and
+    /// system prompt are still in scope.
+    project_dir: String,
 }
 
 /// Handle to the background capture worker. Cheap to clone via `Arc` in
@@ -31,26 +36,24 @@ struct Job {
 /// thread exits.
 pub struct CtxObserver {
     tx: Sender<Job>,
-    /// The shared sessions store, so the CTX-4 injection engine can read the
-    /// events/prefixes this worker writes (one DB, one connection pool).
-    store: Arc<SessionsStore>,
+    /// The per-project store registry, so the CTX-4 injection engine reads the
+    /// events/prefixes this worker writes — from the same file, for the same
+    /// project.
+    stores: Arc<ProjectStores>,
+    /// Captures thrown away because the worker was not there to take them.
+    /// Expected to stay at zero — see `observe` for why, and `should_report`
+    /// for what happens if it does not.
+    dropped: AtomicU64,
 }
 
 impl CtxObserver {
-    /// Open (or create) the sessions DB under `store_dir` and spawn the worker.
+    /// Spawn the worker over a per-project store registry.
     ///
-    /// The DB lives at `<store_dir>/sessions/proxy.db`. NOTE (CTX-2b): the
-    /// proxy does not yet know the client's project dir, so all conversations
-    /// share one un-sharded DB with `project_dir=''` (the public bucket). Once
-    /// the request→project mapping lands, switch to
-    /// `headroom_core::ctx::session_db_path` for per-project sharding.
-    pub fn start(store_dir: &Path) -> std::io::Result<Self> {
-        let sessions_dir = store_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir)?;
-        let db_path = sessions_dir.join("proxy.db");
-        let store = Arc::new(SessionsStore::open(&db_path).map_err(std::io::Error::other)?);
-
-        let worker_store = Arc::clone(&store);
+    /// Each request's sessions DB is `<store_dir>/sessions/<project-hash>.db`,
+    /// opened on first sight of that project. Nothing is opened here: the
+    /// project is a property of a request, and at start-up there are none.
+    pub fn start(stores: Arc<ProjectStores>) -> std::io::Result<Self> {
+        let worker_stores = Arc::clone(&stores);
         let (tx, rx) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("ctx-observer".to_string())
@@ -70,8 +73,13 @@ impl CtxObserver {
                     // read-then-write against SQLite with no transaction
                     // spanning them, and the store recovers a poisoned lock
                     // rather than propagating it.
+                    let Some(store) = worker_stores.sessions(&job.project_dir) else {
+                        // The registry already logged why. One project's DB
+                        // failing to open must not stop capture for the rest.
+                        continue;
+                    };
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        process(&worker_store, &job.parsed, &job.session_key);
+                        process(&store, &job.parsed, &job.session_key);
                     }));
                     if outcome.is_err() {
                         tracing::error!(
@@ -82,29 +90,75 @@ impl CtxObserver {
                 }
             })?;
 
-        Ok(Self { tx, store })
+        Ok(Self {
+            tx,
+            stores,
+            dropped: AtomicU64::new(0),
+        })
     }
 
-    /// The shared sessions store handle (for the CTX-4 injection engine).
-    pub fn sessions(&self) -> Arc<SessionsStore> {
-        Arc::clone(&self.store)
+    /// The shared per-project store registry (for the CTX-4 injection engine).
+    pub fn stores(&self) -> Arc<ProjectStores> {
+        Arc::clone(&self.stores)
     }
 
     /// Hand a request body to the worker. Non-blocking: clones the body once
-    /// and enqueues. A send failure means the worker is gone — logged, never
+    /// and enqueues. A send failure means the worker is gone — reported, never
     /// fatal (capture must never break or slow a live request).
-    pub fn observe(&self, parsed: &Value, session_key: &str) {
+    pub fn observe(&self, parsed: &Value, session_key: &str, project_dir: &str) {
         let job = Job {
             parsed: parsed.clone(),
             session_key: session_key.to_string(),
+            project_dir: project_dir.to_string(),
         };
         if self.tx.send(job).is_err() {
-            tracing::warn!(
-                event = "ctx_observe_worker_gone",
-                "CTX-2 observer worker unavailable; dropping capture"
-            );
+            // Nothing known can reach this branch: the panic that used to
+            // kill the worker is caught per job above, so the loop no longer
+            // exits while a sender is alive. It stays because the failure it
+            // reports is absolute — the channel is unbounded, so a send can
+            // only fail because the receiver is gone, and the receiver lives
+            // in the worker thread. A drop is therefore never a busy queue
+            // and never a transient: capture is finished until the process
+            // restarts, and nothing in the process can bring it back.
+            //
+            // Counted rather than logged per request because a permanent
+            // condition repeated per request buries the one event that
+            // explains it — the last worker to die, before the panic was
+            // contained, wrote 5,916 identical warnings over 16 hours.
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_report(n) {
+                tracing::error!(
+                    event = "ctx_observe_worker_gone",
+                    dropped = n,
+                    "CTX-2 observer worker is gone; capture stays off until the proxy restarts"
+                );
+            }
         }
     }
+
+    /// Captures dropped so far because the worker was gone. Zero unless the
+    /// worker has died, which no known path still allows.
+    pub fn dropped_captures(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Report the first drop, then only at powers of ten.
+///
+/// The first line has to be immediate — if a worker ever dies again, an
+/// operator needs to see capture stop at the moment it stops. After that the
+/// only new information is the order of magnitude, so 5,916 drops cost four
+/// lines (1, 10, 100, 1k) and the count carried on each one says how much
+/// capture was lost.
+fn should_report(n: u64) -> bool {
+    let mut threshold = 1u64;
+    while threshold < n {
+        threshold = match threshold.checked_mul(10) {
+            Some(t) => t,
+            None => return false,
+        };
+    }
+    threshold == n
 }
 
 /// Classify + extract + persist for one request. Off the request path; every
@@ -168,7 +222,66 @@ fn to_new_event(conv_id: &str, ev: &ExtractedEvent) -> NewEvent {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::TempDir;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    /// Counts every event emitted on the current thread, so a test can assert
+    /// on log volume the same way a log file measures it.
+    struct CountEvents(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for CountEvents {
+        fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A `CtxObserver` whose worker is already gone: the receiver is dropped,
+    /// so every send fails exactly as it does after the worker thread dies.
+    fn observer_with_dead_worker(dir: &TempDir) -> CtxObserver {
+        let stores = Arc::new(ProjectStores::new(dir.path().to_path_buf()));
+        let (tx, rx) = mpsc::channel::<Job>();
+        drop(rx);
+        CtxObserver {
+            tx,
+            stores,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn dead_worker_counts_every_drop_but_reports_a_handful() {
+        // What the worst single run in the proxy log actually dropped.
+        const DROPS: usize = 5_916;
+
+        let dir = TempDir::new().unwrap();
+        let obs = observer_with_dead_worker(&dir);
+        let body = json!({"messages":[{"role":"user","content":"hi"}]});
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountEvents(Arc::clone(&seen)));
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..DROPS {
+                obs.observe(&body, "sk", "/home/dev/alpha");
+            }
+        });
+
+        // Every drop is accounted for even though almost none are logged.
+        assert_eq!(obs.dropped_captures(), DROPS as u64);
+        // 1, 10, 100, 1_000 — and nothing else.
+        assert_eq!(seen.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn report_thresholds_stay_sparse_forever() {
+        let reports = (1..=1_000_000u64).filter(|&n| should_report(n)).count();
+        assert_eq!(reports, 7); // 1 … 1_000_000
+
+        // A count that overruns the last threshold must not report again, and
+        // must not overflow while looking for one.
+        assert!(!should_report(u64::MAX));
+    }
 
     #[test]
     fn observe_persists_events_and_prefix() {

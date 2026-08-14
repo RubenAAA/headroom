@@ -131,11 +131,20 @@ const MAX_ALTERNATE_MESSAGES: usize = 4_000;
 /// forwarded: a prefix that passes here is one the overlay would have accepted
 /// anyway. Content only — the shared canonicalizer strips `cache_control` and
 /// the rest of the per-turn transport churn.
-fn is_canonical_prefix(candidate: &[Value], current: &[Value]) -> bool {
-    if candidate.is_empty() || current.len() < candidate.len() {
+/// Against a `current` slice the caller already canonicalized.
+///
+/// Both selecting a prefix and storing one walk every branch held for the
+/// session, testing each against the same current conversation. Canonicalizing
+/// that conversation inside those loops made the work scale with branches times
+/// depth — on a 600-message session with a full alternates list, tens of
+/// thousands of message projections per request, all but one set of them
+/// identical. Hoisting it out leaves one projection of the current messages and
+/// one of each candidate.
+fn matches_canonical_prefix(candidate: &[Value], canonical_current: &[Value]) -> bool {
+    if candidate.is_empty() || canonical_current.len() < candidate.len() {
         return false;
     }
-    canonicalize_slice(&current[..candidate.len()]) == canonicalize_slice(candidate)
+    canonicalize_slice(candidate).as_slice() == &canonical_current[..candidate.len()]
 }
 
 /// Proactive expansion is deliberately a cache *tail*. When it becomes the
@@ -172,6 +181,8 @@ fn is_proactive_expansion_block(block: &Value) -> bool {
 /// where its disappearance does the damage.
 const SYSTEM_REMINDER_OPEN_TAG: &str = "<system-reminder>";
 
+const SYSTEM_REMINDER_CLOSE_TAG: &str = "</system-reminder>";
+
 fn is_ephemeral_client_text(text: &str) -> bool {
     text.trim_start().starts_with(SYSTEM_REMINDER_OPEN_TAG)
 }
@@ -182,6 +193,168 @@ fn is_ephemeral_client_block(block: &Value) -> bool {
             .get("text")
             .and_then(Value::as_str)
             .is_some_and(is_ephemeral_client_text)
+}
+
+/// Lift every `<system-reminder>…</system-reminder>` span out of `text`.
+///
+/// Returns the remaining text and the spans, in order. The client does not
+/// always give a reminder its own block: it also arrives inline, in the middle
+/// of a plain string message. [`is_ephemeral_client_text`] only sees the block
+/// form, because it tests the *start* of the text, so an inline one survived
+/// into the comparison key on the turn it arrived and vanished from it on the
+/// turn the client re-shaped or withdrew it. The two keys then differed at that
+/// message — always the newest one, so always the tail of the stored prefix —
+/// and the whole prefix was re-written. Measured 2026-08-13 in one session:
+/// four declines, 507,201 tokens, 67% of everything that session cached.
+///
+/// A span that never closes is left alone. The client always closes these, and
+/// swallowing to end-of-text would eat real content on a malformed one.
+fn split_ephemeral_spans(text: &str) -> (String, Vec<String>) {
+    let mut kept = String::with_capacity(text.len());
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find(SYSTEM_REMINDER_OPEN_TAG) {
+        let Some(close) = rest[open..].find(SYSTEM_REMINDER_CLOSE_TAG) else {
+            break;
+        };
+        let end = open + close + SYSTEM_REMINDER_CLOSE_TAG.len();
+        kept.push_str(&rest[..open]);
+        spans.push(rest[open..end].to_string());
+        rest = &rest[end..];
+    }
+    kept.push_str(rest);
+    if spans.is_empty() {
+        return (kept, spans);
+    }
+    // Lifting a span leaves the whitespace that separated it from the real
+    // text. The client's own block-form version of the same message does not
+    // carry that whitespace, so without this the two shapes still differ by a
+    // newline — and differ in the forwarded bytes, not just the key.
+    (kept.trim().to_string(), spans)
+}
+
+fn block_carries_ephemeral_span(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.contains(SYSTEM_REMINDER_OPEN_TAG))
+}
+
+/// Edge whitespace off a text block, for the comparison key only.
+///
+/// The forwarding side never calls this: trimming there would rewrite the
+/// client's bytes for no gain. Here it costs nothing and buys the one thing the
+/// key needs — that a message keys the same however the client shaped it. A
+/// block left empty goes, because the other representation has no block there
+/// at all.
+fn trim_text_block(block: Value) -> Option<Value> {
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return Some(block);
+    }
+    let Some(text) = block.get("text").and_then(Value::as_str) else {
+        return Some(block);
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() == text.len() {
+        return Some(block);
+    }
+    let trimmed = trimmed.to_string();
+    let mut block = block;
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert("text".to_string(), Value::String(trimmed));
+    }
+    Some(block)
+}
+
+/// Scaffolding at the END of `text`: the spans that trail it, and the prose
+/// before them. `None` when a span sits in the middle of prose.
+///
+/// The permissive [`split_ephemeral_spans`] is right for the comparison key and
+/// wrong for anything that rewrites bytes. A turn that merely QUOTES the tag —
+/// writing test cases for this file will do it — had the span lifted out of the
+/// middle of its prose, and a block that held nothing else was left as `""`.
+/// The model then read its own words back as an empty block.
+///
+/// Only a span the client appended may be moved, and an appended one is always
+/// at the end. Anything else is prose that happens to contain the characters.
+fn split_trailing_ephemeral_spans(text: &str) -> Option<(String, Vec<String>)> {
+    let first_open = text.find(SYSTEM_REMINDER_OPEN_TAG)?;
+    let (prose, trailing) = text.split_at(first_open);
+    let (leftover, spans) = split_ephemeral_spans(trailing);
+    // Anything left after the first span means prose follows it, so the spans
+    // are embedded rather than appended. Leave the whole block alone.
+    if spans.is_empty() || !leftover.is_empty() {
+        return None;
+    }
+    Some((prose.trim_end().to_string(), spans))
+}
+
+/// [`split_trailing_ephemeral_spans`] for one block: what remains of it (`None`
+/// when it held nothing else) and the spans taken. The outer `None` means the
+/// block must not be touched at all.
+fn take_trailing_ephemeral_spans(block: &Value) -> Option<(Option<Value>, Vec<String>)> {
+    if !block_carries_ephemeral_span(block) {
+        return None;
+    }
+    let text = block.get("text").and_then(Value::as_str)?;
+    let (prose, spans) = split_trailing_ephemeral_spans(text)?;
+    if prose.is_empty() {
+        return Some((None, spans));
+    }
+    let mut kept = block.clone();
+    if let Some(obj) = kept.as_object_mut() {
+        obj.insert("text".to_string(), Value::String(prose));
+    }
+    Some((Some(kept), spans))
+}
+
+/// Does this message carry scaffolding that relocation would move?
+///
+/// Reaches exactly as far as [`relocate_ephemeral_blocks_counted`] does — user
+/// role, trailing spans only — so a `true` here means relocation left a movable
+/// span standing where it was.
+fn message_carries_movable_ephemeral_span(message: &Value) -> bool {
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match message.get("content") {
+        Some(Value::String(text)) => split_trailing_ephemeral_spans(text).is_some(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .any(|block| take_trailing_ephemeral_spans(block).is_some()),
+        _ => false,
+    }
+}
+
+/// Strip reminder spans from a text block, dropping the block when only
+/// scaffolding was there. Counterpart to [`split_ephemeral_spans`] for the
+/// comparison key; the forwarding side lifts the same spans in
+/// [`relocate_ephemeral_blocks_counted`].
+fn without_ephemeral_spans(block: Value) -> Option<Value> {
+    if !block_carries_ephemeral_span(&block) {
+        return Some(block);
+    }
+    let text = block
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (kept, spans) = split_ephemeral_spans(&text);
+    if spans.is_empty() {
+        return Some(block);
+    }
+    if kept.trim().is_empty() {
+        return None;
+    }
+    let mut block = block;
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert("text".to_string(), Value::String(kept));
+    }
+    Some(block)
 }
 
 /// Anthropic refuses `cache_control` on a `thinking` block outright —
@@ -272,12 +445,16 @@ pub fn canonicalize_for_prefix_compare(value: &Value) -> Value {
                 if is_opaque_payload(key) {
                     out.insert(key.clone(), val.clone()); // verbatim — do not recurse
                 } else if key == "content" && val.is_string() {
-                    // Anthropic string sugar → canonical block form.
+                    // Anthropic string sugar → canonical block form, then back
+                    // through the array arm so a reminder embedded in the
+                    // string is treated exactly like one that arrived as its
+                    // own block. Inserting the block directly, as this used to,
+                    // skipped the filter below and left the reminder text in
+                    // the key.
                     let text = val.as_str().unwrap_or_default();
-                    out.insert(
-                        key.clone(),
-                        Value::Array(vec![serde_json::json!({"type": "text", "text": text})]),
-                    );
+                    let blocks =
+                        Value::Array(vec![serde_json::json!({"type": "text", "text": text})]);
+                    out.insert(key.clone(), canonicalize_for_prefix_compare(&blocks));
                 } else {
                     out.insert(key.clone(), canonicalize_for_prefix_compare(val));
                 }
@@ -296,7 +473,7 @@ pub fn canonicalize_for_prefix_compare(value: &Value) -> Value {
                     .iter()
                     .map(canonicalize_for_prefix_compare)
                     .filter(|v| *v != empty)
-                    // And drop the client's ephemeral scaffolding, for the same
+                    // Drop the client's ephemeral scaffolding, for the same
                     // reason `cache_control` is dropped: it rides on a message
                     // for a turn or two and then leaves, and it is not what
                     // makes one message different from another.
@@ -314,7 +491,27 @@ pub fn canonicalize_for_prefix_compare(value: &Value) -> Value {
                     // match (see `relocate_ephemeral_blocks`). Ignoring a
                     // difference here while still forwarding it would replay
                     // bytes the provider never cached.
+                    //
+                    // Span level first, block level second. Reversed — as this
+                    // was — a block that OPENS with a reminder and carries real
+                    // text after it was dropped whole by the block-level
+                    // predicate, taking the text with it, so string sugar
+                    // holding `<system-reminder>…</system-reminder>\nDo X` keyed
+                    // as no content at all while the same message in block form
+                    // kept `Do X`.
+                    .filter_map(without_ephemeral_spans)
+                    // What survives the lift is a block with an unclosed tag,
+                    // which `split_ephemeral_spans` deliberately leaves alone.
                     .filter(|v| !is_ephemeral_client_block(v))
+                    // Edge whitespace, for the key only. `split_ephemeral_spans`
+                    // trims what it leaves behind, so a message whose reminder
+                    // was embedded in the text keys as `Do X`, while the same
+                    // message in block form keeps the separator on the
+                    // neighbouring block — `Do X\n` — because that block never
+                    // carried a span and nothing trimmed it. The two then differ
+                    // at `content[0].text`, which is what all three declines
+                    // logged on 2026-08-13 named.
+                    .filter_map(trim_text_block)
                     .collect(),
             )
         }
@@ -346,10 +543,36 @@ fn has_empty_canonical_content(message: &Value) -> bool {
         .is_some_and(Vec::is_empty)
 }
 
-/// Length of the replayable stored prefix after removing trailing messages
-/// whose canonical content is empty.
+/// Length of the replayable stored prefix after removing trailing messages the
+/// next turn will rewrite.
+///
+/// Two kinds qualify, and only the first used to. A message whose canonical
+/// content is empty is pure scaffolding that was never in the provider's cached
+/// prefix. A message still carrying a movable ephemeral span is the one
+/// relocation just landed its collection on — real content with reminder blocks
+/// appended, so it canonicalizes to something non-empty and the emptiness test
+/// keeps it. Once the conversation grows past it, relocation sees it as history
+/// and strips those blocks out again. Held in replay state, that reads as an
+/// edit inside the cached prefix and busts it.
+///
+/// The destination is a hard cap, not a trailing trim. A request often ends in
+/// an assistant turn, which puts the destination second from last — and a
+/// trailing scan stops at the clean assistant message and keeps the destination
+/// anyway. Three events on 2026-08-14 measured that: message 20 of 21 lost
+/// `text,text` four messages later (24,565 re-created), and messages 196 of 198
+/// and 164 of 166 each gained a plain block against the branch they were
+/// compared with (128,616 and 126,388, both falling back to a 21,359-token read
+/// — system and tools, the breakpoint before any message).
+///
+/// Only the destination can carry a movable span here: relocation strips every
+/// earlier user turn, and the assistant turns after it are never sources. So
+/// this cap lands near the tail rather than truncating real history.
 fn replayable_stored_prefix_len(original_messages: &[Value]) -> usize {
-    original_messages
+    let cap = original_messages
+        .iter()
+        .rposition(message_carries_movable_ephemeral_span)
+        .unwrap_or(original_messages.len());
+    original_messages[..cap]
         .iter()
         .rposition(|message| !has_empty_canonical_content(message))
         .map_or(0, |index| index + 1)
@@ -496,6 +719,84 @@ pub fn describe_divergence(
     )
 }
 
+/// How much of the differing text reaches the log, in characters.
+const DIFF_TEXT_HEAD_CHARS: usize = 120;
+
+/// The head of the text a divergence sits in, on each side.
+///
+/// `first_diff_path` says a mismatch is at `content[0].text` but not what it
+/// is, and that gap cost a whole investigation: the cause was trailing
+/// whitespace, which had to be inferred from message shapes when reading a
+/// hundred characters of the two strings would have shown it.
+///
+/// This is the one place the rule against logging values is relaxed, so it is
+/// held tight: the first [`DIFF_TEXT_HEAD_CHARS`] characters only, escaped so
+/// no control byte or newline can break the line, and only for the message the
+/// path already names. The text is the canonical form — scaffolding filtered,
+/// edges trimmed — the same pair [`describe_divergence`] compares, so the path
+/// and the text can never disagree. Returns `None` when the two agree or the
+/// path points at something that is not text, in which case the shape fields
+/// already say what changed.
+pub fn divergence_text_heads(
+    previous_originals: &[Value],
+    current_originals: &[Value],
+    index: usize,
+) -> Option<(String, String)> {
+    let prev = canonicalize_for_prefix_compare(previous_originals.get(index)?);
+    let cur = canonicalize_for_prefix_compare(current_originals.get(index)?);
+    let path = first_structural_difference(&prev, &cur)?;
+    Some((text_head_at(&prev, &path), text_head_at(&cur, &path)))
+}
+
+/// The escaped head of the string at `path`, empty when it is not a string.
+///
+/// Reads the paths [`first_structural_difference`] writes — dotted keys with
+/// `[i]` indices. `content[len 2 vs 1]` and friends do not resolve, and are
+/// meant not to: a block came or went, so there is no differing text to show.
+fn text_head_at(value: &Value, path: &str) -> String {
+    let mut cursor = value;
+    for segment in path.split('.') {
+        let (key, mut rest) = match segment.find('[') {
+            Some(open) => segment.split_at(open),
+            None => (segment, ""),
+        };
+        if !key.is_empty() {
+            let Some(next) = cursor.get(key) else {
+                return String::new();
+            };
+            cursor = next;
+        }
+        while let Some(close) = rest.find(']') {
+            let Ok(index) = rest[1..close].parse::<usize>() else {
+                return String::new();
+            };
+            let Some(next) = cursor.get(index) else {
+                return String::new();
+            };
+            cursor = next;
+            rest = &rest[close + 1..];
+        }
+    }
+    cursor.as_str().map(escaped_head).unwrap_or_default()
+}
+
+/// First [`DIFF_TEXT_HEAD_CHARS`] characters, escaped for a log line.
+///
+/// `escape_debug` is what makes the whitespace case readable: a trailing
+/// newline is the difference that started this, and it prints as `\n` rather
+/// than as nothing at all.
+fn escaped_head(text: &str) -> String {
+    let mut head: String = text
+        .chars()
+        .take(DIFF_TEXT_HEAD_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if text.chars().nth(DIFF_TEXT_HEAD_CHARS).is_some() {
+        head.push('…');
+    }
+    head
+}
+
 /// What kind of `text` blocks a message carries, from a closed vocabulary.
 ///
 /// `block_type_shape` says a `text` block appeared or vanished; it cannot say
@@ -507,25 +808,42 @@ pub fn describe_divergence(
 /// nothing user-controlled reaches the log. Reporting the actual tag name would
 /// break that, because a tag is as attacker- and user-controlled as the body.
 pub fn text_block_kinds(message: &Value) -> String {
-    let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    // String content is classified too. Returning empty for it — as this did
+    // until 2026-08-13 — made `diff_text_kinds` read `'' -> ''` across a
+    // divergence whose cause was a reminder living inside the string. That
+    // looks exactly like "no reminder involved" and cost a wrong diagnosis.
+    if let Some(text) = content.as_str() {
+        return text_kind(text).to_string();
+    }
+    let Some(blocks) = content.as_array() else {
         return String::new();
     };
     blocks
         .iter()
         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .map(|b| {
-            let text = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            let trimmed = text.trim_start();
-            if trimmed.starts_with("<system-reminder>") {
-                "system-reminder"
-            } else if trimmed.starts_with('<') {
-                "other-tag"
-            } else {
-                "plain"
-            }
-        })
+        .map(|b| text_kind(b.get("text").and_then(|t| t.as_str()).unwrap_or("")))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Closed vocabulary — `system-reminder`, `plain+system-reminder`, `other-tag`,
+/// `plain`. Nothing user-controlled reaches the log.
+fn text_kind(text: &str) -> &'static str {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(SYSTEM_REMINDER_OPEN_TAG) {
+        "system-reminder"
+    } else if text.contains(SYSTEM_REMINDER_OPEN_TAG) {
+        // Reminder sitting after real text. Reported apart from `plain`
+        // because this is the shape the filter used to miss entirely.
+        "plain+system-reminder"
+    } else if trimmed.starts_with('<') {
+        "other-tag"
+    } else {
+        "plain"
+    }
 }
 
 /// The sequence of content-block `type` values in a message, e.g.
@@ -634,6 +952,18 @@ pub enum ReplaySkip {
     /// Carries the first message index that differs, as a diagnostic only.
     /// Replaying up to it was tried and measured worse.
     PrefixContentDiverged { first_diff_index: usize },
+    /// This turn still carries a `<system-reminder>` inside the region the
+    /// replay would overwrite, so replaying would delete it from the request.
+    ///
+    /// Replay is only free of the client's scaffolding because relocation puts
+    /// every span past the stored prefix first. Two turns break that: one whose
+    /// last message is not a `user` message, where relocation declines because
+    /// there is nowhere safe to put them, and one no longer than the stored
+    /// prefix, which has no room past it. On either, the stored bytes have
+    /// their copies stripped and the live ones are overwritten by those same
+    /// stripped bytes — the span leaves the request entirely and the model
+    /// stops seeing instructions the client sent.
+    ReminderInsidePrefix,
 }
 
 impl ReplaySkip {
@@ -645,6 +975,7 @@ impl ReplaySkip {
             ReplaySkip::ShorterThanStoredPrefix => "shorter_than_stored_prefix",
             ReplaySkip::OptimizedShorterThanPrefix => "optimized_shorter_than_prefix",
             ReplaySkip::PrefixContentDiverged { .. } => "prefix_content_diverged",
+            ReplaySkip::ReminderInsidePrefix => "reminder_inside_prefix",
         }
     }
 }
@@ -716,6 +1047,18 @@ pub fn overlay_cached_prefix_reported(
             Some(ReplaySkip::PrefixContentDiverged { first_diff_index }),
         );
     }
+    // Relocation normally clears the replayed region of scaffolding before we
+    // get here, so stripping the stored copies below loses nothing — this
+    // turn's own tail carries them. When a span is still standing inside the
+    // region, that did not happen, and replaying would take the stored copies
+    // out and overwrite the live ones with the result. The span would then be
+    // in neither half and the model would never see it.
+    if current_original_messages[..n]
+        .iter()
+        .any(message_carries_movable_ephemeral_span)
+    {
+        return (optimized_messages, Some(ReplaySkip::ReminderInsidePrefix));
+    }
     // Replay the cached (compressed) prefix; keep this turn's tail.
     let mut out = prefix_without_ephemeral_blocks(prev_fwd);
     out.extend_from_slice(&optimized_messages[n..]);
@@ -746,16 +1089,32 @@ fn prefix_without_ephemeral_blocks(prefix: &[Value]) -> Vec<Value> {
     prefix
         .iter()
         .map(|msg| {
+            // Exactly what relocation moves, and nothing else: user role,
+            // trailing spans. Reaching further would delete from history spans
+            // relocation left standing — model output quoting the tag, most of
+            // all — and nothing would put them back.
+            if msg.get("role").and_then(Value::as_str) != Some("user") {
+                return msg.clone();
+            }
             let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
                 return msg.clone();
             };
-            if !blocks.iter().any(is_ephemeral_client_block) {
+            if !blocks
+                .iter()
+                .any(|block| take_trailing_ephemeral_spans(block).is_some())
+            {
                 return msg.clone();
             }
+            // Span level, not block level. A reminder appended to a block that
+            // carries real text is not a block of its own, so a block-level
+            // filter left it in the stored bytes while relocation lifted this
+            // turn's copy onto the tail — and the same span went out twice.
             let keep: Vec<Value> = blocks
                 .iter()
-                .filter(|b| !is_ephemeral_client_block(b))
-                .cloned()
+                .filter_map(|block| match take_trailing_ephemeral_spans(block) {
+                    Some((kept, _)) => kept,
+                    None => Some(block.clone()),
+                })
                 .collect();
             if keep.is_empty() {
                 return msg.clone();
@@ -793,43 +1152,280 @@ fn prefix_without_ephemeral_blocks(prefix: &[Value]) -> Vec<Value> {
 ///   nowhere safe to put them;
 /// - stripping would empty a message's content, which the API rejects.
 pub fn relocate_ephemeral_blocks(messages: Vec<Value>) -> Vec<Value> {
-    let Some(last) = messages.len().checked_sub(1) else {
-        return messages;
-    };
-    let tail_is_open = messages[last].get("role").and_then(Value::as_str) == Some("user")
-        && messages[last]
-            .get("content")
-            .map(Value::is_array)
-            .unwrap_or(false);
-    if !tail_is_open {
-        return messages;
+    relocate_ephemeral_blocks_counted(messages).0
+}
+
+/// How many `<system-reminder>` spans a whole message list carries.
+///
+/// Counts the opening tag wherever text sits — string content and any block
+/// with a `text` field, every role — deliberately reaching wider than
+/// relocation moves. The point is conservation: a span this proxy dropped,
+/// wherever it sat, then shows up as `spans_out < spans_in` on the relocation
+/// event. Four reminder-loss defects were each found days later from the
+/// model's behaviour because nothing counted this.
+///
+/// One pass over text already parsed and in hand; nothing is serialised.
+fn count_ephemeral_spans(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .map(|message| match message.get("content") {
+            Some(Value::String(text)) => text.matches(SYSTEM_REMINDER_OPEN_TAG).count(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .map(|block| {
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map_or(0, |text| text.matches(SYSTEM_REMINDER_OPEN_TAG).count())
+                })
+                .sum(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A message's content shape: `string`, `array`, or `absent`.
+///
+/// Named apart from [`block_type_shape`], which reports the block types inside
+/// an array. Relocation cares only which of the two forms the newest message
+/// arrived in, because a string tail has to be promoted before it can receive
+/// anything and an `absent` one cannot receive at all.
+fn content_shape(message: &Value) -> &'static str {
+    match message.get("content") {
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        _ => "absent",
     }
+}
+
+/// Fold a raided message's text kinds into the distinct set for the log.
+fn note_text_kinds(seen: &mut Vec<&'static str>, message: &Value) {
+    for kind in text_block_kinds(message).split(',') {
+        // Re-borrowed from the closed vocabulary rather than kept as an owned
+        // string, so nothing user-controlled can reach the log by this route
+        // even if `text_block_kinds` ever grows a case.
+        let kind = match kind {
+            "system-reminder" => "system-reminder",
+            "plain+system-reminder" => "plain+system-reminder",
+            "other-tag" => "other-tag",
+            "plain" => "plain",
+            _ => continue,
+        };
+        if !seen.contains(&kind) {
+            seen.push(kind);
+        }
+    }
+}
+
+/// Role of a raided message, from a closed vocabulary.
+fn role_label(message: &Value) -> &'static str {
+    match message.get("role").and_then(Value::as_str) {
+        Some("user") => "user",
+        Some("assistant") => "assistant",
+        _ => "other",
+    }
+}
+
+/// What one relocation pass did, for the log line.
+///
+/// Relocation has produced four separate reminder-loss defects — spans deleted
+/// on retry turns, deleted on turns ending in an assistant message, duplicated
+/// when inline, and lifted out of assistant messages leaving empty text blocks.
+/// Each took days to find because the log said how many blocks moved, and only
+/// on turns where something moved. Every field here answers one of those
+/// questions from a single line.
+#[derive(Debug, Default, Clone)]
+pub struct RelocationReport {
+    /// Spans appended to the newest message.
+    pub blocks_moved: usize,
+    /// Spans in the whole request before the pass, and after it. These must
+    /// agree: relocation moves the client's scaffolding, it never removes it.
+    pub spans_in: usize,
+    pub spans_out: usize,
+    /// Bytes of scaffolding lifted out of history.
+    pub bytes_moved: usize,
+    /// Which messages were raided, and the roles they held. Only a `user` turn
+    /// may be raided — an `assistant` here is the regression that emptied text
+    /// blocks the model itself had written.
+    pub source_indices: Vec<usize>,
+    pub source_roles: Vec<&'static str>,
+    /// What the raided messages' text was, in [`text_block_kinds`]' closed
+    /// vocabulary, distinct. `system-reminder` is the client's own block form;
+    /// `plain+system-reminder` is the inline shape that was once sent twice.
+    pub span_kinds: Vec<&'static str>,
+    /// The destination's content shape as it arrived — the newest USER message,
+    /// which is not always the newest one — and whether relocation had to give
+    /// it block form before it could land anything.
+    pub tail_shape: &'static str,
+    pub tail_promoted: bool,
+    /// Why nothing moved, `""` when something did. Set on the bail paths so a
+    /// no-op is visible: until this existed a bail and a request with no
+    /// scaffolding in it both wrote nothing at all.
+    pub skip_reason: &'static str,
+}
+
+impl RelocationReport {
+    /// A pass that never reached the messages — the caller's own bail.
+    pub fn skipped(skip_reason: &'static str) -> Self {
+        Self {
+            skip_reason,
+            ..Self::default()
+        }
+    }
+}
+
+/// As [`relocate_ephemeral_blocks`], plus the number of blocks it moved.
+///
+/// The count exists so the caller can log whether this ran at all. Without it
+/// a turn that diverged anyway is indistinguishable from one where relocation
+/// never fired, and both look the same in the log — which is exactly the hole
+/// hit while attributing a 210k-token divergence on 2026-08-13.
+pub fn relocate_ephemeral_blocks_counted(messages: Vec<Value>) -> (Vec<Value>, usize) {
+    let (out, report) = relocate_ephemeral_blocks_reported(messages);
+    (out, report.blocks_moved)
+}
+
+/// As [`relocate_ephemeral_blocks_counted`], with the full account of what
+/// moved, from where, and what stopped it. See [`RelocationReport`].
+pub fn relocate_ephemeral_blocks_reported(messages: Vec<Value>) -> (Vec<Value>, RelocationReport) {
+    let mut report = RelocationReport {
+        spans_in: count_ephemeral_spans(&messages),
+        ..RelocationReport::default()
+    };
+    if messages.is_empty() {
+        report.skip_reason = "empty_messages";
+        return (messages, report);
+    }
+    // Scaffolding lands on the newest USER message, which is not always the
+    // newest message. Gating the whole pass on the tail's role made the raid
+    // conditional on something that alternates turn to turn: a request ending
+    // in an assistant message left history alone, the next one ending in a user
+    // message stripped it, and message 0 flipped between two forms inside the
+    // cached prefix. Measured 2026-08-14 on the 07:14Z run: 8 passes moved a
+    // block, every one of them out of index 0, and 7 cost a full re-cache —
+    // 507,265 tokens, 31.5% of all creation. Same defect the content-shape gate
+    // used to cause, same fix: what the pass does to history must not depend on
+    // the tail.
+    let Some(dest) = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        // The output is the input, so the conservation count is too. Counted
+        // twice this would be a second full scan on a path every such request
+        // takes.
+        report.spans_out = report.spans_in;
+        report.skip_reason = "no_user_message";
+        return (messages, report);
+    };
+    report.tail_shape = content_shape(&messages[dest]);
 
     let mut messages = messages;
+    let mut span_kinds: Vec<&'static str> = Vec::new();
     let mut collected: Vec<Value> = Vec::new();
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
-    let tail = messages.split_off(last);
-    for mut msg in messages {
+    // Anything after the destination is an assistant turn: never a source, never
+    // a recipient. It rides along untouched and is re-appended before the spans
+    // are counted, so conservation still sees the whole request.
+    let after = messages.split_off(dest + 1);
+    // The destination is a source like every other user message. Excluding it
+    // left the pass depending on where the destination SITS, which the tail-role
+    // fix above did not reach. A conversation's first turn has message 0 as its
+    // only user message, so message 0 was the destination and kept its
+    // scaffolding; from the second turn the destination had moved forward and
+    // the same blocks were lifted out of it. Message 0 therefore had two forms
+    // in every conversation and the prefix died at its first block. Measured
+    // 2026-08-14 on the capture-beta capture: inbound message 0 byte-identical
+    // across both turns at 79,165 chars, forwarded blocks 2240/67929/6996/179
+    // and then 1948/6996. Stripping the destination too and re-appending the
+    // spans below costs nothing — they land past the breakpoint — and makes a
+    // message's forwarded form independent of its distance from the tail.
+    for (index, mut msg) in messages.into_iter().enumerate() {
+        let is_dest = index == dest;
+        // The destination has always been role-gated; the source was not. So a
+        // reminder tag written by the MODEL — quoting it while discussing this
+        // very code will do it — was lifted out of an assistant turn and the
+        // block that held it left as `""`. The model read its own words back as
+        // empty. Only the client puts scaffolding on a request, and it only
+        // ever puts it on a user turn.
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            out.push(msg);
+            continue;
+        }
+        // String content carries reminders inline, and used to pass straight
+        // through here — invisible to relocation exactly as it was to the
+        // comparison filter.
+        if let Some(text) = msg.get("content").and_then(Value::as_str).map(str::to_owned) {
+            let Some((kept, spans)) = split_trailing_ephemeral_spans(&text) else {
+                out.push(msg);
+                continue;
+            };
+            report.source_indices.push(index);
+            let role = role_label(&msg);
+            if !report.source_roles.contains(&role) {
+                report.source_roles.push(role);
+            }
+            note_text_kinds(&mut span_kinds, &msg);
+            report.bytes_moved += spans.iter().map(String::len).sum::<usize>();
+            collected.extend(
+                spans
+                    .into_iter()
+                    .map(|s| serde_json::json!({"type": "text", "text": s})),
+            );
+            if kept.is_empty() && !is_dest {
+                continue;
+            }
+            if let Some(obj) = msg.as_object_mut() {
+                obj.insert("content".to_string(), Value::String(kept));
+            }
+            out.push(msg);
+            continue;
+        }
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             out.push(msg);
             continue;
         };
-        if !blocks.iter().any(is_ephemeral_client_block) {
+        if !blocks
+            .iter()
+            .any(|block| take_trailing_ephemeral_spans(block).is_some())
+        {
             out.push(msg);
             continue;
         }
-        let (ephemeral, keep): (Vec<Value>, Vec<Value>) = blocks
-            .iter()
-            .cloned()
-            .partition(|b| is_ephemeral_client_block(b));
-        collected.extend(ephemeral);
+        report.source_indices.push(index);
+        let role = role_label(&msg);
+        if !report.source_roles.contains(&role) {
+            report.source_roles.push(role);
+        }
+        note_text_kinds(&mut span_kinds, &msg);
+        // Lift trailing spans rather than whole blocks. A block that ends with
+        // a reminder but carries real text before it would otherwise leave with
+        // the text still attached — and a block whose reminder sits mid-prose
+        // is not scaffolding at all, so it is not touched.
+        let mut keep: Vec<Value> = Vec::with_capacity(blocks.len());
+        for block in blocks.iter() {
+            let Some((kept_block, spans)) = take_trailing_ephemeral_spans(block) else {
+                keep.push(block.clone());
+                continue;
+            };
+            report.bytes_moved += spans.iter().map(String::len).sum::<usize>();
+            collected.extend(
+                spans
+                    .into_iter()
+                    .map(|s| serde_json::json!({"type": "text", "text": s})),
+            );
+            if let Some(kept_block) = kept_block {
+                keep.push(kept_block);
+            }
+        }
         // A message that was nothing but scaffolding leaves with it. Emptying
         // its content instead would be rejected by the API, and keeping the
         // message is what let this churn survive block-level relocation: the
         // client drops the whole message a turn later, every index after it
         // shifts, and the prefix dies there. Dropping it is safe because the
         // client's own next request is that same sequence without it.
-        if keep.is_empty() {
+        // The destination is exempt: its spans are re-appended a few lines down,
+        // so emptying it here would drop the very message they land on.
+        if keep.is_empty() && !is_dest {
             continue;
         }
         if let Some(obj) = msg.as_object_mut() {
@@ -837,9 +1433,31 @@ pub fn relocate_ephemeral_blocks(messages: Vec<Value>) -> Vec<Value> {
         }
         out.push(msg);
     }
-    out.extend(tail);
     if collected.is_empty() {
-        return out;
+        // Nothing was mutated, so the output is the input and its span count
+        // with it. Same reason as the `no_user_message` path: no second scan.
+        out.extend(after);
+        report.spans_out = report.spans_in;
+        report.skip_reason = "nothing_to_move";
+        return (out, report);
+    }
+    report.span_kinds = span_kinds;
+    let moved = collected.len();
+    // Give a string-content tail block form so it can receive the scaffolding.
+    // Only when there is something to move, so an ordinary turn keeps its bytes
+    // byte-for-byte as the client sent them.
+    if let Some(tail_msg) = out.last_mut() {
+        if let Some(text) = tail_msg.get("content").and_then(Value::as_str) {
+            let text = text.to_string();
+            let mut blocks = Vec::with_capacity(1);
+            if !text.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            if let Some(obj) = tail_msg.as_object_mut() {
+                obj.insert("content".to_string(), Value::Array(blocks));
+            }
+            report.tail_promoted = true;
+        }
     }
     if let Some(blocks) = out
         .last_mut()
@@ -847,8 +1465,19 @@ pub fn relocate_ephemeral_blocks(messages: Vec<Value>) -> Vec<Value> {
         .and_then(Value::as_array_mut)
     {
         blocks.extend(collected);
+        report.blocks_moved = moved;
+        out.extend(after);
+        report.spans_out = count_ephemeral_spans(&out);
+        return (out, report);
     }
-    out
+    // No block-style destination to land on: the blocks were lifted out of
+    // history but have nowhere to go, so report zero moved rather than claiming
+    // a relocation that did not happen. The spans are gone from the output,
+    // which is what `spans_out < spans_in` is there to announce.
+    report.skip_reason = "no_block_tail";
+    out.extend(after);
+    report.spans_out = count_ephemeral_spans(&out);
+    (out, report)
 }
 
 /// Own message-level `cache_control` placement so breakpoints stay bounded.
@@ -1325,12 +1954,15 @@ impl PrefixReplayTracker {
         incoming_original.truncate(stored_prefix_len);
         let mut incoming_forwarded = forwarded.to_vec();
         incoming_forwarded.truncate(stored_prefix_len);
+        // One projection of this turn's messages for all three branch tests
+        // below — see [`matches_canonical_prefix`].
+        let canonical_incoming = canonicalize_slice(&incoming_original);
         // If this turn does not continue the prefix we are currently holding,
         // the two belong to different streams sharing this session. Keep the
         // displaced one instead of dropping it, so the stream it belongs to can
         // still replay on its next turn rather than busting.
         if !self.last_forwarded_messages.is_empty()
-            && !is_canonical_prefix(&self.last_original_messages, &incoming_original)
+            && !matches_canonical_prefix(&self.last_original_messages, &canonical_incoming)
         {
             let displaced = (
                 self.primary_chain_id,
@@ -1340,6 +1972,7 @@ impl PrefixReplayTracker {
             self.primary_chain_id = 0;
             self.alternates.retain(|(_, o, _)| o != &displaced.1);
             self.alternates.insert(0, displaced);
+            let held_before_caps = self.alternates.len();
             self.alternates.truncate(MAX_ALTERNATE_PREFIXES);
             // Then trim to the message budget, dropping the
             // least-recently-displaced first. A stream that keeps taking turns
@@ -1356,6 +1989,14 @@ impl PrefixReplayTracker {
                 keep += 1;
             }
             self.alternates.truncate(keep);
+            // An evicted stream busts on its next turn and cannot say why — it
+            // reports a miss with no stored prefix to name. The drop is the only
+            // place it can be counted, and whether either cap is worth raising
+            // is a question nothing else answers.
+            let evicted = held_before_caps - self.alternates.len();
+            if evicted > 0 {
+                crate::observability::replay_alternates::observe_alternates_evicted(evicted as u64);
+            }
         }
         // Whichever chain this turn continues, it inherits that chain's id;
         // continuing nothing starts a new one. This is the only place a chain
@@ -1365,7 +2006,7 @@ impl PrefixReplayTracker {
             self.primary_chain_id = self
                 .alternates
                 .iter()
-                .find(|(_, o, _)| is_canonical_prefix(o, &incoming_original))
+                .find(|(_, o, _)| matches_canonical_prefix(o, &canonical_incoming))
                 .map(|(id, _, _)| *id)
                 .unwrap_or_else(|| {
                     let id = self.next_chain_id;
@@ -1377,7 +2018,7 @@ impl PrefixReplayTracker {
         // alternate — it is the live prefix, and holding it twice would let a
         // stale copy win a later match.
         self.alternates
-            .retain(|(_, o, _)| !is_canonical_prefix(o, &incoming_original));
+            .retain(|(_, o, _)| !matches_canonical_prefix(o, &canonical_incoming));
         self.last_original_messages = incoming_original;
         self.last_forwarded_messages = incoming_forwarded;
 
@@ -1513,13 +2154,16 @@ impl SessionReplayStore {
         if tracker.last_forwarded_messages.is_empty() && tracker.alternates.is_empty() {
             return Err(PrefixMiss::NothingForwardedYet);
         }
+        // One projection of this turn's messages, reused across every branch
+        // tested below — see [`matches_canonical_prefix`].
+        let canonical_current = canonicalize_slice(current_originals);
         let best = std::iter::once((
             tracker.primary_chain_id,
             &tracker.last_original_messages,
             &tracker.last_forwarded_messages,
         ))
         .chain(tracker.alternates.iter().map(|(id, o, f)| (*id, o, f)))
-        .filter(|(_, o, f)| !f.is_empty() && is_canonical_prefix(o, current_originals))
+        .filter(|(_, o, f)| !f.is_empty() && matches_canonical_prefix(o, &canonical_current))
         .max_by_key(|(_, o, _)| o.len());
         match best {
             Some((chain_id, o, f)) => {
@@ -1669,6 +2313,110 @@ mod tests {
 
     fn text_msg(role: &str, text: &str) -> Value {
         json!({"role": role, "content": [{"type": "text", "text": text}]})
+    }
+
+    // Reproduces the two prefix declines logged on 2026-08-13 in conversation
+    // 2e82d794bb9707c9. Both name `content[0].text` at an index equal to
+    // `stored_prefix_msgs - 1` — the newest message of the stored prefix.
+    #[test]
+    fn reminder_embedded_in_string_then_split_into_blocks_compares_equal() {
+        // 20:12:03 — diff_shape 'string' -> 'text,text',
+        //            diff_text_kinds '' -> 'plain,system-reminder'.
+        let stored = vec![
+            json!({"role":"user","content":"do the thing\n\n<system-reminder>x</system-reminder>"}),
+        ];
+        let current = vec![
+            json!({"role":"user","content":[
+                {"type":"text","text":"do the thing"},
+                {"type":"text","text":"<system-reminder>x</system-reminder>"}
+            ]}),
+            text_msg("assistant", "ok"),
+        ];
+        assert!(matches_canonical_prefix(&stored, &canonicalize_slice(&current)));
+    }
+
+    #[test]
+    fn reminder_embedded_in_string_then_withdrawn_compares_equal() {
+        // 20:04:29 — diff_shape 'string' -> 'string', diff_text_kinds '' -> ''.
+        // The kinds field reports empty for any non-array content, so it cannot
+        // show a reminder living inside the string.
+        let stored = vec![
+            json!({"role":"user","content":"do the thing\n\n<system-reminder>x</system-reminder>"}),
+        ];
+        let current = vec![
+            json!({"role":"user","content":"do the thing"}),
+            text_msg("assistant", "ok"),
+        ];
+        assert!(matches_canonical_prefix(&stored, &canonicalize_slice(&current)));
+    }
+
+    // Control: the same string→blocks representation change, with the reminder
+    // arriving as its own block rather than embedded. The filter sees it here,
+    // so this must pass — isolating the cause to the embedded case above.
+    #[test]
+    fn reminder_as_its_own_block_compares_equal() {
+        let stored = vec![json!({"role":"user","content":"do the thing"})];
+        let current = vec![
+            json!({"role":"user","content":[
+                {"type":"text","text":"do the thing"},
+                {"type":"text","text":"<system-reminder>x</system-reminder>"}
+            ]}),
+            text_msg("assistant", "ok"),
+        ];
+        assert!(matches_canonical_prefix(&stored, &canonicalize_slice(&current)));
+    }
+
+    /// One message, every representation the client sends it in — they must all
+    /// give the same key.
+    ///
+    /// The three declines logged on 2026-08-13 all name `content[0].text` at a
+    /// `first_diff_index` one short of `stored_prefix_msgs`, so the difference
+    /// is in the surviving PLAIN text, not in the reminder block or a block
+    /// count. [`split_ephemeral_spans`] trims what it leaves behind, so the
+    /// embedded form keys as `"Do X"`; the block form keeps the separator on
+    /// the neighbouring block, which never carried a span and so was never
+    /// trimmed, and keys as `"Do X\n"`. One of those declines was followed 35
+    /// seconds later by an 88,606-token `aftershock_of_diverged_prefix`.
+    #[test]
+    fn every_representation_of_one_message_canonicalizes_alike() {
+        let reference =
+            canonicalize_for_prefix_compare(&json!({"role":"user","content":"Do X"}));
+        let variants = vec![
+            // Embedded in string sugar, with and without a separator.
+            json!({"role":"user","content":"Do X\n<system-reminder>foo</system-reminder>"}),
+            json!({"role":"user","content":"Do X\n\n<system-reminder>foo</system-reminder>"}),
+            json!({"role":"user","content":"Do X<system-reminder>foo</system-reminder>"}),
+            // A newline after the closing tag, and spaces before the open tag.
+            json!({"role":"user","content":"Do X\n<system-reminder>foo</system-reminder>\n"}),
+            json!({"role":"user","content":"Do X\n   <system-reminder>foo</system-reminder>"}),
+            // A span in the middle, and several spans.
+            json!({"role":"user","content":"<system-reminder>a</system-reminder>\nDo X"}),
+            json!({"role":"user","content":
+                "<system-reminder>a</system-reminder>\nDo X\n<system-reminder>b</system-reminder>"}),
+            // The same message as blocks. The separator stays on the plain
+            // block here — nothing lifts a span out of it, so nothing trims it.
+            json!({"role":"user","content":[
+                {"type":"text","text":"Do X"},
+                {"type":"text","text":"<system-reminder>foo</system-reminder>"}]}),
+            json!({"role":"user","content":[
+                {"type":"text","text":"Do X\n"},
+                {"type":"text","text":"<system-reminder>foo</system-reminder>"}]}),
+            json!({"role":"user","content":[
+                {"type":"text","text":"Do X\n\n"},
+                {"type":"text","text":"<system-reminder>foo</system-reminder>"}]}),
+            // The client withdraws the reminder. This is the 21:07:09 decline:
+            // stored `text,text` / `plain,system-reminder` against current
+            // `string` / `plain`.
+            json!({"role":"user","content":"Do X\n"}),
+            json!({"role":"user","content":[{"type":"text","text":"Do X\n"}]}),
+        ];
+        for variant in variants {
+            assert_eq!(
+                canonicalize_for_prefix_compare(&variant),
+                reference,
+                "representation must not change the key: {variant}"
+            );
+        }
     }
 
     // ── canonicalizer ───────────────────────────────────────────────────
@@ -3336,6 +4084,577 @@ mod block_shape_tests {
         assert_eq!(before, after, "blocks are moved, never dropped");
     }
 
+    // ── the relocation report ───────────────────────────────────────────
+
+    /// The conservation check, and the fields that say where the spans came
+    /// from. Four reminder-loss defects were each found from the model behaving
+    /// oddly turns later; this is what a single log line has to answer instead.
+    #[test]
+    fn a_relocated_request_accounts_for_every_span() {
+        let msgs = vec![
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>one</system-reminder>"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "prose\n\n<system-reminder>two</system-reminder>"}]}),
+            text_msg("user", "newest"),
+        ];
+        let (out, report) = relocate_ephemeral_blocks_reported(msgs);
+        assert_eq!(report.spans_in, 2);
+        assert_eq!(report.spans_out, 2, "spans are moved, never dropped");
+        assert_eq!(report.blocks_moved, 2);
+        assert_eq!(report.skip_reason, "");
+        assert_eq!(report.source_indices, vec![0, 2]);
+        assert_eq!(report.source_roles, vec!["user"]);
+        assert_eq!(
+            report.span_kinds,
+            vec!["system-reminder", "plain+system-reminder"]
+        );
+        assert_eq!(
+            report.bytes_moved,
+            "<system-reminder>one</system-reminder>".len()
+                + "<system-reminder>two</system-reminder>".len()
+        );
+        assert_eq!(report.tail_shape, "array");
+        assert!(!report.tail_promoted);
+        assert_eq!(out.last().unwrap()["content"].as_array().unwrap().len(), 3);
+    }
+
+    /// A bail has to be visible. Reported as nothing at all — which is what the
+    /// event did until it carried `skip_reason` — it looks exactly like a
+    /// request with no scaffolding in it.
+    #[test]
+    fn a_no_op_relocation_names_why_it_bailed() {
+        let no_user_at_all =
+            vec![json!({"role": "assistant", "content": [{"type": "text", "text": "prefill"}]})];
+        let (_, report) = relocate_ephemeral_blocks_reported(no_user_at_all);
+        assert_eq!(report.skip_reason, "no_user_message");
+
+        let nothing_to_move = vec![text_msg("user", "opener"), text_msg("user", "newest")];
+        let (_, report) = relocate_ephemeral_blocks_reported(nothing_to_move);
+        assert_eq!(report.skip_reason, "nothing_to_move");
+        assert_eq!(report.spans_in, 0);
+        assert_eq!(report.spans_out, 0);
+
+        let (_, report) = relocate_ephemeral_blocks_reported(Vec::new());
+        assert_eq!(report.skip_reason, "empty_messages");
+    }
+
+    /// Message 0 has to read the same whether or not it is the destination. It
+    /// IS the destination on a conversation's first turn, being the only user
+    /// message there, and stops being one as soon as the conversation grows — so
+    /// sparing the destination gave message 0 two forms and killed the prefix at
+    /// its first block. Measured 2026-08-14 on the capture-beta capture: forwarded
+    /// blocks 2240/67929/6996/179 on turn 1 and 1948/6996 on turn 2, from an
+    /// inbound message that was byte-identical both times.
+    #[test]
+    fn message_zero_reads_the_same_whether_or_not_it_is_the_destination() {
+        // The reminder trails INSIDE the first block, which is the shape the
+        // capture showed. A reminder in a block of its own would survive the old
+        // behaviour untouched and prove nothing.
+        let opener = json!({"role": "user", "content": [
+            {"type": "text", "text": "opener<system-reminder>x</system-reminder>"}]});
+
+        let (turn_one, report) = relocate_ephemeral_blocks_reported(vec![opener.clone()]);
+        assert_eq!(report.source_indices, vec![0], "the destination is a source");
+        assert_eq!(report.spans_out, report.spans_in, "the span is moved, not lost");
+
+        let (turn_two, _) = relocate_ephemeral_blocks_reported(vec![
+            opener,
+            json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
+            text_msg("user", "newest"),
+        ]);
+
+        assert_eq!(
+            turn_one[0]["content"][0], turn_two[0]["content"][0],
+            "message 0 leads with the same block on both turns"
+        );
+        assert_eq!(turn_one[0]["content"][0]["text"], "opener");
+    }
+
+    /// The relocation destination is real content with reminder blocks appended,
+    /// so it canonicalizes to something non-empty and the emptiness test alone
+    /// kept it in replay state. Once the conversation grew past it, relocation
+    /// stripped those blocks and the stored copy read as an edit inside the
+    /// cached prefix — 24,565 tokens on one turn, 2026-08-14.
+    #[test]
+    fn the_relocation_destination_stays_out_of_the_stored_prefix() {
+        let landed = vec![
+            text_msg("user", "opener"),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1"},
+                {"type": "text", "text": "prose"},
+                {"type": "text", "text": "<system-reminder>x</system-reminder>"}]}),
+        ];
+        assert_eq!(
+            replayable_stored_prefix_len(&landed),
+            2,
+            "a message relocation will rewrite must not be stored"
+        );
+
+        // A request ending in an assistant turn puts the destination second from
+        // last, and a trailing scan stops at the clean assistant message and
+        // keeps the destination anyway. Two of the three busts measured on
+        // 2026-08-14 had exactly this shape.
+        let mut prefilled = landed.clone();
+        prefilled
+            .push(json!({"role": "assistant", "content": [{"type": "text", "text": "prefill"}]}));
+        assert_eq!(
+            replayable_stored_prefix_len(&prefilled),
+            2,
+            "an assistant tail must not drag the destination back into the prefix"
+        );
+
+        // The same message without the appended span is ordinary history.
+        let mut settled = landed.clone();
+        settled[2] = json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1"},
+            {"type": "text", "text": "prose"}]});
+        assert_eq!(replayable_stored_prefix_len(&settled), 3);
+    }
+
+    /// The defect that made this pass the single largest source of re-cached
+    /// tokens: what it did to HISTORY depended on the tail's role. A request
+    /// ending in an assistant prefill left message 0 alone, the next one ending
+    /// in a user turn stripped it, and message 0 alternated between two forms
+    /// inside the cached prefix. Measured 2026-08-14: 7 re-caches, 507,265
+    /// tokens, every pass raiding index 0.
+    #[test]
+    fn history_is_raided_the_same_whatever_the_tail_is() {
+        let history = || {
+            vec![
+                json!({"role": "user", "content": [
+                    {"type": "text", "text": "opener<system-reminder>x</system-reminder>"}]}),
+                json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
+                json!({"role": "user", "content": [{"type": "text", "text": "newest"}]}),
+            ]
+        };
+        let (user_tail, user_report) = relocate_ephemeral_blocks_reported(history());
+
+        let mut with_prefill = history();
+        with_prefill
+            .push(json!({"role": "assistant", "content": [{"type": "text", "text": "prefill"}]}));
+        let (assistant_tail, assistant_report) = relocate_ephemeral_blocks_reported(with_prefill);
+
+        assert_eq!(user_report.source_indices, vec![0]);
+        assert_eq!(
+            user_report.source_indices, assistant_report.source_indices,
+            "the tail's role must not decide whether history is raided"
+        );
+        assert_eq!(user_report.bytes_moved, assistant_report.bytes_moved);
+        assert_eq!(
+            user_tail[..3],
+            assistant_tail[..3],
+            "message 0 has to forward identically on both turns"
+        );
+        assert_eq!(assistant_report.spans_in, assistant_report.spans_out);
+        assert_eq!(
+            assistant_tail.last().unwrap()["content"][0]["text"], "prefill",
+            "the trailing assistant message rides along untouched"
+        );
+    }
+
+    /// A string tail has to be given block form before it can take anything,
+    /// and that promotion is itself a rewrite of the client's bytes.
+    #[test]
+    fn a_promoted_string_tail_is_reported_as_one() {
+        let msgs = vec![
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>x</system-reminder>"}]}),
+            json!({"role": "user", "content": "newest"}),
+        ];
+        let (_, report) = relocate_ephemeral_blocks_reported(msgs);
+        assert_eq!(report.tail_shape, "string");
+        assert!(report.tail_promoted);
+        assert_eq!(report.spans_in, report.spans_out);
+    }
+
+    /// Spans lifted with nowhere to land are gone from the request. Behaviour
+    /// unchanged — the point is that the count now says so, instead of the loss
+    /// surfacing as the model ignoring instructions it was never shown.
+    #[test]
+    fn spans_lifted_with_nowhere_to_land_show_up_as_lost() {
+        let msgs = vec![
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>x</system-reminder>"}]}),
+            json!({"role": "user", "content": {"not": "a shape we can append to"}}),
+        ];
+        let (_, report) = relocate_ephemeral_blocks_reported(msgs);
+        assert_eq!(report.skip_reason, "no_block_tail");
+        assert_eq!(report.tail_shape, "absent");
+        assert_eq!(report.spans_in, 1);
+        assert_eq!(report.spans_out, 0, "the span left the request");
+        assert_eq!(report.blocks_moved, 0);
+    }
+
+    /// The role gate, from the report's side: an `assistant` in `source_roles`
+    /// is the regression that emptied blocks the model itself wrote.
+    #[test]
+    fn model_output_is_never_a_reported_source() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": [
+                {"type": "text", "text": "I wrote <system-reminder>x</system-reminder>"}]}),
+            text_msg("user", "newest"),
+        ];
+        let (_, report) = relocate_ephemeral_blocks_reported(msgs);
+        assert!(report.source_roles.is_empty());
+        assert_eq!(report.spans_in, report.spans_out);
+    }
+
+    // ── divergence_text_heads ───────────────────────────────────────────
+
+    /// `first_diff_path` says WHERE; this says WHAT. Without it the 2026-08-13
+    /// divergence had to be inferred from message shapes.
+    #[test]
+    fn divergence_heads_show_the_text_on_each_side() {
+        let stored = vec![text_msg("user", "read the file")];
+        let current = vec![text_msg("user", "read the file now")];
+        let (head_stored, head_current) = divergence_text_heads(&stored, &current, 0).unwrap();
+        assert_eq!(head_stored, "read the file");
+        assert_eq!(head_current, "read the file now");
+    }
+
+    /// A newline must print as `\n`, not as a break in the log line, and a long
+    /// message must not write the whole conversation into it.
+    #[test]
+    fn divergence_heads_are_escaped_and_truncated() {
+        let stored = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "line\tone\nline two"}]})];
+        let current = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "x".repeat(500)}]})];
+        let (head_stored, head_current) = divergence_text_heads(&stored, &current, 0).unwrap();
+        assert_eq!(head_stored, "line\\tone\\nline two");
+        assert!(!head_current.contains('\n'));
+        assert_eq!(
+            head_current.chars().count(),
+            DIFF_TEXT_HEAD_CHARS + 1,
+            "head plus the ellipsis that marks the cut"
+        );
+    }
+
+    /// A block that came or went is not a text difference, and the shape fields
+    /// already report it. Better empty than a head from the wrong block.
+    #[test]
+    fn divergence_heads_are_empty_when_a_block_came_or_went() {
+        let stored = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]})];
+        let current = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "a"}]})];
+        let (head_stored, head_current) = divergence_text_heads(&stored, &current, 0).unwrap();
+        assert_eq!(head_stored, "");
+        assert_eq!(head_current, "");
+    }
+
+    #[test]
+    fn divergence_heads_are_none_when_the_messages_agree() {
+        let msgs = vec![text_msg("user", "same")];
+        assert!(divergence_text_heads(&msgs, &msgs, 0).is_none());
+        assert!(divergence_text_heads(&msgs, &msgs, 9).is_none());
+    }
+
+    // ── relocation rewrites bytes, so it stays conservative ─────────────
+
+    /// The model quoting the tag is not scaffolding.
+    ///
+    /// Observed live on 2026-08-14: an assistant turn discussing this file
+    /// contained the literal tag, relocation lifted it out of the middle of the
+    /// prose, and the block that held it was left as `""`. The model read its
+    /// own words back as empty. The destination was role-gated and the source
+    /// was not.
+    #[test]
+    fn an_assistant_message_is_never_a_relocation_source() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": [
+                {"type": "text", "text":
+                    "I wrote <system-reminder>foo</system-reminder> in the test case"}]}),
+            json!({"role": "assistant", "content":
+                "and <system-reminder>bar</system-reminder> here too"}),
+            text_msg("user", "newest"),
+        ];
+        assert_eq!(
+            relocate_ephemeral_blocks(msgs.clone()),
+            msgs,
+            "model output is returned byte-identical"
+        );
+    }
+
+    /// A span in the middle of prose is prose. Lifting it is what emptied the
+    /// block above, and it would mangle the sentence even when it did not.
+    #[test]
+    fn a_reminder_in_mid_prose_leaves_the_message_alone() {
+        let msgs = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text":
+                    "before <system-reminder>x</system-reminder> after"}]}),
+            json!({"role": "user", "content":
+                "before <system-reminder>y</system-reminder> after"}),
+            text_msg("user", "newest"),
+        ];
+        assert_eq!(relocate_ephemeral_blocks(msgs.clone()), msgs);
+    }
+
+    /// The shape the client actually sends still moves: a whole reminder block,
+    /// and a reminder appended to the end of a message's text.
+    #[test]
+    fn trailing_reminders_still_relocate() {
+        let msgs = vec![
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>whole</system-reminder>"}]}),
+            json!({"role": "user", "content": "prose\n\n<system-reminder>appended</system-reminder>"}),
+            text_msg("user", "newest"),
+        ];
+        let out = relocate_ephemeral_blocks(msgs);
+        assert_eq!(
+            out[0]["content"].as_array().unwrap().len(),
+            1,
+            "the whole-block reminder left history"
+        );
+        assert_eq!(out[1]["content"], json!("prose"), "the appended one left too");
+        let tail = out[2]["content"].as_array().unwrap();
+        assert_eq!(tail.len(), 3, "both ride on the newest message");
+        assert!(tail[1]["text"].as_str().unwrap().contains("whole"));
+        assert!(tail[2]["text"].as_str().unwrap().contains("appended"));
+    }
+
+    /// Every scrap of message text, scaffolding removed, whitespace collapsed.
+    fn prose(messages: &[Value]) -> String {
+        let mut out = String::new();
+        let mut push = |text: &str| {
+            out.push(' ');
+            out.push_str(&split_ephemeral_spans(text).0);
+        };
+        for message in messages {
+            match message.get("content") {
+                Some(Value::String(text)) => push(text),
+                Some(Value::Array(blocks)) => {
+                    for block in blocks {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            push(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Relocation may move spans and may drop a block that held nothing else.
+    /// It may never lose a character of prose.
+    #[test]
+    fn relocation_loses_no_prose() {
+        let msgs = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "opener"},
+                {"type": "text", "text": "<system-reminder>whole</system-reminder>"}]}),
+            json!({"role": "assistant", "content": [
+                {"type": "text", "text":
+                    "I wrote <system-reminder>quoted</system-reminder> in the test"}]}),
+            json!({"role": "user", "content":
+                "mid <system-reminder>embedded</system-reminder> prose"}),
+            json!({"role": "user", "content": "tail text\n<system-reminder>appended</system-reminder>"}),
+            json!({"role": "user", "content": "newest"}),
+        ];
+        let out = relocate_ephemeral_blocks(msgs.clone());
+        assert_eq!(prose(&msgs), prose(&out), "no text is lost in the move");
+        assert_eq!(
+            reminder_spans(&msgs),
+            reminder_spans(&out),
+            "and no span is lost or duplicated"
+        );
+    }
+
+    // ── reminder conservation across the forward path ───────────────────
+
+    /// Every `<system-reminder>` span in a message list, sorted.
+    ///
+    /// Walks every string rather than the known content shapes: a span that
+    /// moved between block form and string sugar must still be counted, or the
+    /// check passes by looking in the wrong place.
+    fn reminder_spans(messages: &[Value]) -> Vec<String> {
+        fn walk(value: &Value, out: &mut Vec<String>) {
+            match value {
+                Value::String(text) => out.extend(split_ephemeral_spans(text).1),
+                Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+                Value::Object(map) => map.values().for_each(|value| walk(value, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for message in messages {
+            walk(message, &mut out);
+        }
+        out.sort();
+        out
+    }
+
+    /// The forward path in the order `proxy.rs` runs it: relocation on the
+    /// inbound body, then the overlay, then breakpoint placement. Compression
+    /// is the identity here — what is under test is what the replay layer does
+    /// to the client's content, not what the compressor does to it.
+    fn forward(
+        inbound: &[Value],
+        previous: Option<&(Vec<Value>, Vec<Value>)>,
+    ) -> (Vec<Value>, Option<ReplaySkip>) {
+        let relocated = relocate_ephemeral_blocks(inbound.to_vec());
+        let (overlaid, skip) = overlay_cached_prefix_reported(
+            relocated.clone(),
+            &relocated,
+            previous.map(|(original, _)| original.as_slice()),
+            previous.map(|(_, forwarded)| forwarded.as_slice()),
+        );
+        (place_tail_cache_breakpoints(overlaid, 1).0, skip)
+    }
+
+    /// What the store holds after a turn: its post-relocation inbound messages
+    /// and the bytes that went out.
+    fn stored_turn(inbound: &[Value]) -> (Vec<Value>, Vec<Value>) {
+        (
+            relocate_ephemeral_blocks(inbound.to_vec()),
+            forward(inbound, None).0,
+        )
+    }
+
+    #[track_caller]
+    fn assert_reminders_conserved(inbound: &[Value], forwarded: &[Value]) {
+        assert_eq!(
+            reminder_spans(inbound),
+            reminder_spans(forwarded),
+            "every reminder the client sent must go out exactly once"
+        );
+    }
+
+    /// The stored prefix carries the reminder relocation put on its newest
+    /// message, and the replay strips it from there. The current turn has to be
+    /// the thing that re-supplies it.
+    #[test]
+    fn replayed_turn_keeps_the_reminder_it_relocated() {
+        let turn_n = vec![
+            text_msg("user", "opener"),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>a</system-reminder>"}]}),
+        ];
+        let stored = stored_turn(&turn_n);
+        assert_eq!(reminder_spans(&stored.1).len(), 1, "stored bytes carry it");
+
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.push(text_msg("assistant", "reply"));
+        turn_n1.push(text_msg("user", "newest"));
+        let (forwarded, skip) = forward(&turn_n1, Some(&stored));
+        assert_eq!(skip, None, "the prefix replays");
+        assert_reminders_conserved(&turn_n1, &forwarded);
+    }
+
+    /// A turn no longer than the stored prefix — a client retry of an unchanged
+    /// turn is exactly this shape. `optimized[n..]` is empty, so nothing
+    /// re-supplies the spans the strip takes out of the stored prefix.
+    #[test]
+    fn turn_no_longer_than_the_stored_prefix_keeps_its_reminders() {
+        let turn = vec![
+            text_msg("user", "opener"),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>a</system-reminder>"}]}),
+        ];
+        let stored = stored_turn(&turn);
+        let (forwarded, _) = forward(&turn, Some(&stored));
+        assert_reminders_conserved(&turn, &forwarded);
+    }
+
+    /// A declined replay forwards this turn's own bytes, so nothing it carries
+    /// can go missing.
+    #[test]
+    fn declined_turn_keeps_its_reminders() {
+        let stored = stored_turn(&[text_msg("user", "opener"), text_msg("assistant", "reply")]);
+        let turn = vec![
+            text_msg("user", "a different opener"),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "<system-reminder>a</system-reminder>"},
+                {"type": "text", "text": "more"}]}),
+            text_msg("user", "newest"),
+        ];
+        let (forwarded, skip) = forward(&turn, Some(&stored));
+        assert!(skip.is_some(), "the prefix diverged");
+        assert_reminders_conserved(&turn, &forwarded);
+    }
+
+    /// A reminder sitting mid-text rather than in its own block. The stored
+    /// prefix holds it inline, because the turn that produced those bytes ended
+    /// with an assistant message and relocation declined there.
+    #[test]
+    fn inline_reminder_is_not_duplicated_by_the_replay() {
+        let turn_n = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "do the thing\n\n<system-reminder>x</system-reminder>"}]}),
+            text_msg("assistant", "reply"),
+        ];
+        let stored = stored_turn(&turn_n);
+
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.push(text_msg("user", "newest"));
+        let (forwarded, skip) = forward(&turn_n1, Some(&stored));
+        assert_eq!(skip, None, "the prefix replays");
+        assert_reminders_conserved(&turn_n1, &forwarded);
+    }
+
+    /// A tail with string content. Relocation promotes it to block form so it
+    /// can take the scaffolding; nothing may be lost in the promotion.
+    #[test]
+    fn string_content_tail_keeps_the_reminders_moved_onto_it() {
+        let turn = vec![
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>a</system-reminder>"}]}),
+            json!({"role": "user", "content": "newest"}),
+        ];
+        let (forwarded, _) = forward(&turn, None);
+        assert_reminders_conserved(&turn, &forwarded);
+    }
+
+    /// A reminder on a message that is not the last one, on a turn whose last
+    /// message is an assistant message. Relocation declines there — no user
+    /// message at the end to move the span to — so the span is still sitting
+    /// inside the region the replay overwrites.
+    #[test]
+    fn reminder_in_history_survives_a_turn_ending_in_an_assistant_message() {
+        let turn_n = vec![
+            text_msg("user", "opener"),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "out"},
+                {"type": "text", "text": "<system-reminder>a</system-reminder>"}]}),
+            text_msg("user", "newest"),
+        ];
+        let stored = stored_turn(&turn_n);
+
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.push(text_msg("assistant", "reply"));
+        let (forwarded, _) = forward(&turn_n1, Some(&stored));
+        assert_reminders_conserved(&turn_n1, &forwarded);
+    }
+
+    /// Several reminders, on several history messages, in one request — block
+    /// form, inline in an assistant message, and inline in string sugar.
+    #[test]
+    fn many_reminders_across_history_all_reach_the_wire() {
+        let turn = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "opener"},
+                {"type": "text", "text": "<system-reminder>a</system-reminder>"}]}),
+            json!({"role": "assistant", "content": [
+                {"type": "text", "text": "reply <system-reminder>b</system-reminder>"}]}),
+            json!({"role": "user", "content": "third <system-reminder>c</system-reminder> turn"}),
+            text_msg("user", "newest"),
+        ];
+        let (forwarded, _) = forward(&turn, None);
+        assert_reminders_conserved(&turn, &forwarded);
+    }
+
     /// The invariant the whole design rests on, across the turn boundary.
     ///
     /// On turn N a reminder rides on the newest message. On turn N+1 that
@@ -3607,8 +4926,23 @@ mod block_shape_tests {
     fn text_kinds_ignore_non_text_blocks_and_string_content() {
         let m = json!({"content": [{"type": "tool_result", "content": "x"}]});
         assert_eq!(text_block_kinds(&m), "");
-        assert_eq!(text_block_kinds(&json!({"content": "plain"})), "");
         assert_eq!(text_block_kinds(&json!({"role": "user"})), "");
+    }
+
+    /// String content is classified rather than skipped. Reporting `""` for it
+    /// hid a reminder living inside the string behind the same output a message
+    /// with no text at all produces.
+    #[test]
+    fn text_kinds_classify_string_content() {
+        assert_eq!(text_block_kinds(&json!({"content": "plain"})), "plain");
+        assert_eq!(
+            text_block_kinds(&json!({"content": "do the thing\n\n<system-reminder>x</system-reminder>"})),
+            "plain+system-reminder"
+        );
+        assert_eq!(
+            text_block_kinds(&json!({"content": "<system-reminder>x</system-reminder>"})),
+            "system-reminder"
+        );
     }
 
     #[test]

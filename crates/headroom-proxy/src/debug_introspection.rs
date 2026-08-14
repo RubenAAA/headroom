@@ -103,10 +103,16 @@ mod tests {
 
     #[test]
     fn collect_runtime_metrics_returns_valid_data() {
+        // `worker_count` is 0 outside a tokio runtime (this test) and > 0
+        // inside one, so there is no value to assert on — `>= 0` on a `usize`
+        // is always true and clippy denies it. What this test actually pins is
+        // that the call returns rather than panicking when no runtime handle
+        // exists, which is the case `collect_runtime_metrics` exists to handle.
         let metrics = collect_runtime_metrics();
-        // worker_count is 0 outside a tokio runtime (unit test context),
-        // > 0 inside one. Either is valid.
-        assert!(metrics.worker_count >= 0);
+        assert_eq!(
+            metrics.worker_count, 0,
+            "no tokio runtime here, so the zeroed fallback is what should come back"
+        );
     }
 
     #[test]

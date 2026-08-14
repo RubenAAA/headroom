@@ -88,12 +88,8 @@ pub trait SubscriptionFetcher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn env_guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    // Shared with `session_tracking`'s tests: both read `CLAUDE_CONFIG_DIR`.
+    use crate::subscription::env_guard;
 
     #[test]
     fn env_token_takes_priority() {

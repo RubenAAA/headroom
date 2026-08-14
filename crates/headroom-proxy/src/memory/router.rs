@@ -165,22 +165,52 @@ impl ProjectResolver {
         None
     }
 
-    fn identity_from_cwd(raw_cwd: &str) -> Option<(String, String)> {
+    /// The canonical project directory for a request, or `None` when nothing
+    /// in the request names one.
+    ///
+    /// Same tier order as [`Self::resolve`], but it yields the normalized
+    /// directory *path* rather than the derived key. The ctx stores shard on
+    /// the path itself (`hash_project_dir_canonical`), so they need the value
+    /// that hash is defined over — feeding them a key derived from it would
+    /// land in a different, unrelated bucket.
+    pub fn resolve_project_dir(ctx: &RequestContext) -> Option<String> {
+        // An explicit project id is not a path. It is still a stable bucket of
+        // its own, which is what sharding needs.
+        if let Some(explicit) = Self::first_nonempty_header(&ctx.headers, "x-headroom-project-id") {
+            let safe = Self::sanitize_basename(&explicit);
+            if !safe.is_empty() {
+                return Some(safe);
+            }
+        }
+        [
+            Self::first_nonempty_header(&ctx.headers, "x-headroom-cwd"),
+            ctx.project_root_override.clone(),
+            Self::extract_cwd_from_system_prompt(&ctx.system_prompt),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|raw| Self::normalize_cwd(&raw))
+    }
+
+    /// Canonicalize a cwd: resolve symlinks where the path exists, drop the
+    /// trailing slash. Best-effort — a directory this machine cannot see still
+    /// shards consistently by its literal form.
+    fn normalize_cwd(raw_cwd: &str) -> Option<String> {
         let cwd = raw_cwd.trim();
         if cwd.is_empty() {
             return None;
         }
-        // Normalise path (best-effort)
         let normalised = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
-        let normalised_str = normalised
+        let s = normalised
             .to_string_lossy()
             .trim_end_matches('/')
             .to_string();
-        let normalised_str = if normalised_str.is_empty() {
-            "/".to_string()
-        } else {
-            normalised_str
-        };
+        Some(if s.is_empty() { "/".to_string() } else { s })
+    }
+
+    fn identity_from_cwd(raw_cwd: &str) -> Option<(String, String)> {
+        let normalised_str = Self::normalize_cwd(raw_cwd)?;
+        let normalised = PathBuf::from(&normalised_str);
         let basename = normalised
             .file_name()
             .map(|n| n.to_string_lossy().to_string())

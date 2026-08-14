@@ -22,30 +22,45 @@ use std::sync::Arc;
 use std::thread;
 
 use headroom_core::ccr::{from_config, CcrBackendConfig, CcrStore};
-use headroom_core::ctx::{content_db_path, CtxStore, IndexOpts};
+use headroom_core::ctx::{CtxStore, IndexOpts};
 
+use super::projects::ProjectStores;
 use crate::compression::ctx_offload::OffloadRecord;
 
 /// Handle to the background offload-persistence worker. Cheap to clone behind
 /// an `Arc` in `AppState`. Dropping the last handle closes the channel and the
 /// worker exits.
 pub struct OffloadStore {
-    tx: Sender<Vec<OffloadRecord>>,
+    tx: Sender<Batch>,
     /// Shared reference to the CCR store — used by CTX-5 `/ctx/get`.
     ccr: Arc<dyn CcrStore>,
-    /// Shared reference to the FTS content store — used by CTX-5 `/ctx/search`
-    /// and `/ctx/index`.
-    content: Arc<CtxStore>,
+    /// Per-project FTS content stores — used by CTX-5 `/ctx/search` and
+    /// `/ctx/index`, and by CTX-4 recall.
+    stores: Arc<ProjectStores>,
+}
+
+/// A batch of originals plus the project whose index they belong in.
+struct Batch {
+    records: Vec<OffloadRecord>,
+    project_dir: String,
 }
 
 impl OffloadStore {
-    /// Open the CCR + content stores under `store_dir` and spawn the worker.
+    /// Open the CCR store under `store_dir` and spawn the worker.
     ///
     /// - CCR: `<store_dir>/ccr.db`, sqlite, TTL `ttl_seconds` (long by design).
-    /// - Content: the CTX-1 per-project content DB for the public bucket
-    ///   (`project_dir=""`); NOTE (CTX-2b) per-project sharding lands with the
-    ///   request→project mapping, same as `observer`.
-    pub fn start(store_dir: &Path, ttl_seconds: u64) -> std::io::Result<Self> {
+    ///   Content-addressed by `blake3` hash and shared across projects on
+    ///   purpose: `/ctx/get` answers a hash the model read out of its own
+    ///   transcript, so there is nothing to scope it to.
+    /// - Content: the CTX-1 per-project FTS index, opened per request through
+    ///   `stores`. This one *is* scoped — it is searched by relevance rather
+    ///   than by an exact key, so a shared index hands one project's tool
+    ///   output to another's recall (CTX-2b).
+    pub fn start(
+        store_dir: &Path,
+        ttl_seconds: u64,
+        stores: Arc<ProjectStores>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(store_dir)?;
 
         let ccr: Arc<dyn CcrStore> = Arc::from(
@@ -56,30 +71,29 @@ impl OffloadStore {
             .map_err(std::io::Error::other)?,
         );
 
-        let content_path = content_db_path(store_dir, "");
-        if let Some(parent) = content_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = Arc::new(CtxStore::open(&content_path).map_err(std::io::Error::other)?);
-
-        let (tx, rx) = mpsc::channel::<Vec<OffloadRecord>>();
+        let (tx, rx) = mpsc::channel::<Batch>();
         // Clone Arcs for the background thread — cheap (atomic refcount).
         let ccr_bg = Arc::clone(&ccr);
-        let content_bg = Arc::clone(&content);
+        let stores_bg = Arc::clone(&stores);
         thread::Builder::new()
             .name("ctx-offload-store".to_string())
             .spawn(move || {
                 for batch in rx {
-                    for record in batch {
+                    let Some(content) = stores_bg.content(&batch.project_dir) else {
+                        // The registry logged why. Persistence is best-effort
+                        // and the wire bytes are already correct.
+                        continue;
+                    };
+                    for record in batch.records {
                         let bytes = record.original.len() as u64;
-                        if persist_one(ccr_bg.as_ref(), &content_bg, &record) {
+                        if persist_one(ccr_bg.as_ref(), &content, &record) {
                             crate::observability::ctx_metrics::observe_offloaded(bytes);
                         }
                     }
                 }
             })?;
 
-        Ok(Self { tx, ccr, content })
+        Ok(Self { tx, ccr, stores })
     }
 
     /// CCR store handle — used by CTX-5 `/ctx/get` to retrieve offloaded
@@ -89,20 +103,31 @@ impl OffloadStore {
         Arc::clone(&self.ccr)
     }
 
-    /// FTS content store handle — used by CTX-5 `/ctx/search` and `/ctx/index`.
-    /// Returns an `Arc` clone for the same reason as [`Self::ccr`].
-    pub fn content(&self) -> Arc<CtxStore> {
-        Arc::clone(&self.content)
+    /// FTS content store handle for one project — used by CTX-5 `/ctx/search`
+    /// and `/ctx/index`. Returns an `Arc` clone for the same reason as
+    /// [`Self::ccr`]. `None` when that project's DB cannot be opened.
+    pub fn content_for(&self, project_dir: &str) -> Option<Arc<CtxStore>> {
+        self.stores.content(project_dir)
     }
 
-    /// Enqueue offloaded originals for persistence. Non-blocking: hands the
-    /// batch to the worker and returns. A send failure means the worker is
-    /// gone — logged, never fatal (the wire bytes are already correct).
-    pub fn persist(&self, records: Vec<OffloadRecord>) {
+    /// The per-project store registry, shared with capture and recall.
+    pub fn stores(&self) -> Arc<ProjectStores> {
+        Arc::clone(&self.stores)
+    }
+
+    /// Enqueue offloaded originals for persistence into `project_dir`'s index.
+    /// Non-blocking: hands the batch to the worker and returns. A send failure
+    /// means the worker is gone — logged, never fatal (the wire bytes are
+    /// already correct).
+    pub fn persist(&self, records: Vec<OffloadRecord>, project_dir: &str) {
         if records.is_empty() {
             return;
         }
-        if self.tx.send(records).is_err() {
+        let batch = Batch {
+            records,
+            project_dir: project_dir.to_string(),
+        };
+        if self.tx.send(batch).is_err() {
             tracing::warn!(
                 event = "ctx_offload_store_worker_gone",
                 "CTX-3 offload-store worker unavailable; dropping persistence"
@@ -139,12 +164,31 @@ fn persist_one(ccr: &dyn CcrStore, content: &CtxStore, record: &OffloadRecord) -
     };
     if let Err(e) = content.index_content(&label, &record.original, &opts) {
         tracing::warn!(
-            event = "ctx_offload_index_failed",
+            event = "ctx_offload_persist_partial",
+            index_ok = false,
+            ccr_ok,
+            event_detail = "index_failed",
             hash = %record.hash,
             error = %e,
             "CTX-3 offload FTS index failed"
         );
         return false;
+    }
+    // The half-failure item 12.3 names: the index write landed, the CCR put did
+    // not. `/ctx/search` will find this record and `/ctx/get` will not return
+    // it, and until now the two halves shared one return value with no line
+    // saying which one broke. Only the anomaly is logged — a record that
+    // persisted correctly is the common case and would be one line per
+    // offloaded block in a log that is never rotated.
+    if !ccr_ok {
+        tracing::warn!(
+            event = "ctx_offload_persist_partial",
+            index_ok = true,
+            ccr_ok = false,
+            hash = %record.hash,
+            bytes = record.original.len(),
+            "CTX-3 offload indexed but not stored: searchable, not retrievable"
+        );
     }
     ccr_ok
 }
@@ -152,6 +196,7 @@ fn persist_one(ccr: &dyn CcrStore, content: &CtxStore, record: &OffloadRecord) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use headroom_core::ctx::content_db_path;
     use tempfile::TempDir;
 
     #[test]

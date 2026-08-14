@@ -287,6 +287,15 @@ pub struct TurnRecord {
     /// the observer without a fingerprint, which falls back to single-stream
     /// behaviour.
     pub msgs: Option<usize>,
+    /// This turn was itself a `prefix_content_diverged` bust.
+    ///
+    /// Carried forward one turn so the turn *after* a divergence can be named.
+    /// Measured 2026-08-13: after a 210k-token divergence the next turn read
+    /// only the system-and-tools floor and rewrote another 212k, landing in the
+    /// residual bucket as though it had no cause. It had one — the turn before.
+    /// (A second divergence the same minute recovered immediately, so this is
+    /// an aftershock that happens, not one that always happens.)
+    pub diverged: bool,
 }
 
 /// Streams tracked per conversation key before the oldest is dropped.
@@ -428,6 +437,26 @@ impl ReplayAppliedEvidence {
 }
 
 impl ReplaySkipEvidence {
+    /// Message index where the prefix first differed, when that was the reason.
+    ///
+    /// The whole cost story turns on this number: an edit in the first quarter
+    /// of the prefix destroys far more than one in the third, and the index is
+    /// what separates "the client deleted mid-history" from "the opener churns
+    /// every turn". It was computed and then dropped before reaching the log.
+    pub fn first_diff_index(&self) -> Option<usize> {
+        match self.reason {
+            ReplaySkip::PrefixContentDiverged { first_diff_index } => Some(first_diff_index),
+            _ => None,
+        }
+    }
+
+    /// Messages the stored turn carried, and this one carries. A count that
+    /// holds steady or falls while the content changed is the deletion
+    /// signature; one that grows is ordinary appending.
+    pub fn message_counts(&self) -> (Option<usize>, usize) {
+        (self.prior_message_count, self.current_message_count)
+    }
+
     /// Evidence produced by comparing the prior and current inbound originals.
     pub fn from_inbound_original_histories(
         reason: ReplaySkip,
@@ -516,6 +545,7 @@ fn recache_attribution<'a>(
     drift_dims: Option<&'a str>,
     replay_skip: Option<ReplaySkipEvidence>,
     replay_applied: Option<ReplayAppliedEvidence>,
+    previous_turn_diverged: bool,
 ) -> RecacheAttribution<'a> {
     if replay_skip.is_some_and(ReplaySkipEvidence::is_inbound_tail_replacement) {
         return RecacheAttribution {
@@ -541,14 +571,43 @@ fn recache_attribution<'a>(
             reason @ ("prefix_content_diverged"
             | "forwarded_count_mismatch"
             | "shorter_than_stored_prefix"
-            | "optimized_shorter_than_prefix"),
+            | "optimized_shorter_than_prefix"
+            // A reminder still standing inside the replayed region names the
+            // boundary as directly as the mismatches above do: relocation
+            // declined this turn, so the prefix went out as this turn's own
+            // bytes with the client's scaffolding still inside it. Left out of
+            // this list it landed in the same bucket as `no_previous_turn`,
+            // which reads as "no evidence" for a turn that carries plenty.
+            | "reminder_inside_prefix"),
         ) => Some(reason),
         _ => None,
     };
+    // Residual, not a finding. Everything above named a cause from evidence;
+    // reaching here means a replay went out and the read still came back short,
+    // with nothing to say why.
+    //
+    // Deliberately NOT called a provider miss. `ReplayAppliedEvidence` proves
+    // the overlay serialized stored bytes onto the request — it does not prove
+    // those bytes match what the provider cached, because the equality behind
+    // it is content-only and tolerates a `cache_control` marker moving between
+    // messages (see `overlay_survives_moved_cache_control_marker`). Blaming the
+    // provider here would assert something the evidence does not carry, and
+    // that misreading is what sends people hunting a provider bug.
     if reason.is_none() && replay_applied.is_some() {
+        // The turn before this one diverged. That is a cause, and naming it
+        // keeps a divergence's aftershock out of the residual bucket — the
+        // whole point being that one client edit can bill twice.
+        if previous_turn_diverged {
+            return RecacheAttribution {
+                reason: Some("aftershock_of_diverged_prefix"),
+                origin: Some("previous_turn"),
+                scope: Some("replayed_prefix"),
+                counts_as_waste: true,
+            };
+        }
         return RecacheAttribution {
-            reason: Some("provider_miss_after_replay"),
-            origin: Some("provider_cache"),
+            reason: Some("unexplained_after_replay"),
+            origin: Some("unknown"),
             scope: Some("replayed_prefix"),
             counts_as_waste: true,
         };
@@ -575,7 +634,7 @@ pub enum RecacheEventKind {
     /// The proxy put the stored prefix back on the wire, but the provider did
     /// not read the expected cache footprint. This attributes the boundary,
     /// not an unproved provider-internal cause.
-    ProviderMiss,
+    Unexplained,
     /// No direct structural-drift or replay-mismatch evidence. This is an
     /// unattributed event, not evidence of a benign reset.
     Expected,
@@ -640,6 +699,27 @@ pub struct CacheHealthSnapshot {
     /// Convenience for statusline scripts: seconds since
     /// `last_event`, `null` when no event has occurred.
     pub last_event_age_seconds: Option<u64>,
+    /// Billed usage over the same window as `recent_hit_rate`. The read/write
+    /// split is what the hit rate averages; these are the totals behind it, so
+    /// a caller can price the window instead of only ranking it.
+    pub recent_cache_read_tokens: u64,
+    pub recent_cache_write_tokens: u64,
+    pub recent_forwarded_bytes: u64,
+    /// Billed fresh-equivalents per KB actually put on the wire — reads at 0.1x,
+    /// writes at 1.25x. Tokens, not dollars. `null` until a turn with a known
+    /// forwarded size lands.
+    pub recent_cost_per_forwarded_kb: Option<f64>,
+}
+
+/// One turn's billed usage, kept only long enough to average. The statusline
+/// needs the read/write split and the cost of a forwarded KB in the same window
+/// the hit rate already covers, and the log is the wrong place to ask — it would
+/// mean re-parsing megabytes on every render.
+struct CostSample {
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    forwarded_bytes: u64,
+    billed_fresh_equivalents: f64,
 }
 
 struct Inner {
@@ -647,6 +727,7 @@ struct Inner {
     /// Several streams can share one key — see [`match_stream`].
     conversations: LruCache<String, Vec<TurnRecord>>,
     recent_hit_rates: VecDeque<f64>,
+    recent_cost_samples: VecDeque<CostSample>,
     recache_events_total: u64,
     recache_wasted_tokens_total: u64,
     ttl_expiries_total: u64,
@@ -678,7 +759,7 @@ pub enum CompletionClass {
     /// A stored prefix reached the wire but the provider did not reuse its
     /// expected cache footprint. The detailed boundary cause lives in the
     /// recache event; the durable three-bucket schema retains it as unknown.
-    ProviderMissAfterReplay { wasted_tokens: u64 },
+    UnexplainedAfterReplay { wasted_tokens: u64 },
     /// A re-cache with no direct causal evidence.
     Unknown,
 }
@@ -694,7 +775,7 @@ impl CompletionClass {
             CompletionClass::PrefixChange { wasted_tokens } => {
                 ("prefix_change", wasted_tokens.min(i64::MAX as u64) as i64)
             }
-            CompletionClass::ProviderMissAfterReplay { wasted_tokens } => {
+            CompletionClass::UnexplainedAfterReplay { wasted_tokens } => {
                 ("unknown", wasted_tokens.min(i64::MAX as u64) as i64)
             }
             CompletionClass::Unknown => ("unknown", 0),
@@ -713,6 +794,7 @@ impl UsageObserver {
                     NonZeroUsize::new(CONVERSATION_CAPACITY).expect("capacity is non-zero"),
                 ),
                 recent_hit_rates: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
+                recent_cost_samples: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
                 recache_events_total: 0,
                 recache_wasted_tokens_total: 0,
                 ttl_expiries_total: 0,
@@ -833,12 +915,21 @@ impl UsageObserver {
     /// durable storage can persist it. The observer deliberately holds no
     /// reference to the savings tracker — it is a pure in-process watchdog,
     /// and its counters reset on restart — so the caller does the writing.
+    ///
+    /// `cache_write_ttl_split` is the `(5m, 1h)` breakdown of
+    /// `cache_creation_input_tokens`, when the provider published one. It rides
+    /// in the signature rather than in a `note_*` call because it is part of
+    /// the same billed `usage` block as the three counters beside it, and
+    /// pricing already reads it: a 5-minute write costs 1.25x input, a 1-hour
+    /// write 2.0x. `None` means the caller's provider has no such field, which
+    /// is not the same as a turn that wrote nothing at the 1-hour tier.
     pub fn complete(
         &self,
         request_id: &str,
         input_tokens: u64,
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
+        cache_write_ttl_split: Option<(u64, u64)>,
     ) -> Option<CompletionClass> {
         let now = SystemTime::now();
         let mut inner = self.lock();
@@ -927,6 +1018,21 @@ impl UsageObserver {
             let billed_fresh_equivalents = input_tokens as f64
                 + (cache_read_input_tokens as f64 * 0.1)
                 + (cache_creation_input_tokens as f64 * 1.25);
+            // Same window as the hit rate above, and the same reason: the
+            // statusline needs it per render and cannot afford to re-read the
+            // log. Kept here rather than beside the hit rate because the
+            // forwarded size lives on `pending`, which only exists past the
+            // gate — a turn that never reached compression has no size to
+            // divide by and would price as free.
+            if inner.recent_cost_samples.len() == RECENT_SAMPLE_CAPACITY {
+                inner.recent_cost_samples.pop_front();
+            }
+            inner.recent_cost_samples.push_back(CostSample {
+                cache_read_tokens: cache_read_input_tokens,
+                cache_write_tokens: cache_creation_input_tokens,
+                forwarded_bytes: pending.forwarded_request_bytes.unwrap_or(0),
+                billed_fresh_equivalents,
+            });
             tracing::info!(
                 event = "turn_cost_ledger",
                 request_id = %request_id,
@@ -935,6 +1041,16 @@ impl UsageObserver {
                 input_tokens = input_tokens,
                 cache_read_input_tokens = cache_read_input_tokens,
                 cache_creation_input_tokens = cache_creation_input_tokens,
+                // Which TTL the provider actually billed the write at. The
+                // proxy asks for the 1-hour tier on the prefix, but asking is
+                // not granting, and the flat creation count above cannot tell
+                // the two apart — a 1-hour write costs 2.0x input against the
+                // 5-minute tier's 1.25x, so a silently downgraded request is a
+                // price change the ledger would otherwise miss. `-1` where the
+                // provider publishes no breakdown, so "absent" stays distinct
+                // from "wrote nothing at that tier".
+                cache_write_5m_tokens = cache_write_ttl_split.map_or(-1_i64, |(m5, _)| m5 as i64),
+                cache_write_1h_tokens = cache_write_ttl_split.map_or(-1_i64, |(_, h1)| h1 as i64),
                 billed_fresh_equivalents = billed_fresh_equivalents,
                 // What the client handed us, before anything we did.
                 client_request_bytes = pending.client_request_bytes.unwrap_or(0),
@@ -948,7 +1064,13 @@ impl UsageObserver {
         // Classify against the stream this turn continues, not against
         // whatever turn happened to arrive last under the same key.
         let turn_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs);
-        let (class, expected_cache_read, idle_gap, previous_forwarded_request_bytes) = {
+        let (
+            class,
+            expected_cache_read,
+            idle_gap,
+            previous_forwarded_request_bytes,
+            previous_turn_diverged,
+        ) = {
             if inner.conversations.get(&pending.conversation_key).is_none() {
                 inner
                     .conversations
@@ -960,7 +1082,7 @@ impl UsageObserver {
                 .expect("just inserted");
             let matched = match_stream(streams, turn_msgs);
             let outcome = match matched {
-                None => (TurnClass::FirstTurn, 0, Duration::ZERO, None),
+                None => (TurnClass::FirstTurn, 0, Duration::ZERO, None, false),
                 Some(i) => {
                     let prev = streams[i];
                     (
@@ -977,6 +1099,7 @@ impl UsageObserver {
                         // provider's cache died on its own.
                         now.duration_since(prev.at).unwrap_or(Duration::ZERO),
                         prev.forwarded_request_bytes,
+                        prev.diverged,
                     )
                 }
             };
@@ -986,6 +1109,14 @@ impl UsageObserver {
                 at: now,
                 forwarded_request_bytes: pending.forwarded_request_bytes,
                 msgs: turn_msgs,
+                // Read straight off the skip evidence rather than off the
+                // attribution below, which is computed after this record is
+                // stored. Same source either way: `recache_attribution` derives
+                // `prefix_content_diverged` from this very field.
+                diverged: pending
+                    .replay_skip
+                    .as_ref()
+                    .is_some_and(|e| e.reason.as_str() == "prefix_content_diverged"),
             };
             match matched {
                 Some(i) => streams[i] = record,
@@ -1037,6 +1168,7 @@ impl UsageObserver {
                     pending.drift_dims.as_deref(),
                     pending.replay_skip,
                     pending.replay_applied,
+                    previous_turn_diverged,
                 );
                 let charged_wasted_tokens = if attribution.counts_as_waste {
                     wasted_tokens
@@ -1046,8 +1178,8 @@ impl UsageObserver {
                 inner.recache_wasted_tokens_total += charged_wasted_tokens;
                 let event_kind = if attribution.reason == Some("inbound_tail_replaced") {
                     RecacheEventKind::Branch
-                } else if attribution.reason == Some("provider_miss_after_replay") {
-                    RecacheEventKind::ProviderMiss
+                } else if attribution.reason == Some("unexplained_after_replay") {
+                    RecacheEventKind::Unexplained
                 } else if attribution.reason.is_some() {
                     RecacheEventKind::Drift
                 } else {
@@ -1067,7 +1199,7 @@ impl UsageObserver {
                         MISS_ATTRIBUTION_PROVIDER,
                         match event_kind {
                             RecacheEventKind::Drift => "prefix_change",
-                            RecacheEventKind::ProviderMiss | RecacheEventKind::Expected => {
+                            RecacheEventKind::Unexplained | RecacheEventKind::Expected => {
                                 "unknown"
                             }
                             RecacheEventKind::Branch => unreachable!("guarded above"),
@@ -1107,6 +1239,22 @@ impl UsageObserver {
                         session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
                         drift_dims = event.drift_dims.as_deref().unwrap_or(""),
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
+                        // `-1` for "not a divergence". The index says how much
+                        // of the prefix died: an edit near the opener costs far
+                        // more than one near the tail, and the message counts
+                        // separate a mid-history deletion (count steady or
+                        // falling) from ordinary appending.
+                        first_diff_index = pending
+                            .replay_skip
+                            .and_then(|e| e.first_diff_index())
+                            .map_or(-1_i64, |i| i as i64),
+                        prior_message_count = pending
+                            .replay_skip
+                            .and_then(|e| e.message_counts().0)
+                            .map_or(-1_i64, |n| n as i64),
+                        current_message_count = pending
+                            .replay_skip
+                            .map_or(-1_i64, |e| e.message_counts().1 as i64),
                         attribution_reason = event.attribution_reason.as_deref().unwrap_or(""),
                         origin = event.origin.as_deref().unwrap_or(""),
                         scope = event.scope.as_deref().unwrap_or(""),
@@ -1142,15 +1290,31 @@ impl UsageObserver {
                         cache_creation_input_tokens = cache_creation_input_tokens,
                         "prompt cache built for an inbound final-message replacement; branch creation, not waste"
                     ),
-                    RecacheEventKind::ProviderMiss => tracing::warn!(
+                    RecacheEventKind::Unexplained => tracing::warn!(
                         event = "cache_recache_observed",
                         request_id = %request_id,
                         conversation_key = %event.conversation_key,
                         session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                        attribution_reason = "provider_miss_after_replay",
-                        origin = "provider_cache",
+                        attribution_reason = "unexplained_after_replay",
+                        origin = "unknown",
                         scope = "replayed_prefix",
-                        event_kind = "provider_miss",
+                        event_kind = "unexplained",
+                        // The same structural evidence the drift arm prints.
+                        // Until this was here, "unexplained" was unexplained by
+                        // construction: attribution runs before these fields
+                        // are read, so anything reaching this arm was recorded
+                        // as causeless without ever being shown against the
+                        // evidence — 2.45M of 3.76M wasted tokens over the
+                        // 2026-08-09 logs, in a field set disjoint from the
+                        // drift arm's. Printing them changes no classification;
+                        // it lets a later query ask how many of these turns had
+                        // a structural dimension that simply went unconsulted.
+                        drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+                        replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
+                        prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
+                        prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
+                        prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
+                        prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
                         replayed_prefix = true,
                         replay_chain_id = event.replay_chain_id.unwrap_or(0),
                         breakpoints_placed = event.breakpoints_placed.unwrap_or(0),
@@ -1194,8 +1358,8 @@ impl UsageObserver {
                     // A structural bust: bytes inside the cached prefix moved,
                     // and `wasted_tokens` is what that cost.
                     RecacheEventKind::Drift => CompletionClass::PrefixChange { wasted_tokens },
-                    RecacheEventKind::ProviderMiss => {
-                        CompletionClass::ProviderMissAfterReplay { wasted_tokens }
+                    RecacheEventKind::Unexplained => {
+                        CompletionClass::UnexplainedAfterReplay { wasted_tokens }
                     }
                     // The event remains visible in cache health, but it is not
                     // a miss and therefore has no durable miss classification.
@@ -1223,6 +1387,31 @@ impl UsageObserver {
                 .as_secs()
                 .saturating_sub(e.at_unix)
         });
+        let recent_cache_read_tokens = inner
+            .recent_cost_samples
+            .iter()
+            .map(|s| s.cache_read_tokens)
+            .sum();
+        let recent_cache_write_tokens = inner
+            .recent_cost_samples
+            .iter()
+            .map(|s| s.cache_write_tokens)
+            .sum();
+        let recent_forwarded_bytes: u64 = inner
+            .recent_cost_samples
+            .iter()
+            .map(|s| s.forwarded_bytes)
+            .sum();
+        let recent_cost_per_forwarded_kb = if recent_forwarded_bytes == 0 {
+            None
+        } else {
+            let billed: f64 = inner
+                .recent_cost_samples
+                .iter()
+                .map(|s| s.billed_fresh_equivalents)
+                .sum();
+            Some(billed / (recent_forwarded_bytes as f64 / 1024.0))
+        };
         CacheHealthSnapshot {
             recent_hit_rate,
             samples: inner.recent_hit_rates.len(),
@@ -1231,6 +1420,10 @@ impl UsageObserver {
             ttl_expiries_total: inner.ttl_expiries_total,
             last_event: inner.last_event.clone(),
             last_event_age_seconds,
+            recent_cache_read_tokens,
+            recent_cache_write_tokens,
+            recent_forwarded_bytes,
+            recent_cost_per_forwarded_kb,
         }
     }
 }
@@ -1239,6 +1432,64 @@ impl UsageObserver {
 mod tests {
     use super::*;
     use crate::observability::proxy_counters::cache_miss_attribution_for_test;
+
+    // ── aftershock attribution ───────────────────────────────────────
+    fn applied_evidence() -> ReplayAppliedEvidence {
+        ReplayAppliedEvidence::new(1, 2, 0)
+    }
+
+    #[test]
+    fn a_turn_after_a_divergence_names_the_previous_turn() {
+        let a = recache_attribution(None, None, Some(applied_evidence()), true);
+        assert_eq!(a.reason, Some("aftershock_of_diverged_prefix"));
+        assert_eq!(a.origin, Some("previous_turn"));
+        assert!(a.counts_as_waste, "the rewrite is still real waste");
+    }
+
+    #[test]
+    fn without_a_previous_divergence_the_residual_stays_unexplained() {
+        let a = recache_attribution(None, None, Some(applied_evidence()), false);
+        assert_eq!(a.reason, Some("unexplained_after_replay"));
+        assert_eq!(a.origin, Some("unknown"));
+    }
+
+    #[test]
+    fn a_cause_this_turn_produced_outranks_the_aftershock_flag() {
+        // The carried flag must never mask evidence from the turn itself,
+        // or a divergence following a divergence would be filed as its own
+        // aftershock and the real cause would vanish.
+        let prior = vec![serde_json::json!({"role": "user", "content": "a"})];
+        let current = vec![
+            serde_json::json!({"role": "user", "content": "b"}),
+            serde_json::json!({"role": "assistant", "content": "c"}),
+        ];
+        let skip = ReplaySkipEvidence::from_inbound_original_histories(
+            ReplaySkip::PrefixContentDiverged {
+                first_diff_index: 0,
+            },
+            Some(&prior),
+            &current,
+        );
+        let a = recache_attribution(None, Some(skip), Some(applied_evidence()), true);
+        assert_eq!(a.reason, Some("prefix_content_diverged"));
+    }
+
+    /// A span left standing inside the replayed region is evidence in its own
+    /// right. It shared the residual bucket with `no_previous_turn` when the
+    /// reason was added, so turns that named their own boundary were counted as
+    /// unattributed.
+    #[test]
+    fn a_reminder_inside_the_prefix_is_an_attributed_cause() {
+        let current = [serde_json::json!({"role": "user", "content": "tail"})];
+        let skip = ReplaySkipEvidence::from_inbound_original_histories(
+            ReplaySkip::ReminderInsidePrefix,
+            None,
+            &current,
+        );
+        let a = recache_attribution(None, Some(skip), None, false);
+        assert_eq!(a.reason, Some("reminder_inside_prefix"));
+        assert!(a.counts_as_waste, "the rewrite is still real waste");
+    }
 
     /// The Prometheus registry is process-global, so tests that read a counter
     /// delta must not run concurrently with any other test that writes it.
@@ -1258,6 +1509,7 @@ mod tests {
             at: SystemTime::now() - age,
             forwarded_request_bytes: None,
             msgs: None,
+            diverged: false,
         }
     }
 
@@ -1325,15 +1577,15 @@ mod tests {
         let obs = UsageObserver::new();
         // Turn 1.
         obs.begin_request("req-1", "conv-a".into(), None, None, None);
-        obs.complete("req-1", 300, 0, 10_000);
+        obs.complete("req-1", 300, 0, 10_000, None);
         // Turn 2: healthy.
         obs.begin_request("req-2", "conv-a".into(), None, None, None);
-        obs.complete("req-2", 200, 10_000, 800);
+        obs.complete("req-2", 200, 10_000, 800, None);
         let snap = obs.snapshot();
         assert_eq!(snap.recache_events_total, 0);
         // Turn 3: recache, drift detector blamed tools.
         obs.begin_request("req-3", "conv-a".into(), None, Some("tools".into()), None);
-        obs.complete("req-3", 200, 0, 11_000);
+        obs.complete("req-3", 200, 0, 11_000, None);
         let snap = obs.snapshot();
         assert_eq!(snap.recache_events_total, 1);
         let ev = snap.last_event.expect("recache event recorded");
@@ -1347,6 +1599,31 @@ mod tests {
         assert_eq!(snap.samples, 3);
     }
 
+    /// These four fields were served by one binary, dropped from the tree, and
+    /// nobody noticed until the statusline segment reading them went blank.
+    /// Nothing else asserts they exist.
+    #[test]
+    fn snapshot_prices_the_recent_window() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("req-1", "conv-a".into(), None, None, None);
+        obs.note_wire_bytes("req-1", 4096, 2048, "all_messages");
+        obs.complete("req-1", 100, 10_000, 400, None);
+
+        let snap = obs.snapshot();
+        assert_eq!(snap.recent_cache_read_tokens, 10_000);
+        assert_eq!(snap.recent_cache_write_tokens, 400);
+        assert_eq!(snap.recent_forwarded_bytes, 2048);
+        // 100 + 10_000 * 0.1 + 400 * 1.25 = 1600 over 2 KB.
+        assert_eq!(snap.recent_cost_per_forwarded_kb, Some(800.0));
+
+        // A turn that never reached the gate has no forwarded size, so it must
+        // not price as free work.
+        let obs = UsageObserver::new();
+        obs.complete("never-began", 100, 10_000, 400, None);
+        assert_eq!(obs.snapshot().recent_cost_per_forwarded_kb, None);
+    }
+
     #[test]
     fn recache_without_drift_dims_is_expected_kind() {
         // Subagent close / `/clear`: cache busted upstream but the
@@ -1354,9 +1631,9 @@ mod tests {
         let _guard = miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("req-1", "conv-a".into(), None, None, None);
-        obs.complete("req-1", 300, 0, 10_000);
+        obs.complete("req-1", 300, 0, 10_000, None);
         obs.begin_request("req-2", "conv-a".into(), None, None, None);
-        obs.complete("req-2", 200, 0, 11_000);
+        obs.complete("req-2", 200, 0, 11_000, None);
         let ev = obs.snapshot().last_event.expect("event recorded");
         assert_eq!(ev.event_kind, RecacheEventKind::Expected);
     }
@@ -1366,9 +1643,9 @@ mod tests {
         let _guard = miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("req-1", "conv-a".into(), None, Some(String::new()), None);
-        obs.complete("req-1", 300, 0, 10_000);
+        obs.complete("req-1", 300, 0, 10_000, None);
         obs.begin_request("req-2", "conv-a".into(), None, Some(String::new()), None);
-        obs.complete("req-2", 200, 0, 11_000);
+        obs.complete("req-2", 200, 0, 11_000, None);
         let ev = obs.snapshot().last_event.expect("event recorded");
         assert_eq!(ev.event_kind, RecacheEventKind::Expected);
     }
@@ -1379,20 +1656,20 @@ mod tests {
         // subagent) interleave; neither must flag the other.
         let obs = UsageObserver::new();
         obs.begin_request("req-a1", "conv-a".into(), None, None, None);
-        obs.complete("req-a1", 300, 0, 50_000);
+        obs.complete("req-a1", 300, 0, 50_000, None);
         obs.begin_request("req-b1", "conv-b".into(), None, None, None);
-        obs.complete("req-b1", 300, 0, 2_000);
+        obs.complete("req-b1", 300, 0, 2_000, None);
         obs.begin_request("req-a2", "conv-a".into(), None, None, None);
-        obs.complete("req-a2", 200, 50_000, 900);
+        obs.complete("req-a2", 200, 50_000, 900, None);
         obs.begin_request("req-b2", "conv-b".into(), None, None, None);
-        obs.complete("req-b2", 200, 2_000, 400);
+        obs.complete("req-b2", 200, 2_000, 400, None);
         assert_eq!(obs.snapshot().recache_events_total, 0);
     }
 
     #[test]
     fn unknown_request_only_updates_rolling_rate() {
         let obs = UsageObserver::new();
-        obs.complete("never-began", 100, 900, 0);
+        obs.complete("never-began", 100, 900, 0, None);
         let snap = obs.snapshot();
         assert_eq!(snap.samples, 1);
         assert_eq!(snap.recache_events_total, 0);
@@ -1416,13 +1693,13 @@ mod tests {
         let k = conversation_key(&body1, "sess");
         // Turn 1: cold cache — all creation.
         obs.begin_request("r1", k.clone(), None, None, None);
-        obs.complete("r1", 10, 0, 8400);
+        obs.complete("r1", 10, 0, 8400, None);
         // Turn 2: healthy — reads what turn 1 created.
         obs.begin_request("r2", conversation_key(&body1, "sess"), None, None, None);
-        obs.complete("r2", 10, 8400, 0);
+        obs.complete("r2", 10, 8400, 0, None);
         // Turn 3: mutated system → cache busted upstream (read 0, big creation).
         obs.begin_request("r3", conversation_key(&body3, "sess"), None, None, None);
-        obs.complete("r3", 10, 0, 8410);
+        obs.complete("r3", 10, 0, 8410, None);
 
         let snap = obs.snapshot();
         assert_eq!(snap.recache_events_total, 1, "bust must be classified");
@@ -1491,7 +1768,7 @@ mod tests {
             Some("tools".into()),
             None,
         );
-        obs.complete("m-d1", 300, 0, 10_000);
+        obs.complete("m-d1", 300, 0, 10_000, None);
         obs.begin_request(
             "m-d2",
             "conv-drift".into(),
@@ -1499,7 +1776,7 @@ mod tests {
             Some("tools".into()),
             None,
         );
-        obs.complete("m-d2", 200, 0, 11_000);
+        obs.complete("m-d2", 200, 0, 11_000, None);
 
         assert_eq!(miss_count("prefix_change"), b0 + 1);
         assert_eq!(miss_count("unknown"), b1);
@@ -1515,9 +1792,9 @@ mod tests {
 
         let obs = UsageObserver::new();
         obs.begin_request("m-u1", "conv-unknown".into(), None, None, None);
-        obs.complete("m-u1", 300, 0, 10_000);
+        obs.complete("m-u1", 300, 0, 10_000, None);
         obs.begin_request("m-u2", "conv-unknown".into(), None, None, None);
-        obs.complete("m-u2", 200, 0, 11_000);
+        obs.complete("m-u2", 200, 0, 11_000, None);
 
         assert_eq!(miss_count("unknown"), b0 + 1);
         assert_eq!(miss_count("prefix_change"), b1);
@@ -1540,6 +1817,7 @@ mod tests {
                     at: SystemTime::now(),
                     forwarded_request_bytes: None,
                     msgs: None,
+                    diverged: false,
                 }],
             );
         }
@@ -1551,7 +1829,7 @@ mod tests {
             Some("tools".to_string()),
             None,
         );
-        let class = obs.complete("m-d1", 200, 0, 12_500);
+        let class = obs.complete("m-d1", 200, 0, 12_500, None);
 
         assert_eq!(
             class,
@@ -1578,11 +1856,12 @@ mod tests {
                     at: SystemTime::now() - (ANTHROPIC_CACHE_TTL + Duration::from_secs(10)),
                     forwarded_request_bytes: None,
                     msgs: None,
+                    diverged: false,
                 }],
             );
         }
         obs.begin_request("m-t9", "conv-ttl2".into(), None, None, None);
-        let class = obs.complete("m-t9", 200, 0, 12_500);
+        let class = obs.complete("m-t9", 200, 0, 12_500, None);
         assert_eq!(class, Some(CompletionClass::TtlExpiry));
         assert_eq!(class.unwrap().as_record(), ("ttl_expiry", 0));
     }
@@ -1594,7 +1873,7 @@ mod tests {
         let _guard = miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("m-h1", "conv-healthy".into(), None, None, None);
-        assert_eq!(obs.complete("m-h1", 200, 10_000, 0), None);
+        assert_eq!(obs.complete("m-h1", 200, 10_000, 0, None), None);
     }
 
     /// An idle gap past the TTL is a real miss, bucketed `ttl_expiry`.
@@ -1616,11 +1895,12 @@ mod tests {
                     at: SystemTime::now() - (ANTHROPIC_CACHE_TTL + Duration::from_secs(10)),
                     forwarded_request_bytes: None,
                     msgs: None,
+                    diverged: false,
                 }],
             );
         }
         obs.begin_request("m-t1", "conv-ttl".into(), None, None, None);
-        obs.complete("m-t1", 200, 0, 12_500);
+        obs.complete("m-t1", 200, 0, 12_500, None);
 
         assert_eq!(obs.snapshot().ttl_expiries_total, 1);
         assert_eq!(miss_count("ttl_expiry"), b0 + 1);
@@ -1646,7 +1926,7 @@ mod tests {
             Some("tools".into()),
             None,
         );
-        obs.complete("m-h1", 300, 0, 10_000);
+        obs.complete("m-h1", 300, 0, 10_000, None);
         // Healthy: reads back everything turn 1 wrote.
         obs.begin_request(
             "m-h2",
@@ -1655,7 +1935,7 @@ mod tests {
             Some("tools".into()),
             None,
         );
-        obs.complete("m-h2", 200, 10_000, 800);
+        obs.complete("m-h2", 200, 10_000, 800, None);
 
         assert_eq!(
             [
@@ -1835,7 +2115,7 @@ mod prefix_on_recache_event_tests {
                 Some("tools".into()),
                 Some(fp.clone()),
             );
-            obs.complete("r1", 300, 0, 10_000);
+            obs.complete("r1", 300, 0, 10_000, None);
             // Turn 2 reads back almost nothing while re-writing: a recache.
             obs.begin_request(
                 "r2",
@@ -1844,7 +2124,7 @@ mod prefix_on_recache_event_tests {
                 Some("tools".into()),
                 Some(fp.clone()),
             );
-            obs.complete("r2", 200, 0, 11_000);
+            obs.complete("r2", 200, 0, 11_000, None);
         });
 
         let joined = cap.lock().unwrap().fields.join("\n");
@@ -1892,7 +2172,7 @@ mod prefix_on_recache_event_tests {
             obs.note_compression("p1", 3_673, 2_176);
             // Live zone (2176) exceeds cache_creation + input (1015), so the
             // compressed span reaches into the cached prefix: the cheap case.
-            obs.complete("p1", 2, 480_000, 1_013);
+            obs.complete("p1", 2, 480_000, 1_013, None);
         });
         let joined = cap.lock().unwrap().fields.join("\n");
         let line = joined
@@ -1919,7 +2199,7 @@ mod prefix_on_recache_event_tests {
             obs.begin_request("p2", "conv-price2".into(), None, None, None);
             obs.note_compression("p2", 5_000, 900);
             // Live zone (900) fits inside cache_creation + input (4002).
-            obs.complete("p2", 2, 10_000, 4_000);
+            obs.complete("p2", 2, 10_000, 4_000, None);
         });
         let joined = cap.lock().unwrap().fields.join("\n");
         let line = joined
@@ -1943,7 +2223,7 @@ mod prefix_on_recache_event_tests {
             obs.note_wire_bytes("g1", 100_000, 90_000, "all_messages");
             // The compressor claims a huge saving; the ledger must ignore it.
             obs.note_compression("g1", 999_999, 1);
-            obs.complete("g1", 10, 200_000, 4_000);
+            obs.complete("g1", 10, 200_000, 4_000, None);
         });
         let joined = cap.lock().unwrap().fields.join("\n");
         let line = joined
@@ -1971,13 +2251,144 @@ mod prefix_on_recache_event_tests {
         tracing::subscriber::with_default(sub, || {
             let obs = UsageObserver::new();
             obs.begin_request("g2", "conv-ledger2".into(), None, None, None);
-            obs.complete("g2", 5, 1_000, 0);
+            obs.complete("g2", 5, 1_000, 0, None);
         });
         let joined = cap.lock().unwrap().fields.join("\n");
         assert!(
             joined.contains("turn_cost_ledger"),
             "the ledger must not be conditional on a saving: {joined}"
         );
+    }
+
+    /// The proxy asks for the 1-hour cache tier, and asking is not granting.
+    /// The flat creation count cannot tell a granted 1-hour write (2.0x input)
+    /// from a downgraded 5-minute one (1.25x), so the split has to reach the
+    /// log or the question stays unanswerable from the books.
+    #[test]
+    fn the_cost_ledger_names_the_ttl_the_write_was_billed_at() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+        tracing::subscriber::with_default(sub, || {
+            let obs = UsageObserver::new();
+            obs.begin_request("g3", "conv-ttl".into(), None, None, None);
+            obs.complete("g3", 10, 0, 4_000, Some((1_000, 3_000)));
+        });
+        let joined = cap.lock().unwrap().fields.join("\n");
+        let line = joined
+            .lines()
+            .find(|l| l.contains("turn_cost_ledger"))
+            .unwrap_or_else(|| panic!("no ledger event; captured:\n{joined}"));
+        assert!(line.contains("cache_write_5m_tokens=1000"), "{line}");
+        assert!(line.contains("cache_write_1h_tokens=3000"), "{line}");
+    }
+
+    /// A provider that publishes no breakdown must not read as one that wrote
+    /// nothing at either tier — a zero here would be counted, and the count
+    /// would be wrong.
+    #[test]
+    fn a_provider_without_a_ttl_breakdown_prints_minus_one_not_zero() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+        tracing::subscriber::with_default(sub, || {
+            let obs = UsageObserver::new();
+            obs.begin_request("g4", "conv-ttl-none".into(), None, None, None);
+            obs.complete("g4", 10, 0, 4_000, None);
+        });
+        let joined = cap.lock().unwrap().fields.join("\n");
+        let line = joined
+            .lines()
+            .find(|l| l.contains("turn_cost_ledger"))
+            .unwrap_or_else(|| panic!("no ledger event; captured:\n{joined}"));
+        assert!(line.contains("cache_write_5m_tokens=-1"), "{line}");
+        assert!(line.contains("cache_write_1h_tokens=-1"), "{line}");
+    }
+
+    /// `unexplained_after_replay` carried a field set disjoint from the drift
+    /// arm's, so the largest waste bucket was unexplained by construction:
+    /// nothing on the line could be tested against, whatever the turn actually
+    /// looked like. The evidence is already parked when this arm runs, so it
+    /// must print it too.
+    #[test]
+    fn an_unexplained_event_carries_the_structural_evidence_the_drift_arm_prints() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+
+        let fp = PrefixFingerprint {
+            head: "hhhhhhhhhhhhhhhh".into(),
+            body: "dddddddddddddddd".into(),
+            stable: "ssssssssssssssss".into(),
+            stable_msgs: 17,
+        };
+
+        tracing::subscriber::with_default(sub, || {
+            let obs = UsageObserver::new();
+            obs.begin_request("x1", "conv-unexplained".into(), None, None, Some(fp.clone()));
+            obs.complete("x1", 10_000, 46_985, 55_557, None);
+            // A confirmed replay with no named cause is what lands on this arm.
+            obs.begin_request("x2", "conv-unexplained".into(), None, None, Some(fp.clone()));
+            obs.note_replay_applied("x2", ReplayAppliedEvidence::new(2, 2, 0));
+            let class = obs.complete("x2", 9_714, 46_985, 48_669, None);
+            assert_eq!(
+                class,
+                Some(CompletionClass::UnexplainedAfterReplay {
+                    wasted_tokens: 48_669
+                }),
+                "the added fields must not move the classification"
+            );
+        });
+        let joined = cap.lock().unwrap().fields.join("\n");
+        let line = joined
+            .lines()
+            .filter(|l| l.contains("cache_recache_observed"))
+            .find(|l| l.contains("attribution_reason=unexplained_after_replay"))
+            .unwrap_or_else(|| panic!("no unexplained event; captured:\n{joined}"));
+
+        assert!(line.contains("prefix_head=hhhhhhhhhhhhhhhh"), "{line}");
+        assert!(line.contains("prefix_body=dddddddddddddddd"), "{line}");
+        assert!(line.contains("prefix_stable=ssssssssssssssss"), "{line}");
+        assert!(line.contains("prefix_stable_msgs=17"), "{line}");
+        // Present-but-empty is the answer for a turn with neither, and a query
+        // can only read that off a field that is always printed.
+        assert!(line.contains("drift_dims="), "{line}");
+        assert!(line.contains("replay_skipped="), "{line}");
+    }
+
+    /// The point of the fields above is that they can be non-empty here. A
+    /// replay skip whose reason is not causal (`no_previous_turn` and friends)
+    /// attributes nothing, so the turn still lands on the unexplained arm —
+    /// and that reason is exactly the evidence the arm used to drop.
+    #[test]
+    fn an_unexplained_event_names_a_replay_skip_that_attributed_nothing() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+
+        tracing::subscriber::with_default(sub, || {
+            let obs = UsageObserver::new();
+            obs.begin_request("y1", "conv-unexplained-skip".into(), None, None, None);
+            obs.complete("y1", 10_000, 46_985, 55_557, None);
+            obs.begin_request("y2", "conv-unexplained-skip".into(), None, None, None);
+            obs.note_replay_skip(
+                "y2",
+                ReplaySkipEvidence::from_inbound_original_histories(
+                    ReplaySkip::NoPreviousTurn,
+                    None,
+                    &[serde_json::json!({"role":"user","content":"hi"})],
+                ),
+            );
+            obs.note_replay_applied("y2", ReplayAppliedEvidence::new(3, 2, 0));
+            obs.complete("y2", 9_714, 46_985, 48_669, None);
+        });
+        let joined = cap.lock().unwrap().fields.join("\n");
+        let line = joined
+            .lines()
+            .filter(|l| l.contains("cache_recache_observed"))
+            .find(|l| l.contains("attribution_reason=unexplained_after_replay"))
+            .unwrap_or_else(|| panic!("no unexplained event; captured:\n{joined}"));
+        assert!(line.contains("replay_skipped=no_previous_turn"), "{line}");
     }
 
     /// A turn parked without a fingerprint must not print a stale or invented
@@ -1992,9 +2403,9 @@ mod prefix_on_recache_event_tests {
         tracing::subscriber::with_default(sub, || {
             let obs = UsageObserver::new();
             obs.begin_request("r1", "conv-y".into(), None, Some("tools".into()), None);
-            obs.complete("r1", 300, 0, 10_000);
+            obs.complete("r1", 300, 0, 10_000, None);
             obs.begin_request("r2", "conv-y".into(), None, Some("tools".into()), None);
-            obs.complete("r2", 200, 0, 11_000);
+            obs.complete("r2", 200, 0, 11_000, None);
         });
         let joined = cap.lock().unwrap().fields.join("\n");
         let line = joined
@@ -2043,6 +2454,7 @@ mod stream_matching_tests {
             at: SystemTime::now(),
             forwarded_request_bytes: None,
             msgs,
+            diverged: false,
         }
     }
 
@@ -2138,7 +2550,7 @@ mod stream_matching_tests {
             Some("system".into()),
             Some(fp(40)),
         );
-        obs.complete("e1", 300, 0, 50_000);
+        obs.complete("e1", 300, 0, 50_000, None);
         // Same conversation, same length — one early message was rewritten.
         obs.begin_request(
             "e2",
@@ -2147,7 +2559,7 @@ mod stream_matching_tests {
             Some("system".into()),
             Some(fp(40)),
         );
-        let class = obs.complete("e2", 300, 0, 50_000);
+        let class = obs.complete("e2", 300, 0, 50_000, None);
         assert!(
             matches!(class, Some(CompletionClass::PrefixChange { .. })),
             "an in-place prefix edit must still be a bust, got {class:?}"
@@ -2164,12 +2576,12 @@ mod stream_matching_tests {
         let obs = UsageObserver::new();
         // Stream A opens small, stream B opens five times larger.
         obs.begin_request("a1", "conv-mix".into(), None, None, Some(fp(17)));
-        obs.complete("a1", 200, 0, 10_000);
+        obs.complete("a1", 200, 0, 10_000, None);
         obs.begin_request("b1", "conv-mix".into(), None, None, Some(fp(16)));
-        obs.complete("b1", 200, 0, 50_000);
+        obs.complete("b1", 200, 0, 50_000, None);
         // A's next turn reads back exactly A's prefix and writes a small tail.
         obs.begin_request("a2", "conv-mix".into(), None, None, Some(fp(35)));
-        let class = obs.complete("a2", 200, 10_000, 500);
+        let class = obs.complete("a2", 200, 10_000, 500, None);
         assert_eq!(
             class, None,
             "A continued A healthily; charging it against B's 50K prefix is item 11's artefact"
@@ -2184,7 +2596,7 @@ mod stream_matching_tests {
         let _guard = super::tests::miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("t1", "conv-tail".into(), None, None, Some(fp(3)));
-        obs.complete("t1", 200, 0, 50_000);
+        obs.complete("t1", 200, 0, 50_000, None);
 
         let prior = [
             serde_json::json!({"role":"user","content":"open"}),
@@ -2208,7 +2620,7 @@ mod stream_matching_tests {
             ),
         );
 
-        let class = obs.complete("t2", 200, 0, 50_000);
+        let class = obs.complete("t2", 200, 0, 50_000, None);
         assert_eq!(class, None, "a branch cache build is not a cache miss");
 
         let snap = obs.snapshot();
@@ -2268,7 +2680,7 @@ mod stream_matching_tests {
         let _guard = super::tests::miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("s1", "conv-skip".into(), None, None, Some(fp(40)));
-        obs.complete("s1", 200, 0, 50_000);
+        obs.complete("s1", 200, 0, 50_000, None);
         // No drift dims: the detector saw nothing in system/tools/first-3.
         obs.begin_request("s2", "conv-skip".into(), None, None, Some(fp(41)));
         // But the prefix could not be replayed, which explains the bust.
@@ -2292,7 +2704,7 @@ mod stream_matching_tests {
                 &current,
             ),
         );
-        let class = obs.complete("s2", 200, 0, 50_000);
+        let class = obs.complete("s2", 200, 0, 50_000, None);
         assert!(
             matches!(class, Some(CompletionClass::PrefixChange { .. })),
             "a declined replay is a named cause, not an unattributable reset; got {class:?}"
@@ -2314,7 +2726,7 @@ mod stream_matching_tests {
             let obs = UsageObserver::new();
             let conversation = format!("conv-non-causal-{i}");
             obs.begin_request("n1", conversation.clone(), None, None, Some(fp(40)));
-            obs.complete("n1", 200, 0, 50_000);
+            obs.complete("n1", 200, 0, 50_000, None);
             obs.begin_request("n2", conversation, None, None, Some(fp(41)));
             let current = [serde_json::json!({"role":"user","content":"tail"})];
             obs.note_replay_skip(
@@ -2323,7 +2735,7 @@ mod stream_matching_tests {
             );
 
             assert_eq!(
-                obs.complete("n2", 200, 0, 50_000),
+                obs.complete("n2", 200, 0, 50_000, None),
                 Some(CompletionClass::Unknown)
             );
             let event = obs.snapshot().last_event.expect("event recorded");
@@ -2344,9 +2756,9 @@ mod stream_matching_tests {
         let _guard = super::tests::miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("u1", "conv-nocause".into(), None, None, Some(fp(40)));
-        obs.complete("u1", 200, 0, 50_000);
+        obs.complete("u1", 200, 0, 50_000, None);
         obs.begin_request("u2", "conv-nocause".into(), None, None, Some(fp(41)));
-        let class = obs.complete("u2", 200, 0, 50_000);
+        let class = obs.complete("u2", 200, 0, 50_000, None);
         assert_eq!(class, Some(CompletionClass::Unknown));
     }
 
@@ -2356,26 +2768,26 @@ mod stream_matching_tests {
         let obs = UsageObserver::new();
         obs.begin_request("p1", "conv-provider".into(), None, None, Some(fp(20)));
         obs.note_wire_bytes("p1", 158_474, 147_638, "all_messages");
-        obs.complete("p1", 10_000, 46_985, 55_557);
+        obs.complete("p1", 10_000, 46_985, 55_557, None);
 
         obs.begin_request("p2", "conv-provider".into(), None, None, Some(fp(22)));
         obs.note_wire_bytes("p2", 167_578, 130_528, "all_messages");
         obs.note_replay_applied("p2", ReplayAppliedEvidence::new(2, 2, 0));
-        let class = obs.complete("p2", 9_714, 46_985, 48_669);
+        let class = obs.complete("p2", 9_714, 46_985, 48_669, None);
 
         assert_eq!(
             class,
-            Some(CompletionClass::ProviderMissAfterReplay {
+            Some(CompletionClass::UnexplainedAfterReplay {
                 wasted_tokens: 48_669
             })
         );
         let event = obs.snapshot().last_event.expect("provider miss recorded");
-        assert_eq!(event.event_kind, RecacheEventKind::ProviderMiss);
+        assert_eq!(event.event_kind, RecacheEventKind::Unexplained);
         assert_eq!(
             event.attribution_reason.as_deref(),
-            Some("provider_miss_after_replay")
+            Some("unexplained_after_replay")
         );
-        assert_eq!(event.origin.as_deref(), Some("provider_cache"));
+        assert_eq!(event.origin.as_deref(), Some("unknown"));
         assert_eq!(event.scope.as_deref(), Some("replayed_prefix"));
         assert!(event.replayed_prefix);
         assert_eq!(event.replay_chain_id, Some(2));
@@ -2400,7 +2812,7 @@ mod stream_matching_tests {
                 &current,
             ),
         );
-        assert_eq!(obs.complete("never-parked", 1, 0, 0), None);
+        assert_eq!(obs.complete("never-parked", 1, 0, 0, None), None);
     }
 
     /// Memory bound: a key that keeps spawning streams must not grow forever.
@@ -2413,7 +2825,7 @@ mod stream_matching_tests {
         for i in 0..(MAX_STREAMS_PER_CONVERSATION + 4) {
             let msgs = 500 - i * 10;
             obs.begin_request("c", "conv-cap".into(), None, None, Some(fp(msgs)));
-            obs.complete("c", 100, 0, 1_000);
+            obs.complete("c", 100, 0, 1_000, None);
         }
         let inner = obs.lock();
         let streams = inner.conversations.peek("conv-cap").expect("key tracked");

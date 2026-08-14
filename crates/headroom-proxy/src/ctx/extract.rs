@@ -421,11 +421,7 @@ fn extract_cd_target(cmd: &str) -> Option<String> {
             let quoted = arg.len() >= 2
                 && ((arg.starts_with('"') && arg.ends_with('"'))
                     || (arg.starts_with('\'') && arg.ends_with('\'')));
-            let dir = if quoted {
-                &arg[1..arg.len() - 1]
-            } else {
-                arg
-            };
+            let dir = if quoted { &arg[1..arg.len() - 1] } else { arg };
             if !dir.is_empty() && !dir.starts_with('-') {
                 return Some(dir.to_string());
             }

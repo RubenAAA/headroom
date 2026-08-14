@@ -229,7 +229,7 @@ impl CtxStore {
     /// endpoint.
     pub fn purge_all(&self) -> rusqlite::Result<usize> {
         let conn = self.conn();
-        let chunks_deleted: usize = conn.execute("DELETE FROM chunks", []).unwrap_or(0);
+        let chunks_deleted: usize = conn.execute("DELETE FROM chunks", [])?;
         conn.execute("DELETE FROM chunks_trigram", [])?;
         conn.execute("DELETE FROM sources", [])?;
         conn.execute("DELETE FROM vocabulary", [])?;
@@ -1607,14 +1607,27 @@ pub fn content_db_path(base: &Path, project_dir: &str) -> PathBuf {
         .join(format!("{}.db", hash_project_dir_canonical(project_dir)))
 }
 
-/// Default base dir: `~/.claude-personal/context-mode`. Returns `None` if
-/// `$HOME` is unset (we never guess a home path).
+/// Default base dir: `<workspace>/ctx`, i.e. `~/.headroom/ctx` unless
+/// `$HEADROOM_WORKSPACE_DIR` moves the workspace. Returns `None` if `$HOME` is
+/// unset and no workspace override is set (we never guess a home path).
+///
+/// This store was ported from the context-mode plugin and initially kept that
+/// tool's directory (`~/.claude-personal/context-mode`), which put headroom's
+/// sessions DB inside an unrelated tool's state — invisible where an operator
+/// looks for it, and mixed in with that tool's own `sessions/` and `content/`
+/// shards. Everything headroom writes belongs under the workspace root defined
+/// in `crate::paths`.
+///
+/// Existing deployments: the old location is not migrated, so a proxy upgraded
+/// in place starts a fresh store. That loses recall history and the injection
+/// decisions keyed to it, which is safe (a missing injection row for a
+/// conversation with no prefix history is a first sight, and re-decides) but
+/// not free — point `--ctx-store-dir` at the old path to keep it.
 pub fn default_base_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".claude-personal")
-            .join("context-mode")
-    })
+    if crate::paths::env_workspace_dir_is_set() || std::env::var_os("HOME").is_some() {
+        return Some(crate::paths::workspace_dir().join("ctx"));
+    }
+    None
 }
 
 /// Test-only hook exposing the private markdown chunker as

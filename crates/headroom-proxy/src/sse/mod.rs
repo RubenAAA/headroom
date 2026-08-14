@@ -33,6 +33,7 @@
 //!   subsequent chunks.
 
 pub mod anthropic;
+pub mod ccr_stream;
 pub mod framing;
 pub mod openai_chat;
 pub mod openai_responses;

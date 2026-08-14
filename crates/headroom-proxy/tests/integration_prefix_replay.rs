@@ -100,10 +100,9 @@ fn turn1_body(big: &Value) -> Value {
 }
 
 /// Turn 2 append-only-extends turn 1. The appended messages use STRING
-/// content on purpose: they carry no `cache_control`-capable blocks, so
-/// the normalizer's single ephemeral breakpoint stays on the big
-/// message's last block — exactly where turn 1 forwarded it — and the
-/// replayed prefix can be asserted with strict equality.
+/// content on purpose: prefix replay makes them eligible breakpoint targets,
+/// so this also exercises moving the marker past the previously cached
+/// message without changing that message's provider cache key.
 fn turn2_body(big: &Value) -> Value {
     json!({
         "model": "claude-sonnet-4-6",
@@ -123,6 +122,25 @@ fn messages_of(body: &[u8]) -> Vec<Value> {
         .and_then(|m| m.as_array())
         .expect("messages array present")
         .clone()
+}
+
+/// The provider's prefix key ignores the cache directive itself. Keep every
+/// other byte-level distinction, especially string content versus the
+/// equivalent one-element text-block form: that is the stability property the
+/// bare-string breakpoint path must preserve across turns.
+fn without_cache_control(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "cache_control")
+                .map(|(key, value)| (key.clone(), without_cache_control(value)))
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(without_cache_control).collect())
+        }
+        _ => value.clone(),
+    }
 }
 
 /// Extract the `tool_result.content` string of a message's first block.
@@ -150,7 +168,7 @@ async fn post_turn(client: &reqwest::Client, proxy_url: &str, body: &Value) {
 }
 
 #[tokio::test]
-async fn replay_forwards_previous_compressed_prefix_byte_identical() {
+async fn replay_preserves_previous_compressed_provider_prefix() {
     let upstream = MockServer::start().await;
     let captured = mount_anthropic_sse_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
@@ -186,30 +204,44 @@ async fn replay_forwards_previous_compressed_prefix_byte_identical() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         post_turn(&client, &proxy.url(), &turn2).await;
         let got = messages_of(captured.lock().unwrap().last().unwrap());
-        if got[0] == fwd1[0] {
+        if without_cache_control(&got[0]) == without_cache_control(&fwd1[0]) {
             fwd2 = Some(got);
             break;
         }
     }
     let fwd2 = fwd2.expect(
         "turn 2 never replayed the previously-forwarded prefix: message 0 \
-         should be byte-identical to what turn 1 forwarded (compressed), \
-         not the original client bytes",
+         should preserve the provider key from turn 1 (compressed), not the \
+         original client bytes",
     );
 
-    // The replayed prefix is the turn-1 forwarded bytes — including the
-    // compressed payload, NOT the client's original.
-    assert_eq!(fwd2[0], fwd1[0], "frozen prefix must replay byte-identical");
+    // The replayed prefix is the turn-1 forwarded provider key — including the
+    // compressed payload, NOT the client's original. The cache directive may
+    // move to a newer message and is not itself part of that key.
+    assert_eq!(
+        without_cache_control(&fwd2[0]),
+        without_cache_control(&fwd1[0]),
+        "frozen prefix must preserve its provider cache key"
+    );
     assert_ne!(
         tool_result_content(&fwd2[0]),
         original_payload,
         "turn 2 forwarded the ORIGINAL big payload — the replay overlay \
          did not run and the prompt cache would bust (prefix_change)"
     );
-    // The appended suffix is this turn's fresh content, untouched.
+    // The appended suffix is this turn's fresh content. Every eligible string
+    // is wrapped to block form so its shape cannot change when the marker
+    // moves on; the available tail slot lands on the newest one.
     assert_eq!(fwd2.len(), 3);
-    assert_eq!(fwd2[1]["content"], json!("done."));
-    assert_eq!(fwd2[2]["content"], json!("next step please"));
+    assert_eq!(fwd2[1]["content"], json!([{"type": "text", "text": "done."}]));
+    assert_eq!(
+        fwd2[2]["content"],
+        json!([{
+            "type": "text",
+            "text": "next step please",
+            "cache_control": {"type": "ephemeral"},
+        }])
+    );
 
     proxy.shutdown().await;
 }

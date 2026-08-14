@@ -39,6 +39,7 @@
 //! revisit if multi-process aggregation lands.
 
 pub mod cache_hit_rate;
+pub mod ccr_splice;
 pub mod compression_ratio;
 pub mod ctx_metrics;
 pub mod metric_names;
@@ -46,6 +47,9 @@ pub mod prometheus;
 pub mod proxy_counters;
 pub mod proxy_metrics;
 pub mod recache;
+pub mod relocation;
+pub mod replay_alternates;
+pub mod upstream_health;
 
 pub use prometheus::{
     handle_metrics, observe_bedrock_invoke_latency, record_bedrock_eventstream_message,
@@ -63,11 +67,13 @@ pub use cache_hit_rate::{
 };
 pub use compression_ratio::{
     observe_ratio as observe_compression_ratio,
+    record_declined_no_shrink as record_compression_declined_no_shrink,
     record_rejected_by_token_check as record_compression_rejected_by_token_check,
 };
 pub use proxy_metrics::{
     extract_rate_limit_snapshot, extract_unified_rate_limit, record_passthrough_bytes_modified,
     record_rate_limit_snapshot, record_response_status, record_service_tier,
-    record_unified_rate_limit, RateLimitSnapshot, UnifiedRateLimitSnapshot, UnifiedWindow,
+    record_stream_incomplete, record_unified_rate_limit, record_upstream_retry, retry_reason,
+    RateLimitSnapshot, UnifiedRateLimitSnapshot, UnifiedWindow,
 };
 pub use recache::observe_recache_event;

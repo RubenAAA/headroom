@@ -95,7 +95,16 @@ impl InMemoryCcrStore {
             };
             // `remove` is a no-op if `oldest` was already lazy-expired.
             // Loop continues until we actually shrink the map.
-            self.map.remove(&oldest);
+            let was_present = self.map.remove(&oldest).is_some();
+            if was_present {
+                tracing::info!(
+                    event = "ccr_in_memory_capacity_eviction",
+                    hash = %oldest,
+                    capacity = self.capacity,
+                    remaining = self.map.len(),
+                    "in-memory CCR store evicted an entry at capacity"
+                );
+            }
         }
     }
 }

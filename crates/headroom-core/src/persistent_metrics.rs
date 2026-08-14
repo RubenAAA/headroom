@@ -41,8 +41,14 @@ pub const MAX_LABEL_LENGTH: usize = 128;
 /// Cache-miss reasons that keep their own bucket; anything else is `unknown`.
 pub const KNOWN_MISS_REASONS: [&str; 3] = ["ttl_expiry", "prefix_change", "unknown"];
 
-/// Waste signals that keep their own bucket.
-pub const KNOWN_WASTE_SIGNALS: [&str; 8] = [
+/// Waste signals that keep their own bucket; anything else is `other`.
+///
+/// `other` is itself in the list because it is the recording fallback, and a
+/// bucket the recorder can produce but the loader does not recognise gets
+/// folded into `unknown` on the way back in. Leaving it out migrated the whole
+/// `other` bucket into `unknown` on every restart, so `unknown` grew without
+/// any request ever having been classified that way.
+pub const KNOWN_WASTE_SIGNALS: [&str; 9] = [
     "json_noise",
     "html_noise",
     "base64",
@@ -51,6 +57,7 @@ pub const KNOWN_WASTE_SIGNALS: [&str; 8] = [
     "repetition",
     "reread",
     "reread_compressed",
+    "other",
 ];
 
 /// The current UTC time without sub-second noise in persisted state.
@@ -458,6 +465,46 @@ pub struct ProxyOverheadState {
     pub measured_requests: i64,
 }
 
+/// Whole-body wire bytes against what the provider then billed.
+///
+/// Every other counter here measures the proxy against itself: tokens freed by
+/// a transform, bytes moved on the `tools`+`system` axis. None of them can say
+/// whether the provider actually saw less, because the provider's own `usage`
+/// block is the only authority on that and it is denominated in tokens, not
+/// bytes.
+///
+/// This pairs the two on the same requests: the body as received from the
+/// client, the body actually put on the wire, and the input tokens Anthropic
+/// reported for it. `bytes_out < bytes_in` says the proxy shrank the request;
+/// the token columns say what that was worth once the provider's cache had its
+/// say. Read apart, either half flatters.
+///
+/// Only requests carrying a provider `usage` block are counted, so a stream
+/// that died before its usage arrived leaves the pair untouched rather than
+/// booking a byte count against absent tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WireFootprintState {
+    /// Body bytes as received from the client, before any transform.
+    pub bytes_in: i64,
+    /// Body bytes as sent upstream, after every transform.
+    pub bytes_out: i64,
+    /// Provider-reported non-cached input tokens for those same requests.
+    pub provider_input_tokens: i64,
+    /// Provider-reported cache reads for those same requests.
+    pub provider_cache_read_tokens: i64,
+    /// Provider-reported cache creations for those same requests.
+    pub provider_cache_write_tokens: i64,
+    /// Requests both halves were recorded on.
+    pub measured_requests: i64,
+    /// Turns dropped from the cost and savings books because their stream
+    /// ended before the terminal event that carries the usage totals.
+    ///
+    /// Counted here as well as in Prometheus because the Prometheus counter
+    /// resets on restart while the books it qualifies do not: a lifetime
+    /// savings figure needs a lifetime count of what it is missing.
+    pub unbooked_turns: i64,
+}
+
 /// Per-tool definition size and call count.
 ///
 /// Tool schemas are the single largest segment of an agentic request, and a
@@ -555,6 +602,9 @@ pub struct MetricsSnapshotState {
     /// Tool definition sizes and call counts. Rust-only; see above.
     #[serde(skip)]
     pub tool_inventory: ToolInventoryState,
+    /// Wire bytes against provider-reported usage. Rust-only; see above.
+    #[serde(skip)]
+    pub wire_footprint: WireFootprintState,
     /// Per-model totals.
     pub models: ModelsState,
     /// Save metadata.
@@ -693,6 +743,7 @@ impl PersistentMetricsState {
         serde_json::json!({
             "proxy_overhead": to_value(&self.state.proxy_overhead),
             "tool_inventory": to_value(&self.state.tool_inventory),
+            "wire_footprint": to_value(&self.state.wire_footprint),
         })
     }
 
@@ -706,6 +757,16 @@ impl PersistentMetricsState {
             added_bytes: coerce_int(get(raw_overhead, "added_bytes")),
             removed_bytes: coerce_int(get(raw_overhead, "removed_bytes")),
             measured_requests: coerce_int(get(raw_overhead, "measured_requests")),
+        };
+        let raw_wire = dict_or_empty(get(raw, "wire_footprint"));
+        self.state.wire_footprint = WireFootprintState {
+            bytes_in: coerce_int(get(raw_wire, "bytes_in")),
+            bytes_out: coerce_int(get(raw_wire, "bytes_out")),
+            provider_input_tokens: coerce_int(get(raw_wire, "provider_input_tokens")),
+            provider_cache_read_tokens: coerce_int(get(raw_wire, "provider_cache_read_tokens")),
+            provider_cache_write_tokens: coerce_int(get(raw_wire, "provider_cache_write_tokens")),
+            measured_requests: coerce_int(get(raw_wire, "measured_requests")),
+            unbooked_turns: coerce_int(get(raw_wire, "unbooked_turns")),
         };
         let raw_tools = dict_or_empty(get(raw, "tool_inventory"));
         self.state.tool_inventory = ToolInventoryState {
@@ -728,6 +789,33 @@ impl PersistentMetricsState {
             self.state.proxy_overhead.removed_bytes += -delta;
         }
         self.state.proxy_overhead.measured_requests += 1;
+    }
+
+    /// Record one request's wire bytes alongside the usage the provider
+    /// reported for it. Call once per completed request that carried a `usage`
+    /// block; a request without one is skipped by the caller so the byte and
+    /// token halves always cover the same set.
+    pub fn record_wire_footprint(
+        &mut self,
+        bytes_in: i64,
+        bytes_out: i64,
+        input_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) {
+        let wire = &mut self.state.wire_footprint;
+        wire.bytes_in += bytes_in.max(0);
+        wire.bytes_out += bytes_out.max(0);
+        wire.provider_input_tokens += input_tokens.max(0);
+        wire.provider_cache_read_tokens += cache_read_tokens.max(0);
+        wire.provider_cache_write_tokens += cache_write_tokens.max(0);
+        wire.measured_requests += 1;
+    }
+
+    /// Record one turn the books had to drop because its stream ended without
+    /// the terminal event carrying the usage totals.
+    pub fn record_unbooked_turn(&mut self) {
+        self.state.wire_footprint.unbooked_turns += 1;
     }
 
     /// Record the tool definitions a request carried and the calls the model
@@ -789,6 +877,16 @@ impl PersistentMetricsState {
 
     /// What the proxy added, alongside what it saved, so the two can be read
     /// against each other.
+    ///
+    /// `measured_requests` counts a narrower population than
+    /// `lifetime_metrics.requests.total`, and the two are not comparable: this
+    /// one is incremented on the buffered Anthropic path only, and only when
+    /// the prefix head size actually moved. It also persists in
+    /// `lifetime_footprint`, which survives the schema migrations that rebuild
+    /// `lifetime_metrics`, so it can legitimately exceed the request total.
+    /// `scope` says so in the payload, because three counters that look alike
+    /// and count different things get averaged together by whoever reads them
+    /// next.
     pub fn proxy_overhead_report(&self) -> Value {
         let overhead = &self.state.proxy_overhead;
         let net = overhead.added_bytes - overhead.removed_bytes;
@@ -797,6 +895,9 @@ impl PersistentMetricsState {
             "removed_bytes": overhead.removed_bytes,
             "net_bytes": net,
             "measured_requests": overhead.measured_requests,
+            "scope": "buffered anthropic requests whose prefix head size changed; \
+                      persisted in lifetime_footprint, not comparable to \
+                      lifetime_metrics.requests.total",
             "net_bytes_per_request": if overhead.measured_requests > 0 {
                 net / overhead.measured_requests
             } else {
@@ -840,6 +941,11 @@ impl PersistentMetricsState {
             "cache_write_tokens": pc.cache_write_tokens,
             "uncached_input_tokens": pc.uncached_input_tokens,
             "attempted_input_tokens": self.state.tokens.attempted_input,
+            // Turns these totals are missing. A verdict computed from a book
+            // with holes in it should say how many holes, next to the number,
+            // rather than leave it to a Prometheus counter that resets on
+            // restart.
+            "unbooked_turns": self.state.wire_footprint.unbooked_turns,
             // Free on a subscription, so a high read count against a low write
             // count is the shape you want.
             "verdict": if saved == 0 && busted == 0 {
@@ -851,6 +957,51 @@ impl PersistentMetricsState {
             } else {
                 "break-even"
             },
+        })
+    }
+
+    /// Wire bytes reconciled against provider-reported usage.
+    ///
+    /// The one view that crosses the boundary: what the proxy sent, next to
+    /// what Anthropic said it received. `bytes_saved_percent` is the proxy's
+    /// own claim; `provider_cache_hit_percent` is the provider's verdict on the
+    /// same requests. They answer different questions and neither alone settles
+    /// whether the proxy helped.
+    ///
+    /// `bytes_per_input_token` is the reconciliation: with the request shrinking
+    /// and the ratio steady, fewer bytes really did mean fewer billed tokens. If
+    /// bytes fall while the ratio falls with them, the proxy is stripping bytes
+    /// the tokenizer was barely charging for — motion without saving.
+    pub fn wire_verdict(&self) -> Value {
+        let wire = &self.state.wire_footprint;
+        let billed = wire.provider_input_tokens + wire.provider_cache_write_tokens;
+        let provider_total = billed + wire.provider_cache_read_tokens;
+        let pct = |num: i64, den: i64| -> Option<f64> {
+            (den > 0).then(|| num as f64 / den as f64 * 100.0)
+        };
+        serde_json::json!({
+            "bytes_in": wire.bytes_in,
+            "bytes_out": wire.bytes_out,
+            "bytes_saved": wire.bytes_in - wire.bytes_out,
+            "bytes_saved_percent": pct(wire.bytes_in - wire.bytes_out, wire.bytes_in),
+            "provider_input_tokens": wire.provider_input_tokens,
+            "provider_cache_read_tokens": wire.provider_cache_read_tokens,
+            "provider_cache_write_tokens": wire.provider_cache_write_tokens,
+            // What the request actually cost: cache reads are free on a
+            // subscription, so they are excluded from the billed figure and
+            // reported beside it instead.
+            "provider_billed_tokens": billed,
+            "provider_cache_hit_percent": pct(wire.provider_cache_read_tokens, provider_total),
+            // Bytes on the wire per token the provider charged for. Stable
+            // across a config change means the byte saving converted; a drop
+            // means it did not.
+            "bytes_per_billed_token": (billed > 0)
+                .then(|| wire.bytes_out as f64 / billed as f64),
+            "measured_requests": wire.measured_requests,
+            "scope": "completed anthropic streaming turns that carried a usage \
+                      block; excludes buffered turns, other providers and \
+                      streams that ended early, so it trails \
+                      lifetime_metrics.requests.total",
         })
     }
 
@@ -1101,9 +1252,27 @@ impl PersistentMetricsState {
         let tokens = &self.state.tokens;
 
         let mut tokens_out = object_of(&tokens);
+        // Savings as a share of what arrived, which is `input` — the sum of
+        // pre-compression body sizes. Same definition as
+        // `RequestOutcome::savings_pct`, so the per-request and lifetime
+        // figures now agree.
+        //
+        // This used to divide by `attempted_input`, which on the Anthropic
+        // paths is populated from `usage.input_tokens`. That field EXCLUDES
+        // cache reads and writes, so on a cache-warm session it collapses to
+        // the uncached remainder while `saved` stays whole: a real session
+        // reported 2,489,559 saved against 8,059 attempted — 30,891%. The
+        // giveaway was `attempted_input` and `uncached_input_tokens` holding
+        // byte-identical values, two fields that mean different things.
+        //
+        // `attempted_input` is still reported as its own number. It is the
+        // compressible-portion denominator for active-savings, a different
+        // question from this one, and fixing what feeds it on the Anthropic
+        // paths is a separate change — `original_tokens` is derived from it
+        // when compression did not run, so moving it moves the baseline too.
         tokens_out.insert(
             "token_savings_percent".to_string(),
-            to_value(&Self::percent(tokens.saved, tokens.attempted_input)),
+            to_value(&Self::percent(tokens.saved, tokens.input)),
         );
 
         let mut cache_out = object_of(&cache);
@@ -1505,7 +1674,36 @@ mod tests {
         let snapshot = state.snapshot(&json!({"path": "/tmp/x.json", "enabled": true}));
         assert_eq!(
             compact(&snapshot),
-            r#"{"scope":"lifetime","schema_version":5,"generated_at":"2026-07-27T12:00:00Z","started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"anthropic":1},"by_stack":{"claude-code":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50,"token_savings_percent":33.333333},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"anthropic":1},"cache_hit_rate":100.0,"ttl_1h_percent":40.0,"ttl_5m_percent":60.0},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"by_model":{"sonnet":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"path":"/tmp/x.json","enabled":true,"last_saved_at":"2026-07-27T12:00:05Z"}}"#
+            r#"{"scope":"lifetime","schema_version":5,"generated_at":"2026-07-27T12:00:00Z","started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"anthropic":1},"by_stack":{"claude-code":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50,"token_savings_percent":50.0},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"anthropic":1},"cache_hit_rate":100.0,"ttl_1h_percent":40.0,"ttl_5m_percent":60.0},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"by_model":{"sonnet":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"path":"/tmp/x.json","enabled":true,"last_saved_at":"2026-07-27T12:00:05Z"}}"#
+        );
+    }
+
+    /// The number a cache-warm session actually produced: 2,489,559 tokens
+    /// saved reported as 30,891% because the denominator was
+    /// `attempted_input`, which on Anthropic excludes cache reads and writes
+    /// and had collapsed to 8,059 over 832 requests.
+    ///
+    /// A savings percentage is a share of something; anything above 100 means
+    /// the denominator is not the thing that arrived.
+    #[test]
+    fn savings_percent_survives_a_cache_warm_session() {
+        let mut state = state_at("2026-08-07T00:07:27Z");
+        state.state.tokens.input = 3_658_473;
+        state.state.tokens.saved = 2_489_559;
+        // What the live proxy reported: nearly every input token was served
+        // from cache, so the uncached remainder is a rounding error.
+        state.state.tokens.attempted_input = 8_059;
+
+        let pct = state.snapshot(&json!({}))["tokens"]["token_savings_percent"]
+            .as_f64()
+            .expect("percent is a number");
+        assert!(
+            (0.0..=100.0).contains(&pct),
+            "savings must be a share of what arrived, got {pct}%"
+        );
+        assert!(
+            (pct - 68.05).abs() < 0.1,
+            "expected ~68% of 3.66M pre-compression tokens, got {pct}%"
         );
     }
 

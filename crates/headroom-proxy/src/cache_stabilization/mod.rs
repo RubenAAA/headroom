@@ -69,6 +69,7 @@
 //! `mod.rs`'s `pub mod` list.
 
 pub mod anthropic_cache_control;
+pub mod billing_header;
 pub mod cache_ttl;
 pub mod capture;
 pub mod drift_detector;

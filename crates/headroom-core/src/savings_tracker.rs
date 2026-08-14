@@ -180,17 +180,60 @@ fn estimate_output_savings_usd(model: &str, tokens_saved: i64) -> f64 {
     tokens_saved as f64 * rate
 }
 
+/// Resolve a request's cache writes into `(token_count, cost_usd)` across the
+/// two published TTL rates.
+///
+/// Anthropic bills a 5-minute write at 1.25x input and a 1-hour write at 2.0x,
+/// and reports which of the two each request used in
+/// `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`. Where that split is
+/// present the price is measured, not assumed from the configured TTL — which
+/// matters because `--force-1h-cache-ttl` makes every write the 2.0x kind while
+/// the 5m rate is what a single-rate table would charge.
+///
+/// Any total the reported split does not cover — including every token on a
+/// route that reports no split at all — is priced at the 5m rate. That is the
+/// cheaper of the two, so an unreported write understates cost rather than
+/// inventing a premium the provider may never have charged.
+fn cache_write_tokens_and_cost(
+    pricing: &crate::pricing::ModelPricing,
+    fallback_5m_rate: f64,
+    cache_write_tokens: i64,
+    cache_write_5m_tokens: i64,
+    cache_write_1h_tokens: i64,
+) -> (f64, f64) {
+    let rate_5m = pricing
+        .cache_write_cost_per_token
+        .unwrap_or(fallback_5m_rate);
+    let rate_1h = pricing.cache_write_1h_cost_per_token.unwrap_or(rate_5m);
+    let total = coerce_int(cache_write_tokens);
+    let w5m = coerce_int(cache_write_5m_tokens);
+    let w1h = coerce_int(cache_write_1h_tokens);
+    // A split that overshoots the reported total wins: it is the more specific
+    // measurement. `residual` therefore floors at zero rather than going
+    // negative and refunding tokens the provider did bill.
+    let residual = (total - w5m - w1h).max(0);
+    let at_5m = (w5m + residual) as f64;
+    let at_1h = w1h as f64;
+    (at_5m + at_1h, at_5m * rate_5m + at_1h * rate_1h)
+}
+
 fn estimate_input_cost_usd(
     model: &str,
     input_tokens: i64,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
+    cache_write_5m_tokens: i64,
+    cache_write_1h_tokens: i64,
     uncached_input_tokens: i64,
 ) -> f64 {
     let total_input = coerce_int(input_tokens);
     let cr = coerce_int(cache_read_tokens);
-    let cw = coerce_int(cache_write_tokens);
+    let cw_total = coerce_int(cache_write_tokens);
     let unc = coerce_int(uncached_input_tokens);
+    // Effective write count: a reported split that overshoots the total wins,
+    // matching how `cache_write_tokens_and_cost` prices it.
+    let cw =
+        cw_total.max(coerce_int(cache_write_5m_tokens) + coerce_int(cache_write_1h_tokens));
     let use_breakdown = (cr + cw + unc) > 0;
     let chargeable = if use_breakdown {
         cr + cw + unc
@@ -206,8 +249,14 @@ fn estimate_input_cost_usd(
             let input_rate = p.input_cost_per_token;
             if use_breakdown {
                 let cr_rate = p.cache_read_cost_per_token.unwrap_or(input_rate);
-                let cw_rate = p.cache_write_cost_per_token.unwrap_or(input_rate);
-                cr as f64 * cr_rate + cw as f64 * cw_rate + unc as f64 * input_rate
+                let (_, cw_cost) = cache_write_tokens_and_cost(
+                    p,
+                    input_rate,
+                    cw_total,
+                    cache_write_5m_tokens,
+                    cache_write_1h_tokens,
+                );
+                cr as f64 * cr_rate + cw_cost + unc as f64 * input_rate
             } else {
                 total_input as f64 * input_rate
             }
@@ -219,12 +268,16 @@ fn estimate_input_cost_usd(
 /// the model's fresh-input rate.
 ///
 /// Cache reads contribute their discount while cache writes contribute their
-/// premium (and can make the result negative). Unknown models fail open: with
-/// no published rates there is no defensible cache counterfactual to book.
+/// premium (and can make the result negative). Writes are priced per TTL from
+/// the provider's own `ephemeral_{5m,1h}` split — see
+/// [`cache_write_tokens_and_cost`]. Unknown models fail open: with no published
+/// rates there is no defensible cache counterfactual to book.
 fn estimate_cache_savings_usd(
     model: &str,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
+    cache_write_5m_tokens: i64,
+    cache_write_1h_tokens: i64,
     uncached_input_tokens: i64,
 ) -> f64 {
     let Some(pricing) = crate::pricing::lookup(model) else {
@@ -232,12 +285,17 @@ fn estimate_cache_savings_usd(
     };
     let fresh_rate = pricing.input_cost_per_token;
     let read_rate = pricing.cache_read_cost_per_token.unwrap_or(fresh_rate);
-    let write_rate = pricing.cache_write_cost_per_token.unwrap_or(fresh_rate);
+    let (write, write_cost) = cache_write_tokens_and_cost(
+        pricing,
+        fresh_rate,
+        cache_write_tokens,
+        cache_write_5m_tokens,
+        cache_write_1h_tokens,
+    );
     let read = coerce_int(cache_read_tokens) as f64;
-    let write = coerce_int(cache_write_tokens) as f64;
     let uncached = coerce_int(uncached_input_tokens) as f64;
     let all_fresh = (read + write + uncached) * fresh_rate;
-    let actual = read * read_rate + write * write_rate + uncached * fresh_rate;
+    let actual = read * read_rate + write_cost + uncached * fresh_rate;
     all_fresh - actual
 }
 
@@ -523,7 +581,7 @@ impl SavingsTracker {
         };
         st.history.push(entry);
         self.trim_history(&mut st, ts);
-        self.save(&st);
+        self.save(&mut st);
         true
     }
 
@@ -547,12 +605,16 @@ impl SavingsTracker {
             delta_input_tokens,
             rec.cache_read_tokens,
             rec.cache_write_tokens,
+            rec.cache_write_5m_tokens,
+            rec.cache_write_1h_tokens,
             rec.uncached_input_tokens,
         );
         let delta_cache_savings_usd = estimate_cache_savings_usd(
             rec.model,
             rec.cache_read_tokens,
             rec.cache_write_tokens,
+            rec.cache_write_5m_tokens,
+            rec.cache_write_1h_tokens,
             rec.uncached_input_tokens,
         );
 
@@ -672,7 +734,7 @@ impl SavingsTracker {
                 }),
             });
 
-        self.save(&st);
+        self.save(&mut st);
         true
     }
 
@@ -716,7 +778,7 @@ impl SavingsTracker {
     pub fn record_cache_bust(&self, tokens_lost: i64) {
         let mut st = self.state.lock().unwrap();
         st.metrics.record_cache_bust(tokens_lost);
-        self.save(&st);
+        self.save(&mut st);
     }
 
     /// Record why the prefix cache missed (`ttl_expiry`, `prefix_change`, or
@@ -724,7 +786,7 @@ impl SavingsTracker {
     pub fn record_cache_miss(&self, provider: Option<&str>, reason: Option<&str>) {
         let mut st = self.state.lock().unwrap();
         st.metrics.record_cache_miss(provider, reason);
-        self.save(&st);
+        self.save(&mut st);
     }
 
     /// Record what the proxy added to a request, in bytes of `tools` +
@@ -736,7 +798,16 @@ impl SavingsTracker {
         }
         let mut st = self.state.lock().unwrap();
         st.metrics.record_proxy_overhead(before_bytes, after_bytes);
-        self.save(&st);
+        self.save(&mut st);
+    }
+
+    /// Record one turn dropped from the books because its stream ended without
+    /// the terminal event carrying the usage totals. See
+    /// [`crate::persistent_metrics::PersistentMetricsState::record_unbooked_turn`].
+    pub fn record_unbooked_turn(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.metrics.record_unbooked_turn();
+        self.save(&mut st);
     }
 
     /// Record the tool definitions a request carried and the calls the model
@@ -747,7 +818,7 @@ impl SavingsTracker {
         }
         let mut st = self.state.lock().unwrap();
         st.metrics.record_tools(definitions, calls);
-        self.save(&st);
+        self.save(&mut st);
     }
 
     /// What the proxy added to requests, against what compaction gave back.
@@ -774,6 +845,35 @@ impl SavingsTracker {
     pub fn savings_verdict(&self) -> Value {
         let st = self.state.lock().unwrap();
         st.metrics.savings_verdict()
+    }
+
+    /// Record one request's wire bytes against the usage the provider reported
+    /// for it. Skipped when the provider sent no usage, so the byte and token
+    /// halves always describe the same requests.
+    pub fn record_wire_footprint(
+        &self,
+        bytes_in: i64,
+        bytes_out: i64,
+        input_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) {
+        let mut st = self.state.lock().unwrap();
+        st.metrics.record_wire_footprint(
+            bytes_in,
+            bytes_out,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        );
+        self.save(&mut st);
+    }
+
+    /// Wire bytes reconciled against provider-reported usage. See
+    /// [`crate::persistent_metrics::PersistentMetricsState::wire_verdict`].
+    pub fn wire_verdict(&self) -> Value {
+        let st = self.state.lock().unwrap();
+        st.metrics.wire_verdict()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1277,7 +1377,7 @@ impl SavingsTracker {
         st
     }
 
-    fn save(&self, st: &State) {
+    fn save(&self, st: &mut State) {
         if self.stateless {
             return;
         }
@@ -1287,6 +1387,12 @@ impl SavingsTracker {
         if std::fs::create_dir_all(parent).is_err() {
             return;
         }
+        // Stamp before serialising so the file carries the time it was written,
+        // and roll the stamp back on any failure below. `snapshot` reports this
+        // field straight from state, so a save that didn't happen must not
+        // leave a timestamp behind claiming it did.
+        let previous_saved_at = st.metrics.state().persistence.last_saved_at.clone();
+        st.metrics.set_last_saved_at(Some(to_utc_iso(utc_now())));
         let payload = json!({
             "schema_version": SCHEMA_VERSION,
             "lifetime": lifetime_value(&st.lifetime),
@@ -1301,6 +1407,7 @@ impl SavingsTracker {
             "lifetime_footprint": st.metrics.footprint_to_dict(),
         });
         let Ok(json_data) = serde_json::to_string_pretty(&payload) else {
+            st.metrics.set_last_saved_at(previous_saved_at);
             return;
         };
         // Atomic temp-file + fsync + rename (Python parity, no tempfile crate).
@@ -1317,6 +1424,7 @@ impl SavingsTracker {
         })();
         if write_result.is_err() {
             let _ = std::fs::remove_file(&tmp);
+            st.metrics.set_last_saved_at(previous_saved_at);
         }
     }
 }
@@ -1879,6 +1987,102 @@ mod tests {
         assert_eq!(snap["net_bytes_per_request"], 100);
     }
 
+    /// The wire/usage pair is the only measurement that crosses the boundary
+    /// to the provider, so it has to survive a restart like the rest.
+    #[test]
+    fn wire_footprint_reconciles_bytes_against_provider_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            t.record_wire_footprint(10_000, 6_000, 1_000, 8_000, 500);
+            t.record_wire_footprint(10_000, 6_000, 1_000, 8_000, 500);
+        }
+        let t = tracker(&path);
+        let snap = t.wire_verdict();
+        assert_eq!(snap["bytes_in"], 20_000);
+        assert_eq!(snap["bytes_out"], 12_000);
+        assert_eq!(snap["bytes_saved"], 8_000);
+        assert_eq!(snap["bytes_saved_percent"], 40.0);
+        // Cache reads are free on a subscription, so "billed" is uncached
+        // input plus creation only.
+        assert_eq!(snap["provider_billed_tokens"], 3_000);
+        assert_eq!(snap["bytes_per_billed_token"], 4.0);
+        assert_eq!(snap["measured_requests"], 2);
+    }
+
+    /// The field exists to prove the state on disk is current. Left unstamped
+    /// it reported `null` forever while the file was being written every few
+    /// seconds, which reads as "persistence is broken" when persistence is
+    /// fine.
+    #[test]
+    fn a_successful_save_stamps_last_saved_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let empty = serde_json::json!({});
+        {
+            let t = tracker(&path);
+            assert!(
+                t.metrics_snapshot(&empty)["persistence"]["last_saved_at"].is_null(),
+                "nothing saved yet, so nothing to stamp"
+            );
+            t.record_proxy_overhead(5_000, 4_000);
+            assert!(
+                t.metrics_snapshot(&empty)["persistence"]["last_saved_at"].is_string(),
+                "the write happened, so the stamp has to be there"
+            );
+        }
+        // And it survives the round trip, so a restart can tell how stale the
+        // state it just loaded is.
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["lifetime_metrics"]["persistence"]["last_saved_at"].is_string());
+    }
+
+    /// `other` is the bucket the recorder falls back to for an unrecognised
+    /// waste label. It used to be missing from the loader's vocabulary, so
+    /// every restart folded the whole bucket into `unknown` — a bucket no
+    /// request is ever classified into. Left alone it grew without bound and
+    /// looked like a classifier failure.
+    #[test]
+    fn the_other_waste_bucket_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        {
+            let t = tracker(&path);
+            t.record_request(&RequestRecord {
+                model: "claude-sonnet-4",
+                input_tokens: 1_000,
+                waste_signals: Some(vec![("a_label_the_loader_never_heard_of".to_string(), 900)]),
+                ..Default::default()
+            });
+        }
+        // The recorder buckets it as `other` on the way out.
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["lifetime_metrics"]["waste_signals"]["other"], 900);
+
+        // And the loader has to keep it there on the way back in.
+        let t = tracker(&path);
+        let waste = t.metrics_snapshot(&serde_json::json!({}))["waste_signals"].clone();
+        assert_eq!(waste["other"], 900, "the fallback bucket has to round-trip");
+        assert!(
+            waste.get("unknown").is_none(),
+            "nothing should land in `unknown`: {waste}"
+        );
+    }
+
+    /// With no usage recorded the ratios must be absent, not zero: a zero here
+    /// reads as "we sent bytes and were billed nothing", which is a much
+    /// stronger claim than "we never measured".
+    #[test]
+    fn wire_verdict_reports_null_rather_than_zero_without_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = tracker(&dir.path().join("proxy_savings.json"));
+        let snap = t.wire_verdict();
+        assert!(snap["bytes_saved_percent"].is_null());
+        assert!(snap["bytes_per_billed_token"].is_null());
+        assert_eq!(snap["measured_requests"], 0);
+    }
+
     /// A net shrink has to survive as a negative. Reporting it as zero would
     /// hide compaction paying for the injections.
     #[test]
@@ -2042,9 +2246,10 @@ mod tests {
 
     #[test]
     fn claude_cache_economics_include_read_discount_and_write_premium() {
-        // Sonnet: fresh=$3/M, read=$0.30/M, write=$3.75/M.
+        // Sonnet: fresh=$3/M, read=$0.30/M, 5m write=$3.75/M.
         // Read discount: $0.027; write premium: $0.0015; net: $0.0255.
-        let savings = estimate_cache_savings_usd("claude-sonnet-4", 10_000, 2_000, 3_000);
+        // No TTL split reported, so every write falls back to the 5m rate.
+        let savings = estimate_cache_savings_usd("claude-sonnet-4", 10_000, 2_000, 0, 0, 3_000);
         assert!((savings - 0.0255).abs() < 1e-12, "got {savings}");
     }
 
@@ -2052,16 +2257,51 @@ mod tests {
     fn cache_write_premium_can_make_net_savings_negative() {
         // Four thousand fresh Sonnet tokens would cost $0.012; creating the
         // cache entry costs $0.015, so this turn is a $0.003 cache loss.
-        let savings = estimate_cache_savings_usd("claude-sonnet-4", 0, 4_000, 0);
+        let savings = estimate_cache_savings_usd("claude-sonnet-4", 0, 4_000, 0, 0, 0);
         assert!((savings + 0.003).abs() < 1e-12, "got {savings}");
     }
 
     #[test]
     fn unknown_model_does_not_invent_cache_savings() {
         assert_eq!(
-            estimate_cache_savings_usd("unpriced-provider/model", 1_000_000, 0, 0),
+            estimate_cache_savings_usd("unpriced-provider/model", 1_000_000, 0, 0, 0, 0),
             0.0
         );
+    }
+
+    #[test]
+    fn a_one_hour_write_costs_more_than_the_same_tokens_at_five_minutes() {
+        // The regression that made `--force-1h-cache-ttl` free on paper: the
+        // same 2k writes billed at 2.0x instead of 1.25x. Sonnet fresh=$3/M, so
+        // all-fresh is $0.006 against $0.0075 (5m) and $0.012 (1h).
+        let five_m = estimate_cache_savings_usd("claude-sonnet-4", 0, 2_000, 2_000, 0, 0);
+        let one_h = estimate_cache_savings_usd("claude-sonnet-4", 0, 2_000, 0, 2_000, 0);
+        assert!((five_m + 0.0015).abs() < 1e-12, "5m: got {five_m}");
+        assert!((one_h + 0.006).abs() < 1e-12, "1h: got {one_h}");
+        assert!(one_h < five_m, "a 1h write must book the larger premium");
+    }
+
+    #[test]
+    fn a_mixed_ttl_turn_prices_each_half_at_its_own_rate() {
+        // 1k at $3.75/M + 3k at $6/M = $0.02175 against $0.012 all-fresh.
+        let savings = estimate_cache_savings_usd("claude-sonnet-4", 0, 4_000, 1_000, 3_000, 0);
+        assert!((savings + 0.00975).abs() < 1e-12, "got {savings}");
+    }
+
+    #[test]
+    fn writes_the_split_does_not_cover_fall_back_to_the_five_minute_rate() {
+        // A route that reports a total but no split must not invent a premium:
+        // the 2k residual joins the 1k of reported 5m at $3.75/M, and only the
+        // measured 1k of 1h pays $6/M.
+        let savings = estimate_cache_savings_usd("claude-sonnet-4", 0, 4_000, 1_000, 1_000, 0);
+        assert!((savings + 0.00525).abs() < 1e-12, "got {savings}");
+    }
+
+    #[test]
+    fn input_cost_charges_one_hour_writes_at_the_one_hour_rate() {
+        // 2k 1h writes = $0.012; the single-rate table would have said $0.0075.
+        let cost = estimate_input_cost_usd("claude-sonnet-4", 0, 0, 2_000, 0, 2_000, 0);
+        assert!((cost - 0.012).abs() < 1e-12, "got {cost}");
     }
 
     #[test]

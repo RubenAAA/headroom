@@ -38,8 +38,48 @@ impl CodexRateLimitSnapshot {
             "age_seconds": now_unix().saturating_sub(self.observed_at),
             "model": self.model,
             "headers": self.headers,
-            "rate_limits": self.rate_limits,
+            "rate_limits": self
+                .rate_limits
+                .clone()
+                .or_else(|| self.rate_limits_from_headers()),
         })
+    }
+
+    /// Codex sends the quota as `x-codex-*` headers on every turn; the
+    /// `rate_limits` stream object is rarer, and some backends never send one
+    /// at all. Serving only the stream object left the statusline with a full
+    /// `headers` map next to a null `rate_limits`, so it fell through to
+    /// printing the bare plan name — `codex premium`, no numbers, while the
+    /// percentages sat right there in the headers. Derive the same shape.
+    ///
+    /// A window counts only when it has a length. The secondary slot comes
+    /// back as `window_minutes: 0` with an empty reset for an account with no
+    /// second bucket, and emitting it would render a `0m:0%` segment.
+    fn rate_limits_from_headers(&self) -> Option<Value> {
+        let mut out = serde_json::Map::new();
+        for slot in ["primary", "secondary"] {
+            let field = |key: &str| {
+                self.headers
+                    .get(&format!("x-codex-{slot}-{key}"))
+                    .map(String::as_str)
+                    .filter(|v| !v.is_empty())
+            };
+            let minutes = match field("window-minutes").and_then(|v| v.parse::<u64>().ok()) {
+                Some(m) if m > 0 => m,
+                _ => continue,
+            };
+            let Some(pct) = field("used-percent").and_then(|v| v.parse::<f64>().ok()) else {
+                continue;
+            };
+            let mut window = serde_json::Map::new();
+            window.insert("used_percent".to_string(), json!(pct));
+            window.insert("window_minutes".to_string(), json!(minutes));
+            if let Some(reset) = field("reset-at").and_then(|v| v.parse::<u64>().ok()) {
+                window.insert("resets_at".to_string(), json!(reset));
+            }
+            out.insert(slot.to_string(), Value::Object(window));
+        }
+        (!out.is_empty()).then(|| Value::Object(out))
     }
 }
 
@@ -120,6 +160,16 @@ pub fn extract_rate_limits(chunk: &Value) -> Option<Value> {
             }
         }
     }
+    // Deliberately silent. This runs on EVERY SSE frame
+    // (`local_model.rs::process_responses_frame`), and almost every frame is an
+    // ordinary content delta that carries no quota at all — absence here is the
+    // normal case, not a shape change. An earlier revision warned on this path;
+    // it produced one warn per frame into a log that is never rotated, which is
+    // worse than the blind spot item 12.8 describes.
+    //
+    // The signal 12.8 actually wants is "this whole stream carried no quota
+    // anywhere", emitted once when the stream ends — that needs a flag on
+    // `StreamTranslator`, not a branch here.
     None
 }
 
@@ -159,6 +209,40 @@ mod tests {
         headers.insert("content-type", "text/event-stream".parse().unwrap());
         store.record_headers("m", &headers);
         assert!(store.snapshot().is_none());
+    }
+
+    #[test]
+    fn rate_limits_are_derived_from_headers_when_the_stream_sends_none() {
+        let store = CodexRateLimitStore::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "5".parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        headers.insert("x-codex-primary-reset-at", "1786398152".parse().unwrap());
+        // No second bucket on this account: zero-length window, empty reset.
+        headers.insert("x-codex-secondary-used-percent", "0".parse().unwrap());
+        headers.insert("x-codex-secondary-window-minutes", "0".parse().unwrap());
+        headers.insert("x-codex-secondary-reset-at", "".parse().unwrap());
+        store.record_headers("claude-codex-5.6", &headers);
+
+        let out = store.snapshot().unwrap().to_json();
+        assert_eq!(out["rate_limits"]["primary"]["used_percent"], 5.0);
+        assert_eq!(out["rate_limits"]["primary"]["window_minutes"], 10080);
+        assert_eq!(out["rate_limits"]["primary"]["resets_at"], 1_786_398_152u64);
+        // A zero-length window renders as `0m:0%`, so it must not appear.
+        assert!(out["rate_limits"].get("secondary").is_none());
+    }
+
+    #[test]
+    fn a_stream_object_wins_over_the_header_derivation() {
+        let store = CodexRateLimitStore::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "5".parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        store.record_headers("m", &headers);
+        store.record_rate_limits("m", json!({"primary": {"used_percent": 9.0}}));
+
+        let out = store.snapshot().unwrap().to_json();
+        assert_eq!(out["rate_limits"]["primary"]["used_percent"], 9.0);
     }
 
     #[test]

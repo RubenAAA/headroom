@@ -653,6 +653,7 @@ mod tests {
         let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
         config.bedrock_region = "us-west-2".to_string();
         let state = AppState {
+            started_at: std::time::Instant::now(),
             config: std::sync::Arc::new(config),
             client: reqwest::Client::new(),
             bedrock_credentials: None,
@@ -743,6 +744,7 @@ mod tests {
         let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
         config.bedrock_endpoint = Some(Url::parse("http://127.0.0.1:9999").unwrap());
         let state = AppState {
+            started_at: std::time::Instant::now(),
             config: std::sync::Arc::new(config),
             client: reqwest::Client::new(),
             bedrock_credentials: None,

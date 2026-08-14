@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use prometheus::{Gauge, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry};
 
 use super::metric_names::{
-    LABEL_PATH, LABEL_PROVIDER, LABEL_STATUS, LABEL_TIER, LABEL_WINDOW,
+    LABEL_PATH, LABEL_PROVIDER, LABEL_REASON, LABEL_STATUS, LABEL_TIER, LABEL_WINDOW,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL_HELP,
     METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE,
@@ -30,7 +30,85 @@ use super::metric_names::{
     METRIC_PROXY_RATE_LIMIT_REMAINING_TOKENS, METRIC_PROXY_RATE_LIMIT_REMAINING_TOKENS_HELP,
     METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL, METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP,
     METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL, METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL_HELP,
+    METRIC_PROXY_STREAM_INCOMPLETE_TOTAL, METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP,
+    METRIC_PROXY_UPSTREAM_RETRIES_TOTAL, METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP,
 };
+
+// ---------- proxy_upstream_retries_total{path,reason} ----------
+
+/// Both label values come from the code, never from request input: `path` is
+/// one of two forward paths and `reason` is one of the four
+/// [`retry_reason`] constants.
+pub fn upstream_retries_counter(registry: &Registry) -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_UPSTREAM_RETRIES_TOTAL,
+            METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP,
+        );
+        let counter = IntCounterVec::new(opts, &[LABEL_PATH, LABEL_REASON])
+            .expect("proxy_upstream_retries_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("proxy_upstream_retries_total registers exactly once");
+        counter
+    })
+}
+
+/// The bounded `reason` label values.
+pub mod retry_reason {
+    pub const STATUS_429: &str = "status_429";
+    pub const STATUS_529: &str = "status_529";
+    pub const STATUS_5XX: &str = "status_5xx";
+    pub const TRANSPORT: &str = "transport";
+    /// A 200 response whose SSE body opened with an error event. The HTTP
+    /// status says success; the body disagrees.
+    pub const IN_BAND_SSE: &str = "in_band_sse";
+
+    /// Bucket an HTTP status into a reason. 529 is Anthropic's "overloaded"
+    /// and gets its own bucket because it behaves differently from a generic
+    /// 5xx: it means the upstream is busy, not broken.
+    pub fn from_status(status: u16) -> &'static str {
+        match status {
+            429 => STATUS_429,
+            529 => STATUS_529,
+            _ => STATUS_5XX,
+        }
+    }
+}
+
+/// Count one re-send. Call it at the point the retry is decided, next to the
+/// `sleep`, so the counter and the backoff cannot drift apart.
+pub fn record_upstream_retry(path: &str, reason: &str) {
+    upstream_retries_counter(super::prometheus::registry())
+        .with_label_values(&[path, reason])
+        .inc();
+}
+
+// ---------- proxy_stream_incomplete_total{provider} ----------
+
+pub fn stream_incomplete_counter(registry: &Registry) -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_STREAM_INCOMPLETE_TOTAL,
+            METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP,
+        );
+        let counter = IntCounterVec::new(opts, &[LABEL_PROVIDER])
+            .expect("proxy_stream_incomplete_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("proxy_stream_incomplete_total registers exactly once");
+        counter
+    })
+}
+
+/// Count a stream that ended before its terminal event.
+pub fn record_stream_incomplete(provider: &str) {
+    stream_incomplete_counter(super::prometheus::registry())
+        .with_label_values(&[provider])
+        .inc();
+}
 
 // ---------- proxy_passthrough_bytes_modified_total{path} ----------
 

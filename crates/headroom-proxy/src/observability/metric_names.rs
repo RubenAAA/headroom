@@ -41,6 +41,28 @@ pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP: &str =
      prefixes that should have been cache reads (summed wasted_tokens \
      across recache events).";
 
+// ---------- proxy_cache_reminder_spans_lost_total ----------
+
+pub const METRIC_PROXY_CACHE_REMINDER_SPANS_LOST_TOTAL: &str =
+    "proxy_cache_reminder_spans_lost_total";
+pub const METRIC_PROXY_CACHE_REMINDER_SPANS_LOST_TOTAL_HELP: &str =
+    "Count of client `<system-reminder>` spans that the relocation pass \
+     failed to conserve — present in the request the client sent, absent \
+     from the one forwarded. Relocation moves scaffolding, it never drops \
+     it, so any increase is a defect and the model is being shown less \
+     than the client wrote.";
+
+// ---------- proxy_cache_replay_alternates_evicted_total ----------
+
+pub const METRIC_PROXY_CACHE_REPLAY_ALTERNATES_EVICTED_TOTAL: &str =
+    "proxy_cache_replay_alternates_evicted_total";
+pub const METRIC_PROXY_CACHE_REPLAY_ALTERNATES_EVICTED_TOTAL_HELP: &str =
+    "Count of stored branch prefixes dropped from a session's alternates \
+     because the count or message budget was full. One session key carries \
+     several interleaved streams, and each holds the prefix its own next turn \
+     replays; an evicted stream busts instead. Deep conversations spend the \
+     message budget fastest, so this is where a raised cap would pay.";
+
 // ---------- proxy_compression_ratio_by_strategy ----------
 
 pub const METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY: &str = "proxy_compression_ratio_by_strategy";
@@ -67,6 +89,19 @@ pub const METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL_HELP: &str =
     "Count of compressor runs whose output failed the tokenizer-validated \
      shrink check (compressed_tokens >= original_tokens). Surfaces 'we ran \
      but kept the original' cases that would otherwise be invisible.";
+
+// ---------- proxy_compression_declined_no_shrink_total ----------
+
+pub const METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL: &str =
+    "proxy_compression_declined_no_shrink_total";
+pub const METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL_HELP: &str =
+    "Count of compressor runs the dispatcher declined because the output was \
+     not smaller in bytes than the input. These used to travel to the \
+     tokenizer and land in proxy_compression_rejected_by_token_check_total; \
+     counting them here keeps that visible. Read alongside \
+     proxy_compression_ratio_by_strategy_sum: this rising while accepted \
+     compression holds steady means the gate is absorbing waste, both \
+     falling together means it is declining work that pays.";
 
 // ---------- proxy_passthrough_bytes_modified_total ----------
 
@@ -169,6 +204,54 @@ pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str =
 // integration they measured has been removed from Headroom.
 // See `docs/observability.md`.
 
+// ---------- proxy_upstream_retries_total ----------
+
+pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL: &str = "proxy_upstream_retries_total";
+pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP: &str =
+    "Count of upstream requests re-sent after a transient failure, labelled \
+     by forward path (anthropic, local_model) and reason (status_429, \
+     status_529, status_5xx, transport). One increment per re-send, so a \
+     request that succeeds on its third try contributes 2. Retries cost \
+     latency and re-bill the input tokens, and until this counter existed \
+     they were visible only in the logs.";
+
+// ---------- ctx_proactive_expansion_bytes_total ----------
+
+pub const METRIC_CTX_PROACTIVE_EXPANSION_BYTES_TOTAL: &str = "ctx_proactive_expansion_bytes_total";
+pub const METRIC_CTX_PROACTIVE_EXPANSION_BYTES_TOTAL_HELP: &str =
+    "CCR Phase 4: cumulative bytes of previously-offloaded content appended \
+     back into the latest user turn by proactive expansion. This is the \
+     counterweight to ctx_offloaded_bytes_total — offload removes bytes, \
+     expansion puts them back, and only the difference is a real saving.";
+
+// ---------- ctx_proactive_expansion_cache_write_tokens_total ----------
+
+pub const METRIC_CTX_PROACTIVE_EXPANSION_CACHE_WRITE_TOKENS_TOTAL: &str =
+    "ctx_proactive_expansion_cache_write_tokens_total";
+pub const METRIC_CTX_PROACTIVE_EXPANSION_CACHE_WRITE_TOKENS_TOTAL_HELP: &str =
+    "CCR Phase 4: Anthropic cache-creation input tokens on requests that \
+     injected proactive expansion. Provider usage cannot split the expansion \
+     from the rest of that newly-written cache segment, so this records the \
+     actual write charged to the affected request rather than estimating from \
+     expansion bytes.";
+
+// ---------- ctx_proactive_expansions_total ----------
+
+pub const METRIC_CTX_PROACTIVE_EXPANSIONS_TOTAL: &str = "ctx_proactive_expansions_total";
+pub const METRIC_CTX_PROACTIVE_EXPANSIONS_TOTAL_HELP: &str =
+    "CCR Phase 4: count of requests that had at least one previously-offloaded \
+     block re-inserted into the latest user turn.";
+
+// ---------- proxy_stream_incomplete_total ----------
+
+pub const METRIC_PROXY_STREAM_INCOMPLETE_TOTAL: &str = "proxy_stream_incomplete_total";
+pub const METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP: &str =
+    "Count of SSE streams that ended without their terminal event \
+     (Anthropic `message_stop`), labelled by provider. Usage totals arrive \
+     with that event, so these turns are dropped from the cost and savings \
+     books rather than booked at their partial figures. A rising rate means \
+     the books are getting less complete, not that nothing happened.";
+
 // ---------- ctx_offloaded_bytes_total ----------
 
 pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL: &str = "ctx_offloaded_bytes_total";
@@ -191,6 +274,14 @@ pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL_HELP: &str =
     "CTX-5/6: count of recall/resume blocks injected into the first user \
      message of a conversation (CTX-4 injection engine).";
 
+// ---------- ctx_injection_clipped_bytes_total ----------
+
+pub const METRIC_CTX_INJECTION_CLIPPED_BYTES_TOTAL: &str = "ctx_injection_clipped_bytes_total";
+pub const METRIC_CTX_INJECTION_CLIPPED_BYTES_TOTAL_HELP: &str =
+    "Bytes dropped by the shared per-request injection budget, labelled by \
+     stage (proactive_expansion / recall / memory). Non-zero means a stage \
+     wanted more room than --max-injection-bytes allowed.";
+
 // ---------- ctx_retrieval_hits_total ----------
 
 pub const METRIC_CTX_RETRIEVAL_HITS_TOTAL: &str = "ctx_retrieval_hits_total";
@@ -211,6 +302,34 @@ pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL_HELP: &str =
 pub const METRIC_CTX_SEARCH_QUERIES_TOTAL: &str = "ctx_search_queries_total";
 pub const METRIC_CTX_SEARCH_QUERIES_TOTAL_HELP: &str =
     "CTX-5: count of search queries served via the /ctx/search endpoint.";
+
+// ---------- proxy_upstream_responses_total ----------
+
+pub const METRIC_PROXY_UPSTREAM_RESPONSES_TOTAL: &str = "proxy_upstream_responses_total";
+pub const METRIC_PROXY_UPSTREAM_RESPONSES_TOTAL_HELP: &str =
+    "Responses received from upstream, of any status. The denominator \
+     for the rejection rate — a refusal count on its own says nothing \
+     about whether the proxy is healthy.";
+
+// ---------- proxy_upstream_rejections_total ----------
+
+pub const METRIC_PROXY_UPSTREAM_REJECTIONS_TOTAL: &str = "proxy_upstream_rejections_total";
+pub const METRIC_PROXY_UPSTREAM_REJECTIONS_TOTAL_HELP: &str =
+    "Non-2xx responses from upstream, labelled by HTTP status. A \
+     rejected turn is work lost and a cached prefix rewritten, so this \
+     is costlier than any cache miss. 429 is kept separate by its label \
+     because rate limiting is the provider throttling a healthy proxy.";
+
+// ---------- proxy_ccr_splice_dropped_blocks_total ----------
+
+pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL: &str =
+    "proxy_ccr_splice_dropped_blocks_total";
+pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL_HELP: &str =
+    "Content blocks the CCR retrieval splice refused to forward to the \
+     client, labelled by reason. `unresolved_proxy_tool` is routine; \
+     `continuation_thinking` and `already_streamed` are the two shapes \
+     that made upstream refuse the *following* turn, so a non-zero \
+     count next to a rising rejection rate names the cause.";
 
 // ---------- shared label keys ----------
 

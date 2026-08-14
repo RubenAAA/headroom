@@ -23,6 +23,7 @@ pub mod handlers;
 pub mod headers;
 pub mod health;
 pub mod image_compression_decision;
+pub mod injection_budget;
 pub mod interceptors;
 pub mod loopback_guard;
 pub mod memory;

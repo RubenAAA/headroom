@@ -12,6 +12,10 @@
 //!   `tool_result` originals into the CCR store + FTS content index. The
 //!   offload *transform* itself lives in `compression::ctx_offload`; this
 //!   module only handles the storage side effect (never touches wire bytes).
+//! - [`projects`] (CTX-2b) — the per-project store registry. The storage layer
+//!   isolates projects by file path, so opening the right file is the only
+//!   thing keeping one project's context out of another's; this resolves and
+//!   caches those handles for the three consumers below.
 //! - [`inject`] (CTX-4) — the recall/resume injection engine. Unlike the rest
 //!   of this module, it **does** mutate wire bytes (prepends a once-decided,
 //!   timestamp-free block into the first user message and replays it verbatim
@@ -28,3 +32,4 @@ pub mod identity;
 pub mod inject;
 pub mod observer;
 pub mod offload_store;
+pub mod projects;

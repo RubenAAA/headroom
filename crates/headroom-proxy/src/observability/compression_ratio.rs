@@ -36,8 +36,9 @@ use std::sync::OnceLock;
 use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry};
 
 use super::metric_names::{
-    LABEL_CONTENT_TYPE, LABEL_STRATEGY, METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY,
-    METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY_HELP,
+    LABEL_CONTENT_TYPE, LABEL_STRATEGY, METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL,
+    METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL_HELP,
+    METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY, METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY_HELP,
     METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL,
     METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL_HELP, METRIC_PROXY_TOKENS_SAVED_TOTAL,
     METRIC_PROXY_TOKENS_SAVED_TOTAL_HELP,
@@ -83,6 +84,31 @@ pub fn rejected_counter(registry: &Registry) -> &'static IntCounterVec {
             .expect("proxy_compression_rejected_by_token_check_total registers exactly once");
         counter
     })
+}
+
+/// `proxy_compression_declined_no_shrink_total{strategy}` — the work the
+/// dispatcher's size gate absorbs before the tokenizer sees it.
+pub fn declined_no_shrink_counter(registry: &Registry) -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL,
+            METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL_HELP,
+        );
+        let counter = IntCounterVec::new(opts, &[LABEL_STRATEGY])
+            .expect("proxy_compression_declined_no_shrink_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("proxy_compression_declined_no_shrink_total registers exactly once");
+        counter
+    })
+}
+
+/// Record one block the size gate declined.
+pub fn record_declined_no_shrink(strategy: &str) {
+    declined_no_shrink_counter(super::prometheus::registry())
+        .with_label_values(&[strategy])
+        .inc();
 }
 
 /// `proxy_tokens_saved_total{strategy, content_type}` — cumulative
