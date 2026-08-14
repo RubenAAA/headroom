@@ -141,6 +141,14 @@ pub fn compute_window_tokens(start_ts: f64, end_ts: f64) -> WindowTokens {
     let mut by_model: std::collections::HashMap<String, WindowTokens> =
         std::collections::HashMap::new();
     let mut unattributed = WindowTokens::default();
+    // Claude Code can store one assistant response across several transcript
+    // lines, one per content block, each carrying the SAME request-level
+    // `message.usage`. Summing per line multiplies a single response's tokens
+    // by its block count — 19x on one 420K response upstream. Count each
+    // response once, keyed by the Anthropic `message.id`. Entries with no id
+    // keep the per-line behaviour, so this only ever drops true duplicates.
+    let mut seen_message_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for path in find_transcript_files() {
         for line in read_transcript_lines(&path) {
@@ -166,6 +174,12 @@ pub fn compute_window_tokens(start_ts: f64, end_ts: f64) -> WindowTokens {
                 Some(u) if !u.is_null() => u.clone(),
                 _ => continue,
             };
+
+            if let Some(msg_id) = msg.get("id").and_then(|v| v.as_str()) {
+                if !msg_id.is_empty() && !seen_message_ids.insert(msg_id.to_string()) {
+                    continue;
+                }
+            }
 
             add_usage_to_tokens(&mut totals, &usage);
 
@@ -252,5 +266,44 @@ mod tests {
         // opus weight 2.0 × (100+20+10+5) = 270
         assert_eq!(tokens.weighted_token_equivalent, 270.0);
         assert!(tokens.by_model.contains_key("claude-opus-4"));
+    }
+
+    #[test]
+    fn compute_window_tokens_counts_each_message_id_once() {
+        // One response can span several lines, one per content block, each
+        // repeating the response's usage. Three lines carrying two ids must
+        // count twice, not three times.
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects").join("proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        let block = |id: &str| {
+            json!({
+                "timestamp": "2026-06-17T12:00:00Z",
+                "message": {
+                    "id": id,
+                    "model": "claude-opus-4",
+                    "usage": {"input_tokens": 100, "output_tokens": 20}
+                }
+            })
+            .to_string()
+        };
+        let lines = format!("{}\n{}\n{}\n", block("msg_a"), block("msg_a"), block("msg_b"));
+        std::fs::write(projects.join("a.jsonl"), lines).unwrap();
+
+        let _guard = crate::subscription::env_guard();
+        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path());
+        let start = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 17, 0, 0, 0)
+            .unwrap()
+            .timestamp() as f64;
+        let end = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 18, 0, 0, 0)
+            .unwrap()
+            .timestamp() as f64;
+        let tokens = compute_window_tokens(start, end);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert_eq!(tokens.input, 200, "msg_a once plus msg_b once");
+        assert_eq!(tokens.output, 40);
     }
 }
