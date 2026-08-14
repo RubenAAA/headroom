@@ -411,6 +411,63 @@ fn transform_timing_max() -> &'static GaugeVec {
 
 // ─── Record helpers ─────────────────────────────────────────────────────
 
+/// Cap on distinct `model` label values. `model` comes straight off the
+/// request body, so it is client-supplied: without a cap, one buggy or
+/// hostile client grows `headroom_requests_by_model` and the three timing
+/// histograms one series at a time, forever. Nothing expires them; only a
+/// restart clears them.
+const MAX_DISTINCT_MODELS: usize = 1024;
+
+/// Label value that models past [`MAX_DISTINCT_MODELS`] collapse into.
+const OTHER_MODEL: &str = "other";
+
+/// Model labels already admitted.
+fn admitted_models() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static ADMITTED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    ADMITTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether `model` fits within `cap` distinct values, admitting it if it does.
+///
+/// Membership is tested before inserting, never indexed into: admitting
+/// unconditionally would create the very key the cap exists to refuse.
+fn admit_model(
+    admitted: &mut std::collections::HashSet<String>,
+    model: &str,
+    cap: usize,
+) -> bool {
+    if admitted.contains(model) {
+        return true;
+    }
+    if admitted.len() >= cap {
+        return false;
+    }
+    admitted.insert(model.to_string());
+    true
+}
+
+/// `model` while there is room for it, otherwise [`OTHER_MODEL`].
+///
+/// Warns once, when the cap first trips, rather than on every request past it.
+fn bounded_model(model: &str) -> &str {
+    let mut admitted = admitted_models()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if admit_model(&mut admitted, model, MAX_DISTINCT_MODELS) {
+        return model;
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            event = "model_label_cardinality_capped",
+            cap = MAX_DISTINCT_MODELS,
+            "distinct model labels hit the cap; bucketing further models into \"other\""
+        );
+    }
+    OTHER_MODEL
+}
+
 /// Record a completed proxy request.
 pub fn record_request(
     provider: &str,
@@ -423,6 +480,10 @@ pub fn record_request(
     overhead_ms: f64,
     ttfb_ms: f64,
 ) {
+    // Bound the client-supplied label before it reaches any metric: the
+    // counter below and the three timing histograms all carry it.
+    let model = bounded_model(model);
+
     requests_total().inc();
     requests_by_provider().with_label_values(&[provider]).inc();
     requests_by_model().with_label_values(&[model]).inc();
@@ -1003,6 +1064,11 @@ pub fn record_provider_cache_observation(
     record_provider_cache_request(provider, read_tokens > 0);
 
     let prior = {
+        // Same bounded vocabulary as record_request; this map grows an entry
+        // per distinct model too. Past the cap the bust heuristic below mixes
+        // models under "other", which is worth it: reaching that point takes
+        // MAX_DISTINCT_MODELS distinct models on cached requests alone.
+        let model = bounded_model(model);
         let mut seen = cache_requests_by_model()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1206,6 +1272,22 @@ pub fn force_register_all(reg: &Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admit_model_caps_distinct_values() {
+        let mut admitted = std::collections::HashSet::new();
+        assert!(admit_model(&mut admitted, "a", 2));
+        assert!(admit_model(&mut admitted, "b", 2));
+
+        // The third distinct model is refused, and refusing must not admit
+        // it — that would spend the cap on the value it just turned away.
+        assert!(!admit_model(&mut admitted, "c", 2));
+        assert_eq!(admitted.len(), 2);
+
+        // Models already admitted keep counting under their own label.
+        assert!(admit_model(&mut admitted, "a", 2));
+        assert_eq!(admitted.len(), 2);
+    }
 
     #[test]
     fn record_request_does_not_panic() {
