@@ -613,6 +613,33 @@ struct SessionCtx {
     client_addr: SocketAddr,
     handler_started: Instant,
     upstream_connect_ms: Option<f64>,
+    /// Counter behind [`SessionCtx::next_request_id`]. Shared with the relay
+    /// task's copy of the context so the per-turn and residual emissions draw
+    /// from one sequence.
+    emission_seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The next id in `base`'s emission sequence: `base` itself first, then
+/// `base-1`, `base-2`, … The first emission keeps the session's request id so
+/// the request log still lines up with the session's trace lines.
+fn next_emission_id(base: &str, seq: &std::sync::atomic::AtomicU64) -> String {
+    let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        base.to_string()
+    } else {
+        format!("{base}-{n}")
+    }
+}
+
+impl SessionCtx {
+    /// A distinct request id for each emitted outcome. One WS session emits an
+    /// outcome per completed turn plus a residual at close; while they all
+    /// carried the session's request id the request log keyed them alike, so
+    /// the dashboard's recent-requests table dropped every turn but one — and
+    /// dropped unrelated rows sharing the reused key with it.
+    fn next_request_id(&self) -> String {
+        next_emission_id(&self.request_id, &self.emission_seq)
+    }
 }
 
 /// Local mirror of proxy.rs's private `ProxyOutcomeSink` — fans a
@@ -760,7 +787,7 @@ fn emit_per_turn_outcome(ctx: &SessionCtx, totals: &mut SessionTotals) {
     };
 
     let outcome = RequestOutcome {
-        request_id: ctx.request_id.clone(),
+        request_id: ctx.next_request_id(),
         provider: "openai".to_string(),
         model: if totals.model.is_empty() {
             "unknown".to_string()
@@ -1062,6 +1089,7 @@ pub async fn ws_codex_handler(
         client_addr,
         handler_started,
         upstream_connect_ms: Some(upstream_connect_ms),
+        emission_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     let ws = if subprotocols.is_empty() {
@@ -1268,7 +1296,7 @@ async fn run_codex_session(client_ws: WebSocket, upstream: Option<UpstreamWs>, c
             || uncached_delta > 0
         {
             let outcome = RequestOutcome {
-                request_id: ctx.request_id.clone(),
+                request_id: ctx.next_request_id(),
                 provider: "openai".to_string(),
                 model: if t.model.is_empty() {
                     "unknown".to_string()
@@ -1689,6 +1717,7 @@ async fn run_codex_session_inner(
             client_addr: ctx.client_addr,
             handler_started: ctx.handler_started,
             upstream_connect_ms: ctx.upstream_connect_ms,
+            emission_seq: Arc::clone(&ctx.emission_seq),
         };
         tokio::spawn(async move {
             let mut had_error = false;
@@ -2419,5 +2448,17 @@ mod compression_failure_metric_tests {
             compression_failure_metric_reason("small_frame_transient"),
             "small_frame_transient"
         );
+    }
+
+    // ── per-emission request ids ─────────────────────────────────
+
+    /// A multi-turn session emits one outcome per completed turn plus a
+    /// residual at close, all off one counter. Each needs its own request-log
+    /// key.
+    #[test]
+    fn emission_ids_are_unique_per_turn() {
+        let seq = std::sync::atomic::AtomicU64::new(0);
+        let ids: Vec<String> = (0..3).map(|_| next_emission_id("req-1", &seq)).collect();
+        assert_eq!(ids, vec!["req-1", "req-1-1", "req-1-2"]);
     }
 }
