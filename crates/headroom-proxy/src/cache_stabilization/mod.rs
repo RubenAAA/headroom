@@ -94,5 +94,6 @@ pub mod prefix_replay;
 pub mod tool_def_normalize;
 pub mod tool_order;
 pub mod tool_prune;
+pub mod ttl_order;
 pub mod usage_observer;
 pub mod volatile_detector;

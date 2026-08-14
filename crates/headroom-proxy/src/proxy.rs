@@ -3723,6 +3723,26 @@ pub(crate) async fn forward_http(
             body_to_send
         };
 
+        // `cache_control` TTL ordering, last of all: it has to read the
+        // markers every stage above left behind, including the ones the
+        // restore just put back.
+        let body_to_send = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) {
+            enforce_cache_control_ttl_order(
+                body_to_send,
+                &original_buffered,
+                // B1 pins every marker to 1h on the operator's orders, so a 1h
+                // marker on such a turn is theirs, not a leak from an earlier
+                // one.
+                state.config.force_1h_cache_ttl && auth_mode != AuthMode::Payg,
+                &request_id,
+            )
+        } else {
+            body_to_send
+        };
+
         // Wire footprint. The last measurement before the body leaves, so it
         // covers every stage — compression, routing, prune, replay, TTL, hooks
         // — not just the compression dispatcher that `tok_saved` is measured
@@ -4993,6 +5013,60 @@ fn restore_client_reasoning_blocks(
                 messages_before = before_messages.len(),
                 "outbound body altered the client's signed reasoning blocks; \
                  forwarding the client's message array instead"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body_to_send,
+    }
+}
+
+/// Make the outbound body satisfy Anthropic's `cache_control` TTL ordering.
+///
+/// A `ttl: "1h"` marker behind a 5-minute one kills the whole turn with a 400,
+/// and the sections are read as one sequence — `tools`, `system`, `messages` —
+/// so a violation can straddle two of them and be invisible to any stage that
+/// looks at one list. See [`cache_stabilization::ttl_order`] for the two
+/// repairs and which one applies when.
+fn enforce_cache_control_ttl_order(
+    body_to_send: bytes::Bytes,
+    original: &bytes::Bytes,
+    forced_1h: bool,
+    request_id: &str,
+) -> bytes::Bytes {
+    // Cheap gate: only a 1h marker can break the rule, and only a 1h marker
+    // can have leaked in.
+    const LONG_TTL: &[u8] = b"\"1h\"";
+    if !body_to_send.windows(LONG_TTL.len()).any(|w| w == LONG_TTL) {
+        return body_to_send;
+    }
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_to_send) else {
+        return body_to_send;
+    };
+
+    // Which lane the turn belongs to is the client's call — except when B1 is
+    // pinning every marker to 1h, which is the operator asking for that lane
+    // on their behalf. Reading an unparseable client body as "asked for 1h"
+    // keeps a marker of theirs from being stripped on a guess.
+    let client_asked_for_1h = forced_1h
+        || serde_json::from_slice::<serde_json::Value>(original)
+            .map(|client| cache_stabilization::ttl_order::asks_for_1h(&client))
+            .unwrap_or(true);
+
+    let repair =
+        cache_stabilization::ttl_order::enforce_ttl_order(&mut parsed, client_asked_for_1h);
+    if repair.is_noop() {
+        return body_to_send;
+    }
+    match serde_json::to_vec(&parsed) {
+        Ok(bytes) => {
+            tracing::warn!(
+                target: "headroom.proxy",
+                event = "cache_control_ttl_order",
+                request_id = %request_id,
+                demoted = repair.demoted,
+                promoted = repair.promoted,
+                client_asked_for_1h,
+                "repaired cache_control TTL ordering before forwarding"
             );
             bytes::Bytes::from(bytes)
         }
@@ -8860,5 +8934,62 @@ mod timing_field_tests {
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["messages"].as_array().unwrap().len(), 3);
         assert_eq!(parsed["messages"][1]["content"][0]["signature"], "sig123");
+    }
+
+    // ── cache_control TTL ordering ───────────────────────────────
+
+    /// A body with no 1h marker cannot break the rule, and pays no parse.
+    #[test]
+    fn a_body_with_no_1h_marker_skips_the_ttl_repair() {
+        let body = as_bytes(&serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        let out = enforce_cache_control_ttl_order(body.clone(), &body, false, "r1");
+        assert_eq!(out, body);
+    }
+
+    /// The `/btw` case end to end: the client's turn is in the 5m lane and a
+    /// replayed 1h marker sits behind its breakpoints.
+    #[test]
+    fn a_replayed_1h_marker_is_contained_before_forwarding() {
+        let client = as_bytes(&serde_json::json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "u"}]}]
+        }));
+        let sent = as_bytes(&serde_json::json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]}]
+        }));
+
+        let out = enforce_cache_control_ttl_order(sent, &client, false, "r1");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(parsed["messages"][0]["content"][0]["cache_control"]
+            .get("ttl")
+            .is_none());
+    }
+
+    /// B1 authors those 1h markers on purpose, so they are not a leak and the
+    /// pin must survive the guard.
+    #[test]
+    fn the_forced_1h_pin_survives_the_ttl_repair() {
+        let client = as_bytes(&serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        let sent = as_bytes(&serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]}]
+        }));
+
+        let out = enforce_cache_control_ttl_order(sent.clone(), &client, true, "r1");
+        assert_eq!(out, sent);
     }
 }
