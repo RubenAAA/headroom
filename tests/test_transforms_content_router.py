@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
 
+import headroom._ort as ort_runtime
 import headroom.transforms.content_router as content_router_module
 from headroom.transforms.content_detector import ContentType, DetectionResult
 from headroom.transforms.content_router import (
@@ -35,6 +37,11 @@ def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(content_router_module, "_detect_native_unhealthy", False)
     monkeypatch.setattr(content_router_module, "_detect_backend_warned", False)
     monkeypatch.setattr(content_router_module, "_detect_panic_warned", False)
+    # Router unit tests replace ``headroom._core.detect_content_type`` with
+    # deterministic fakes. Keep the separate ORT API-compatibility preflight
+    # open so those fakes reach the watchdog/circuit-breaker behavior under
+    # test; incompatibility itself is covered in test_ort_dylib.py (#2960).
+    monkeypatch.setattr(ort_runtime, "rust_ort_runtime_compatible", lambda: True)
 
 
 def test_compression_cache_handles_hits_skips_evictions_and_clear(
@@ -152,6 +159,29 @@ def test_content_signature_and_detection_helpers(monkeypatch: pytest.MonkeyPatch
     assert result.content_type is ContentType.SOURCE_CODE
     assert result.confidence == 1.0
     assert result.metadata == {}
+
+
+def test_native_detection_remains_bounded_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful native call must not disable the watchdog for later calls."""
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module, "_detect_timeout_secs", lambda: 0.01)
+    calls = 0
+
+    def _succeeds_then_hangs(_content: str) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SimpleNamespace(content_type="plain_text")
+        threading.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(_core, "detect_content_type", _succeeds_then_hangs)
+
+    assert _detect_content("first").content_type is ContentType.PLAIN_TEXT
+    assert _detect_content("second").content_type is ContentType.PLAIN_TEXT
+    assert content_router_module._detect_native_unhealthy is True
 
 
 def test_mixed_content_section_splitting_and_json_extraction() -> None:

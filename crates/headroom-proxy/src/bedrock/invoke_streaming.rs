@@ -1126,6 +1126,7 @@ mod tests {
             // PR-E6: drift detector is unused by this URL-builder
             // unit test; small capacity to satisfy the struct shape.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(
@@ -1206,6 +1207,7 @@ mod tests {
             client: reqwest::Client::new(),
             bedrock_credentials: None,
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
             usage_observer: std::sync::Arc::new(

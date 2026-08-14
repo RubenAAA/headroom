@@ -18,6 +18,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -326,12 +327,18 @@ def log_outbound_request(
     mutation_reasons: list[str],
     request_id: str | None,
     source: str,
+    dropped_mutation_reasons: tuple[str, ...] | list[str] | None = None,
 ) -> None:
     """Structured log line for every outbound forwarder call.
 
     Per realignment build constraints: every cache-affecting decision is
     logged. Never includes ``Authorization``/``x-api-key`` content or full
     body bytes.
+
+    ``dropped_mutation_reasons`` records edits that byte-faithful passthrough
+    discarded before the wire. That is a WARNING, not a detail: the line above
+    reports the transforms Headroom *decided* on, and without this the operator
+    reads savings and injections that the upstream never saw.
     """
     logger.info(
         "event=outbound_request forwarder=%s method=%s path=%s body_bytes=%d "
@@ -344,6 +351,405 @@ def log_outbound_request(
         ",".join(mutation_reasons) if mutation_reasons else "",
         source,
         request_id or "",
+    )
+    if dropped_mutation_reasons:
+        logger.warning(
+            "event=outbound_body_mutations_dropped forwarder=%s source=%s "
+            "dropped_mutation_reasons=%s request_id=%s (signed thinking blocks force "
+            "byte-faithful passthrough, so these body edits did NOT reach upstream)",
+            forwarder,
+            source,
+            ",".join(dropped_mutation_reasons),
+            request_id or "",
+        )
+
+
+def count_cache_breakpoints(
+    system: Any,
+    messages: Any,
+    tools: Any,
+) -> dict[str, int]:
+    """Count client ``cache_control`` breakpoints per request section.
+
+    Besides raw counts, records how far from the END of the message list the
+    last marker sits (``last_marker_tail`` = messages after the last marked
+    one). A dropped or backward-moved final breakpoint — the signature of a
+    "large uncached tail next to a healthy cache read" billing regression —
+    shows up as ``last_marker_tail`` growing between inbound and outbound.
+    Nested markers inside ``tool_result`` list content are counted too, so a
+    transform that rewrites sub-blocks can't lose one invisibly.
+    """
+    system_count = 0
+    if isinstance(system, list):
+        system_count = sum(1 for b in system if isinstance(b, dict) and "cache_control" in b)
+
+    tools_count = 0
+    if isinstance(tools, list):
+        tools_count = sum(1 for t in tools if isinstance(t, dict) and "cache_control" in t)
+
+    message_count = 0
+    messages_total = 0
+    last_marker_index = -1
+    if isinstance(messages, list):
+        message_count = len(messages)
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            found = 1 if "cache_control" in msg else 0
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if "cache_control" in block:
+                        found += 1
+                    inner = block.get("content")
+                    if isinstance(inner, list):
+                        found += sum(
+                            1 for sub in inner if isinstance(sub, dict) and "cache_control" in sub
+                        )
+            if found:
+                messages_total += found
+                last_marker_index = i
+
+    last_marker_tail = message_count - 1 - last_marker_index if last_marker_index >= 0 else -1
+    return {
+        "system": system_count,
+        "tools": tools_count,
+        "messages": messages_total,
+        "total": system_count + tools_count + messages_total,
+        "message_count": message_count,
+        "last_marker_tail": last_marker_tail,
+    }
+
+
+# --------------------------------------------------------------------------
+# cache_control TTL lanes (issues #2939, #2767).
+#
+# Anthropic reads cache breakpoints in ONE global walk -- `tools`, then
+# `system`, then `messages` -- and requires every ``ttl="1h"`` marker to appear
+# before every 5-minute one. A bare ``{"type": "ephemeral"}`` marker IS 5m. Get
+# it wrong and the whole turn dies with
+#
+#   messages.15.content.1.cache_control.ttl: a ttl='1h' cache_control block must
+#   not come after a ttl='5m' cache_control block.
+#
+# The rule is already modelled in ``crates/headroom-core/src/cache_control.rs``
+# (``TtlOrderingWalk``), but that walker is instantiated once per field list, so
+# it only sees violations *within* `tools`, `system` or `messages` -- never
+# across them -- and it only warns. The helpers below are the cross-section
+# Python counterpart, and they repair rather than warn, because by the time the
+# body reaches the forwarder any violation in it is one Headroom introduced.
+#
+# No Headroom code ever invents a ``ttl`` value: every marker we re-place is
+# copied from some client marker. So an outbound 1h marker on a request whose
+# client sent none can only have leaked in from an EARLIER turn (via
+# ``overlay_cached_prefix`` replaying the previous turn's forwarded bytes), and
+# the fix is to drop the leaked ttl rather than to spread it.
+# --------------------------------------------------------------------------
+
+CACHE_TTL_1H = "1h"
+CACHE_TTL_5M = "5m"
+#: Any other ``ttl`` value is a lane we don't model; markers carrying one are
+#: reported but never rewritten, so a future Anthropic TTL can't be mangled by
+#: guesswork here. Mirrors ``TtlOrderingWalk::observe`` in headroom-core.
+CACHE_TTL_OTHER = "other"
+
+_TTL_GUARD_ENV = "HEADROOM_CACHE_CONTROL_TTL_GUARD"
+
+
+def cache_control_ttl_lane(marker: Any) -> str:
+    """Return ``"1h"``, ``"5m"`` or ``"other"`` for one ``cache_control`` marker.
+
+    A marker with no ``ttl`` key is 5m -- that is Anthropic's default lane, and
+    treating it as "unknown" instead would make every ordinary Claude Code
+    request look like a violation.
+    """
+    if not isinstance(marker, dict):
+        return CACHE_TTL_OTHER
+    ttl = marker.get("ttl")
+    if ttl is None:
+        return CACHE_TTL_5M
+    ttl = str(ttl)
+    return ttl if ttl in (CACHE_TTL_1H, CACHE_TTL_5M) else CACHE_TTL_OTHER
+
+
+def _revisit_holder(
+    holder: Any,
+    section: str,
+    visit: Callable[[str, dict[str, Any]], dict[str, Any] | None],
+) -> tuple[Any, bool]:
+    """Offer ``holder``'s marker to ``visit``; return a copy only if replaced."""
+    if not isinstance(holder, dict):
+        return holder, False
+    marker = holder.get("cache_control")
+    if not isinstance(marker, dict):
+        return holder, False
+    replacement = visit(section, marker)
+    if replacement is None:
+        return holder, False
+    return {**holder, "cache_control": replacement}, True
+
+
+def walk_cache_control(
+    system: Any,
+    messages: Any,
+    tools: Any,
+    visit: Callable[[str, dict[str, Any]], dict[str, Any] | None],
+) -> tuple[Any, Any, Any, bool]:
+    """Visit every ``cache_control`` marker in Anthropic's evaluation order.
+
+    ``visit(section, marker)`` returns a replacement marker, or ``None`` to
+    leave it alone -- so the same traversal serves both a read-only survey and a
+    rewrite. Sections are rebuilt copy-on-write and the untouched originals are
+    returned by identity: the forwarded body shares structure with the prefix
+    tracker's snapshot of what we sent, so mutating a marker in place would
+    rewrite history the next turn compares against.
+
+    Traversal matches :func:`count_cache_breakpoints`, nested ``tool_result``
+    sub-blocks included, so the guard and the diagnostic can never disagree
+    about what counts as a breakpoint.
+    """
+    changed = False
+
+    new_tools = tools
+    if isinstance(tools, list):
+        rebuilt_tools: list[Any] = []
+        hit = False
+        for tool in tools:
+            out, did = _revisit_holder(tool, "tools", visit)
+            hit = hit or did
+            rebuilt_tools.append(out)
+        if hit:
+            new_tools = rebuilt_tools
+            changed = True
+
+    new_system = system
+    if isinstance(system, list):
+        rebuilt_system: list[Any] = []
+        hit = False
+        for block in system:
+            out, did = _revisit_holder(block, "system", visit)
+            hit = hit or did
+            rebuilt_system.append(out)
+        if hit:
+            new_system = rebuilt_system
+            changed = True
+
+    new_messages = messages
+    if isinstance(messages, list):
+        rebuilt_messages: list[Any] = []
+        any_message_hit = False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                rebuilt_messages.append(msg)
+                continue
+            # Message-level markers are non-standard but Headroom's own
+            # diagnostics count them, so keep the two traversals in step.
+            new_msg, message_hit = _revisit_holder(msg, "messages", visit)
+            content = new_msg.get("content")
+            if isinstance(content, list):
+                rebuilt_blocks: list[Any] = []
+                block_hit = False
+                for block in content:
+                    new_block, did = _revisit_holder(block, "messages", visit)
+                    inner = new_block.get("content") if isinstance(new_block, dict) else None
+                    if isinstance(inner, list):
+                        rebuilt_inner: list[Any] = []
+                        inner_hit = False
+                        for sub in inner:
+                            new_sub, sub_did = _revisit_holder(sub, "messages", visit)
+                            inner_hit = inner_hit or sub_did
+                            rebuilt_inner.append(new_sub)
+                        if inner_hit:
+                            new_block = {**new_block, "content": rebuilt_inner}
+                            did = True
+                    block_hit = block_hit or did
+                    rebuilt_blocks.append(new_block)
+                if block_hit:
+                    new_msg = {**new_msg, "content": rebuilt_blocks}
+                    message_hit = True
+            any_message_hit = any_message_hit or message_hit
+            rebuilt_messages.append(new_msg)
+        if any_message_hit:
+            new_messages = rebuilt_messages
+            changed = True
+
+    return new_system, new_messages, new_tools, changed
+
+
+def cache_control_ttl_lanes(system: Any, messages: Any, tools: Any) -> set[str]:
+    """Return the distinct TTL lanes the request's markers ask for."""
+    lanes: set[str] = set()
+
+    def _survey(_section: str, marker: dict[str, Any]) -> None:
+        lanes.add(cache_control_ttl_lane(marker))
+        return None
+
+    walk_cache_control(system, messages, tools, _survey)
+    return lanes
+
+
+def enforce_cache_control_ttl_order(
+    system: Any,
+    messages: Any,
+    tools: Any,
+    *,
+    client_uses_1h: bool,
+    request_id: str = "",
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Make the outbound body satisfy Anthropic's cache_control TTL ordering.
+
+    Two repairs, in this order:
+
+    1. **Lane containment.** When the client's own request carried no 1h marker
+       anywhere (``client_uses_1h`` is False), strip ``ttl`` from every outbound
+       1h marker. Headroom never authors a ttl, so such a marker is a previous
+       turn's value replayed into this one -- and a client that did not ask for
+       the 1h lane has not sent the ``extended-cache-ttl`` beta header either,
+       so promoting the rest of the request to match it is not an option. This
+       is the ``/btw`` case in #2939: Claude Code forks a side question into the
+       5m lane, and the replayed prefix drags a 1h marker in behind the fork's
+       own 5m ``tools``/``system`` breakpoints.
+    2. **Ordering.** Any 5m marker still sitting before the last 1h marker is
+       promoted to 1h. Here the client *is* in the 1h lane, so the beta header
+       is present and the promotion is safe. This covers the mirror-image bug
+       where a transform downgrades an early breakpoint -- e.g.
+       ``inject_tool_search_deferral`` losing a 1h marker off a deferred tool
+       (#2767) -- leaving the client's later 1h message breakpoints illegal.
+
+    Demoting the later 1h instead would also make the request legal, but it
+    throws away 1h caching the client asked and paid for, which is the exact
+    regression #2375 / #2382 / #2651 were filed to stop.
+
+    Returns ``(system, messages, tools, stats)``. When nothing needed repairing
+    the three sections are the objects that were passed in.
+    """
+    stats: dict[str, Any] = {
+        "violation": False,
+        "demoted": 0,
+        "promoted": 0,
+        "first_short_section": "",
+        "first_long_section": "",
+    }
+    if os.environ.get(_TTL_GUARD_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
+        return system, messages, tools, stats
+
+    if not client_uses_1h:
+
+        def _contain(section: str, marker: dict[str, Any]) -> dict[str, Any] | None:
+            if cache_control_ttl_lane(marker) != CACHE_TTL_1H:
+                return None
+            stats["demoted"] += 1
+            if not stats["first_long_section"]:
+                stats["first_long_section"] = section
+            return {k: v for k, v in marker.items() if k != "ttl"}
+
+        system, messages, tools, contained = walk_cache_control(system, messages, tools, _contain)
+        if contained:
+            stats["violation"] = True
+            logger.warning(
+                "event=cache_control_ttl_order request_id=%s repair=lane_containment "
+                "demoted=%d leaked_from_section=%s; the client sent no 1h marker, so a "
+                "replayed 1h breakpoint would have been rejected upstream",
+                request_id,
+                stats["demoted"],
+                stats["first_long_section"],
+            )
+        return system, messages, tools, stats
+
+    # Ordering pass. Survey first so we know how far the violation reaches, then
+    # rewrite only the markers ahead of the last 1h one.
+    lanes: list[tuple[int, str, str]] = []
+    index = 0
+
+    def _survey(section: str, marker: dict[str, Any]) -> None:
+        nonlocal index
+        lanes.append((index, section, cache_control_ttl_lane(marker)))
+        index += 1
+        return None
+
+    walk_cache_control(system, messages, tools, _survey)
+
+    last_long = max((i for i, _s, lane in lanes if lane == CACHE_TTL_1H), default=-1)
+    offenders = [
+        (i, section) for i, section, lane in lanes if lane == CACHE_TTL_5M and i < last_long
+    ]
+    if not offenders:
+        return system, messages, tools, stats
+
+    stats["violation"] = True
+    stats["first_short_section"] = offenders[0][1]
+    stats["first_long_section"] = next(s for i, s, lane in lanes if lane == CACHE_TTL_1H)
+    offending_indices = {i for i, _section in offenders}
+    cursor = 0
+
+    def _promote(_section: str, marker: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal cursor
+        position = cursor
+        cursor += 1
+        if position not in offending_indices:
+            return None
+        stats["promoted"] += 1
+        return {**marker, "ttl": CACHE_TTL_1H}
+
+    system, messages, tools, _ = walk_cache_control(system, messages, tools, _promote)
+    logger.warning(
+        "event=cache_control_ttl_order request_id=%s repair=promote_to_1h promoted=%d "
+        "first_short_section=%s first_long_section=%s; a 5m breakpoint preceded a 1h one, "
+        "which Anthropic rejects outright",
+        request_id,
+        stats["promoted"],
+        stats["first_short_section"],
+        stats["first_long_section"],
+    )
+    return system, messages, tools, stats
+
+
+def log_cache_breakpoints(
+    *,
+    request_id: str | None,
+    inbound: dict[str, int],
+    outbound: dict[str, int],
+) -> None:
+    """One structured line per request: client breakpoints in vs forwarded out.
+
+    Per realignment build constraints: every cache-affecting decision is
+    logged. Escalates to WARNING when the forwarded request has fewer
+    breakpoints than the client sent, or the last marker moved further from
+    the end of the message list — either one silently un-caches the tail.
+    """
+    dropped = outbound["total"] < inbound["total"]
+    tail_grew = (
+        inbound["last_marker_tail"] >= 0
+        and outbound["last_marker_tail"] != inbound["last_marker_tail"]
+        and (
+            outbound["last_marker_tail"] < 0
+            or outbound["last_marker_tail"] > inbound["last_marker_tail"]
+        )
+    )
+    log = logger.warning if (dropped or tail_grew) else logger.info
+    log(
+        "event=cache_breakpoints request_id=%s "
+        "in_total=%d out_total=%d in_system=%d out_system=%d "
+        "in_tools=%d out_tools=%d in_messages=%d out_messages=%d "
+        "in_msg_count=%d out_msg_count=%d in_last_tail=%d out_last_tail=%d "
+        "dropped=%s tail_grew=%s",
+        request_id or "",
+        inbound["total"],
+        outbound["total"],
+        inbound["system"],
+        outbound["system"],
+        inbound["tools"],
+        outbound["tools"],
+        inbound["messages"],
+        outbound["messages"],
+        inbound["message_count"],
+        outbound["message_count"],
+        inbound["last_marker_tail"],
+        outbound["last_marker_tail"],
+        "true" if dropped else "false",
+        "true" if tail_grew else "false",
     )
 
 
@@ -435,6 +841,82 @@ def append_text_to_latest_user_chat_message(
         return messages, 0
 
     return messages, 0
+
+
+# Anthropic wire contract: the system prompt lives in the top-level ``system``
+# parameter; a ``role="system"`` entry inside ``messages`` is rejected with a
+# 400 ("messages.0: use the top-level 'system' parameter ..."). ``role`` /
+# ``content`` / ``type`` are bare wire keys used throughout this module; only
+# the load-bearing values are named here.
+_ROLE_SYSTEM = "system"
+_TEXT_BLOCK_TYPE = "text"
+
+
+def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
+    """Convert a ``role="system"`` message into Anthropic system content blocks."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return [{"type": _TEXT_BLOCK_TYPE, "text": content}] if content else []
+    if isinstance(content, list):
+        blocks: list[Any] = []
+        for block in content:
+            if isinstance(block, dict):
+                blocks.append(block)
+            elif isinstance(block, str) and block:
+                blocks.append({"type": _TEXT_BLOCK_TYPE, "text": block})
+        return blocks
+    return []
+
+
+def relocate_system_messages_to_top_level(
+    messages: list[dict[str, Any]],
+    system: Any,
+) -> tuple[list[dict[str, Any]], Any, bool]:
+    """Move any ``role="system"`` entries out of ``messages`` into ``system``.
+
+    Anthropic's Messages API rejects a ``system`` role inside ``messages`` with
+    HTTP 400 ("messages.0: use the top-level 'system' parameter for the initial
+    system prompt"). Internal transforms / pipeline extensions can leave a stray
+    system message in the list (e.g. a relocated harness system block during
+    compression). This is the Anthropic forwarder's last line of defense: it
+    guarantees the forwarded body never violates the wire contract, regardless
+    of which transform introduced the entry.
+
+    The relocated content is appended after any existing top-level ``system``
+    so wire order (system prompt, then conversation) is preserved and no content
+    is dropped.
+
+    Returns ``(clean_messages, new_system, changed)``. When no system-role
+    message is present the inputs pass through unchanged (``changed=False``) so
+    the common path is untouched.
+    """
+    system_indices = {
+        i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == _ROLE_SYSTEM
+    }
+    if not system_indices:
+        return messages, system, False
+
+    relocated_blocks: list[Any] = []
+    for i in sorted(system_indices):
+        relocated_blocks.extend(_system_message_to_blocks(messages[i]))
+
+    clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
+
+    if not relocated_blocks:
+        # System message(s) carried no content — drop the empty entries only.
+        return clean_messages, system, True
+
+    if system is None or system == "" or system == []:
+        new_system: Any = relocated_blocks
+    elif isinstance(system, str):
+        new_system = [{"type": _TEXT_BLOCK_TYPE, "text": system}, *relocated_blocks]
+    elif isinstance(system, list):
+        new_system = [*system, *relocated_blocks]
+    else:
+        # Unexpected shape — wrap rather than drop (safety-first: never lose content).
+        new_system = [system, *relocated_blocks]
+
+    return clean_messages, new_system, True
 
 
 def append_text_to_latest_user_input_item(
@@ -1712,6 +2194,43 @@ def has_new_ccr_markers(
     )
 
 
+def history_references_ccr_tool(messages: Any) -> bool:
+    """True when the request history already contains a ``headroom_retrieve`` call.
+
+    Anthropic emits it as an assistant ``tool_use`` content block; OpenAI as an
+    assistant ``tool_calls[].function.name``. When such a reference is present in
+    history but the tool is not re-declared in ``tools``, the provider rejects
+    the whole request (``400 Tool reference 'headroom_retrieve' not found``,
+    #2440). Used to force sticky re-injection on the sessionless path.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == CCR_TOOL_NAME
+                ):
+                    return True
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                name = fn.get("name") if isinstance(fn, dict) else tc.get("name")
+                if name == CCR_TOOL_NAME:
+                    return True
+    return False
+
+
 def apply_session_sticky_ccr_tool(
     *,
     provider: Literal["anthropic", "openai", "google"],
@@ -1719,6 +2238,7 @@ def apply_session_sticky_ccr_tool(
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
+    history_has_ccr_reference: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -1767,9 +2287,14 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, False
 
-    # No session_id (e.g. WS path): per-turn decision drives directly.
+    # No session_id (e.g. WS path): the per-turn flag drives the decision, but
+    # a headroom_retrieve tool_use already sitting in history must ALSO force
+    # re-injection. Without a session the tracker can't remember a prior turn's
+    # CCR, so a later turn with no fresh compression would drop the tool
+    # definition and the provider rejects the request because history still
+    # references it (#2440).
     if not session_id:
-        if not has_compressed_content_this_turn:
+        if not (has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -1783,7 +2308,9 @@ def apply_session_sticky_ccr_tool(
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
-            decision="inject_first_time",
+            decision="inject_first_time"
+            if has_compressed_content_this_turn
+            else "inject_history_reference",
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
@@ -2284,6 +2811,31 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
+    """Return whether Anthropic server-side tool search is valid for this upstream."""
+    from headroom.providers.claude.runtime import is_custom_anthropic_base_url
+
+    return not is_custom_anthropic_base_url(api_base_url)
+
+
+def strip_first_party_tool_search_tools_for_third_party_upstream(
+    tools: Any,
+    api_base_url: str | None,
+) -> Any:
+    """Remove first-party Anthropic tool-search tools when forwarding to a custom upstream."""
+    if not isinstance(tools, list) or anthropic_first_party_tool_search_supported(api_base_url):
+        return tools
+    filtered = [
+        tool
+        for tool in tools
+        if not (
+            isinstance(tool, dict)
+            and str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        )
+    ]
+    return filtered if len(filtered) != len(tools) else tools
+
+
 def inject_tool_search_deferral(
     tools: Any,
     *,
@@ -2306,8 +2858,9 @@ def inject_tool_search_deferral(
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
     for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
+        if isinstance(tool, dict) and (
+            str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            or str(tool.get("name") or "").lower().startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         ):
             return tools  # client already uses tool search — leave it alone
 
@@ -2422,7 +2975,19 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
         return messages, 0
 
     tool_list = tools if isinstance(tools, list) else []
-    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # Typed search tools (type starts with "tool_search_tool_") are the search
+    # mechanism itself — they are never the target of a tool_reference lookup.
+    # Excluding them from `available` ensures that a stale history entry that
+    # references "tool_search_tool_regex" (from a turn where inject deferred a
+    # typeless client tool with that name) is correctly dropped rather than
+    # falsely kept because the injected typed search tool shares the same name.
+    available = {
+        str(t["name"])
+        for t in tool_list
+        if isinstance(t, dict)
+        and t.get("name")
+        and not str(t.get("type") or "").startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+    }
     has_search_tool = any(
         isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         for t in tool_list
@@ -2475,6 +3040,126 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
     return (out, removed) if changed else (messages, 0)
 
 
+def _ccr_result_as_text(block: dict[str, Any]) -> str:
+    """Flatten a ``tool_result`` block's content to plain text, preserving what
+    the model already saw. Falls back to a short placeholder when there is no
+    textual content to keep."""
+    content = block.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        ]
+        joined = "\n".join(part for part in parts if part)
+        if joined.strip():
+            return joined
+    return "[headroom_retrieve result omitted]"
+
+
+def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Neutralize ``headroom_retrieve`` history references the outbound ``tools``
+    array cannot support.
+
+    Claude Code replays one transcript across requests that carry different
+    ``tools`` arrays, and Anthropic validates every history ``tool_use`` against
+    the array of the request at hand. A passthrough side-request (the prompt-type
+    Stop hook evaluator, ``/compact``) that the proxy forwards without declaring
+    ``headroom_retrieve`` then 400s on a historical ``tool_use`` that names it --
+    the CCR sibling of the tool-search history repair (#2814 / #2807). This is
+    belt-and-braces with the injection-side fixes: they keep the tool available
+    where it belongs; this makes the 400 structurally impossible where it cannot.
+
+    When the request does NOT declare ``headroom_retrieve``, replace each
+    ``headroom_retrieve`` ``tool_use`` block and its paired ``tool_result`` with a
+    text block, so no dangling reference survives. Neutralize rather than drop:
+    CCR's ``tool_use`` (an assistant turn) and its ``tool_result`` (the next user
+    turn) live in DIFFERENT messages, so removing a message could leave two
+    same-role messages adjacent and break Anthropic's user/assistant alternation.
+    Replacing blocks in place keeps every message and role intact, and preserves
+    the retrieved text the model already saw.
+
+    Returns ``(messages, blocks_neutralized)``, and the ORIGINAL ``messages``
+    object when nothing changed -- callers rely on identity to skip the write-back.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # The tool is declared this turn (e.g. the main loop, or sticky re-injection),
+    # so its history references resolve. Nothing to repair.
+    if CCR_TOOL_NAME in available:
+        return messages, 0
+
+    # First pass: collect the ids of headroom_retrieve tool_use blocks so their
+    # paired tool_result blocks (in a later user turn) can be matched.
+    retrieve_ids: set[str] = set()
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == CCR_TOOL_NAME
+            ):
+                use_id = block.get("id")
+                if use_id:
+                    retrieve_ids.add(str(use_id))
+
+    if not retrieve_ids:
+        return messages, 0
+
+    out: list[Any] = []
+    neutralized = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        new_content: list[Any] = []
+        touched = False
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_use" and block.get("name") == CCR_TOOL_NAME:
+                    new_content.append(
+                        {
+                            "type": "text",
+                            "text": "[headroom_retrieve call omitted: tool not available this turn]",
+                        }
+                    )
+                    neutralized += 1
+                    touched = True
+                    continue
+                if (
+                    block.get("type") == "tool_result"
+                    and str(block.get("tool_use_id", "")) in retrieve_ids
+                ):
+                    new_content.append({"type": "text", "text": _ccr_result_as_text(block)})
+                    neutralized += 1
+                    touched = True
+                    continue
+            new_content.append(block)
+
+        if touched:
+            changed = True
+            repaired = dict(message)
+            repaired["content"] = new_content
+            out.append(repaired)
+        else:
+            out.append(message)
+
+    return (out, neutralized) if changed else (messages, 0)
+
+
 # ---------------------------------------------------------------------------
 # Server-side Tool Search injection — OpenAI Responses API (gpt-5.4+).
 #
@@ -2485,7 +3170,11 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
 # (only name+description remain) until the model searches for one — while every
 # tool stays callable and the prompt cache is preserved. Same win as Anthropic
 # (~15-25k tool-schema tokens -> ~200) for clients that ship a big tool surface
-# and never opt into tool search themselves (opencode, plain API clients).
+# and never opt into tool search themselves (plain API clients).
+#
+# Two harnesses are excluded. Codex drops deferred-call namespaces during its
+# round trip, while GH #2660 reports OpenCode rejecting the injected
+# `tool_search` tool as unavailable. Their tools therefore stay resident.
 #
 # Differences from the Anthropic path that require a separate function:
 #   * Responses function tools carry ``type: "function"`` (Anthropic real tools
@@ -2500,7 +3189,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
-_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
@@ -2548,8 +3237,9 @@ def inject_tool_search_deferral_openai(
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op for Codex, whose round-trip structs drop deferred-call namespaces. Also
-    no-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    No-op for Codex and OpenCode, whose harnesses cannot safely execute the
+    injected search tool. Also no-op when: the model doesn't support tool search
+    (gpt-5.4+ only), ``tools``
     is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
     tool_search tool is already present (client already defers), or nothing would
     be deferred. Core coding tools and hosted/typed tools (web_search,

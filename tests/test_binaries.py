@@ -257,6 +257,30 @@ def test_fetch_extract_zip(monkeypatch, fake_urlopen):
     assert path.read_bytes() == payload
 
 
+def test_download_retries_transient_network_failure(monkeypatch, tmp_path):
+    attempts = 0
+    sleeps: list[float] = []
+
+    def flaky_urlopen(req, timeout=None):  # noqa: ARG001
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            import urllib.error
+
+            raise urllib.error.URLError("temporary GitHub release failure")
+        return _FakeResponse(b"binary")
+
+    monkeypatch.setattr(binaries.urllib.request, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(binaries.time, "sleep", sleeps.append)
+
+    destination = tmp_path / "download"
+    binaries._download("https://github.com/example/tool", destination, progress=False)
+
+    assert attempts == 3
+    assert sleeps == [0.25, 0.5]
+    assert destination.read_bytes() == b"binary"
+
+
 def test_sha256_mismatch_raises_and_deletes(monkeypatch, fake_urlopen, tmp_path):
     _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
     monkeypatch.setattr(binaries.shutil, "which", lambda _name: None)

@@ -19,6 +19,7 @@ pub mod proxy;
 pub mod relevance;
 pub mod request_outcome;
 pub mod retry;
+pub mod rollout;
 pub mod savings_ledger;
 pub mod savings_tracker;
 pub mod session_sticky;

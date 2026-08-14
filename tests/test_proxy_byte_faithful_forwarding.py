@@ -34,6 +34,7 @@ from headroom.proxy.body_forwarding import (
     BodyMutationTracker,
     OutboundBody,
     get_python_forwarder_mode,
+    outbound_body_is_client_bytes,
     prepare_outbound_body_bytes,
     select_outbound_body,
     serialize_body_canonical,
@@ -170,6 +171,195 @@ def test_prepare_outbound_mutated_uses_canonical() -> None:
     )
     assert out == b'{"a":1,"b":"\xf0\x9f\x94\xa5"}'
     assert source == "canonical"
+
+
+@pytest.mark.parametrize("block_type", ["thinking", "redacted_thinking"])
+def test_signed_thinking_history_with_original_bytes_uses_passthrough(
+    block_type: str,
+) -> None:
+    body = {
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": "Solve this"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": block_type,
+                        "thinking": "private reasoning",
+                        "signature": "sig123",
+                    },
+                    {"type": "text", "text": "The answer is 42."},
+                ],
+            },
+            {"role": "user", "content": "Continue"},
+        ],
+    }
+    original = json.dumps(body, indent=2).encode("utf-8")
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    assert outbound.source == "passthrough"
+    assert outbound.content == original
+
+
+def test_signed_thinking_history_without_original_bytes_uses_canonical() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "private reasoning",
+                        "signature": "sig123",
+                    }
+                ],
+            }
+        ]
+    }
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=None,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    assert outbound.source == "canonical"
+    assert outbound.content == serialize_body_canonical(body)
+
+
+def test_signed_thinking_history_overrides_legacy_encoder() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+    original = json.dumps(body, indent=2).encode("utf-8")
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="legacy_json_kwarg",
+    )
+
+    assert outbound == OutboundBody(content=original, source="passthrough", dropped_mutations=True)
+
+
+def test_signed_thinking_passthrough_reports_the_mutations_it_discarded() -> None:
+    """Passthrough silently winning over a mutated body is what hid #2952."""
+    body = {
+        "stream": False,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ],
+    }
+    original = json.dumps({**body, "stream": True}).encode("utf-8")
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["ccr_streaming_retrieve_buffered_non_stream"],
+    )
+
+    assert outbound.source == "passthrough"
+    assert outbound.dropped_mutations is True
+    assert outbound.dropped_mutation_reasons == ("ccr_streaming_retrieve_buffered_non_stream",)
+
+
+def test_signed_thinking_passthrough_reports_nothing_when_body_unmutated() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+    original = json.dumps(body).encode("utf-8")
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=False,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["irrelevant"],
+    )
+
+    assert outbound.source == "passthrough"
+    assert outbound.dropped_mutations is False
+    assert outbound.dropped_mutation_reasons == ()
+
+
+def test_canonical_path_reports_no_dropped_mutations() -> None:
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=b'{"messages": []}',
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["compression"],
+    )
+
+    assert outbound.source == "canonical"
+    assert outbound.dropped_mutations is False
+    assert outbound.dropped_mutation_reasons == ()
+
+
+@pytest.mark.parametrize(
+    ("original_body_bytes", "expected"),
+    [(b'{"messages": []}', True), (None, False)],
+)
+def test_outbound_body_is_client_bytes_matches_selection(
+    original_body_bytes: bytes | None, expected: bool
+) -> None:
+    """Handlers gate on this before mutating a body for their own upstream call."""
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+
+    assert (
+        outbound_body_is_client_bytes(body=body, original_body_bytes=original_body_bytes)
+        is expected
+    )
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original_body_bytes,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+    assert (outbound.source == "passthrough") is expected
+
+
+def test_outbound_body_is_client_bytes_false_without_thinking_blocks() -> None:
+    assert (
+        outbound_body_is_client_bytes(
+            body={"messages": [{"role": "user", "content": "hi"}]},
+            original_body_bytes=b'{"messages": []}',
+        )
+        is False
+    )
 
 
 def test_prepare_outbound_no_original_bytes_uses_canonical() -> None:

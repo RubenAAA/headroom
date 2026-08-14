@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Any, Literal
 
 from headroom.models.config import ML_MODEL_DEFAULTS
+from headroom.rollout import RolloutSnapshot, resolve_rollout
 
 
 class HeadroomMode(str, Enum):
@@ -672,8 +673,13 @@ class HeadroomConfig:
     content_router_enabled: InitVar[bool | None] = None
 
     # Tool-result interceptors (ast-grep Read outline, etc.). Opt-in for now.
-    # Env var HEADROOM_INTERCEPT_ENABLED=1 also enables (for CLI `--intercept-tool-results`).
+    # The legacy env alias and this typed request still obey the canary rollout gate.
     intercept_tool_results: bool = False
+
+    # Immutable runtime rollout state. ``None`` is resolved once here so every
+    # pipeline built from this config observes the same decisions even if the
+    # process environment later changes.
+    rollout: RolloutSnapshot | None = None
 
     # Debugging - opt-in diff artifact generation
     generate_diff_artifact: bool = False  # Enable to get detailed transform diffs
@@ -681,6 +687,11 @@ class HeadroomConfig:
     # Canonical pipeline lifecycle extensions
     pipeline_extensions: list[Any] = field(default_factory=list)
     discover_pipeline_extensions: bool = True
+
+    def __post_init__(self, content_router_enabled: bool | None = None) -> None:
+        if self.rollout is None:
+            requested = ("tool_result_interceptors",) if self.intercept_tool_results else ()
+            self.rollout = resolve_rollout(requested=requested)
 
     def get_context_limit(self, model: str) -> int | None:
         """

@@ -42,7 +42,8 @@ def test_wrap_codex_prepare_only_updates_config(monkeypatch, tmp_path: Path) -> 
     _set_test_home(monkeypatch, tmp_path)
     runner = CliRunner()
 
-    result = runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
+    with patch("headroom.cli.wrap.ensure_proxy_dependencies", return_value=None):
+        result = runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
 
     assert result.exit_code == 0, result.output
     config_file = tmp_path / ".codex" / "config.toml"

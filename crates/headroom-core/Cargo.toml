@@ -22,7 +22,7 @@ tokenizers = "0.22"
 # with `rustls` (no system OpenSSL dep — keeps the binary static-linkable for
 # AWS deploys). `from_pretrained` is called once at startup, so blocking is
 # fine; if a tokio caller needs it later we can wrap in `spawn_blocking`.
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 # `lru` powers the bounded session-sticky tracker (`session_sticky.rs`), the
 # Rust replacement for Python helpers.py SessionBetaTracker/SessionToolTracker/
 # SessionCcrTracker OrderedDict LRUs. Already in the lock tree transitively;
@@ -133,7 +133,7 @@ blake3 = "1"
 # image may lag behind. Sub-1 MB binary cost. WAL is enabled at
 # connection-open time (see `ccr/backends/sqlite.rs`); no extra feature
 # flags required.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # `redis` for the optional multi-worker CCR backend. Cfg-gated behind
 # the `redis` feature so deploys that don't need it pay no compile
 # cost. Default features include the sync `Connection` API used in
@@ -249,7 +249,7 @@ redis = ["dep:redis"]
 
 [dev-dependencies]
 proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 # Failure accounting (item 6) is a log line and nothing else, so the only test
 # that can prove it works has to read the emitted event.

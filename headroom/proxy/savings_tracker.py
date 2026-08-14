@@ -14,8 +14,10 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import Mapping
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -164,6 +166,23 @@ def _normalize_model(value: Any) -> str:
     return cleaned or MODEL_UNKNOWN
 
 
+# `_resolve_litellm_model` is called on every savings-tracking update (i.e.
+# every request), and `model` is client-controlled — it comes straight off
+# the request body. For a model LiteLLM can't price (a custom / local /
+# gateway name), the uncached fallback below calls `litellm.cost_per_token`
+# purely to probe resolvability, which prints LiteLLM's noisy "Provider
+# List: https://docs.litellm.ai/docs/providers" banner on every failed probe
+# (#2851). Cache the resolution per model name so that probe runs at most
+# once per distinct model — bounded, not a plain dict: a request-facing
+# proxy must not let a caller grow an unbounded cache for free by sending a
+# fresh model string on every request. `maxsize` caps memory; LRU eviction
+# means a model that stops being sent eventually falls out and simply
+# re-probes if it's ever sent again — never a correctness issue, only
+# whether the probe (and its noisy failure banner) reruns.
+_MODEL_RESOLUTION_CACHE_MAXSIZE = 256
+
+
+@lru_cache(maxsize=_MODEL_RESOLUTION_CACHE_MAXSIZE)
 def _resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes.
 
@@ -173,6 +192,12 @@ def _resolve_litellm_model(model: str) -> str:
     "claude-opus" identically to the live /stats path. Uses the shared result
     only when it maps to a priced model_cost key; otherwise falls through to the
     bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
+
+    Bounded LRU cache, keyed by model name — see
+    ``_MODEL_RESOLUTION_CACHE_MAXSIZE`` above. Tests that mock the LiteLLM
+    module across calls with the same model name must call
+    ``_resolve_litellm_model.cache_clear()`` between cases, or results from
+    an earlier case leak in.
     """
     litellm = _get_litellm_module()
     if litellm is None:
@@ -302,6 +327,37 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         return float(cache_read_tokens) * discount
     except Exception:
         return 0.0
+
+
+def estimate_request_savings_usd(
+    model: str,
+    *,
+    compression_tokens_saved: int = 0,
+    tool_schema_tokens_saved: int = 0,
+    output_tokens_saved: int = 0,
+    cache_read_tokens: int = 0,
+) -> dict[str, float]:
+    """Price one request's distinct savings layers for external telemetry.
+
+    The values use the same pricing functions as the built-in dashboard. They
+    stay separate because provider-cache benefit is not caused by compression,
+    and extension attribution can be explanatory rather than additive.
+    """
+
+    return {
+        "compression": _estimate_compression_savings_usd(
+            model, max(_coerce_int(compression_tokens_saved), 0)
+        ),
+        "tool_schema": _estimate_compression_savings_usd(
+            model, max(_coerce_int(tool_schema_tokens_saved), 0)
+        ),
+        "output_shaping": _estimate_output_savings_usd(
+            model, max(_coerce_int(output_tokens_saved), 0)
+        ),
+        "provider_cache": _estimate_cache_savings_usd(
+            model, max(_coerce_int(cache_read_tokens), 0)
+        ),
+    }
 
 
 def _estimate_input_cost_usd(
@@ -693,6 +749,7 @@ class SavingsTracker:
         uncached_input_tokens: int = 0,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
+        estimated_savings_usd: Mapping[str, float] | None = None,
         timestamp: datetime | str | None = None,
     ) -> bool:
         """Persist a canonical display-session update for every request."""
@@ -708,11 +765,24 @@ class SavingsTracker:
 
         delta_tokens_saved = _coerce_int(tokens_saved)
         delta_input_tokens = _coerce_int(input_tokens)
-        delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
-        delta_output_savings_usd = _estimate_output_savings_usd(model, delta_output_tokens_saved)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
-        delta_cache_savings_usd = _estimate_cache_savings_usd(model, delta_cache_read_tokens)
+        priced = estimated_savings_usd
+        delta_savings_usd = (
+            max(_coerce_float(priced.get("compression")), 0.0)
+            if priced is not None
+            else _estimate_compression_savings_usd(model, delta_tokens_saved)
+        )
+        delta_output_savings_usd = (
+            max(_coerce_float(priced.get("output_shaping")), 0.0)
+            if priced is not None
+            else _estimate_output_savings_usd(model, delta_output_tokens_saved)
+        )
+        delta_cache_savings_usd = (
+            max(_coerce_float(priced.get("provider_cache")), 0.0)
+            if priced is not None
+            else _estimate_cache_savings_usd(model, delta_cache_read_tokens)
+        )
         delta_input_cost_usd = _estimate_input_cost_usd(
             model,
             delta_input_tokens,

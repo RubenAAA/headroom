@@ -245,7 +245,9 @@ impl CtxStore {
             conn.prepare("SELECT chunk_count, indexed_at FROM sources WHERE label = ?1 LIMIT 1")?;
         let mut rows = stmt.query_map(params![label], |row| {
             Ok(SourceMeta {
-                chunk_count: row.get(0)?,
+                // rusqlite 0.40 dropped `FromSql for usize`; the column is a
+                // SQLite INTEGER, so read its native width and narrow.
+                chunk_count: row.get::<_, i64>(0)? as usize,
                 indexed_at: row.get(1)?,
             })
         })?;

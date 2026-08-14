@@ -33,6 +33,8 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
@@ -57,6 +59,7 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
     _API_TOKEN_EXPIRES_AT_ENV_VAR,
@@ -74,6 +77,8 @@ from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     claude_user_settings_path,
     configure_vscode_claude_settings,
     detect_claude_code_version,
@@ -87,6 +92,7 @@ from headroom.providers.claude import (
 from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
 )
+from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
@@ -256,6 +262,30 @@ def _read_settings_for_write(path: Path) -> dict[str, Any]:
     return cast("dict[str, Any]", payload)
 
 
+def _claude_settings_env(path: Path) -> dict[str, object]:
+    """Read a Claude settings env block for preflight validation."""
+    env = _read_settings_for_write(path).get("env")
+    return dict(env) if isinstance(env, dict) else {}
+
+
+def _raise_on_claude_auth_conflict(
+    *,
+    user_settings_path: Path,
+    project_settings_path: Path,
+    project_local_settings_path: Path,
+    environ: dict[str, str],
+) -> None:
+    """Refuse an auth state Claude Code rejects before mutating wrap state."""
+    conflict = claude_auth_conflict_sources(
+        (str(user_settings_path), _claude_settings_env(user_settings_path)),
+        (str(project_settings_path), _claude_settings_env(project_settings_path)),
+        (str(project_local_settings_path), _claude_settings_env(project_local_settings_path)),
+        ("shell environment", environ),
+    )
+    if conflict is not None:
+        raise click.ClickException(claude_auth_conflict_message(conflict))
+
+
 def _append_text(path: Path, content: str) -> None:
     """Append to a text file as UTF-8 without translating line endings."""
     fsutil.append_text(path, content)
@@ -269,13 +299,14 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # Issue #746: Claude Code disables on-demand tool loading (deferral) when
 # ANTHROPIC_BASE_URL is a custom host and ENABLE_TOOL_SEARCH is unset, which
 # inflates the local context window by tens of K tokens. Setting the env var
-# when we launch Claude Code keeps deferral on. Default to "true" — defer the
-# MCP/system tools for maximum context savings, matching native first-party
-# behaviour (core built-ins like Read/Edit/Bash are never deferred by Claude
-# Code, so the agent loop is unaffected). The key/default are shared with
-# `init` and `install` via the Claude provider package to prevent drift.
+# when we launch Claude Code keeps deferral on. The generic default stays
+# "true" for non-Foundry sessions, while Foundry uses a dedicated compatibility
+# default of "false" because its upstream does not support the deferred-tool
+# shape. The key/defaults are shared with `init` and `install` via the Claude
+# provider package to prevent drift.
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
+_TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
@@ -301,6 +332,33 @@ def _resolve_1m_model(current: str | None) -> str:
     """
     base = (current or "").strip() or _DEFAULT_1M_MODEL
     return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+
+
+def _apply_1m_to_claude_args(args: tuple[str, ...]) -> tuple[tuple[str, ...], str | None]:
+    """Add the ``[1m]`` suffix to an explicit ``--model`` in pass-through args.
+
+    Claude Code gives the ``--model`` CLI flag precedence over the
+    ``ANTHROPIC_MODEL`` env var, so when a user passes both ``--1m`` and
+    ``--model X`` the env-var suffix is silently shadowed and the session caps at
+    200k (#2915). Rewriting the flag's value the same way ``_resolve_1m_model``
+    rewrites the env var keeps ``--1m`` effective on the higher-precedence flag.
+
+    Handles ``--model VALUE`` and ``--model=VALUE`` (the first occurrence only, as
+    Claude Code honours the first). Idempotent via ``_resolve_1m_model``. Returns
+    ``(new_args, rewritten_value)``; ``rewritten_value`` is ``None`` when no
+    ``--model`` was present (the env-var path already covers that case).
+    """
+    out = list(args)
+    for i, arg in enumerate(out):
+        if arg == "--model" and i + 1 < len(out):
+            rewritten = _resolve_1m_model(out[i + 1])
+            out[i + 1] = rewritten
+            return tuple(out), rewritten
+        if arg.startswith("--model="):
+            rewritten = _resolve_1m_model(arg.split("=", 1)[1])
+            out[i] = f"--model={rewritten}"
+            return tuple(out), rewritten
+    return tuple(out), None
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -331,7 +389,8 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     1. explicit ``--tool-search`` flag — wins (the user asked for it on the CLI),
     2. a pre-existing ``ENABLE_TOOL_SEARCH`` in the environment — respected and
        left untouched (the user's own Claude Code knob),
-    3. the built-in default (``true``).
+    3. the built-in mode-specific default (``true`` normally, ``false`` on
+       Foundry).
 
     Returns the value written, or ``None`` when an existing environment value
     was deliberately left in place.
@@ -346,8 +405,11 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     existing = env.get(_TOOL_SEARCH_ENV)
     if existing is not None and existing.strip():
         return None
-    env[_TOOL_SEARCH_ENV] = _TOOL_SEARCH_DEFAULT
-    return _TOOL_SEARCH_DEFAULT
+    default = (
+        _TOOL_SEARCH_FOUNDRY_DEFAULT if env.get("CLAUDE_CODE_USE_FOUNDRY") else _TOOL_SEARCH_DEFAULT
+    )
+    env[_TOOL_SEARCH_ENV] = default
+    return default
 
 
 # ENABLE_TOOL_SEARCH modes that turn deferral OFF. Everything else Claude Code
@@ -415,6 +477,8 @@ def _resolved_tool_search_mode(flag_value: str | None) -> str:
     existing = os.environ.get(_TOOL_SEARCH_ENV)
     if existing is not None:
         probe[_TOOL_SEARCH_ENV] = existing
+    if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
+        probe["CLAUDE_CODE_USE_FOUNDRY"] = os.environ["CLAUDE_CODE_USE_FOUNDRY"]
     written = _configure_tool_search_env(probe, flag_value)
     return written if written is not None else probe.get(_TOOL_SEARCH_ENV, "")
 
@@ -629,6 +693,15 @@ def _start_proxy(
     proxy_env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(proxy_env)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
+    # `wrap` from a directory that contains a `headroom/` folder (most commonly a
+    # clone of this repo, whose package lives at <root>/headroom/) shadows the
+    # installed wheel with the raw source tree, which has no compiled
+    # `headroom._core`. The proxy then dies with "No module named 'headroom._core'"
+    # and wrap silently falls back to launching the client unwrapped (#2793).
+    # PYTHONSAFEPATH disables that cwd prepend (Python 3.11+; a harmless no-op on
+    # 3.10) so the subprocess always resolves the installed package.
+    proxy_env["PYTHONSAFEPATH"] = "1"
     # Vertex AI RST_STREAMs HTTP/2 connections (error_code:2). Force HTTP/1.1
     # when wrapping a Vertex-mode client so upstream requests succeed.
     if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):
@@ -750,7 +823,7 @@ _RETIRED_CONTEXT_TOOL_MESSAGE = (
     "rewrote shell commands through a third-party binary Headroom no longer "
     "manages. Drop --context-tool / --no-context-tool and unset "
     f"{_RETIRED_CONTEXT_TOOL_ENV}; `headroom wrap` uninstalls what they left "
-    "behind on first run."
+    "behind automatically."
 )
 
 
@@ -810,8 +883,10 @@ def _report_context_tool_purge() -> None:
     default: the Claude ``PreToolUse`` hook, the vendored binaries and the
     injected hint-file guidance are all durable on disk. Running this once per
     ``wrap`` / ``unwrap`` invocation is what actually makes the tools go away.
-    Silent when there is nothing to do, which is the steady state after the first
-    run, and never fatal — a cleanup failure must not block launching the tool.
+    Silent when there is nothing to do — the common case once the machine-global
+    half is stamped done, though the project- and config-directory-scoped half
+    still runs every launch — and never fatal: a cleanup failure must not block
+    launching the tool.
 
     Reports on **stderr**: some subcommands (``wrap/unwrap openclaw
     --prepare-only``) emit machine-readable JSON on stdout as their entire
@@ -1431,6 +1506,36 @@ def _write_claude_wrap_base_url(
     return previous
 
 
+def _write_claude_wrap_tool_search(value: str, *, settings_path: Path | None = None) -> str | None:
+    """Persist the resolved tool-search mode for daemon-spawned workers.
+
+    Claude Code workers read project settings afresh rather than inheriting
+    the parent process environment (#2492). Keep this separate from the proxy
+    URL crash marker: a stale tool-search mode cannot route traffic to a dead
+    process, and is restored transactionally when the wrap session exits.
+    """
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    payload = _read_settings_for_write(path)
+    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+    previous = env_map.get(_TOOL_SEARCH_ENV)
+    env_map[_TOOL_SEARCH_ENV] = value
+    payload["env"] = env_map
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
+    return previous
+
+
+def _restore_claude_wrap_tool_search(
+    previous: str | None, *, settings_path: Path | None = None
+) -> None:
+    """Restore the project-local tool-search value written for this session."""
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=_TOOL_SEARCH_ENV,
+    )
+
+
 def _restore_claude_wrap_base_url(
     previous: str | None,
     *,
@@ -1671,6 +1776,18 @@ def _serena_project_skip_reason(root: Path) -> str | None:
     Serena's own ``~/.serena`` config directory. A linked git worktree (its
     top-level ``.git`` is a file, not a directory) is an ephemeral checkout that
     would pay for its own index at a path that soon disappears.
+
+    A project with no ``.serena/project.yml`` is skipped because the pre-index
+    cannot succeed there (#2938). ``serena project index`` auto-creates the file
+    when it is missing, and that auto-creation calls
+    ``ProjectConfig.autogenerate(interactive=True)``, which asks one ``[y/N]``
+    question per additionally-detected language server. The CLI has no
+    non-interactive switch; the only way to reach the silent branch is to pass
+    ``--ls/--language`` explicitly, which means Headroom guessing the project's
+    languages again — exactly the hand-maintained map removed below. Serena's
+    MCP server generates that file itself (non-interactively) on first start and
+    indexes lazily on demand, so the pre-index simply resumes from the next
+    wrap onwards.
     """
     try:
         resolved = root.resolve()
@@ -1681,46 +1798,144 @@ def _serena_project_skip_reason(root: Path) -> str | None:
         return "$HOME is not a project"
     if (resolved / ".git").is_file():
         return "linked git worktree"
+    if not (resolved / ".serena" / "project.yml").is_file():
+        return "no .serena/project.yml yet — Serena will create it and index on demand"
     return None
+
+
+#: Upper bound on the synchronous pre-index. The agent does not launch until
+#: this call returns, so the number is a stall budget, not just a safety net.
+_SERENA_INDEX_TIMEOUT = 300
+
+
+def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
+    """Kill *proc* and everything it spawned (best-effort, never raises).
+
+    ``uvx`` is a launcher: it resolves the environment and then runs the real
+    ``serena`` executable as a grandchild. Killing only the direct child leaves
+    that grandchild alive and reparented to PID 1, so every timed-out pre-index
+    leaked one process that never exits (#2938 — the same failure mode as #615
+    and #880). The child is started in its own process group precisely so the
+    whole tree can be signalled here.
+    """
+    if sys.platform == "win32":
+        # Windows has no process groups to signal for an already-wedged child;
+        # ``taskkill /T`` walks the tree by parent PID instead. ``/F`` because a
+        # process blocked in a read will not act on a graceful close request.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+    # Backstop: if the tree kill above did not land, at least the direct child
+    # goes. Then reap so the parent does not leave a zombie behind, and close
+    # the capture pipes we opened so the wrap does not carry stray fds into the
+    # agent it is about to exec.
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
 
 
 def _index_serena_project(*, verbose: bool = False) -> None:
     """Warm Serena's symbol cache for the current project (non-fatal).
 
-    Runs ``serena project index`` (the same ``uvx --from git+…`` launch used to
-    start the MCP server) in the project directory so the first symbol query is
-    not paying for a cold index. Timeout-guarded and best-effort: Serena also
-    indexes lazily on demand, so a failure or timeout here never blocks the
-    wrap.
+    Runs ``serena project index`` (the same ``uvx --from serena-agent`` launch
+    used to start the MCP server) in the project directory so the first symbol
+    query is not paying for a cold index. Serena also indexes lazily on demand,
+    so any failure here is survivable.
+
+    This runs on the launch path, synchronously: the agent starts only once it
+    returns, so the timeout below is time the user spends staring at nothing.
+    Two guards keep that bounded (#2938):
+
+    * ``stdin`` is ``DEVNULL``. Serena prompts when it has to auto-create
+      ``project.yml``, and because stdout is captured the question never
+      reaches the terminal — an inherited stdin turned that into a silent,
+      full-timeout hang. EOF makes it fail in about a second instead.
+      ``_serena_project_skip_reason`` already keeps us out of that state; this
+      is the belt-and-braces half, and it covers any future Serena prompt too.
+    * The child gets its own process group so ``_kill_serena_index_tree`` can
+      take out the ``uvx`` grandchild on timeout rather than orphaning it.
     """
     if shutil.which("uvx") is None:
         if verbose:
             click.echo("  Serena: uvx not found — skipping pre-index")
         return
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        # ``subprocess.Popen`` directly, so the encoding defaults that
+        # ``headroom._subprocess.run`` applies have to be repeated here.
+        "encoding": "utf-8",
+        "errors": "replace",
+        "cwd": str(Path.cwd()),
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
     try:
-        result = run(
+        proc = subprocess.Popen(
             [
                 "uvx",
+                # PyPI (prebuilt wheels), not the git source that fails to build
+                # under proot-based filesystems (#2871).
                 "--from",
-                "git+https://github.com/oraios/serena",
+                "serena-agent",
                 "serena",
                 "project",
                 "index",
             ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            cwd=str(Path.cwd()),
+            **popen_kwargs,
         )
-        if result.returncode == 0:
-            click.echo("  Serena: project pre-indexed (symbol cache warmed)")
-        elif verbose:
-            click.echo(f"  Serena: pre-index failed ({(result.stderr or '')[:100]})")
-    except subprocess.TimeoutExpired:
-        click.echo("  Serena: pre-index timed out (will index on demand)")
     except Exception as e:
         if verbose:
             click.echo(f"  Serena: pre-index skipped ({e})")
+        return
+
+    # Announce the wait. Indexing a large repo legitimately takes minutes and
+    # the output is captured, so without this line the wrap looks hung.
+    click.echo("  Serena: pre-indexing project (first run can take a while)…")
+    try:
+        _stdout, stderr = proc.communicate(timeout=_SERENA_INDEX_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_serena_index_tree(proc)
+        click.echo("  Serena: pre-index timed out (will index on demand)")
+        return
+    except Exception as e:
+        _kill_serena_index_tree(proc)
+        if verbose:
+            click.echo(f"  Serena: pre-index skipped ({e})")
+        return
+
+    if proc.returncode == 0:
+        click.echo("  Serena: project pre-indexed (symbol cache warmed)")
+    elif verbose:
+        click.echo(f"  Serena: pre-index failed ({(stderr or '')[:100]})")
 
 
 def _setup_serena_mcp(
@@ -1787,7 +2002,9 @@ def _setup_serena_mcp(
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
     # the agent toward symbol-level tools, then warm the symbol cache. Both are
-    # best-effort and non-fatal — neither blocks the wrap.
+    # best-effort and non-fatal, but the pre-index is *synchronous* — the agent
+    # does not launch until it returns or hits ``_SERENA_INDEX_TIMEOUT``. See
+    # ``_index_serena_project`` for how that wait is kept bounded and visible.
     #
     # Headroom no longer writes ``.serena/project.yml`` language scoping. Serena
     # determines the project's languages itself during
@@ -3416,7 +3633,7 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
-def _ensure_proxy(
+def _ensure_proxy_unlocked(
     port: int,
     no_proxy: bool,
     *,
@@ -3435,7 +3652,13 @@ def _ensure_proxy(
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
 ) -> tuple[subprocess.Popen | None, int]:
-    """Start or verify proxy. Returns (process_handle, actual_port)."""
+    """Start or verify proxy. Returns (process_handle, actual_port).
+
+    The public ``_ensure_proxy`` wrapper serializes callers per port before
+    entering this function. Keeping the implementation separate makes the
+    lock boundary explicit and ensures every health/configuration check runs
+    under the same startup critical section.
+    """
     helpers = _live_wrap_module()
     copilot_subscription_seed_requested = (
         bool(copilot_api_token)
@@ -3800,6 +4023,81 @@ def _ensure_proxy(
                     "to the proxy's existing Vertex upstream."
                 )
         return None, port
+
+
+@contextmanager
+def _proxy_start_lock(port: int) -> Any:
+    """Serialize wrap proxy startup across processes sharing a port.
+
+    A proxy can spend tens of seconds loading optional ML components before it
+    binds its socket. Without this lock, two concurrent ``headroom wrap``
+    commands both see an unavailable health endpoint, choose the same port,
+    and race to spawn a listener. The lock is deliberately held through the
+    health/configuration checks and startup, then released once the proxy is
+    ready (or startup fails). Lock files are retained so an interrupted
+    process cannot create an inode-replacement race for another waiter.
+    """
+    from headroom import paths as _paths
+
+    lock_path = _paths.proxy_start_lock_path(port)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Locking is a race-prevention enhancement, not a reason to make wrap
+        # unusable when a read-only/custom workspace cannot hold state. The
+        # existing port bind remains the final safety check in that degraded
+        # environment.
+        yield
+        return
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits. A proxy may
+            # legitimately take longer than that to load ML components, so
+            # use the non-blocking primitive in a loop instead.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@wraps(_ensure_proxy_unlocked)
+def _ensure_proxy(
+    port: int,
+    no_proxy: bool,
+    **kwargs: Any,
+) -> tuple[subprocess.Popen | None, int]:
+    """Start or reuse a proxy without racing another wrap on the same port."""
+    if no_proxy:
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
+    with _proxy_start_lock(port):
+        # Re-checking is part of the lock boundary: a concurrent wrapper may
+        # have finished startup while this caller was waiting for the lock.
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
 
 
 def _client_marker_path(port: int) -> Path:
@@ -4463,6 +4761,8 @@ def claude(
 
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
+    _tool_search_not_written = object()
+    _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
@@ -4471,6 +4771,12 @@ def claude(
     # early proxy-start failure would make the finally raise UnboundLocalError,
     # masking the real error and skipping cleanup(). Mirrors the holders above.
     _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    _raise_on_claude_auth_conflict(
+        user_settings_path=claude_user_settings_path(),
+        project_settings_path=Path.cwd() / ".claude" / "settings.json",
+        project_local_settings_path=_wrap_settings_path,
+        environ=dict(os.environ),
+    )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
@@ -4694,6 +5000,11 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
+        _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
+        _saved_tool_search[0] = _write_claude_wrap_tool_search(
+            _resolved_tool_search_value,
+            settings_path=_wrap_settings_path,
+        )
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -4717,10 +5028,18 @@ def claude(
         # force it via ANTHROPIC_MODEL on the launched process.
         if context_1m:
             env[_ANTHROPIC_MODEL_ENV] = _resolve_1m_model(env.get(_ANTHROPIC_MODEL_ENV))
-            click.echo(
-                f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
-                "(1M context window; issue #1158)"
-            )
+            # An explicit pass-through --model outranks ANTHROPIC_MODEL in Claude
+            # Code, so add the suffix there too or the env var is silently
+            # shadowed and the window stays 200k (#2915). Report what will
+            # actually take effect rather than the shadowed env value.
+            claude_args, _model_flag_1m = _apply_1m_to_claude_args(claude_args)
+            if _model_flag_1m is not None:
+                click.echo(f"  --model {_model_flag_1m} (1M context window; issue #1158)")
+            else:
+                click.echo(
+                    f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
+                    "(1M context window; issue #1158)"
+                )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
         raise SystemExit(result.returncode)
@@ -4731,6 +5050,11 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
+        if _saved_tool_search[0] is not _tool_search_not_written:
+            _restore_claude_wrap_tool_search(
+                cast(str | None, _saved_tool_search[0]),
+                settings_path=_wrap_settings_path,
+            )
         _restore_claude_wrap_base_url(
             _saved_base_url[0],
             foundry_mode=_settings_foundry[0],
@@ -5044,8 +5368,11 @@ def copilot(
                 "automatic model selection."
             )
 
+        env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
         effective_wire_api = wire_api or (
-            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
+            env_wire_api
+            if env_wire_api in {"completions", "responses"}
+            else _copilot_default_wire_api_for_model(selected_model)
         )
         env["COPILOT_PROVIDER_TYPE"] = "openai"
         # Per-project savings: the Copilot CLI cannot send custom headers, so
@@ -5184,8 +5511,8 @@ def vscode_copilot(
 ) -> None:
     """Run Headroom for GitHub Copilot inside Visual Studio Code.
 
-    Transparently overrides Copilot's proxy endpoint, preserving the model
-    selected in VS Code. It does not edit Codex settings.
+    Transparently overrides Copilot's proxy and CAPI endpoints, preserving the
+    model selected in VS Code. It does not edit Codex settings.
     """
     resolution = _require_copilot_subscription_resolution()
     target_settings = settings_file or vscode_settings_path()
@@ -5204,6 +5531,9 @@ def vscode_copilot(
         click.echo("  Add these user settings to VS Code:")
         click.echo(
             f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
+        )
+        click.echo(
+            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
         )
         click.echo('  "github.copilot.advanced.debug.overrideAuthType": "token"')
 
@@ -5469,6 +5799,9 @@ def _run_codex_wrap(
     codex_args: tuple,
 ) -> None:
     """Execute the Codex wrap flow against the durable Codex home."""
+    if not no_proxy:
+        ensure_proxy_dependencies()
+
     if prepare_only:
         _prepare_codex_wrap_state(
             port=port,
@@ -6936,6 +7269,20 @@ def opencode(
             )
         subscription_resolution = _require_copilot_subscription_resolution()
 
+    # Verify the opencode binary exists BEFORE mutating any config. Otherwise a
+    # missing binary leaves headroom MCP/Serena/memory entries in the user's
+    # opencode config and an injected AGENTS.md, then errors with no cleanup --
+    # the config-before-verify anti-pattern (#1614). Siblings (claude, codex,
+    # goose, omp) already check first. `--prepare-only` intentionally writes
+    # config without launching, so it is exempt.
+    opencode_bin: str | None = None
+    if not prepare_only:
+        opencode_bin = shutil.which("opencode")
+        if not opencode_bin:
+            click.echo("Error: 'opencode' not found in PATH.")
+            click.echo("Install OpenCode: https://opencode.ai")
+            raise SystemExit(1)
+
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
     _opencode_config_file, _opencode_backup_file = opencode_config_paths()
@@ -6976,11 +7323,9 @@ def opencode(
         inject_opencode_provider_config(port)
         return
 
-    opencode_bin = shutil.which("opencode")
-    if not opencode_bin:
-        click.echo("Error: 'opencode' not found in PATH.")
-        click.echo("Install OpenCode: https://opencode.ai")
-        raise SystemExit(1)
+    # Past the prepare-only return the launch path always ran the binary check
+    # above, so opencode_bin is resolved.
+    assert opencode_bin is not None
 
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a

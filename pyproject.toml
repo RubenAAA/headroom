@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.34.0"
+version = "0.35.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -78,11 +78,17 @@ proxy = [
     "orjson>=3.9.14; platform_python_implementation != 'PyPy'",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
+    # The server still uses the v1 low-level Server decorator API. Keep this
+    # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
     "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
-    "onnxruntime>=1.16.0",        # Kompress ONNX INT8 text compression (no torch needed)
+    # Rust fastembed enables ORT C API 24. ORT <1.24 deadlocks instead of
+    # returning an initialization error; 1.24+ no longer ships Python 3.10
+    # wheels, so 3.10 keeps Python-only ORT and bypasses native detection.
+    "onnxruntime>=1.24.0; python_version>='3.11'",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
     "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
@@ -232,7 +238,8 @@ mcp = [
 ]
 # Voice filler detection
 voice = [
-    "onnxruntime>=1.16.0",
+    "onnxruntime>=1.24.0; python_version>='3.11'",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
     "transformers>=5.5.0,<6.0",
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
@@ -270,7 +277,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff==0.15.17",
+    "ruff==0.15.22",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -495,6 +502,7 @@ markers = [
     "slow: slow tests (model loads, large fixtures)",
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
     "live: opt-in multi-turn tests that hit real upstream APIs; require provider keys",
+    "proxy_dependency_gate: exercises ensure_proxy_dependencies() without mocking",
 ]
 
 [tool.coverage.run]
