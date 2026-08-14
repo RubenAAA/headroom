@@ -55,9 +55,11 @@ pub fn compute_optimal_k(items: &[&str], bias: f64, min_k: usize, max_k: Option<
     let n = items.len();
     let effective_max = max_k.unwrap_or(n);
 
-    // Tier 1: fast path.
+    // Tier 1: fast path. Clamps like every other exit below: the caller's
+    // cap is a cap at any n, and returning more items than were asked for
+    // is not a shortcut the small-input case gets to take.
     if n <= 8 {
-        return n;
+        return n.min(effective_max);
     }
 
     // Near-total redundancy: at most 3 unique groups → keep that many.
@@ -611,6 +613,16 @@ mod tests {
         let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
         let k = compute_optimal_k(&refs, 1.0, 3, Some(10));
         assert!(k <= 10, "k={} should be ≤ max_k=10", k);
+    }
+
+    #[test]
+    fn compute_optimal_k_respects_max_k_on_the_small_input_fast_path() {
+        // n <= 8 takes the fast path, which used to return n outright and
+        // hand back more items than the caller capped it at.
+        let items = ["a", "b", "c", "d", "e"];
+        assert_eq!(compute_optimal_k(&items, 1.0, 1, Some(2)), 2);
+        // No cap still keeps everything.
+        assert_eq!(compute_optimal_k(&items, 1.0, 1, None), 5);
     }
 
     #[test]
