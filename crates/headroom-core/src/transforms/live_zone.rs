@@ -566,8 +566,17 @@ fn code_compressor() -> &'static CodeAwareCompressor {
     INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
 }
 
+// Source-code compression changes request content, so it remains disabled
+// unless an operator explicitly enables it at proxy startup.
+static CODE_COMPRESSOR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable AST-aware `SourceCode` compression process-wide.
+pub fn set_code_compressor_enabled(enabled: bool) {
+    CODE_COMPRESSOR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 // Process-wide gate for the Kompress (PlainText) compressor. Default OFF:
-// unlike the always-on structural compressors and CodeCompressor, Kompress
+// unlike the structural compressors and opt-in CodeCompressor, Kompress
 // carries a ~261 MB ONNX model, so an operator must opt in before it is ever
 // loaded. Mirrors the Python reference's `config.enable_kompress`. The proxy
 // sets this once at startup from `--enable-kompress`.
@@ -626,7 +635,9 @@ fn kompress() -> Option<&'static Kompress> {
 /// or not cached). Idempotent: the underlying `OnceLock` loads at most once.
 pub fn warm_live_zone_compressors() -> bool {
     // CodeCompressor: statically-linked grammars, trivial to construct.
-    let _ = code_compressor();
+    if CODE_COMPRESSOR_ENABLED.load(Ordering::Relaxed) {
+        let _ = code_compressor();
+    }
 
     // Kompress: perform the (potentially slow) load here, off the request path.
     // `Some` iff enabled AND the model was already in the HF cache.
@@ -1525,6 +1536,11 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             }
         }
         ContentType::SourceCode => {
+            if !CODE_COMPRESSOR_ENABLED.load(Ordering::Relaxed) {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
+            }
             let result = code_compressor().compress(text);
             // The engine returns the input unchanged for passthrough
             // branches (below min-tokens, UNKNOWN language, invalid-syntax

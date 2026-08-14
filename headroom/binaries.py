@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -245,12 +246,24 @@ def _download(url: str, dest: Path, *, progress: bool = True) -> None:
         raise OSError(f"binary cache directory is not writable: {dest.parent}")
     final_url = _mirror_url(url)
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (https)
-            total = int(resp.headers.get("Content-Length") or 0)
-            _stream_to(resp, dest, total, label=dest.name, show_progress=progress)
-    except urllib.error.URLError as e:
-        raise BinaryFetchError(f"failed to download {final_url}: {e}") from e
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (https)
+                total = int(resp.headers.get("Content-Length") or 0)
+                _stream_to(resp, dest, total, label=dest.name, show_progress=progress)
+            return
+        except urllib.error.URLError as e:
+            dest.unlink(missing_ok=True)
+            if attempt == attempts:
+                raise BinaryFetchError(
+                    f"failed to download {final_url} after {attempts} attempts: {e}"
+                ) from e
+            # GitHub release assets occasionally return a transient 5xx or
+            # reset while redirecting to the object store. A short bounded
+            # retry keeps proxy startup reliable without hiding persistent
+            # credential, mirror, or connectivity failures.
+            time.sleep(0.25 * attempt)
 
 
 def _stream_to(src: Any, dest: Path, total: int, *, label: str, show_progress: bool) -> None:

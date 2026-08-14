@@ -30,6 +30,8 @@ from headroom.paths import savings_path
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     REMOTE_CONTROL_SIBLING_GATE_NOTE,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     detect_claude_code_version,
     is_custom_anthropic_base_url,
     remote_control_applies_to_auth,
@@ -47,6 +49,13 @@ SKIP = "skip"
 
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
 _CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
+
+# Ollama's fixed default port. `ollama launch claude` writes
+# ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
+# child, which outranks the persistent-install env block and silently bypasses
+# the Headroom proxy (issue #2199). Recognized so the routing diagnostic names
+# the collision instead of telling the user to re-probe port 11434.
+_OLLAMA_DEFAULT_PORT = 11434
 
 
 @dataclass
@@ -180,6 +189,39 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             hint="wrap it: headroom wrap claude",
         )
     return _classify_routing_url(name, base_url, port, source=str(settings_path))
+
+
+def check_claude_auth_conflict(
+    settings_path: Path,
+    project_settings_path: Path,
+    project_local_settings_path: Path,
+    environ: Mapping[str, str],
+) -> CheckResult | None:
+    """Report contradictory effective Claude credentials without their values."""
+
+    def settings_env(path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        env = payload.get("env") if isinstance(payload, dict) else None
+        return dict(env) if isinstance(env, dict) else {}
+
+    conflict = claude_auth_conflict_sources(
+        (str(settings_path), settings_env(settings_path)),
+        (str(project_settings_path), settings_env(project_settings_path)),
+        (str(project_local_settings_path), settings_env(project_local_settings_path)),
+        ("shell environment", environ),
+    )
+    if conflict is None:
+        return None
+    return CheckResult(
+        name="claude auth",
+        status=FAIL,
+        summary=claude_auth_conflict_message(conflict),
+    )
 
 
 def check_claude_remote_control_gate(
@@ -344,6 +386,22 @@ def _classify_routing_url(name: str, url: str, port: int, *, source: str) -> Che
         )
     found_port = int(match.group(1))
     if found_port != port:
+        if found_port == _OLLAMA_DEFAULT_PORT:
+            # Not a mis-probed Headroom port — this is Ollama's endpoint, so
+            # `headroom doctor --port 11434` would only chase a red herring.
+            return CheckResult(
+                name=name,
+                status=WARN,
+                summary=(
+                    f"points at Ollama ({url}), not the Headroom proxy ({source}) — "
+                    "`ollama launch claude` bypasses the persistent Headroom route"
+                ),
+                hint=(
+                    "both claim ANTHROPIC_BASE_URL; run Ollama-backed sessions "
+                    "through Headroom by chaining the proxy at its Ollama upstream "
+                    "(see issue #2199)"
+                ),
+            )
         return CheckResult(
             name=name,
             status=WARN,
@@ -426,7 +484,36 @@ def check_budget(stats: dict[str, Any] | None) -> CheckResult:
             hint="set one: headroom proxy --budget 10 (env: HEADROOM_BUDGET)",
         )
     period = cost.get("budget_period", "daily")
-    return CheckResult(name=name, status=PASS, summary=f"${limit}/{period} budget enforced")
+    summary = f"${limit}/{period} budget enforced"
+    return CheckResult(name=name, status=PASS, summary=summary + _estimated_basis_note(cost))
+
+
+def _estimated_basis_note(cost: dict[str, Any]) -> str:
+    """Describe how much of the period's spend was booked from a token estimate.
+
+    Informational, never a WARN: a provider that simply never reports a usage
+    breakdown would otherwise sit at a permanent warning. Every read is
+    defensive so `doctor` still works against a proxy predating these fields.
+    """
+    note = ""
+
+    basis = cost.get("budget_basis")
+    if isinstance(basis, dict):
+        estimated_usd = basis.get("estimated_usd")
+        estimated_pct = basis.get("estimated_pct")
+        if isinstance(estimated_usd, (int, float)) and estimated_usd > 0:
+            pct = f"{estimated_pct:.0f}% " if isinstance(estimated_pct, (int, float)) else ""
+            note += (
+                f" — {pct}of period spend (${estimated_usd:.4f}) "
+                "booked from Headroom token estimates"
+            )
+
+    # Reported independently of the breakdown: a non-default policy changes how
+    # the budget is enforced and should surface even if the split is missing.
+    policy = cost.get("budget_estimated_basis")
+    if isinstance(policy, str) and policy and policy != "count":
+        note += f" — estimated-basis policy: {policy}"
+    return note
 
 
 def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckResult | None:
@@ -515,16 +602,26 @@ def doctor(port: int, emit_json: bool) -> None:
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
 
+    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
+    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     checks = [
         check_proxy_liveness(livez, base_url),
         check_version_drift(livez, installed),
         check_claude_routing(claude_settings_path(), port),
-        check_wrap_marker_staleness(Path.cwd() / ".claude" / "settings.local.json"),
+        check_wrap_marker_staleness(project_local_claude_settings),
         check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
+    auth_conflict_check = check_claude_auth_conflict(
+        claude_settings_path(),
+        project_claude_settings,
+        project_local_claude_settings,
+        os.environ,
+    )
+    if auth_conflict_check is not None:
+        checks.append(auth_conflict_check)
     # Lazy resolver: `claude --version` is a Node CLI subprocess (seconds of
     # cold start, 10s worst-case timeout) — only pay for it when the RC gate
     # is actually plausible (custom base URL + subscription auth).

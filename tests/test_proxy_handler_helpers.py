@@ -17,7 +17,10 @@ from headroom.proxy.handlers.openai import (
     _passthrough_usage_from_json,
     _prefers_http1_passthrough,
 )
-from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.helpers import (
+    _headroom_bypass_enabled,
+    relocate_system_messages_to_top_level,
+)
 from headroom.proxy.server import HeadroomProxy
 
 
@@ -268,6 +271,46 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     assert changed == 1
 
 
+def test_relocate_system_messages_moves_stray_system_into_top_level() -> None:
+    # Issue #765: compression relocated the harness system block into
+    # messages[0] as a role="system" entry, which Anthropic rejects with a 400.
+    # The forwarder guard must move it back to the top-level `system` parameter.
+    messages = [
+        {"role": "system", "content": "You are a harness."},
+        {"role": "user", "content": "hi"},
+    ]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None)
+
+    assert changed is True
+    # No role="system" entry may survive in messages[] — that is the wire-contract violation.
+    assert all(m.get("role") != "system" for m in clean)
+    assert clean == [{"role": "user", "content": "hi"}]
+    # The relocated content lands in the top-level system parameter.
+    assert system == [{"type": "text", "text": "You are a harness."}]
+
+
+def test_relocate_system_messages_appends_to_existing_system() -> None:
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "B"}]},
+        {"role": "user", "content": "hi"},
+    ]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "A")
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    # Existing system first, relocated content after — wire order preserved.
+    assert system == [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]
+
+
+def test_relocate_system_messages_noop_without_system_entry() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "A")
+
+    assert changed is False
+    assert clean is messages
+    assert system == "A"
+
+
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
     assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True
@@ -379,6 +422,51 @@ def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
         "output_tokens": 7,
         "cache_read_input_tokens": 3,
     }
+
+
+def test_gemini_output_tokens_includes_thinking_when_exclusive() -> None:
+    """Gemini 2.5 thinking: when prompt + candidates != total, thoughtsTokenCount
+    is a separate output bucket and must be added, or output cost undercounts."""
+    from headroom.proxy.token_counting import gemini_output_tokens
+
+    exclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 200,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(exclusive) == 700  # 200 visible + 500 thinking
+
+    # Inclusive: candidatesTokenCount already covers thoughts (prompt+cand==total).
+    inclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 700,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(inclusive) == 700
+
+    # No thinking tokens: just the candidates count (common non-2.5 case).
+    assert gemini_output_tokens({"candidatesTokenCount": 42, "totalTokenCount": 100}) == 42
+    # Robust to empty / missing fields.
+    assert gemini_output_tokens({}) == 0
+
+
+def test_passthrough_usage_counts_gemini_thinking_tokens() -> None:
+    """_passthrough_usage_from_json must include thinking tokens in output_tokens."""
+    usage = _passthrough_usage_from_json(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 500,
+                "totalTokenCount": 1700,
+                "cachedContentTokenCount": 100,
+            }
+        }
+    )
+    assert usage["output_tokens"] == 700
+    assert usage["input_tokens"] == 1000
 
 
 def test_vertex_passthrough_records_usage_metadata_for_dashboard() -> None:
@@ -851,7 +939,8 @@ def test_resolve_ccr_workspace_explicit_project_id_wins() -> None:
     request = _fake_request({"x-headroom-project-id": "my-cool-project"})
     body = {}
     key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
-    assert key == "my-cool-project"
+    assert key.startswith("my-cool-project-")
+    assert len(key.split("-")[-1]) == 16
     assert label == "my-cool-project"
 
 

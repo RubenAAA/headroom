@@ -70,7 +70,6 @@ jobs:
               - 'headroom/cli/**'
               - 'headroom/install/**'
               - 'headroom/providers/**'
-              - 'headroom/rtk/**'
               - 'crates/**'
               - '**/*.rs'
               - 'Cargo.toml'
@@ -294,6 +293,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: coverage-${{ matrix.shard }}.xml
+          disable_search: true
           flags: python
           name: python-shard-${{ matrix.shard }}
           # Token is sent so uploads authenticate once the repo is activated on
@@ -561,7 +561,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install pytest 'opentelemetry-api>=1.24.0'
       - name: Run native installer wrapper tests
         run: pytest tests/test_install/test_native_installers.py -q
 
@@ -579,7 +579,7 @@ jobs:
         run: |
           brew install bash
           python -m pip install --upgrade pip
-          python -m pip install --retries 10 --timeout 60 pytest
+          python -m pip install --retries 10 --timeout 60 pytest 'opentelemetry-api>=1.24.0'
       - name: Run native installer wrapper tests
         run: |
           BASH_PREFIX="$(brew --prefix bash)"

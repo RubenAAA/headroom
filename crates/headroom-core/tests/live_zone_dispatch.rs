@@ -263,6 +263,7 @@ fn diff_tool_result_routes_to_diff_compressor() {
 
 #[test]
 fn source_code_tool_result_routes_to_code_compressor() {
+    headroom_core::transforms::set_code_compressor_enabled(true);
     // Detector classifies this as SourceCode; the dispatcher now routes it
     // to the Rust CodeCompressor (was no-op before the port landed). Twenty
     // identical multi-line Rust functions are well above the SourceCode byte

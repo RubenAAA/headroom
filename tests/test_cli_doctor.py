@@ -390,6 +390,17 @@ class TestShellEnv:
         env = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
         assert check_shell_env(env, 8787).status == WARN
 
+    def test_ollama_launch_url_names_the_collision(self):
+        # `ollama launch claude` points Claude Code at Ollama's :11434, which
+        # outranks the persistent Headroom route (issue #2199). The diagnostic
+        # must name Ollama, not tell the user to re-probe port 11434.
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"}
+        result = check_shell_env(env, 8787)
+        assert result.status == WARN
+        assert "Ollama" in result.summary
+        assert "#2199" in (result.hint or "")
+        assert "--port 11434" not in (result.hint or "")
+
 
 class TestSavings:
     def test_from_stats_passes_with_totals(self, tmp_path):
@@ -444,6 +455,62 @@ class TestBudget:
         assert result.status == PASS
         assert "$10.0/daily" in result.summary
 
+    def test_estimated_basis_share_is_reported_without_warning(self):
+        """#2713: spend booked from a token estimate is surfaced, not warned on.
+
+        A provider that never reports a usage breakdown would otherwise sit at a
+        permanent WARN, so this stays informational.
+        """
+        result = check_budget(
+            {
+                "cost": {
+                    "budget_limit_usd": 10.0,
+                    "budget_period": "daily",
+                    "budget_estimated_basis": "count",
+                    "budget_basis": {"estimated_usd": 1.24, "estimated_pct": 62.3},
+                }
+            }
+        )
+        assert result.status == PASS
+        assert "62% of period spend ($1.2400)" in result.summary
+        assert "Headroom token estimates" in result.summary
+
+    def test_all_measured_spend_adds_no_note(self):
+        result = check_budget(
+            {
+                "cost": {
+                    "budget_limit_usd": 10.0,
+                    "budget_period": "daily",
+                    "budget_estimated_basis": "count",
+                    "budget_basis": {"estimated_usd": 0.0, "estimated_pct": 0.0},
+                }
+            }
+        )
+        assert result.summary == "$10.0/daily budget enforced"
+
+    def test_non_default_basis_policy_is_named(self):
+        result = check_budget(
+            {
+                "cost": {
+                    "budget_limit_usd": 10.0,
+                    "budget_period": "daily",
+                    "budget_estimated_basis": "block",
+                }
+            }
+        )
+        assert "estimated-basis policy: block" in result.summary
+
+    def test_missing_basis_fields_degrade_quietly(self):
+        """`doctor` must still work against a proxy predating these fields."""
+        result = check_budget({"cost": {"budget_limit_usd": 10.0, "budget_period": "daily"}})
+        assert result.status == PASS
+        assert result.summary == "$10.0/daily budget enforced"
+
+        malformed = check_budget(
+            {"cost": {"budget_limit_usd": 10.0, "budget_period": "daily", "budget_basis": "nope"}}
+        )
+        assert malformed.status == PASS
+
 
 @dataclass
 class _FakeManifest:
@@ -479,7 +546,16 @@ class TestDoctorCommand:
         monkeypatch.setattr(doctor_mod, "codex_config_path", lambda: tmp_path / "config.toml")
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: tmp_path / "savings.json")
         monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
-        for var in ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "HEADROOM_PORT"):
+        for var in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_VERTEX",
+            "OPENAI_BASE_URL",
+            "HEADROOM_PORT",
+        ):
             monkeypatch.delenv(var, raising=False)
         return tmp_path
 
@@ -499,6 +575,23 @@ class TestDoctorCommand:
         assert result.exit_code == 2
         assert "not reachable" in result.output
 
+    def test_conflicting_claude_auth_is_a_redacted_failure(self, runner, isolated, monkeypatch):
+        settings = isolated / "settings.json"
+        settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "api-value")
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(None, None))
+
+        result = runner.invoke(main, ["doctor", "--json"])
+
+        assert result.exit_code == 2
+        payload = json.loads(result.output)
+        auth = next(check for check in payload["checks"] if check["name"] == "claude auth")
+        assert auth["status"] == "fail"
+        assert "shell environment" in auth["summary"]
+        assert str(settings) in auth["summary"]
+        assert "api-value" not in result.output
+        assert "token-value" not in result.output
+
     def test_warnings_only_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
@@ -509,6 +602,7 @@ class TestDoctorCommand:
     def test_remote_control_warning_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
+        monkeypatch.setattr(doctor_mod, "detect_claude_code_version", lambda: None)
         (isolated / "settings.json").write_text(
             json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}),
             encoding="utf-8",

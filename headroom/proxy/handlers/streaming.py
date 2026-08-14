@@ -12,12 +12,13 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalescing
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
     retry_after_ms,
 )
+from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -224,7 +225,7 @@ class StreamingMixin:
                     usage_meta = data.get("usageMetadata")
                     if usage_meta:
                         usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                        usage["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                        usage["output_tokens"] = gemini_output_tokens(usage_meta)
                         # Gemini also has cachedContentTokenCount for context caching
                         usage["cache_read_input_tokens"] = usage_meta.get(
                             "cachedContentTokenCount", 0
@@ -342,7 +343,7 @@ class StreamingMixin:
                 usage_meta = data.get("usageMetadata")
                 if usage_meta:
                     usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                    usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                    usage_found["output_tokens"] = gemini_output_tokens(usage_meta)
                     usage_found["cache_read_input_tokens"] = usage_meta.get(
                         "cachedContentTokenCount", 0
                     )
@@ -1032,7 +1033,6 @@ class StreamingMixin:
         4. Streams the final response to the client
         """
         session_key = session_key or self._get_session_key(body)
-        self._active_streams.add(session_key)
 
         # Guard everything up to the generator's own try/finally (which owns
         # cleanup once streaming starts): any exception here — including
@@ -1097,6 +1097,7 @@ class StreamingMixin:
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
+        from starlette.background import BackgroundTask
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
@@ -1104,6 +1105,15 @@ class StreamingMixin:
         # ...) from the *client's* User-Agent before copilot-auth
         # potentially rewrites headers for upstream.
         client = classify_client(headers)
+        # Mid-turn message coalescing (queueing a concurrent same-session
+        # request and later replaying it via a `headroom_pending_messages`
+        # SSE event) is a Claude Code-only protocol. Only register the stream
+        # as active for coalescing when the client can consume that protocol,
+        # so concurrent requests from other harnesses (e.g. OpenCode subagents
+        # that share a body-derived session key) are streamed normally instead
+        # of being swallowed. (#1608)
+        if supports_mid_turn_coalescing(client):
+            self._active_streams.add(session_key)
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
@@ -1649,16 +1659,35 @@ class StreamingMixin:
                     client=client,
                     waste_signals=waste_signals,
                 )
-                if pending_messages:
+                if supports_mid_turn_coalescing(client) and pending_messages:
                     pending_event = json.dumps(
                         {"type": "headroom_pending_messages", "messages": pending_messages}
                     )
                     yield f"event: headroom_pending_messages\ndata: {pending_event}\n\n".encode()
 
+        async def _release_upstream_stream() -> None:
+            # Guarantee the upstream HTTP/2 stream is released even when the
+            # body generator above is never iterated — the client disconnected
+            # before Starlette started sending the response body (routine when a
+            # harness like Claude Code cancels or supersedes an in-flight turn),
+            # so ``generate()`` never entered its own ``aclosing`` and nothing
+            # else closes ``upstream_response``. Each such request otherwise
+            # leaks one open h2 stream; they accumulate on the pooled upstream
+            # connection until it reaches SETTINGS_MAX_CONCURRENT_STREAMS (100)
+            # and no new stream can open ("Max outbound streams is 100, 100
+            # open"), and the proxy goes unhealthy until restart (#2797).
+            # Starlette runs a response's ``background`` task after the body
+            # finishes *and* after an early client disconnect, so this fires in
+            # both cases. ``aclose()`` is idempotent, so on the normal path —
+            # where the generator already closed the stream — this is a no-op.
+            with contextlib.suppress(Exception):
+                await upstream_response.aclose()
+
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
             headers=forwarded_headers,
+            background=BackgroundTask(_release_upstream_stream),
         )
 
     async def _stream_response_bedrock(
@@ -1678,6 +1707,7 @@ class StreamingMixin:
         original_messages: list[dict] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream response from Bedrock backend with metrics tracking.
 
@@ -1695,6 +1725,11 @@ class StreamingMixin:
         from fastapi.responses import StreamingResponse
 
         from headroom.proxy.outcome import RequestOutcome
+
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
 
         client = classify_client(headers)
 
@@ -1720,9 +1755,17 @@ class StreamingMixin:
 
         async def generate():
             try:
-                assert self.anthropic_backend is not None
+                assert backend is not None
 
-                async for event in self.anthropic_backend.stream_message(body, headers):
+                # Emit a synthetic ping before the first message_start so that
+                # downstream clients (e.g. Claude Code) arm their mid-turn
+                # steering / interruptible state.  The Bedrock-to-Anthropic
+                # translation layer never produces SSE-level keepalives; we
+                # synthesise one here to match the real Anthropic wire format
+                # (issue #902).
+                yield b"event: ping\ndata: {}\n\n"
+
+                async for event in backend.stream_message(body, headers):
                     # Record TTFB on first event
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
@@ -1798,9 +1841,7 @@ class StreamingMixin:
 
             finally:
                 total_latency = (time.time() - start_time) * 1000
-                _backend_name = (
-                    self.anthropic_backend.name if self.anthropic_backend else "anthropic"
-                )
+                _backend_name = backend.name if backend else "anthropic"
 
                 # Update prefix cache tracker for the next turn — mirrors
                 # _finalize_stream_response (direct-API streaming path)
@@ -1899,6 +1940,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
@@ -1933,7 +1975,11 @@ class StreamingMixin:
         from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
         from headroom.proxy.outcome import RequestOutcome
 
-        assert self.anthropic_backend is not None
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
+        assert backend is not None
         client = classify_client(headers)
 
         async def generate():
@@ -1963,7 +2009,7 @@ class StreamingMixin:
                         stream_state[key] = usage[key]
 
             try:
-                async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
+                async for sse_chunk in backend.stream_openai_message(body, headers):
                     chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
                     stream_state["sse_buffer"].extend(chunk_bytes)
                     full_sse_bytes.extend(chunk_bytes)
@@ -2065,7 +2111,7 @@ class StreamingMixin:
                 # instead of collapsing the dashboard headline to 0%.
                 outcome = RequestOutcome.from_stream(
                     body=body,
-                    provider=self.anthropic_backend.name,
+                    provider=backend.name,
                     model=model,
                     request_id=request_id,
                     original_tokens=original_tokens,
@@ -2090,7 +2136,7 @@ class StreamingMixin:
                 if tokens_saved > 0:
                     logger.info(
                         f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
-                        f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name} [stream]"
+                        f"(saved {tokens_saved:,} tokens) via {backend.name} [stream]"
                     )
 
         return StreamingResponse(

@@ -178,7 +178,7 @@ class SessionAnalyzer:
             total_failures=len(failed_calls),
         )
 
-        # Detect loops up front: an RTK re-fetch loop has NO failed calls
+        # Detect loops up front: a re-fetch loop has NO failed calls
         # (each truncated command succeeds), so it must be a first-class reason
         # to analyze — otherwise the guard below would skip the most expensive
         # waste pattern whenever a session has no failures and no events.
@@ -423,7 +423,7 @@ Your job is to identify patterns that, if documented, would PREVENT TOKEN WASTE 
 Focus on (in priority order):
 1. **Loops (HIGHEST PRIORITY)** — patterns that REPEATED within a session. If the
    digest has a "Detected Loops" section, every loop there MUST get a guardrail
-   rule, because loop waste scales with repetition. This includes RTK re-fetch
+   rule, because loop waste scales with repetition. This includes re-fetch
    loops: a command whose output was truncated, so the agent re-ran variants of
    it to fetch more. The fix names the command and prescribes getting the full
    output up front (e.g., "read the whole file" / "raise the output limit for X").

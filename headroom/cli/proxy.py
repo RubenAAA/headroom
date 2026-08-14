@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import warnings
+from importlib import import_module
 from typing import Any, Literal, cast
 
 import click
@@ -17,6 +18,38 @@ from headroom.providers.registry import (
 from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 
 from .main import main
+
+
+def ensure_proxy_dependencies() -> None:
+    """Verify optional proxy extras are installed before starting or wrapping."""
+    required_modules: list[str] = [
+        "fastapi",
+        "uvicorn",
+        "httpx",
+        "openai",
+        "mcp",
+        "magika",
+        "zstandard",
+        "websockets",
+        "onnxruntime",
+        "transformers",
+        "watchdog",
+    ]
+    if sys.implementation.name != "pypy":
+        required_modules.append("orjson")
+
+    try:
+        for module in required_modules:
+            import_module(module)
+    except ImportError as e:
+        click.secho(
+            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
+            fg="red",
+            err=True,
+        )
+        click.secho(f"Details: {e}", fg="red", err=True)
+        raise SystemExit(1) from None
+
 
 # ---------------------------------------------------------------------------
 # Startup log suppression.
@@ -66,11 +99,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub"
 
 # ---------------------------------------------------------------------------
 
-_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
-_CONTEXT_TOOL_RTK = "rtk"
-_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
-
 
 def _get_env_bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
@@ -115,19 +143,6 @@ def _get_env_float_optional(name: str) -> float | None:
         return float(val)
     except ValueError:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
-
-
-def _selected_context_tool() -> str:
-    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
-    if not raw:
-        return _CONTEXT_TOOL_RTK
-    if raw == "leanctx":
-        raw = _CONTEXT_TOOL_LEAN_CTX
-    if raw not in _VALID_CONTEXT_TOOLS:
-        raise click.ClickException(
-            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
-        )
-    return raw
 
 
 @main.command()
@@ -276,7 +291,7 @@ def dashboard(port: int, no_open: bool) -> None:
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.). "
-        "Off by default while this feature ships."
+        "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
     ),
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
@@ -329,6 +344,19 @@ def dashboard(port: int, no_open: bool) -> None:
         "No-CCR lossless mode: compress tool outputs with format-native lossless "
         "compaction (and marker-free SmartCrusher) without emitting any CCR "
         "retrieval marker, so no MCP retrieve tool is needed. Env: HEADROOM_LOSSLESS=1."
+    ),
+)
+@click.option(
+    "--ccr-inline-resolve",
+    is_flag=True,
+    envvar="HEADROOM_CCR_INLINE_RESOLVE",
+    help=(
+        "Resolve <<ccr:...>> markers inline on the response path instead of "
+        "relying on the model to call headroom_retrieve. For callers with no "
+        "tool-call round-trip to redeem a marker (e.g. Headroom running as a "
+        "LiteLLM guardrail/proxy hop, see issue #2509). Applies to non-streaming "
+        "responses only. Off by default. "
+        "Env: HEADROOM_CCR_INLINE_RESOLVE."
     ),
 )
 @click.option(
@@ -552,6 +580,20 @@ def dashboard(port: int, no_open: bool) -> None:
         "Env: HEADROOM_BUDGET_PERIOD."
     ),
 )
+@click.option(
+    "--budget-estimated-basis",
+    type=click.Choice(["count", "ignore", "block"]),
+    default="count",
+    envvar="HEADROOM_BUDGET_ESTIMATED_BASIS",
+    help=(
+        "What to do with spend booked from Headroom's own token estimate, which "
+        "happens when a provider response carries no input-token breakdown. "
+        "count: it consumes the budget like measured spend (default). "
+        "ignore: only provider-reported spend consumes the budget. "
+        "block: refuse requests rather than enforce a hard limit on an estimate. "
+        "Env: HEADROOM_BUDGET_ESTIMATED_BASIS."
+    ),
+)
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
 # Pair of flags so users can override the env-var default in either direction.
 # We resolve HEADROOM_CODE_AWARE_ENABLED in the body (not via Click's envvar=),
@@ -632,7 +674,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
         "out of the provider prefix cache and compress them once their "
-        "file quiesces (env: HEADROOM_READ_MATURATION=1)"
+        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
+        "env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -938,6 +981,7 @@ def proxy(
     tpm: int | None,
     no_ccr: bool,
     lossless: bool,
+    ccr_inline_resolve: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
@@ -959,6 +1003,7 @@ def proxy(
     codex_wire_debug_dir: str | None,
     budget: float | None,
     budget_period: str,
+    budget_estimated_basis: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
     disable_kompress_fallback: bool,
@@ -1020,23 +1065,16 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    ensure_proxy_dependencies()
+
     # Import here to avoid slow startup
-    try:
-        from headroom.proxy.server import (
-            ProxyConfig,
-            _parse_csv_tools,
-            _parse_exclude_tools,
-            _parse_tool_profiles,
-            run_server,
-        )
-    except ImportError as e:
-        click.secho(
-            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
-            fg="red",
-            err=True,
-        )
-        click.secho(f"Details: {e}", fg="red", err=True)
-        raise SystemExit(1) from None
+    from headroom.proxy.server import (
+        ProxyConfig,
+        _parse_csv_tools,
+        _parse_exclude_tools,
+        _parse_tool_profiles,
+        run_server,
+    )
 
     # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
     if learn and no_learn:
@@ -1069,12 +1107,46 @@ def proxy(
             err=True,
         )
 
+    # Resolve rollout inputs once before constructing any rollout-managed
+    # behavior. The immutable snapshot is injected into ProxyConfig and is also
+    # what /stats later exposes.
+    from headroom.rollout import resolve_rollout
+
+    rollout_requests = []
+    if intercept_tool_results:
+        rollout_requests.append("tool_result_interceptors")
+    if read_maturation:
+        rollout_requests.append("read_maturation")
+    rollout_snapshot = resolve_rollout(os.environ, requested=rollout_requests)
+
+    if read_maturation and not rollout_snapshot.is_enabled("read_maturation"):
+        click.secho(
+            "error: --read-maturation is not available in the current rollout channel "
+            f"({rollout_snapshot.channel.value}). Set HEADROOM_ROLLOUT_CHANNEL=beta "
+            "(or dev), or use HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for an "
+            "emergency override.",
+            fg="red",
+            err=True,
+        )
+        sys.exit(1)
+
     # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
     # Only fetch the bundled CLI tool binaries when the feature is enabled —
     # otherwise we'd pay a network round-trip and risk a readonly-FS failure
     # for capabilities the user hasn't asked for. The TransformPipeline reads
-    # this env var at construction time.
+    # the resolved snapshot says it is active.
     if intercept_tool_results:
+        if not rollout_snapshot.is_enabled("tool_result_interceptors"):
+            click.secho(
+                "error: --intercept-tool-results is not available in the current "
+                f"rollout channel ({rollout_snapshot.channel.value}). Set "
+                "HEADROOM_ROLLOUT_CHANNEL=canary to dogfood it, or use "
+                "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for emergency override.",
+                fg="red",
+                err=True,
+            )
+            sys.exit(1)
+
         from headroom.binaries import ensure_tools
 
         resolved_tools = ensure_tools()
@@ -1092,7 +1164,6 @@ def proxy(
                 err=True,
             )
             sys.exit(1)
-        os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
 
     try:
         resolved_anthropic_extra_headers = resolve_extra_headers(
@@ -1174,6 +1245,7 @@ def proxy(
     config = ProxyConfig(
         host=host,
         port=port,
+        rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
         openai_extra_headers=resolved_openai_extra_headers,
@@ -1209,6 +1281,7 @@ def proxy(
         # CCR fully on.
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
+        ccr_resolve_markers_inline=ccr_inline_resolve,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -1253,6 +1326,7 @@ def proxy(
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
         budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
+        budget_estimated_basis=cast(Literal["count", "ignore", "block"], budget_estimated_basis),
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
@@ -1278,7 +1352,7 @@ def proxy(
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
         # Read maturation (Mechanism B): experimental, OFF by default
-        read_maturation=read_maturation,
+        read_maturation=rollout_snapshot.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=read_maturation_quiesce_turns,
         read_maturation_max_hold_turns=read_maturation_max_hold_turns,
         read_maturation_min_size_bytes=read_maturation_min_size_bytes,
@@ -1460,7 +1534,6 @@ Memory (Multi-Provider):
     from headroom.proxy.server import _get_code_aware_banner_status
 
     code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
-    context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
@@ -1490,7 +1563,6 @@ Starting proxy server...
   Memory:       {memory_status}
   License:      {license_status}
 {code_aware_line}
-{context_tool_line}
 {extensions_line}
 {security_line}
 {stateless_line}{telemetry_line}

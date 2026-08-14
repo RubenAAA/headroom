@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from collections.abc import Iterable
 
 import click
 
 from headroom import paths as _paths
 from headroom.providers.install_registry import build_install_target_envs
+from headroom.rollout import RolloutChannel
 
 from .models import (
     ConfigScope,
     DeploymentManifest,
     InstallPreset,
     ProviderSelectionMode,
+    RuntimeKind,
     SupervisorKind,
     ToolTarget,
 )
@@ -140,9 +143,19 @@ def build_manifest(
 
     normalized_profile = validate_profile_name(profile)
 
-    if preset == InstallPreset.PERSISTENT_SERVICE.value:
+    # A Windows service must implement the Service Control Manager protocol.
+    # The Python runner is an ordinary console process, so registering it with
+    # ``sc.exe create`` always fails at start with SCM error 1053.  Task
+    # Scheduler can run the same runner safely and already provides startup
+    # plus periodic health recovery, so make it the effective preset on
+    # Windows instead of creating a service that can never start (#2552).
+    effective_preset = preset
+    if sys.platform.startswith("win") and preset == InstallPreset.PERSISTENT_SERVICE.value:
+        effective_preset = InstallPreset.PERSISTENT_TASK.value
+
+    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
         supervisor_kind = SupervisorKind.SERVICE.value
-    elif preset == InstallPreset.PERSISTENT_TASK.value:
+    elif effective_preset == InstallPreset.PERSISTENT_TASK.value:
         supervisor_kind = SupervisorKind.TASK.value
     else:
         supervisor_kind = SupervisorKind.NONE.value
@@ -168,6 +181,26 @@ def build_manifest(
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:
         base_env.update(extra_env)
+    if intercept_tool_results:
+        configured_channel = base_env.get("HEADROOM_ROLLOUT_CHANNEL")
+        if configured_channel is None:
+            # The flag is an explicit canary opt-in. Persist the matching
+            # channel so the generated service can actually start.
+            base_env["HEADROOM_ROLLOUT_CHANNEL"] = RolloutChannel.CANARY.value
+        else:
+            channel = RolloutChannel.parse(configured_channel)
+            unsafe = base_env.get("HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "enabled",
+            }
+            if not channel.allows(RolloutChannel.CANARY) and not unsafe:
+                raise click.ClickException(
+                    "--intercept-tool-results requires HEADROOM_ROLLOUT_CHANNEL=canary "
+                    "(or dev), unless the unsafe rollout override is explicitly enabled"
+                )
 
     proxy_args = [
         "--host",
@@ -181,7 +214,19 @@ def build_manifest(
     ]
     proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
     if memory_enabled:
-        proxy_args.extend(["--memory", "--memory-db-path", str(_paths.memory_db_path())])
+        proxy_args.append("--memory")
+        # `_paths.memory_db_path()` resolves against the HOST home. A container
+        # runtime cannot use it: the container's HOME is /tmp/headroom-home and
+        # the host's ~/.headroom is bind-mounted there, so a host path like
+        # /home/<user>/.headroom/memory.db does not exist inside the container,
+        # SQLite fails to open the DB, /readyz stays 503, and the deployment
+        # times out and rolls back (#2803). Omit the flag for a container runtime:
+        # the proxy then resolves the DB under its own cwd (.headroom/memory.db),
+        # which is the container's workdir and therefore the bind mount, landing
+        # in the same host file the explicit path intended. On the host (python)
+        # runtime the resolved host path is correct, so keep passing it.
+        if runtime_kind != RuntimeKind.DOCKER.value:
+            proxy_args.extend(["--memory-db-path", str(_paths.memory_db_path())])
     if anyllm_provider:
         proxy_args.extend(["--anyllm-provider", anyllm_provider])
     if region:
@@ -200,7 +245,7 @@ def build_manifest(
     container_name = f"headroom-{normalized_profile}"
     return DeploymentManifest(
         profile=normalized_profile,
-        preset=preset,
+        preset=effective_preset,
         runtime_kind=runtime_kind,
         supervisor_kind=supervisor_kind,
         scope=scope,

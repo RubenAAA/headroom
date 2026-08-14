@@ -14,6 +14,7 @@ from typing import Any, Literal
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.model_router import ModelRouterConfig
+from headroom.rollout import RolloutSnapshot, resolve_rollout
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +66,13 @@ class RequestLog:
     total_latency_ms: float | None
 
     # Metadata
-    tags: dict[str, str]
+    tags: dict[str, Any]
     cache_hit: bool
     transforms_applied: list[str]
+
+    # Per-request attribution. Headline totals remain authoritative, so these
+    # explanatory rows are never added a second time.
+    savings_breakdown: list[dict[str, Any]] = field(default_factory=list)
 
     # Provider-side cache economics (Anthropic prompt caching, #2438).
     # ``cache_hit`` alone is ambiguous: a call billed cache-*creation* (write)
@@ -133,6 +138,8 @@ class ProxyConfig:
     # Server
     host: str = "127.0.0.1"
     port: int = 8787
+    # Resolved at this configuration boundary and then injected unchanged.
+    rollout: RolloutSnapshot | None = None
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
     openai_api_url: str | None = None  # Custom OpenAI API URL override
     # Display label for the OpenAI-compatible upstream (dashboard/stats only).
@@ -186,6 +193,13 @@ class ProxyConfig:
     # markers can be toggled from the CLI (--no-ccr, which also drops the retrieve
     # tool). Threaded into the router in server.py; default preserves current behavior.
     ccr_inject_marker: bool = True
+    # Explicit opt-in fallback for callers with no path to redeem a marker via
+    # the headroom_retrieve tool (e.g. a LiteLLM guardrail/proxy hop with no
+    # tool-call turn — issue #2509). Off by default: guessing "this caller
+    # can't use tools" is fragile, so operators must opt in with
+    # --ccr-inline-resolve / HEADROOM_CCR_INLINE_RESOLVE. Applies to
+    # non-streaming responses only; buffered-CCR streaming is untouched.
+    ccr_resolve_markers_inline: bool = False
 
     # CCR Response Handling
     ccr_handle_responses: bool = True
@@ -319,6 +333,9 @@ class ProxyConfig:
     cost_tracking_enabled: bool = True
     budget_limit_usd: float | None = None
     budget_period: Literal["hourly", "daily", "monthly"] = "daily"
+    # What spend booked from Headroom's own token estimate (provider returned no
+    # usage breakdown) does to budget enforcement. See budget_basis_policy.
+    budget_estimated_basis: Literal["count", "ignore", "block"] = "count"
 
     # Logging
     log_requests: bool = True
@@ -483,7 +500,22 @@ class ProxyConfig:
     # ``HeadroomProxy._run_compression_in_executor``.
     compression_max_workers: int | None = None
 
+    # Number of built-in uvicorn worker processes sharing this listen socket.
+    # Kept at the end to avoid shifting existing positional constructor fields.
+    # Process-local runtime hot reload is unsafe above one worker because only
+    # the worker receiving the admin request would observe the update.
+    worker_processes: int = 1
+
     def __post_init__(self, smart_routing: bool | None = None) -> None:
+        if self.rollout is None:
+            self.rollout = resolve_rollout()
+        # ``read_maturation`` remains a concrete, already-resolved runtime
+        # setting for programmatic/config-file callers.  The CLI composition
+        # root derives it from this same snapshot before constructing the
+        # config; rewriting it here would resolve policy a second time and
+        # break explicit non-CLI configuration.
+        if self.worker_processes < 1:
+            raise ValueError("worker_processes must be >= 1")
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
         # A 0 (or negative) requests-per-minute limit divides by zero in the
