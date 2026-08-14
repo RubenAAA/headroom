@@ -2626,29 +2626,12 @@ pub(crate) async fn forward_http(
                         .get("model")
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown");
-                    let messages = parsed
-                        .get("messages")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    // Build extra key fields: system, tools, tool_choice,
-                    // temperature, top_p, top_k, max_tokens, stop.
-                    let mut extra = serde_json::Map::new();
-                    for key in &[
-                        "system",
-                        "tools",
-                        "tool_choice",
-                        "temperature",
-                        "top_p",
-                        "top_k",
-                        "max_tokens",
-                        "stop",
-                    ] {
-                        if let Some(val) = parsed.get(*key) {
-                            extra.insert(key.to_string(), val.clone());
-                        }
-                    }
-                    if let Some(entry) = cache.get(&messages, model, &extra) {
+                    // `None` when the body carries no turn array we can key
+                    // on, in which case the request is neither served from
+                    // the cache nor stored in it.
+                    if let Some(entry) = crate::semantic_cache::cache_key_inputs(&parsed)
+                        .and_then(|(messages, extra)| cache.get(&messages, model, &extra))
+                    {
                         tracing::info!(
                             event = "semantic_cache_hit",
                             request_id = %request_id,
@@ -4437,26 +4420,6 @@ pub(crate) async fn forward_http(
                                 .get("model")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("unknown");
-                            let messages = parsed
-                                .get("messages")
-                                .and_then(|v| v.as_array())
-                                .cloned()
-                                .unwrap_or_default();
-                            let mut extra = serde_json::Map::new();
-                            for key in &[
-                                "system",
-                                "tools",
-                                "tool_choice",
-                                "temperature",
-                                "top_p",
-                                "top_k",
-                                "max_tokens",
-                                "stop",
-                            ] {
-                                if let Some(val) = parsed.get(*key) {
-                                    extra.insert(key.to_string(), val.clone());
-                                }
-                            }
                             let response_headers: std::collections::HashMap<String, String> =
                                 resp_headers
                                     .iter()
@@ -4466,21 +4429,27 @@ pub(crate) async fn forward_http(
                                             .map(|val| (k.as_str().to_string(), val.to_string()))
                                     })
                                     .collect();
-                            cache.set(
-                                &messages,
-                                model,
-                                body_bytes.to_vec(),
-                                response_headers,
-                                0,
-                                &extra,
-                            );
-                            tracing::debug!(
-                                event = "semantic_cache_set",
-                                request_id = %request_id,
-                                model = model,
-                                body_bytes = body_bytes.len(),
-                                "cached non-streaming response"
-                            );
+                            // Same key derivation as the lookup above; the two
+                            // have to move together or the cache stops hitting.
+                            if let Some((messages, extra)) =
+                                crate::semantic_cache::cache_key_inputs(&parsed)
+                            {
+                                cache.set(
+                                    &messages,
+                                    model,
+                                    body_bytes.to_vec(),
+                                    response_headers,
+                                    0,
+                                    &extra,
+                                );
+                                tracing::debug!(
+                                    event = "semantic_cache_set",
+                                    request_id = %request_id,
+                                    model = model,
+                                    body_bytes = body_bytes.len(),
+                                    "cached non-streaming response"
+                                );
+                            }
                         }
                     }
                 }

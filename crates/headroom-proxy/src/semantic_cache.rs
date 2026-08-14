@@ -24,6 +24,49 @@ fn strip_cache_control(obj: &Value) -> Value {
     }
 }
 
+/// Fields besides the turn array that change the answer, and so have to
+/// change the key. `instructions` is the Responses API's system prompt —
+/// the counterpart of Anthropic's `system`.
+const KEY_EXTRA_FIELDS: &[&str] = &[
+    "system",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "stop",
+];
+
+/// The turn array and extra fields a cache key has to cover, or `None` when
+/// the body carries no array we recognize as the turn and so cannot be keyed.
+///
+/// Anthropic Messages and Chat Completions both put the turn in `messages`;
+/// the Responses API puts it in a top-level `input` and its system prompt in
+/// `instructions`. Reading only `messages` and defaulting a miss to an empty
+/// array made the key blind to the request: every Responses turn on one model
+/// hashed alike, so a second turn was served the first turn's cached body.
+/// Gemini's `contents` collided the same way. Returning `None` keeps a shape
+/// we cannot key out of the cache instead of keying it on nothing — a missed
+/// cache hit costs latency, a false hit returns someone else's answer.
+pub fn cache_key_inputs(parsed: &Value) -> Option<(Vec<Value>, serde_json::Map<String, Value>)> {
+    let turns = match parsed.get("messages").or_else(|| parsed.get("input")) {
+        Some(Value::Array(items)) => items.clone(),
+        // `input` may also be a bare string rather than an array of items.
+        Some(Value::String(text)) => vec![Value::String(text.clone())],
+        _ => return None,
+    };
+
+    let mut extra = serde_json::Map::new();
+    for key in KEY_EXTRA_FIELDS {
+        if let Some(val) = parsed.get(*key) {
+            extra.insert((*key).to_string(), val.clone());
+        }
+    }
+    Some((turns, extra))
+}
+
 /// A cached response entry.
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
