@@ -3712,6 +3712,17 @@ pub(crate) async fn forward_http(
             apply_request_hooks(body_to_send, endpoint, &request_id)
         };
 
+        // Signed reasoning blocks, checked after every stage that can rewrite
+        // the message array has run.
+        let body_to_send = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) {
+            restore_client_reasoning_blocks(body_to_send, &original_buffered, &request_id)
+        } else {
+            body_to_send
+        };
+
         // Wire footprint. The last measurement before the body leaves, so it
         // covers every stage — compression, routing, prune, replay, TTL, hooks
         // — not just the compression dispatcher that `tok_saved` is measured
@@ -4710,7 +4721,11 @@ fn relocate_ephemeral_blocks_in_body(body: bytes::Bytes, request_id: &str) -> by
         .filter(|m| !m.is_empty())
         .cloned()
     else {
-        log_relocation(request_id, &RelocationReport::skipped("no_messages_array"), 0);
+        log_relocation(
+            request_id,
+            &RelocationReport::skipped("no_messages_array"),
+            0,
+        );
         return body;
     };
     let (relocated, report) =
@@ -4895,6 +4910,94 @@ fn carries_thinking_block(message: &serde_json::Value) -> bool {
                 )
             })
         })
+}
+
+/// Every signed reasoning block in a message array, in order.
+fn signed_reasoning_blocks(messages: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|b| {
+            matches!(
+                b.get("type").and_then(|t| t.as_str()),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        })
+        .collect()
+}
+
+/// Put the client's message array back when the outbound body no longer
+/// carries their signed reasoning blocks unchanged.
+///
+/// Anthropic refuses a turn whose signed `thinking` or `redacted_thinking`
+/// blocks came back altered — "blocks cannot be modified", naming a message
+/// index but not who modified it. The live-zone compressor excludes those
+/// block types and every stage of the outbound chain returns its input
+/// untouched when it has nothing to do, so today the invariant holds by
+/// convention: prefix replay rewrites the message array wholesale, the hook
+/// seam re-serializes whatever a hook hands back, and neither checks. This is
+/// the check, taken once on the bytes that are about to leave.
+///
+/// Restoring only `messages` keeps every change made outside it — model
+/// routing, tool pruning, the TTL pin — so a body that trips this costs one
+/// turn's compression rather than the turn.
+fn restore_client_reasoning_blocks(
+    body_to_send: bytes::Bytes,
+    original: &bytes::Bytes,
+    request_id: &str,
+) -> bytes::Bytes {
+    if body_to_send == original {
+        return body_to_send;
+    }
+    // Cheap gate: nothing downstream matters for a body with no signed block,
+    // and that is the overwhelming majority of them.
+    const MARKER: &[u8] = b"thinking";
+    if !original.windows(MARKER.len()).any(|w| w == MARKER) {
+        return body_to_send;
+    }
+
+    let (Ok(before), Ok(mut after)) = (
+        serde_json::from_slice::<serde_json::Value>(original),
+        serde_json::from_slice::<serde_json::Value>(&body_to_send),
+    ) else {
+        return body_to_send;
+    };
+
+    let empty = Vec::new();
+    let before_messages = before
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
+    let after_messages = after
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
+    if signed_reasoning_blocks(before_messages) == signed_reasoning_blocks(after_messages) {
+        return body_to_send;
+    }
+
+    let restored = serde_json::Value::Array(before_messages.clone());
+    let block_count = signed_reasoning_blocks(before_messages).len();
+    let Some(map) = after.as_object_mut() else {
+        return body_to_send;
+    };
+    map.insert("messages".to_string(), restored);
+    match serde_json::to_vec(&after) {
+        Ok(bytes) => {
+            tracing::warn!(
+                target: "headroom.proxy",
+                event = "signed_reasoning_blocks_restored",
+                request_id = %request_id,
+                signed_blocks = block_count,
+                messages_before = before_messages.len(),
+                "outbound body altered the client's signed reasoning blocks; \
+                 forwarding the client's message array instead"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body_to_send,
+    }
 }
 
 /// Render indices for a log field, capped so one pathological turn cannot
@@ -8038,10 +8141,13 @@ mod tests {
     fn cache_control_placement_is_not_a_rewrite() {
         // The proxy re-places the breakpoint every turn by design; counting
         // that as a rewrite would mark every message and say nothing.
-        let before = serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
+        let before =
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
         let after = serde_json::json!({"role": "user", "content": [
             {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]});
-        assert!(rewritten_message_report(&[before], &[after]).indices.is_empty());
+        assert!(rewritten_message_report(&[before], &[after])
+            .indices
+            .is_empty());
     }
 
     #[test]
@@ -8280,7 +8386,8 @@ mod tests {
                         field: &tracing::field::Field,
                         value: &dyn std::fmt::Debug,
                     ) {
-                        self.0.insert(field.name().to_string(), format!("{value:?}"));
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
                     }
 
                     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -8342,9 +8449,7 @@ mod tests {
     #[test]
     fn apply_prefix_replay_pipes_inbound_tail_evidence_to_usage_observer() {
         use crate::cache_stabilization::prefix_replay::SessionReplayStore;
-        use crate::cache_stabilization::usage_observer::{
-            RecacheEventKind, UsageObserver,
-        };
+        use crate::cache_stabilization::usage_observer::{RecacheEventKind, UsageObserver};
 
         let store = SessionReplayStore::new(2);
         let observer = UsageObserver::new();
@@ -8671,5 +8776,89 @@ mod timing_field_tests {
         assert_eq!(outcome.ttfb_ms, 340.0);
         // Overhead is headroom's own cost and must not exceed the wall clock.
         assert!(outcome.overhead_ms <= outcome.total_latency_ms);
+    }
+
+    // ── signed reasoning blocks ──────────────────────────────────
+
+    fn client_body_with_thinking() -> serde_json::Value {
+        serde_json::json!({
+            "model": "claude-sonnet-4-5[1m]",
+            "tools": [{"name": "a"}, {"name": "b"}],
+            "messages": [
+                {"role": "user", "content": "solve this"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "private reasoning", "signature": "sig123"},
+                    {"type": "text", "text": "42"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        })
+    }
+
+    fn as_bytes(v: &serde_json::Value) -> bytes::Bytes {
+        bytes::Bytes::from(serde_json::to_vec(v).unwrap())
+    }
+
+    /// The common case: the pipeline changed something outside the message
+    /// array, so the signed blocks still match and the body goes as built.
+    #[test]
+    fn a_body_whose_reasoning_blocks_survive_is_forwarded_as_built() {
+        let original = as_bytes(&client_body_with_thinking());
+        let mut sent = client_body_with_thinking();
+        sent["model"] = serde_json::json!("claude-sonnet-4-5");
+        sent["tools"] = serde_json::json!([{"name": "a"}]);
+        let sent = as_bytes(&sent);
+
+        let out = restore_client_reasoning_blocks(sent.clone(), &original, "r1");
+        assert_eq!(out, sent);
+    }
+
+    /// A body with no signed block never takes the restore path, however much
+    /// the pipeline rewrote it.
+    #[test]
+    fn a_body_without_reasoning_blocks_is_forwarded_as_built() {
+        let original = as_bytes(&serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        let sent = as_bytes(&serde_json::json!({
+            "messages": [{"role": "user", "content": "compressed"}]
+        }));
+
+        let out = restore_client_reasoning_blocks(sent.clone(), &original, "r1");
+        assert_eq!(out, sent);
+    }
+
+    /// Editing a signed block is what Anthropic refuses. The client's message
+    /// array goes back; the model rewrite outside it stays.
+    #[test]
+    fn an_edited_reasoning_block_restores_the_client_messages() {
+        let original = as_bytes(&client_body_with_thinking());
+        let mut sent = client_body_with_thinking();
+        sent["model"] = serde_json::json!("claude-sonnet-4-5");
+        sent["messages"][1]["content"][0]["thinking"] = serde_json::json!("edited");
+        let sent = as_bytes(&sent);
+
+        let out = restore_client_reasoning_blocks(sent, &original, "r1");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed["messages"][1]["content"][0]["thinking"],
+            "private reasoning"
+        );
+        assert_eq!(parsed["model"], "claude-sonnet-4-5");
+    }
+
+    /// Dropping the message that held the block counts as altering it: the
+    /// signed blocks on the wire no longer match what the client sent.
+    #[test]
+    fn a_dropped_reasoning_block_restores_the_client_messages() {
+        let original = as_bytes(&client_body_with_thinking());
+        let mut sent = client_body_with_thinking();
+        sent["messages"].as_array_mut().unwrap().remove(1);
+        let sent = as_bytes(&sent);
+
+        let out = restore_client_reasoning_blocks(sent, &original, "r1");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["messages"][1]["content"][0]["signature"], "sig123");
     }
 }
