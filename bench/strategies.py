@@ -174,6 +174,29 @@ def tail_slots_2(body):
 
 THINKING = ("thinking", "redacted_thinking")
 
+# ── Do not ship anything below this line ──────────────────────────────────────
+#
+# Reasoning is 31.6% of every token the proxy writes into the cache and the
+# strategies here price at up to -27%, which makes them the best-scoring ideas
+# in this file. They are all disqualified, and the reason is not a cache
+# property the simulator can see.
+#
+# Anthropic's extended-thinking docs, on preservation by model: "Claude Opus 4.5
+# and models numbered 4.6 and higher keep prior turns' thinking blocks in
+# context and bill them as input, where Claude Sonnet 4.5, Claude Haiku 4.5, and
+# earlier models stripped them." On the models this proxy actually serves, the
+# reasoning of earlier turns is context the model reads. Removing it buys tokens
+# by making the model worse at the conversation it is having, and the simulator
+# scores answer quality at exactly zero.
+#
+# Manual thinking mode adds a second, harder barrier: the final assistant turn
+# of a thinking-enabled request must begin with a thinking block, so
+# `strip-all-thinking` is not merely unwise but rejected on the wire.
+#
+# They stay because an upper bound is worth knowing: they say how much of the
+# bill is reasoning, which is how you know not to go looking for that 27%
+# somewhere else.
+
 
 @strategy("strip-old-thinking")
 def strip_old_thinking(body):

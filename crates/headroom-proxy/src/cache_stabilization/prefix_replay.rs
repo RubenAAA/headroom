@@ -147,6 +147,34 @@ fn matches_canonical_prefix(candidate: &[Value], canonical_current: &[Value]) ->
     canonicalize_slice(candidate).as_slice() == &canonical_current[..candidate.len()]
 }
 
+/// How many leading messages a stored prefix and this turn agree on.
+fn canonical_agreement_len(candidate: &[Value], canonical_current: &[Value]) -> usize {
+    canonicalize_slice(candidate)
+        .iter()
+        .zip(canonical_current)
+        .take_while(|(stored, current)| stored == current)
+        .count()
+}
+
+/// How much of a stored prefix's tail may be edited and still count as the same
+/// stream.
+///
+/// A client that edits a message inside its own history stops being a prefix of
+/// what we stored, so the exact match above cannot see it — and that is the one
+/// case worth replaying, because everything ahead of the edit is still cached.
+/// Every such event in the 2026-08-15/16 logs edited the last message or the one
+/// before it: `first_diff_index` 305 of 307, 269 of 271, 286 of 288, 321 of 323,
+/// 309 of 311.
+const TAIL_EDIT_SLACK: usize = 2;
+
+/// The shortest agreeing run that counts as evidence of one stream.
+///
+/// Unrelated conversations share their opening messages — the same system
+/// reminder, the same first instruction — so a short agreement says nothing
+/// about identity. A conversation short enough to fail this has almost nothing
+/// cached to lose by declining.
+const MIN_AGREEING_RUN: usize = 4;
+
 /// Proactive expansion is deliberately a cache *tail*. When it becomes the
 /// cache-control target, its first appearance makes Anthropic write the entire
 /// segment we were trying to preserve. Keep the marker on the preceding block
@@ -2132,6 +2160,30 @@ impl SessionReplayStore {
         .chain(tracker.alternates.iter().map(|(id, o, f)| (*id, o, f)))
         .filter(|(_, o, f)| !f.is_empty() && matches_canonical_prefix(o, &canonical_current))
         .max_by_key(|(_, o, _)| o.len());
+        // Nothing leads this turn exactly. Before giving up on identity, look
+        // for a stream this turn continues with its tail edited — the client
+        // rewriting a message it already sent, which is what a content
+        // divergence is. The overlay can replay everything ahead of the edit,
+        // but only if it is told whose prefix this is, so the answer has to
+        // carry that stream's real chain id rather than the fallback's zero.
+        let best = best.or_else(|| {
+            std::iter::once((
+                tracker.primary_chain_id,
+                &tracker.last_original_messages,
+                &tracker.last_forwarded_messages,
+            ))
+            .chain(tracker.alternates.iter().map(|(id, o, f)| (*id, o, f)))
+            .filter_map(|(id, o, f)| {
+                if f.is_empty() {
+                    return None;
+                }
+                let agreed = canonical_agreement_len(o, &canonical_current);
+                (agreed >= MIN_AGREEING_RUN && agreed + TAIL_EDIT_SLACK >= o.len())
+                    .then_some((agreed, id, o, f))
+            })
+            .max_by_key(|(agreed, ..)| *agreed)
+            .map(|(_, id, o, f)| (id, o, f))
+        });
         match best {
             Some((chain_id, o, f)) => {
                 // Did a stream other than the session's most recent one win?
@@ -3555,6 +3607,53 @@ mod interleaved_stream_tests {
             assert!(skip.is_some(), "an unrelated stream must not replay");
             assert_eq!(out, c, "the turn's own bytes must be forwarded untouched");
         }
+    }
+
+    /// A client that edits a message it already sent is still the same stream,
+    /// and must be told so — otherwise the overlay refuses to splice on exactly
+    /// the turn where splicing is worth the most.
+    ///
+    /// This is what a content divergence looks like from the store's side: the
+    /// stored prefix stops being a prefix of the turn, so the exact match finds
+    /// nothing. Live traffic on 2026-08-16 declined here with 309 of 311
+    /// messages agreeing and re-created the whole conversation.
+    #[test]
+    fn a_stream_that_edits_its_own_tail_is_still_recognised() {
+        let store = SessionReplayStore::new(8);
+        let mut original = stream("a", 9);
+        turn(&store, "a1", &original);
+
+        // The client rewrites its last message and adds a new one — the shape
+        // `<system-reminder>` churn produces.
+        let last = original.len() - 1;
+        original[last] = msg("a-8 edited");
+        original.push(msg("a-9"));
+
+        let (orig, fwd, chain_id) = store
+            .previous_turn_for("S", &original)
+            .expect("a tail edit must still find its own stream");
+        assert_ne!(chain_id, 0, "an edited tail is not a stranger");
+
+        let (out, skip) = overlay_cached_prefix_reported(
+            original.clone(),
+            &original,
+            Some(&orig),
+            Some(&fwd),
+            chain_id != 0,
+        );
+        assert_eq!(
+            skip,
+            Some(ReplaySkip::PrefixContentDiverged {
+                first_diff_index: last,
+                replayed_prefix_msgs: last,
+            }),
+            "everything ahead of the edit is replayed"
+        );
+        assert!(
+            out[..last].iter().all(|m| m == &msg("compressed")),
+            "the agreeing run must come from the stored prefix"
+        );
+        assert_eq!(out[last..], original[last..], "the edited tail is this turn's own");
     }
 
     /// Growth on one stream must not accumulate stale copies of itself, or an
