@@ -2717,26 +2717,23 @@ pub(crate) async fn forward_http(
         // guarantees the forwarded side is byte-stable turn to turn, so our own
         // rewrites can no longer trip the guard. Both sides of the comparison
         // are captured here, so the stored and current flavours always match.
-        // Canonicalise away the client's ephemeral scaffolding FIRST, so every
-        // stage below — the capture just after, compression, the append-only
-        // guard, and the bytes on the wire — sees one form of history that does
-        // not depend on whether a `<system-reminder>` happened to be attached
-        // this turn.
+        // History keeps its own `<system-reminder>` spans. Lifting them onto the
+        // newest user message used to run here, and it put the whole accumulated
+        // block past the last cache breakpoint, where the provider bills it fresh
+        // every turn — the block moves with the tail, so it can never sit at the
+        // same prefix offset twice. Measured 2026-08-16: 22.0M uncached input
+        // tokens over 1093 turns, 64% of all billed weight, spent to avoid drift
+        // that wasted 346k. Roughly 20:1 against.
         //
-        // It runs ahead of the capture on purpose, and that is safe here for the
-        // reason `ctx_offload` was not: this is a pure function of the body.
-        // Same input, same output, no store state, so the comparison baseline
-        // cannot drift under it. Offload decisions could, which is what made
-        // capturing after them a defect.
-        let buffered = if state.config.prefix_replay
-            && matches!(
-                endpoint,
-                compression::CompressibleEndpoint::AnthropicMessages
-            ) {
-            relocate_ephemeral_blocks_in_body(buffered, &request_id)
-        } else {
-            buffered
-        };
+        // Replay covers what the lift covered, and the lift only ever ran when
+        // replay was on. `canonicalize_for_prefix_compare` already drops these
+        // spans from the append-only guard's key, and the overlay forwards the
+        // PREVIOUS turn's bytes for the whole stored prefix — the bytes the
+        // provider actually cached. A span the client attaches to or withdraws
+        // from a message inside that prefix therefore never reaches the wire,
+        // which is the guarantee the lift existed to provide. Past the stored
+        // prefix the client's own bytes go out either way, so there is nothing
+        // there to protect.
 
         let replay_original_messages: Option<Vec<serde_json::Value>> = if state.config.prefix_replay
             && matches!(
@@ -4342,6 +4339,9 @@ pub(crate) async fn forward_http(
                 // upstream calls the client never sees. Stays zero unless
                 // the model asked for a retrieval.
                 let mut ccr_round_usage = CcrRoundUsage::default();
+                // Same for a turn hook's own re-drives. Stays zero unless a
+                // hook is registered and calls the model again.
+                let mut turn_hook_usage = TurnHookUsage::default();
 
                 // CCR response handling: detect headroom_retrieve tool
                 // calls, fetch from CCR store, and continue conversation.
@@ -4425,16 +4425,25 @@ pub(crate) async fn forward_http(
                     } else {
                         "openai"
                     };
-                    body_bytes = apply_response_hooks(
+                    // The outcome block parses `usage` by the finer label, and
+                    // the hook's own calls have to be read the same way.
+                    let usage_provider = outcome_ctx
+                        .as_ref()
+                        .map(|c| c.provider.clone())
+                        .unwrap_or_else(|| provider.to_string());
+                    let (hooked, hook_usage) = apply_response_hooks(
                         body_bytes,
                         &original_buffered,
                         provider,
+                        &usage_provider,
                         &upstream_url,
                         &state.client,
                         &outgoing_headers,
                         &request_id,
                     )
                     .await;
+                    body_bytes = hooked;
+                    turn_hook_usage = hook_usage;
                 }
 
                 // Cache the response for future identical requests.
@@ -4571,6 +4580,36 @@ pub(crate) async fn forward_http(
                         let cache_read = cache_read + ccr_round_usage.cache_read_tokens;
                         let cache_write = cache_write + ccr_round_usage.cache_write_tokens;
                         let uncached_input = uncached_input + ccr_round_usage.input_tokens;
+                        // Same for a turn hook's re-drives. The usage parsed
+                        // above describes the one response the hook handed
+                        // back; anything it called on the way there was just
+                        // as billed, and leaving it out lets a token-saving
+                        // hook hide its overhead behind the saving it claims.
+                        if !turn_hook_usage.is_empty() {
+                            tracing::info!(
+                                request_id = %request_id,
+                                event = "turn_hook_usage",
+                                calls = turn_hook_usage.calls,
+                                input_tokens = turn_hook_usage.input_tokens,
+                                output_tokens = turn_hook_usage.output_tokens,
+                                cache_write_tokens = turn_hook_usage.cache_write_tokens,
+                                "billed turn-hook re-drives the client never saw"
+                            );
+                        }
+                        // Anthropic's `input_tokens` is already the uncached
+                        // count; both OpenAI shapes report a total the read
+                        // has to come off, exactly as above.
+                        let hook_uncached_input = if ctx.provider == "anthropic" {
+                            turn_hook_usage.input_tokens
+                        } else {
+                            (turn_hook_usage.input_tokens - turn_hook_usage.cache_read_tokens)
+                                .max(0)
+                        };
+                        let attempted_input = attempted_input + turn_hook_usage.input_tokens;
+                        let output_tok = output_tok + turn_hook_usage.output_tokens;
+                        let cache_read = cache_read + turn_hook_usage.cache_read_tokens;
+                        let cache_write = cache_write + turn_hook_usage.cache_write_tokens;
+                        let uncached_input = uncached_input + hook_uncached_input;
                         // Read off the pre-CCR `usage`: continuation rounds fold
                         // into the write total above but carry no TTL breakdown,
                         // so the split stays a subset of it and pricing charges
@@ -4719,128 +4758,6 @@ impl SseStreamKind {
             // We still pass bytes through unchanged.
             _ => Self::None,
         }
-    }
-}
-
-/// Apply [`relocate_ephemeral_blocks`] to a request body's `messages`.
-///
-/// Returns the bytes untouched on any parse or serialise failure, and when
-/// nothing moved — a request with no scaffolding in its history must go out
-/// byte-identical, or the transform would itself be a source of cache churn.
-///
-/// [`relocate_ephemeral_blocks`]: cache_stabilization::prefix_replay::relocate_ephemeral_blocks
-fn relocate_ephemeral_blocks_in_body(body: bytes::Bytes, request_id: &str) -> bytes::Bytes {
-    use cache_stabilization::prefix_replay::RelocationReport;
-    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        log_relocation(request_id, &RelocationReport::skipped("body_not_json"), 0);
-        return body;
-    };
-    let Some(messages) = parsed
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .filter(|m| !m.is_empty())
-        .cloned()
-    else {
-        log_relocation(
-            request_id,
-            &RelocationReport::skipped("no_messages_array"),
-            0,
-        );
-        return body;
-    };
-    let (relocated, report) =
-        cache_stabilization::prefix_replay::relocate_ephemeral_blocks_reported(messages.clone());
-    if relocated == messages {
-        log_relocation(request_id, &report, 0);
-        return body;
-    }
-    let messages_dropped = messages.len() - relocated.len();
-    parsed["messages"] = serde_json::Value::Array(relocated);
-    match serde_json::to_vec(&parsed) {
-        Ok(bytes) => {
-            log_relocation(request_id, &report, messages_dropped);
-            bytes::Bytes::from(bytes)
-        }
-        // The rewritten messages are discarded here, so the client's own bytes
-        // go out whole. Report the bail rather than the pass that was thrown
-        // away, or a conservation warning would fire for spans still on the
-        // wire.
-        Err(_) => {
-            log_relocation(
-                request_id,
-                &RelocationReport::skipped("reserialize_failed"),
-                0,
-            );
-            body
-        }
-    }
-}
-
-/// One line per relocation pass, whether or not it moved anything.
-///
-/// INFO, not DEBUG: the proxy runs at INFO, so at DEBUG this never reached the
-/// log. That left no way to tell a turn where relocation ran and the prefix
-/// diverged anyway from one where it never fired — the gap hit while
-/// attributing a 210k-token divergence on 2026-08-13.
-///
-/// Emitted on the bail paths too. It used to fire only when the body changed,
-/// so a pass that gave up — no user tail, nowhere to land — looked exactly like
-/// a request with no scaffolding in it, and four reminder-loss defects were
-/// each found days later from the model's behaviour instead of from a line
-/// saying what relocation had done.
-///
-/// Without `request_id` this event joins to nothing: it can say relocation ran,
-/// but not on which turn, so it cannot be set against that turn's cache
-/// creation to show whether it helped.
-fn log_relocation(
-    request_id: &str,
-    report: &cache_stabilization::prefix_replay::RelocationReport,
-    messages_dropped: usize,
-) {
-    tracing::info!(
-        event = "ephemeral_blocks_relocated",
-        request_id = %request_id,
-        blocks_moved = report.blocks_moved,
-        messages_dropped = messages_dropped,
-        // The conservation check. Relocation moves the client's scaffolding; it
-        // must never lose it, and these two are what says so in one line.
-        spans_in = report.spans_in,
-        spans_out = report.spans_out,
-        bytes_moved = report.bytes_moved,
-        // Which messages were raided, and their roles. Only the client's `user`
-        // turns may be — an `assistant` here is the regression that lifted a
-        // reminder tag out of the model's own prose and left the block empty.
-        source_indices = %join_indices(&report.source_indices),
-        source_roles = %report.source_roles.join(","),
-        // Whether the client gave each span its own block or appended it to
-        // real text. The inline shape is the one that went out twice.
-        span_kinds = %report.span_kinds.join(","),
-        // Where the spans had to land. A string tail has to be promoted to
-        // block form first, and an `absent` shape is the case with nowhere to
-        // put them at all.
-        tail_shape = report.tail_shape,
-        tail_promoted = report.tail_promoted,
-        // Empty when something moved. Anything else names the bail.
-        skip_reason = report.skip_reason,
-        "relocation pass over request history"
-    );
-    if report.spans_out < report.spans_in {
-        // Loss has to announce itself. Every one of the four defects here was
-        // found from the model behaving oddly turns later, because the log
-        // recorded what relocation moved and never what it dropped.
-        let lost = report.spans_in - report.spans_out;
-        crate::observability::relocation::observe_reminder_spans_lost(lost as u64);
-        tracing::warn!(
-            event = "ephemeral_spans_lost",
-            request_id = %request_id,
-            spans_in = report.spans_in,
-            spans_out = report.spans_out,
-            spans_lost = lost,
-            skip_reason = report.skip_reason,
-            tail_shape = report.tail_shape,
-            source_indices = %join_indices(&report.source_indices),
-            "relocation dropped client scaffolding: the model will not see reminders the client sent"
-        );
     }
 }
 
@@ -6533,6 +6450,109 @@ fn turn_hook_provider(endpoint: compression::CompressibleEndpoint) -> &'static s
     }
 }
 
+/// Read `(input, output, cache_read, cache_write)` out of one upstream
+/// response's `usage` block.
+///
+/// `provider` carries the same labels as `OutcomeContext::provider`
+/// (`"anthropic"` / `"openai_responses"` / anything else = OpenAI chat), and
+/// the three arms below mirror the outcome block's parsing exactly. They have
+/// to: the total this feeds is added to a number that block read, and settled
+/// against one it will read, so a different reading here would stop cancelling.
+fn response_usage(response: &serde_json::Value, provider: &str) -> (i64, i64, i64, i64) {
+    let usage = response.get("usage");
+    let get = |key: &str| -> i64 {
+        usage
+            .and_then(|u| u.get(key))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    let cached = |details: &str| -> i64 {
+        usage
+            .and_then(|u| u.get(details))
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    match provider {
+        "anthropic" => (
+            get("input_tokens"),
+            get("output_tokens"),
+            get("cache_read_input_tokens"),
+            get("cache_creation_input_tokens"),
+        ),
+        "openai_responses" => (
+            get("input_tokens"),
+            get("output_tokens"),
+            cached("input_tokens_details"),
+            0,
+        ),
+        _ => (
+            get("prompt_tokens"),
+            get("completion_tokens"),
+            cached("prompt_tokens_details"),
+            0,
+        ),
+    }
+}
+
+/// Upstream calls a turn hook made that nothing else accounts for.
+///
+/// A hook that re-drives the model through `call_model` makes real, billed
+/// requests. The outcome block reads exactly one response — whichever the hook
+/// handed back — so every other upstream call on that turn is spend no surface
+/// records. A tool-search reload is a whole extra model call; count only the
+/// last one and the feature hides its own overhead behind the saving it claims.
+///
+/// The Python original matched the response the usage block would read by
+/// object identity and dropped that one entry. Here [`record`](Self::record)
+/// takes the running total of every real upstream response and
+/// [`settle`](Self::settle) subtracts whatever the outcome block is about to
+/// read, so the two always sum back to what the upstream actually billed —
+/// including when a hook returns a response it synthesised rather than one it
+/// was given, which upstream over-counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TurnHookUsage {
+    /// Upstream calls beyond the one the outcome block reads. Zero on the
+    /// common path, and zero unless a hook re-drove the model.
+    calls: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+}
+
+impl TurnHookUsage {
+    /// Note one real upstream response, the original included.
+    fn record(&mut self, response: &serde_json::Value, provider: &str) {
+        let (input, output, cache_read, cache_write) = response_usage(response, provider);
+        self.calls += 1;
+        self.input_tokens += input;
+        self.output_tokens += output;
+        self.cache_read_tokens += cache_read;
+        self.cache_write_tokens += cache_write;
+    }
+
+    /// Drop the contribution of the response the outcome block will read. What
+    /// is left is the delta that block has to add.
+    ///
+    /// A hook is free to return a response carrying larger figures than
+    /// anything upstream sent, so each component floors at zero: over-counting
+    /// a bill beats under-counting it.
+    fn settle(&mut self, read: &serde_json::Value, provider: &str) {
+        let (input, output, cache_read, cache_write) = response_usage(read, provider);
+        self.calls = (self.calls - 1).max(0);
+        self.input_tokens = (self.input_tokens - input).max(0);
+        self.output_tokens = (self.output_tokens - output).max(0);
+        self.cache_read_tokens = (self.cache_read_tokens - cache_read).max(0);
+        self.cache_write_tokens = (self.cache_write_tokens - cache_write).max(0);
+    }
+
+    /// True when there is nothing extra to account for.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Pre-send `on_request` seam. Parses the outbound body, lets registered hooks
 /// inspect/mutate `messages`/`tools`, and re-serializes only if a hook changed
 /// them. Returns the body unchanged on any parse/serialize failure. Callers
@@ -6602,6 +6622,23 @@ struct ProxyCallModel {
     client: reqwest::Client,
     headers: http::HeaderMap,
     request_id: String,
+    /// Usage of every re-drive made through this handle. Shared with
+    /// `apply_response_hooks`, and behind a lock because `CallModel::call`
+    /// only has `&self`.
+    usage: Arc<std::sync::Mutex<TurnHookUsage>>,
+    /// Provider label for reading those responses' `usage` blocks.
+    usage_provider: String,
+}
+
+impl ProxyCallModel {
+    /// Note one re-drive's usage. Only the calls that came back with a body
+    /// count: a request that never left, or died on the wire, was not billed.
+    fn record(&self, response: &serde_json::Value) {
+        self.usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(response, &self.usage_provider);
+    }
 }
 
 #[async_trait::async_trait]
@@ -6627,7 +6664,12 @@ impl crate::turn_hooks::CallModel for ProxyCallModel {
             .await;
         match resp {
             Ok(r) => match r.bytes().await {
-                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+                Ok(bytes) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                    self.record(&parsed);
+                    parsed
+                }
                 Err(e) => {
                     tracing::warn!(request_id = %self.request_id, error = %e, "turn hooks call_model: read body failed");
                     serde_json::Value::Null
@@ -6643,24 +6685,29 @@ impl crate::turn_hooks::CallModel for ProxyCallModel {
 
 /// Post-response `on_response` seam. Runs registered hooks over the buffered
 /// upstream response, giving them a `call_model` that re-drives this same turn.
-/// Returns the (possibly replaced) body bytes; unchanged on parse/serialize
-/// failure. Callers MUST gate on a non-empty registry (byte-identical no-op).
+/// Returns the (possibly replaced) body bytes, unchanged on parse failure,
+/// along with the usage of any upstream call the caller's outcome block will
+/// not see. Callers MUST gate on a non-empty registry (byte-identical no-op).
+///
+/// `provider` is the hook-facing label (`"anthropic"` / `"openai"`);
+/// `usage_provider` is the finer one the outcome block parses `usage` by.
 async fn apply_response_hooks(
     body_bytes: bytes::Bytes,
     original_request: &bytes::Bytes,
     provider: &str,
+    usage_provider: &str,
     upstream_url: &url::Url,
     client: &reqwest::Client,
     headers: &http::HeaderMap,
     request_id: &str,
-) -> bytes::Bytes {
+) -> (bytes::Bytes, TurnHookUsage) {
     let response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
-        Err(_) => return body_bytes,
+        Err(_) => return (body_bytes, TurnHookUsage::default()),
     };
     let template: serde_json::Value = match serde_json::from_slice(original_request) {
         Ok(v) => v,
-        Err(_) => return body_bytes,
+        Err(_) => return (body_bytes, TurnHookUsage::default()),
     };
     let model = template
         .get("model")
@@ -6681,18 +6728,37 @@ async fn apply_response_hooks(
         tools,
         config: None,
     };
+    // The call we already made counts too: if a hook replaces the response,
+    // this original is the one nobody else will read.
+    let usage = Arc::new(std::sync::Mutex::new(TurnHookUsage::default()));
+    usage
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .record(&response, usage_provider);
+
     let call_model = ProxyCallModel {
         template,
         upstream_url: upstream_url.clone(),
         client: client.clone(),
         headers: headers.clone(),
         request_id: request_id.to_string(),
+        usage: Arc::clone(&usage),
+        usage_provider: usage_provider.to_string(),
     };
     let out = crate::turn_hooks::run_response_hooks(&ctx, response, &call_model).await;
-    match serde_json::to_vec(&out) {
-        Ok(v) => bytes::Bytes::from(v),
-        Err(_) => body_bytes,
-    }
+    let mut hook_usage = *usage.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Settle against the body the caller will actually go on to read, which on
+    // a serialize failure is still the original response.
+    let (final_bytes, final_response) = match serde_json::to_vec(&out) {
+        Ok(v) => (bytes::Bytes::from(v), out),
+        Err(_) => {
+            let original = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+            (body_bytes, original)
+        }
+    };
+    hook_usage.settle(&final_response, usage_provider);
+    (final_bytes, hook_usage)
 }
 
 // ─── CCR Response Handling ────────────────────────────────────────────────
@@ -8991,5 +9057,175 @@ mod timing_field_tests {
 
         let out = enforce_cache_control_ttl_order(sent.clone(), &client, true, "r1");
         assert_eq!(out, sent);
+    }
+
+    // ── turn-hook re-drive accounting ──────────────────────────────────
+
+    /// Each surface spells the same quantities differently, and reading a
+    /// response by the wrong name silently bills it as zero.
+    #[test]
+    fn usage_is_read_by_the_provider_shape() {
+        let anthropic = serde_json::json!({"usage": {
+            "input_tokens": 10, "output_tokens": 2,
+            "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4
+        }});
+        assert_eq!(response_usage(&anthropic, "anthropic"), (10, 2, 3, 4));
+
+        let responses = serde_json::json!({"usage": {
+            "input_tokens": 10, "output_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 3}
+        }});
+        assert_eq!(
+            response_usage(&responses, "openai_responses"),
+            (10, 2, 3, 0)
+        );
+
+        let chat = serde_json::json!({"usage": {
+            "prompt_tokens": 10, "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 3}
+        }});
+        assert_eq!(response_usage(&chat, "openai_chat"), (10, 2, 3, 0));
+
+        // A response with no usage block reads as zeros rather than failing.
+        assert_eq!(
+            response_usage(&serde_json::json!({}), "anthropic"),
+            (0, 0, 0, 0)
+        );
+    }
+
+    /// No re-drive: the one response recorded is the one the outcome block
+    /// reads, so the accounting has to come out untouched.
+    #[test]
+    fn a_hook_that_never_calls_the_model_reports_nothing() {
+        let response = serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 10}});
+        let mut usage = TurnHookUsage::default();
+        usage.record(&response, "anthropic");
+        usage.settle(&response, "anthropic");
+        assert!(usage.is_empty());
+    }
+
+    /// Whichever response the hook hands back, what is left is the spend the
+    /// outcome block would otherwise miss.
+    #[test]
+    fn settling_leaves_only_the_calls_the_outcome_block_misses() {
+        let original = serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 10}});
+        let redrive = serde_json::json!({"usage": {"input_tokens": 300, "output_tokens": 20}});
+
+        // The hook looked and left the response alone: its own call is the delta.
+        let mut kept = TurnHookUsage::default();
+        kept.record(&original, "anthropic");
+        kept.record(&redrive, "anthropic");
+        kept.settle(&original, "anthropic");
+        assert_eq!(kept.calls, 1);
+        assert_eq!(kept.input_tokens, 300);
+        assert_eq!(kept.output_tokens, 20);
+
+        // The hook returned the re-drive: now the original is the unread one.
+        let mut replaced = TurnHookUsage::default();
+        replaced.record(&original, "anthropic");
+        replaced.record(&redrive, "anthropic");
+        replaced.settle(&redrive, "anthropic");
+        assert_eq!(replaced.calls, 1);
+        assert_eq!(replaced.input_tokens, 100);
+        assert_eq!(replaced.output_tokens, 10);
+    }
+
+    /// A hook may hand back a response it built itself, matching no upstream
+    /// call. The delta plus what the outcome block reads still has to come to
+    /// what was really billed.
+    #[test]
+    fn a_synthesised_response_still_totals_the_real_spend() {
+        let original = serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 10}});
+        let redrive = serde_json::json!({"usage": {"input_tokens": 300, "output_tokens": 20}});
+
+        let mut usage = TurnHookUsage::default();
+        usage.record(&original, "anthropic");
+        usage.record(&redrive, "anthropic");
+        usage.settle(&serde_json::json!({"id": "made-up"}), "anthropic");
+        // The outcome block reads nothing off the synthetic body, so the delta
+        // carries both real calls.
+        assert_eq!(usage.input_tokens, 400);
+        assert_eq!(usage.output_tokens, 30);
+    }
+
+    /// Inflated figures in a synthesised response must not drive the delta
+    /// negative and bill less than the turn cost.
+    #[test]
+    fn settling_never_goes_negative() {
+        let original = serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 10}});
+        let inflated = serde_json::json!({"usage": {"input_tokens": 9000, "output_tokens": 900}});
+        let mut usage = TurnHookUsage::default();
+        usage.record(&original, "anthropic");
+        usage.settle(&inflated, "anthropic");
+        assert!(usage.is_empty());
+    }
+
+    /// A hook that calls the model twice made two billed requests, and the
+    /// outcome block reads neither.
+    #[tokio::test]
+    async fn call_model_records_every_redrive() {
+        use crate::turn_hooks::CallModel;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "redrive",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 7,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 5
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let usage = Arc::new(std::sync::Mutex::new(TurnHookUsage::default()));
+        let call_model = ProxyCallModel {
+            template: serde_json::json!({"model": "claude-x", "messages": []}),
+            upstream_url: format!("{}/v1/messages", server.uri()).parse().unwrap(),
+            client: reqwest::Client::new(),
+            headers: http::HeaderMap::new(),
+            request_id: "req-hook".to_string(),
+            usage: Arc::clone(&usage),
+            usage_provider: "anthropic".to_string(),
+        };
+
+        assert_eq!(call_model.call(vec![]).await["id"], "redrive");
+        call_model.call(vec![]).await;
+
+        let recorded = *usage.lock().unwrap();
+        assert_eq!(recorded.calls, 2);
+        assert_eq!(recorded.input_tokens, 200);
+        assert_eq!(recorded.output_tokens, 14);
+        assert_eq!(recorded.cache_read_tokens, 80);
+        assert_eq!(recorded.cache_write_tokens, 10);
+    }
+
+    /// A call that never reached the upstream was not billed, so it must not
+    /// show up as spend.
+    #[tokio::test]
+    async fn a_failed_redrive_records_nothing() {
+        use crate::turn_hooks::CallModel;
+
+        let usage = Arc::new(std::sync::Mutex::new(TurnHookUsage::default()));
+        let call_model = ProxyCallModel {
+            template: serde_json::json!({"model": "claude-x", "messages": []}),
+            // Reserved as invalid by RFC 6890; nothing is listening.
+            upstream_url: "http://192.0.2.1:1/v1/messages".parse().unwrap(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            headers: http::HeaderMap::new(),
+            request_id: "req-hook".to_string(),
+            usage: Arc::clone(&usage),
+            usage_provider: "anthropic".to_string(),
+        };
+
+        assert!(call_model.call(vec![]).await.is_null());
+        assert!(usage.lock().unwrap().is_empty());
     }
 }

@@ -47,7 +47,6 @@ pub mod prometheus;
 pub mod proxy_counters;
 pub mod proxy_metrics;
 pub mod recache;
-pub mod relocation;
 pub mod replay_alternates;
 pub mod upstream_health;
 

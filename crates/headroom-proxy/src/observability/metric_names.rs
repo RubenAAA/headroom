@@ -41,17 +41,6 @@ pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP: &str =
      prefixes that should have been cache reads (summed wasted_tokens \
      across recache events).";
 
-// ---------- proxy_cache_reminder_spans_lost_total ----------
-
-pub const METRIC_PROXY_CACHE_REMINDER_SPANS_LOST_TOTAL: &str =
-    "proxy_cache_reminder_spans_lost_total";
-pub const METRIC_PROXY_CACHE_REMINDER_SPANS_LOST_TOTAL_HELP: &str =
-    "Count of client `<system-reminder>` spans that the relocation pass \
-     failed to conserve — present in the request the client sent, absent \
-     from the one forwarded. Relocation moves scaffolding, it never drops \
-     it, so any increase is a defect and the model is being shown less \
-     than the client wrote.";
-
 // ---------- proxy_cache_replay_alternates_evicted_total ----------
 
 pub const METRIC_PROXY_CACHE_REPLAY_ALTERNATES_EVICTED_TOTAL: &str =

@@ -312,24 +312,6 @@ fn take_trailing_ephemeral_spans(block: &Value) -> Option<(Option<Value>, Vec<St
     Some((Some(kept), spans))
 }
 
-/// Does this message carry scaffolding that relocation would move?
-///
-/// Reaches exactly as far as [`relocate_ephemeral_blocks_counted`] does — user
-/// role, trailing spans only — so a `true` here means relocation left a movable
-/// span standing where it was.
-fn message_carries_movable_ephemeral_span(message: &Value) -> bool {
-    if message.get("role").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    match message.get("content") {
-        Some(Value::String(text)) => split_trailing_ephemeral_spans(text).is_some(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .any(|block| take_trailing_ephemeral_spans(block).is_some()),
-        _ => false,
-    }
-}
-
 /// Strip reminder spans from a text block, dropping the block when only
 /// scaffolding was there. Counterpart to [`split_ephemeral_spans`] for the
 /// comparison key; the forwarding side lifts the same spans in
@@ -546,33 +528,27 @@ fn has_empty_canonical_content(message: &Value) -> bool {
 /// Length of the replayable stored prefix after removing trailing messages the
 /// next turn will rewrite.
 ///
-/// Two kinds qualify, and only the first used to. A message whose canonical
-/// content is empty is pure scaffolding that was never in the provider's cached
-/// prefix. A message still carrying a movable ephemeral span is the one
-/// relocation just landed its collection on — real content with reminder blocks
-/// appended, so it canonicalizes to something non-empty and the emptiness test
-/// keeps it. Once the conversation grows past it, relocation sees it as history
-/// and strips those blocks out again. Held in replay state, that reads as an
-/// edit inside the cached prefix and busts it.
+/// A message whose canonical content is empty is pure scaffolding that was
+/// never in the provider's cached prefix.
 ///
-/// The destination is a hard cap, not a trailing trim. A request often ends in
-/// an assistant turn, which puts the destination second from last — and a
-/// trailing scan stops at the clean assistant message and keeps the destination
-/// anyway. Three events on 2026-08-14 measured that: message 20 of 21 lost
-/// `text,text` four messages later (24,565 re-created), and messages 196 of 198
-/// and 164 of 166 each gained a plain block against the branch they were
-/// compared with (128,616 and 126,388, both falling back to a 21,359-token read
-/// — system and tools, the breakpoint before any message).
+/// A second rule used to cap this at the last message carrying a movable
+/// ephemeral span — the message relocation had just landed its collection on.
+/// Relocation stripped those blocks out again once the conversation grew past
+/// the message, so holding the fat copy in replay state read as an edit inside
+/// the cached prefix and busted it. Three events on 2026-08-14 measured that:
+/// message 20 of 21 lost `text,text` four messages later (24,565 re-created),
+/// and messages 196 of 198 and 164 of 166 each gained a plain block against the
+/// branch they were compared with (128,616 and 126,388, both falling back to a
+/// 21,359-token read — system and tools, the breakpoint before any message).
 ///
-/// Only the destination can carry a movable span here: relocation strips every
-/// earlier user turn, and the assistant turns after it are never sources. So
-/// this cap lands near the tail rather than truncating real history.
+/// Both halves of that went with relocation. Nothing rewrites a message's spans
+/// after the fact now, so the stored copy stays the message's only form, and
+/// keeping it is what makes the client's own withdrawal of a reminder harmless:
+/// replay forwards the stored bytes over it. Capping here would exclude the
+/// newest user turn — the one message that always carries spans now — and hand
+/// exactly that withdrawal a way through.
 fn replayable_stored_prefix_len(original_messages: &[Value]) -> usize {
-    let cap = original_messages
-        .iter()
-        .rposition(message_carries_movable_ephemeral_span)
-        .unwrap_or(original_messages.len());
-    original_messages[..cap]
+    original_messages
         .iter()
         .rposition(|message| !has_empty_canonical_content(message))
         .map_or(0, |index| index + 1)
@@ -952,18 +928,6 @@ pub enum ReplaySkip {
     /// Carries the first message index that differs, as a diagnostic only.
     /// Replaying up to it was tried and measured worse.
     PrefixContentDiverged { first_diff_index: usize },
-    /// This turn still carries a `<system-reminder>` inside the region the
-    /// replay would overwrite, so replaying would delete it from the request.
-    ///
-    /// Replay is only free of the client's scaffolding because relocation puts
-    /// every span past the stored prefix first. Two turns break that: one whose
-    /// last message is not a `user` message, where relocation declines because
-    /// there is nowhere safe to put them, and one no longer than the stored
-    /// prefix, which has no room past it. On either, the stored bytes have
-    /// their copies stripped and the live ones are overwritten by those same
-    /// stripped bytes — the span leaves the request entirely and the model
-    /// stops seeing instructions the client sent.
-    ReminderInsidePrefix,
 }
 
 impl ReplaySkip {
@@ -975,7 +939,6 @@ impl ReplaySkip {
             ReplaySkip::ShorterThanStoredPrefix => "shorter_than_stored_prefix",
             ReplaySkip::OptimizedShorterThanPrefix => "optimized_shorter_than_prefix",
             ReplaySkip::PrefixContentDiverged { .. } => "prefix_content_diverged",
-            ReplaySkip::ReminderInsidePrefix => "reminder_inside_prefix",
         }
     }
 }
@@ -1017,7 +980,30 @@ pub fn overlay_cached_prefix_reported(
     // canonicalizer so the guard is robust to ALL per-turn transport /
     // annotation churn — cache_control movement, litellm `caller`, streaming
     // `index`, string↔block content shape, etc.
-    if canonicalize_slice(&current_original_messages[..n]) != canonicalize_slice(prev_orig) {
+    //
+    // Deliberately blind to `<system-reminder>` churn: the canonicalizer
+    // filters those spans out, so a reminder the client attached or withdrew
+    // inside this region does not count as divergence and the turn still
+    // replays. That is the whole point. Claude Code withdraws a reminder from
+    // the message it decorated a turn earlier, which lands in the prefix TAIL
+    // where the breakpoints are, so treating it as divergence rebuilds nearly
+    // the whole prefix — measured 2026-08-16 at 151k creation against 18k read
+    // on a single turn, eleven turns of savings for one withdrawn span.
+    //
+    // The cost of the blindness is that replay forwards the stored copy, so a
+    // withdrawn reminder stays on the wire and history keeps one per decorated
+    // message. Those bytes sit INSIDE the cached prefix and bill at 0.1x. The
+    // 382%-of-client-body growth recorded here on 2026-08-11 was read as the
+    // price of this and it was not: it was the relocation pass parking its
+    // block past the last breakpoint at 1.0x, 64% of all billed weight when it
+    // was finally measured on 2026-08-16. Relocation is gone. Watch
+    // `outbound_body_bytes` against `client_request_bytes` — a ratio climbing
+    // past ~1.2 means the accumulation is real after all and this is wrong.
+    if current_original_messages[..n]
+        .iter()
+        .map(canonicalize_for_prefix_compare)
+        .ne(prev_orig.iter().map(canonicalize_for_prefix_compare))
+    {
         // Locate the first disagreement. The whole-slice compare above already
         // told us there is one; this only runs on the decline path, so the
         // per-message walk never touches a turn that replays cleanly.
@@ -1047,85 +1033,25 @@ pub fn overlay_cached_prefix_reported(
             Some(ReplaySkip::PrefixContentDiverged { first_diff_index }),
         );
     }
-    // Relocation normally clears the replayed region of scaffolding before we
-    // get here, so stripping the stored copies below loses nothing — this
-    // turn's own tail carries them. When a span is still standing inside the
-    // region, that did not happen, and replaying would take the stored copies
-    // out and overwrite the live ones with the result. The span would then be
-    // in neither half and the model would never see it.
-    if current_original_messages[..n]
-        .iter()
-        .any(message_carries_movable_ephemeral_span)
-    {
-        return (optimized_messages, Some(ReplaySkip::ReminderInsidePrefix));
-    }
-    // Replay the cached (compressed) prefix; keep this turn's tail.
-    let mut out = prefix_without_ephemeral_blocks(prev_fwd);
+    // Replay the cached (compressed) prefix verbatim; keep this turn's tail.
+    //
+    // Verbatim is what makes the guard above safe. It ignores a
+    // `<system-reminder>` the client attached or withdrew inside this region,
+    // and these bytes are the ones the provider cached last turn, so the churn
+    // it ignored never reaches the wire. That agreement used to come from the
+    // relocation pass, which lifted every span onto the newest message before
+    // the request got here; it cost 64% of all billed weight (measured
+    // 2026-08-16) and is gone.
+    //
+    // So nothing is stripped on the way out. Stripping the stored copies made
+    // sense only while relocation guaranteed this turn's tail carried the same
+    // spans; doing it now would rewrite history on every turn and throw away
+    // the read. The `ReminderInsidePrefix` decline that stood here went with
+    // it — it guarded the strip, and with history holding its own spans it
+    // would fire on every turn.
+    let mut out = prev_fwd.to_vec();
     out.extend_from_slice(&optimized_messages[n..]);
     (out, None)
-}
-
-/// The frozen prefix with client reminders taken out.
-///
-/// [`relocate_ephemeral_blocks`] moves reminders onto the newest message. One
-/// turn later that message is history, and replaying it verbatim puts the
-/// reminder back into a conversation the client has already withdrawn it from
-/// — while [`canonicalize_for_prefix_compare`] filters reminders, so the
-/// append-only guard sees two equal prefixes and replays anyway. Each turn
-/// leaves one more behind. Measured live on 2026-08-11, the forwarded body
-/// reached 382% of the client body in sixteen turns, with the whole pile
-/// sitting past the last breakpoint where it bills fresh at 1.0x.
-///
-/// Stripping here is what makes the bytes agree with the comparison: history
-/// we forward stops carrying reminders in either direction, so the prefix is
-/// the same every turn. Nothing cached is lost — the breakpoint goes on the
-/// last non-ephemeral block, so the provider never cached these blocks to
-/// begin with.
-///
-/// Message count is preserved, and a message that is nothing but reminders is
-/// left alone: dropping it would trip [`ReplaySkip::ForwardedCountMismatch`]
-/// on the next turn, and emptying its content is rejected by the API.
-fn prefix_without_ephemeral_blocks(prefix: &[Value]) -> Vec<Value> {
-    prefix
-        .iter()
-        .map(|msg| {
-            // Exactly what relocation moves, and nothing else: user role,
-            // trailing spans. Reaching further would delete from history spans
-            // relocation left standing — model output quoting the tag, most of
-            // all — and nothing would put them back.
-            if msg.get("role").and_then(Value::as_str) != Some("user") {
-                return msg.clone();
-            }
-            let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
-                return msg.clone();
-            };
-            if !blocks
-                .iter()
-                .any(|block| take_trailing_ephemeral_spans(block).is_some())
-            {
-                return msg.clone();
-            }
-            // Span level, not block level. A reminder appended to a block that
-            // carries real text is not a block of its own, so a block-level
-            // filter left it in the stored bytes while relocation lifted this
-            // turn's copy onto the tail — and the same span went out twice.
-            let keep: Vec<Value> = blocks
-                .iter()
-                .filter_map(|block| match take_trailing_ephemeral_spans(block) {
-                    Some((kept, _)) => kept,
-                    None => Some(block.clone()),
-                })
-                .collect();
-            if keep.is_empty() {
-                return msg.clone();
-            }
-            let mut msg = msg.clone();
-            if let Some(obj) = msg.as_object_mut() {
-                obj.insert("content".to_string(), Value::Array(keep));
-            }
-            msg
-        })
-        .collect()
 }
 
 /// Move the client's `<system-reminder>` blocks out of history and onto the
@@ -4173,13 +4099,17 @@ mod block_shape_tests {
         assert_eq!(turn_one[0]["content"][0]["text"], "opener");
     }
 
-    /// The relocation destination is real content with reminder blocks appended,
-    /// so it canonicalizes to something non-empty and the emptiness test alone
-    /// kept it in replay state. Once the conversation grew past it, relocation
-    /// stripped those blocks and the stored copy read as an edit inside the
-    /// cached prefix — 24,565 tokens on one turn, 2026-08-14.
+    /// The newest user turn is stored with its reminders, not held back.
+    ///
+    /// This used to be capped out of the stored prefix, because relocation would
+    /// strip its spans once the conversation grew past it and the fat stored
+    /// copy then read as an edit inside the cached prefix — 24,565 tokens on one
+    /// turn, 2026-08-14. Nothing rewrites those spans now, and storing the
+    /// message is what makes the client's own withdrawal of a reminder
+    /// harmless: the guard sees it and declines, so the model never reads a
+    /// reminder the client dropped.
     #[test]
-    fn the_relocation_destination_stays_out_of_the_stored_prefix() {
+    fn the_newest_user_turn_is_stored_with_its_reminders() {
         let landed = vec![
             text_msg("user", "opener"),
             json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
@@ -4188,31 +4118,22 @@ mod block_shape_tests {
                 {"type": "text", "text": "prose"},
                 {"type": "text", "text": "<system-reminder>x</system-reminder>"}]}),
         ];
-        assert_eq!(
-            replayable_stored_prefix_len(&landed),
-            2,
-            "a message relocation will rewrite must not be stored"
-        );
+        assert_eq!(replayable_stored_prefix_len(&landed), 3);
 
-        // A request ending in an assistant turn puts the destination second from
-        // last, and a trailing scan stops at the clean assistant message and
-        // keeps the destination anyway. Two of the three busts measured on
-        // 2026-08-14 had exactly this shape.
+        // An assistant prefill after it changes nothing: it carries real content
+        // of its own, so the trailing scan keeps both.
         let mut prefilled = landed.clone();
         prefilled
             .push(json!({"role": "assistant", "content": [{"type": "text", "text": "prefill"}]}));
-        assert_eq!(
-            replayable_stored_prefix_len(&prefilled),
-            2,
-            "an assistant tail must not drag the destination back into the prefix"
-        );
+        assert_eq!(replayable_stored_prefix_len(&prefilled), 4);
 
-        // The same message without the appended span is ordinary history.
-        let mut settled = landed.clone();
-        settled[2] = json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t1"},
-            {"type": "text", "text": "prose"}]});
-        assert_eq!(replayable_stored_prefix_len(&settled), 3);
+        // Pure scaffolding at the end is still trimmed. It was never in the
+        // provider's cached prefix, so holding it would make its replacement
+        // next turn look like an edit.
+        let mut trailing_scaffolding = landed.clone();
+        trailing_scaffolding.push(json!({"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>y</system-reminder>"}]}));
+        assert_eq!(replayable_stored_prefix_len(&trailing_scaffolding), 3);
     }
 
     /// The defect that made this pass the single largest source of re-cached
@@ -4493,31 +4414,30 @@ mod block_shape_tests {
         out
     }
 
-    /// The forward path in the order `proxy.rs` runs it: relocation on the
-    /// inbound body, then the overlay, then breakpoint placement. Compression
-    /// is the identity here — what is under test is what the replay layer does
-    /// to the client's content, not what the compressor does to it.
+    /// The forward path in the order `proxy.rs` runs it: the overlay, then
+    /// breakpoint placement. Compression is the identity here — what is under
+    /// test is what the replay layer does to the client's content, not what the
+    /// compressor does to it.
+    ///
+    /// No relocation stage. The client's `<system-reminder>` spans go out where
+    /// the client put them, so these tests read the same path production does.
     fn forward(
         inbound: &[Value],
         previous: Option<&(Vec<Value>, Vec<Value>)>,
     ) -> (Vec<Value>, Option<ReplaySkip>) {
-        let relocated = relocate_ephemeral_blocks(inbound.to_vec());
         let (overlaid, skip) = overlay_cached_prefix_reported(
-            relocated.clone(),
-            &relocated,
+            inbound.to_vec(),
+            inbound,
             previous.map(|(original, _)| original.as_slice()),
             previous.map(|(_, forwarded)| forwarded.as_slice()),
         );
         (place_tail_cache_breakpoints(overlaid, 1).0, skip)
     }
 
-    /// What the store holds after a turn: its post-relocation inbound messages
-    /// and the bytes that went out.
+    /// What the store holds after a turn: the inbound messages and the bytes
+    /// that went out.
     fn stored_turn(inbound: &[Value]) -> (Vec<Value>, Vec<Value>) {
-        (
-            relocate_ephemeral_blocks(inbound.to_vec()),
-            forward(inbound, None).0,
-        )
+        (inbound.to_vec(), forward(inbound, None).0)
     }
 
     #[track_caller]
@@ -4952,20 +4872,20 @@ mod block_shape_tests {
         assert_eq!(text_block_kinds(&m), "system-reminder");
     }
 
-    /// Reminders the client has withdrawn must not survive in what we forward.
+    /// Withdrawing a reminder must not disturb a single byte of stored history.
     ///
-    /// Relocation and replay pull in opposite directions. Relocation moves a
-    /// reminder onto the newest message; the next turn that message is history,
-    /// so the frozen prefix carries the reminder forward even though the client
-    /// dropped it. [`canonicalize_for_prefix_compare`] filters reminders out, so
-    /// the append-only guard cannot see the difference and replays anyway.
+    /// Claude Code decorates its newest user message with a reminder and takes
+    /// it off the turn after, so the change always lands in the prefix TAIL,
+    /// next to the breakpoints. Honouring it means rebuilding from the last
+    /// breakpoint that still matches, which is far back: measured live on
+    /// 2026-08-16, one such turn wrote 151k and read 18k where its neighbours
+    /// read 165k and wrote under 1k.
     ///
-    /// Each turn leaves one more behind. Measured live on 2026-08-11: the
-    /// forwarded body climbed from 82% of the client body to 382% over sixteen
-    /// turns, with roughly 28k tokens per turn sitting past the last breakpoint
-    /// where they bill fresh at 1.0x.
+    /// So replay forwards the stored bytes and the withdrawn reminder rides
+    /// along. This pins the price of that: one stale span per decorated
+    /// message, never more, and all of it inside the cached prefix at 0.1x.
     #[test]
-    fn replay_does_not_accumulate_withdrawn_reminders() {
+    fn withdrawn_reminders_leave_forwarded_history_untouched() {
         fn reminder_count(messages: &[Value]) -> usize {
             messages
                 .iter()
@@ -4992,10 +4912,9 @@ mod block_shape_tests {
                 {"type": "text", "text": format!("<system-reminder>r{turn}</system-reminder>")},
             ]}));
 
-            // What the proxy does to it: relocate, then overlay last turn's
-            // forwarded prefix. Compression is the identity here so the test
-            // measures the replay path and nothing else.
-            let originals = relocate_ephemeral_blocks(client.clone());
+            // Compression is the identity here, so this measures the replay
+            // path and nothing else.
+            let originals = client.clone();
             let (prev_orig, prev_fwd) = match &prev {
                 Some((o, f)) => (Some(o.as_slice()), Some(f.as_slice())),
                 None => (None, None),
@@ -5003,11 +4922,22 @@ mod block_shape_tests {
             let forwarded =
                 overlay_cached_prefix(originals.clone(), &originals, prev_orig, prev_fwd);
 
+            // The point of the exercise: everything the provider cached last
+            // turn goes back out identical, so the read survives the withdrawal.
+            if let Some(stored) = prev_fwd {
+                assert_eq!(
+                    &forwarded[..stored.len()],
+                    stored,
+                    "turn {turn}: replayed history diverged from the cached bytes"
+                );
+            }
+            // One user message, one span it was decorated with. Growth that
+            // outruns this is accumulation and would mean the guard is wrong.
             assert_eq!(
                 reminder_count(&forwarded),
-                1,
-                "turn {turn}: the client is sending one reminder, so one is what \
-                 goes upstream — found {} in {} messages",
+                turn + 1,
+                "turn {turn}: expected one stale span per decorated message, \
+                 found {} in {} messages",
                 reminder_count(&forwarded),
                 forwarded.len()
             );

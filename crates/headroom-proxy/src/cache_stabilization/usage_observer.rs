@@ -571,14 +571,7 @@ fn recache_attribution<'a>(
             reason @ ("prefix_content_diverged"
             | "forwarded_count_mismatch"
             | "shorter_than_stored_prefix"
-            | "optimized_shorter_than_prefix"
-            // A reminder still standing inside the replayed region names the
-            // boundary as directly as the mismatches above do: relocation
-            // declined this turn, so the prefix went out as this turn's own
-            // bytes with the client's scaffolding still inside it. Left out of
-            // this list it landed in the same bucket as `no_previous_turn`,
-            // which reads as "no evidence" for a turn that carries plenty.
-            | "reminder_inside_prefix"),
+            | "optimized_shorter_than_prefix"),
         ) => Some(reason),
         _ => None,
     };
@@ -1472,23 +1465,6 @@ mod tests {
         );
         let a = recache_attribution(None, Some(skip), Some(applied_evidence()), true);
         assert_eq!(a.reason, Some("prefix_content_diverged"));
-    }
-
-    /// A span left standing inside the replayed region is evidence in its own
-    /// right. It shared the residual bucket with `no_previous_turn` when the
-    /// reason was added, so turns that named their own boundary were counted as
-    /// unattributed.
-    #[test]
-    fn a_reminder_inside_the_prefix_is_an_attributed_cause() {
-        let current = [serde_json::json!({"role": "user", "content": "tail"})];
-        let skip = ReplaySkipEvidence::from_inbound_original_histories(
-            ReplaySkip::ReminderInsidePrefix,
-            None,
-            &current,
-        );
-        let a = recache_attribution(None, Some(skip), None, false);
-        assert_eq!(a.reason, Some("reminder_inside_prefix"));
-        assert!(a.counts_as_waste, "the rewrite is still real waste");
     }
 
     /// The Prometheus registry is process-global, so tests that read a counter
