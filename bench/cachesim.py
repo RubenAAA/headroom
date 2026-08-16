@@ -429,29 +429,55 @@ def load_ledger(path: str) -> dict[str, dict]:
     return ledger
 
 
-def validate(turns, ledger, bytes_per_token):
+def ledger_usage(real: dict) -> Usage:
+    """One ledger line as a `Usage`.
+
+    `cache_creation_input_tokens` is the creation total and the TTL fields are
+    its split, so the two should agree. On a handful of turns they do not — the
+    split reads far above or far below the total, in one case 149,094 against
+    258 — and the total is the trustworthy one: it is a single number the
+    provider states, while the split is a nested object read separately and can
+    be captured a beat apart on a streamed response. Taking the split at face
+    value made the simulator look 24% low on creation when it is within 0.5%.
+
+    So the total sets the size and the split only sets the mix.
+    """
+    total = real.get("cache_creation_input_tokens") or 0
+    m5 = real.get("cache_write_5m_tokens") or 0
+    h1 = real.get("cache_write_1h_tokens") or 0
+    m5, h1 = max(m5, 0), max(h1, 0)  # -1 means the provider published no split
+    split = m5 + h1
+    if split:
+        share_1h = h1 / split
+    else:
+        share_1h = 1.0  # the proxy asks for the 1-hour tier
+    write_1h = round(total * share_1h)
+    return Usage(
+        input_tokens=real.get("input_tokens") or 0,
+        read_tokens=real.get("cache_read_input_tokens") or 0,
+        write_5m_tokens=total - write_1h,
+        write_1h_tokens=write_1h,
+    )
+
+
+def validate(turns, path, ledger, bytes_per_token):
     """Compare simulated usage against what the provider actually billed.
 
     Reports the ratio distribution rather than a mean error, because a single
     prefix rebuild dwarfs a hundred ordinary turns and would own any average.
+
+    Scores the FORWARDED bodies. The ledger is the bill for what the proxy put
+    on the wire, so pricing the inbound bodies against it charges the simulator
+    for the proxy's whole effect: it read 0.68 on creation that way and reads
+    1.00 on the bodies that were actually sent.
     """
-    _, per_turn = score_corpus(turns, bytes_per_token)
+    _, per_turn = score_corpus(with_forwarded_bodies(turns, path), bytes_per_token)
     rows = []
     for turn, usage in per_turn:
         real = ledger.get(turn.request_id)
         if not real:
             continue
-        rows.append(
-            (
-                usage,
-                Usage(
-                    input_tokens=real.get("input_tokens") or 0,
-                    read_tokens=real.get("cache_read_input_tokens") or 0,
-                    write_5m_tokens=real.get("cache_write_5m_tokens") or 0,
-                    write_1h_tokens=real.get("cache_write_1h_tokens") or 0,
-                ),
-            )
-        )
+        rows.append((usage, ledger_usage(real)))
     return rows
 
 
@@ -816,7 +842,9 @@ def main() -> int:
         return 1
 
     if args.mode == "validate":
-        report_validation(validate(turns, load_ledger(args.log), args.bytes_per_token))
+        report_validation(
+            validate(turns, args.corpus, load_ledger(args.log), args.bytes_per_token)
+        )
         return 0
 
     if args.mode == "compare":

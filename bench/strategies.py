@@ -135,6 +135,143 @@ def _force_ttl(body, ttl):
     return body
 
 
+def _emulate_proxy_tail(body, slots):
+    """Strip the client's message markers and re-place `slots` at the tail.
+
+    A faithful-enough stand-in for `place_tail_cache_breakpoints`, so the marker
+    policy can be priced on its own against the client's untouched placement.
+    """
+    _clear_message_markers(body)
+    if slots <= 0:
+        return body
+    tails = []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            tails.append(content[-1])
+    for block in tails[-slots:]:
+        block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    return body
+
+
+@strategy("tail-slots-0")
+def tail_slots_0(body):
+    """Drop every message breakpoint: what the client sent, minus its own markers."""
+    return _emulate_proxy_tail(body, 0)
+
+
+@strategy("tail-slots-1")
+def tail_slots_1(body):
+    """One proxy-placed tail breakpoint, client markers stripped."""
+    return _emulate_proxy_tail(body, 1)
+
+
+@strategy("tail-slots-2")
+def tail_slots_2(body):
+    """Two proxy-placed tail breakpoints — what ships today."""
+    return _emulate_proxy_tail(body, 2)
+
+
+THINKING = ("thinking", "redacted_thinking")
+
+
+@strategy("strip-old-thinking")
+def strip_old_thinking(body):
+    """Drop reasoning blocks from every assistant message but the last.
+
+    Reasoning is 29% of the message tokens on this traffic and is re-sent in full
+    on every turn thereafter. Anthropic requires the block only while its own
+    tool loop is still open — the last assistant message — so everything behind
+    that is re-sent for nothing.
+
+    It is also cheap in cache terms, which is not obvious. A message is stripped
+    once, on the turn it stops being last, and never changes again. That breaks
+    the prefix at a point one turn from the tail, which is inside the span being
+    rewritten anyway; the older prefix is untouched and keeps hitting.
+    """
+    messages = body.get("messages") or []
+    last = max((i for i, m in enumerate(messages)
+                if m.get("role") == "assistant"), default=-1)
+    for i, message in enumerate(messages):
+        if i == last or not isinstance(message.get("content"), list):
+            continue
+        message["content"] = [b for b in message["content"]
+                              if not (isinstance(b, dict) and b.get("type") in THINKING)]
+    return body
+
+
+@strategy("strip-all-thinking")
+def strip_all_thinking(body):
+    """Drop every reasoning block, including the newest.
+
+    The upper bound on what stripping can buy, and position-independent, so no
+    message ever changes shape. Not shippable as-is: an open tool loop needs its
+    signed block back or the API rejects the turn.
+    """
+    for message in body.get("messages") or []:
+        if isinstance(message.get("content"), list):
+            message["content"] = [b for b in message["content"]
+                                  if not (isinstance(b, dict) and b.get("type") in THINKING)]
+    return body
+
+
+@strategy("strip-thinking-cache-behind")
+def strip_thinking_cache_behind(body):
+    """Strip reasoning except the open tool loop, and keep every breakpoint behind it.
+
+    `strip-old-thinking` measured +285% and the reason generalises. Each cached
+    prefix was written on the turn its own tail message was still carrying
+    reasoning; strip that message a turn later and the entry is dead. Not the
+    newest entry — every entry ever written, all the way back. The break is only
+    six messages deep and still costs the whole conversation, which is why
+    depth-of-break is a misleading thing to measure.
+
+    So the last assistant message keeps its signed blocks, because the API wants
+    them, and no breakpoint is allowed to sit at or after it. Nothing cached ever
+    contains a block that will later be removed, so nothing is ever invalidated.
+    What falls outside the last breakpoint bills fresh, but that is the newest
+    turn, which bills fresh regardless.
+    """
+    messages = body.get("messages") or []
+    last = max((i for i, m in enumerate(messages)
+                if m.get("role") == "assistant"), default=-1)
+    for i, message in enumerate(messages):
+        if i == last or not isinstance(message.get("content"), list):
+            continue
+        message["content"] = [b for b in message["content"]
+                              if not (isinstance(b, dict) and b.get("type") in THINKING)]
+
+    _clear_message_markers(body)
+    # The marker goes on the last block that is safe forever: the end of the
+    # message before the preserved one.
+    safe = [b for m, b in _content_blocks(body)
+            if messages.index(m) < last] if last > 0 else []
+    if safe:
+        safe[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    return body
+
+
+@strategy("tail-5m-stable-1h")
+def tail_5m_stable_1h(body):
+    """1h on the system/tools prefix, 5m on the moving message tail.
+
+    A message-tail breakpoint moves forward every turn, so what it writes is read
+    by the next turn and then superseded. The median gap between turns is fifteen
+    seconds. Buying an hour of retention for it costs 2.0x instead of 1.25x and
+    is never claimed. The system prefix is the opposite case — stable for the
+    whole session, read hundreds of times — so it keeps the long TTL.
+    """
+    system = body.get("system")
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    for _, block in _content_blocks(body):
+        if isinstance(block.get("cache_control"), dict):
+            block["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
+    return body
+
+
 # The counter Claude Code appends to the tail. It changes every single turn, so
 # any prefix that contains it dies every single turn.
 COUNTER = re.compile(r"<total_tokens>\s*\d+\s*tokens left</total_tokens>")

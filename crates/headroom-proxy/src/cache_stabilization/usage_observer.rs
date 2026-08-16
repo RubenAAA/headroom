@@ -445,7 +445,7 @@ impl ReplaySkipEvidence {
     /// every turn". It was computed and then dropped before reaching the log.
     pub fn first_diff_index(&self) -> Option<usize> {
         match self.reason {
-            ReplaySkip::PrefixContentDiverged { first_diff_index } => Some(first_diff_index),
+            ReplaySkip::PrefixContentDiverged { first_diff_index, .. } => Some(first_diff_index),
             _ => None,
         }
     }
@@ -482,7 +482,7 @@ impl ReplaySkipEvidence {
             (self.comparison_origin, self.reason),
             (
                 ReplayComparisonOrigin::InboundOriginalHistories,
-                ReplaySkip::PrefixContentDiverged { first_diff_index }
+                ReplaySkip::PrefixContentDiverged { first_diff_index, .. }
             ) if first_diff_index == prior_count - 1
         )
     }
@@ -1459,6 +1459,7 @@ mod tests {
         let skip = ReplaySkipEvidence::from_inbound_original_histories(
             ReplaySkip::PrefixContentDiverged {
                 first_diff_index: 0,
+                replayed_prefix_msgs: 0,
             },
             Some(&prior),
             &current,
@@ -2590,6 +2591,7 @@ mod stream_matching_tests {
             ReplaySkipEvidence::from_inbound_original_histories(
                 ReplaySkip::PrefixContentDiverged {
                     first_diff_index: 2,
+                    replayed_prefix_msgs: 2,
                 },
                 Some(&prior),
                 &current,
@@ -2625,7 +2627,8 @@ mod stream_matching_tests {
 
         assert!(!ReplaySkipEvidence::from_inbound_original_histories(
             ReplaySkip::PrefixContentDiverged {
-                first_diff_index: 0
+                first_diff_index: 0,
+                replayed_prefix_msgs: 0,
             },
             Some(&one),
             &two,
@@ -2633,7 +2636,8 @@ mod stream_matching_tests {
         .is_inbound_tail_replacement());
         assert!(!ReplaySkipEvidence::from_inbound_original_histories(
             ReplaySkip::PrefixContentDiverged {
-                first_diff_index: 0
+                first_diff_index: 0,
+                replayed_prefix_msgs: 0,
             },
             Some(&empty),
             &empty,
@@ -2675,6 +2679,7 @@ mod stream_matching_tests {
             ReplaySkipEvidence::from_inbound_original_histories(
                 ReplaySkip::PrefixContentDiverged {
                     first_diff_index: 1,
+                    replayed_prefix_msgs: 1,
                 },
                 Some(&prior),
                 &current,

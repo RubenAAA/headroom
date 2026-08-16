@@ -602,6 +602,11 @@ pub fn extract_cache_stable_delta(
 /// and there must be exactly one forwarded message per original. Otherwise we
 /// return `optimized_messages` unchanged (accept a possible bust over forwarding
 /// wrong content).
+///
+/// Assumes the stored prefix belongs to this conversation. Callers that got it
+/// from the fallback — which hands back the session's most recent prefix even
+/// when nothing continues it — must use [`overlay_cached_prefix_reported`] and
+/// pass `continues_chain: false`.
 pub fn overlay_cached_prefix(
     optimized_messages: Vec<Value>,
     current_original_messages: &[Value],
@@ -613,6 +618,7 @@ pub fn overlay_cached_prefix(
         current_original_messages,
         previous_original_messages,
         previous_forwarded_messages,
+        true,
     )
     .0
 }
@@ -925,9 +931,14 @@ pub enum ReplaySkip {
     /// provider already reads up to the deletion and rebuilds only what
     /// follows.
     ///
-    /// Carries the first message index that differs, as a diagnostic only.
-    /// Replaying up to it was tried and measured worse.
-    PrefixContentDiverged { first_diff_index: usize },
+    /// Carries the first message index that differs, and how many leading
+    /// messages were replayed from the stored prefix anyway (see
+    /// [`overlay_cached_prefix_reported`] — since 2026-08-17 that is all of them
+    /// up to the divergence, where it used to be none).
+    PrefixContentDiverged {
+        first_diff_index: usize,
+        replayed_prefix_msgs: usize,
+    },
 }
 
 impl ReplaySkip {
@@ -945,14 +956,22 @@ impl ReplaySkip {
 
 /// [`overlay_cached_prefix`], but reporting why it declined.
 ///
-/// Returns `(messages, None)` when the cached prefix was replayed, and
-/// `(messages_unchanged, Some(reason))` otherwise. It is all-or-nothing on
-/// purpose — see the comment on the divergence path.
+/// Returns `(messages, None)` when the whole cached prefix was replayed, and
+/// `(messages, Some(reason))` otherwise. A `Some` no longer implies the messages
+/// came back untouched: on a content divergence the leading run that still
+/// agrees is spliced in — see the comment on that path.
+///
+/// `continues_chain` says whether the stored prefix is this conversation's own.
+/// `previous_turn_for` falls back to the session's most recent prefix when
+/// nothing continues it, reporting `chain_id = 0`; splicing another stream's
+/// bytes in on the strength of a shared opener would forward compressed content
+/// whose referents live in a conversation this one never had.
 pub fn overlay_cached_prefix_reported(
     optimized_messages: Vec<Value>,
     current_original_messages: &[Value],
     previous_original_messages: Option<&[Value]>,
     previous_forwarded_messages: Option<&[Value]>,
+    continues_chain: bool,
 ) -> (Vec<Value>, Option<ReplaySkip>) {
     let (prev_orig, prev_fwd) = match (previous_original_messages, previous_forwarded_messages) {
         (Some(o), Some(f)) if !o.is_empty() && !f.is_empty() => (o, f),
@@ -1013,25 +1032,47 @@ pub fn overlay_cached_prefix_reported(
                     != canonicalize_for_prefix_compare(&prev_orig[i])
             })
             .unwrap_or(n);
-        // Forward this turn's own bytes for the whole prefix.
+        // Replay the leading run that still agrees; take this turn's own bytes
+        // from the divergence on.
         //
-        // Replaying the leading run that still agrees looks obviously better
-        // and was tried on 2026-08-09. It is not. Measured live on one
-        // conversation, `prev_fwd[..k] ++ optimized[k..]` collapsed a turn from
-        // 224,689 cache-read / 981 cache-write to 22,026 read / 204,768 write,
-        // and the following turn recovered on its own.
+        // This was tried on 2026-08-09, measured worse, and reverted. The
+        // premise recorded then was that a declined replay is not a bust
+        // because compression is deterministic, so this turn's own bytes for an
+        // unchanged prefix reproduce what the provider already cached. Capture
+        // refutes it. Early messages carry `<system-reminder>` spans that the
+        // client attaches and withdraws over the life of a conversation, and
+        // replay freezes whichever form was current when the chain started. The
+        // stored copy and a freshly computed one therefore disagree at message
+        // 0, so a decline does not reproduce the cached bytes — it misses at
+        // the very first message and rebuilds the entire conversation.
         //
-        // The premise was wrong. A declined replay is not a bust: compression
-        // is deterministic, so this turn's own bytes for an unchanged prefix
-        // reproduce the bytes the provider already cached. The same
-        // conversation shows it — a `no_previous_turn` turn, replaying nothing
-        // at all, still read 222,975 tokens from cache. Splicing a previous
-        // turn's bytes onto this turn's tail creates a seam that matches
-        // neither, which is the one way to actually lose the prefix.
-        return (
-            optimized_messages,
-            Some(ReplaySkip::PrefixContentDiverged { first_diff_index }),
-        );
+        // Measured on the 2026-08-17 capture: 5 declined turns, every one of
+        // them diverging in the last 1% of the prefix (median 99.3% depth),
+        // between them stranding 443,541 tokens — 55% of all recorded waste.
+        // Splicing recovers cache creation by 25.6% and the bill by 16.3% at
+        // the fitted subscription weights. The 2026-08-09 measurement was taken
+        // while the relocation pass was live, which lifted blocks out of
+        // history and re-appended them every turn; a spliced prefix could not
+        // match under it. Relocation is gone.
+        //
+        // Only the run that agrees is replayed, so this stays correct when the
+        // divergence is a mid-history deletion: the removed message sits at or
+        // after `first_diff_index` and never comes from the stored copy.
+        let replay_upto = if continues_chain {
+            first_diff_index.min(prev_fwd.len()).min(optimized_messages.len())
+        } else {
+            0
+        };
+        let skip = ReplaySkip::PrefixContentDiverged {
+            first_diff_index,
+            replayed_prefix_msgs: replay_upto,
+        };
+        if replay_upto == 0 {
+            return (optimized_messages, Some(skip));
+        }
+        let mut out = prev_fwd[..replay_upto].to_vec();
+        out.extend_from_slice(&optimized_messages[replay_upto..]);
+        return (out, Some(skip));
     }
     // Replay the cached (compressed) prefix verbatim; keep this turn's tail.
     //
@@ -2476,15 +2517,17 @@ mod tests {
         );
     }
 
-    /// A divergence costs the whole prefix, and that is deliberate.
+    /// A divergence costs only what follows it: the leading run that still
+    /// agrees is replayed from the stored prefix.
     ///
-    /// Replaying the leading run that still agrees was implemented and measured
-    /// live on 2026-08-09: it turned a 224,689-read / 981-write turn into a
-    /// 22,026-read / 204,768-write one. Compression is deterministic, so this
-    /// turn's own bytes for an unchanged prefix already reproduce what the
-    /// provider cached; a splice between two turns' bytes matches neither.
+    /// The premise for declining the whole prefix used to be that compression
+    /// is deterministic, so this turn's own bytes reproduce what the provider
+    /// cached anyway. Capture refutes it — early messages carry reminder spans
+    /// the client attaches and withdraws, so a freshly computed message 0
+    /// disagrees with the frozen one and the miss lands at the very first
+    /// message. See `overlay_cached_prefix_reported`.
     #[test]
-    fn overlay_declines_whole_prefix_when_a_later_message_diverges() {
+    fn overlay_replays_agreeing_run_when_a_later_message_diverges() {
         let prev_orig = vec![
             text_msg("user", "a"),
             text_msg("assistant", "b"),
@@ -2508,17 +2551,21 @@ mod tests {
             &current_orig,
             Some(&prev_orig),
             Some(&prev_fwd),
+            true,
         );
         assert_eq!(
             skip,
             Some(ReplaySkip::PrefixContentDiverged {
-                first_diff_index: 2
+                first_diff_index: 2,
+                replayed_prefix_msgs: 2,
             }),
-            "the index is still reported, as a diagnostic"
+            "the index is reported, and so is how much was salvaged"
         );
+        let mut expected = prev_fwd[..2].to_vec();
+        expected.extend_from_slice(&optimized[2..]);
         assert_eq!(
-            out, optimized,
-            "no partial splice: the turn forwards its own bytes throughout"
+            out, expected,
+            "the agreeing run comes from the stored prefix, the rest from this turn"
         );
     }
 
@@ -2932,6 +2979,7 @@ mod tests {
             &current,
             Some(&stored_originals),
             Some(&stored_forwarded),
+            true,
         );
         assert_eq!(skip, None);
         assert_eq!(out[0], stable_forwarded);
@@ -3193,7 +3241,7 @@ mod skip_reason_tests {
         prev_orig: Option<&[Value]>,
         prev_fwd: Option<&[Value]>,
     ) -> Option<ReplaySkip> {
-        overlay_cached_prefix_reported(optimized, current, prev_orig, prev_fwd).1
+        overlay_cached_prefix_reported(optimized, current, prev_orig, prev_fwd, true).1
     }
 
     #[test]
@@ -3206,6 +3254,7 @@ mod skip_reason_tests {
             &current,
             Some(&prev_orig),
             Some(&prev_fwd),
+            true,
         );
         assert_eq!(reason, None, "an append-only turn must replay");
         assert_eq!(out[0], prev_fwd[0], "the cached bytes must be forwarded");
@@ -3254,7 +3303,8 @@ mod skip_reason_tests {
         assert_eq!(
             skip(current.clone(), &current, Some(&prev_orig), Some(&prev_fwd)),
             Some(ReplaySkip::PrefixContentDiverged {
-                first_diff_index: 0
+                first_diff_index: 0,
+                replayed_prefix_msgs: 0,
             })
         );
     }
@@ -3297,6 +3347,7 @@ mod skip_reason_tests {
             ReplaySkip::OptimizedShorterThanPrefix,
             ReplaySkip::PrefixContentDiverged {
                 first_diff_index: 0,
+                replayed_prefix_msgs: 0,
             },
         ];
         let labels: std::collections::HashSet<_> = all.iter().map(|r| r.as_str()).collect();
@@ -3428,7 +3479,7 @@ mod interleaved_stream_tests {
         assert_eq!(fwd.len(), a1.len());
 
         // And the overlay accepts it, which is the whole point.
-        let (_, skip) = overlay_cached_prefix_reported(a2.clone(), &a2, Some(&orig), Some(&fwd));
+        let (_, skip) = overlay_cached_prefix_reported(a2.clone(), &a2, Some(&orig), Some(&fwd), true);
         assert_eq!(skip, None, "A's turn must replay rather than decline");
     }
 
@@ -3487,11 +3538,20 @@ mod interleaved_stream_tests {
         // A conversation that continues neither branch.
         let c = stream("c", 6);
         let got = store.previous_turn_for("S", &c);
-        if let Ok((orig, fwd, _)) = got {
+        if let Ok((orig, fwd, chain_id)) = got {
+            assert_eq!(chain_id, 0, "the fallback must admit it continues nothing");
             // The fallback may hand back the most recent prefix, but the
-            // overlay must then refuse it — nothing wrong is forwarded.
-            let (out, skip) =
-                overlay_cached_prefix_reported(c.clone(), &c, Some(&orig), Some(&fwd));
+            // overlay must then refuse it — nothing wrong is forwarded. Every
+            // stream here opens with the same message, so the divergence is at
+            // index 1 and the splice would otherwise take the bait: `chain_id`
+            // is what stops it, exactly as the proxy passes it.
+            let (out, skip) = overlay_cached_prefix_reported(
+                c.clone(),
+                &c,
+                Some(&orig),
+                Some(&fwd),
+                chain_id != 0,
+            );
             assert!(skip.is_some(), "an unrelated stream must not replay");
             assert_eq!(out, c, "the turn's own bytes must be forwarded untouched");
         }
@@ -3580,7 +3640,7 @@ mod interleaved_stream_tests {
                 .previous_turn_for("S", &next)
                 .unwrap_or_else(|e| panic!("agent{i} lost its prefix: {e:?}"));
             let (_, skip) =
-                overlay_cached_prefix_reported(next.clone(), &next, Some(&orig), Some(&fwd));
+                overlay_cached_prefix_reported(next.clone(), &next, Some(&orig), Some(&fwd), true);
             assert_eq!(skip, None, "agent{i} was forced to decline and would bust");
         }
     }
@@ -3634,10 +3694,13 @@ mod divergence_index_tests {
             current,
             Some(prev),
             Some(&prev.to_vec()),
+            true,
         )
         .1
         {
-            Some(ReplaySkip::PrefixContentDiverged { first_diff_index }) => Some(first_diff_index),
+            Some(ReplaySkip::PrefixContentDiverged {
+                first_diff_index, ..
+            }) => Some(first_diff_index),
             _ => None,
         }
     }
@@ -3785,6 +3848,7 @@ mod originals_are_the_clients_tests {
             &ours_now,
             Some(&ours_prev),
             Some(&ours_prev),
+            true,
         );
         assert!(
             matches!(skip, Some(ReplaySkip::PrefixContentDiverged { .. })),
@@ -3805,6 +3869,7 @@ mod originals_are_the_clients_tests {
             &client_now,
             Some(&client_prev),
             Some(&forwarded_prev),
+            true,
         );
         assert_eq!(skip, None, "an append-only client turn must replay");
         assert_eq!(
@@ -3825,6 +3890,7 @@ mod originals_are_the_clients_tests {
             &client_now,
             Some(&client_prev),
             Some(&forwarded_prev),
+            true,
         );
         assert!(skip.is_some(), "a genuine edit must still decline");
         assert_eq!(out, client_now, "and forward the client's own bytes");
@@ -4430,6 +4496,7 @@ mod block_shape_tests {
             inbound,
             previous.map(|(original, _)| original.as_slice()),
             previous.map(|(_, forwarded)| forwarded.as_slice()),
+            true,
         );
         (place_tail_cache_breakpoints(overlaid, 1).0, skip)
     }

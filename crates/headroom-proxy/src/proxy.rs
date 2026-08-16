@@ -5231,6 +5231,10 @@ pub(crate) fn apply_prefix_replay(
         &original_messages,
         prev_orig.as_deref(),
         prev_fwd.as_deref(),
+        // Only splice a diverged prefix when this turn genuinely continues the
+        // stored chain. A zero id means the store fell back to the session's
+        // most recent prefix, which belongs to some other stream.
+        chain_id != 0,
     );
     let replayed_prefix = overlaid != optimized;
     // A turn that does not replay is where the money goes: measured over the
@@ -5249,6 +5253,7 @@ pub(crate) fn apply_prefix_replay(
                 (
                     Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
                         first_diff_index,
+                        ..
                     }),
                     Some(prev),
                 ) => cache_stabilization::prefix_replay::divergence_text_heads(
@@ -5291,6 +5296,7 @@ pub(crate) fn apply_prefix_replay(
             first_diff_index = match skip_reason {
                 Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
                     first_diff_index,
+                        ..
                 }) => first_diff_index as i64,
                 _ => -1,
             },
@@ -5303,6 +5309,7 @@ pub(crate) fn apply_prefix_replay(
                 (
                     Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
                         first_diff_index,
+                        ..
                     }),
                     Some(prev),
                 ) => cache_stabilization::prefix_replay::describe_divergence(
@@ -5313,6 +5320,19 @@ pub(crate) fn apply_prefix_replay(
                 .unwrap_or_default(),
                 _ => String::new(),
             },
+            // How much of the stored prefix was replayed anyway. A decline no
+            // longer forwards this turn's own bytes for the whole prefix: the
+            // run that still agrees comes from the stored copy, so the provider
+            // keeps reading it instead of missing at message 0. Zero here means
+            // the divergence was at the very first message and nothing could be
+            // salvaged.
+            replayed_prefix_msgs = match skip_reason {
+                Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
+                    replayed_prefix_msgs,
+                    ..
+                }) => replayed_prefix_msgs as i64,
+                _ => -1,
+            },
             // Which block kinds sat on each side of that difference. A
             // `tool_result` that vanished points at something collapsing tool
             // output in front of the client; an ordinary text change points at
@@ -5321,6 +5341,7 @@ pub(crate) fn apply_prefix_replay(
                 (
                     Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
                         first_diff_index,
+                        ..
                     }),
                     Some(prev),
                 ) => prev
@@ -5332,6 +5353,7 @@ pub(crate) fn apply_prefix_replay(
             diff_shape_current = match skip_reason {
                 Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
                     first_diff_index,
+                        ..
                 }) => original_messages
                     .get(first_diff_index)
                     .map(cache_stabilization::prefix_replay::block_type_shape)
@@ -5347,6 +5369,7 @@ pub(crate) fn apply_prefix_replay(
                 (
                     Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
                         first_diff_index,
+                        ..
                     }),
                     Some(prev),
                 ) => prev
@@ -5358,6 +5381,7 @@ pub(crate) fn apply_prefix_replay(
             diff_text_kinds_current = match skip_reason {
                 Some(cache_stabilization::prefix_replay::ReplaySkip::PrefixContentDiverged {
                     first_diff_index,
+                        ..
                 }) => original_messages
                     .get(first_diff_index)
                     .map(cache_stabilization::prefix_replay::text_block_kinds)
