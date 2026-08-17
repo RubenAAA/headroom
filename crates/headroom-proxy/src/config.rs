@@ -794,6 +794,22 @@ pub struct CliArgs {
     )]
     pub split_cache_ttl: bool,
 
+    /// Persist forwarded prefixes here so a proxy restart does not throw them
+    /// away. Empty (the default) keeps them in memory only.
+    ///
+    /// A restart empties the replay store, and the miss that follows is not
+    /// free: with no tracker, compression stops treating the history as frozen
+    /// and rewrites it, so the bytes stop matching the prefix the provider still
+    /// holds. Measured at 352,167 tokens over 7 turns — 10% of all failed
+    /// re-use — every one within minutes of a proxy start. See
+    /// [`crate::cache_stabilization::prefix_replay::SessionReplayStore::with_persistence`].
+    #[arg(
+        long = "replay-store-dir",
+        env = "HEADROOM_PROXY_REPLAY_STORE_DIR",
+        default_value = "",
+    )]
+    pub replay_store_dir: String,
+
     /// Hold the working-directory line in the `system` preamble to the value
     /// each conversation opened with, and state the live one at the message
     /// tail.
@@ -1740,6 +1756,9 @@ pub struct Config {
     /// state the live one at the message tail. See
     /// [`crate::cache_stabilization::working_dir`].
     pub hold_working_directory: bool,
+    /// Where forwarded prefixes are persisted so they survive a restart. Empty
+    /// keeps them in memory only.
+    pub replay_store_dir: String,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
@@ -2009,6 +2028,7 @@ impl Config {
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
             hold_working_directory: args.hold_working_directory,
+            replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
@@ -2239,6 +2259,7 @@ impl Config {
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
             hold_working_directory: false,
+            replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,

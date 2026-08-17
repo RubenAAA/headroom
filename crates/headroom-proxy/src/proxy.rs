@@ -521,13 +521,22 @@ impl AppState {
             None
         };
 
+        let replay_store = if config.replay_store_dir.is_empty() {
+            SessionReplayStore::new(REPLAY_STORE_CAPACITY)
+        } else {
+            SessionReplayStore::with_persistence(
+                REPLAY_STORE_CAPACITY,
+                std::path::PathBuf::from(&config.replay_store_dir),
+            )
+        };
+
         Ok(Self {
             config: Arc::new(config),
             client,
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             tool_order_state: cache_stabilization::tool_order::ToolOrderStore::default(),
-            replay_store: SessionReplayStore::new(REPLAY_STORE_CAPACITY),
+            replay_store,
             working_dir_pins: cache_stabilization::working_dir::WorkingDirPins::new(
                 REPLAY_STORE_CAPACITY,
             ),

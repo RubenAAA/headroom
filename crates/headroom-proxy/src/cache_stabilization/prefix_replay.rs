@@ -2072,6 +2072,123 @@ struct PendingTurn {
     forwarded_messages: Vec<Value>,
 }
 
+/// One session's prefix, on disk, so a proxy restart does not throw it away.
+///
+/// # Why this is on disk at all
+///
+/// The store is in memory, so a restart empties it and the first turn of every
+/// live conversation reports `no_previous_turn`. That is not a free miss.
+/// [`PrefixReplayTracker::frozen_message_count`] returns 0 without a tracker, so
+/// compression stops treating the history as frozen and rewrites it — including
+/// message 0 — and the bytes no longer match the prefix the provider still
+/// holds. Measured over 2,083 ledger-joined turns on 2026-08-17
+/// (`bench/_wastewhere.py`): 7 turns, **352,167 tokens**, 10% of all failed
+/// re-use, every one of them 0 to 193 seconds after a proxy start.
+///
+/// Only the forwarded bytes can reproduce the forwarded bytes. Each message was
+/// compressed once, while it was the live zone, and then frozen; recompressing
+/// the history from scratch compresses every message against a different context
+/// and lands somewhere else. So this stores them verbatim.
+///
+/// # What is not stored
+///
+/// The `alternates` — the interleaved-stream slots. They multiply the file by the
+/// number of streams sharing a session key to protect a case that is already
+/// rare, and a missing alternate costs one decline, which is what happens today.
+///
+/// The session key itself is not written either. It "can contain an
+/// authorization credential or caller-supplied identifier", which is why the
+/// logs only ever print a hash of it, and the same reasoning applies harder to a
+/// file that outlives the process. The file is *named* by its SHA-256, so the
+/// lookup needs nothing inside.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedPrefix {
+    chain_id: u64,
+    cached_token_count: u64,
+    cached_message_count: usize,
+    turn_number: u64,
+    /// Unix seconds. The only staleness signal that survives a restart —
+    /// `Instant` is process-local and meaningless across one.
+    saved_at_unix: u64,
+    originals: Vec<Value>,
+    forwarded: Vec<Value>,
+}
+
+/// Where one session's prefix lives.
+///
+/// Named by the SHA-256 of the session key, which keeps a possible credential out
+/// of a filename and needs nothing stored inside the file to look up.
+fn persisted_path(dir: &std::path::Path, session_key: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(session_key.as_bytes());
+    dir.join(format!("{digest:x}.json"))
+}
+
+/// Read a session's persisted prefix, or `None` if there is none, it is
+/// unreadable, or its last turn is older than [`PERSIST_MAX_AGE`].
+fn read_persisted_prefix(
+    dir: &std::path::Path,
+    session_key: &str,
+) -> Option<PersistedPrefix> {
+    let bytes = std::fs::read(persisted_path(dir, session_key)).ok()?;
+    let snapshot: PersistedPrefix = serde_json::from_slice(&bytes).ok()?;
+    if snapshot.forwarded.is_empty() {
+        return None;
+    }
+    (unix_now().saturating_sub(snapshot.saved_at_unix) <= PERSIST_MAX_AGE.as_secs())
+        .then_some(snapshot)
+}
+
+/// Delete persisted prefixes whose last turn is past [`PERSIST_MAX_AGE`],
+/// returning how many went. Runs once per process start, on one `read_dir`.
+fn sweep_stale_prefixes(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Age from the file's own mtime, not its contents: a truncated or
+        // foreign file should be swept too, and parsing every one to find out
+        // defeats the point of a cheap sweep.
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|e| e > PERSIST_MAX_AGE).unwrap_or(false))
+            .unwrap_or(false);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How stale a persisted prefix may be and still be worth loading.
+///
+/// The proxy asks for the 1-hour tier, and a cache read refreshes the entry for
+/// free — so an entry survives indefinitely while a conversation is active, and
+/// dies an hour after its last turn. A snapshot whose last turn is older than
+/// that names a prefix the provider has already dropped.
+///
+/// Being generous here is safe rather than risky: a stale prefix cannot cause a
+/// wrong replay, because [`matches_canonical_prefix`] still has to accept it. The
+/// worst case is the decline that would have happened anyway.
+const PERSIST_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Runaway guard on one session's file, not a policy choice.
+///
+/// A deep conversation is around 1.2 MB of messages, so originals plus forwarded
+/// runs to a few MB — worth writing, since deep conversations are exactly where
+/// the tokens are. This only stops something pathological from filling the disk.
+const PERSIST_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// Per-session freeze-replay store. Cloneable `Arc<Mutex<…>>` handle like
 /// [`crate::cache_stabilization::drift_detector::DriftState`].
 #[derive(Clone)]
@@ -2079,6 +2196,8 @@ pub struct SessionReplayStore {
     trackers: Arc<Mutex<LruCache<String, PrefixReplayTracker>>>,
     pending: Arc<Mutex<LruCache<String, PendingTurn>>>,
     session_ttl: Duration,
+    /// Where prefixes are persisted, or `None` to keep everything in memory.
+    persist_dir: Option<Arc<std::path::PathBuf>>,
 }
 
 impl std::fmt::Debug for SessionReplayStore {
@@ -2103,6 +2222,116 @@ impl SessionReplayStore {
             trackers: Arc::new(Mutex::new(LruCache::new(cap))),
             pending: Arc::new(Mutex::new(LruCache::new(pending_cap))),
             session_ttl: Duration::from_secs(600),
+            persist_dir: None,
+        }
+    }
+
+    /// [`Self::new`], with prefixes persisted under `dir` so they survive a
+    /// restart. See [`PersistedPrefix`] for what is written and why.
+    ///
+    /// Creates the directory and sweeps anything past [`PERSIST_MAX_AGE`] out of
+    /// it. A failure to do either turns persistence off for this process rather
+    /// than failing the proxy: the feature is a cost optimisation, and the
+    /// in-memory path it falls back to is the behaviour that shipped for months.
+    ///
+    /// # Panics
+    /// If `capacity == 0`.
+    pub fn with_persistence(capacity: usize, dir: std::path::PathBuf) -> Self {
+        let mut store = Self::new(capacity);
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                event = "prefix_replay_persist_unavailable",
+                dir = %dir.display(),
+                %error,
+                "cannot create the prefix-replay directory; keeping prefixes in memory only"
+            );
+            return store;
+        }
+        let swept = sweep_stale_prefixes(&dir);
+        tracing::info!(
+            event = "prefix_replay_persist_enabled",
+            dir = %dir.display(),
+            stale_files_removed = swept,
+            "persisting forwarded prefixes across restarts"
+        );
+        store.persist_dir = Some(Arc::new(dir));
+        store
+    }
+
+    /// Load this session's persisted prefix into memory, if there is one and the
+    /// store does not already hold it.
+    ///
+    /// The file read happens with no lock held. Taking the lock twice — once to
+    /// see whether the read is needed, once to install the result — costs two
+    /// uncontended acquisitions and keeps disk I/O out of the path every other
+    /// request takes through [`Self::previous_turn_for`].
+    fn hydrate(&self, session_key: &str) {
+        let Some(dir) = self.persist_dir.as_deref() else {
+            return;
+        };
+        match self.trackers.lock() {
+            Ok(guard) if guard.contains(session_key) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        let Some(snapshot) = read_persisted_prefix(dir, session_key) else {
+            return;
+        };
+        let messages = snapshot.forwarded.len();
+        let tracker = PrefixReplayTracker {
+            cached_token_count: snapshot.cached_token_count,
+            cached_message_count: snapshot.cached_message_count,
+            turn_number: snapshot.turn_number,
+            // Process-local, so it cannot be restored — and must not read as
+            // stale, or the session TTL below would drop what we just loaded.
+            // `saved_at_unix` is what actually bounds the age, checked on read.
+            last_activity: Instant::now(),
+            last_original_messages: snapshot.originals,
+            last_forwarded_messages: snapshot.forwarded,
+            alternates: Vec::new(),
+            primary_chain_id: snapshot.chain_id,
+            next_chain_id: snapshot.chain_id.saturating_add(1),
+        };
+        if let Ok(mut guard) = self.trackers.lock() {
+            if !guard.contains(session_key) {
+                guard.put(session_key.to_string(), tracker);
+                tracing::info!(
+                    event = "prefix_replay_rehydrated",
+                    session_key_hash =
+                        %super::drift_detector::session_key_log_prefix(session_key),
+                    prefix_msgs = messages,
+                    chain_id = snapshot.chain_id,
+                    "restored a forwarded prefix written before this process started"
+                );
+            }
+        }
+    }
+
+    /// Write this session's primary chain to disk. Best-effort and quiet on
+    /// failure — a lost snapshot costs one decline after the next restart.
+    fn persist(&self, session_key: &str, snapshot: PersistedPrefix) {
+        let Some(dir) = self.persist_dir.as_deref() else {
+            return;
+        };
+        let bytes = match serde_json::to_vec(&snapshot) {
+            Ok(bytes) if bytes.len() <= PERSIST_MAX_BYTES => bytes,
+            Ok(bytes) => {
+                tracing::warn!(
+                    event = "prefix_replay_persist_skipped",
+                    bytes = bytes.len(),
+                    limit = PERSIST_MAX_BYTES,
+                    "prefix is larger than the runaway guard; not persisting it"
+                );
+                return;
+            }
+            Err(_) => return,
+        };
+        let path = persisted_path(dir, session_key);
+        // Write-then-rename, so a restart mid-write cannot leave a truncated
+        // file that reads as a valid but wrong prefix.
+        let temporary = path.with_extension("tmp");
+        if std::fs::write(&temporary, &bytes).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
         }
     }
 
@@ -2135,6 +2364,10 @@ impl SessionReplayStore {
         session_key: &str,
         current_originals: &[Value],
     ) -> Result<(Vec<Value>, Vec<Value>, u64), PrefixMiss> {
+        // A restart empties this store, and the miss that follows is expensive
+        // rather than free — see [`PersistedPrefix`]. No-op unless persistence is
+        // configured or the session is already in memory.
+        self.hydrate(session_key);
         let mut guard = match self.trackers.lock() {
             Ok(g) => g,
             Err(_) => return Err(PrefixMiss::LockPoisoned),
@@ -2235,6 +2468,7 @@ impl SessionReplayStore {
         &self,
         session_key: &str,
     ) -> Result<(Vec<Value>, Vec<Value>), PrefixMiss> {
+        self.hydrate(session_key);
         let mut guard = match self.trackers.lock() {
             Ok(g) => g,
             Err(_) => return Err(PrefixMiss::LockPoisoned),
@@ -2303,6 +2537,10 @@ impl SessionReplayStore {
         let Some(pending) = pending else {
             return;
         };
+        // Taken under the lock, written outside it. Serializing a few MB while
+        // holding the trackers mutex would stall every other request's
+        // `previous_turn_for` for the length of a disk write.
+        let mut snapshot = None;
         if let Ok(mut guard) = self.trackers.lock() {
             let tracker = if let Some(t) = guard.get_mut(&pending.session_key) {
                 t
@@ -2316,6 +2554,20 @@ impl SessionReplayStore {
                 &pending.forwarded_messages,
                 Some(&pending.original_messages),
             );
+            if self.persist_dir.is_some() && !tracker.last_forwarded_messages.is_empty() {
+                snapshot = Some(PersistedPrefix {
+                    chain_id: tracker.primary_chain_id,
+                    cached_token_count: tracker.cached_token_count,
+                    cached_message_count: tracker.cached_message_count,
+                    turn_number: tracker.turn_number,
+                    saved_at_unix: unix_now(),
+                    originals: tracker.last_original_messages.clone(),
+                    forwarded: tracker.last_forwarded_messages.clone(),
+                });
+            }
+        }
+        if let Some(snapshot) = snapshot {
+            self.persist(&pending.session_key, snapshot);
         }
     }
 
@@ -3108,6 +3360,180 @@ mod tests {
         t.invalidate();
         assert!(t.last_forwarded_messages().is_empty());
         assert_eq!(t.frozen_message_count(), 0);
+    }
+
+    /// A directory that cleans itself up, so these tests leave nothing behind.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "headroom-replay-{name}-{}-{}",
+                std::process::id(),
+                unix_now()
+            ));
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A conversation long enough to clear `MIN_CACHED_TOKENS`, plus one turn.
+    fn persisted_turn(store: &SessionReplayStore, key: &str) -> Vec<Value> {
+        let big = "x".repeat(7000);
+        let forwarded = vec![text_msg("user", &big)];
+        store.begin_request("req-1", key, forwarded.clone(), forwarded.clone());
+        store.complete("req-1", 0, 5000);
+        forwarded
+    }
+
+    #[test]
+    fn a_prefix_survives_the_process_that_wrote_it() {
+        let dir = TempDir::new("survives");
+        let key = "auth:abc:02";
+        let forwarded = {
+            let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+            persisted_turn(&store, key)
+        };
+
+        // A new store is what a restart produces: empty memory, same directory.
+        let restarted = SessionReplayStore::with_persistence(8, dir.0.clone());
+        let next = {
+            let mut next = forwarded.clone();
+            next.push(text_msg("assistant", "ok"));
+            next
+        };
+        let (originals, replayed, chain_id) = restarted
+            .previous_turn_for(key, &next)
+            .expect("the persisted prefix should be found");
+        assert_eq!(replayed, forwarded, "the forwarded bytes come back verbatim");
+        assert_eq!(originals, forwarded);
+        assert_ne!(chain_id, 0, "and as a real chain, so the splice can run");
+    }
+
+    #[test]
+    fn the_frozen_boundary_survives_too() {
+        // This is the half that costs the tokens: without it
+        // `frozen_message_count` is 0, compression stops treating the history as
+        // frozen, and the rewritten bytes no longer match the provider's prefix.
+        let dir = TempDir::new("frozen");
+        let key = "auth:abc:02";
+        {
+            let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+            persisted_turn(&store, key);
+        }
+        let restarted = SessionReplayStore::with_persistence(8, dir.0.clone());
+        restarted.hydrate(key);
+        let frozen = restarted
+            .trackers
+            .lock()
+            .expect("lock")
+            .get(key)
+            .map(PrefixReplayTracker::frozen_message_count);
+        assert_eq!(frozen, Some(1));
+    }
+
+    #[test]
+    fn without_a_directory_nothing_is_written() {
+        let dir = TempDir::new("memory-only");
+        let store = SessionReplayStore::new(8);
+        persisted_turn(&store, "auth:abc:02");
+        assert_eq!(
+            std::fs::read_dir(&dir.0).expect("read_dir").count(),
+            0,
+            "persistence is opt-in"
+        );
+    }
+
+    #[test]
+    fn a_stale_snapshot_is_ignored() {
+        // Past PERSIST_MAX_AGE the provider has dropped the entry, so replaying
+        // its bytes would write a prefix nobody holds.
+        let dir = TempDir::new("stale");
+        let key = "auth:abc:02";
+        {
+            let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+            persisted_turn(&store, key);
+        }
+        let path = persisted_path(&dir.0, key);
+        let mut snapshot: PersistedPrefix =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+        snapshot.saved_at_unix = unix_now() - PERSIST_MAX_AGE.as_secs() - 1;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).expect("encode")).expect("write");
+
+        assert!(read_persisted_prefix(&dir.0, key).is_none());
+    }
+
+    #[test]
+    fn one_session_never_reads_another_session_file() {
+        let dir = TempDir::new("scoped");
+        {
+            let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+            persisted_turn(&store, "auth:abc:02");
+        }
+        assert!(read_persisted_prefix(&dir.0, "auth:abc:15").is_none());
+        assert!(read_persisted_prefix(&dir.0, "auth:def:02").is_none());
+    }
+
+    #[test]
+    fn the_session_key_is_never_written_to_disk() {
+        // It can carry a credential, which is why the logs only print a hash of
+        // it. A file outlives the process, so the rule matters more here.
+        let dir = TempDir::new("no-key");
+        let key = "auth:super-secret-token:02";
+        {
+            let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+            persisted_turn(&store, key);
+        }
+        for entry in std::fs::read_dir(&dir.0).expect("read_dir").flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(!name.contains("super-secret-token"), "leaked in {name}");
+            let body = std::fs::read_to_string(entry.path()).expect("read");
+            assert!(!body.contains("super-secret-token"), "leaked in file body");
+        }
+    }
+
+    #[test]
+    fn a_truncated_file_is_ignored_rather_than_trusted() {
+        let dir = TempDir::new("truncated");
+        let key = "auth:abc:02";
+        {
+            let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+            persisted_turn(&store, key);
+        }
+        let path = persisted_path(&dir.0, key);
+        let bytes = std::fs::read(&path).expect("read");
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("write");
+
+        let restarted = SessionReplayStore::with_persistence(8, dir.0.clone());
+        assert!(matches!(
+            restarted.previous_turn_detailed(key),
+            Err(PrefixMiss::NoTrackerForSession)
+        ));
+    }
+
+    #[test]
+    fn a_persisted_prefix_that_does_not_lead_this_turn_still_declines() {
+        // The guards do not weaken across a restart: a prefix from another
+        // stream must fail `matches_canonical_prefix` exactly as it does in
+        // memory, so a stale file can only cost a decline, never a wrong replay.
+        let dir = TempDir::new("unrelated");
+        let key = "auth:abc:02";
+        {
+            let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+            persisted_turn(&store, key);
+        }
+        let restarted = SessionReplayStore::with_persistence(8, dir.0.clone());
+        let unrelated = vec![text_msg("user", "an entirely different conversation")];
+        let (_, _, chain_id) = restarted
+            .previous_turn_for(key, &unrelated)
+            .expect("the prefix is returned for reporting");
+        assert_eq!(chain_id, 0, "but not as a chain this turn continues");
     }
 
     #[test]
