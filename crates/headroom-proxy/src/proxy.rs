@@ -7071,6 +7071,15 @@ pub(crate) async fn handle_ccr_response(
         }
     };
 
+    // Which offloaded Reads the conversation has already invalidated. Computed
+    // once from the request as it arrived: continuation rounds only append tool
+    // results, so no later round can make a Read stale that was not stale here.
+    let stale_reads = current_request
+        .get(items_field)
+        .and_then(|m| m.as_array())
+        .map(|messages| crate::compression::ctx_offload::stale_offloaded_reads(messages))
+        .unwrap_or_default();
+
     let max_rounds = config.ccr_max_retrieval_rounds;
     let mut rounds = 0;
 
@@ -7113,6 +7122,23 @@ pub(crate) async fn handle_ccr_response(
             crate::observability::ctx_metrics::observe_retrieval(fetched.is_some());
             match fetched {
                 Some(content) => {
+                    // What comes back is the file as it was when it was read. If
+                    // it has been edited since, say so — otherwise the model
+                    // takes pre-edit content for the current file and acts on it.
+                    let content = match stale_reads.get(&call.hash_key) {
+                        Some(path) => {
+                            tracing::info!(
+                                request_id = %request_id,
+                                hash = %call.hash_key,
+                                "ccr: retrieved a Read that has since gone stale"
+                            );
+                            format!(
+                                "{}\n\n{content}",
+                                crate::compression::ctx_offload::stale_read_warning(path)
+                            )
+                        }
+                        None => content,
+                    };
                     results.push(CcrToolResult {
                         tool_call_id: call.tool_call_id.clone(),
                         content,

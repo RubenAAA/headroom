@@ -103,7 +103,7 @@ impl Default for ReadLifecycleConfig {
 const READ_TOOL_NAMES: &[&str] = &["Read", "read"];
 
 /// Tool names recognized as mutating operations.
-const EDIT_TOOL_NAMES: &[&str] = &["Edit", "edit"];
+const EDIT_TOOL_NAMES: &[&str] = &["Edit", "edit", "MultiEdit", "NotebookEdit"];
 const WRITE_TOOL_NAMES: &[&str] = &["Write", "write"];
 
 fn is_read_tool(name: &str) -> bool {
@@ -156,12 +156,7 @@ impl ReadLifecycleManager {
             };
         }
 
-        // Phase 1: Build tool metadata and file operation index
-        let tool_metadata = self.build_tool_metadata(messages);
-        let file_ops = self.build_file_operation_index(messages, &tool_metadata);
-
-        // Phase 2: Classify each Read
-        let mut classifications = self.classify_reads(&file_ops);
+        let mut classifications = self.classify(messages);
 
         if classifications.is_empty() {
             return ReadLifecycleResult {
@@ -193,6 +188,19 @@ impl ReadLifecycleManager {
 
         // Phase 4: Replace stale/superseded content
         self.apply_lifecycle(messages, &classifications)
+    }
+
+    /// Classify every Read in `messages` without rewriting anything.
+    ///
+    /// Split out of [`Self::apply`] so callers that only need to know which
+    /// Reads have gone stale can ask without taking the rewrite — the CCR
+    /// retrieval path warns on stale content but must not touch forwarded
+    /// bytes, since a footer that flips mid-conversation breaks the prefix at
+    /// that block.
+    pub fn classify(&self, messages: &[Value]) -> Vec<ReadClassification> {
+        let tool_metadata = self.build_tool_metadata(messages);
+        let file_ops = self.build_file_operation_index(messages, &tool_metadata);
+        self.classify_reads(&file_ops)
     }
 
     /// Build tool_call_id → (tool_name, file_path, offset, limit) mapping.

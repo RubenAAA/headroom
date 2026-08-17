@@ -53,7 +53,7 @@
 //! composes with this transform: after offload, `clear_tool_uses` simply fires
 //! on already-small digests, which is harmless. Both-on is the default posture.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -481,6 +481,76 @@ fn footer(hash: &str, orig_len: usize) -> String {
     )
 }
 
+/// Map each offloaded CCR hash back to the file whose Read produced it, for
+/// the Reads that have since gone stale.
+///
+/// The digest a model retrieves is the file as it was *before* later edits, and
+/// [`footer`] cannot say so: it is a pure function of the block bytes by design,
+/// and staleness flips false→true partway through a conversation. Writing it
+/// there would rewrite an already-cached block and break the prefix at that
+/// point — the most expensive thing this proxy can do. So the warning is
+/// attached at retrieval instead, where it costs no forwarded bytes and is
+/// evaluated against the newest history.
+pub(crate) fn stale_offloaded_reads(messages: &[Value]) -> HashMap<String, String> {
+    use headroom_core::transforms::read_lifecycle::{
+        ReadLifecycleConfig, ReadLifecycleManager, ReadState,
+    };
+
+    // tool_use_id -> hash, for the blocks we have already turned into digests.
+    let mut hash_by_tool_use: HashMap<&str, String> = HashMap::new();
+    for msg in messages {
+        let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let (Some(id), Some(text)) = (
+                block.get("tool_use_id").and_then(Value::as_str),
+                block.get("content").and_then(tool_result_text),
+            ) else {
+                continue;
+            };
+            if let Some(hash) = marker_hash(&text) {
+                hash_by_tool_use.insert(id, hash);
+            }
+        }
+    }
+    if hash_by_tool_use.is_empty() {
+        return HashMap::new();
+    }
+
+    let manager = ReadLifecycleManager::new(ReadLifecycleConfig::default(), None);
+    manager
+        .classify(messages)
+        .into_iter()
+        .filter(|c| c.state == ReadState::Stale)
+        .filter_map(|c| {
+            hash_by_tool_use
+                .get(c.tool_call_id.as_str())
+                .map(|hash| (hash.clone(), c.file_path))
+        })
+        .collect()
+}
+
+/// The banner prepended to retrieved content whose file has since been edited.
+pub(crate) fn stale_read_warning(path: &str) -> String {
+    format!(
+        "[headroom] {path} was edited after this Read. What follows is the file \
+         as it stood BEFORE those edits — use it as history, and Read {path} \
+         again for its current contents."
+    )
+}
+
+/// Pull the hash out of `<<ctx:HASH>>`, if this text is one of our digests.
+fn marker_hash(text: &str) -> Option<String> {
+    let start = text.find(MARKER_PREFIX)? + MARKER_PREFIX.len();
+    let rest = &text[start..];
+    let end = rest.find(">>")?;
+    Some(rest[..end].to_string())
+}
+
 /// Walk every message's `tool_result` blocks and replace qualifying ones with
 /// a digest. Mutates `parsed` in place; returns what changed + records to
 /// persist. Pure function of `parsed` + `config` (I1/I2).
@@ -788,6 +858,92 @@ mod tests {
             stale_margin: 0,
             stale_window: 0,
         }
+    }
+
+    /// A Read of `path` at `id`, already offloaded to `hash`.
+    fn offloaded_read(id: &str, path: &str, hash: &str) -> Vec<Value> {
+        vec![
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":id,"name":"Read","input":{"file_path":path}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":id,
+                 "content": format!("digest\n{MARKER_PREFIX}{hash}>> (900 bytes offloaded)")}
+            ]}),
+        ]
+    }
+
+    fn edit_of(id: &str, path: &str) -> Value {
+        json!({"role":"assistant","content":[
+            {"type":"tool_use","id":id,"name":"Edit","input":{"file_path":path}}
+        ]})
+    }
+
+    #[test]
+    fn an_offloaded_read_edited_afterwards_is_reported_stale() {
+        let mut msgs = offloaded_read("tu_1", "/src/a.rs", "abc123");
+        msgs.push(edit_of("tu_2", "/src/a.rs"));
+
+        let stale = stale_offloaded_reads(&msgs);
+
+        assert_eq!(stale.get("abc123").map(String::as_str), Some("/src/a.rs"));
+    }
+
+    #[test]
+    fn a_read_never_edited_is_not_reported() {
+        let msgs = offloaded_read("tu_1", "/src/a.rs", "abc123");
+
+        assert!(stale_offloaded_reads(&msgs).is_empty());
+    }
+
+    #[test]
+    fn an_edit_before_the_read_does_not_make_it_stale() {
+        let mut msgs = vec![edit_of("tu_0", "/src/a.rs")];
+        msgs.extend(offloaded_read("tu_1", "/src/a.rs", "abc123"));
+
+        assert!(stale_offloaded_reads(&msgs).is_empty());
+    }
+
+    #[test]
+    fn an_edit_to_a_different_file_does_not_make_it_stale() {
+        let mut msgs = offloaded_read("tu_1", "/src/a.rs", "abc123");
+        msgs.push(edit_of("tu_2", "/src/b.rs"));
+
+        assert!(stale_offloaded_reads(&msgs).is_empty());
+    }
+
+    /// Only blocks we actually offloaded have a hash to warn about.
+    #[test]
+    fn a_stale_read_that_was_never_offloaded_has_no_hash() {
+        let msgs = vec![
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/src/a.rs"}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tu_1","content":"the whole file, verbatim"}
+            ]}),
+            edit_of("tu_2", "/src/a.rs"),
+        ];
+
+        assert!(stale_offloaded_reads(&msgs).is_empty());
+    }
+
+    #[test]
+    fn multi_edit_counts_as_an_edit() {
+        let mut msgs = offloaded_read("tu_1", "/src/a.rs", "abc123");
+        msgs.push(json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_2","name":"MultiEdit","input":{"file_path":"/src/a.rs"}}
+        ]}));
+
+        assert!(stale_offloaded_reads(&msgs).contains_key("abc123"));
+    }
+
+    #[test]
+    fn the_warning_names_the_file_and_tells_the_model_to_re_read() {
+        let w = stale_read_warning("/src/a.rs");
+
+        assert!(w.contains("/src/a.rs"));
+        assert!(w.contains("BEFORE"));
     }
 
     /// A tool_result body whose content is `body`, paired to a bash tool_use.
