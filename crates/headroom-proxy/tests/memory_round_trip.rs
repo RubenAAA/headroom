@@ -94,6 +94,128 @@ async fn a_memory_outlives_the_process_that_wrote_it() {
     );
 }
 
+/// One store is shared by every session and account, so saves collide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_saves_all_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = Arc::new(handler(dir.path()));
+
+    // Distinct subjects on purpose: `execute_save` deletes near-duplicates at
+    // 0.92 similarity in the background, so near-identical fixtures would
+    // measure the deduper rather than the concurrency.
+    let subjects = [
+        "the split cache TTL cost 511 percent more creation and was reverted",
+        "images are billed by pixel dimensions, never by payload bytes",
+        "relocation put blocks past the breakpoint and was 64 percent of the bill",
+        "rust-analyzer was a rustup shim with no component installed behind it",
+        "the tools array changes invalidate every live conversation at once",
+        "offload digests Read results once they are four messages into history",
+        "BM25 has no answer to an empty query, so listing needs enumeration",
+        "Codex turns record no client bytes and skewed the savings metric",
+        "context editing clears tool uses server side and is not billed",
+        "the statusline fourth number is Anthropic's own window utilisation",
+        "prefix divergence predicts cost better than the decline reason does",
+        "subscription auth makes the Phase E normalizers passthrough entirely",
+    ];
+    let mut tasks = Vec::new();
+    for (i, subject) in subjects.iter().enumerate() {
+        let handler = Arc::clone(&handler);
+        let subject = subject.to_string();
+        tasks.push(tokio::spawn(async move {
+            call(
+                &handler,
+                "memory_save",
+                json!({"content": subject, "title": format!("m{i}")}),
+            )
+            .await
+        }));
+    }
+    for task in tasks {
+        let answer = task.await.expect("a save must not panic");
+        assert!(
+            answer.contains("saved"),
+            "a concurrent save did not succeed: {answer}"
+        );
+    }
+
+    let listed = call(&handler, "memory_list", json!({"limit": 100})).await;
+    let landed = subjects.iter().filter(|s| listed.contains(*s)).count();
+
+    assert_eq!(
+        landed,
+        subjects.len(),
+        "every concurrent save must be readable back; got {listed}"
+    );
+}
+
+/// Saving twice on one subject keeps both, and says so.
+///
+/// The old code deleted the older one in the background on a 0.92 "cosine"
+/// threshold it could not actually compute. Losing a memory silently is the
+/// worst failure this store has, so a duplicate now survives and the caller is
+/// told to merge it by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_near_duplicate_is_kept_and_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes"})).await;
+    call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes."})).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let listed = call(&handler, "memory_list", json!({"limit": 100})).await;
+
+    assert_eq!(
+        listed.matches("pixel dimensions").count(),
+        2,
+        "neither memory may be deleted behind the user's back; got {listed}"
+    );
+}
+
+/// Two handles on one directory, standing in for two proxy processes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_stores_over_one_directory_do_not_block_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Arc::new(handler(dir.path()));
+    let second = Arc::new(handler(dir.path()));
+
+    let a = {
+        let first = Arc::clone(&first);
+        tokio::spawn(async move {
+            for i in 0..12 {
+                call(
+                    &first,
+                    "memory_save",
+                    json!({"content": format!("from the first process {i}"), "title": format!("a{i}")}),
+                )
+                .await;
+            }
+        })
+    };
+    let b = {
+        let second = Arc::clone(&second);
+        tokio::spawn(async move {
+            for i in 0..12 {
+                call(
+                    &second,
+                    "memory_save",
+                    json!({"content": format!("from the second process {i}"), "title": format!("b{i}")}),
+                )
+                .await;
+            }
+        })
+    };
+    a.await.unwrap();
+    b.await.unwrap();
+
+    // Either handle must see both writers' memories.
+    let listed = call(&second, "memory_list", json!({"limit": 100})).await;
+    assert!(
+        listed.contains("from the first process 11") && listed.contains("from the second process 11"),
+        "both processes' writes must be visible from either handle: {listed}"
+    );
+}
+
 #[tokio::test]
 async fn searching_an_empty_store_is_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -126,3 +248,4 @@ async fn a_listed_memory_is_the_one_that_was_saved() {
         "list must show what was saved; got: {listed}"
     );
 }
+

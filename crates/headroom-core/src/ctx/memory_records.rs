@@ -28,6 +28,16 @@ impl MemoryRecordStore {
     /// per-connection ephemeral store.
     pub fn open(db_path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
+
+        // One store is shared by every session and every account, so writes
+        // arrive concurrently. WAL lets readers run through a write, and the
+        // busy timeout makes a writer wait its turn instead of failing the save
+        // with `database is locked`. Same rationale as `ctx::store`, which had
+        // the pragmas from the start; this store was the one that missed them.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS memories (

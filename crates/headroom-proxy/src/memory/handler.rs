@@ -865,15 +865,12 @@ impl MemoryHandler {
             }
         }
 
-        // Fire-and-forget auto-dedup: delete near-duplicates (>=0.92 cosine)
-        // in the background. Never blocks the tool response.
-        if !similar.is_empty() {
-            let backend_clone = Arc::clone(backend);
-            let dedup_id = memory.id.clone();
-            tokio::spawn(async move {
-                crate::memory_tail::background_dedup(&dedup_id, &similar, &*backend_clone).await;
-            });
-        }
+        // No automatic delete. The threshold it used (0.92) was written for
+        // cosine similarity, and this backend scores with BM25, whose ranks here
+        // sit near 0.03 even for near-identical text — so the comparison was
+        // meaningless in whichever direction the mapping happened to run. A
+        // memory that quietly disappears is worse than a duplicate, and the
+        // caller already gets a hint above telling it to call `memory_update`.
 
         result.to_string()
     }

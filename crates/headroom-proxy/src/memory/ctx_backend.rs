@@ -83,7 +83,14 @@ impl CtxMemoryBackend {
 /// Callers threshold this against `min_similarity`; it is a ranking signal,
 /// not a probability, and is not comparable across query shapes.
 fn rank_to_score(rank: f64) -> f64 {
-    1.0 / (1.0 + rank.abs())
+    // FTS5 BM25 rank is negative and *more* negative for a better match, so
+    // similarity has to rise with `|rank|`. The previous `1/(1+|rank|)` did the
+    // opposite: a barely-related row (rank ~ -0.0001) scored ~0.9999 and a
+    // strong one (rank -5) scored 0.17. Every threshold in the caller then read
+    // backwards — `min_similarity` kept the worst hits, and the background
+    // deduper deleted unrelated memories for clearing 0.92.
+    let strength = rank.abs();
+    strength / (1.0 + strength)
 }
 
 impl CtxMemoryBackend {
@@ -167,7 +174,10 @@ impl MemoryBackend for CtxMemoryBackend {
                 }
                 out.push(MemorySearchResult {
                     related_entities: memory.entity_refs.clone(),
-                    score: 0.0,
+                    // Nothing was ranked, so score is meaningless here — but it
+                    // must clear `min_similarity` (0.3 by default) or callers
+                    // that filter would drop every listed memory.
+                    score: 1.0,
                     memory,
                 });
                 if out.len() >= top_k {
@@ -415,9 +425,13 @@ mod tests {
     #[test]
     fn score_is_monotone_in_rank() {
         // More-negative BM25 rank is a better hit, so it must score higher.
-        assert!(rank_to_score(-10.0) < rank_to_score(-1.0));
+        // The assertion used to read `<`, contradicting the line above it and
+        // certifying the inversion that made every threshold in the caller
+        // read backwards.
+        assert!(rank_to_score(-10.0) > rank_to_score(-1.0));
         assert!(rank_to_score(-1.0) <= 1.0);
         assert!(rank_to_score(-1000.0) > 0.0);
+        assert!(rank_to_score(0.0) < rank_to_score(-0.5), "no match scores lowest");
     }
 
     /// Persistence is the other half of the point: the `Vec` backend lost
