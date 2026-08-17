@@ -153,6 +153,30 @@ impl MemoryBackend for CtxMemoryBackend {
         top_k: usize,
         _include_related: bool,
     ) -> Result<Vec<MemorySearchResult>, BackendError> {
+        // `memory_list` asks for everything by searching for nothing. BM25 has
+        // no answer to that — an empty query matches no documents — so the
+        // enumeration comes from the records instead of the index.
+        if query.trim().is_empty() {
+            let mut out = Vec::new();
+            for id in self.records.ids_for_user(user_id)? {
+                let Some(memory) = self.load(&id)? else {
+                    continue;
+                };
+                if !memory.is_current() {
+                    continue;
+                }
+                out.push(MemorySearchResult {
+                    related_entities: memory.entity_refs.clone(),
+                    score: 0.0,
+                    memory,
+                });
+                if out.len() >= top_k {
+                    break;
+                }
+            }
+            return Ok(out);
+        }
+
         // Over-fetch: hits are filtered by user and validity below, and the
         // index cannot express either, so asking for exactly `top_k` would
         // return fewer after filtering.

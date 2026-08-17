@@ -24,6 +24,7 @@ that wins before believing it.
 from __future__ import annotations
 
 import copy
+import os
 import re
 
 REGISTRY: dict[str, callable] = {}
@@ -66,6 +67,91 @@ def _clear_message_markers(body: dict) -> None:
 def noop(body):
     """Forward unchanged — the control arm, and a check the harness is honest."""
     return body
+
+
+MEMORY_DIR = os.path.expanduser(
+    "~/.claude-work/projects/-home-user-headroom/memory"
+)
+_INDEX_LINE = re.compile(r"^\s*- \[[^\]]+\]\([^)]+\.md\)", re.M)
+
+
+def _memory_index_blocks(body: dict):
+    """Every text block carrying the auto-memory index, with its index lines."""
+    for _, block in _content_blocks(body):
+        text = block.get("text")
+        if not isinstance(text, str) or "MEMORY.md" not in text:
+            continue
+        lines = _INDEX_LINE.findall(text)
+        if lines:
+            yield block, text
+
+
+@strategy("mem-drop-index")
+def mem_drop_index(body):
+    """Drop the MEMORY.md index lines — pointers we pay for on every turn."""
+    for block, text in _memory_index_blocks(body):
+        block["text"] = _INDEX_LINE.sub("", text)
+    return body
+
+
+@strategy("mem-recall-pinned")
+def mem_recall_pinned(body):
+    """Drop the index, pin four memory bodies where the index used to sit."""
+    pinned = _pinned_memories()
+    for block, text in _memory_index_blocks(body):
+        block["text"] = _INDEX_LINE.sub("", text) + pinned
+    return body
+
+
+@strategy("mem-recall-no-rereads")
+def mem_recall_no_rereads(body):
+    """Pinned recall, and the memory-file Reads it makes redundant are digested.
+
+    The optimistic arm: it assumes serving a memory up front stops the model
+    fetching the same file by hand. `damage` will show the removed reads, and
+    should be read before believing this one.
+    """
+    mem_recall_pinned(body)
+    reads = {
+        block.get("id")
+        for _, block in _content_blocks(body)
+        if block.get("type") == "tool_use"
+        and "/memory/" in str((block.get("input") or {}).get("file_path", ""))
+    }
+    for _, block in _content_blocks(body):
+        if block.get("type") == "tool_result" and block.get("tool_use_id") in reads:
+            block["content"] = "[memory served up front; read elided]"
+    return body
+
+
+_PINNED_CACHE: list[str] = []
+
+
+def _pinned_memories() -> str:
+    """The four memories this project reads most, as one stable text run.
+
+    Fixed rather than per-turn: recall that changes as the conversation grows
+    rewrites a message that is already cached, which is the defect this design
+    exists to avoid. A constant set is identical on every turn, so it enters the
+    prefix once and stays there.
+    """
+    if _PINNED_CACHE:
+        return _PINNED_CACHE[0]
+    names = [
+        "features-on-but-inert.md",
+        "context-editing-api-facts.md",
+        "server-side-tool-clearing.md",
+        "prompt-composition-map.md",
+    ]
+    parts = []
+    for name in names:
+        try:
+            with open(os.path.join(MEMORY_DIR, name)) as handle:
+                parts.append(handle.read())
+        except OSError:
+            continue
+    _PINNED_CACHE.append("\n\n".join(parts))
+    return _PINNED_CACHE[0]
 
 
 @strategy("tail-breakpoints-1")
