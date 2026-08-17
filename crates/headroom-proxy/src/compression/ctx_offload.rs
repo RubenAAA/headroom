@@ -78,6 +78,25 @@ pub struct CtxOffloadConfig {
     /// is what makes `--exclude-tools` mean what it says. The default list
     /// covers the file and search tools for exactly this reason.
     pub exclude_tools: Vec<String>,
+    /// How many messages back from the tail a block must be before an
+    /// `exclude_tools` entry stops protecting it. `0` protects the whole
+    /// history, which is the behaviour this field was added to relax.
+    ///
+    /// The exclusion above exists so the model never acts on a summary of a
+    /// file it is about to edit. That argument holds for the results it is
+    /// working with and weakens with every turn that passes: a file read
+    /// twenty messages ago is history, the digest keeps its head, and the rest
+    /// is one `headroom_retrieve` call away. Offload differs from the live-zone
+    /// compressors here — it is lossy to look at but nothing is destroyed.
+    ///
+    /// Measured over 4,046 forwarded bodies on 2026-08-17: raw `tool_result`
+    /// blocks were 22% of a 135,814-token mean prompt, and `Read` alone was
+    /// 9.9% of it with not one block ever digested. Offloading only blocks this
+    /// far back, at a 4,000-byte floor, recovers 11.4% of the prompt.
+    ///
+    /// [`headroom_core::tool_exclusion::is_verbatim_excluded`] still applies at
+    /// any distance: those results break when their bytes change at all.
+    pub stale_margin: usize,
 }
 
 /// One offloaded block, handed to the background worker for storage. Never
@@ -198,10 +217,24 @@ pub struct OffloadPolicy<'a> {
     pub rebuild_boundary: bool,
 }
 
-/// Preview budget for the no-compressor fallback, in bytes. Matches
-/// context-mode's `FETCH_PREVIEW_LIMIT` (3072): enough to orient the model,
-/// small enough that offload always shrinks a qualifying (>50KB) block.
+/// Ceiling on the preview kept by the no-compressor fallback, in bytes.
+/// Matches context-mode's `FETCH_PREVIEW_LIMIT` (3072): enough to orient the
+/// model, small enough that offload always shrinks a large block.
 const PREVIEW_BYTES: usize = 3072;
+
+/// Floor on the same preview. A fixed 3,072-byte cut cannot shrink a 4,000-byte
+/// block, so blocks under roughly 3.2KB were unreachable whatever `min_bytes`
+/// said — and blocks that size are where the bytes now are: dropping the floor
+/// from 15,000 to 4,000 reaches 45% of all `tool_result` bytes against 27%.
+/// Below this the preview stops being worth reading.
+const PREVIEW_FLOOR_BYTES: usize = 600;
+
+/// Preview budget for one block: a quarter of it, clamped to the two constants
+/// above. Pure function of the block's own length (I1) — no session state, so
+/// the same bytes yield the same digest on every turn and after a restart.
+fn preview_budget(len: usize) -> usize {
+    (len / 4).clamp(PREVIEW_FLOOR_BYTES, PREVIEW_BYTES)
+}
 
 /// Longest prefix of `text` whose UTF-8 encoding is at most `max_bytes`,
 /// cut on a char boundary, with a truncation notice. Pure function of
@@ -269,16 +302,45 @@ pub fn offload_anthropic_request(
                 .unwrap_or("")
                 .to_string();
             let (title, tool_name) = tool_titles.get(&tool_use_id).cloned().unwrap_or_default();
-            // An operator who excluded a tool from lossy rewriting meant this
-            // stage too: offload replaces the result with a preview, which is
-            // exactly what the exclusion exists to prevent.
-            if headroom_core::tool_exclusion::is_tool_excluded(
-                &tool_name,
-                config.exclude_tools.iter().map(String::as_str),
-            ) {
+            // These results break when their bytes change at all, at any
+            // distance from the tail. No margin reaches them.
+            if headroom_core::tool_exclusion::is_verbatim_excluded(&tool_name) {
                 continue;
             }
-            match offload_tool_result(block, config, &title, policy, is_live) {
+            // An operator who excluded a tool from lossy rewriting meant this
+            // stage too: offload replaces the result with a preview, which is
+            // exactly what the exclusion exists to prevent — while the model is
+            // still working with the result. `stale_margin` messages later that
+            // reasoning has expired; see the field's docs.
+            let excluded = headroom_core::tool_exclusion::is_tool_excluded(
+                &tool_name,
+                config.exclude_tools.iter().map(String::as_str),
+            );
+            // Distance from the tail GROWS as the conversation does, so this
+            // predicate flips from false to true under a block that is already
+            // inside the cached prefix. Converting it there would rewrite the
+            // prefix mid-history, which is the most expensive thing this proxy
+            // can do. Two things stop that, and both are needed:
+            //
+            //   - the PR-J4 boundary gate below defers every first conversion
+            //     of a non-live block to a turn that is rebuilding anyway, so
+            //     the transition is never paid for on a steady-state turn;
+            //   - `prior` is checked BEFORE this exclusion, so a block already
+            //     converted stays converted. Claude Code edits its own history
+            //     and the message count can fall, which would otherwise let a
+            //     stale block read as fresh again and revert digest→raw. That
+            //     is the same flip in the other direction and busts the cache
+            //     just as hard.
+            let stale = config.stale_margin > 0 && msg_idx + config.stale_margin <= last_idx;
+            let excluded_unless_prior = excluded && !stale;
+            match offload_tool_result(
+                block,
+                config,
+                &title,
+                policy,
+                is_live,
+                excluded_unless_prior,
+            ) {
                 BlockOutcome::Offloaded {
                     record,
                     prior,
@@ -325,6 +387,7 @@ fn offload_tool_result(
     title: &str,
     policy: Option<&OffloadPolicy>,
     is_live: bool,
+    excluded_unless_prior: bool,
 ) -> BlockOutcome {
     let Some(original) = block.get("content").and_then(|c| tool_result_text(c)) else {
         return BlockOutcome::Skipped;
@@ -344,19 +407,26 @@ fn offload_tool_result(
 
     let hash = compute_key(original.as_bytes());
 
+    // Whether this block has been converted before, in this session. Read
+    // before anything positional so that "already a digest" outranks every
+    // other test: monotonicity (I3) is what keeps the prefix stable, and a
+    // block that reverts to raw costs the same as one that converts late.
+    let prior = policy.is_some_and(|p| p.gate.contains(p.session_key, &hash));
+
+    // A tool the operator excluded, on a block the model may still be working
+    // with. First conversions wait; conversions already made stand.
+    if excluded_unless_prior && !prior {
+        return BlockOutcome::Skipped;
+    }
+
     // PR-J4 boundary gate: a frozen block's *first* conversion only rides a
     // rebuild boundary; re-applications (hash already in the session set) and
     // live-tail blocks always pass. See [`OffloadGate`].
-    let prior = match policy {
-        Some(p) => {
-            let prior = p.gate.contains(p.session_key, &hash);
-            if !prior && !is_live && !p.rebuild_boundary {
-                return BlockOutcome::Deferred;
-            }
-            prior
+    if let Some(p) = policy {
+        if !prior && !is_live && !p.rebuild_boundary {
+            return BlockOutcome::Deferred;
         }
-        None => false,
-    };
+    }
     // Structural compressor when one applies; otherwise a plain preview cut,
     // mirroring context-mode's behaviour (charSafePrefix + pointer). The
     // original is always retrievable by hash, so the digest only needs to
@@ -366,7 +436,7 @@ fn offload_tool_result(
     let body = if strategy.is_some() {
         compressed
     } else {
-        preview(&original, PREVIEW_BYTES)
+        preview(&original, preview_budget(original.len()))
     };
     let digest = format!("{body}{}", footer(&hash, original.len()));
 
@@ -484,6 +554,7 @@ mod tests {
         CtxOffloadConfig {
             min_bytes: min,
             exclude_tools: Vec::new(),
+            stale_margin: 0,
         }
     }
 
@@ -519,10 +590,169 @@ mod tests {
         let config = CtxOffloadConfig {
             min_bytes: 200,
             exclude_tools: vec!["Bash".to_string()],
+            stale_margin: 0,
         };
         let out = offload_anthropic_request(&mut parsed, &config, None);
         assert_eq!(out.blocks_offloaded, 0, "excluded tool must not offload");
         assert_eq!(first_tool_result_text(&parsed), body, "content untouched");
+    }
+
+    /// A conversation whose `tool_result` sits at message 1 with `tail` filler
+    /// messages after it, so its distance from the tail is what the test varies.
+    fn req_with_tail(body: &str, tool: &str, tail: usize) -> Value {
+        let mut messages = vec![
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"tu_1","name":tool,"input":{"file_path":"/big.rs"}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tu_1","content": body}
+            ]}),
+        ];
+        for i in 0..tail {
+            messages.push(json!({"role":"assistant","content":[
+                {"type":"text","text":format!("step {i}")}
+            ]}));
+        }
+        json!({"model":"claude-3-5-sonnet-20241022","messages": messages})
+    }
+
+    fn excluded_cfg(stale_margin: usize) -> CtxOffloadConfig {
+        CtxOffloadConfig {
+            min_bytes: 200,
+            exclude_tools: vec!["Read".to_string()],
+            stale_margin,
+        }
+    }
+
+    fn big_body() -> String {
+        "ERROR: disk full on volume /dev/sda1\n".repeat(200)
+    }
+
+    /// The point of `stale_margin`: a file read the model has long since moved
+    /// past is history, and the bytes are retrievable, so the exclusion that
+    /// protects results in play stops applying.
+    #[test]
+    fn an_excluded_tool_offloads_once_it_is_far_enough_back() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 6);
+        let out = offload_anthropic_request(&mut parsed, &excluded_cfg(4), None);
+        assert_eq!(out.blocks_offloaded, 1, "message 1 of 8 is past the margin");
+    }
+
+    /// ...and while it is still in play, nothing changes.
+    #[test]
+    fn an_excluded_tool_inside_the_margin_is_still_protected() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 1);
+        let out = offload_anthropic_request(&mut parsed, &excluded_cfg(4), None);
+        assert_eq!(out.blocks_offloaded, 0, "the model may still need this one");
+        assert_eq!(first_tool_result_text(&parsed), body, "content untouched");
+    }
+
+    /// A margin of zero is the behaviour from before the field existed.
+    #[test]
+    fn a_zero_margin_protects_the_whole_history() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 40);
+        let out = offload_anthropic_request(&mut parsed, &excluded_cfg(0), None);
+        assert_eq!(out.blocks_offloaded, 0, "zero must mean off, not immediate");
+    }
+
+    /// Verbatim exclusions are not distance-sensitive: those results break when
+    /// their bytes change at all, so no margin reaches them.
+    #[test]
+    fn a_verbatim_excluded_tool_is_never_offloaded_however_stale() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "WebFetch", 40);
+        let config = CtxOffloadConfig {
+            min_bytes: 200,
+            exclude_tools: Vec::new(),
+            stale_margin: 4,
+        };
+        let out = offload_anthropic_request(&mut parsed, &config, None);
+        assert_eq!(out.blocks_offloaded, 0, "WebFetch must stay byte-faithful");
+    }
+
+    /// The cache-safety half of `stale_margin`. Distance from the tail grows,
+    /// so a first conversion of a block inside the cached prefix has to wait for
+    /// a turn that is rewriting the prefix anyway.
+    #[test]
+    fn a_newly_stale_block_waits_for_a_rebuild_boundary() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 6);
+        let gate = OffloadGate::new(16);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess",
+            rebuild_boundary: false,
+        };
+        let out = offload_anthropic_request(&mut parsed, &excluded_cfg(4), Some(&policy));
+        assert_eq!(out.blocks_offloaded, 0, "not on a steady-state turn");
+        assert_eq!(out.blocks_deferred, 1, "deferred, not abandoned");
+        assert_eq!(first_tool_result_text(&parsed), body, "prefix bytes unchanged");
+    }
+
+    /// The other half, and the one that is easy to miss: Claude Code edits its
+    /// own history, so the message count can FALL and a stale block can read as
+    /// fresh again. Reverting the digest would bust the prefix exactly as hard
+    /// as converting it late, so a conversion already made has to stand.
+    #[test]
+    fn a_converted_block_stays_converted_when_the_history_shrinks() {
+        let body = big_body();
+        let gate = OffloadGate::new(16);
+        let boundary = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess",
+            rebuild_boundary: true,
+        };
+        let mut deep = req_with_tail(&body, "Read", 6);
+        let first = offload_anthropic_request(&mut deep, &excluded_cfg(4), Some(&boundary));
+        assert_eq!(first.blocks_offloaded, 1, "converts on the boundary turn");
+        let digest = first_tool_result_text(&deep);
+
+        // Same block, now one message from the tail: inside the margin, so the
+        // exclusion would apply again if `prior` were not checked first.
+        let mut shallow = req_with_tail(&body, "Read", 1);
+        let steady = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess",
+            rebuild_boundary: false,
+        };
+        let second = offload_anthropic_request(&mut shallow, &excluded_cfg(4), Some(&steady));
+        assert_eq!(second.blocks_offloaded, 1, "must not revert to raw");
+        assert_eq!(
+            first_tool_result_text(&shallow),
+            digest,
+            "the same bytes must yield the same digest at any depth"
+        );
+    }
+
+    /// I1 restated for this field: position decides *whether* a block converts,
+    /// never *what* it converts to. If the digest moved with depth, every turn
+    /// would rewrite the prefix.
+    #[test]
+    fn the_digest_does_not_depend_on_position() {
+        let body = big_body();
+        let mut near = req_with_tail(&body, "Bash", 4);
+        let mut far = req_with_tail(&body, "Bash", 40);
+        offload_anthropic_request(&mut near, &cfg(200), None);
+        offload_anthropic_request(&mut far, &cfg(200), None);
+        assert_eq!(first_tool_result_text(&near), first_tool_result_text(&far));
+    }
+
+    /// The preview has to scale, or `min_bytes` below ~3.2KB is a no-op: a fixed
+    /// 3,072-byte cut cannot shrink a 4,000-byte block.
+    #[test]
+    fn the_preview_budget_scales_with_the_block() {
+        assert_eq!(preview_budget(100), PREVIEW_FLOOR_BYTES, "floor holds");
+        assert_eq!(preview_budget(8_000), 2_000, "a quarter in the middle");
+        assert_eq!(preview_budget(10_000_000), PREVIEW_BYTES, "ceiling holds");
+        for len in [4_000usize, 20_000, 200_000] {
+            assert!(
+                preview_budget(len) < len,
+                "a {len}-byte block must be able to shrink"
+            );
+        }
     }
 
     #[test]

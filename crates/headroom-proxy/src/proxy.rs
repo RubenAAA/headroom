@@ -338,6 +338,7 @@ impl AppState {
                             config: crate::compression::ctx_offload::CtxOffloadConfig {
                                 min_bytes: config.ctx_offload_min_bytes,
                                 exclude_tools: config.exclude_tools.clone(),
+                                stale_margin: config.ctx_offload_stale_messages,
                             },
                             store: Arc::new(store),
                             gate: Arc::new(crate::compression::ctx_offload::OffloadGate::new(

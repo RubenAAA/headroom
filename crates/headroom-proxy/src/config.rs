@@ -841,6 +841,30 @@ pub struct CliArgs {
     )]
     pub ctx_offload_min_bytes: usize,
 
+    /// CTX-3: how many messages back from the tail a `tool_result` must be
+    /// before `--exclude-tools` stops shielding it from offload. `0` (the
+    /// default) shields the whole history, which is the behaviour before this
+    /// flag existed.
+    ///
+    /// `--exclude-tools` keeps file and search results verbatim so the model
+    /// never edits a file from a summary of it. Offload is not a summary — the
+    /// original is retrievable by hash — and the risk it guards against is
+    /// about the results in play, not the ones twenty messages back. Those were
+    /// 9.9% of a mean prompt as raw `Read` output alone on 2026-08-17, never
+    /// once digested.
+    ///
+    /// Distance from the tail grows, so this predicate turns true under blocks
+    /// already inside the cached prefix. Safe only because a first conversion
+    /// waits for a rebuild boundary and a converted block never reverts; see
+    /// `CtxOffloadConfig::stale_margin`. Do not reimplement the test without
+    /// both.
+    #[arg(
+        long = "ctx-offload-stale-messages",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_STALE_MESSAGES",
+        default_value_t = 0
+    )]
+    pub ctx_offload_stale_messages: usize,
+
     /// CTX-3: TTL (seconds) for offloaded originals in the CCR store. Long by
     /// design (retrieval outlives a session); default `604_800` (7 days).
     #[arg(
@@ -1761,6 +1785,9 @@ pub struct Config {
     pub replay_store_dir: String,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
+    /// CTX-3: messages back from the tail before `exclude_tools` stops
+    /// shielding a block from offload; `0` shields all of it.
+    pub ctx_offload_stale_messages: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
     pub ctx_offload_ttl_seconds: u64,
     /// CTX-4: recall/resume injection on/off. Requires `ctx_capture`.
@@ -2030,6 +2057,7 @@ impl Config {
             hold_working_directory: args.hold_working_directory,
             replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
+            ctx_offload_stale_messages: args.ctx_offload_stale_messages,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
             ccr_context_tracking: args.ccr_context_tracking,
@@ -2261,6 +2289,7 @@ impl Config {
             hold_working_directory: false,
             replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,
+            ctx_offload_stale_messages: 0,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,
             ccr_context_tracking: true,

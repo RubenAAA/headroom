@@ -73,11 +73,19 @@ pub fn unusable_blocks_get() -> u64 {
 mod tests {
     use super::*;
 
+    /// A label of its own, because the counters live in a process-global
+    /// registry that every test in this binary shares and `cargo test` runs
+    /// them in parallel. This test used `already_streamed`, which
+    /// [`unusable_blocks_get`] sums, so its +3 landed between the two reads in
+    /// the test below and failed it — in the full suite only, which made it look
+    /// like whatever else had just changed.
+    const TEST_ONLY_REASON: &str = "test_only_accumulation";
+
     #[test]
     fn counts_accumulate_per_reason() {
-        let before = dropped_get("already_streamed");
-        observe_dropped("already_streamed", 3);
-        assert_eq!(dropped_get("already_streamed"), before + 3);
+        let before = dropped_get(TEST_ONLY_REASON);
+        observe_dropped(TEST_ONLY_REASON, 3);
+        assert_eq!(dropped_get(TEST_ONLY_REASON), before + 3);
     }
 
     /// The health summary must count both defect reasons and ignore the

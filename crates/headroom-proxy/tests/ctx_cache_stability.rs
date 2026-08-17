@@ -34,6 +34,7 @@ fn cfg() -> CtxOffloadConfig {
     CtxOffloadConfig {
         min_bytes: MIN_BYTES,
         exclude_tools: Vec::new(),
+        stale_margin: 0,
     }
 }
 
@@ -346,6 +347,83 @@ fn all_messages_prefix_is_stable_without_offload() {
             let next = message_bytes(&transformed[n + 1].0);
             assert_prefix(&prev, &next, n);
         }
+    }
+}
+
+/// `stale_margin` lets an `--exclude-tools` entry be offloaded once it is far
+/// enough back, and "far enough back" is a test on POSITION, which moves under a
+/// block that is already inside the cached prefix. This is the acceptance gate
+/// for that: the conversion may only land on a rebuild boundary, and once landed
+/// it must never come back out.
+///
+/// Without the boundary gate every turn would convert whichever block had just
+/// crossed the margin, rewriting the prefix mid-history — the most expensive
+/// thing this proxy can do.
+#[test]
+fn a_stale_margin_never_rewrites_a_settled_prefix() {
+    use headroom_proxy::compression::ctx_offload::{OffloadGate, OffloadPolicy};
+
+    let stale_cfg = CtxOffloadConfig {
+        min_bytes: MIN_BYTES,
+        exclude_tools: vec!["Read".to_string()],
+        stale_margin: 4,
+    };
+    // A conversation of excluded-tool results, so nothing would offload at all
+    // were it not for the margin.
+    let mut history: Vec<Value> = vec![json!({"role":"user","content":"start the task"})];
+    let mut snapshots = Vec::new();
+    for t in 0..12 {
+        history.extend(vec![
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":format!("tu_{t}"),"name":"Read",
+                 "input":{"file_path":format!("/src/mod{t}.rs")}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":format!("tu_{t}"),
+                 "content":big_log(&format!("read{t}"))}
+            ]}),
+        ]);
+        snapshots.push(history.clone());
+    }
+
+    let gate = OffloadGate::new(64);
+    let run = |messages: &[Value], boundary: bool| -> Value {
+        let mut v = body(messages);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "stale-margin-session",
+            rebuild_boundary: boundary,
+        };
+        offload_anthropic_request(&mut v, &stale_cfg, Some(&policy));
+        v
+    };
+
+    // Steady-state turns before any boundary: blocks cross the margin here, and
+    // not one of them may convert.
+    let mut prev = message_bytes(&run(&snapshots[0], false));
+    for (turn, messages) in snapshots.iter().enumerate().take(8).skip(1) {
+        let next = message_bytes(&run(messages, false));
+        assert_prefix(&prev, &next, turn);
+        prev = next;
+    }
+
+    // The rebuild boundary is where the conversion is allowed to land, because
+    // the prefix is being rewritten anyway. The prefix legitimately changes.
+    let at_boundary = run(&snapshots[7], true);
+    let digested = serde_json::to_string(&at_boundary["messages"]).unwrap();
+    assert!(
+        digested.contains("bytes offloaded"),
+        "the boundary turn is the one chance these blocks get to convert"
+    );
+
+    // And from here the digests are part of the prefix. Every later turn pushes
+    // more blocks past the margin; none of them may be converted, and none of
+    // the converted ones may revert.
+    let mut prev = message_bytes(&at_boundary);
+    for (turn, messages) in snapshots.iter().enumerate().skip(8) {
+        let next = message_bytes(&run(messages, false));
+        assert_prefix(&prev, &next, turn);
+        prev = next;
     }
 }
 
