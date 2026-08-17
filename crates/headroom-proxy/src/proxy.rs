@@ -342,9 +342,17 @@ impl AppState {
                                 stale_window: config.ctx_offload_stale_window,
                             },
                             store: Arc::new(store),
-                            gate: Arc::new(crate::compression::ctx_offload::OffloadGate::new(
-                                DRIFT_DETECTOR_CAPACITY,
-                            )),
+                            // Under the offload store's own directory, so it needs
+                            // no flag of its own and lives beside the originals it
+                            // refers to. Forgetting a conversion does not merely
+                            // defer it — the block forwards raw where the provider
+                            // cached a digest. See `OffloadGate`.
+                            gate: Arc::new(
+                                crate::compression::ctx_offload::OffloadGate::with_persistence(
+                                    DRIFT_DETECTOR_CAPACITY,
+                                    dir.join("offload-gate"),
+                                ),
+                            ),
                         }),
                         Err(e) => {
                             tracing::warn!(

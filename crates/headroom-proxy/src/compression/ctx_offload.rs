@@ -55,7 +55,8 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use headroom_core::ccr::compute_key;
 use headroom_core::tokenizer::get_tokenizer;
@@ -200,11 +201,89 @@ use headroom_core::transforms::live_zone::CTX_OFFLOAD_MARKER_PREFIX as MARKER_PR
 /// Once converted, the block's hash enters a per-session **monotonic set**
 /// (invariant I3): subsequent turns re-apply the offload unconditionally, so
 /// the digest never flip-flops back to raw bytes on a steady-state turn.
+///
+/// # Why the set is on disk
+///
+/// It used to live only in memory, and the comment on the field below claimed
+/// that losing it "merely defers" a conversion, which is safe. That was wrong in
+/// the direction that costs money. A block already forwarded as a digest, whose
+/// hash the gate has forgotten, is a FIRST conversion again: too deep for the
+/// window and with no boundary in sight, it forwards RAW where the provider
+/// cached a digest, so the prefix diverges mid-history — and it stays raw,
+/// losing the saving for the rest of the conversation.
+///
+/// Measured on 2026-08-17: 296 blocks sat deferred across the restarts of one
+/// afternoon, all of them previously converted. Persisting the set is the same
+/// move `--replay-store-dir` made for forwarded prefixes, for the same reason.
 pub struct OffloadGate {
-    /// session key → hashes already offloaded in that session. Bounded LRU so
-    /// abandoned sessions age out; evicting a live session merely defers its
-    /// frozen-history offloads to the next rebuild boundary (safe).
+    /// session key → hashes already offloaded in that session. Bounded LRU;
+    /// eviction re-reads from disk when the session is next seen.
     sessions: Mutex<LruCache<String, HashSet<String>>>,
+    /// Where the sets are kept so they survive a restart. `None` keeps them in
+    /// memory only, which is the pre-2026-08-17 behaviour.
+    persist_dir: Option<Arc<std::path::PathBuf>>,
+}
+
+/// One session's converted-hash set, as written to disk.
+///
+/// Holds hashes and a timestamp — never the session key, which can carry a
+/// credential. The key only appears as the SHA-256 in the filename, exactly as
+/// [`crate::cache_stabilization::prefix_replay`] does it. A test asserts it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedGate {
+    saved_at_unix: u64,
+    hashes: Vec<String>,
+}
+
+/// How stale a persisted set may be and still be honoured.
+///
+/// Two bounds, and this sits between them. Below: an hour, after which the
+/// provider has dropped the cache entry a revert would have busted — but the set
+/// carries the SAVING as well as the safety, and a conversation resumed the next
+/// morning should keep its digests rather than re-inflate its prompt. Above: the
+/// offload store keeps originals for 7 days (`--ctx-offload-ttl-seconds`), and a
+/// digest whose original is gone is a pointer to nothing.
+///
+/// A day is comfortably inside the upper bound and covers an overnight resume.
+const GATE_PERSIST_MAX_AGE: Duration = Duration::from_secs(86_400);
+
+/// Where one session's set lives. See [`PersistedGate`] for why it is hashed.
+fn gate_path(dir: &std::path::Path, session_key: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(session_key.as_bytes());
+    dir.join(format!("{digest:x}.json"))
+}
+
+/// Delete sets past [`GATE_PERSIST_MAX_AGE`]. One `read_dir` per process start.
+fn sweep_stale_gates(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        // Age from the file's own mtime: a truncated or foreign file should be
+        // swept too, and parsing every one defeats a cheap sweep.
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| {
+                t.elapsed()
+                    .map(|e| e > GATE_PERSIST_MAX_AGE)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn gate_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl OffloadGate {
@@ -214,10 +293,79 @@ impl OffloadGate {
         let cap = NonZeroUsize::new(capacity).expect("OffloadGate capacity must be > 0");
         Self {
             sessions: Mutex::new(LruCache::new(cap)),
+            persist_dir: None,
+        }
+    }
+
+    /// [`Self::new`], with the converted-hash sets kept under `dir` so a restart
+    /// does not turn every digest back into raw bytes.
+    ///
+    /// Creates the directory and sweeps anything past
+    /// [`GATE_PERSIST_MAX_AGE`]. Failing either turns persistence off for this
+    /// process rather than failing the proxy — the fallback is the in-memory
+    /// behaviour that shipped for months. Deleting the directory is the off
+    /// switch; the cost is one restart's worth of reverts.
+    ///
+    /// # Panics
+    /// Panics if `capacity == 0`.
+    pub fn with_persistence(capacity: usize, dir: std::path::PathBuf) -> Self {
+        let mut gate = Self::new(capacity);
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                event = "offload_gate_persist_unavailable",
+                dir = %dir.display(),
+                %error,
+                "cannot create the offload-gate directory; keeping the set in memory only"
+            );
+            return gate;
+        }
+        let swept = sweep_stale_gates(&dir);
+        tracing::info!(
+            event = "offload_gate_persist_enabled",
+            dir = %dir.display(),
+            stale_files_removed = swept,
+            "persisting offload conversions across restarts"
+        );
+        gate.persist_dir = Some(Arc::new(dir));
+        gate
+    }
+
+    /// Read this session's set into memory if it is not already there.
+    ///
+    /// Installs an empty set on a miss, so a session with nothing on disk costs
+    /// one failed read per process rather than one per block. The read happens
+    /// with no lock held.
+    fn hydrate(&self, session: &str) {
+        let Some(dir) = self.persist_dir.as_deref() else {
+            return;
+        };
+        match self.sessions.lock() {
+            Ok(guard) if guard.contains(session) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        let loaded = std::fs::read(gate_path(dir, session))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PersistedGate>(&bytes).ok())
+            .filter(|g| gate_unix_now().saturating_sub(g.saved_at_unix) <= GATE_PERSIST_MAX_AGE.as_secs());
+        let restored = loaded.as_ref().map(|g| g.hashes.len()).unwrap_or(0);
+        let set: HashSet<String> = loaded.map(|g| g.hashes.into_iter().collect()).unwrap_or_default();
+        if let Ok(mut guard) = self.sessions.lock() {
+            if !guard.contains(session) {
+                guard.put(session.to_string(), set);
+                if restored > 0 {
+                    tracing::info!(
+                        event = "offload_gate_rehydrated",
+                        conversions = restored,
+                        "restored offload conversions recorded before this process started"
+                    );
+                }
+            }
         }
     }
 
     fn contains(&self, session: &str, hash: &str) -> bool {
+        self.hydrate(session);
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         sessions
             .get(session)
@@ -226,16 +374,48 @@ impl OffloadGate {
     }
 
     fn record(&self, session: &str, hash: &str) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        match sessions.get_mut(session) {
-            Some(set) => {
-                set.insert(hash.to_string());
+        let snapshot = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            match sessions.get_mut(session) {
+                Some(set) => {
+                    set.insert(hash.to_string());
+                }
+                None => {
+                    let mut set = HashSet::new();
+                    set.insert(hash.to_string());
+                    sessions.put(session.to_string(), set);
+                }
             }
-            None => {
-                let mut set = HashSet::new();
-                set.insert(hash.to_string());
-                sessions.put(session.to_string(), set);
-            }
+            // Clone under the lock, write outside it. Conversions are rare — 26
+            // in 51 turns on live traffic — so a small write per conversion is
+            // cheaper than any scheme for batching it.
+            sessions.get(session).cloned()
+        };
+        if let (Some(dir), Some(set)) = (self.persist_dir.as_deref(), snapshot) {
+            self.persist(dir, session, set);
+        }
+    }
+
+    /// Best-effort and quiet on failure: a lost set costs what the in-memory
+    /// gate cost before it existed.
+    fn persist(&self, dir: &std::path::Path, session: &str, set: HashSet<String>) {
+        let mut hashes: Vec<String> = set.into_iter().collect();
+        // Sorted so the file is stable for the same content — nothing depends on
+        // it, but a diffable file is worth the one sort per conversion.
+        hashes.sort();
+        let snapshot = PersistedGate {
+            saved_at_unix: gate_unix_now(),
+            hashes,
+        };
+        let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+            return;
+        };
+        let path = gate_path(dir, session);
+        // Write-then-rename, so a restart mid-write cannot leave a truncated file
+        // that parses as a valid but short set.
+        let temporary = path.with_extension("tmp");
+        if std::fs::write(&temporary, &bytes).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
         }
     }
 }
@@ -828,6 +1008,135 @@ mod tests {
         );
         assert_eq!(out.blocks_offloaded, 0, "distance 20 is far too deep");
         assert_eq!(out.blocks_deferred, 1);
+    }
+
+    /// The reason the set is on disk at all: a restart used to turn every digest
+    /// back into raw bytes. Deep blocks then forwarded raw where the provider had
+    /// cached a digest — a mid-history prefix break — and, being too deep for the
+    /// window and with no boundary in sight, they stayed raw. 296 blocks sat in
+    /// that state after one afternoon of restarts.
+    #[test]
+    fn a_conversion_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = big_body();
+
+        // First process: converts at a boundary and records the hash.
+        let before = OffloadGate::with_persistence(16, dir.path().to_path_buf());
+        let mut deep = req_with_tail(&body, "Read", 20);
+        let first = offload_anthropic_request(
+            &mut deep,
+            &excluded_cfg(4),
+            Some(&OffloadPolicy {
+                gate: &before,
+                session_key: "sess",
+                rebuild_boundary: true,
+            }),
+        );
+        assert_eq!(first.blocks_offloaded, 1, "converts on the boundary turn");
+        let digest = first_tool_result_text(&deep);
+
+        // Second process, same directory, no boundary: the block is deep and
+        // would be a first conversion again if the set had not survived.
+        let after = OffloadGate::with_persistence(16, dir.path().to_path_buf());
+        let mut same = req_with_tail(&body, "Read", 20);
+        let second = offload_anthropic_request(
+            &mut same,
+            &excluded_cfg(4),
+            Some(&OffloadPolicy {
+                gate: &after,
+                session_key: "sess",
+                rebuild_boundary: false,
+            }),
+        );
+        assert_eq!(
+            second.blocks_offloaded, 1,
+            "a restart must not revert a digest to raw bytes"
+        );
+        assert_eq!(second.blocks_deferred, 0);
+        assert_eq!(
+            first_tool_result_text(&same),
+            digest,
+            "and the bytes must be the same digest, or the prefix broke anyway"
+        );
+    }
+
+    /// Without a directory the old behaviour stands, so the fallback is the thing
+    /// that shipped for months rather than something new and untested.
+    #[test]
+    fn without_a_directory_a_restart_still_forgets() {
+        let body = big_body();
+        let before = OffloadGate::new(16);
+        let mut deep = req_with_tail(&body, "Read", 20);
+        offload_anthropic_request(
+            &mut deep,
+            &excluded_cfg(4),
+            Some(&OffloadPolicy {
+                gate: &before,
+                session_key: "sess",
+                rebuild_boundary: true,
+            }),
+        );
+        let after = OffloadGate::new(16);
+        let mut same = req_with_tail(&body, "Read", 20);
+        let out = offload_anthropic_request(
+            &mut same,
+            &excluded_cfg(4),
+            Some(&OffloadPolicy {
+                gate: &after,
+                session_key: "sess",
+                rebuild_boundary: false,
+            }),
+        );
+        assert_eq!(out.blocks_deferred, 1, "in-memory only: forgotten, deferred");
+    }
+
+    /// A session key can carry a credential. It may appear in the filename only
+    /// as a SHA-256, and never inside the file.
+    #[test]
+    fn the_session_key_is_never_written_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "sk-ant-oat01-a-real-looking-credential";
+        let gate = OffloadGate::with_persistence(16, dir.path().to_path_buf());
+        gate.record(secret, "deadbeefcafe");
+
+        let mut files = 0;
+        for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            files += 1;
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains(secret),
+                "the session key must not appear in a filename"
+            );
+            let body = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                !body.contains(secret),
+                "the session key must not appear in the file"
+            );
+            assert!(body.contains("deadbeefcafe"), "the hash itself is the payload");
+        }
+        assert_eq!(files, 1, "one file per session");
+    }
+
+    /// A set older than the window names conversions the provider has long since
+    /// dropped, and whose originals may be past the store's own TTL.
+    #[test]
+    fn a_stale_set_is_not_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = OffloadGate::with_persistence(16, dir.path().to_path_buf());
+        gate.record("sess", "abc123");
+
+        // Age the file's contents past the window.
+        let path = gate_path(dir.path(), "sess");
+        let mut snapshot: PersistedGate =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot.saved_at_unix = gate_unix_now() - GATE_PERSIST_MAX_AGE.as_secs() - 1;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let reopened = OffloadGate::with_persistence(16, dir.path().to_path_buf());
+        assert!(
+            !reopened.contains("sess", "abc123"),
+            "a set past the window must not be honoured"
+        );
     }
 
     /// The PR-J5 guard exists to shout when frozen history converts on a quiet
