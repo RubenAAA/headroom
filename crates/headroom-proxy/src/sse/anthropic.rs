@@ -116,6 +116,11 @@ pub struct AnthropicStreamState {
     pub stop_reason: Option<String>,
     pub usage: UsageBuilder,
     pub status: StreamStatus,
+    /// Tokens the server removed under `context_management`, summed over
+    /// `message_delta.context_management.applied_edits[].cleared_input_tokens`.
+    /// The only way to price server-side clearing: it is the saving, and the
+    /// cache creation on the same turn is what it cost.
+    pub cleared_input_tokens: u64,
 }
 
 /// Accumulator for token counts. `message_start` carries the input
@@ -373,6 +378,20 @@ impl AnthropicStreamState {
         }
         if let Some(usage) = v.get("usage") {
             self.usage.merge_from(usage);
+        }
+        // Anthropic reports what context editing removed here, once, on the
+        // final delta. Summed rather than maxed: two strategies can fire on one
+        // turn and each reports its own share.
+        if let Some(edits) = v
+            .get("context_management")
+            .and_then(|cm| cm.get("applied_edits"))
+            .and_then(|e| e.as_array())
+        {
+            let cleared: u64 = edits
+                .iter()
+                .filter_map(|e| e.get("cleared_input_tokens").and_then(|x| x.as_u64()))
+                .sum();
+            self.cleared_input_tokens = self.cleared_input_tokens.max(cleared);
         }
         Ok(())
     }

@@ -1636,6 +1636,7 @@ fn maybe_inject_context_management(
         &mut value,
         Some(config.context_edit_keep_tool_uses),
         config.context_edit_trigger_tokens,
+        config.context_edit_clear_at_least,
         config.context_edit_keep_thinking,
     );
     if !changed {
@@ -6139,6 +6140,7 @@ async fn run_sse_state_machine(
                 output_tokens = state.usage.output_tokens,
                 cache_creation_input_tokens = state.usage.cache_creation_input_tokens,
                 cache_read_input_tokens = state.usage.cache_read_input_tokens,
+                cleared_input_tokens = state.cleared_input_tokens,
                 stop_reason = state.stop_reason.as_deref().unwrap_or(""),
                 blocks = state.blocks.len(),
                 "sse stream closed"

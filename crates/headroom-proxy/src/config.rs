@@ -417,7 +417,24 @@ pub struct CliArgs {
     #[arg(long = "context-edit-trigger-tokens", default_value_t = 60_000)]
     pub context_edit_trigger_tokens: u64,
 
-    /// When set, also inject `clear_thinking` keeping this many thinking turns.
+    /// `clear_tool_uses`: skip the strategy entirely unless it can clear at
+    /// least this many tokens. Stops a small clear from buying a full cache
+    /// write; below the floor the cached prefix survives untouched.
+    #[arg(long = "context-edit-clear-at-least")]
+    pub context_edit_clear_at_least: Option<u64>,
+
+    /// `clear_thinking`: keep thinking from this many most-recent assistant
+    /// turns and let the server drop the rest. Must be > 0.
+    ///
+    /// Claude Code sends this edit itself on every request with `keep: "all"`,
+    /// so setting this OVERRIDES the client's value — the whole point, since
+    /// `"all"` clears nothing. Only worth it on models that bill prior turns'
+    /// thinking as input (Opus 4.5, and 4.6 and later); Sonnet 4.5 and earlier
+    /// stripped it for free.
+    ///
+    /// Measured on 8 deep bodies: `1` removes 12.2% of input tokens. Larger
+    /// values save less AND invalidate more, because the newly-cleared block
+    /// sits further from the tail. See `docs/context-editing-api-facts.md`.
     #[arg(long = "context-edit-keep-thinking")]
     pub context_edit_keep_thinking: Option<u64>,
 
@@ -1730,7 +1747,11 @@ pub struct Config {
     pub context_edit_keep_tool_uses: u64,
     /// `clear_tool_uses`: input-token trigger threshold.
     pub context_edit_trigger_tokens: u64,
-    /// When `Some(n)`, also inject `clear_thinking` keeping `n` thinking turns.
+    /// `clear_tool_uses`: skip the strategy unless it clears at least this many
+    /// tokens.
+    pub context_edit_clear_at_least: Option<u64>,
+    /// When `Some(n)`, set `clear_thinking` to keep `n` thinking turns,
+    /// overriding the `keep: "all"` the client sends.
     pub context_edit_keep_thinking: Option<u64>,
     /// Tool-pruning (A4) policy, parsed once from `--prune-keep-tools` /
     /// `--prune-drop-mcp`. `is_noop()` when neither flag is set (passthrough).
@@ -2044,6 +2065,7 @@ impl Config {
             context_edit: args.context_edit,
             context_edit_keep_tool_uses: args.context_edit_keep_tool_uses,
             context_edit_trigger_tokens: args.context_edit_trigger_tokens,
+            context_edit_clear_at_least: args.context_edit_clear_at_least,
             context_edit_keep_thinking: args.context_edit_keep_thinking,
             tool_prune_policy: parse_prune_policy(
                 args.prune_keep_tools.as_deref(),
@@ -2262,6 +2284,7 @@ impl Config {
             context_edit: false,
             context_edit_keep_tool_uses: 6,
             context_edit_trigger_tokens: 60_000,
+            context_edit_clear_at_least: None,
             context_edit_keep_thinking: None,
             tool_prune_policy: Default::default(),
             model_router: Default::default(),
