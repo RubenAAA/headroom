@@ -540,6 +540,13 @@ impl AppState {
             )
         };
 
+        // Read before `config` moves into the Arc below.
+        let observed_cache_ttl = if config.force_1h_cache_ttl || config.split_cache_ttl {
+            cache_stabilization::usage_observer::ANTHROPIC_CACHE_TTL_1H
+        } else {
+            cache_stabilization::usage_observer::ANTHROPIC_CACHE_TTL
+        };
+
         Ok(Self {
             config: Arc::new(config),
             client,
@@ -555,7 +562,13 @@ impl AppState {
                 cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
             ),
             vertex_token_source,
-            usage_observer: Arc::new(cache_stabilization::usage_observer::UsageObserver::new()),
+            // Tell the classifier which TTL we actually pin. Left at the
+            // 5-minute default it files every bust in a 5m..1h gap as a
+            // legitimate expiry, which hid ~3% of daily creation.
+            usage_observer: Arc::new(
+                cache_stabilization::usage_observer::UsageObserver::new()
+                    .with_cache_ttl(observed_cache_ttl),
+            ),
             codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
             ctx_observer,
             ctx_offload,

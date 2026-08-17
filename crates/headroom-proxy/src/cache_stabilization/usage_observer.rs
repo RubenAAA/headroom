@@ -64,12 +64,25 @@ use super::prefix_replay::ReplaySkip;
 /// constant rather than threaded through every call site.
 const MISS_ATTRIBUTION_PROVIDER: &str = "anthropic";
 
-/// Anthropic prompt-cache TTL. A gap between turns longer than this
-/// makes a full cache re-write legitimate (TtlExpiry, not a bug).
-/// The default ephemeral TTL is 5 minutes; the optional 1h tier
-/// would only make us *more* conservative, never produce a false
-/// warning, so we key off the short tier.
+/// Anthropic's default ephemeral prompt-cache TTL, and the classifier's
+/// threshold when nothing pins a longer one. A gap between turns longer than
+/// the effective TTL makes a full re-write legitimate (TtlExpiry, not a bug).
+///
+/// This used to be the threshold unconditionally, on the reasoning that the
+/// optional 1h tier "would only make us *more* conservative, never produce a
+/// false warning". That has it backwards. Keying off the short tier does not
+/// risk false warnings — it manufactures false *exonerations*: with
+/// `--force-1h-cache-ttl` on, every bust in a 5-minute-to-1-hour gap was filed
+/// as "expected, not a defect" and disappeared from the numbers. Measured on
+/// 2026-08-17 that was 557,276 creation tokens in a day, ~3% of all creation,
+/// while resumptions in those same gap bands showed 74-88% cache read share —
+/// so the prefix was mostly alive and the creation needed a different
+/// explanation. Pass the TTL actually pinned; see [`ANTHROPIC_CACHE_TTL_1H`].
 pub const ANTHROPIC_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The extended cache tier `--force-1h-cache-ttl` pins. Since 2025-08-13 it
+/// needs no beta header.
+pub const ANTHROPIC_CACHE_TTL_1H: Duration = Duration::from_secs(60 * 60);
 
 /// Token slack for the healthy-turn comparison. `cache_read` can
 /// legitimately undershoot the expectation by a few tokens
@@ -367,6 +380,7 @@ pub fn classify_turn(
     now: SystemTime,
     cache_read_input_tokens: u64,
     cache_creation_input_tokens: u64,
+    cache_ttl: Duration,
 ) -> TurnClass {
     let expected_read = prev
         .cache_read_input_tokens
@@ -383,7 +397,7 @@ pub fn classify_turn(
         return TurnClass::Healthy;
     }
     let gap = now.duration_since(prev.at).unwrap_or(Duration::ZERO);
-    if gap > ANTHROPIC_CACHE_TTL {
+    if gap > cache_ttl {
         return TurnClass::TtlExpiry;
     }
     TurnClass::Recache {
@@ -731,6 +745,11 @@ struct Inner {
 
 /// Shared observer, one per proxy process (lives on `AppState`).
 pub struct UsageObserver {
+    /// TTL the forwarded body actually pins, used to tell a legitimate cache
+    /// expiry apart from a bust. Defaults to the 5-minute tier; set it to match
+    /// `--force-1h-cache-ttl` or every bust in a 5m..1h gap is filed as
+    /// "expected" and vanishes from the numbers.
+    cache_ttl: Duration,
     inner: Mutex<Inner>,
 }
 
@@ -779,6 +798,14 @@ impl CompletionClass {
 }
 
 impl UsageObserver {
+    /// Pin the TTL the classifier assumes. Must match what the forwarded body
+    /// carries, not what Anthropic defaults to.
+    #[must_use]
+    pub fn with_cache_ttl(mut self, cache_ttl: Duration) -> Self {
+        self.cache_ttl = cache_ttl;
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -795,6 +822,7 @@ impl UsageObserver {
                 ttl_expiries_total: 0,
                 last_event: None,
             }),
+            cache_ttl: ANTHROPIC_CACHE_TTL,
         }
     }
 
@@ -927,6 +955,7 @@ impl UsageObserver {
         cache_write_ttl_split: Option<(u64, u64)>,
     ) -> Option<CompletionClass> {
         let now = SystemTime::now();
+        let cache_ttl = self.cache_ttl;
         let mut inner = self.lock();
 
         // Fleet-wide rolling hit rate (statusline ambient signal).
@@ -1086,6 +1115,7 @@ impl UsageObserver {
                             now,
                             cache_read_input_tokens,
                             cache_creation_input_tokens,
+                            cache_ttl,
                         ),
                         prev.cache_read_input_tokens
                             .saturating_add(prev.cache_creation_input_tokens),
@@ -1494,14 +1524,20 @@ mod tests {
     fn healthy_turn_reads_previous_prefix() {
         // prev cached 10_000 + wrote 2_000 → expect 12_000 read.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 12_000, 500);
+        let c = classify_turn(&p, SystemTime::now(), 12_000, 500, ANTHROPIC_CACHE_TTL);
         assert_eq!(c, TurnClass::Healthy);
     }
 
     #[test]
     fn healthy_within_slack() {
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 12_000 - RECACHE_SLACK_TOKENS, 500);
+        let c = classify_turn(
+            &p,
+            SystemTime::now(),
+            12_000 - RECACHE_SLACK_TOKENS,
+            500,
+            ANTHROPIC_CACHE_TTL,
+        );
         assert_eq!(c, TurnClass::Healthy);
     }
 
@@ -1509,7 +1545,7 @@ mod tests {
     fn recache_inside_ttl_is_flagged_with_wasted_tokens() {
         // Expected read 12_000, got 0, re-wrote 12_500 → 12_000 wasted.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 0, 12_500);
+        let c = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL);
         assert_eq!(
             c,
             TurnClass::Recache {
@@ -1523,7 +1559,7 @@ mod tests {
         // Shortfall 12_000 but only 3_000 re-written (partial prefix
         // reuse via an earlier breakpoint) → waste is the re-write.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 0, 3_000);
+        let c = classify_turn(&p, SystemTime::now(), 0, 3_000, ANTHROPIC_CACHE_TTL);
         assert_eq!(
             c,
             TurnClass::Recache {
@@ -1535,7 +1571,46 @@ mod tests {
     #[test]
     fn ttl_expiry_suppressed() {
         let p = prev(10_000, 2_000, ANTHROPIC_CACHE_TTL + Duration::from_secs(10));
-        let c = classify_turn(&p, SystemTime::now(), 0, 12_500);
+        let c = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL);
+        assert_eq!(c, TurnClass::TtlExpiry);
+    }
+
+    #[test]
+    fn a_bust_inside_the_pinned_hour_is_not_excused_as_expiry() {
+        // The defect this parameter exists for. With `--force-1h-cache-ttl` the
+        // forwarded body pins an hour, so a 20-minute gap cannot have expired —
+        // but the classifier used to key off the 5-minute tier and filed it as
+        // "expected, not a defect". Measured at 557,276 creation tokens in one
+        // day, all of it invisible.
+        let gap = Duration::from_secs(20 * 60);
+        let p = prev(10_000, 2_000, gap);
+
+        let excused = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL);
+        assert_eq!(
+            excused,
+            TurnClass::TtlExpiry,
+            "sanity: against the 5-minute tier this gap does read as an expiry"
+        );
+
+        let p = prev(10_000, 2_000, gap);
+        let honest = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL_1H);
+        assert_eq!(
+            honest,
+            TurnClass::Recache {
+                wasted_tokens: 12_000
+            },
+            "against the hour we actually pin it is a bust and must be counted"
+        );
+    }
+
+    #[test]
+    fn a_gap_beyond_the_pinned_hour_is_still_an_expiry() {
+        let p = prev(
+            10_000,
+            2_000,
+            ANTHROPIC_CACHE_TTL_1H + Duration::from_secs(10),
+        );
+        let c = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL_1H);
         assert_eq!(c, TurnClass::TtlExpiry);
     }
 
@@ -1544,7 +1619,7 @@ mod tests {
         // Branched/shorter conversation: read dropped but nothing
         // significant was re-billed → nothing to warn about.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 4_000, 10);
+        let c = classify_turn(&p, SystemTime::now(), 4_000, 10, ANTHROPIC_CACHE_TTL);
         assert_eq!(c, TurnClass::Healthy);
     }
 
