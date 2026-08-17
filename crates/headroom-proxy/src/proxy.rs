@@ -2891,9 +2891,16 @@ pub(crate) async fn forward_http(
                                 "ctx_offload converted frozen history on a non-boundary turn (I4 violation)"
                             );
                         }
-                        if out.changed() {
-                            changed = true;
-                            ctx_transform_tokens_saved += out.tokens_saved;
+                        // Logged whenever a block QUALIFIED, converted or not.
+                        // `changed()` is only true for conversions, and this
+                        // event used to sit behind it — so a turn that deferred
+                        // every candidate logged nothing at all, which reads
+                        // exactly like a turn with no candidates. Offload can
+                        // sit idle for an entirely healthy reason (no rebuild
+                        // boundary yet) and there was no way to tell that from
+                        // being switched off, which cost an hour of looking for
+                        // a fault in a working build.
+                        if out.blocks_offloaded > 0 || out.blocks_deferred > 0 {
                             // CTX-6: offload metrics are recorded by the
                             // offload-store worker after persist_one confirms
                             // the record is durably recoverable, not here —
@@ -2905,8 +2912,12 @@ pub(crate) async fn forward_http(
                                 blocks_deferred = out.blocks_deferred,
                                 tokens_saved = out.tokens_saved,
                                 rebuild_boundary,
-                                "ctx_offload rewrote tool_result blocks"
+                                "ctx_offload considered tool_result blocks"
                             );
+                        }
+                        if out.changed() {
+                            changed = true;
+                            ctx_transform_tokens_saved += out.tokens_saved;
                             Some((runtime, out.records))
                         } else {
                             None
