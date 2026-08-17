@@ -35,6 +35,7 @@ fn cfg() -> CtxOffloadConfig {
         min_bytes: MIN_BYTES,
         exclude_tools: Vec::new(),
         stale_margin: 0,
+        stale_window: 0,
     }
 }
 
@@ -367,6 +368,10 @@ fn a_stale_margin_never_rewrites_a_settled_prefix() {
         min_bytes: MIN_BYTES,
         exclude_tools: vec!["Read".to_string()],
         stale_margin: 4,
+        // Zero: this test is about the boundary gate on its own. The window is
+        // allowed to rewrite the tail, and does so in
+        // `the_stale_window_confines_its_rewrite_to_the_tail`.
+        stale_window: 0,
     };
     // A conversation of excluded-tool results, so nothing would offload at all
     // were it not for the margin.
@@ -424,6 +429,108 @@ fn a_stale_margin_never_rewrites_a_settled_prefix() {
         let next = message_bytes(&run(messages, false));
         assert_prefix(&prev, &next, turn);
         prev = next;
+    }
+}
+
+/// The stale WINDOW is the one transform here that changes a cached prefix on an
+/// ordinary turn, on purpose. So the guarantee is not "nothing moves" — it is
+/// "nothing moves deeper than the window", because the whole economic argument
+/// rests on the rewrite being confined to the last few messages. The last 4
+/// messages are 1,460 tokens and the last 8 are 3,699; a break at message 10 of
+/// 300 would cost 40x that and never pay back.
+///
+/// This asserts the bound directly: between consecutive turns, the first message
+/// whose bytes differ is never further from the tail than margin + window.
+#[test]
+fn the_stale_window_confines_its_rewrite_to_the_tail() {
+    use headroom_proxy::compression::ctx_offload::{OffloadGate, OffloadPolicy};
+
+    const MARGIN: usize = 4;
+    const WINDOW: usize = 4;
+    let cfg = CtxOffloadConfig {
+        min_bytes: MIN_BYTES,
+        exclude_tools: vec!["Read".to_string()],
+        stale_margin: MARGIN,
+        stale_window: WINDOW,
+    };
+    let mut history: Vec<Value> = vec![json!({"role":"user","content":"start the task"})];
+    let mut snapshots = Vec::new();
+    for t in 0..14 {
+        history.extend(vec![
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":format!("tu_{t}"),"name":"Read",
+                 "input":{"file_path":format!("/src/mod{t}.rs")}}
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":format!("tu_{t}"),
+                 "content":big_log(&format!("read{t}"))}
+            ]}),
+        ]);
+        snapshots.push(history.clone());
+    }
+
+    let gate = OffloadGate::new(64);
+    let run = |messages: &[Value]| -> Value {
+        let mut v = body(messages);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "window-session",
+            // Never a boundary: the window is the only thing that may convert.
+            rebuild_boundary: false,
+        };
+        offload_anthropic_request(&mut v, &cfg, Some(&policy));
+        v
+    };
+
+    // Turn by turn, a block converts the moment it crosses the margin, which is
+    // always near the tail — so a continuous conversation cannot break the bound
+    // and this half only checks the window is doing something at all.
+    let mut converted = 0;
+    let mut prev = message_bytes(&run(&snapshots[0]));
+    for messages in snapshots.iter().skip(1) {
+        let next = message_bytes(&run(messages));
+        if prev.iter().zip(next.iter()).any(|(a, b)| a != b) {
+            converted += 1;
+        }
+        prev = next;
+    }
+    assert!(
+        converted > 0,
+        "the window converted nothing over 14 turns; it would be inert"
+    );
+
+    // The case that can break the bound: a block first seen while ALREADY deep.
+    // That is a restart or a resume — the gate is in memory, so after one the
+    // whole history is unconverted and every block is a first sighting at
+    // whatever depth it happens to sit. Converting the deep ones there would
+    // rewrite most of the prompt on an ordinary turn.
+    let cold_gate = OffloadGate::new(64);
+    let deepest = snapshots.last().unwrap();
+    let mut v = body(deepest);
+    let policy = OffloadPolicy {
+        gate: &cold_gate,
+        session_key: "cold-session",
+        rebuild_boundary: false,
+    };
+    let out = offload_anthropic_request(&mut v, &cfg, Some(&policy));
+    assert!(
+        out.blocks_deferred > 0,
+        "a cold gate on a deep history must defer the deep blocks"
+    );
+    let msgs = v["messages"].as_array().unwrap();
+    let last = msgs.len() - 1;
+    for (i, m) in msgs.iter().enumerate() {
+        let is_digest = serde_json::to_string(m).unwrap().contains("bytes offloaded");
+        if is_digest {
+            assert!(
+                last - i <= MARGIN + WINDOW,
+                "message[{i}] converted {} back from the tail on a cold gate — \
+                 deeper than the {} the window allows, and a rewrite there costs \
+                 more than it can ever save",
+                last - i,
+                MARGIN + WINDOW
+            );
+        }
     }
 }
 

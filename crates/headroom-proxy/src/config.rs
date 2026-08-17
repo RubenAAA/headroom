@@ -865,6 +865,27 @@ pub struct CliArgs {
     )]
     pub ctx_offload_stale_messages: usize,
 
+    /// CTX-3: how many messages past `--ctx-offload-stale-messages` a first
+    /// conversion may happen on an ordinary turn rather than waiting for a
+    /// rebuild boundary. `0` (the default) always waits.
+    ///
+    /// This is the one deliberate cache cost in the offload path. Converting a
+    /// block inside the cached prefix rewrites everything after it, and at 1.45
+    /// for creation against 0.09 for reads the trade needs
+    /// `16.1 * tokens_after / tokens_saved` turns to pay off. Deep in the history
+    /// that is hundreds of turns; just past the margin it is ten, because the
+    /// last 4 messages are only 1,460 tokens (median, 3,545 bodies at depth ≥ 20,
+    /// 2026-08-17) while a qualifying block there saves 2,280.
+    ///
+    /// Keep it narrow. The last 8 messages are already 3,699 tokens, so widening
+    /// this raises the cost faster than the saving.
+    #[arg(
+        long = "ctx-offload-stale-window",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_STALE_WINDOW",
+        default_value_t = 0
+    )]
+    pub ctx_offload_stale_window: usize,
+
     /// CTX-3: TTL (seconds) for offloaded originals in the CCR store. Long by
     /// design (retrieval outlives a session); default `604_800` (7 days).
     #[arg(
@@ -1788,6 +1809,9 @@ pub struct Config {
     /// CTX-3: messages back from the tail before `exclude_tools` stops
     /// shielding a block from offload; `0` shields all of it.
     pub ctx_offload_stale_messages: usize,
+    /// CTX-3: messages past that margin where a first conversion may skip the
+    /// rebuild-boundary wait; `0` always waits.
+    pub ctx_offload_stale_window: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
     pub ctx_offload_ttl_seconds: u64,
     /// CTX-4: recall/resume injection on/off. Requires `ctx_capture`.
@@ -2058,6 +2082,7 @@ impl Config {
             replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_stale_messages: args.ctx_offload_stale_messages,
+            ctx_offload_stale_window: args.ctx_offload_stale_window,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
             ccr_context_tracking: args.ccr_context_tracking,
@@ -2290,6 +2315,7 @@ impl Config {
             replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,
             ctx_offload_stale_messages: 0,
+            ctx_offload_stale_window: 0,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,
             ccr_context_tracking: true,

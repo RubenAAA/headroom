@@ -5653,6 +5653,7 @@ mod tests {
             min_bytes: 50_000,
             exclude_tools: Vec::new(),
             stale_margin: 0,
+            stale_window: 0,
         };
         let out =
             crate::compression::ctx_offload::offload_anthropic_request(&mut parsed, &cfg, None);

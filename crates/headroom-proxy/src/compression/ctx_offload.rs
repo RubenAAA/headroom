@@ -97,6 +97,28 @@ pub struct CtxOffloadConfig {
     /// [`headroom_core::tool_exclusion::is_verbatim_excluded`] still applies at
     /// any distance: those results break when their bytes change at all.
     pub stale_margin: usize,
+    /// How many messages past `stale_margin` a first conversion may happen on an
+    /// ordinary turn instead of waiting for a rebuild boundary. `0` waits
+    /// always.
+    ///
+    /// Converting a block that is already inside the cached prefix costs one
+    /// rewrite of everything after it, and buys a smaller prompt on every later
+    /// turn. Cache creation bills at 1.45 and reads at 0.09, so the trade takes
+    /// `16.1 * tokens_after / tokens_saved` turns to come out ahead. Deep in the
+    /// history that is hundreds of turns and never pays — hence the boundary
+    /// gate, which waits for a turn that is rewriting anyway.
+    ///
+    /// Just past the margin it is a different trade, because `tokens_after` is
+    /// tiny there. Measured over 3,545 bodies at depth ≥ 20 on 2026-08-17: the
+    /// last 4 messages are 1,460 tokens (median), and a qualifying block in the
+    /// 4-to-8-back window saves 2,280. That is a **10-turn** payback against a
+    /// median conversation of 15 turns, and conversations of 51-150 turns hold
+    /// 58.7% of all cache reads.
+    ///
+    /// So this window is a deliberate, bounded cache cost — the only one in this
+    /// module. Widening it moves `tokens_after` up fast (the last 8 messages are
+    /// already 3,699 tokens) and the payback with it.
+    pub stale_window: usize,
 }
 
 /// One offloaded block, handed to the background worker for storage. Never
@@ -331,8 +353,13 @@ pub fn offload_anthropic_request(
             //     stale block read as fresh again and revert digest→raw. That
             //     is the same flip in the other direction and busts the cache
             //     just as hard.
-            let stale = config.stale_margin > 0 && msg_idx + config.stale_margin <= last_idx;
+            let distance = last_idx - msg_idx;
+            let stale = config.stale_margin > 0 && distance >= config.stale_margin;
             let excluded_unless_prior = excluded && !stale;
+            // Close enough to the tail that the rewrite it costs is small — see
+            // `stale_window`. Deeper than this, a first conversion still waits.
+            let near_tail = config.stale_window > 0
+                && distance < config.stale_margin + config.stale_window;
             match offload_tool_result(
                 block,
                 config,
@@ -340,6 +367,7 @@ pub fn offload_anthropic_request(
                 policy,
                 is_live,
                 excluded_unless_prior,
+                near_tail,
             ) {
                 BlockOutcome::Offloaded {
                     record,
@@ -388,6 +416,7 @@ fn offload_tool_result(
     policy: Option<&OffloadPolicy>,
     is_live: bool,
     excluded_unless_prior: bool,
+    near_tail: bool,
 ) -> BlockOutcome {
     let Some(original) = block.get("content").and_then(|c| tool_result_text(c)) else {
         return BlockOutcome::Skipped;
@@ -423,7 +452,7 @@ fn offload_tool_result(
     // rebuild boundary; re-applications (hash already in the session set) and
     // live-tail blocks always pass. See [`OffloadGate`].
     if let Some(p) = policy {
-        if !prior && !is_live && !p.rebuild_boundary {
+        if !prior && !is_live && !near_tail && !p.rebuild_boundary {
             return BlockOutcome::Deferred;
         }
     }
@@ -555,6 +584,7 @@ mod tests {
             min_bytes: min,
             exclude_tools: Vec::new(),
             stale_margin: 0,
+            stale_window: 0,
         }
     }
 
@@ -591,6 +621,7 @@ mod tests {
             min_bytes: 200,
             exclude_tools: vec!["Bash".to_string()],
             stale_margin: 0,
+            stale_window: 0,
         };
         let out = offload_anthropic_request(&mut parsed, &config, None);
         assert_eq!(out.blocks_offloaded, 0, "excluded tool must not offload");
@@ -621,6 +652,7 @@ mod tests {
             min_bytes: 200,
             exclude_tools: vec!["Read".to_string()],
             stale_margin,
+            stale_window: 0,
         }
     }
 
@@ -668,6 +700,7 @@ mod tests {
             min_bytes: 200,
             exclude_tools: Vec::new(),
             stale_margin: 4,
+            stale_window: 0,
         };
         let out = offload_anthropic_request(&mut parsed, &config, None);
         assert_eq!(out.blocks_offloaded, 0, "WebFetch must stay byte-faithful");
@@ -725,6 +758,89 @@ mod tests {
             digest,
             "the same bytes must yield the same digest at any depth"
         );
+    }
+
+    fn window_cfg(stale_margin: usize, stale_window: usize) -> CtxOffloadConfig {
+        CtxOffloadConfig {
+            min_bytes: 200,
+            exclude_tools: vec!["Read".to_string()],
+            stale_margin,
+            stale_window,
+        }
+    }
+
+    fn gate_policy<'a>(gate: &'a OffloadGate, boundary: bool) -> OffloadPolicy<'a> {
+        OffloadPolicy {
+            gate,
+            session_key: "sess",
+            rebuild_boundary: boundary,
+        }
+    }
+
+    /// Just past the margin the rewrite a conversion costs is small — the last
+    /// four messages are 1,460 tokens where a qualifying block saves 2,280 — so
+    /// it pays for itself in about ten turns and does not need to wait for a
+    /// boundary that may never come.
+    #[test]
+    fn a_block_inside_the_window_converts_without_a_boundary() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 4);
+        let gate = OffloadGate::new(16);
+        let out = offload_anthropic_request(
+            &mut parsed,
+            &window_cfg(4, 4),
+            Some(&gate_policy(&gate, false)),
+        );
+        assert_eq!(out.blocks_offloaded, 1, "distance 4 is inside the window");
+        assert_eq!(out.blocks_deferred, 0);
+    }
+
+    /// Deeper than the window the same trade needs hundreds of turns, because
+    /// everything after the block is rewritten. Those still wait for a turn that
+    /// is rewriting anyway.
+    #[test]
+    fn a_block_past_the_window_still_waits_for_a_boundary() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 20);
+        let gate = OffloadGate::new(16);
+        let out = offload_anthropic_request(
+            &mut parsed,
+            &window_cfg(4, 4),
+            Some(&gate_policy(&gate, false)),
+        );
+        assert_eq!(out.blocks_offloaded, 0, "distance 20 is far too deep");
+        assert_eq!(out.blocks_deferred, 1);
+    }
+
+    /// A zero window is the boundary-only behaviour, which is the default.
+    #[test]
+    fn a_zero_window_waits_even_next_to_the_tail() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 4);
+        let gate = OffloadGate::new(16);
+        let out = offload_anthropic_request(
+            &mut parsed,
+            &window_cfg(4, 0),
+            Some(&gate_policy(&gate, false)),
+        );
+        assert_eq!(out.blocks_offloaded, 0);
+        assert_eq!(out.blocks_deferred, 1);
+    }
+
+    /// The window must not reopen the exclusion for a block the model is still
+    /// working with: inside the margin it stays raw however near the tail it is.
+    #[test]
+    fn the_window_does_not_override_the_margin() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 1);
+        let gate = OffloadGate::new(16);
+        let out = offload_anthropic_request(
+            &mut parsed,
+            &window_cfg(4, 4),
+            Some(&gate_policy(&gate, false)),
+        );
+        assert_eq!(out.blocks_offloaded, 0, "distance 1 is still in play");
+        assert_eq!(first_tool_result_text(&parsed), body);
     }
 
     /// I1 restated for this field: position decides *whether* a block converts,
