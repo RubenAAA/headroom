@@ -2911,6 +2911,7 @@ pub(crate) async fn forward_http(
                                 request_id = %request_id,
                                 blocks_offloaded = out.blocks_offloaded,
                                 blocks_deferred = out.blocks_deferred,
+                                window_offloads = out.window_offloads,
                                 tokens_saved = out.tokens_saved,
                                 rebuild_boundary,
                                 "ctx_offload considered tool_result blocks"

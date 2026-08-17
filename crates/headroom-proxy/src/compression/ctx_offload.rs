@@ -145,7 +145,18 @@ pub struct OffloadOutcome {
     /// PR-J5 thrash guard: conversions of frozen blocks not previously in the
     /// session's offload set. Non-zero on a non-boundary turn means the I4
     /// invariant was violated (a cache-thrash bug) — the caller warns loudly.
+    ///
+    /// Window conversions are counted in [`Self::window_offloads`] instead. They
+    /// are frozen conversions on a non-boundary turn by design, so counting them
+    /// here made the guard fire on correct behaviour — twice within 15 turns of
+    /// shipping `stale_window`. A guard that cries wolf is worse than no guard,
+    /// because the next real thrash bug hides inside the noise.
     pub frozen_new_offloads: usize,
+    /// Conversions that rode the near-tail window rather than a boundary. These
+    /// each spend a small, deliberate cache rewrite; see
+    /// [`CtxOffloadConfig::stale_window`] for the payback arithmetic. Worth
+    /// watching, not warning about.
+    pub window_offloads: usize,
     /// Tokens removed from the body, summed over the offloaded blocks.
     ///
     /// Free to collect: the per-block tokenizer gate already counts both the
@@ -376,7 +387,14 @@ pub fn offload_anthropic_request(
                 } => {
                     outcome.blocks_offloaded += 1;
                     if !prior && !is_live {
-                        outcome.frozen_new_offloads += 1;
+                        // Intended (window) and unintended (I4 violation) frozen
+                        // conversions are counted apart, so the guard downstream
+                        // keeps meaning "this should never happen".
+                        if near_tail {
+                            outcome.window_offloads += 1;
+                        } else {
+                            outcome.frozen_new_offloads += 1;
+                        }
                     }
                     outcome.tokens_saved += tokens_saved;
                     outcome.records.push(record);
@@ -810,6 +828,45 @@ mod tests {
         );
         assert_eq!(out.blocks_offloaded, 0, "distance 20 is far too deep");
         assert_eq!(out.blocks_deferred, 1);
+    }
+
+    /// The PR-J5 guard exists to shout when frozen history converts on a quiet
+    /// turn, which the window now does on purpose. Counted together, the guard
+    /// fired twice in the first 15 turns after `stale_window` shipped — and a
+    /// guard that fires on correct behaviour hides the next real bug.
+    #[test]
+    fn a_window_conversion_does_not_trip_the_thrash_guard() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 4);
+        let gate = OffloadGate::new(16);
+        let out = offload_anthropic_request(
+            &mut parsed,
+            &window_cfg(4, 4),
+            Some(&gate_policy(&gate, false)),
+        );
+        assert_eq!(out.blocks_offloaded, 1);
+        assert_eq!(out.window_offloads, 1, "counted as a window conversion");
+        assert_eq!(
+            out.frozen_new_offloads, 0,
+            "the guard must stay quiet for a conversion the window authorised"
+        );
+    }
+
+    /// The same conversion riding a boundary instead still counts as a frozen
+    /// one, so the guard keeps its teeth where the window does not reach.
+    #[test]
+    fn a_boundary_conversion_beyond_the_window_still_counts_as_frozen() {
+        let body = big_body();
+        let mut parsed = req_with_tail(&body, "Read", 20);
+        let gate = OffloadGate::new(16);
+        let out = offload_anthropic_request(
+            &mut parsed,
+            &window_cfg(4, 4),
+            Some(&gate_policy(&gate, true)),
+        );
+        assert_eq!(out.blocks_offloaded, 1, "a boundary lets the deep one through");
+        assert_eq!(out.window_offloads, 0, "too deep to be a window conversion");
+        assert_eq!(out.frozen_new_offloads, 1);
     }
 
     /// A zero window is the boundary-only behaviour, which is the default.
