@@ -96,6 +96,39 @@ fn pin_marker(marker: &mut Value) -> bool {
 
 /// 1h on the tools and system prefix, 5m on every message marker.
 ///
+/// # Measured in production and reverted, 2026-08-17
+///
+/// This ran live for 489 minutes behind `--split-cache-ttl` and cost five times
+/// more than the all-1h tail it replaced. Actual creation per turn from the
+/// `turn_cost_ledger`, binned by inbound message count so depth cannot explain
+/// it (`bench/_ttlverdict.py`, 1,009 joined turns):
+///
+/// ```text
+/// depth 0-20    1,994 ->  9,562      depth 50-100    1,601 -> 5,809
+/// depth 20-50     772 -> 13,092      depth 100-200   1,521 -> 9,837
+/// ```
+///
+/// +511% standardised for depth, flat across the window, so not restart
+/// warm-up. It is creation VOLUME that rose, so no weighting of the
+/// subscription window rescues it.
+///
+/// The mechanism is the interaction with the second tail breakpoint
+/// ([`super::prefix_replay::place_tail_cache_breakpoints`]). That breakpoint is
+/// a hedge: when the newest entry misses, the read lands one marker back
+/// instead of at nothing. The hedge only pays while the older entry is still
+/// alive, and at five minutes it is not — the tail advances every turn, so the
+/// older entry is never read again and dies. A miss then falls all the way back
+/// to the system marker and rewrites the conversation.
+///
+/// `bench/cachesim.py` priced this at -38% and could not see the above. It
+/// models expiry from inter-turn gaps and renews the entry a read hits, and
+/// both are right in isolation; what it misses is that the fallback entry's
+/// survival is what the second marker is worth. Anything that changes TTLs
+/// needs an A/B on live traffic, not the simulator.
+///
+/// Everything below is the reasoning that led to shipping it. Kept because the
+/// premises are still true and only the conclusion was wrong.
+///
 /// The docstring above prices a 1h write at 2.0x base input against 5m's 1.25x
 /// and then argues the difference is free on a subscription, "where the usage
 /// window is token-counted". `bench/fit_weights.py` scores that hypothesis —
