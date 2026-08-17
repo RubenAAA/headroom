@@ -782,10 +782,10 @@ pub struct CliArgs {
     /// supersedes within seconds, which never needed an hour. See
     /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`].
     ///
-    /// Default `false` while the premise is under test: it rests on the
-    /// subscription window charging a 1h write more than a 5m one, which the
-    /// published API prices say and `bench/fit_weights.py` supports but has not
-    /// yet separated with confidence.
+    /// Default `false`, and measured at +511% depth-standardised creation on
+    /// live traffic on 2026-08-17 — see
+    /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`] for the
+    /// numbers and the mechanism. Do not enable without a live A/B.
     #[arg(
         long = "split-cache-ttl",
         env = "HEADROOM_PROXY_SPLIT_CACHE_TTL",
@@ -793,6 +793,27 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub split_cache_ttl: bool,
+
+    /// Hold the working-directory line in the `system` preamble to the value
+    /// each conversation opened with, and state the live one at the message
+    /// tail.
+    ///
+    /// The line sits inside every cached prefix and carries no marker of its
+    /// own, so a `cd` re-creates the conversation from the system block down: one
+    /// such edit cost 65,051 tokens against a depth-peer average of 4,637 in the
+    /// 2026-08-17 capture. See
+    /// [`crate::cache_stabilization::working_dir`], which also explains why the
+    /// live directory is restated rather than dropped.
+    ///
+    /// Default `false`. It is the only mechanism here that adds text the client
+    /// did not send, so it stays opt-in.
+    #[arg(
+        long = "hold-working-directory",
+        env = "HEADROOM_PROXY_HOLD_WORKING_DIRECTORY",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub hold_working_directory: bool,
 
     /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
     /// to be offloaded. Static per invariant I3 (never changes mid-session).
@@ -1715,6 +1736,10 @@ pub struct Config {
     /// precedence over `force_1h_cache_ttl`; see
     /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`].
     pub split_cache_ttl: bool,
+    /// Hold each conversation's working-directory line in `system` still, and
+    /// state the live one at the message tail. See
+    /// [`crate::cache_stabilization::working_dir`].
+    pub hold_working_directory: bool,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
@@ -1983,6 +2008,7 @@ impl Config {
             cache_stable_tool_order: args.cache_stable_tool_order,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
+            hold_working_directory: args.hold_working_directory,
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
@@ -2212,6 +2238,7 @@ impl Config {
             cache_stable_tool_order: false,
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
+            hold_working_directory: false,
             ctx_offload_min_bytes: 50_000,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,

@@ -4258,6 +4258,7 @@ mod tests {
             tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
             beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
+            working_dir_pins: crate::cache_stabilization::working_dir::WorkingDirPins::new(8),
             usage_observer: std::sync::Arc::new(
                 crate::cache_stabilization::usage_observer::UsageObserver::new(),
             ),

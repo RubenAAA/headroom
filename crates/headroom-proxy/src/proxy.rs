@@ -93,6 +93,11 @@ pub struct AppState {
     /// Anthropic buffered path reads/writes it, and only when
     /// `Config::prefix_replay` is on.
     pub replay_store: SessionReplayStore,
+    /// Per-conversation working-directory pins. Read and written only when
+    /// `Config::hold_working_directory` is on; see
+    /// [`cache_stabilization::working_dir`] for why the pin outlives the replay
+    /// store's session TTL.
+    pub working_dir_pins: cache_stabilization::working_dir::WorkingDirPins,
     /// When this process started. The replay store is in-memory, so every
     /// restart empties it and the first turn of every live conversation then
     /// finds no prefix. Without this, that expected gap is indistinguishable
@@ -523,6 +528,9 @@ impl AppState {
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             tool_order_state: cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store: SessionReplayStore::new(REPLAY_STORE_CAPACITY),
+            working_dir_pins: cache_stabilization::working_dir::WorkingDirPins::new(
+                REPLAY_STORE_CAPACITY,
+            ),
             started_at: std::time::Instant::now(),
             beta_sticky: cache_stabilization::beta_sticky::BetaStickyState::new(
                 cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
@@ -1787,6 +1795,43 @@ fn maybe_pin_cache_ttl(body: bytes::Bytes, request_id: &str, split: bool) -> byt
                 request_id = %request_id,
                 event = if split { "split_cache_ttl" } else { "force_1h_cache_ttl" },
                 "pinned cache_control ttl"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
+/// Hold this conversation's working-directory line still, restating the live
+/// directory at the message tail.
+///
+/// Byte-equal passthrough — the same cache-safety invariant the other body
+/// rewrites keep — when the body is not JSON, `system` names no working
+/// directory, this is the conversation's first sight, or the live directory
+/// already matches the pin. See [`cache_stabilization::working_dir`].
+fn hold_working_directory(
+    body: bytes::Bytes,
+    pins: &cache_stabilization::working_dir::WorkingDirPins,
+    session_key: &str,
+    request_id: &str,
+) -> bytes::Bytes {
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let Some(live) = pins.hold(&mut value, session_key) else {
+        return body;
+    };
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            // The path is the operator's own filesystem, and the session key is
+            // hashed for the same reason every other event here hashes it.
+            tracing::info!(
+                event = "working_directory_held",
+                request_id = %request_id,
+                session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+                live_directory = %live,
+                "held the system preamble's working directory and restated the live one at the tail"
             );
             bytes::Bytes::from(bytes)
         }
@@ -3537,6 +3582,32 @@ pub(crate) async fn forward_http(
         // (compressed) prefix is replayed byte-identical in place of
         // whatever the dispatcher just produced for the same leading
         // positions, so the provider's prompt cache keeps hitting.
+        // Hold the working-directory line in `system` still. Runs BEFORE prefix
+        // replay so the note it adds is part of the tail the overlay stores, and
+        // so breakpoint placement inside `apply_prefix_replay` sees it. The
+        // comparison the overlay makes is against the client's own
+        // `replay_original_messages`, captured earlier, so the note cannot make
+        // this turn look like a divergence.
+        //
+        // Gated on `prefix_replay` because the note only stays in history if the
+        // next turn replays what we forwarded. Without replay the client re-sends
+        // that message without the note every turn, and the prefix breaks at the
+        // tail each time — the hold would then cause the churn it exists to stop.
+        let body_to_send = if state.config.hold_working_directory
+            && state.config.prefix_replay
+            && matches!(endpoint, compression::CompressibleEndpoint::AnthropicMessages)
+            && !request_session_key.is_empty()
+        {
+            hold_working_directory(
+                body_to_send,
+                &state.working_dir_pins,
+                &request_session_key,
+                &request_id,
+            )
+        } else {
+            body_to_send
+        };
+
         // `headers_snapshot` is always `Some` on this buffered branch;
         // `replay_original_messages` is `Some` only when the flag is on
         // and the body carried a messages array.
