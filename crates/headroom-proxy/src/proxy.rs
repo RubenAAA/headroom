@@ -1648,6 +1648,7 @@ fn maybe_inject_context_management(
                 request_id = %request_id,
                 keep_tool_uses = config.context_edit_keep_tool_uses,
                 trigger_tokens = config.context_edit_trigger_tokens,
+                clear_at_least = ?config.context_edit_clear_at_least,
                 keep_thinking = ?config.context_edit_keep_thinking,
                 "injected context_management directives"
             );
