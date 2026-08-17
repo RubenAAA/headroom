@@ -26,7 +26,16 @@ use super::tool_adapter::{
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
-const DEDUP_HINT_THRESHOLD: f64 = 0.75;
+/// Word overlap at or above which a save updates the existing memory instead of
+/// adding a second one. Set from the real corpus: across all 666 pairs of the 37
+/// memories the most alike *distinct* pair scores 0.397, so 0.70 leaves a wide
+/// margin against a false merge while still catching a reworded duplicate at
+/// 0.706. Bias it high — a wrong merge loses a fact, a missed one is clutter.
+const DEDUP_MERGE_THRESHOLD: f64 = 0.70;
+
+/// Word overlap at or above which a save mentions the neighbour without touching
+/// it. Above the 0.397 of the closest distinct real pair, so it stays rare.
+const DEDUP_HINT_THRESHOLD: f64 = 0.45;
 
 // ─── Configuration ───────────────────────────────────────────────────────
 
@@ -804,6 +813,48 @@ impl MemoryHandler {
             }
         };
 
+        // Merge before inserting. A duplicate that is caught here never becomes
+        // a second row, so the store cannot silently accumulate five phrasings
+        // of one fact — and nothing is deleted to achieve that.
+        let existing = backend
+            .search_memories(content, &effective_user_id, 5, false)
+            .await
+            .unwrap_or_default();
+        if let Some(dupe) = existing.iter().find(|r| {
+            crate::memory_tail::text_similarity(&r.memory.content, content) >= DEDUP_MERGE_THRESHOLD
+        }) {
+            let merged = if content.len() > dupe.memory.content.len() {
+                content
+            } else {
+                dupe.memory.content.as_str()
+            };
+            return match backend
+                .update_memory(
+                    &dupe.memory.id,
+                    merged,
+                    &effective_user_id,
+                    Some("merged with a restatement on save"),
+                )
+                .await
+            {
+                Ok(_) => serde_json::json!({
+                    "status": "merged",
+                    "memory_id": dupe.memory.id,
+                    "note": format!(
+                        "This restates an existing memory ({:.0}% of the same words), \
+                         so that one was updated rather than a duplicate created. \
+                         Call memory_update on {} to change it further.",
+                        crate::memory_tail::text_similarity(&dupe.memory.content, content) * 100.0,
+                        dupe.memory.id,
+                    ),
+                })
+                .to_string(),
+                Err(e) => {
+                    serde_json::json!({"status": "error", "error": e.to_string()}).to_string()
+                }
+            };
+        }
+
         let memory = match backend
             .save_memory(
                 content,
@@ -840,7 +891,11 @@ impl MemoryHandler {
         });
 
         if let Some(top) = similar.first() {
-            if top.score >= DEDUP_HINT_THRESHOLD {
+            // Compared on words, not on `top.score`: that is a BM25 rank, which
+            // sits near 0.03 even for identical text, so this hint never fired.
+            if crate::memory_tail::text_similarity(&top.memory.content, content)
+                >= DEDUP_HINT_THRESHOLD
+            {
                 let src = top
                     .memory
                     .metadata

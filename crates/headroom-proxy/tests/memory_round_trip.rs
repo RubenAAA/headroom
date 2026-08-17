@@ -148,29 +148,62 @@ async fn concurrent_saves_all_land() {
     );
 }
 
-/// Saving twice on one subject keeps both, and says so.
+/// Saving a restatement updates the original instead of adding a second row.
 ///
-/// The old code deleted the older one in the background on a 0.92 "cosine"
-/// threshold it could not actually compute. Losing a memory silently is the
-/// worst failure this store has, so a duplicate now survives and the caller is
-/// told to merge it by hand.
+/// Nothing is deleted to achieve that — the duplicate simply never becomes a
+/// row, and the caller is told which memory it landed on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_near_duplicate_is_kept_and_flagged() {
+async fn a_near_duplicate_merges_into_the_original() {
     let dir = tempfile::tempdir().unwrap();
     let handler = handler(dir.path());
 
-    call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes"})).await;
-    call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes."})).await;
+    let first = call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes"})).await;
+    let second = call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes."})).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(second.contains("merged"), "a restatement must merge: {second}");
+    assert!(
+        second.contains("memory_update"),
+        "and must say how to change it further: {second}"
+    );
+
     let listed = call(&handler, "memory_list", json!({"limit": 100})).await;
-
     assert_eq!(
         listed.matches("pixel dimensions").count(),
-        2,
-        "neither memory may be deleted behind the user's back; got {listed}"
+        1,
+        "one fact, one memory; got {listed}"
     );
+    assert!(!first.contains("merged"), "the first save had nothing to merge into");
 }
+
+/// Two facts that merely share vocabulary must stay two facts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn related_but_distinct_memories_are_both_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    call(&handler, "memory_save", json!({"content":
+        "the split cache TTL cost 511 percent more creation on live traffic and was reverted"})).await;
+    call(&handler, "memory_save", json!({"content":
+        "the reminder guard cut depth-standardised cache creation by 55 percent on live traffic"})).await;
+
+    let listed = call(&handler, "memory_list", json!({"limit": 100})).await;
+    assert!(listed.contains("511 percent"), "first fact lost: {listed}");
+    assert!(listed.contains("55 percent"), "second fact lost: {listed}");
+}
+
+/// Distinct subjects, because a restatement now merges rather than duplicating.
+const SUBJECTS_A: [&str; 4] = [
+    "the reminder guard halved depth-standardised cache creation",
+    "Gemini turns take a translated route with no client bytes recorded",
+    "the parity harness replays captured bodies against the python port",
+    "kompress is an ONNX model on disk that has never been switched on",
+];
+const SUBJECTS_B: [&str; 4] = [
+    "prefix divergence predicts waste better than the decline reason",
+    "tool membership rather than ordering splits the cached tools block",
+    "proactive expansion pasted offloaded content back into the prompt",
+    "the capture-beta capture run baseline must be beaten to ship",
+];
 
 /// Two handles on one directory, standing in for two proxy processes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -182,11 +215,11 @@ async fn two_stores_over_one_directory_do_not_block_each_other() {
     let a = {
         let first = Arc::clone(&first);
         tokio::spawn(async move {
-            for i in 0..12 {
+            for i in 0..SUBJECTS_A.len() {
                 call(
                     &first,
                     "memory_save",
-                    json!({"content": format!("from the first process {i}"), "title": format!("a{i}")}),
+                    json!({"content": SUBJECTS_A[i], "title": format!("a{i}")}),
                 )
                 .await;
             }
@@ -195,11 +228,11 @@ async fn two_stores_over_one_directory_do_not_block_each_other() {
     let b = {
         let second = Arc::clone(&second);
         tokio::spawn(async move {
-            for i in 0..12 {
+            for i in 0..SUBJECTS_B.len() {
                 call(
                     &second,
                     "memory_save",
-                    json!({"content": format!("from the second process {i}"), "title": format!("b{i}")}),
+                    json!({"content": SUBJECTS_B[i], "title": format!("b{i}")}),
                 )
                 .await;
             }
@@ -211,7 +244,7 @@ async fn two_stores_over_one_directory_do_not_block_each_other() {
     // Either handle must see both writers' memories.
     let listed = call(&second, "memory_list", json!({"limit": 100})).await;
     assert!(
-        listed.contains("from the first process 11") && listed.contains("from the second process 11"),
+        listed.contains(SUBJECTS_A[0]) && listed.contains(SUBJECTS_B[0]),
         "both processes' writes must be visible from either handle: {listed}"
     );
 }

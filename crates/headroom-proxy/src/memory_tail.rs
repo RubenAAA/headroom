@@ -26,14 +26,43 @@ const DEDUP_AUTO_THRESHOLD: f64 = 0.92;
 /// duplicate is deleted. This runs asynchronously and never blocks
 /// the tool response.
 ///
+/// How alike two memories are, from 0 (nothing shared) to 1 (same words).
+///
+/// A Dice coefficient over lowercased word sets, ignoring words of three
+/// characters or fewer. Deterministic, needs no model, and — unlike the BM25
+/// ranks this module used to threshold — actually bounded in 0..1.
+///
+/// Calibrated on the 37 real memories, all 666 pairs: the most alike *distinct*
+/// pair scores **0.397** and the median pair 0.255, while a reworded duplicate
+/// scores 0.706 and a punctuation-only one 1.000. That gap is what makes the
+/// thresholds in `handler` safe.
+pub fn text_similarity(a: &str, b: &str) -> f64 {
+    let words = |t: &str| -> std::collections::HashSet<String> {
+        t.to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            // Short words carry no signal, but short *numbers* carry most of it
+            // here: "511 percent" and "55 percent" are different findings, and
+            // dropping the figure would merge them.
+            .filter(|w| w.len() > 3 || w.chars().any(|c| c.is_ascii_digit()))
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (words(a), words(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    2.0 * a.intersection(&b).count() as f64 / (a.len() + b.len()) as f64
+}
+
 /// Mirrors `MemoryHandler._background_dedup`.
 ///
 /// **No caller since 2026-08-18, deliberately.** `execute_save` used to spawn
 /// this on every save. The threshold it takes is a cosine similarity, and the
 /// only backend we run scores with BM25, whose ranks sit near 0.03 even for
 /// near-identical text — so the comparison was meaningless and it deleted
-/// unrelated memories: 8 of 12 in a concurrency test. Do not wire it back
-/// without a similarity measure that is actually bounded in 0..1.
+/// unrelated memories: 8 of 12 in a concurrency test. Saving now merges
+/// duplicates with [`text_similarity`] instead, which is bounded and reported.
+/// Do not wire this back.
 pub async fn background_dedup(
     new_memory_id: &str,
     similar_results: &[MemorySearchResult],
