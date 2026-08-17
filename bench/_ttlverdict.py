@@ -1,13 +1,25 @@
-"""Is the split TTL better or worse in production, at equal conversation depth?
+"""Did a config change help or hurt production, at equal conversation depth?
+
+    python3 _ttlverdict.py <capture_dir> <proxy.log> [split_epoch_seconds]
+
+Reads what the provider actually billed, not what `cachesim.py` predicts. This
+exists because the simulator priced the split TTL at -38% and it cost +511% —
+anything touching TTLs or breakpoint counts has to be settled here.
 
 Creation per turn rises with depth, so a raw before/after mean says nothing: the
-window after the switch is also the window with the deepest conversations. Bins
-by inbound message count and reports actual creation per turn in each bin, so
-the two configurations are compared like for like.
+window after a change is rarely the same mix of conversation lengths. Bins by
+inbound message count and reports actual creation per turn in each bin, so the
+two configurations are compared like for like.
 
 The first turn of each conversation is excluded. It has no prefix to read and
 writes the lot, and counting it inverts the answer — the same trap that
 `cache-measure-excludes-first-turns` records.
+
+With no `split_epoch_seconds`, splits on the first turn the provider reported a
+5-minute write, which is the split-TTL switch. Pass one explicitly for any other
+change, and remember that `~/headroom-proxy.log` rotates on restart: concatenate
+`headroom-proxy.log.*` oldest-first, or the window you are measuring will be
+half gone.
 """
 import collections
 import sys
@@ -25,10 +37,15 @@ for t in turns:
         rows.append((t.ts, len(t.body.get("messages") or []), ledger_usage(real),
                      t.session_key))
 rows.sort()
+if not rows:
+    sys.exit("no captured turn joins a ledger line — wrong log, or it rotated")
 
-switch = next((ts for ts, _, u, _ in rows if u.write_5m_tokens > 0), None)
-if switch is None:
-    sys.exit("no turn in this corpus reports a 5-minute write")
+if len(sys.argv) > 3:
+    switch = float(sys.argv[3])
+else:
+    switch = next((ts for ts, _, u, _ in rows if u.write_5m_tokens > 0), None)
+    if switch is None:
+        sys.exit("no turn reports a 5-minute write; pass a split timestamp")
 
 # Drop each conversation's first observed turn.
 first = {}
