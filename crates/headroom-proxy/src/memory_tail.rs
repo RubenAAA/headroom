@@ -27,6 +27,13 @@ const DEDUP_AUTO_THRESHOLD: f64 = 0.92;
 /// the tool response.
 ///
 /// Mirrors `MemoryHandler._background_dedup`.
+///
+/// **No caller since 2026-08-18, deliberately.** `execute_save` used to spawn
+/// this on every save. The threshold it takes is a cosine similarity, and the
+/// only backend we run scores with BM25, whose ranks sit near 0.03 even for
+/// near-identical text — so the comparison was meaningless and it deleted
+/// unrelated memories: 8 of 12 in a concurrency test. Do not wire it back
+/// without a similarity measure that is actually bounded in 0..1.
 pub async fn background_dedup(
     new_memory_id: &str,
     similar_results: &[MemorySearchResult],
