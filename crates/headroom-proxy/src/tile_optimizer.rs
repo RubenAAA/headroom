@@ -75,22 +75,25 @@ pub fn estimate_openai_tokens(width: u32, height: u32, detail: &str) -> u32 {
 }
 
 /// Anthropic Claude vision token formula: (w * h) / 750.
+/// What Anthropic actually bills for an image.
+///
+/// Only the 1568px edge limit is enforced — above it the provider downscales and
+/// bills the smaller size. **1.15MP is a guideline, not a billing cap**, and
+/// assuming otherwise here is what made this whole module inert: applying the
+/// cap made `tokens_after == tokens_before` for every real screenshot, so
+/// [`optimize_content_block`] bailed every time.
+///
+/// Measured against `count_tokens` on 2026-08-17: a 1560x1150 screenshot (1.79MP)
+/// billed **2,365 tokens**, against 2,392 for the uncapped `w * h / 750` and
+/// 1,533 if the 1.15MP cap applied. The uncapped formula is right.
 pub fn estimate_anthropic_tokens(width: u32, height: u32) -> u32 {
     let mut w = width;
     let mut h = height;
 
-    // Auto-downscale: longest edge ≤ 1568
+    // The one limit the provider does enforce.
     let max_edge = w.max(h);
     if max_edge > 1568 {
         let scale = 1568.0 / max_edge as f64;
-        w = scale_dim(w, scale);
-        h = scale_dim(h, scale);
-    }
-
-    // Auto-downscale: total pixels ≤ 1.15MP
-    let total = w as f64 * h as f64;
-    if total > 1_150_000.0 {
-        let scale = (1_150_000.0 / total).sqrt();
         w = scale_dim(w, scale);
         h = scale_dim(h, scale);
     }
@@ -334,6 +337,150 @@ fn optimize_content_block(item: &Value, provider: &str) -> Option<(Value, TileOp
     None
 }
 
+// ─── Caching ─────────────────────────────────────────────────────────────
+
+/// Resized images, keyed by the hash of the bytes that produced them.
+///
+/// Two reasons, and the second is the load-bearing one:
+///
+/// 1. Cost. History carries every past screenshot on every turn, so without a
+///    cache a deep conversation would Lanczos-resize the same multi-megapixel
+///    PNGs on each request.
+/// 2. **Prefix stability.** The forwarded bytes for a given image must be
+///    identical on every turn or the cached prefix breaks at that image and
+///    everything after it is re-created. The encoder is deterministic for a
+///    fixed input, but memoising removes the question: one image, one output,
+///    for the life of the process.
+///
+/// A miss stores `None` too, so an image that is not worth resizing is decoded
+/// once rather than on every turn.
+type ImageCacheKey = [u8; 32];
+static RESIZE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<lru::LruCache<ImageCacheKey, Option<(Value, TileOptResult)>>>,
+> = std::sync::OnceLock::new();
+
+/// Distinct images held before the oldest is dropped. Screenshots are the only
+/// images in practice and a conversation carries a handful.
+const RESIZE_CACHE_CAPACITY: usize = 512;
+
+fn resize_cache(
+) -> &'static std::sync::Mutex<lru::LruCache<ImageCacheKey, Option<(Value, TileOptResult)>>> {
+    RESIZE_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(RESIZE_CACHE_CAPACITY).expect("capacity is non-zero"),
+        ))
+    })
+}
+
+fn cache_key(item: &Value, provider: &str) -> Option<ImageCacheKey> {
+    use sha2::{Digest, Sha256};
+    let data = item
+        .get("source")
+        .and_then(|s| s.get("data"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.get("image_url")
+                .and_then(|iu| iu.get("url"))
+                .and_then(Value::as_str)
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update(provider.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(data.as_bytes());
+    Some(hasher.finalize().into())
+}
+
+/// [`optimize_content_block`] memoised on the source bytes.
+fn optimize_content_block_cached(item: &Value, provider: &str) -> Option<(Value, TileOptResult)> {
+    let Some(key) = cache_key(item, provider) else {
+        return optimize_content_block(item, provider);
+    };
+    if let Ok(mut cache) = resize_cache().lock() {
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+    }
+    // Resize outside the lock: it is the slow part and nothing else needs
+    // serialising. A duplicate resize under contention is wasted work, not a
+    // wrong answer, because the transform is a pure function of the bytes.
+    let computed = optimize_content_block(item, provider);
+    if let Ok(mut cache) = resize_cache().lock() {
+        cache.put(key, computed.clone());
+    }
+    computed
+}
+
+/// [`optimize_images_in_messages`], reusing previously resized images.
+///
+/// This is the entry point the proxy calls; the uncached variant stays for
+/// callers that want a one-shot transform.
+pub fn optimize_images_in_messages_cached(
+    messages: &[Value],
+    provider: &str,
+) -> (Vec<Value>, Vec<TileOptResult>) {
+    let mut results = Vec::new();
+    let mut optimized = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            optimized.push(message.clone());
+            continue;
+        };
+
+        let mut new_content = Vec::with_capacity(content.len());
+        let mut touched = false;
+        for item in content {
+            // Screenshots arrive nested: measured over 800 live bodies, all 13
+            // distinct images sat in `tool_result.content` and not one at the
+            // top level. Walking only the top level finds nothing at all.
+            if item.get("type").and_then(Value::as_str) == Some("tool_result") {
+                if let Some(inner) = item.get("content").and_then(Value::as_array) {
+                    let mut new_inner = Vec::with_capacity(inner.len());
+                    let mut inner_touched = false;
+                    for sub in inner {
+                        match optimize_content_block_cached(sub, provider) {
+                            Some((opt_sub, opt_result)) => {
+                                new_inner.push(opt_sub);
+                                results.push(opt_result);
+                                inner_touched = true;
+                            }
+                            None => new_inner.push(sub.clone()),
+                        }
+                    }
+                    if inner_touched {
+                        let mut wrapper = item.clone();
+                        wrapper["content"] = Value::Array(new_inner);
+                        new_content.push(wrapper);
+                        touched = true;
+                        continue;
+                    }
+                }
+                new_content.push(item.clone());
+                continue;
+            }
+
+            match optimize_content_block_cached(item, provider) {
+                Some((opt_item, opt_result)) => {
+                    new_content.push(opt_item);
+                    results.push(opt_result);
+                    touched = true;
+                }
+                None => new_content.push(item.clone()),
+            }
+        }
+
+        if touched {
+            let mut msg = message.clone();
+            msg["content"] = Value::Array(new_content);
+            optimized.push(msg);
+        } else {
+            optimized.push(message.clone());
+        }
+    }
+
+    (optimized, results)
+}
+
 /// Decode base64 image data from a data URL.
 fn decode_data_url(url: &str) -> Option<Vec<u8>> {
     // Format: data:image/png;base64,<data>
@@ -392,12 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn anthro_high_pixel_count_capped() {
-        // 2000×2000=4MP>1.15MP → scale by sqrt(1.15M/4M)=0.536 → 1072×1072
-        // 1072×1072=1149184, /750=1532
-        let tokens = estimate_anthropic_tokens(2000, 2000);
-        assert!(tokens > 0);
-        assert!(tokens < 2000); // Should be capped
+    fn anthro_bills_the_edge_cap_only() {
+        // 2000x2000 → the provider's 1568px edge limit → 1568x1568 = 2,458,624
+        // px, /750 = 3,278. It does NOT further cap to 1.15MP for billing; this
+        // test used to assert `< 2000` on that belief and so certified the
+        // no-op. Confirmed against count_tokens (see estimate_anthropic_tokens).
+        assert_eq!(estimate_anthropic_tokens(2000, 2000), 3_278);
     }
 
     // ── OpenAI dimension optimization ────────────────────────────────
@@ -515,15 +662,19 @@ mod tests {
         });
 
         let result = optimize_content_block(&item, "anthropic");
-        // Anthropic optimize is bandwidth-only; tokens same due to internal capping.
-        // With 1800×1800 the image gets resized but tokens_before == tokens_after,
-        // so the function returns None (no token savings).
-        // Use a case where tokens DO drop: a non-square image where
-        // find_optimal produces genuinely smaller dims.
-        //
-        // Actually: estimate_anthropic_tokens already caps, so we test the
-        // OpenAI path instead which genuinely saves tokens.
-        assert!(result.is_none());
+        // This asserted `is_none()` — "tokens same due to internal capping" —
+        // which was the phantom 1.15MP cap. 1800x1800 bills as 1568x1568 =
+        // 3,278 tokens and resizing to 1.15MP takes it to 1,532, so there is a
+        // real saving and the block must be rewritten.
+        let (new_item, res) = result.expect("an oversized image must be resized");
+        assert_eq!(res.tokens_before, 3_278);
+        assert!(
+            res.tokens_after < res.tokens_before,
+            "{} -> {}",
+            res.tokens_before,
+            res.tokens_after
+        );
+        assert_eq!(new_item["source"]["media_type"], json!("image/jpeg"));
     }
 
     #[test]
@@ -626,5 +777,100 @@ mod tests {
         assert!(results[0].tokens_saved() > 0);
         // Text message unchanged
         assert_eq!(opt[0]["content"], "look at this");
+    }
+
+    // ── Wiring: what made this module inert ──────────────────────────
+
+    /// A deterministic PNG of the given size, big enough to be worth resizing.
+    fn png_b64(w: u32, h: u32) -> String {
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x ^ y) % 239) as u8])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode png");
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner())
+    }
+
+    fn image_block(w: u32, h: u32) -> Value {
+        json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": "image/png", "data": png_b64(w, h) }
+        })
+    }
+
+    #[test]
+    fn an_image_nested_in_a_tool_result_is_found() {
+        // Measured over 800 live bodies: all 13 distinct images sat inside
+        // `tool_result.content` and none at the top level, so a walker that only
+        // reads the top level finds nothing at all.
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [ image_block(1560, 1900) ]
+            }]
+        })];
+
+        let (opt, results) = optimize_images_in_messages_cached(&messages, "anthropic");
+
+        assert_eq!(results.len(), 1, "the nested image must be optimized");
+        assert!(results[0].tokens_saved() > 0);
+        let inner = &opt[0]["content"][0]["content"][0];
+        assert_eq!(inner["source"]["media_type"], json!("image/jpeg"));
+        assert_ne!(
+            inner["source"]["data"], messages[0]["content"][0]["content"][0]["source"]["data"],
+            "the nested block must actually be rewritten, not just counted"
+        );
+    }
+
+    #[test]
+    fn the_same_image_forwards_identically_every_turn() {
+        // Prefix stability. If a resize is not byte-stable the cached prefix
+        // breaks at that image and everything after it is re-created — which
+        // would cost far more than the image saves.
+        let messages = vec![json!({ "role": "user", "content": [ image_block(1560, 1500) ] })];
+
+        let (first, r1) = optimize_images_in_messages_cached(&messages, "anthropic");
+        let (second, r2) = optimize_images_in_messages_cached(&messages, "anthropic");
+
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r2.len(), 1, "a cached hit must still report its saving");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+            "identical input must forward identical bytes"
+        );
+    }
+
+    #[test]
+    fn an_image_already_within_the_limits_is_left_alone() {
+        let messages = vec![json!({ "role": "user", "content": [ image_block(400, 300) ] })];
+
+        let (opt, results) = optimize_images_in_messages_cached(&messages, "anthropic");
+
+        assert!(results.is_empty(), "nothing to gain, so do not touch it");
+        assert_eq!(
+            opt[0]["content"][0]["source"]["media_type"],
+            json!("image/png"),
+            "an untouched image must keep its original encoding"
+        );
+    }
+
+    #[test]
+    fn a_message_without_images_is_returned_unchanged() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{ "type": "tool_result", "tool_use_id": "t", "content": [
+                { "type": "text", "text": "no pixels here" }
+            ]}]
+        })];
+
+        let (opt, results) = optimize_images_in_messages_cached(&messages, "anthropic");
+
+        assert!(results.is_empty());
+        assert_eq!(opt, messages);
     }
 }

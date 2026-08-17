@@ -1681,6 +1681,56 @@ fn maybe_inject_context_management(
 /// (cache reads are free per Anthropic's rate-limit docs). No-op (returns the
 /// original bytes untouched) when the body has no tools array or nothing is
 /// removed, so a cache-stable request is never perturbed.
+/// Resize oversized images down to Anthropic's own limits before forwarding.
+///
+/// Anthropic bills images by **dimensions, not bytes** — `(w * h) / 750`, capped
+/// at 1568px on the long edge and 1.15MP — so re-encoding alone saves nothing
+/// and only a resize moves the number. Measured over 800 live bodies: images are
+/// 9.2% of the prompt at 16,228 tok/body, and 13 of 13 distinct images exceeded
+/// 1.15MP at a mean 2,877 tokens each. They sit just under the 1568px edge cap,
+/// so the provider does not shrink them for us.
+///
+/// The transform is a pure function of the source bytes and memoised on their
+/// hash, so a given image forwards identically on every turn and the cached
+/// prefix holds. Enabling it re-keys live conversations once, like any change to
+/// content already inside a cached prefix.
+pub(crate) fn maybe_optimize_images(body: bytes::Bytes, request_id: &str) -> bytes::Bytes {
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
+        return body;
+    };
+    let (optimized, results) =
+        crate::tile_optimizer::optimize_images_in_messages_cached(messages, "anthropic");
+    if results.is_empty() {
+        return body;
+    }
+    let saved: u32 = results
+        .iter()
+        .map(super::tile_optimizer::TileOptResult::tokens_saved)
+        .sum();
+    if saved == 0 {
+        return body;
+    }
+    value["messages"] = serde_json::Value::Array(optimized);
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::info!(
+                event = "image_optimize",
+                request_id = %request_id,
+                images = results.len(),
+                tokens_before = results.iter().map(|r| r.tokens_before).sum::<u32>(),
+                tokens_saved = saved,
+                "resized oversized images"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
 pub(crate) fn maybe_prune_tools(
     body: bytes::Bytes,
     policy: &crate::cache_stabilization::tool_prune::PrunePolicy,
@@ -3734,6 +3784,11 @@ pub(crate) async fn forward_http(
                     body_to_send
                 } else {
                     maybe_prune_tools(body_to_send, &state.config.tool_prune_policy, &request_id)
+                };
+                let body_to_send = if state.config.image_optimize {
+                    maybe_optimize_images(body_to_send, &request_id)
+                } else {
+                    body_to_send
                 };
                 if state.config.context_edit {
                     maybe_inject_context_management(body_to_send, &state.config, &request_id)
