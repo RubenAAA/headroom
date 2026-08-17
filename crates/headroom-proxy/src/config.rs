@@ -1328,10 +1328,21 @@ pub struct CliArgs {
     pub smart_crusher_with_compaction: bool,
 
     /// Gate compression of user-role messages.
+    ///
+    /// **Not wired. Setting this changes nothing.** Verified 2026-08-17: the
+    /// field is read only by the `agent-savings` CLI subcommand, never on a
+    /// serving path. `content_router::Config` carries a field of the same name
+    /// that only a `SavingsProfile` ever writes and nothing reads, and
+    /// `live_zone::DispatchConfig` declares one that is neither read nor
+    /// written. `skip_user_messages`, which the doc comments say this overrides,
+    /// is itself only declared and defaulted. See [[features-on-but-inert]].
     #[arg(long = "compress-user-messages", env = "HEADROOM_COMPRESS_USER_MESSAGES", default_value_t = true, action = clap::ArgAction::Set)]
     pub compress_user_messages: bool,
 
     /// Gate compression of system-role messages.
+    ///
+    /// **Not wired. Setting this changes nothing.** Same three dead layers as
+    /// `compress_user_messages` above.
     #[arg(long = "compress-system-messages", env = "HEADROOM_COMPRESS_SYSTEM_MESSAGES", default_value_t = true, action = clap::ArgAction::Set)]
     pub compress_system_messages: bool,
 
