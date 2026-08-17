@@ -1537,6 +1537,21 @@ pub fn place_tail_cache_breakpoints(messages: Vec<Value>, tail_slots: usize) -> 
     // Older reminders are not seals: reminders sometimes persist deep in
     // history, and stranding every later message would cost more than the churn
     // this protects against.
+    //
+    // Message 0 is never a seal either (`i > 0` below), measured 2026-08-17. On
+    // the first turn the latest user message IS message 0, and Claude Code's
+    // opener carries `<system-reminder>` blocks, so the seal landed on the very
+    // first block and stranded everything after it: 16,971 bytes forwarded
+    // outside the cached prefix, billed as 5,959 fresh input tokens where the
+    // base client billed 18. It bought nothing — creation came out the same
+    // either way (57,993 against the client's 57,895), because `system` and
+    // `tools` markers were already writing that prefix — so it was 4.4 points of
+    // an 11.5% loss against an unproxied client, paid for no benefit.
+    //
+    // The seal exists to keep a withdrawn reminder out of an ALREADY cached
+    // prefix. On turn one nothing is cached yet, so there is nothing to protect,
+    // and from turn two the reminder is held steady by prefix replay, whose
+    // append-only guard is deliberately blind to reminder churn.
     let mut sealed = false;
     let final_message = messages.len().saturating_sub(1);
     let latest_user_message = messages.iter().rposition(|message| {
@@ -1583,7 +1598,8 @@ pub fn place_tail_cache_breakpoints(messages: Vec<Value>, tail_slots: usize) -> 
                     // marked block, so a marker placed after this one would
                     // pull the ephemeral block into the cached prefix — the
                     // exact thing that costs 19% of the bill.
-                    if (i == final_message || latest_user_message == Some(i))
+                    if i > 0
+                        && (i == final_message || latest_user_message == Some(i))
                         && is_ephemeral_client_block(block)
                     {
                         sealed = true;
@@ -1623,7 +1639,8 @@ pub fn place_tail_cache_breakpoints(messages: Vec<Value>, tail_slots: usize) -> 
             // positional (a reminder is only withdrawn from the newest
             // message), so a reminder is wrapped like any other string and
             // simply never selected while it is the final message.
-            let final_ephemeral = (i == final_message || latest_user_message == Some(i))
+            let final_ephemeral = i > 0
+                && (i == final_message || latest_user_message == Some(i))
                 && is_ephemeral_client_text(&text);
             let eligible = !text.trim().is_empty() && !is_proactive_expansion_text(&text);
             if eligible {
@@ -5337,17 +5354,47 @@ mod block_shape_tests {
     fn a_reminder_seals_everything_after_it() {
         // Even a later ordinary block must not take the marker: Anthropic
         // caches up to and including it, which would swallow the reminder.
-        let msgs = vec![json!({"role": "user", "content": [
-            {"type": "tool_result", "content": "output"},
-            reminder(),
-            {"type": "text", "text": "trailing"}]})];
+        //
+        // The reminder-bearing message sits at index 1, not 0. Message 0 is
+        // deliberately exempt from sealing — Claude Code's opener begins with a
+        // reminder block, and sealing there stranded the entire message array
+        // outside the cached prefix (see the note in
+        // `place_tail_cache_breakpoints`). This test is about a reminder in the
+        // live TAIL, which is what it always meant.
+        let msgs = vec![
+            text_msg("user", "opener"),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "content": "output"},
+                reminder(),
+                {"type": "text", "text": "trailing"}]}),
+        ];
         let out = normalize_message_cache_control(msgs);
-        let blocks = out[0]["content"].as_array().unwrap();
+        let blocks = out[1]["content"].as_array().unwrap();
         assert!(blocks[0].get("cache_control").is_some());
         assert!(blocks[1].get("cache_control").is_none());
         assert!(
             blocks[2].get("cache_control").is_none(),
             "a block after the reminder must not be the cache target"
+        );
+    }
+
+    /// The production shape that made message 0 an exception, measured
+    /// 2026-08-17. Claude Code's first user message opens with a reminder block
+    /// carrying CLAUDE.md, so sealing on it left nothing in `messages` cacheable
+    /// and 16,971 bytes billed as fresh input where the client billed none.
+    #[test]
+    fn an_opening_reminder_does_not_strand_the_first_turn() {
+        let msgs = vec![
+            json!({"role": "user", "content": [
+                reminder(),
+                {"type": "text", "text": "the actual question"}]}),
+        ];
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 1);
+        assert_eq!(placed, 1, "turn one must still get a breakpoint");
+        let blocks = out[0]["content"].as_array().unwrap();
+        assert!(
+            blocks[1].get("cache_control").is_some(),
+            "the marker belongs on the real question, after the opening reminder"
         );
     }
 
@@ -5357,7 +5404,11 @@ mod block_shape_tests {
         // scaffolding, then an assistant tool-use message ended the request.
         // Caching through the assistant also cached the reminder and caused a
         // 6,434-token rebuild as soon as the client withdrew it.
+        // Indices are shifted by one opener: message 0 is exempt from sealing,
+        // so the shape this test is about — a reminder on the newest user
+        // message, mid-conversation — has to live where it really lives.
         let msgs = vec![
+            text_msg("user", "opener"),
             json!({"role": "user", "content": [
                 {"type": "text", "text": "question"},
                 reminder()]}),
@@ -5366,10 +5417,10 @@ mod block_shape_tests {
         ];
         let (out, placed) = place_tail_cache_breakpoints(msgs, 2);
 
-        assert_eq!(placed, 1);
-        assert!(out[0]["content"][0].get("cache_control").is_some());
-        assert!(out[0]["content"][1].get("cache_control").is_none());
-        assert!(out[1]["content"][0].get("cache_control").is_none());
+        assert_eq!(placed, 2, "the opener and the question are both cacheable");
+        assert!(out[1]["content"][0].get("cache_control").is_some());
+        assert!(out[1]["content"][1].get("cache_control").is_none());
+        assert!(out[2]["content"][0].get("cache_control").is_none());
     }
 
     /// Shipped as a regression on 2026-08-12: 400s on 8% of turns, every one
