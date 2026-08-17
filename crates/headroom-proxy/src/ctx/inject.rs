@@ -50,6 +50,28 @@ const MAX_SNAPSHOT_EVENTS: usize = 200;
 /// Max content-store hits in a fresh recall block.
 const RECALL_LIMIT: usize = 5;
 
+/// Deepest a body may be and still be treated as a conversation's first sight.
+///
+/// The injection goes into `messages[0]`, at the front of every cached prefix, so
+/// introducing one mid-conversation re-creates the whole history. The row-miss
+/// fail-safe below exists to prevent that, but it asks `last_prefix(conv_id)` —
+/// the same key that went missing — so it cannot fire when the key itself
+/// changed. This is the backstop that does not depend on the key.
+///
+/// A genuinely new conversation sends one message, and a compaction-resume sends
+/// its summary plus a caveat block, so anything past a handful of messages is a
+/// lost row rather than a new conversation. Measured 2026-08-17: changing the
+/// conversation-key derivation orphaned two live conversations' rows, and
+/// rebuilding an injection into them at depth 247 and 283 cost 433,366 and
+/// 255,527 tokens of cache creation — together 99% of everything the proxy billed
+/// above an unproxied client over that window.
+///
+/// The cost of being wrong here is a lost resume snapshot on a conversation
+/// resumed with a long history already in it. That is a quality regression on one
+/// turn, not a token cost, and it is the cheaper mistake by three orders of
+/// magnitude.
+const MAX_FIRST_SIGHT_MESSAGES: u64 = 8;
+
 /// A per-conversation injection decision. `Some` = inject these exact bytes;
 /// `None` = inject nothing (fresh with a deliberate no-op, or the row-miss
 /// fail-safe). Cached so the hot path is a single map lookup.
@@ -229,6 +251,21 @@ impl InjectEngine {
                 last_turn = turn_n,
                 current_turn,
                 "injection row missing for a known conversation; injecting nothing (fail-safe)"
+            );
+            return None;
+        }
+
+        // Deep body with no stored decision: the row was lost, not absent. See
+        // [`MAX_FIRST_SIGHT_MESSAGES`] for what building one here costs.
+        if current_turn > MAX_FIRST_SIGHT_MESSAGES {
+            tracing::warn!(
+                event = "ctx_inject_too_deep_for_first_sight",
+                request_id = %request_id,
+                conv = %conv_id,
+                current_turn,
+                limit = MAX_FIRST_SIGHT_MESSAGES,
+                "no stored injection for a conversation this deep; injecting nothing \
+                 rather than rewriting its cached prefix"
             );
             return None;
         }
@@ -545,6 +582,48 @@ mod tests {
             .find(|line| line.contains("ctx_inject_row_miss"))
             .unwrap_or_else(|| panic!("row-miss event missing from:\n{joined}"));
         assert!(event.contains("request_id=req-row-miss"), "{event}");
+    }
+
+    /// A deep body with no stored decision is a lost row, whatever the prefix
+    /// chain says. This is the case the `conv_id`-keyed fail-safe cannot catch,
+    /// because a changed key loses the prefix row too.
+    #[test]
+    fn a_deep_conversation_is_never_a_first_sight() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        // Deeper than MAX_FIRST_SIGHT_MESSAGES, and nothing recorded anywhere:
+        // no injection row, no prefix row. Exactly what a key change leaves.
+        let mut msgs = vec![json!({"role":"user","content":"hi"})];
+        for i in 0..20 {
+            msgs.push(json!({"role":"assistant","content":format!("a{i}")}));
+            msgs.push(json!({"role":"user","content":format!("u{i}")}));
+        }
+        let mut r = json!({"system":"sys","messages": msgs});
+        assert!(
+            !eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()),
+            "injecting into a deep conversation rewrites its whole cached prefix"
+        );
+        assert_eq!(r["messages"][0]["content"], json!("hi"));
+    }
+
+    /// The guard must not cost the compaction-resume feature, whose whole point
+    /// is to inject on the turn right after a compaction — which is shallow.
+    #[test]
+    fn a_shallow_resume_still_injects() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        let mut r = json!({
+            "system":"sys",
+            "messages":[
+                {"role":"user","content":"summary of the prior session"},
+                {"role":"assistant","content":"ok"},
+                {"role":"user","content":"carry on"}
+            ]
+        });
+        assert!(
+            eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()),
+            "a post-compaction turn is shallow and must still get its injection"
+        );
     }
 
     /// The capture observer writes the prefix chain from a detached worker

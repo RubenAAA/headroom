@@ -2189,12 +2189,42 @@ const PERSIST_MAX_AGE: Duration = Duration::from_secs(3600);
 /// the tokens are. This only stops something pathological from filling the disk.
 const PERSIST_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// How long a tracker survives with no turn on it. Past this a turn reports
+/// [`PrefixMiss::IdlePastTtl`] and rebuilds instead of replaying.
+///
+/// # Why one hour, measured 2026-08-17
+///
+/// This was 600 seconds, which is the 5-minute cache tier plus margin. The proxy
+/// forces a **one hour** provider TTL (`--force-1h-cache-ttl`), and reads renew an
+/// entry for free, so between ten and sixty minutes the provider still held a
+/// prefix that this store had already thrown away. Losing the tracker is not a
+/// cheap decline: `frozen_message_count` returns 0 without one, so compression
+/// rewrites the conversation from message 0 and the provider matches nothing.
+///
+/// Two turns in a 142-turn window paid for that — 247 messages deep at 433,366
+/// tokens of creation and 283 deep at 255,527, against roughly 1,000 for a turn
+/// of that depth that replays. Together they were 99% of everything the proxy
+/// billed above what an unproxied client would have on that window.
+///
+/// An earlier measurement priced idle declines at 750 tokens against a 1,648
+/// baseline and concluded this constant was harmless. That sample was 14 shallow
+/// turns; the cost is entirely in deep conversations, so it missed them.
+///
+/// Being wrong in the other direction is cheap: if the provider HAS dropped the
+/// entry, replaying a prefix it no longer holds costs a rewrite, which is exactly
+/// what declining costs. Correctness does not rest on this number either — a
+/// replayed prefix still has to pass `matches_canonical_prefix`.
+///
+/// Kept in step with [`PERSIST_MAX_AGE`], which bounds the same staleness on disk.
+const SESSION_TTL: Duration = Duration::from_secs(3600);
+
 /// Per-session freeze-replay store. Cloneable `Arc<Mutex<…>>` handle like
 /// [`crate::cache_stabilization::drift_detector::DriftState`].
 #[derive(Clone)]
 pub struct SessionReplayStore {
     trackers: Arc<Mutex<LruCache<String, PrefixReplayTracker>>>,
     pending: Arc<Mutex<LruCache<String, PendingTurn>>>,
+    /// How long a tracker survives without a turn. See [`SESSION_TTL`].
     session_ttl: Duration,
     /// Where prefixes are persisted, or `None` to keep everything in memory.
     persist_dir: Option<Arc<std::path::PathBuf>>,
@@ -2221,7 +2251,7 @@ impl SessionReplayStore {
         Self {
             trackers: Arc::new(Mutex::new(LruCache::new(cap))),
             pending: Arc::new(Mutex::new(LruCache::new(pending_cap))),
-            session_ttl: Duration::from_secs(600),
+            session_ttl: SESSION_TTL,
             persist_dir: None,
         }
     }
@@ -3880,9 +3910,9 @@ mod prefix_miss_tests {
         assert_eq!(store.previous_turn_detailed("S"), Ok((orig, fwd)));
     }
 
-    /// An idle gap past the TTL is not a proxy fault — the provider's cache
-    /// (5 minutes) expired well before this store's 10 — so it must be
-    /// distinguishable from a tracker that went missing on a live session.
+    /// An idle gap past the TTL must stay distinguishable from a tracker that
+    /// went missing on a live session — the two have different causes and, as
+    /// [`SESSION_TTL`] records, very different costs.
     #[test]
     fn an_idle_session_is_named_as_ttl_rather_than_missing() {
         let mut store = SessionReplayStore::new(8);
@@ -3893,6 +3923,22 @@ mod prefix_miss_tests {
         assert_eq!(
             store.previous_turn_detailed("S"),
             Err(PrefixMiss::IdlePastTtl)
+        );
+    }
+
+    /// A tracker must outlive the provider's entry, not die before it. Holding a
+    /// prefix for less time than the cache it describes guarantees a rewrite for
+    /// any conversation resumed in the gap — 433,366 tokens on one such turn.
+    #[test]
+    fn a_tracker_outlives_the_cache_entry_it_describes() {
+        assert_eq!(SessionReplayStore::new(8).session_ttl, SESSION_TTL);
+        assert!(
+            SESSION_TTL >= PERSIST_MAX_AGE,
+            "memory must not forget a prefix the disk copy still considers fresh"
+        );
+        assert!(
+            SESSION_TTL >= Duration::from_secs(3600),
+            "the proxy forces a 1h provider TTL; a shorter tracker life is a rewrite"
         );
     }
 
