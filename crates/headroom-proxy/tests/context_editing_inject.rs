@@ -15,7 +15,7 @@ fn injects_clear_tool_uses_into_body_without_context_management() {
         "messages": [{ "role": "user", "content": "hi" }],
     });
 
-    let changed = inject_context_management(&mut body, Some(6), 60_000, None, None);
+    let changed = inject_context_management(&mut body, Some(6), 0, 60_000, None, None);
 
     assert!(changed, "injection must report a modification");
     let edits = body["context_management"]["edits"]
@@ -43,7 +43,7 @@ fn merges_without_clobbering_existing_clear_thinking() {
         }
     });
 
-    let changed = inject_context_management(&mut body, Some(6), 60_000, None, None);
+    let changed = inject_context_management(&mut body, Some(6), 0, 60_000, None, None);
 
     assert!(changed);
     let edits = body["context_management"]["edits"].as_array().unwrap();
@@ -69,11 +69,15 @@ fn overrides_the_keep_all_the_client_sends_for_clear_thinking() {
         }
     });
 
-    let changed = inject_context_management(&mut body, None, 60_000, None, Some(1));
+    let changed = inject_context_management(&mut body, None, 0, 60_000, None, Some(1));
 
     assert!(changed, "overriding a no-op keep is a modification");
     let edits = body["context_management"]["edits"].as_array().unwrap();
-    assert_eq!(edits.len(), 1, "override in place, do not add a second edit");
+    assert_eq!(
+        edits.len(),
+        1,
+        "override in place, do not add a second edit"
+    );
     assert_eq!(
         edits[0]["keep"],
         json!({ "type": "thinking_turns", "value": 1 })
@@ -89,7 +93,7 @@ fn leaves_the_clients_clear_thinking_alone_when_unset() {
         }
     });
 
-    let changed = inject_context_management(&mut body, None, 60_000, None, None);
+    let changed = inject_context_management(&mut body, None, 0, 60_000, None, None);
 
     assert!(!changed);
     assert_eq!(body["context_management"]["edits"][0]["keep"], json!("all"));
@@ -101,7 +105,7 @@ fn clear_thinking_is_listed_first() {
     // append thinking after tool_uses.
     let mut body = json!({ "messages": [] });
 
-    let changed = inject_context_management(&mut body, Some(6), 60_000, None, Some(2));
+    let changed = inject_context_management(&mut body, Some(6), 0, 60_000, None, Some(2));
 
     assert!(changed);
     let edits = body["context_management"]["edits"].as_array().unwrap();
@@ -116,14 +120,14 @@ fn clear_thinking_is_listed_first() {
 #[test]
 fn clear_at_least_is_attached_only_when_set() {
     let mut with = json!({ "messages": [] });
-    inject_context_management(&mut with, Some(6), 60_000, Some(5_000), None);
+    inject_context_management(&mut with, Some(6), 0, 60_000, Some(5_000), None);
     assert_eq!(
         with["context_management"]["edits"][0]["clear_at_least"],
         json!({ "type": "input_tokens", "value": 5_000 })
     );
 
     let mut without = json!({ "messages": [] });
-    inject_context_management(&mut without, Some(6), 60_000, None, None);
+    inject_context_management(&mut without, Some(6), 0, 60_000, None, None);
     assert!(
         without["context_management"]["edits"][0]
             .get("clear_at_least")
@@ -146,9 +150,65 @@ fn an_already_narrowed_clear_thinking_is_left_untouched() {
         }
     });
 
-    let changed = inject_context_management(&mut body, None, 60_000, None, Some(1));
+    let changed = inject_context_management(&mut body, None, 0, 60_000, None, Some(1));
 
     assert!(!changed, "same value is not a modification");
+}
+
+fn body_with_messages(n: usize) -> Value {
+    let msgs: Vec<Value> = (0..n)
+        .map(|i| json!({ "role": if i % 2 == 0 { "user" } else { "assistant" }, "content": "x" }))
+        .collect();
+    json!({ "model": "claude-opus-5", "messages": msgs })
+}
+
+#[test]
+fn a_short_conversation_is_left_alone() {
+    // The first clear re-creates nearly the whole history, ~60 turns to pay
+    // back. A conversation this short would never recover the fee.
+    let mut body = body_with_messages(10);
+
+    let changed = inject_context_management(&mut body, Some(20), 40, 30_000, Some(5_000), None);
+
+    assert!(!changed, "below the gate nothing may be injected");
+    assert!(
+        body.get("context_management").is_none()
+            || body["context_management"]["edits"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+        "no edits array should be left behind: {body}"
+    );
+}
+
+#[test]
+fn a_long_conversation_gets_the_edit() {
+    let mut body = body_with_messages(40);
+
+    let changed = inject_context_management(&mut body, Some(20), 40, 30_000, Some(5_000), None);
+
+    assert!(changed, "at the gate exactly, inject");
+    assert_eq!(
+        body["context_management"]["edits"][0]["type"],
+        json!("clear_tool_uses_20250919")
+    );
+}
+
+#[test]
+fn the_gate_does_not_hold_back_clear_thinking() {
+    // The gate exists for the tool-use entry fee. Thinking clearing has no such
+    // fee, so it must not be caught by the same test.
+    let mut body = body_with_messages(4);
+
+    let changed = inject_context_management(&mut body, Some(20), 40, 30_000, None, Some(1));
+
+    assert!(changed);
+    let edits = body["context_management"]["edits"].as_array().unwrap();
+    assert_eq!(
+        edits.len(),
+        1,
+        "only thinking, and only thinking: {edits:?}"
+    );
+    assert_eq!(edits[0]["type"], json!("clear_thinking_20251015"));
 }
 
 #[test]
@@ -161,7 +221,7 @@ fn does_not_duplicate_an_edit_type_already_present() {
         }
     });
 
-    let changed = inject_context_management(&mut body, Some(6), 60_000, None, None);
+    let changed = inject_context_management(&mut body, Some(6), 0, 60_000, None, None);
 
     let edits = body["context_management"]["edits"].as_array().unwrap();
     let count = edits

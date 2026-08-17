@@ -201,10 +201,7 @@ mod tests {
             "x-anthropic-billing-header: cc_version=2.1.231.ea8; cc_entrypoint=sdk;",
             &cell,
         );
-        let added = pin_header_text(
-            "x-anthropic-billing-header: cc_version=2.1.231.ea8;",
-            &cell,
-        );
+        let added = pin_header_text("x-anthropic-billing-header: cc_version=2.1.231.ea8;", &cell);
         let expected =
             Some("x-anthropic-billing-header: cc_version=2.1.231.ea8; cc_entrypoint=cli;");
         assert_eq!(rewritten.as_deref(), expected);

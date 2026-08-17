@@ -445,7 +445,9 @@ impl ReplaySkipEvidence {
     /// every turn". It was computed and then dropped before reaching the log.
     pub fn first_diff_index(&self) -> Option<usize> {
         match self.reason {
-            ReplaySkip::PrefixContentDiverged { first_diff_index, .. } => Some(first_diff_index),
+            ReplaySkip::PrefixContentDiverged {
+                first_diff_index, ..
+            } => Some(first_diff_index),
             _ => None,
         }
     }
@@ -1192,9 +1194,7 @@ impl UsageObserver {
                         MISS_ATTRIBUTION_PROVIDER,
                         match event_kind {
                             RecacheEventKind::Drift => "prefix_change",
-                            RecacheEventKind::Unexplained | RecacheEventKind::Expected => {
-                                "unknown"
-                            }
+                            RecacheEventKind::Unexplained | RecacheEventKind::Expected => "unknown",
                             RecacheEventKind::Branch => unreachable!("guarded above"),
                         },
                     );
@@ -2302,10 +2302,22 @@ mod prefix_on_recache_event_tests {
 
         tracing::subscriber::with_default(sub, || {
             let obs = UsageObserver::new();
-            obs.begin_request("x1", "conv-unexplained".into(), None, None, Some(fp.clone()));
+            obs.begin_request(
+                "x1",
+                "conv-unexplained".into(),
+                None,
+                None,
+                Some(fp.clone()),
+            );
             obs.complete("x1", 10_000, 46_985, 55_557, None);
             // A confirmed replay with no named cause is what lands on this arm.
-            obs.begin_request("x2", "conv-unexplained".into(), None, None, Some(fp.clone()));
+            obs.begin_request(
+                "x2",
+                "conv-unexplained".into(),
+                None,
+                None,
+                Some(fp.clone()),
+            );
             obs.note_replay_applied("x2", ReplayAppliedEvidence::new(2, 2, 0));
             let class = obs.complete("x2", 9_714, 46_985, 48_669, None);
             assert_eq!(

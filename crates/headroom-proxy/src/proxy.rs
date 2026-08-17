@@ -1635,6 +1635,7 @@ fn maybe_inject_context_management(
     let changed = crate::compression::context_editing::inject_context_management(
         &mut value,
         Some(config.context_edit_keep_tool_uses),
+        config.context_edit_min_messages,
         config.context_edit_trigger_tokens,
         config.context_edit_clear_at_least,
         config.context_edit_keep_thinking,
@@ -1647,6 +1648,7 @@ fn maybe_inject_context_management(
             tracing::info!(
                 request_id = %request_id,
                 keep_tool_uses = config.context_edit_keep_tool_uses,
+                min_messages = config.context_edit_min_messages,
                 trigger_tokens = config.context_edit_trigger_tokens,
                 clear_at_least = ?config.context_edit_clear_at_least,
                 keep_thinking = ?config.context_edit_keep_thinking,
@@ -3628,7 +3630,10 @@ pub(crate) async fn forward_http(
         // tail each time — the hold would then cause the churn it exists to stop.
         let body_to_send = if state.config.hold_working_directory
             && state.config.prefix_replay
-            && matches!(endpoint, compression::CompressibleEndpoint::AnthropicMessages)
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            )
             && !request_session_key.is_empty()
         {
             hold_working_directory(

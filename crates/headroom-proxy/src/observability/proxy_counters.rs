@@ -432,11 +432,7 @@ fn admitted_models() -> &'static std::sync::Mutex<std::collections::HashSet<Stri
 ///
 /// Membership is tested before inserting, never indexed into: admitting
 /// unconditionally would create the very key the cap exists to refuse.
-fn admit_model(
-    admitted: &mut std::collections::HashSet<String>,
-    model: &str,
-    cap: usize,
-) -> bool {
+fn admit_model(admitted: &mut std::collections::HashSet<String>, model: &str, cap: usize) -> bool {
     if admitted.contains(model) {
         return true;
     }
@@ -451,9 +447,7 @@ fn admit_model(
 ///
 /// Warns once, when the cap first trips, rather than on every request past it.
 fn bounded_model(model: &str) -> &str {
-    let mut admitted = admitted_models()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut admitted = admitted_models().lock().unwrap_or_else(|e| e.into_inner());
     if admit_model(&mut admitted, model, MAX_DISTINCT_MODELS) {
         return model;
     }

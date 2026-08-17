@@ -1087,7 +1087,9 @@ pub fn overlay_cached_prefix_reported(
         // divergence is a mid-history deletion: the removed message sits at or
         // after `first_diff_index` and never comes from the stored copy.
         let replay_upto = if continues_chain {
-            first_diff_index.min(prev_fwd.len()).min(optimized_messages.len())
+            first_diff_index
+                .min(prev_fwd.len())
+                .min(optimized_messages.len())
         } else {
             0
         };
@@ -1349,7 +1351,11 @@ pub fn relocate_ephemeral_blocks_reported(messages: Vec<Value>) -> (Vec<Value>, 
         // String content carries reminders inline, and used to pass straight
         // through here — invisible to relocation exactly as it was to the
         // comparison filter.
-        if let Some(text) = msg.get("content").and_then(Value::as_str).map(str::to_owned) {
+        if let Some(text) = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
             let Some((kept, spans)) = split_trailing_ephemeral_spans(&text) else {
                 out.push(msg);
                 continue;
@@ -1514,7 +1520,10 @@ pub fn normalize_message_cache_control(messages: Vec<Value>) -> Vec<Value> {
 /// `tail_slots` is taken as given, `0` included — this function cannot see
 /// `system` or `tools`, so it cannot know how many of Anthropic's four marker
 /// slots are already spoken for. Ask [`tail_slots_within_budget`] first.
-pub fn place_tail_cache_breakpoints(messages: Vec<Value>, tail_slots: usize) -> (Vec<Value>, usize) {
+pub fn place_tail_cache_breakpoints(
+    messages: Vec<Value>,
+    tail_slots: usize,
+) -> (Vec<Value>, usize) {
     #[derive(Clone, Copy)]
     struct CacheTarget {
         message_idx: usize,
@@ -1554,9 +1563,9 @@ pub fn place_tail_cache_breakpoints(messages: Vec<Value>, tail_slots: usize) -> 
     // append-only guard is deliberately blind to reminder churn.
     let mut sealed = false;
     let final_message = messages.len().saturating_sub(1);
-    let latest_user_message = messages.iter().rposition(|message| {
-        message.get("role").and_then(Value::as_str) == Some("user")
-    });
+    let latest_user_message = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
 
     for (i, msg) in messages.into_iter().enumerate() {
         let is_block_content = msg.get("content").map(|c| c.is_array()).unwrap_or(false);
@@ -1621,7 +1630,11 @@ pub fn place_tail_cache_breakpoints(messages: Vec<Value>, tail_slots: usize) -> 
                     });
                 }
             }
-        } else if let Some(text) = msg.get("content").and_then(Value::as_str).map(str::to_owned) {
+        } else if let Some(text) = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
             // String sugar has no block on which to put `cache_control`, so an
             // eligible string is converted to its one-text-block equivalent —
             // every eligible message, not only the one selected this turn.
@@ -2143,10 +2156,7 @@ fn persisted_path(dir: &std::path::Path, session_key: &str) -> std::path::PathBu
 
 /// Read a session's persisted prefix, or `None` if there is none, it is
 /// unreadable, or its last turn is older than [`PERSIST_MAX_AGE`].
-fn read_persisted_prefix(
-    dir: &std::path::Path,
-    session_key: &str,
-) -> Option<PersistedPrefix> {
+fn read_persisted_prefix(dir: &std::path::Path, session_key: &str) -> Option<PersistedPrefix> {
     let bytes = std::fs::read(persisted_path(dir, session_key)).ok()?;
     let snapshot: PersistedPrefix = serde_json::from_slice(&bytes).ok()?;
     if snapshot.forwarded.is_empty() {
@@ -2650,7 +2660,10 @@ mod tests {
             ]}),
             text_msg("assistant", "ok"),
         ];
-        assert!(matches_canonical_prefix(&stored, &canonicalize_slice(&current)));
+        assert!(matches_canonical_prefix(
+            &stored,
+            &canonicalize_slice(&current)
+        ));
     }
 
     #[test]
@@ -2665,7 +2678,10 @@ mod tests {
             json!({"role":"user","content":"do the thing"}),
             text_msg("assistant", "ok"),
         ];
-        assert!(matches_canonical_prefix(&stored, &canonicalize_slice(&current)));
+        assert!(matches_canonical_prefix(
+            &stored,
+            &canonicalize_slice(&current)
+        ));
     }
 
     // Control: the same string→blocks representation change, with the reminder
@@ -2681,7 +2697,10 @@ mod tests {
             ]}),
             text_msg("assistant", "ok"),
         ];
-        assert!(matches_canonical_prefix(&stored, &canonicalize_slice(&current)));
+        assert!(matches_canonical_prefix(
+            &stored,
+            &canonicalize_slice(&current)
+        ));
     }
 
     /// One message, every representation the client sends it in — they must all
@@ -2697,8 +2716,7 @@ mod tests {
     /// seconds later by an 88,606-token `aftershock_of_diverged_prefix`.
     #[test]
     fn every_representation_of_one_message_canonicalizes_alike() {
-        let reference =
-            canonicalize_for_prefix_compare(&json!({"role":"user","content":"Do X"}));
+        let reference = canonicalize_for_prefix_compare(&json!({"role":"user","content":"Do X"}));
         let variants = vec![
             // Embedded in string sugar, with and without a separator.
             json!({"role":"user","content":"Do X\n<system-reminder>foo</system-reminder>"}),
@@ -3121,7 +3139,10 @@ mod tests {
 
         assert_eq!(placed, 1);
         assert_eq!(marked_messages(&out), vec![0]);
-        assert_eq!(out[1], expansion, "the expansion must remain bare and unmarked");
+        assert_eq!(
+            out[1], expansion,
+            "the expansion must remain bare and unmarked"
+        );
     }
 
     #[test]
@@ -3362,12 +3383,7 @@ mod tests {
         let messages = vec![stable, reminder_only];
         let all_forwarded_tokens = estimate_message_tokens(&messages).iter().sum();
 
-        tracker.update_from_response(
-            all_forwarded_tokens,
-            0,
-            &messages,
-            Some(&messages),
-        );
+        tracker.update_from_response(all_forwarded_tokens, 0, &messages, Some(&messages));
 
         assert_eq!(tracker.last_forwarded_messages().len(), 1);
         assert_eq!(
@@ -3458,7 +3474,10 @@ mod tests {
         let (originals, replayed, chain_id) = restarted
             .previous_turn_for(key, &next)
             .expect("the persisted prefix should be found");
-        assert_eq!(replayed, forwarded, "the forwarded bytes come back verbatim");
+        assert_eq!(
+            replayed, forwarded,
+            "the forwarded bytes come back verbatim"
+        );
         assert_eq!(originals, forwarded);
         assert_ne!(chain_id, 0, "and as a real chain, so the splice can run");
     }
@@ -3649,10 +3668,7 @@ mod tests {
                 .iter()
                 .map(|message| {
                     let mut message = message.clone();
-                    if let Some(blocks) = message
-                        .get_mut("content")
-                        .and_then(Value::as_array_mut)
-                    {
+                    if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
                         for block in blocks {
                             if let Some(block) = block.as_object_mut() {
                                 block.remove("cache_control");
@@ -4020,7 +4036,8 @@ mod interleaved_stream_tests {
         assert_eq!(fwd.len(), a1.len());
 
         // And the overlay accepts it, which is the whole point.
-        let (_, skip) = overlay_cached_prefix_reported(a2.clone(), &a2, Some(&orig), Some(&fwd), true);
+        let (_, skip) =
+            overlay_cached_prefix_reported(a2.clone(), &a2, Some(&orig), Some(&fwd), true);
         assert_eq!(skip, None, "A's turn must replay rather than decline");
     }
 
@@ -4064,7 +4081,10 @@ mod interleaved_stream_tests {
         let (_, _, id) = store
             .previous_turn_for("S", &unrelated)
             .expect("the fallback still returns a prefix to report against");
-        assert_eq!(id, 0, "continuing nothing must not borrow another chain's id");
+        assert_eq!(
+            id, 0,
+            "continuing nothing must not borrow another chain's id"
+        );
     }
 
     /// The safety property. A candidate is only ever returned when it
@@ -4142,7 +4162,11 @@ mod interleaved_stream_tests {
             out[..last].iter().all(|m| m == &msg("compressed")),
             "the agreeing run must come from the stored prefix"
         );
-        assert_eq!(out[last..], original[last..], "the edited tail is this turn's own");
+        assert_eq!(
+            out[last..],
+            original[last..],
+            "the edited tail is this turn's own"
+        );
     }
 
     /// Growth on one stream must not accumulate stale copies of itself, or an
@@ -4552,7 +4576,10 @@ mod block_shape_tests {
         );
         let tail = out[2]["content"].as_array().unwrap();
         assert_eq!(tail.len(), 2, "the reminder rides on the newest message");
-        assert!(tail[1]["text"].as_str().unwrap().contains("<system-reminder>"));
+        assert!(tail[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
     }
 
     #[test]
@@ -4593,7 +4620,10 @@ mod block_shape_tests {
         assert_eq!(out[0]["content"][0]["text"], "opener");
         let tail = out[1]["content"].as_array().unwrap();
         assert_eq!(tail.len(), 2, "its reminder rides on the newest message");
-        assert!(tail[1]["text"].as_str().unwrap().contains("<system-reminder>"));
+        assert!(tail[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
     }
 
     /// The property that makes the whole thing work, at message level: history
@@ -4737,8 +4767,15 @@ mod block_shape_tests {
             {"type": "text", "text": "opener<system-reminder>x</system-reminder>"}]});
 
         let (turn_one, report) = relocate_ephemeral_blocks_reported(vec![opener.clone()]);
-        assert_eq!(report.source_indices, vec![0], "the destination is a source");
-        assert_eq!(report.spans_out, report.spans_in, "the span is moved, not lost");
+        assert_eq!(
+            report.source_indices,
+            vec![0],
+            "the destination is a source"
+        );
+        assert_eq!(
+            report.spans_out, report.spans_in,
+            "the span is moved, not lost"
+        );
 
         let (turn_two, _) = relocate_ephemeral_blocks_reported(vec![
             opener,
@@ -4826,7 +4863,8 @@ mod block_shape_tests {
         );
         assert_eq!(assistant_report.spans_in, assistant_report.spans_out);
         assert_eq!(
-            assistant_tail.last().unwrap()["content"][0]["text"], "prefill",
+            assistant_tail.last().unwrap()["content"][0]["text"],
+            "prefill",
             "the trailing assistant message rides along untouched"
         );
     }
@@ -4989,7 +5027,11 @@ mod block_shape_tests {
             1,
             "the whole-block reminder left history"
         );
-        assert_eq!(out[1]["content"], json!("prose"), "the appended one left too");
+        assert_eq!(
+            out[1]["content"],
+            json!("prose"),
+            "the appended one left too"
+        );
         let tail = out[2]["content"].as_array().unwrap();
         assert_eq!(tail.len(), 3, "both ride on the newest message");
         assert!(tail[1]["text"].as_str().unwrap().contains("whole"));
@@ -5274,7 +5316,8 @@ mod block_shape_tests {
         ];
         // Next turn the client has withdrawn the reminder and added two messages.
         let mut turn_n1 = turn_n.clone();
-        turn_n1[2] = json!({"role": "user", "content": [{"type": "tool_result", "content": "out"}]});
+        turn_n1[2] =
+            json!({"role": "user", "content": [{"type": "tool_result", "content": "out"}]});
         turn_n1.push(json!({"role": "assistant", "content": [{"type": "text", "text": "more"}]}));
         turn_n1.push(json!({"role": "user", "content": [{"type": "text", "text": "newest"}]}));
 
@@ -5384,11 +5427,9 @@ mod block_shape_tests {
     /// and 16,971 bytes billed as fresh input where the client billed none.
     #[test]
     fn an_opening_reminder_does_not_strand_the_first_turn() {
-        let msgs = vec![
-            json!({"role": "user", "content": [
+        let msgs = vec![json!({"role": "user", "content": [
                 reminder(),
-                {"type": "text", "text": "the actual question"}]}),
-        ];
+                {"type": "text", "text": "the actual question"}]})];
         let (out, placed) = place_tail_cache_breakpoints(msgs, 1);
         assert_eq!(placed, 1, "turn one must still get a breakpoint");
         let blocks = out[0]["content"].as_array().unwrap();
@@ -5545,7 +5586,9 @@ mod block_shape_tests {
     fn text_kinds_classify_string_content() {
         assert_eq!(text_block_kinds(&json!({"content": "plain"})), "plain");
         assert_eq!(
-            text_block_kinds(&json!({"content": "do the thing\n\n<system-reminder>x</system-reminder>"})),
+            text_block_kinds(
+                &json!({"content": "do the thing\n\n<system-reminder>x</system-reminder>"})
+            ),
             "plain+system-reminder"
         );
         assert_eq!(
@@ -5590,7 +5633,10 @@ mod block_shape_tests {
         let mut prev: Option<(Vec<Value>, Vec<Value>)> = None;
         for turn in 0..4 {
             if let Some(last) = client.last_mut() {
-                let blocks = last.get_mut("content").and_then(Value::as_array_mut).unwrap();
+                let blocks = last
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .unwrap();
                 blocks.retain(|b| !is_ephemeral_client_block(b));
             }
             if turn > 0 {

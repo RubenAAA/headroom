@@ -136,9 +136,7 @@ fn without_cache_control(value: &Value) -> Value {
                 .map(|(key, value)| (key.clone(), without_cache_control(value)))
                 .collect(),
         ),
-        Value::Array(values) => {
-            Value::Array(values.iter().map(without_cache_control).collect())
-        }
+        Value::Array(values) => Value::Array(values.iter().map(without_cache_control).collect()),
         _ => value.clone(),
     }
 }
@@ -233,7 +231,10 @@ async fn replay_preserves_previous_compressed_provider_prefix() {
     // is wrapped to block form so its shape cannot change when the marker
     // moves on; the available tail slot lands on the newest one.
     assert_eq!(fwd2.len(), 3);
-    assert_eq!(fwd2[1]["content"], json!([{"type": "text", "text": "done."}]));
+    assert_eq!(
+        fwd2[1]["content"],
+        json!([{"type": "text", "text": "done."}])
+    );
     assert_eq!(
         fwd2[2]["content"],
         json!([{

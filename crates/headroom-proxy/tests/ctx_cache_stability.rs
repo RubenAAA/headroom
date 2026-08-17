@@ -520,7 +520,9 @@ fn the_stale_window_confines_its_rewrite_to_the_tail() {
     let msgs = v["messages"].as_array().unwrap();
     let last = msgs.len() - 1;
     for (i, m) in msgs.iter().enumerate() {
-        let is_digest = serde_json::to_string(m).unwrap().contains("bytes offloaded");
+        let is_digest = serde_json::to_string(m)
+            .unwrap()
+            .contains("bytes offloaded");
         if is_digest {
             assert!(
                 last - i <= MARGIN + WINDOW,

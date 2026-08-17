@@ -347,9 +347,13 @@ impl OffloadGate {
         let loaded = std::fs::read(gate_path(dir, session))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<PersistedGate>(&bytes).ok())
-            .filter(|g| gate_unix_now().saturating_sub(g.saved_at_unix) <= GATE_PERSIST_MAX_AGE.as_secs());
+            .filter(|g| {
+                gate_unix_now().saturating_sub(g.saved_at_unix) <= GATE_PERSIST_MAX_AGE.as_secs()
+            });
         let restored = loaded.as_ref().map(|g| g.hashes.len()).unwrap_or(0);
-        let set: HashSet<String> = loaded.map(|g| g.hashes.into_iter().collect()).unwrap_or_default();
+        let set: HashSet<String> = loaded
+            .map(|g| g.hashes.into_iter().collect())
+            .unwrap_or_default();
         if let Ok(mut guard) = self.sessions.lock() {
             if !guard.contains(session) {
                 guard.put(session.to_string(), set);
@@ -549,8 +553,8 @@ pub fn offload_anthropic_request(
             let excluded_unless_prior = excluded && !stale;
             // Close enough to the tail that the rewrite it costs is small — see
             // `stale_window`. Deeper than this, a first conversion still waits.
-            let near_tail = config.stale_window > 0
-                && distance < config.stale_margin + config.stale_window;
+            let near_tail =
+                config.stale_window > 0 && distance < config.stale_margin + config.stale_window;
             match offload_tool_result(
                 block,
                 config,
@@ -920,7 +924,11 @@ mod tests {
         let out = offload_anthropic_request(&mut parsed, &excluded_cfg(4), Some(&policy));
         assert_eq!(out.blocks_offloaded, 0, "not on a steady-state turn");
         assert_eq!(out.blocks_deferred, 1, "deferred, not abandoned");
-        assert_eq!(first_tool_result_text(&parsed), body, "prefix bytes unchanged");
+        assert_eq!(
+            first_tool_result_text(&parsed),
+            body,
+            "prefix bytes unchanged"
+        );
     }
 
     /// The other half, and the one that is easy to miss: Claude Code edits its
@@ -1087,7 +1095,10 @@ mod tests {
                 rebuild_boundary: false,
             }),
         );
-        assert_eq!(out.blocks_deferred, 1, "in-memory only: forgotten, deferred");
+        assert_eq!(
+            out.blocks_deferred, 1,
+            "in-memory only: forgotten, deferred"
+        );
     }
 
     /// A session key can carry a credential. It may appear in the filename only
@@ -1112,7 +1123,10 @@ mod tests {
                 !body.contains(secret),
                 "the session key must not appear in the file"
             );
-            assert!(body.contains("deadbeefcafe"), "the hash itself is the payload");
+            assert!(
+                body.contains("deadbeefcafe"),
+                "the hash itself is the payload"
+            );
         }
         assert_eq!(files, 1, "one file per session");
     }
@@ -1173,7 +1187,10 @@ mod tests {
             &window_cfg(4, 4),
             Some(&gate_policy(&gate, true)),
         );
-        assert_eq!(out.blocks_offloaded, 1, "a boundary lets the deep one through");
+        assert_eq!(
+            out.blocks_offloaded, 1,
+            "a boundary lets the deep one through"
+        );
         assert_eq!(out.window_offloads, 0, "too deep to be a window conversion");
         assert_eq!(out.frozen_new_offloads, 1);
     }

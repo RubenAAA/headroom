@@ -149,9 +149,7 @@ fn read_dirs(system: &Value) -> Vec<String> {
         let mut rest = text;
         while let Some(at) = rest.find(MARKER) {
             rest = &rest[at + MARKER.len()..];
-            let end = rest
-                .find(|c: char| c.is_whitespace())
-                .unwrap_or(rest.len());
+            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
             if end > 0 {
                 out.push(rest[..end].to_string());
             }
@@ -175,9 +173,7 @@ fn write_dirs(system: &mut Value, held: &[String]) -> bool {
             let after = at + MARKER.len();
             out.push_str(&rest[..after]);
             rest = &rest[after..];
-            let end = rest
-                .find(|c: char| c.is_whitespace())
-                .unwrap_or(rest.len());
+            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
             match next.next() {
                 Some(value) if end > 0 => out.push_str(value),
                 _ => out.push_str(&rest[..end]),
@@ -216,9 +212,10 @@ fn note_at_tail(body: &mut Value, live: &str, held: &str) {
     };
     // Idempotent: a retried turn must forward the same bytes, and a second note
     // would be a second entry for a prefix the provider already holds.
-    if blocks.iter().any(|block| {
-        block.get("text").and_then(Value::as_str) == Some(text.as_str())
-    }) {
+    if blocks
+        .iter()
+        .any(|block| block.get("text").and_then(Value::as_str) == Some(text.as_str()))
+    {
         return;
     }
     blocks.push(serde_json::json!({"type": "text", "text": text}));
@@ -290,14 +287,23 @@ mod tests {
         pins.hold(&mut body("/repo", "user"), "conv");
 
         let mut b = body("/repo/apps/mobile", "user");
-        assert_eq!(pins.hold(&mut b, "conv").as_deref(), Some("/repo/apps/mobile"));
+        assert_eq!(
+            pins.hold(&mut b, "conv").as_deref(),
+            Some("/repo/apps/mobile")
+        );
         assert_eq!(dirs(&b), vec!["/repo", "/repo"], "both lines held");
 
         let tail = b["messages"][0]["content"].as_array().unwrap();
         assert_eq!(tail.len(), 2, "the live directory is stated once");
         let note = tail[1]["text"].as_str().unwrap();
-        assert!(note.contains("/repo/apps/mobile"), "states the live directory");
-        assert!(note.contains("/repo"), "names the one the preamble still shows");
+        assert!(
+            note.contains("/repo/apps/mobile"),
+            "states the live directory"
+        );
+        assert!(
+            note.contains("/repo"),
+            "names the one the preamble still shows"
+        );
     }
 
     #[test]
@@ -396,7 +402,10 @@ mod tests {
             "messages": [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
         });
         assert_eq!(pins.hold(&mut b, "conv").as_deref(), Some("/moved"));
-        assert_eq!(b["system"].as_str().unwrap(), " - Primary working directory: /repo\n");
+        assert_eq!(
+            b["system"].as_str().unwrap(),
+            " - Primary working directory: /repo\n"
+        );
     }
 
     #[test]

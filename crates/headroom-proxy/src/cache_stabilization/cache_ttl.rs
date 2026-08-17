@@ -312,8 +312,7 @@ mod tests {
         assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(body["system"][1]["cache_control"]["ttl"], "1h");
         assert_eq!(
-            body["messages"][1]["content"][0]["cache_control"]["ttl"],
-            "5m",
+            body["messages"][1]["content"][0]["cache_control"]["ttl"], "5m",
             "the moving tail is what the cheap tier is for"
         );
         assert!(

@@ -397,12 +397,11 @@ fn continuation_thinking(block: &Value) -> bool {
 /// otherwise.
 fn already_streamed(block: &Value, live: &[Value]) -> bool {
     let id = block.get("id").and_then(Value::as_str);
-    live.iter().any(|seen| {
-        match (id, seen.get("id").and_then(Value::as_str)) {
+    live.iter()
+        .any(|seen| match (id, seen.get("id").and_then(Value::as_str)) {
             (Some(a), Some(b)) => a == b,
             _ => seen == block,
-        }
-    })
+        })
 }
 
 /// Why a block from the retrieval continuation must not reach the client.

@@ -417,6 +417,19 @@ pub struct CliArgs {
     #[arg(long = "context-edit-trigger-tokens", default_value_t = 60_000)]
     pub context_edit_trigger_tokens: u64,
 
+    /// `clear_tool_uses`: leave conversations shorter than this many messages
+    /// alone.
+    ///
+    /// The first clear invalidates from the oldest tool result, so it re-creates
+    /// nearly the whole history however `keep` is set — measured at 109,035
+    /// creation tokens against ~1,836 weighted saved per turn, about 60 turns to
+    /// pay back. A conversation that ends before then paid that fee for nothing,
+    /// and the median conversation is 15 turns. This gate is what keeps the
+    /// short ones out of it; it does not improve the payback ratio, which is
+    /// structural.
+    #[arg(long = "context-edit-min-messages", default_value_t = 40)]
+    pub context_edit_min_messages: usize,
+
     /// `clear_tool_uses`: skip the strategy entirely unless it can clear at
     /// least this many tokens. Stops a small clear from buying a full cache
     /// write; below the floor the cached prefix survives untouched.
@@ -823,7 +836,7 @@ pub struct CliArgs {
     #[arg(
         long = "replay-store-dir",
         env = "HEADROOM_PROXY_REPLAY_STORE_DIR",
-        default_value = "",
+        default_value = ""
     )]
     pub replay_store_dir: String,
 
@@ -1747,6 +1760,9 @@ pub struct Config {
     pub context_edit_keep_tool_uses: u64,
     /// `clear_tool_uses`: input-token trigger threshold.
     pub context_edit_trigger_tokens: u64,
+    /// `clear_tool_uses`: leave conversations shorter than this many messages
+    /// alone, so short ones never pay the one-time entry fee.
+    pub context_edit_min_messages: usize,
     /// `clear_tool_uses`: skip the strategy unless it clears at least this many
     /// tokens.
     pub context_edit_clear_at_least: Option<u64>,
@@ -2065,6 +2081,7 @@ impl Config {
             context_edit: args.context_edit,
             context_edit_keep_tool_uses: args.context_edit_keep_tool_uses,
             context_edit_trigger_tokens: args.context_edit_trigger_tokens,
+            context_edit_min_messages: args.context_edit_min_messages,
             context_edit_clear_at_least: args.context_edit_clear_at_least,
             context_edit_keep_thinking: args.context_edit_keep_thinking,
             tool_prune_policy: parse_prune_policy(
@@ -2284,6 +2301,7 @@ impl Config {
             context_edit: false,
             context_edit_keep_tool_uses: 6,
             context_edit_trigger_tokens: 60_000,
+            context_edit_min_messages: 40,
             context_edit_clear_at_least: None,
             context_edit_keep_thinking: None,
             tool_prune_policy: Default::default(),
@@ -2452,7 +2470,11 @@ mod prune_policy_tests {
 
     #[test]
     fn parses_drop_tools_names() {
-        let p = parse_prune_policy(None, None, Some(" ListMcpResourcesTool ,,ReadMcpResourceTool"));
+        let p = parse_prune_policy(
+            None,
+            None,
+            Some(" ListMcpResourcesTool ,,ReadMcpResourceTool"),
+        );
         assert!(p.keep_names.is_empty());
         assert!(p.drop_mcp_servers.is_empty());
         assert_eq!(p.drop_names.len(), 2);

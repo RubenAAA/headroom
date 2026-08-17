@@ -27,13 +27,26 @@ pub const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 ///
 /// See `docs/context-editing-api-facts.md` for the schema and what clearing
 /// costs in cache writes.
+/// `clear_tool_uses_min_messages` leaves short conversations alone. The first
+/// clear invalidates from the *oldest* tool result, so it re-creates nearly the
+/// whole history however `keep` is set — measured at 109,035 creation tokens
+/// against ~1,836 weighted saved per turn, about 60 turns to pay back. A
+/// conversation that ends before then paid that fee for nothing. The gate does
+/// not improve the ratio, which is structural; it only keeps the short ones out.
 pub fn inject_context_management(
     body: &mut Value,
     clear_tool_uses_keep: Option<u64>,
+    clear_tool_uses_min_messages: usize,
     clear_tool_uses_trigger: u64,
     clear_tool_uses_at_least: Option<u64>,
     clear_thinking_keep_turns: Option<u64>,
 ) -> bool {
+    let messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map_or(0, Vec::len);
+    let clear_tool_uses_keep =
+        clear_tool_uses_keep.filter(|_| messages >= clear_tool_uses_min_messages);
     let Some(obj) = body.as_object_mut() else {
         return false;
     };
@@ -56,7 +69,10 @@ pub fn inject_context_management(
     // `clear_thinking` leads the array, per the API's ordering requirement.
     if let Some(turns) = clear_thinking_keep_turns {
         let keep = serde_json::json!({ "type": "thinking_turns", "value": turns });
-        match edits_arr.iter_mut().find(|e| is_family(e, "clear_thinking")) {
+        match edits_arr
+            .iter_mut()
+            .find(|e| is_family(e, "clear_thinking"))
+        {
             Some(existing) => {
                 if existing.get("keep") != Some(&keep) {
                     if let Some(obj) = existing.as_object_mut() {

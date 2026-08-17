@@ -241,7 +241,10 @@ mod tests {
             t("Read"),
         ];
         let policy = PrunePolicy {
-            drop_names: ["ReadMcpResourceTool"].iter().map(|s| s.to_string()).collect(),
+            drop_names: ["ReadMcpResourceTool"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
@@ -286,7 +289,10 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 1, "allowlist decides alone; Bash is the only casualty");
+        assert_eq!(
+            removed, 1,
+            "allowlist decides alone; Bash is the only casualty"
+        );
         assert_eq!(names(&tools), vec!["Read", "ListMcpResourcesTool"]);
     }
 
