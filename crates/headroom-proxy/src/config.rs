@@ -775,6 +775,25 @@ pub struct CliArgs {
     )]
     pub force_1h_cache_ttl: bool,
 
+    /// Split the cache TTL: 1h on the tools and system prefix, 5m on messages.
+    ///
+    /// Takes precedence over `--force-1h-cache-ttl`, which pins everything to
+    /// the 2.0x tier including the moving message tail — content the next turn
+    /// supersedes within seconds, which never needed an hour. See
+    /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`].
+    ///
+    /// Default `false` while the premise is under test: it rests on the
+    /// subscription window charging a 1h write more than a 5m one, which the
+    /// published API prices say and `bench/fit_weights.py` supports but has not
+    /// yet separated with confidence.
+    #[arg(
+        long = "split-cache-ttl",
+        env = "HEADROOM_PROXY_SPLIT_CACHE_TTL",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub split_cache_ttl: bool,
+
     /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
     /// to be offloaded. Static per invariant I3 (never changes mid-session).
     /// Default `50_000` (mirrors context-mode's Read threshold).
@@ -1692,6 +1711,10 @@ pub struct Config {
     pub cache_stable_tool_order: bool,
     /// B1: pin `cache_control.ttl` to `1h`. Non-PAYG only. Default `false`.
     pub force_1h_cache_ttl: bool,
+    /// 1h on the tools and system prefix, 5m on the message tail. Takes
+    /// precedence over `force_1h_cache_ttl`; see
+    /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`].
+    pub split_cache_ttl: bool,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
@@ -1959,6 +1982,7 @@ impl Config {
             strip_system_cache_breakpoints: args.strip_system_cache_breakpoints,
             cache_stable_tool_order: args.cache_stable_tool_order,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
+            split_cache_ttl: args.split_cache_ttl,
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_inject: args.ctx_inject,
@@ -2187,6 +2211,7 @@ impl Config {
             // asserting byte-identical tool arrays; production defaults to on.
             cache_stable_tool_order: false,
             force_1h_cache_ttl: false,
+            split_cache_ttl: false,
             ctx_offload_min_bytes: 50_000,
             ctx_offload_ttl_seconds: 604_800,
             ctx_inject: false,

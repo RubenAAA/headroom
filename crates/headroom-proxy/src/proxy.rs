@@ -1768,20 +1768,25 @@ pub(crate) fn maybe_stabilize_tool_order(
 ///
 /// Forwards the original bytes untouched when there is no marker to change or
 /// on any parse/serialize failure.
-fn maybe_force_1h_cache_ttl(body: bytes::Bytes, request_id: &str) -> bytes::Bytes {
+fn maybe_pin_cache_ttl(body: bytes::Bytes, request_id: &str, split: bool) -> bytes::Bytes {
     let mut value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return body,
     };
-    if !cache_stabilization::cache_ttl::force_1h_ttl(&mut value) {
+    let changed = if split {
+        cache_stabilization::cache_ttl::tail_5m_prefix_1h(&mut value)
+    } else {
+        cache_stabilization::cache_ttl::force_1h_ttl(&mut value)
+    };
+    if !changed {
         return body;
     }
     match serde_json::to_vec(&value) {
         Ok(bytes) => {
             tracing::debug!(
                 request_id = %request_id,
-                event = "force_1h_cache_ttl",
-                "pinned cache_control ttl to 1h"
+                event = if split { "split_cache_ttl" } else { "force_1h_cache_ttl" },
+                "pinned cache_control ttl"
             );
             bytes::Bytes::from(bytes)
         }
@@ -3643,13 +3648,16 @@ pub(crate) async fn forward_http(
         // placed or moved is covered. Skipped on PAYG, where a 1h write is
         // priced 60% above a 5m one and the operator pays the difference in
         // dollars rather than in a token-counted usage window.
-        let body_to_send = if state.config.force_1h_cache_ttl
+        let body_to_send = if (state.config.force_1h_cache_ttl || state.config.split_cache_ttl)
             && auth_mode != AuthMode::Payg
             && matches!(
                 endpoint,
                 compression::CompressibleEndpoint::AnthropicMessages
             ) {
-            maybe_force_1h_cache_ttl(body_to_send, &request_id)
+            // The split takes precedence: pinning the moving message tail to 1h
+            // buys an hour of retention for content the next turn supersedes in
+            // seconds, at 2.0x base input against 5m's 1.25x.
+            maybe_pin_cache_ttl(body_to_send, &request_id, state.config.split_cache_ttl)
         } else {
             body_to_send
         };

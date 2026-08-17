@@ -296,9 +296,10 @@ class CacheSim:
 
         # Longest live cached prefix wins, so search boundaries from the end.
         read_upto = 0
+        read_digest = None
         for boundary, digest in reversed(boundaries):
             if self.entries.get(digest, 0) > now:
-                read_upto = boundary
+                read_upto, read_digest = boundary, digest
                 break
         usage.read_tokens = read_upto
 
@@ -324,6 +325,16 @@ class CacheSim:
         # well past the nominal TTL.
         for _, digest, ttl in breakpoints:
             self.entries[digest] = now + TTL_SECONDS.get(ttl, TTL_SECONDS[DEFAULT_TTL])
+        # "The cache is refreshed for no additional cost each time the cached
+        # content is used." The entry that was read is renewed even when this
+        # turn puts no breakpoint on it, which is the normal case: the client
+        # advances its marker every turn, so the position it hit is never a
+        # marker position now.
+        if read_digest is not None and read_digest not in {d for _, d, _ in breakpoints}:
+            self.entries[read_digest] = max(
+                self.entries.get(read_digest, 0),
+                now + TTL_SECONDS[DEFAULT_TTL],
+            )
         return usage
 
     def evict_expired(self, now: float) -> None:

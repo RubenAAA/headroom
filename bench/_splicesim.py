@@ -169,13 +169,200 @@ def normalize_build_id(body):
     return body
 
 
+def tail_5m_stable_1h(body):
+    """1h on the system/tools prefix, 5m on the moving message tail.
+
+    Nearly every created token is the tail: content this turn appends, written
+    once and superseded by the next turn's marker seconds later. Buying an hour
+    of retention for it costs 2.0x input against the 5-minute tier's 1.25x, and
+    the hour is never claimed. The system and tools prefix is the opposite case
+    — stable for the session, read hundreds of times — so it keeps the long TTL
+    and carries the conversation across an idle gap.
+    """
+    for key in ("system", "tools"):
+        node = body.get(key)
+        if isinstance(node, list):
+            for block in node:
+                if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                    block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                block["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
+    return body
+
+
+def one_tail_marker(body):
+    """Keep only the last message breakpoint — what the client itself sends.
+
+    The proxy places two. The second exists so a miss on the newest entry still
+    finds the one behind it, which mattered when a diverged prefix declined
+    outright; with the splice replaying through a divergence it buys less.
+    """
+    seen = []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                seen.append(block)
+    for block in seen[:-1]:
+        block.pop("cache_control", None)
+    return body
+
+
+for label, mark in (("tail 5m", tail_5m_stable_1h),
+                    ("one tail marker", one_tail_marker)):
+    got = splice_corpus(normalize_build_id, mark)
+    arms[f"splice + normalize + {label}"] = [
+        replace(t, body=got[t.request_id]) for t in turns
+    ]
+
 normalized = splice_corpus(normalize_build_id)
 arms["splice + normalize build id"] = [
     replace(t, body=normalized[t.request_id]) for t in turns
 ]
+
+# Hold the whole system array to the first one each conversation sent. The
+# build id is only the commonest thing that churns in it; a `cd` rewrites the
+# environment block and costs the same conversation-wide re-creation. This
+# prices the ceiling — shipping it needs the changed text delivered somewhere
+# harmless rather than dropped, since the model does need the current directory.
+_first_system = {}
+
+
+def pin_system(body):
+    key = id(body)
+    return body
+
+
+def pinned_arm():
+    scopes = collections.defaultdict(list)
+    for t in turns:
+        scopes[(t.session_key, t.body.get("model"))].append(t)
+    out = {}
+    for _, ts in scopes.items():
+        ts.sort(key=lambda t: t.ts)
+        first = ts[0].body.get("system")
+        first = [b.get("text") for b in first] if isinstance(first, list) else None
+
+        def hold(body, first=first):
+            system = body.get("system")
+            if isinstance(system, list) and first:
+                for i, block in enumerate(system):
+                    if i < len(first) and isinstance(block, dict):
+                        block["text"] = first[i]
+            return body
+
+        got = splice_corpus(hold, one_tail_marker)
+        for t in ts:
+            out[t.request_id] = got[t.request_id]
+    return out
+
+
+def mark_behind_reminders(body):
+    """One breakpoint, sealed before the newest `<system-reminder>`.
+
+    The client hangs these off its newest message and withdraws them a turn or
+    two later — half of the 56,988 reminder tokens in this corpus are taken back
+    by the client itself. Cached, they cost the 1h write rate and then break the
+    prefix when they vanish. Left outside the last breakpoint they bill as fresh
+    input for the one turn they exist, and their withdrawal costs nothing.
+
+    The model sees exactly what the client sent, on every turn. Only where the
+    bytes sit in the cache changes.
+    """
+    messages = body.get("messages") or []
+
+    def has_reminder(message):
+        content = message.get("content")
+        if isinstance(content, str):
+            return "<system-reminder>" in content
+        return any("<system-reminder>" in (b.get("text") or "")
+                   for b in (content or []) if isinstance(b, dict))
+
+    # Only the tail is in play. Old messages keep their reminders in the
+    # replayed prefix, and sealing before one of those would leave the whole
+    # conversation outside the cache — which is what happens if you take the
+    # last reminder in the array rather than the last one in the live window.
+    window = max(0, len(messages) - 3)
+    seal = min((i for i, m in enumerate(messages[window:], start=window)
+                if has_reminder(m)), default=len(messages))
+    strategies._clear_message_markers(body)
+    for message in reversed(messages[:seal] or messages):
+        content = message.get("content")
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        if blocks:
+            blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+            break
+    return body
+
+
+def pinned_arm_marked(mark):
+    scopes = collections.defaultdict(list)
+    for t in turns:
+        scopes[(t.session_key, t.body.get("model"))].append(t)
+    out = {}
+    for _, ts in scopes.items():
+        ts.sort(key=lambda t: t.ts)
+        first = ts[0].body.get("system")
+        first = [b.get("text") for b in first] if isinstance(first, list) else None
+
+        def hold(body, first=first):
+            system = body.get("system")
+            if isinstance(system, list) and first:
+                for i, block in enumerate(system):
+                    if i < len(first) and isinstance(block, dict):
+                        block["text"] = first[i]
+            return body
+
+        got = splice_corpus(hold, mark)
+        for t in ts:
+            out[t.request_id] = got[t.request_id]
+    return out
+
+
+rem = pinned_arm_marked(mark_behind_reminders)
+arms["everything + seal behind reminders"] = [
+    replace(t, body=rem[t.request_id]) for t in turns
+]
+
+held = pinned_arm()
+arms["splice + hold system + 1 marker"] = [
+    replace(t, body=held[t.request_id]) for t in turns
+]
 arms["claude code + normalize"] = [
     replace(t, body=normalize_build_id(copy.deepcopy(t.body))) for t in turns
 ]
+
+def tail_5m_one_marker(body):
+    """One message breakpoint at the tail, asking for the 5-minute tier.
+
+    A 5m write costs 1.25x input against the 1h tier's 2.0x, and every cache
+    read refreshes the entry for free. Turns arrive a median of 9 seconds apart,
+    so the entry is renewed long before it can expire. The whole risk is the 1%
+    of gaps longer than five minutes, where the conversation falls back to the
+    system marker and rewrites its history.
+    """
+    one_tail_marker(body)
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                block["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
+    return body
+
+
+warm = pinned_arm_marked(tail_5m_one_marker)
+arms["everything + 5m tail"] = [replace(t, body=warm[t.request_id]) for t in turns]
+
+# The same arm, scored as if a scheduled refresh kept the 5-minute entries
+# alive across the idle gaps. Anthropic documents the pattern: a `max_tokens: 0`
+# request re-reads the prefix, which renews it at the cache-hit rate. This is
+# the ceiling — it assumes the refresh itself is free, which is only true if
+# reads are.
+KEEP_WARM = dict(arms)
+
 
 gaps = []
 scopes = collections.defaultdict(list)
@@ -201,3 +388,15 @@ for name, arm in arms.items():
     base.setdefault("fit", fit)
     print(f"{name:>26}{total.read_tokens:>13,}{total.create_tokens:>11,}"
           f"{api:>12,.0f}{fit:>12,.0f}{fit / base['fit'] - 1:>+9.1%}")
+
+import cachesim
+
+held_5m = cachesim.TTL_SECONDS["5m"]
+cachesim.TTL_SECONDS["5m"] = cachesim.TTL_SECONDS["1h"]
+for name in ("everything + 5m tail",):
+    total, _ = score_corpus(sorted(arms[name], key=lambda t: t.ts), BPT)
+    fit = total.billed_with(PROFILES["subscription"])
+    api = total.billed_with(PROFILES["api"])
+    print(f"{name + ', kept warm':>26}{total.read_tokens:>13,}{total.create_tokens:>11,}"
+          f"{api:>12,.0f}{fit:>12,.0f}{fit / base['fit'] - 1:>+9.1%}")
+cachesim.TTL_SECONDS["5m"] = held_5m
