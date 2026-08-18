@@ -31,7 +31,9 @@ use super::metric_names::{
     METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL, METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP,
     METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL, METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL_HELP,
     METRIC_PROXY_STREAM_INCOMPLETE_TOTAL, METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP,
-    METRIC_PROXY_UPSTREAM_RETRIES_TOTAL, METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP,
+    METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL,
+    METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL_HELP, METRIC_PROXY_UPSTREAM_RETRIES_TOTAL,
+    METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP,
 };
 
 // ---------- proxy_upstream_retries_total{path,reason} ----------
@@ -81,6 +83,32 @@ pub mod retry_reason {
 /// `sleep`, so the counter and the backoff cannot drift apart.
 pub fn record_upstream_retry(path: &str, reason: &str) {
     upstream_retries_counter(super::prometheus::registry())
+        .with_label_values(&[path, reason])
+        .inc();
+}
+
+// ---------- proxy_upstream_retries_exhausted_total{path,reason} ----------
+
+pub fn upstream_retries_exhausted_counter(registry: &Registry) -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let opts = Opts::new(
+            METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL,
+            METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL_HELP,
+        );
+        let counter = IntCounterVec::new(opts, &[LABEL_PATH, LABEL_REASON])
+            .expect("proxy_upstream_retries_exhausted_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("proxy_upstream_retries_exhausted_total registers exactly once");
+        counter
+    })
+}
+
+/// Count one turn the retry loop could not save. Same label vocabulary as
+/// [`record_upstream_retry`], so the two divide.
+pub fn record_upstream_retry_exhausted(path: &str, reason: &str) {
+    upstream_retries_exhausted_counter(super::prometheus::registry())
         .with_label_values(&[path, reason])
         .inc();
 }

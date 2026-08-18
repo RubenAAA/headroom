@@ -75,7 +75,8 @@ pub use compression_ratio::{
 pub use proxy_metrics::{
     extract_rate_limit_snapshot, extract_unified_rate_limit, record_passthrough_bytes_modified,
     record_rate_limit_snapshot, record_response_status, record_service_tier,
-    record_stream_incomplete, record_unified_rate_limit, record_upstream_retry, retry_reason,
+    record_stream_incomplete, record_unified_rate_limit, record_upstream_retry,
+    record_upstream_retry_exhausted, retry_reason,
     RateLimitSnapshot, UnifiedRateLimitSnapshot, UnifiedWindow,
 };
 pub use recache::observe_recache_event;

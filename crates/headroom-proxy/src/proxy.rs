@@ -4015,11 +4015,22 @@ pub(crate) async fn forward_http(
         } else {
             1
         };
+        // An overload reported inside a 200 body gets its own, longer budget:
+        // it is the one retry here that cannot duplicate output, and the
+        // outages it rides out run tens of seconds rather than a blip. The
+        // loop has to spin far enough for it; every other branch keeps
+        // checking `max_attempts` and falls through when that runs out.
+        let overload_max_attempts = if state.config.retry_enabled {
+            state.config.retry_overload_max_attempts.max(max_attempts)
+        } else {
+            1
+        };
+        let loop_attempts = max_attempts.max(overload_max_attempts);
         let mut last_err: Option<ProxyError> = None;
         {
             let mut result = None;
             let mut attempts_made = 0i64;
-            for attempt in 0..max_attempts {
+            for attempt in 0..loop_attempts {
                 attempts_made = i64::from(attempt + 1);
                 let resp = state
                     .client
@@ -4116,7 +4127,7 @@ pub(crate) async fn forward_http(
                         let mut r = r;
                         let (prefix, leading_error) = peek_leading_sse_error(&mut r).await;
                         if let Some(kind) = leading_error {
-                            if attempt + 1 < max_attempts {
+                            if attempt + 1 < overload_max_attempts {
                                 let base = state.config.retry_base_delay_ms;
                                 let max = state.config.retry_max_delay_ms;
                                 let delay_ms = base.saturating_mul(1u64 << attempt).min(max);
@@ -4124,7 +4135,7 @@ pub(crate) async fn forward_http(
                                     request_id = %request_id,
                                     error_type = %kind,
                                     attempt = attempt + 1,
-                                    max_attempts = max_attempts,
+                                    max_attempts = overload_max_attempts,
                                     delay_ms = delay_ms,
                                     "upstream reported an error inside a 200 stream; retrying"
                                 );
@@ -4139,7 +4150,12 @@ pub(crate) async fn forward_http(
                             tracing::warn!(
                                 request_id = %request_id,
                                 error_type = %kind,
+                                attempts = overload_max_attempts,
                                 "upstream error inside a 200 stream survived every retry"
+                            );
+                            crate::observability::record_upstream_retry_exhausted(
+                                "anthropic",
+                                crate::observability::retry_reason::IN_BAND_SSE,
                             );
                         }
                         result = Some((r, prefix));
@@ -4174,6 +4190,12 @@ pub(crate) async fn forward_http(
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                             last_err = Some(ProxyError::Upstream(e));
                             continue;
+                        }
+                        if is_retryable {
+                            crate::observability::record_upstream_retry_exhausted(
+                                "anthropic",
+                                crate::observability::retry_reason::TRANSPORT,
+                            );
                         }
                         return Err(ProxyError::Upstream(e));
                     }

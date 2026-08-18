@@ -1239,6 +1239,25 @@ pub struct CliArgs {
     )]
     pub retry_max_attempts: u32,
 
+    /// Attempts for a 200 response whose SSE body opens with an error event.
+    /// Default `6`.
+    ///
+    /// Anthropic reports overload inside the body when the client asked for a
+    /// stream, and those outages run far longer than a transport blip: across
+    /// 77 turns the proxy gave up on, the bursts lasted 27 to 245 seconds. At
+    /// three attempts the loop waits about 3 seconds and clears 21% of them.
+    /// Six waits about 31 seconds and clears 69%, which is where the curve
+    /// bends — a seventh attempt doubles the wait for five more points.
+    ///
+    /// Retrying here is free of duplication risk: the error is the *first*
+    /// event, so nothing has been forwarded and the bytes are still ours.
+    #[arg(
+        long = "retry-overload-max-attempts",
+        env = "HEADROOM_RETRY_OVERLOAD_MAX_ATTEMPTS",
+        default_value_t = 6
+    )]
+    pub retry_overload_max_attempts: u32,
+
     /// Base delay for exponential backoff in milliseconds. Default `1000`.
     #[arg(
         long = "retry-base-delay-ms",
@@ -1980,6 +1999,7 @@ pub struct Config {
     pub retry_enabled: bool,
     /// Max retry attempts per upstream call.
     pub retry_max_attempts: u32,
+    pub retry_overload_max_attempts: u32,
     /// Base delay for exponential backoff (ms).
     pub retry_base_delay_ms: u64,
     /// Ceiling on backoff delay (ms).
@@ -2254,6 +2274,7 @@ impl Config {
             ccr_max_retrieval_rounds: args.ccr_max_retrieval_rounds,
             retry_enabled: args.retry_enabled,
             retry_max_attempts: args.retry_max_attempts,
+            retry_overload_max_attempts: args.retry_overload_max_attempts,
             retry_base_delay_ms: args.retry_base_delay_ms,
             retry_max_delay_ms: args.retry_max_delay_ms,
             cost_tracking_enabled: args.cost_tracking_enabled,
@@ -2429,6 +2450,7 @@ impl Config {
             ccr_max_retrieval_rounds: 3,
             retry_enabled: true,
             retry_max_attempts: 3,
+            retry_overload_max_attempts: 6,
             retry_base_delay_ms: 1000,
             retry_max_delay_ms: 30000,
             cost_tracking_enabled: true,

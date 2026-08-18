@@ -360,6 +360,17 @@ pub const METRIC_PROXY_CACHE_BREAKPOINT_SPREAD_TOTAL_HELP: &str =
      refusals are silent, so `applied` against `skipped` is the only way to \
      tell the stage is working from the stage never firing.";
 
+// ---------- proxy_upstream_retries_exhausted_total ----------
+
+pub const METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL: &str =
+    "proxy_upstream_retries_exhausted_total";
+pub const METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL_HELP: &str =
+    "Turns the retry loop gave up on, by path and reason. \
+     `proxy_upstream_retries_total` says retries happened, not whether they \
+     worked — a budget too short for the outage it is riding out looks \
+     healthy there and loses the turn anyway. This is the denominator that \
+     tells the two apart, and every count here is a whole turn lost.";
+
 // ---------- shared label keys ----------
 
 pub const LABEL_PROVIDER: &str = "provider";
