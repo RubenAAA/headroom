@@ -320,6 +320,26 @@ pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL_HELP: &str =
      that made upstream refuse the *following* turn, so a non-zero \
      count next to a rising rejection rate names the cause.";
 
+// ---------- proxy_ccr_retrieval_outcomes_total ----------
+
+pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL: &str = "proxy_ccr_retrieval_outcomes_total";
+pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP: &str =
+    "How each buffered `headroom_retrieve` ended, labelled by outcome. \
+     `continuation` is the normal path: a second upstream call carried the \
+     content back as a tool_result. `spliced_mixed` is a turn that also held \
+     a real client tool call, so the content went in as text instead — that \
+     turn used to lose the retrieval outright. `unresolved` means the model \
+     asked and got nothing, and should stay at zero.";
+
+// ---------- proxy_ccr_continuation_retries_total ----------
+
+pub const METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL: &str =
+    "proxy_ccr_continuation_retries_total";
+pub const METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL_HELP: &str =
+    "Continuation POSTs re-sent after a transport error, a 5xx, or a 429. \
+     Read it against `proxy_ccr_retrieval_outcomes_total`: retries rising \
+     while `unresolved` stays at zero means the backoff is doing its job.";
+
 // ---------- shared label keys ----------
 
 pub const LABEL_PROVIDER: &str = "provider";
@@ -330,6 +350,7 @@ pub const LABEL_TIER: &str = "tier";
 pub const LABEL_STATUS: &str = "status";
 pub const LABEL_WINDOW: &str = "window";
 pub const LABEL_REASON: &str = "reason";
+pub const LABEL_OUTCOME: &str = "outcome";
 
 // ---------- bounded label vocabularies ----------
 

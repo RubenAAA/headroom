@@ -39,6 +39,7 @@
 //! revisit if multi-process aggregation lands.
 
 pub mod cache_hit_rate;
+pub mod ccr_retrieval;
 pub mod ccr_splice;
 pub mod compression_ratio;
 pub mod ctx_metrics;

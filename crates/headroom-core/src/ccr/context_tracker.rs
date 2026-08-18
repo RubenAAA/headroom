@@ -56,7 +56,22 @@ impl Default for ContextTrackerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_tracked_contexts: 100,
+            // Sized against `max_context_age`, because that is how long an
+            // entry can still be recommended: anything older is skipped at
+            // query time, so the cap only has to hold one age window.
+            //
+            // Measured over 870 captured requests across 22 sessions, the
+            // digests referenced inside a 300s window peaked at 91 — against
+            // the old cap of 100. That is why the tracker evicted 3,953 times
+            // in a day, 460 hashes more than once: it was thrashing at the
+            // edge of its own working set. Lifting the tool exclusions makes
+            // roughly 1.8x as many blocks eligible (~164), and this is one
+            // global map shared by every conversation on the box, so a busier
+            // day than the one measured needs room too.
+            //
+            // 512 slots hold ~2.5KB each at the 2000-char sample cap, so about
+            // 1.3MB — small enough that headroom is cheaper than churn.
+            max_tracked_contexts: 512,
             relevance_threshold: 0.3,
             max_context_age: Duration::from_secs(300), // 5 minutes
             proactive_expansion: true,

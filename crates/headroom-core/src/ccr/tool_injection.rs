@@ -284,8 +284,28 @@ pub fn scan_message_for_markers(message: &Value) -> Vec<String> {
 /// Parse a CCR tool call to extract the content hash.
 ///
 /// Returns the hash key, or None if this is not a valid CCR tool call.
-pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
-    let (name, input_data) = match provider {
+/// A rejected hash, trimmed to something safe to put in a log line. The value
+/// is whatever the model emitted, so it is capped and stripped of control
+/// characters rather than logged raw.
+fn loggable_hash(hash: &str) -> String {
+    const MAX: usize = 64;
+    let cleaned: String = hash
+        .chars()
+        .take(MAX)
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect();
+    if hash.chars().count() > MAX {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
+}
+
+/// Split a provider-shaped tool call into its name and input object. Shared by
+/// the strict parse and the raw-hash probe so the two agree on what counts as a
+/// CCR call.
+fn name_and_input<'a>(tool_call: &'a Value, provider: &str) -> Option<(&'a str, Value)> {
+    let pair = match provider {
         "anthropic" => {
             let name = tool_call.get("name")?.as_str()?;
             let input = tool_call.get("input").cloned().unwrap_or(json!({}));
@@ -330,6 +350,35 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
         }
     };
 
+    Some(pair)
+}
+
+/// The `hash` argument of a `headroom_retrieve` call exactly as the model sent
+/// it, with no validation. `None` means the call is not CCR at all.
+///
+/// Callers need this to tell a malformed retrieval apart from an ordinary
+/// client tool call. The client never declared `headroom_retrieve`, so handing
+/// one back unanswered leaves an orphaned `tool_use` that nothing resolves.
+pub fn raw_ccr_hash(tool_call: &Value, provider: &str) -> Option<String> {
+    let (name, input_data) = name_and_input(tool_call, provider)?;
+    if name != CCR_TOOL_NAME {
+        return None;
+    }
+    Some(
+        input_data
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Parse a CCR tool call to extract the content hash.
+///
+/// Returns the hash key, or None if this is not a valid CCR tool call.
+pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
+    let (name, input_data) = name_and_input(tool_call, provider)?;
+
     if name != CCR_TOOL_NAME {
         return None;
     }
@@ -344,6 +393,7 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
         tracing::warn!(
             provider,
             hash_len = hash_key.len(),
+            hash = %loggable_hash(hash_key),
             "CCR tool call has an invalid hash length"
         );
         return None;
@@ -352,6 +402,7 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
         tracing::warn!(
             provider,
             hash_len = hash_key.len(),
+            hash = %loggable_hash(hash_key),
             "CCR tool call has a non-hex hash"
         );
         return None;

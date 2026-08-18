@@ -8,9 +8,9 @@
 
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use super::tool_injection::{parse_tool_call, CCR_TOOL_NAME};
+use super::tool_injection::{parse_tool_call, raw_ccr_hash, CCR_TOOL_NAME};
 
 // ─── Residual-CCR classification ─────────────────────────────────────────
 //
@@ -195,6 +195,53 @@ impl CCRResponseHandler {
         }
     }
 
+    /// Answer resolved `headroom_retrieve` calls in place, as text.
+    ///
+    /// A turn that mixes a CCR call with a real client tool call cannot be
+    /// continued: appending the assistant message upstream would leave the
+    /// client's tool_use unanswered. Skipping the retrieval instead loses it
+    /// silently — the buffered path hands the client a tool_use for a tool it
+    /// never declared, the streamed path drops the block, and either way the
+    /// model asked for content and got nothing back.
+    ///
+    /// Splicing the content in as a text block answers the model while leaving
+    /// the real tool call untouched for the client. The content reads as
+    /// assistant prose rather than a tool result, which is the price of not
+    /// having a turn to put a tool_result in.
+    ///
+    /// Anthropic shape only. Other providers keep the old hand-back: their
+    /// content arrays are not laid out this way and this path has never run
+    /// against them. Returns how many blocks were replaced.
+    pub fn splice_ccr_results_as_text(
+        &self,
+        response: &mut Value,
+        results: &[CcrToolResult],
+        provider: &str,
+    ) -> usize {
+        if provider != "anthropic" {
+            return 0;
+        }
+        let Some(blocks) = response.get_mut("content").and_then(Value::as_array_mut) else {
+            return 0;
+        };
+        let mut spliced = 0;
+        for block in blocks.iter_mut() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+            let Some(result) = results.iter().find(|r| r.tool_call_id == id) else {
+                continue;
+            };
+            *block = json!({
+                "type": "text",
+                "text": format!("<retrieved_context>\n{}\n</retrieved_context>", result.content),
+            });
+            spliced += 1;
+        }
+        spliced
+    }
+
     /// Parse CCR tool calls, separating them from other tool calls.
     pub fn parse_ccr_tool_calls(
         &self,
@@ -206,7 +253,15 @@ impl CCRResponseHandler {
         let mut other_calls = Vec::new();
 
         for tc in all_tool_calls {
-            if let Some(hash_key) = parse_tool_call(&tc, provider) {
+            // A `headroom_retrieve` call whose hash does not validate still has
+            // to be answered. The client never declared the tool, so pushing it
+            // to `other_calls` would hand back a `tool_use` nothing can resolve
+            // and report the turn as cleanly resolved. Keep it on the CCR side
+            // with the hash as sent; the store lookup misses and the model gets
+            // an error result it can act on.
+            let ccr_hash =
+                parse_tool_call(&tc, provider).or_else(|| raw_ccr_hash(&tc, provider));
+            if let Some(hash_key) = ccr_hash {
                 let tool_call_id = if provider == "google" {
                     tc.get("functionCall")
                         .and_then(|fc| fc.get("name"))
@@ -1009,6 +1064,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_ccr_tool_calls_keeps_malformed_hash_on_the_ccr_side() {
+        // 25 chars — one over the valid 24. Observed in production, where it
+        // was handed back to the client as an unanswerable tool_use.
+        let response = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "tu_bad", "name": CCR_TOOL_NAME,
+                 "input": {"hash": "abc123def456abc123def4567"}}
+            ]
+        });
+        let handler = CCRResponseHandler::new(None);
+        let (ccr, other) = handler.parse_ccr_tool_calls(&response, "anthropic");
+        assert_eq!(ccr.len(), 1, "malformed retrieval must still be answered");
+        assert_eq!(ccr[0].hash_key, "abc123def456abc123def4567");
+        assert_eq!(ccr[0].tool_call_id, "tu_bad");
+        assert!(other.is_empty(), "must not look like a client tool call");
+    }
+
+    #[test]
+    fn parse_ccr_tool_calls_keeps_missing_hash_on_the_ccr_side() {
+        let response = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "tu_bad", "name": CCR_TOOL_NAME, "input": {}}
+            ]
+        });
+        let handler = CCRResponseHandler::new(None);
+        let (ccr, other) = handler.parse_ccr_tool_calls(&response, "anthropic");
+        assert_eq!(ccr.len(), 1);
+        assert_eq!(ccr[0].hash_key, "");
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn residual_ccr_status_reports_malformed_hash_as_error() {
+        let response = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "tu_bad", "name": CCR_TOOL_NAME,
+                 "input": {"hash": "abc123def456abc123def4567"}}
+            ]
+        });
+        let handler = CCRResponseHandler::new(None);
+        assert_eq!(
+            handler.residual_ccr_status(&response, "anthropic"),
+            RESIDUAL_CCR_ERROR
+        );
+    }
+
+    #[test]
     fn parse_ccr_tool_calls_none() {
         let response = serde_json::json!({
             "content": [{"type": "text", "text": "no tools here"}]
@@ -1386,5 +1488,75 @@ mod tests {
         assert_eq!(RESIDUAL_CCR_RESOLVED, "resolved");
         assert_eq!(RESIDUAL_CCR_SKIPPED_MIXED, "skipped_mixed_tools");
         assert_eq!(RESIDUAL_CCR_ERROR, "error");
+    }
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::*;
+
+    fn retrieve_block(id: &str) -> Value {
+        json!({"type": "tool_use", "id": id, "name": CCR_TOOL_NAME,
+               "input": {"hash": "aaaaaaaaaaaaaaaaaaaaaaaa"}})
+    }
+
+    fn result(id: &str, content: &str) -> CcrToolResult {
+        CcrToolResult {
+            tool_call_id: id.to_string(),
+            content: content.to_string(),
+            success: true,
+            items_retrieved: 1,
+        }
+    }
+
+    #[test]
+    fn splicing_answers_the_retrieval_and_leaves_the_client_tool_alone() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response = json!({"content": [
+            retrieve_block("toolu_1"),
+            {"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {"command": "ls"}},
+        ]});
+
+        let spliced = handler.splice_ccr_results_as_text(
+            &mut response,
+            &[result("toolu_1", "the original bytes")],
+            "anthropic",
+        );
+
+        assert_eq!(spliced, 1);
+        let blocks = response["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0]["text"].as_str().unwrap().contains("the original bytes"));
+        // The client's own call has to survive untouched, or we have traded one
+        // unanswerable tool_use for another.
+        assert_eq!(blocks[1]["name"], "Bash");
+        // Nothing is left for the client to resolve that it cannot.
+        assert_eq!(
+            handler.residual_ccr_status(&response, "anthropic"),
+            RESIDUAL_CCR_RESOLVED
+        );
+    }
+
+    #[test]
+    fn a_retrieve_with_no_matching_result_is_left_for_the_caller_to_report() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response = json!({"content": [retrieve_block("toolu_1")]});
+        let spliced =
+            handler.splice_ccr_results_as_text(&mut response, &[result("other", "x")], "anthropic");
+        assert_eq!(spliced, 0);
+        assert_eq!(response["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn other_providers_keep_the_old_hand_back() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response = json!({"content": [retrieve_block("toolu_1")]});
+        let spliced = handler.splice_ccr_results_as_text(
+            &mut response,
+            &[result("toolu_1", "bytes")],
+            "openai",
+        );
+        assert_eq!(spliced, 0);
+        assert_eq!(response["content"][0]["type"], "tool_use");
     }
 }

@@ -214,6 +214,12 @@ const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 /// Mirrors Python's `MAX_MESSAGE_ARRAY_LENGTH = 10_000`.
 const MAX_MESSAGE_ARRAY_LENGTH: usize = 10_000;
 
+/// Extra attempts for a CCR continuation before giving up on the retrieval.
+/// The content is already fetched by this point, so the only thing a failure
+/// costs is the model's answer; three attempts covers the overload bursts that
+/// produced every observed continuation failure.
+const CCR_CONTINUATION_RETRIES: u32 = 2;
+
 impl AppState {
     /// The CCR store, when offload is configured and `--ccr-inject-marker` is on.
     ///
@@ -7099,18 +7105,6 @@ pub(crate) async fn handle_ccr_response(
             break;
         }
 
-        // If there are mixed CCR + real tool calls, we can't fabricate
-        // results for the real tools — return as-is.
-        if !other_calls.is_empty() {
-            tracing::info!(
-                request_id = %request_id,
-                ccr_count = ccr_calls.len(),
-                other_count = other_calls.len(),
-                "ccr: mixed CCR and real tool calls; cannot auto-resolve"
-            );
-            break;
-        }
-
         // Fetch original content for each CCR call.
         let mut results: Vec<CcrToolResult> = Vec::new();
         for call in &ccr_calls {
@@ -7170,6 +7164,29 @@ pub(crate) async fn handle_ccr_response(
             }
         }
 
+        // Mixed CCR + real tool calls. The continuation cannot run: appending
+        // the assistant message would leave the client's tool_use unanswered
+        // upstream. Skipping used to drop the retrieval with it, so the model
+        // asked for content and got nothing — silently on the streamed path,
+        // and as a tool_use for a tool it never declared on the buffered one.
+        // Answer it in place and let the real tool call go back to the client.
+        if !other_calls.is_empty() {
+            let spliced =
+                handler.splice_ccr_results_as_text(&mut current_response, &results, provider);
+            tracing::info!(
+                request_id = %request_id,
+                ccr_count = ccr_calls.len(),
+                other_count = other_calls.len(),
+                spliced = spliced,
+                "ccr: mixed CCR and real tool calls; answered the retrieval in place"
+            );
+            crate::observability::ccr_retrieval::observe_outcome(
+                crate::observability::ccr_retrieval::OUTCOME_SPLICED_MIXED,
+                spliced as u64,
+            );
+            break;
+        }
+
         // Build continuation messages: append assistant message + tool results.
         //
         // Some providers return sentinel-keyed shapes (a wrapper dict holding a
@@ -7220,17 +7237,58 @@ pub(crate) async fn handle_ccr_response(
             "ccr: sending continuation request"
         );
 
-        let resp = match client
-            .post(upstream_url.clone())
-            .headers(outgoing_headers.clone())
-            .body(continuation_body)
-            .send()
-            .await
-        {
+        // A continuation that fails is not a soft outcome: the retrieval is
+        // already parsed and the content already fetched, and giving up here
+        // leaves the model with an unanswered `headroom_retrieve`. Overload
+        // and transport blips are exactly what the retry is for; a 4xx is the
+        // request itself being wrong, so retrying it would only burn quota.
+        let mut attempt = 0;
+        let resp = loop {
+            let body = continuation_body.clone();
+            let outcome = client
+                .post(upstream_url.clone())
+                .headers(outgoing_headers.clone())
+                .body(body)
+                .send()
+                .await;
+            let retryable = match &outcome {
+                Err(_) => true,
+                Ok(r) => {
+                    let s = r.status();
+                    s.is_server_error() || s == reqwest::StatusCode::TOO_MANY_REQUESTS
+                }
+            };
+            if !retryable || attempt >= CCR_CONTINUATION_RETRIES {
+                break outcome;
+            }
+            attempt += 1;
+            let backoff = std::time::Duration::from_millis(250 << (attempt - 1));
+            match &outcome {
+                Err(e) => tracing::warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "ccr: continuation transport error; retrying"
+                ),
+                Ok(r) => tracing::warn!(
+                    request_id = %request_id,
+                    status = %r.status(),
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "ccr: continuation rejected upstream; retrying"
+                ),
+            }
+            crate::observability::ccr_retrieval::observe_continuation_retry();
+            tokio::time::sleep(backoff).await;
+        };
+
+        let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
                     request_id = %request_id,
+                    attempts = attempt + 1,
                     error = %e,
                     "ccr: upstream request failed during continuation"
                 );
@@ -7241,6 +7299,7 @@ pub(crate) async fn handle_ccr_response(
         if !resp.status().is_success() {
             tracing::warn!(
                 request_id = %request_id,
+                attempts = attempt + 1,
                 status = %resp.status(),
                 "ccr: upstream returned error during continuation"
             );
@@ -7277,26 +7336,45 @@ pub(crate) async fn handle_ccr_response(
     }
 
     // Classify the outcome before returning. Only claim success when no
-    // `headroom_retrieve` remains: on an intentional mixed-tool skip (#839) the
-    // response still carries one for the CLIENT to resolve, and logging
-    // "handled successfully" there would misreport correct behaviour as a clean
-    // resolution. A retrieve left with no client tool call is a genuine failure.
+    // `headroom_retrieve` remains; a retrieve left standing is a real failure.
     match handler.residual_ccr_status(&current_response, provider) {
         headroom_core::ccr::response_handler::RESIDUAL_CCR_RESOLVED => {
             tracing::info!(request_id = %request_id, "ccr: retrieval handled successfully");
-        }
-        headroom_core::ccr::response_handler::RESIDUAL_CCR_SKIPPED_MIXED => {
-            tracing::info!(
-                request_id = %request_id,
-                "ccr: skipped retrieval — headroom_retrieve returned alongside a \
-                 client tool for the client to resolve"
+            crate::observability::ccr_retrieval::observe_outcome(
+                crate::observability::ccr_retrieval::OUTCOME_CONTINUATION,
+                1,
             );
         }
         status => {
+            // Whatever is left cannot be answered: out of rounds, upstream
+            // refused every attempt, or a provider shape this path cannot
+            // splice. Do not hand it back as a `tool_use` — the client never
+            // declared `headroom_retrieve` and cannot resolve it, so the turn
+            // ends on a call nothing will ever answer. Say so in the turn
+            // instead, which is what the streamed path already does.
+            let (residual, _) = handler.parse_ccr_tool_calls(&current_response, provider);
+            let notes: Vec<_> = residual
+                .iter()
+                .map(|call| headroom_core::ccr::response_handler::CcrToolResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    content: "The proxy could not complete a context retrieval for this turn."
+                        .to_string(),
+                    success: false,
+                    items_retrieved: 0,
+                })
+                .collect();
+            let spliced =
+                handler.splice_ccr_results_as_text(&mut current_response, &notes, provider);
             tracing::warn!(
                 request_id = %request_id,
                 status = %status,
+                residual = residual.len(),
+                spliced = spliced,
                 "ccr: headroom_retrieve remains unresolved with no client tool call"
+            );
+            crate::observability::ccr_retrieval::observe_outcome(
+                crate::observability::ccr_retrieval::OUTCOME_UNRESOLVED,
+                residual.len().max(1) as u64,
             );
         }
     }
