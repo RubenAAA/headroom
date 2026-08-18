@@ -1868,6 +1868,31 @@ pub(crate) fn maybe_stabilize_tool_order(
 ///
 /// Forwards the original bytes untouched when there is no marker to change or
 /// on any parse/serialize failure.
+/// Put the message breakpoint on the last content block. See
+/// [`cache_stabilization::message_breakpoints`] for the measurement.
+fn maybe_push_tail_breakpoint(body: bytes::Bytes, request_id: &str) -> bytes::Bytes {
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    if !cache_stabilization::message_breakpoints::push_marker_to_tail(&mut value) {
+        crate::observability::tail_breakpoint::observe(false);
+        return body;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            crate::observability::tail_breakpoint::observe(true);
+            tracing::debug!(
+                request_id = %request_id,
+                event = "cache_tail_breakpoint",
+                "moved the message breakpoint to the tail"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
 fn maybe_pin_cache_ttl(body: bytes::Bytes, request_id: &str, split: bool) -> bytes::Bytes {
     let mut value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -3823,6 +3848,18 @@ pub(crate) async fn forward_http(
                 &request_session_key,
                 &request_id,
             )
+        } else {
+            body_to_send
+        };
+
+        // Tail breakpoint. Before the TTL pin, so the moved marker is one of
+        // the markers that pin covers.
+        let body_to_send = if state.config.cache_tail_breakpoint
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            ) {
+            maybe_push_tail_breakpoint(body_to_send, &request_id)
         } else {
             body_to_send
         };

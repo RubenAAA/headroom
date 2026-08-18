@@ -805,6 +805,21 @@ pub struct CliArgs {
     )]
     pub force_1h_cache_ttl: bool,
 
+    /// Move Claude Code's single message breakpoint onto the last content
+    /// block when it sits short of it.
+    ///
+    /// Default `true`. A no-op on the 97% of captured requests where the
+    /// client already placed it there, and worth -0.9% of the bill under API
+    /// weights and -3.5% under subscription weights on the rest. See
+    /// [`crate::cache_stabilization::message_breakpoints`].
+    #[arg(
+        long = "cache-tail-breakpoint",
+        env = "HEADROOM_PROXY_CACHE_TAIL_BREAKPOINT",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub cache_tail_breakpoint: bool,
+
     /// Split the cache TTL: 1h on the tools and system prefix, 5m on messages.
     ///
     /// Takes precedence over `--force-1h-cache-ttl`, which pins everything to
@@ -1844,6 +1859,7 @@ pub struct Config {
     /// 1h on the tools and system prefix, 5m on the message tail. Takes
     /// precedence over `force_1h_cache_ttl`; see
     /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`].
+    pub cache_tail_breakpoint: bool,
     pub split_cache_ttl: bool,
     /// Hold each conversation's working-directory line in `system` still, and
     /// state the live one at the message tail. See
@@ -2128,6 +2144,7 @@ impl Config {
             cache_stable_tool_order: args.cache_stable_tool_order,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
+            cache_tail_breakpoint: args.cache_tail_breakpoint,
             hold_working_directory: args.hold_working_directory,
             replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
@@ -2363,6 +2380,7 @@ impl Config {
             cache_stable_tool_order: false,
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
+            cache_tail_breakpoint: false,
             hold_working_directory: false,
             replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,

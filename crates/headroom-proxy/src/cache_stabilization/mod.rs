@@ -89,6 +89,7 @@ pub mod billing_header;
 pub mod cache_ttl;
 pub mod capture;
 pub mod drift_detector;
+pub mod message_breakpoints;
 pub mod openai_cache_key;
 pub mod prefix_replay;
 pub mod tool_def_normalize;

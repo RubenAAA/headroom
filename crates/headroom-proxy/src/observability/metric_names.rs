@@ -340,6 +340,16 @@ pub const METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL_HELP: &str =
      Read it against `proxy_ccr_retrieval_outcomes_total`: retries rising \
      while `unresolved` stays at zero means the backoff is doing its job.";
 
+// ---------- proxy_cache_tail_breakpoint_total ----------
+
+pub const METRIC_PROXY_CACHE_BREAKPOINT_SPREAD_TOTAL: &str =
+    "proxy_cache_tail_breakpoint_total";
+pub const METRIC_PROXY_CACHE_BREAKPOINT_SPREAD_TOTAL_HELP: &str =
+    "Anthropic requests the tail-breakpoint stage looked at, labelled by \
+     whether it moved the message marker. Most requests need no move and the \
+     refusals are silent, so `applied` against `skipped` is the only way to \
+     tell the stage is working from the stage never firing.";
+
 // ---------- shared label keys ----------
 
 pub const LABEL_PROVIDER: &str = "provider";
