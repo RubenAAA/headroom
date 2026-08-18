@@ -343,7 +343,6 @@ impl AppState {
                         Ok(store) => Some(CtxOffloadRuntime {
                             config: crate::compression::ctx_offload::CtxOffloadConfig {
                                 min_bytes: config.ctx_offload_min_bytes,
-                                exclude_tools: config.exclude_tools.clone(),
                                 stale_margin: config.ctx_offload_stale_messages,
                                 stale_window: config.ctx_offload_stale_window,
                             },

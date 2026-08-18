@@ -5651,7 +5651,6 @@ mod tests {
         });
         let cfg = crate::compression::ctx_offload::CtxOffloadConfig {
             min_bytes: 50_000,
-            exclude_tools: Vec::new(),
             stale_margin: 0,
             stale_window: 0,
         };

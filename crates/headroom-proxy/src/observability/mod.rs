@@ -43,6 +43,7 @@ pub mod ccr_retrieval;
 pub mod ccr_splice;
 pub mod compression_ratio;
 pub mod ctx_metrics;
+pub mod ctx_offload_by_tool;
 pub mod metric_names;
 pub mod prometheus;
 pub mod proxy_counters;

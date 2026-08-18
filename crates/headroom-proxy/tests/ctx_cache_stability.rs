@@ -33,7 +33,6 @@ const MIN_BYTES: usize = 2_000;
 fn cfg() -> CtxOffloadConfig {
     CtxOffloadConfig {
         min_bytes: MIN_BYTES,
-        exclude_tools: Vec::new(),
         stale_margin: 0,
         stale_window: 0,
     }
@@ -366,15 +365,15 @@ fn a_stale_margin_never_rewrites_a_settled_prefix() {
 
     let stale_cfg = CtxOffloadConfig {
         min_bytes: MIN_BYTES,
-        exclude_tools: vec!["Read".to_string()],
         stale_margin: 4,
         // Zero: this test is about the boundary gate on its own. The window is
         // allowed to rewrite the tail, and does so in
         // `the_stale_window_confines_its_rewrite_to_the_tail`.
         stale_window: 0,
     };
-    // A conversation of excluded-tool results, so nothing would offload at all
-    // were it not for the margin.
+    // A conversation of Read results — the tool the offload stage stopped
+    // excluding — so every block here is a conversion candidate and the
+    // boundary gate is the only thing deciding when it lands.
     let mut history: Vec<Value> = vec![json!({"role":"user","content":"start the task"})];
     let mut snapshots = Vec::new();
     for t in 0..12 {
@@ -449,7 +448,6 @@ fn the_stale_window_confines_its_rewrite_to_the_tail() {
     const WINDOW: usize = 4;
     let cfg = CtxOffloadConfig {
         min_bytes: MIN_BYTES,
-        exclude_tools: vec!["Read".to_string()],
         stale_margin: MARGIN,
         stale_window: WINDOW,
     };
@@ -482,22 +480,25 @@ fn the_stale_window_confines_its_rewrite_to_the_tail() {
         v
     };
 
-    // Turn by turn, a block converts the moment it crosses the margin, which is
-    // always near the tail — so a continuous conversation cannot break the bound
-    // and this half only checks the window is doing something at all.
-    let mut converted = 0;
+    // Every block now converts on the turn it arrives, at distance 0 or 1,
+    // so the shared prefix between consecutive turns never changes. That is
+    // the bound holding perfectly rather than the window sitting inert, and
+    // the two look identical from a byte diff — so check the conversions
+    // directly and the prefix separately.
     let mut prev = message_bytes(&run(&snapshots[0]));
     for messages in snapshots.iter().skip(1) {
-        let next = message_bytes(&run(messages));
-        if prev.iter().zip(next.iter()).any(|(a, b)| a != b) {
-            converted += 1;
-        }
+        let converted = run(messages);
+        assert!(
+            serde_json::to_string(&converted).unwrap().contains("<<ctx:"),
+            "the window converted nothing; it would be inert"
+        );
+        let next = message_bytes(&converted);
+        assert!(
+            prev.iter().zip(next.iter()).all(|(a, b)| a == b),
+            "a turn rewrote the prefix it shares with the turn before it"
+        );
         prev = next;
     }
-    assert!(
-        converted > 0,
-        "the window converted nothing over 14 turns; it would be inert"
-    );
 
     // The case that can break the bound: a block first seen while ALREADY deep.
     // That is a restart or a resume — the gate is in memory, so after one the

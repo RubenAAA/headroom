@@ -256,6 +256,16 @@ pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL_HELP: &str =
     "CTX-5/6: count of tool_result blocks offloaded (replaced with a \
      deterministic digest) across all requests.";
 
+// ---------- ctx_offloaded_blocks_by_tool_total ----------
+
+pub const METRIC_CTX_OFFLOADED_BLOCKS_BY_TOOL_TOTAL: &str = "ctx_offloaded_blocks_by_tool_total";
+pub const METRIC_CTX_OFFLOADED_BLOCKS_BY_TOOL_TOTAL_HELP: &str =
+    "CTX-5/6: offloaded tool_result blocks broken down by the tool that \
+     produced them. `ctx_offloaded_blocks_total` cannot show whether the \
+     file and search results converted or only Bash output did. The tool \
+     label comes from the request body and is collapsed onto a fixed \
+     allowlist plus `other`, so its cardinality is bounded.";
+
 // ---------- ctx_recall_injections_total ----------
 
 pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL: &str = "ctx_recall_injections_total";
@@ -361,6 +371,7 @@ pub const LABEL_STATUS: &str = "status";
 pub const LABEL_WINDOW: &str = "window";
 pub const LABEL_REASON: &str = "reason";
 pub const LABEL_OUTCOME: &str = "outcome";
+pub const LABEL_TOOL: &str = "tool";
 
 // ---------- bounded label vocabularies ----------
 
