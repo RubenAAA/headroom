@@ -80,6 +80,11 @@ const fn per_1m_ttl(
 /// `claude-sonnet-4` entry, and shorter family keys (`claude-`) catch the rest.
 static TABLE: &[(&str, ModelPricing)] = &[
     // ---- Anthropic (cache write: 5m TTL = 1.25x input, 1h TTL = 2.0x) ----
+    // Fable 5 and Mythos 5 cost twice what Opus 5 does. Without their own
+    // entries they fell through to the `claude-` catch-all at $3/MTok and
+    // under-reported by more than half.
+    ("claude-fable-5", per_1m_ttl(10.0, 50.0, 1.0, 12.5, 20.0)),
+    ("claude-mythos-5", per_1m_ttl(10.0, 50.0, 1.0, 12.5, 20.0)),
     ("claude-opus-5", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
     ("claude-opus-4-8", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
     ("claude-opus-4-7", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
@@ -239,6 +244,19 @@ mod tests {
         let sonnet = lookup("claude-sonnet-5-20260115").unwrap();
         assert!((sonnet.input_cost_per_token - 2.0 / 1e6).abs() < 1e-18);
         assert!((sonnet.cache_read_cost_per_token.unwrap() - 0.2 / 1e6).abs() < 1e-18);
+    }
+
+    #[test]
+    fn fable_and_mythos_do_not_fall_through_to_the_family_rate() {
+        for id in ["claude-fable-5", "claude-mythos-5-20260301"] {
+            let p = lookup(id).unwrap();
+            assert!(
+                (p.input_cost_per_token - 10.0 / 1e6).abs() < 1e-18,
+                "{id} should use $10/MTok, not the $3/MTok claude- fallback"
+            );
+            assert!((p.output_cost_per_token - 50.0 / 1e6).abs() < 1e-18);
+            assert!((p.cache_read_cost_per_token.unwrap() - 1.0 / 1e6).abs() < 1e-18);
+        }
     }
 
     #[test]
