@@ -168,7 +168,14 @@ impl SemanticCache {
     ) -> String {
         let mut key_parts = serde_json::Map::new();
         key_parts.insert("model".to_string(), serde_json::json!(model));
-        key_parts.insert("messages".to_string(), Value::Array(messages.to_vec()));
+        // Strip markers here too, not just from `extra`. A prompt-cache
+        // breakpoint moving within `messages` says nothing about what the model
+        // will answer, so hashing it raw gave the same turn two keys and lost
+        // the hit.
+        key_parts.insert(
+            "messages".to_string(),
+            strip_cache_control(&Value::Array(messages.to_vec())),
+        );
         for (k, v) in extra {
             key_parts.insert(k.clone(), strip_cache_control(v));
         }
@@ -372,5 +379,41 @@ mod tests {
         cache.clear();
         assert!(cache.get(&msgs(), "m", &extra).is_none());
         assert_eq!(cache.stats()["entries"], serde_json::json!(0));
+    }
+}
+
+#[cfg(test)]
+mod cache_key_marker_tests {
+    use super::*;
+
+    fn msgs(with_marker: bool) -> Vec<Value> {
+        let mut block = serde_json::json!({"type": "text", "text": "hi"});
+        if with_marker {
+            block["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+        vec![serde_json::json!({"role": "user", "content": [block]})]
+    }
+
+    #[test]
+    fn a_moved_breakpoint_does_not_fragment_the_key() {
+        let extra = serde_json::Map::new();
+        let with = SemanticCache::compute_key(&msgs(true), "claude-opus-5", &extra);
+        let without = SemanticCache::compute_key(&msgs(false), "claude-opus-5", &extra);
+        assert_eq!(
+            with, without,
+            "a cache_control marker in messages must not change the key"
+        );
+    }
+
+    #[test]
+    fn real_content_still_changes_the_key() {
+        let extra = serde_json::Map::new();
+        let a = SemanticCache::compute_key(&msgs(false), "claude-opus-5", &extra);
+        let b = SemanticCache::compute_key(
+            &[serde_json::json!({"role": "user", "content": [{"type": "text", "text": "bye"}]})],
+            "claude-opus-5",
+            &extra,
+        );
+        assert_ne!(a, b, "different turn text must change the key");
     }
 }
