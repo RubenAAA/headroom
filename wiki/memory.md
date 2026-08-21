@@ -215,15 +215,13 @@ client = with_memory(OpenAI(), user_id="alice")
 
 # Use exactly like normal
 response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "I prefer Python for backend work"}]
+    model="gpt-4o", messages=[{"role": "user", "content": "I prefer Python for backend work"}]
 )
 # Memory extracted INLINE - zero extra latency
 
 # Later, in a new conversation...
 response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "What language should I use?"}]
+    model="gpt-4o", messages=[{"role": "user", "content": "What language should I use?"}]
 )
 # → Response uses the Python preference from memory
 ```
@@ -284,7 +282,7 @@ client1 = with_memory(
 )
 response = client1.chat.completions.create(
     model="gpt-4o",
-    messages=[{"role": "user", "content": "I prefer Go for performance-critical code"}]
+    messages=[{"role": "user", "content": "I prefer Go for performance-critical code"}],
 )
 # Memory stored at USER level (persists across sessions)
 
@@ -295,8 +293,7 @@ client2 = with_memory(
     session_id="afternoon-session",  # Different session
 )
 response = client2.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "What language for my new microservice?"}]
+    model="gpt-4o", messages=[{"role": "user", "content": "What language for my new microservice?"}]
 )
 # → Recalls Go preference from morning session!
 ```
@@ -326,17 +323,21 @@ new = await memory.supersede(
 )
 
 # Query current state (excludes superseded)
-current = await memory.query(MemoryFilter(
-    user_id="alice",
-    include_superseded=False,  # Default
-))
+current = await memory.query(
+    MemoryFilter(
+        user_id="alice",
+        include_superseded=False,  # Default
+    )
+)
 # → Returns only "User now works at Anthropic"
 
 # Query full history (includes superseded)
-history = await memory.query(MemoryFilter(
-    user_id="alice",
-    include_superseded=True,
-))
+history = await memory.query(
+    MemoryFilter(
+        user_id="alice",
+        include_superseded=True,
+    )
+)
 # → Returns both memories with validity timestamps
 
 # Get the chain
@@ -418,6 +419,7 @@ from headroom.memory import (
 )
 from headroom.memory.ports import MemoryFilter, VectorFilter
 
+
 async def main():
     # Create with custom configuration
     config = MemoryConfig(
@@ -458,16 +460,19 @@ async def main():
     )
 
     # Query with filters
-    memories = await memory.query(MemoryFilter(
-        user_id="alice",
-        categories=[MemoryCategory.PREFERENCE, MemoryCategory.FACT],
-        min_importance=0.7,
-        limit=10,
-    ))
+    memories = await memory.query(
+        MemoryFilter(
+            user_id="alice",
+            categories=[MemoryCategory.PREFERENCE, MemoryCategory.FACT],
+            min_importance=0.7,
+            limit=10,
+        )
+    )
 
     # Convenience methods
     await memory.remember("Likes coffee", user_id="alice", importance=0.6)
     relevant = await memory.recall("beverage preferences", user_id="alice")
+
 
 asyncio.run(main())
 ```
@@ -538,13 +543,13 @@ Apple GPU instead of the default ONNX CPU embedder. Notes:
 
 ```python
 config = MemoryConfig(
-    db_path="memory.db",          # SQLite database path
-    vector_dimension=384,          # Must match embedder output
-    hnsw_ef_construction=200,      # HNSW index quality (higher = better, slower)
-    hnsw_m=16,                     # HNSW connections per node
-    hnsw_ef_search=50,             # HNSW search quality
-    cache_enabled=True,            # Enable LRU cache
-    cache_max_size=1000,           # Max cached memories
+    db_path="memory.db",  # SQLite database path
+    vector_dimension=384,  # Must match embedder output
+    hnsw_ef_construction=200,  # HNSW index quality (higher = better, slower)
+    hnsw_m=16,  # HNSW connections per node
+    hnsw_ef_search=50,  # HNSW search quality
+    cache_enabled=True,  # Enable LRU cache
+    cache_max_size=1000,  # Max cached memories
 )
 ```
 
@@ -555,7 +560,7 @@ client = with_memory(
     OpenAI(),
     user_id="alice",
     db_path="memory.db",
-    top_k=5,                       # Memories to inject per request
+    top_k=5,  # Memories to inject per request
     session_id="optional-session",
     agent_id="optional-agent",
     embedder_backend=EmbedderBackend.LOCAL,
@@ -715,6 +720,7 @@ client = with_memory(
 
 # Groq
 from groq import Groq
+
 client = with_memory(Groq(), user_id="alice")
 
 # Any OpenAI-compatible client
@@ -734,10 +740,12 @@ client = with_memory(OpenAI(), user_id="developer_jane")
 # Conversation 1: User shares context
 response = client.chat.completions.create(
     model="gpt-4o",
-    messages=[{
-        "role": "user",
-        "content": "I'm a Python developer at a fintech startup. We use PostgreSQL and FastAPI."
-    }]
+    messages=[
+        {
+            "role": "user",
+            "content": "I'm a Python developer at a fintech startup. We use PostgreSQL and FastAPI.",
+        }
+    ],
 )
 # Memories extracted:
 #   - [FACT] Python developer at fintech startup
@@ -747,10 +755,7 @@ response = client.chat.completions.create(
 # Conversation 2 (new session): User asks question
 response = client.chat.completions.create(
     model="gpt-4o",
-    messages=[{
-        "role": "user",
-        "content": "What database should I use for my new project?"
-    }]
+    messages=[{"role": "user", "content": "What database should I use for my new project?"}],
 )
 # Response references PostgreSQL preference from memory:
 # → "Given your experience with PostgreSQL at your fintech company,

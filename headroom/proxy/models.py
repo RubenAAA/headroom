@@ -7,12 +7,14 @@ Extracted from server.py to keep the codebase maintainable.
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
+from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 from headroom.proxy.model_router import ModelRouterConfig
 from headroom.rollout import RolloutSnapshot, resolve_rollout
 
@@ -369,6 +371,12 @@ class ProxyConfig:
     # Anthropic buffered reads can legitimately run longer than the generic
     # proxy request cap. Keep the generic timeout unchanged elsewhere.
     anthropic_buffered_request_timeout_seconds: int = 600
+    # How long a buffered-CCR turn holds out for full status fidelity before it
+    # commits to SSE and starts a keepalive. Under the window, failures keep
+    # their real HTTP status; past it, the client gets a first byte before its
+    # stream-idle watchdog fires. 0 or less disables the keepalive entirely.
+    # See headroom/proxy/buffered_ccr_response.py (#3079).
+    buffered_ccr_grace_seconds: float = DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 
     # Connection pool
     max_connections: int = 500
@@ -438,6 +446,17 @@ class ProxyConfig:
     # causes avoidable memory pressure on their platform.
     # Env: HEADROOM_PERIODIC_TOIN_STATS=0.
     periodic_toin_stats_enabled: bool = True
+
+    # Periodic allocator trim. Long-lived proxies processing large concurrent
+    # request bodies ratchet RSS through freed-but-retained allocator pages;
+    # this returns them to the OS (malloc_zone_pressure_relief on macOS,
+    # malloc_trim on glibc). Default-on only on macOS, where the retained-page
+    # ratchet is the documented failure (#2820); an opt-in elsewhere via
+    # HEADROOM_MALLOC_TRIM=1 so glibc deployments do not silently take on a
+    # once-a-minute allocator purge they did not ask for. Envs:
+    # HEADROOM_MALLOC_TRIM=0/1, HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
+    periodic_malloc_trim_enabled: bool = field(default_factory=lambda: sys.platform == "darwin")
+    malloc_trim_interval_seconds: int = 60
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False

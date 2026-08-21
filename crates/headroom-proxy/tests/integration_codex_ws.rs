@@ -108,7 +108,7 @@ async fn spawn_mock_upstream(
                             if !sent_events {
                                 sent_events = true;
                                 for e in &events {
-                                    if sink.send(Message::Text(e.clone())).await.is_err() {
+                                    if sink.send(Message::Text(e.clone().into())).await.is_err() {
                                         break;
                                     }
                                 }
@@ -182,7 +182,7 @@ async fn response_create_compressed_other_frames_byte_identical() {
 
     // 1. Wrapped-envelope response.create — must arrive compressed.
     let original = big_response_create_frame();
-    ws.send(Message::Text(original.clone())).await.unwrap();
+    ws.send(Message::Text(original.clone().into())).await.unwrap();
     wait_for_frames(&upstream.frames, 1).await;
     let got = match &upstream.frames.lock().unwrap()[0] {
         Message::Text(t) => t.clone(),
@@ -202,7 +202,7 @@ async fn response_create_compressed_other_frames_byte_identical() {
 
     // 2. Non-response.create JSON frame — byte-identical.
     let cancel = json!({"type": "response.cancel", "response_id": "resp_1"}).to_string();
-    ws.send(Message::Text(cancel.clone())).await.unwrap();
+    ws.send(Message::Text(cancel.clone().into())).await.unwrap();
     wait_for_frames(&upstream.frames, 2).await;
     match &upstream.frames.lock().unwrap()[1] {
         Message::Text(t) => assert_eq!(t, &cancel),
@@ -211,7 +211,7 @@ async fn response_create_compressed_other_frames_byte_identical() {
 
     // 3. Non-JSON frame — byte-identical passthrough.
     let garbage = "this is not json {".to_string();
-    ws.send(Message::Text(garbage.clone())).await.unwrap();
+    ws.send(Message::Text(garbage.clone().into())).await.unwrap();
     wait_for_frames(&upstream.frames, 3).await;
     match &upstream.frames.lock().unwrap()[2] {
         Message::Text(t) => assert_eq!(t, &garbage),
@@ -242,7 +242,7 @@ async fn bare_envelope_compressed() {
         http::HeaderValue::from_static("Bearer sk-test-payg"),
     );
     let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
-    ws.send(Message::Text(original.clone())).await.unwrap();
+    ws.send(Message::Text(original.clone().into())).await.unwrap();
     wait_for_frames(&upstream.frames, 1).await;
     let got = match &upstream.frames.lock().unwrap()[0] {
         Message::Text(t) => t.clone(),
@@ -335,7 +335,7 @@ async fn header_prep_and_x_codex_forwarding() {
     );
 
     // Trigger the upstream connection's header capture assertions.
-    ws.send(Message::Text(json!({"type": "session.update"}).to_string()))
+    ws.send(Message::Text(json!({"type": "session.update"}).to_string().into()))
         .await
         .unwrap();
     wait_for_frames(&upstream.frames, 1).await;
@@ -381,7 +381,7 @@ async fn client_disconnect_tears_down_upstream() {
         tokio_tungstenite::connect_async(format!("{}/v1/responses", proxy.ws_url()))
             .await
             .unwrap();
-    ws.send(Message::Text(json!({"type": "session.update"}).to_string()))
+    ws.send(Message::Text(json!({"type": "session.update"}).to_string().into()))
         .await
         .unwrap();
     wait_for_frames(&upstream.frames, 1).await;
@@ -420,7 +420,7 @@ async fn upstream_close_tears_down_client() {
         tokio_tungstenite::connect_async(format!("{}/v1/responses", proxy.ws_url()))
             .await
             .unwrap();
-    ws.send(Message::Text(big_response_create_frame()))
+    ws.send(Message::Text(big_response_create_frame().into()))
         .await
         .unwrap();
 
@@ -489,7 +489,7 @@ async fn upstream_connect_failure_http_fallback() {
     );
     // Client WS still accepted despite the upstream WS connect failing.
     let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
-    ws.send(Message::Text(big_response_create_frame()))
+    ws.send(Message::Text(big_response_create_frame().into()))
         .await
         .unwrap();
 
@@ -602,7 +602,7 @@ async fn loopback_origin_allowed() {
         http::HeaderValue::from_static("http://localhost:3000"),
     );
     let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
-    ws.send(Message::Text(json!({"type": "session.update"}).to_string()))
+    ws.send(Message::Text(json!({"type": "session.update"}).to_string().into()))
         .await
         .unwrap();
     wait_for_frames(&upstream.frames, 1).await;

@@ -23,6 +23,12 @@ def _clear_caches(monkeypatch, tmp_path):
     """Isolate every test from global state: cache dir, platform lru_cache, env."""
     binaries.detect_platform.cache_clear()
     binaries._registry.cache_clear()
+    # Null the shipped SHA-256 pins so mechanics tests can serve small mock
+    # archives (whose digests won't match production pins); the verification
+    # tests below set their own pin explicitly.
+    for _tool in binaries._registry().get("tools", {}).values():
+        for _asset in _tool.get("assets", {}).values():
+            _asset["sha256"] = None
     monkeypatch.setenv("HEADROOM_BINARIES_CACHE", str(tmp_path / "cache"))
     monkeypatch.delenv("HEADROOM_BINARIES_MIRROR", raising=False)
     monkeypatch.delenv("HEADROOM_BINARIES_OFFLINE", raising=False)

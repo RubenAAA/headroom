@@ -526,7 +526,8 @@ mod tests {
         };
 
         assert_eq!(outcome.compression_savings_cost_basis(), "cache_read");
-        assert!((outcome.compression_savings_cost_usd() - 0.0015).abs() < 1e-12);
+        // 1,000 saved tokens at Opus 5's cache-read rate of $0.50/MTok.
+        assert!((outcome.compression_savings_cost_usd() - 0.0005).abs() < 1e-12);
     }
 
     #[test]
@@ -542,7 +543,8 @@ mod tests {
         };
 
         assert_eq!(outcome.compression_savings_cost_basis(), "fresh_input");
-        assert!((outcome.compression_savings_cost_usd() - 0.015).abs() < 1e-12);
+        // 1,000 saved tokens at Opus 5's fresh-input rate of $5/MTok.
+        assert!((outcome.compression_savings_cost_usd() - 0.005).abs() < 1e-12);
     }
 
     #[test]

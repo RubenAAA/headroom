@@ -24,7 +24,7 @@ use headroom_core::ctx::{ContentType, SearchOpts, SortMode};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/search", get(handle_search))
-        .route("/get/:hash", get(handle_get))
+        .route("/get/{hash}", get(handle_get))
         .route("/index", post(handle_index))
         .route("/fetch", post(handle_fetch))
         .route("/stats", get(handle_stats))

@@ -237,6 +237,25 @@ class TestAnthropicConfigLoading:
                     # Env var should win
                     assert loaded["context_limits"]["test-model"] == 100000
 
+    @pytest.mark.parametrize("raw", ["[1, 2, 3]", '"gpt-4"', "42", "true", "null"])
+    def test_non_object_env_var_falls_back_to_defaults(self, raw):
+        """A valid-JSON-but-not-an-object env var must warn and use defaults,
+        not crash provider init with AttributeError on ``loaded.get``."""
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": raw}):
+            loaded = anthropic_load_config()
+            assert loaded == {"context_limits": {}, "pricing": {}}
+
+    def test_non_object_config_file_falls_back_to_defaults(self):
+        """A models.json whose top level is not an object must not crash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = Path(tmpdir) / ".headroom"
+            config_dir.mkdir()
+            (config_dir / "models.json").write_text("[1, 2, 3]")
+
+            with patch.object(Path, "home", return_value=Path(tmpdir)):
+                loaded = anthropic_load_config()
+                assert loaded == {"context_limits": {}, "pricing": {}}
+
 
 class TestOpenAIModelFallback:
     """Tests for OpenAI provider model fallback."""
@@ -352,6 +371,14 @@ class TestOpenAIConfigLoading:
             with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": str(config_path)}):
                 loaded = openai_load_config()
                 assert loaded["pricing"]["test-model"] == [5.0, 15.0]
+
+    @pytest.mark.parametrize("raw", ["[1, 2, 3]", '"gpt-4"', "42", "true", "null"])
+    def test_non_object_env_var_falls_back_to_defaults(self, raw):
+        """A valid-JSON-but-not-an-object env var must warn and use defaults,
+        not crash provider init with AttributeError on ``loaded.get``."""
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": raw}):
+            loaded = openai_load_config()
+            assert loaded == {"context_limits": {}, "pricing": {}, "encodings": {}}
 
 
 class TestCrossProviderConsistency:

@@ -399,7 +399,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
-    from headroom.proxy.savings_attribution import encode, from_tags, public_tags
+    from headroom.proxy.savings_attribution import (
+        encode,
+        from_tags,
+        public_tags,
+        timings_from_tags,
+    )
     from headroom.telemetry.session import record_outcome
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
@@ -467,6 +472,20 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     tool_search_saved = tool_schema_saved_from_tags(outcome.tags or {})
     savings_breakdown = from_tags(outcome.tags)
 
+    # Stage timings contributed from OUTSIDE the handler, folded in here rather
+    # than in each handler so every provider picks them up from one place.
+    #
+    # The handler's own timings win a name collision, which cannot happen while
+    # extension stages carry the ``ext:`` prefix but is the safe way round if
+    # that ever changes: a plugin must not be able to overwrite a measurement
+    # the pipeline made of itself.
+    extension_timing = timings_from_tags(outcome.tags)
+    pipeline_timing = (
+        {**extension_timing, **(outcome.pipeline_timing or {})}
+        if extension_timing
+        else outcome.pipeline_timing
+    )
+
     # Billed input volume. Prefer the provider's own count where it reported one
     # — that is what the invoice charges for, and it is the number cache math is
     # already expressed in. Falls back to our local ``optimized_tokens`` when the
@@ -488,7 +507,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cached=outcome.cache_hit,
         overhead_ms=outcome.overhead_ms,
         ttfb_ms=outcome.ttfb_ms,
-        pipeline_timing=outcome.pipeline_timing,
+        pipeline_timing=pipeline_timing,
         waste_signals=outcome.waste_signals,
         cache_read_tokens=outcome.cache_read_tokens,
         cache_write_tokens=outcome.cache_write_tokens,
@@ -518,6 +537,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             uncached_tokens=outcome.uncached_input_tokens,
             cache_inferred=outcome.cache_inferred,
             output_tokens=outcome.output_tokens,
+            # Same figure already handed to metrics.record_request above. The
+            # cost tracker feeds the dashboard's per-model table, which read
+            # compression only while its own headline counted both layers.
+            tool_schema_saved=tool_search_saved,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
@@ -567,6 +590,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
+    # ``cached=1`` marks a turn answered from Headroom's own response cache.
+    # Such a turn never contacts the upstream, so it has no outbound_request
+    # line, no upstream stage timings, and all-zero token counters — which
+    # made it indistinguishable in the logs from a turn that died silently
+    # (#3019). Appended only on a hit, so every other PERF line is unchanged
+    # and existing parsers keep working (``_parse_kv`` reads trailing
+    # key=value pairs after ``transforms=`` the same way it reads
+    # ``client=``).
+    cached_part = " cached=1" if outcome.from_response_cache else ""
     # Tool-schema DEFERRAL savings can't move tok_before/after (those count messages
     # only), so a tool-heavy turn shows tok_saved=0 while genuinely saving thousands of
     # tool-definition tokens. `tool_saved` carries that component and `total_saved` is
@@ -592,4 +624,5 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"savings={encoded_savings} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
+        f"{cached_part}"
     )

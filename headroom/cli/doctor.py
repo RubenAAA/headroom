@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -221,6 +222,51 @@ def check_claude_auth_conflict(
         name="claude auth",
         status=FAIL,
         summary=claude_auth_conflict_message(conflict),
+    )
+
+
+def claude_desktop_config_dir() -> Path:
+    """Return Claude Desktop's per-user config directory for this platform.
+
+    Claude Desktop (``com.anthropic.claudefordesktop``) stores its config here,
+    distinct from Claude Code CLI's ``~/.claude``. Directory existence is used as
+    a proxy for "Desktop is installed / has been run" (#2925).
+    """
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Claude"
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else home / "AppData" / "Roaming"
+        return base / "Claude"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else home / ".config"
+    return base / "Claude"
+
+
+def check_claude_desktop(config_dir: Path) -> CheckResult | None:
+    """Surface that Claude Desktop agent sessions bypass the proxy (#2925 / #869).
+
+    Claude Desktop unconditionally overwrites ``ANTHROPIC_BASE_URL`` when it
+    spawns agent sessions, so a correctly-wrapped ``~/.claude/settings.json``
+    (which the ``claude`` check verifies for the terminal CLI) does not route
+    Desktop traffic. Without this, ``doctor`` passes on the settings value alone
+    and never hints that Desktop sessions are unrouted.
+
+    Reported as its own per-surface row -- like ``wrap_marker`` and ``shell env``
+    -- and only when Desktop is detected, so it never contradicts a genuinely
+    routed CLI. Returns ``None`` when Desktop is absent (no row).
+    """
+    if not config_dir.exists():
+        return None
+    return CheckResult(
+        name="claude desktop",
+        status=WARN,
+        summary="agent sessions bypass the proxy (Desktop overwrites ANTHROPIC_BASE_URL)",
+        hint=(
+            "Desktop routing is not supported yet (see #869); use the terminal "
+            "Claude Code CLI for proxy-routed sessions."
+        ),
     )
 
 
@@ -630,6 +676,9 @@ def doctor(port: int, emit_json: bool) -> None:
     )
     if remote_control_gate_check is not None:
         checks.append(remote_control_gate_check)
+    desktop_check = check_claude_desktop(claude_desktop_config_dir())
+    if desktop_check is not None:
+        checks.append(desktop_check)
     deployments = check_deployments(list_manifests())
     if deployments is not None:
         checks.append(deployments)

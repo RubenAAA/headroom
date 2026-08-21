@@ -247,7 +247,7 @@ const GATE_PERSIST_MAX_AGE: Duration = Duration::from_secs(86_400);
 fn gate_path(dir: &std::path::Path, session_key: &str) -> std::path::PathBuf {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(session_key.as_bytes());
-    dir.join(format!("{digest:x}.json"))
+    dir.join(format!("{}.json", hex::encode(digest)))
 }
 
 /// Delete sets past [`GATE_PERSIST_MAX_AGE`]. One `read_dir` per process start.

@@ -2191,7 +2191,7 @@ struct PersistedPrefix {
 fn persisted_path(dir: &std::path::Path, session_key: &str) -> std::path::PathBuf {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(session_key.as_bytes());
-    dir.join(format!("{digest:x}.json"))
+    dir.join(format!("{}.json", hex::encode(digest)))
 }
 
 /// Read a session's persisted prefix, or `None` if there is none, it is

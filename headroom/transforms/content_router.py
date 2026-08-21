@@ -65,6 +65,7 @@ from ..tokenizers.base import count_content_blocks
 from ..tokenizers.estimator import EstimatingTokenCounter
 from . import mixed_content as _mixed_content
 from .base import Transform
+from .compression_policy import cache_write_multiplier_for_ttl
 from .compressor_registry import (
     CompressInput,
     CompressorDescriptor,
@@ -1856,7 +1857,11 @@ class ContentRouter(Transform):
         ).strip().lower() in ("1", "true", "yes", "on")
         self._text_crusher: Any = None
         # Cross-turn dedup: config field OR env HEADROOM_DEDUPE (robust to how the
-        # config was built). Effective only in lossless mode (guarded in apply()).
+        # config was built). Runs in BOTH modes — the call site in ``apply()`` has
+        # no lossless guard, and ``_cross_turn_dedup_messages`` documents working
+        # against lossless folds and CCR-recoverable forms alike. (This comment
+        # previously claimed "lossless mode only", which reads as "inert in your
+        # config" to anyone auditing why dedup never fired.)
         self._cross_turn_dedup_enabled: bool = (
             self.config.enable_cross_turn_dedup
             or os.environ.get("HEADROOM_DEDUPE", "").strip().lower() in ("1", "true", "yes", "on")
@@ -4529,6 +4534,7 @@ class ContentRouter(Transform):
         transforms_applied: list[str],
         batch_state: dict[str, int | None] | None = None,
         p_alive_override: float | None = None,
+        write_multiplier: float | None = None,
     ) -> bool:
         """Break-even gate for one candidate mutation (#856 P2, flag-gated).
 
@@ -4613,7 +4619,15 @@ class ContentRouter(Transform):
                 p_alive = _p_alive
             except ValueError:
                 logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
-        gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
+        gain = float(
+            policy.net_mutation_gain(
+                delta_t,
+                suffix,
+                reads,
+                p_alive,
+                write_multiplier=write_multiplier,
+            )
+        )
         allowed = gain > 0.0
         logger.info(
             "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
@@ -4976,7 +4990,22 @@ class ContentRouter(Transform):
         # env-constant behaviour. Derived once here (not per slot) — idle is a
         # per-request property, like frozen_message_count.
         netcost_p_alive_override: float | None = None
+        netcost_write_multiplier: float | None = None
         if netcost_enabled:
+            # Prefer the authoritative per-request prompt-cache TTL when the
+            # caller has one; retain the env setting for other providers and
+            # legacy callers.
+            request_ttl = kwargs.get("cache_ttl_seconds")
+            if request_ttl is None:
+                netcost_ttl = _net_cost_cache_ttl_seconds()
+            else:
+                try:
+                    netcost_ttl = float(request_ttl)
+                except (TypeError, ValueError):
+                    netcost_ttl = _net_cost_cache_ttl_seconds()
+                if not math.isfinite(netcost_ttl) or netcost_ttl <= 0.0:
+                    netcost_ttl = _net_cost_cache_ttl_seconds()
+            netcost_write_multiplier = cache_write_multiplier_for_ttl(netcost_ttl)
             netcost_suffix_tokens = [0] * (num_messages + 1)
             for j in range(num_messages - 1, -1, -1):
                 netcost_suffix_tokens[j] = netcost_suffix_tokens[j + 1] + _netcost_message_tokens(
@@ -4989,8 +5018,7 @@ class ContentRouter(Transform):
                 except (TypeError, ValueError):
                     idle_f = None
                 if idle_f is not None and math.isfinite(idle_f) and idle_f >= 0.0:
-                    ttl = _net_cost_cache_ttl_seconds()
-                    netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
+                    netcost_p_alive_override = max(0.0, 1.0 - idle_f / netcost_ttl)
 
         # Tasks: list of (slot_index, content, context, bias, content_key)
         _PendingTask = tuple[int, str, str, float, int, bool]
@@ -5294,6 +5322,7 @@ class ContentRouter(Transform):
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
                         p_alive_override=netcost_p_alive_override,
+                        write_multiplier=netcost_write_multiplier,
                     ):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
@@ -5471,6 +5500,7 @@ class ContentRouter(Transform):
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
                         p_alive_override=netcost_p_alive_override,
+                        write_multiplier=netcost_write_multiplier,
                     ):
                         result_slots[slot_idx] = message
                         continue
@@ -5526,7 +5556,16 @@ class ContentRouter(Transform):
         if route_counts["user_msg"]:
             parts.append(f"{route_counts['user_msg']} skipped (user)")
         if route_counts["small"]:
-            parts.append(f"{route_counts['small']} skipped (<50 words)")
+            # Report the thresholds actually in force, not a literal. This line
+            # used to read "skipped (<50 words)" unconditionally: wrong number
+            # (the message gate is `min_tokens`, which profiles set anywhere from
+            # 10 to 250), wrong unit (tokens and characters, never words), and it
+            # merged two different gates under one label. Operators read it as
+            # evidence of a mis-set threshold and tuned the wrong knob.
+            parts.append(
+                f"{route_counts['small']} skipped "
+                f"(<{min_tokens} tok msg / <{min_chars_for_block_compression} chars block)"
+            )
         if route_counts["recent_code"]:
             parts.append(f"{route_counts['recent_code']} protected (recent code)")
         if route_counts["analysis_ctx"]:

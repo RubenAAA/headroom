@@ -850,7 +850,7 @@
                                                     <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="truncateModel(model)"></span>
                                                 </td>
                                                 <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="info.requests"></td>
-                                                <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved)"></td>
+                                                <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved)" :title="formatNumber(info.compression_tokens_saved || 0) + ' from compression · ' + formatNumber(info.tool_tokens_saved || 0) + ' from deferred tool schemas'"></td>
                                                 <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.tokens_sent)"></td>
                                                 <td class="px-4 py-3 text-right">
                                                     <span class="text-accent font-mono tabular-nums" x-text="info.reduction_pct.toFixed(1) + '%'"></span>

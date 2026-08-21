@@ -30,6 +30,9 @@ def _app() -> Any:
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
+    # This routing test uses reserved, intentionally unresolvable hostnames.
+    # Explicitly allow them so the SSRF guard can remain fail-closed on DNS errors.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "azure.example,custom.example,opencode.ai")
     calls: list[tuple[str, str, str, str]] = []
     gemini_calls: list[tuple[str, str, str, str]] = []
     gemini_count_calls: list[tuple[str, str, str, str]] = []

@@ -1210,7 +1210,7 @@ async fn compress_frame_bounded(
 async fn recv_first_text(stream: &mut SplitStream<WebSocket>) -> Option<String> {
     loop {
         match stream.next().await? {
-            Ok(AxMsg::Text(t)) => return Some(t),
+            Ok(AxMsg::Text(t)) => return Some(t.to_string()),
             Ok(AxMsg::Close(_)) => return None,
             Ok(_) => continue,
             Err(_) => return None,
@@ -1564,7 +1564,7 @@ async fn run_codex_session_inner(
 
     // ── Relay (openai.py 4861-5778) ──
     let (mut up_sink, mut up_stream) = upstream.split();
-    if let Err(e) = up_sink.send(TgMsg::Text(first_msg_raw)).await {
+    if let Err(e) = up_sink.send(TgMsg::Text(first_msg_raw.into())).await {
         tracing::warn!(request_id = %ctx.request_id, error = %e, "codex ws first-frame upstream send failed");
         let _ = client_sink
             .send(AxMsg::Close(Some(CloseFrame {
@@ -1608,6 +1608,7 @@ async fn run_codex_session_inner(
                         };
                         match m {
                             AxMsg::Text(text) => {
+                                let text = text.to_string();
                                 let frame_type = serde_json::from_str::<Value>(&text)
                                     .ok()
                                     .and_then(|v| {
@@ -1663,7 +1664,7 @@ async fn run_codex_session_inner(
                                 } else {
                                     text
                                 };
-                                if up_sink.send(TgMsg::Text(out)).await.is_err() {
+                                if up_sink.send(TgMsg::Text(out.into())).await.is_err() {
                                     had_error = true;
                                     break;
                                 }
@@ -1765,7 +1766,7 @@ async fn run_codex_session_inner(
                                 }
                                 // Forward the ORIGINAL string — never a
                                 // re-serialization.
-                                if client_sink.send(AxMsg::Text(text)).await.is_err() {
+                                if client_sink.send(AxMsg::Text(text.as_str().into())).await.is_err() {
                                     break;
                                 }
                             }
@@ -1933,7 +1934,7 @@ async fn ws_http_fallback(
             "type": "error",
             "error": {"type": "server_error", "message": "Upstream unreachable"},
         });
-        let _ = client_sink.send(AxMsg::Text(error_event.to_string())).await;
+        let _ = client_sink.send(AxMsg::Text(error_event.to_string().into())).await;
         return;
     };
 
@@ -1951,7 +1952,7 @@ async fn ws_http_fallback(
                 "message": format!("Upstream returned {status}"),
             },
         });
-        let _ = client_sink.send(AxMsg::Text(error_event.to_string())).await;
+        let _ = client_sink.send(AxMsg::Text(error_event.to_string().into())).await;
         return;
     }
 
@@ -1972,7 +1973,7 @@ async fn ws_http_fallback(
                     continue;
                 }
                 if client_sink
-                    .send(AxMsg::Text(data.to_string()))
+                    .send(AxMsg::Text(data.to_string().into()))
                     .await
                     .is_err()
                 {

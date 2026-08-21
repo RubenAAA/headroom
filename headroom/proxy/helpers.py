@@ -317,6 +317,40 @@ def _headroom_bypass_enabled(headers: Any) -> bool:
     return bypass or passthrough
 
 
+# Response headers that describe how the *upstream* framed its body on the
+# wire, not what the payload means. Every one of them is invalid to replay:
+# Starlette recomputes content-length, and uvicorn owns the connection
+# framing. Forwarding a stale ``transfer-encoding: chunked`` onto a
+# fixed-length body is the worst of them — RFC 9112 §6.1 makes
+# Transfer-Encoding override Content-Length, so the client tries to parse a
+# plain JSON body as chunked frames, finds no valid chunk-size line, and
+# reads an empty body out of an HTTP 200 (#3019).
+FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "server",
+)
+
+
+def sanitize_forwarded_response_headers(
+    headers: Any,
+    *extra_names: str,
+) -> dict[str, str]:
+    """Drop wire-framing headers before replaying an upstream response.
+
+    Pass any additional header names to strip as ``extra_names`` (for
+    example ``"content-type"`` when the caller sets its own media type).
+
+    Matching is case-insensitive, but the casing of the headers that
+    survive is left untouched.
+    """
+    drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
+    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -871,16 +905,15 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
+    model: str | None = None,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
-    """Move any ``role="system"`` entries out of ``messages`` into ``system``.
+    """Relocate only system messages invalid for the selected Anthropic model.
 
-    Anthropic's Messages API rejects a ``system`` role inside ``messages`` with
-    HTTP 400 ("messages.0: use the top-level 'system' parameter for the initial
-    system prompt"). Internal transforms / pipeline extensions can leave a stray
-    system message in the list (e.g. a relocated harness system block during
-    compression). This is the Anthropic forwarder's last line of defense: it
-    guarantees the forwarded body never violates the wire contract, regardless
-    of which transform introduced the entry.
+    Supported models accept mid-conversation system sections after a user turn
+    (or an assistant server-tool result) when followed by an assistant turn or
+    placed at the end. Hoisting those changes semantics and invalidates the
+    cached prefix. The initial/invalid forms are still moved to the top-level
+    field as the issue-765 last-line wire-contract guard.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
@@ -890,9 +923,58 @@ def relocate_system_messages_to_top_level(
     message is present the inputs pass through unchanged (``changed=False``) so
     the common path is untouched.
     """
-    system_indices = {
-        i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == _ROLE_SYSTEM
-    }
+    model_id = str(model or "").lower()
+    supports_mid_conversation = any(
+        family in model_id
+        for family in (
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        )
+    )
+
+    def _assistant_ends_in_server_tool_result(message: object) -> bool:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return False
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        final = content[-1]
+        if not isinstance(final, dict):
+            return False
+        block_type = str(final.get("type") or "")
+        return block_type == "server_tool_use" or block_type.endswith("_tool_result")
+
+    system_indices: set[int] = set()
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != _ROLE_SYSTEM:
+            index += 1
+            continue
+
+        section_start = index
+        while (
+            index + 1 < len(messages)
+            and isinstance(messages[index + 1], dict)
+            and messages[index + 1].get("role") == _ROLE_SYSTEM
+        ):
+            index += 1
+        section_end = index
+
+        previous = messages[section_start - 1] if section_start > 0 else None
+        following = messages[section_end + 1] if section_end + 1 < len(messages) else None
+        valid_previous = (
+            isinstance(previous, dict) and previous.get("role") == "user"
+        ) or _assistant_ends_in_server_tool_result(previous)
+        valid_following = following is None or (
+            isinstance(following, dict) and following.get("role") == "assistant"
+        )
+        if not (supports_mid_conversation and valid_previous and valid_following):
+            system_indices.update(range(section_start, section_end + 1))
+        index += 1
     if not system_indices:
         return messages, system, False
 
@@ -1520,15 +1602,40 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
-def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+def merge_extra_headers(
+    headers: dict[str, str],
+    extra: dict[str, str] | None,
+    *,
+    upstream_url: str | None,
+    config: Any = None,
+) -> dict[str, str]:
     """Merge configured extra headers into ``headers``, overriding same-named keys.
 
     ``extra`` comes from ``ProxyConfig.anthropic_extra_headers``/``openai_extra_headers``
     (settings-panel/CLI-configured, for gateways that need one extra header alongside the
     client's own auth). Returns ``headers`` unchanged (no copy) when nothing is configured.
+
+    ``upstream_url`` is where these headers are about to be sent, and it is
+    **required** rather than optional on purpose. These values are secrets, and
+    several handlers accept a per-request upstream from the ``x-headroom-base-url``
+    request header; merging before the destination was known is what let a client
+    redirect the operator's gateway key to a host of its choosing. Making the
+    destination part of the signature means a new forwarder cannot merge a secret
+    without saying where it goes, so this cannot silently regress.
+
+    Pass ``None`` when the caller is going to its configured target with no
+    per-request override. Anything else is checked against
+    ``upstream_trust.is_trusted_upstream``; an undesignated host still gets its
+    request proxied, just without these headers.
     """
     if not extra:
         return headers
+    if upstream_url is not None:
+        from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
+
+        if not is_trusted_upstream(upstream_url, config):
+            warn_untrusted_once(upstream_url)
+            return headers
     # HTTP header names are case-insensitive: drop any existing key that
     # case-insensitively collides with a configured extra so the extra wins.
     # A plain {**headers, **extra} would emit both casings upstream.
@@ -2811,6 +2918,13 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def _tool_search_resident_key(name: Any) -> str:
+    """Normalize a client tool name for resident-tool membership checks."""
+    # Oh My Pi prefixes every built-in with ``_``. Strip only leading namespace
+    # markers so internal separators such as ``mcp__server__read`` stay intact.
+    return str(name or "").lower().lstrip("_")
+
+
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
     """Return whether Anthropic server-side tool search is valid for this upstream."""
     from headroom.providers.claude.runtime import is_custom_anthropic_base_url
@@ -2872,17 +2986,17 @@ def inject_tool_search_deferral(
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
-    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
-    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
-    # the exemption applies to both — an exact match silently deferred *every*
-    # tool for PascalCase clients, including their own tool-search tool.
-    core_lower = {name.lower() for name in core_tools}
+    # Clients disagree on casing and leading namespace markers for the same tool:
+    # Claude Code sends ``Bash``, opencode sends ``bash``, and Oh My Pi sends
+    # ``_bash``. Normalize both the configured names and each candidate so the
+    # exemption applies consistently across clients.
+    core_keys = {_tool_search_resident_key(name) for name in core_tools}
 
     for tool in tools:
         if (
             not isinstance(tool, dict)
             or tool.get("type")
-            or str(tool.get("name") or "").lower() in core_lower
+            or _tool_search_resident_key(tool.get("name")) in core_keys
         ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
@@ -3259,10 +3373,10 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
-    # Case-insensitive for the same reason as the Anthropic path above: the
-    # resident-name sets are lowercase, clients are not required to be.
-    resident_lower = {name.lower() for name in core_tools} | {
-        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    # Normalize for the same reason as the Anthropic path above: clients may use
+    # different casing or a leading namespace marker for the same resident tool.
+    resident_keys = {_tool_search_resident_key(name) for name in core_tools} | {
+        _tool_search_resident_key(name) for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
     }
     for tool in tools:
         if not isinstance(tool, dict):
@@ -3273,7 +3387,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
+            ttype == "function" and _tool_search_resident_key(tool.get("name")) not in resident_keys
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

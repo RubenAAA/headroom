@@ -371,7 +371,7 @@ impl ToolSignature {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(hash_input.as_bytes());
-        let structure_hash = format!("{:x}", hasher.finalize())[..24].to_string();
+        let structure_hash = hex::encode(hasher.finalize())[..24].to_string();
 
         Self {
             structure_hash,
@@ -499,7 +499,7 @@ impl ToolSignature {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(serde_json::to_string(json).unwrap_or_default().as_bytes());
-        format!("{:x}", hasher.finalize())[..24].to_string()
+        hex::encode(hasher.finalize())[..24].to_string()
     }
 
     fn matches_pattern(key_lower: &str, patterns: &[&str]) -> bool {
@@ -1310,13 +1310,13 @@ pub fn create_content_signature(
     let content_sample: String = content.chars().take(100).collect();
     let mut structure_hint_hasher = Sha256::new();
     structure_hint_hasher.update(content_sample.as_bytes());
-    let structure_hint = format!("{:x}", structure_hint_hasher.finalize())[..8].to_string();
+    let structure_hint = hex::encode(structure_hint_hasher.finalize())[..8].to_string();
 
     let full_input = format!("{}:{}", hash_input, structure_hint);
 
     let mut hasher = Sha256::new();
     hasher.update(full_input.as_bytes());
-    let result = format!("{:x}", hasher.finalize());
+    let result = hex::encode(hasher.finalize());
 
     result[..24].to_string()
 }

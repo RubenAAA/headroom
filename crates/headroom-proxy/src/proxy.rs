@@ -6,7 +6,7 @@ use std::time::Instant;
 use url::Url;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
@@ -974,14 +974,14 @@ pub fn build_app(state: AppState) -> Router {
         // publisher endpoints look like
         // `POST /v1beta1/projects/{p}/locations/{l}/publishers/anthropic/models/{m}:rawPredict`
         // (and `:streamRawPredict`). The trailing `:<verb>` is awkward
-        // in axum's `:param` syntax, so we capture the entire trailing
-        // segment as `:model_action` and split on the last `:` inside
+        // in axum's `{param}` syntax, so we capture the entire trailing
+        // segment as `{model_action}` and split on the last `:` inside
         // the dispatcher. Both verbs share the same axum route shape
         // — matchit can't distinguish two patterns that overlap on the
         // literal parameter. The verb dispatch lives in
         // [`crate::vertex::handle_vertex_predict_dispatch`].
         .route(
-            "/v1beta1/projects/:project/locations/:location/publishers/anthropic/models/:model_action",
+            "/v1beta1/projects/{project}/locations/{location}/publishers/anthropic/models/{model_action}",
             post(crate::vertex::handle_vertex_predict_dispatch),
         );
 
@@ -1004,11 +1004,11 @@ pub fn build_app(state: AppState) -> Router {
         // Bedrock handlers identically.
         let bedrock_router: Router<AppState> = Router::new()
             .route(
-                "/model/:model_id/invoke",
+                "/model/{model_id}/invoke",
                 post(crate::bedrock::invoke::handle_invoke),
             )
             .route(
-                "/model/:model_id/converse",
+                "/model/{model_id}/converse",
                 post(crate::bedrock::invoke::handle_invoke),
             )
             // PR-D2/PR-D5: streaming counterparts. Bedrock's protocol is
@@ -1020,11 +1020,11 @@ pub fn build_app(state: AppState) -> Router {
             // processing pipeline, so both route to the same handler.
             // See `bedrock::invoke_streaming`.
             .route(
-                "/model/:model_id/invoke-with-response-stream",
+                "/model/{model_id}/invoke-with-response-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route(
-                "/model/:model_id/converse-stream",
+                "/model/{model_id}/converse-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route_layer(axum::middleware::from_fn(
@@ -1066,18 +1066,18 @@ pub fn build_app(state: AppState) -> Router {
                 post(crate::handlers::conversations::handle_conversations_create),
             )
             .route(
-                "/v1/conversations/:conversation_id",
+                "/v1/conversations/{conversation_id}",
                 get(crate::handlers::conversations::handle_conversations_get)
                     .post(crate::handlers::conversations::handle_conversations_update)
                     .delete(crate::handlers::conversations::handle_conversations_delete),
             )
             .route(
-                "/v1/conversations/:conversation_id/items",
+                "/v1/conversations/{conversation_id}/items",
                 post(crate::handlers::conversations::handle_conversations_items_create)
                     .get(crate::handlers::conversations::handle_conversations_items_list),
             )
             .route(
-                "/v1/conversations/:conversation_id/items/:item_id",
+                "/v1/conversations/{conversation_id}/items/{item_id}",
                 get(crate::handlers::conversations::handle_conversations_item_get)
                     .delete(crate::handlers::conversations::handle_conversations_item_delete),
             );
@@ -1106,11 +1106,11 @@ pub fn build_app(state: AppState) -> Router {
                     .get(crate::handlers::batch::openai_batch_list),
             )
             .route(
-                "/v1/batches/:batch_id",
+                "/v1/batches/{batch_id}",
                 get(crate::handlers::batch::openai_batch_get),
             )
             .route(
-                "/v1/batches/:batch_id/cancel",
+                "/v1/batches/{batch_id}/cancel",
                 post(crate::handlers::batch::openai_batch_cancel),
             )
             // Anthropic batch (`/v1/messages/batches*`). Create compresses
@@ -1122,15 +1122,15 @@ pub fn build_app(state: AppState) -> Router {
                     .get(crate::handlers::batch_anthropic::anthropic_batch_list),
             )
             .route(
-                "/v1/messages/batches/:batch_id",
+                "/v1/messages/batches/{batch_id}",
                 get(crate::handlers::batch_anthropic::anthropic_batch_get),
             )
             .route(
-                "/v1/messages/batches/:batch_id/cancel",
+                "/v1/messages/batches/{batch_id}/cancel",
                 post(crate::handlers::batch_anthropic::anthropic_batch_cancel),
             )
             .route(
-                "/v1/messages/batches/:batch_id/results",
+                "/v1/messages/batches/{batch_id}/results",
                 get(crate::handlers::batch_anthropic::anthropic_batch_results),
             );
     }
@@ -1139,7 +1139,7 @@ pub fn build_app(state: AppState) -> Router {
     // (contents[] with parts[], systemInstruction) and apply compression
     // via the OpenAI pipeline after format conversion.
     router = router.route(
-        "/v1beta/models/*model_action",
+        "/v1beta/models/{*model_action}",
         post(crate::handlers::gemini::handle_gemini_action),
     );
 
@@ -1277,17 +1277,22 @@ async fn track_inbound_request(
 async fn catch_all(
     State(state): State<AppState>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
-    ws: Option<WebSocketUpgrade>,
     req: Request<Body>,
 ) -> Response<Body> {
-    if is_websocket_upgrade(req.headers()) {
-        if let Some(ws) = ws {
+    let (mut parts, body) = req.into_parts();
+    if is_websocket_upgrade(&parts.headers) {
+        // axum 0.8 requires optional extractors to opt in explicitly, and
+        // WebSocketUpgrade intentionally does not. Extract it only after the
+        // upgrade headers have identified this as a WebSocket request.
+        if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            let req = Request::from_parts(parts, body);
             return ws_handler(ws, state, client_addr, req).await;
         }
         // Header says websocket but axum didn't extract it (likely missing
         // Sec-WebSocket-Key) — fall through to HTTP forwarding which will
         // surface the upstream error.
     }
+    let req = Request::from_parts(parts, body);
     forward_http(state, client_addr, req)
         .await
         .unwrap_or_else(|e| e.into_response())
@@ -3637,7 +3642,7 @@ pub(crate) async fn forward_http(
                 let hash = {
                     use sha2::{Digest, Sha256};
                     let digest = Sha256::digest(buffered.as_ref());
-                    format!("{digest:x}")
+                    hex::encode(digest)
                 };
                 feedback.record_compression(
                     tool_name.as_deref(),
@@ -10344,3 +10349,4 @@ mod timing_field_tests {
         assert!(usage.lock().unwrap().is_empty());
     }
 }
+

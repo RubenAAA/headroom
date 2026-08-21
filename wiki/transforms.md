@@ -136,9 +136,9 @@ result = aligner.align(messages)
 from headroom import CacheAlignerConfig
 
 config = CacheAlignerConfig(
-    extract_dates=True,           # Move dates to dynamic section
-    normalize_whitespace=True,    # Consistent spacing
-    stable_prefix_min_tokens=100, # Min prefix size for alignment
+    extract_dates=True,  # Move dates to dynamic section
+    normalize_whitespace=True,  # Consistent spacing
+    stable_prefix_min_tokens=100,  # Min prefix size for alignment
 )
 ```
 
@@ -212,16 +212,16 @@ pip install "headroom-ai[code]"  # Adds tree-sitter-language-pack
 from headroom.transforms import CodeAwareCompressor, CodeCompressorConfig, DocstringMode
 
 config = CodeCompressorConfig(
-    preserve_imports=True,              # Always keep imports
-    preserve_signatures=True,           # Always keep function signatures
-    preserve_type_annotations=True,     # Keep type hints
-    preserve_error_handlers=True,       # Keep try/except blocks
-    preserve_decorators=True,           # Keep decorators
+    preserve_imports=True,  # Always keep imports
+    preserve_signatures=True,  # Always keep function signatures
+    preserve_type_annotations=True,  # Keep type hints
+    preserve_error_handlers=True,  # Keep try/except blocks
+    preserve_decorators=True,  # Keep decorators
     docstring_mode=DocstringMode.FIRST_LINE,  # FULL, FIRST_LINE, REMOVE
-    target_compression_rate=0.2,        # Keep 20% of tokens
-    max_body_lines=5,                   # Lines to keep per function body
-    min_tokens_for_compression=100,     # Skip small content
-    language_hint=None,                 # Auto-detect if None
+    target_compression_rate=0.2,  # Keep 20% of tokens
+    max_body_lines=5,  # Lines to keep per function body
+    min_tokens_for_compression=100,  # Skip small content
+    language_hint=None,  # Auto-detect if None
 )
 
 compressor = CodeAwareCompressor(config)
@@ -305,10 +305,10 @@ ContentRouter analyzes content and selects the best compression strategy:
 from headroom.transforms import ContentRouter, ContentRouterConfig, CompressionStrategy
 
 config = ContentRouterConfig(
-    min_section_tokens=100,             # Minimum tokens to compress
-    enable_code_aware=True,             # Use CodeAwareCompressor for code
-    enable_search_compression=True,     # Use SearchCompressor for grep output
-    enable_log_compression=True,        # Use LogCompressor for logs
+    min_section_tokens=100,  # Minimum tokens to compress
+    enable_code_aware=True,  # Use CodeAwareCompressor for code
+    enable_search_compression=True,  # Use SearchCompressor for grep output
+    enable_log_compression=True,  # Use LogCompressor for logs
     default_strategy=CompressionStrategy.TEXT,  # Fallback strategy
 )
 
@@ -373,10 +373,12 @@ Combine transforms for optimal results.
 ```python
 from headroom import TransformPipeline, SmartCrusher, CacheAligner
 
-pipeline = TransformPipeline([
-    SmartCrusher(),      # First: compress tool outputs
-    CacheAligner(),      # Then: stabilize prefix
-])
+pipeline = TransformPipeline(
+    [
+        SmartCrusher(),  # First: compress tool outputs
+        CacheAligner(),  # Then: stabilize prefix
+    ]
+)
 
 result = pipeline.transform(messages)
 print(f"Saved {result.tokens_saved} tokens")

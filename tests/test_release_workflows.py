@@ -120,6 +120,51 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
 
 
+def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
+    """`:latest` must have exactly one writer (#3150).
+
+    The sibling test above proves the *promotion step* is owned by the root
+    cell. That was never the whole contract: it checked the intended writer
+    and not the absence of unintended ones.
+
+    ``docker/metadata-action`` defaults to ``latest=auto``, which appends a
+    bare ``latest`` for any semver release. Its own log line reads
+    ``suffixLatest=false`` — the per-tag ``suffix=`` that keeps every other
+    tag variant-scoped does not reach it. So all eight variant cells emitted
+    ``ghcr.io/.../headroom:latest`` and the last to finish won the tag. At
+    0.36.0 that was ``code-slim``: ``:latest`` resolved to the distroless
+    build, whose ``import onnxruntime`` segfaults on arm64, and
+    ``headroom deploy`` crash-looped on Apple Silicon with SIGSEGV.
+
+    Two things hold the line, and both are asserted here: ``latest=false``
+    stops the tag being generated at all, and a runtime guard refuses to
+    publish if a suffixed variant ever carries one anyway.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    manifest = workflow["jobs"]["docker-manifest"]
+
+    meta = next(step for step in manifest["steps"] if step.get("id") == "meta")
+    flavor = meta["with"].get("flavor", "")
+    assert "latest=false" in flavor, (
+        "docker/metadata-action defaults to latest=auto; without latest=false "
+        "every variant cell publishes a bare :latest and the last one wins"
+    )
+
+    # No tag rule may reintroduce it explicitly either.
+    assert "value=latest" not in meta["with"]["tags"]
+
+    create = next(
+        step for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
+    )
+    script = create["run"]
+    # The guard reads the variant name from env, never spliced inline.
+    assert create["env"].get("VARIANT_NAME") == "${{ matrix.variant.name }}"
+    assert 'endswith(":latest")' in script
+    assert script.index('endswith(":latest")') < script.index("docker buildx imagetools create"), (
+        "the bare-latest guard must run before anything is pushed"
+    )
+
+
 def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> None:
     """Each manifest cell must download exactly its two architecture digests.
 
@@ -1467,3 +1512,69 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "server.json",
     ]:
         assert fragment in sync, f"version-sync.py no longer propagates a version to {fragment}"
+
+
+def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -> None:
+    """The release credential must not be readable by the synced branch's code.
+
+    ``release-metadata-sync`` triggers on a push to the ``release-please--branches--**``
+    glob, which is not a protected namespace, and then runs
+    ``scripts/version-sync.py`` *from the checked-out branch*. With
+    ``actions/checkout``'s default ``persist-credentials: true`` the token is
+    written to ``.git/config`` before that script runs, so anyone able to push a
+    matching branch could read it. The credential reaches PyPI, npm and GHCR via
+    the ``release: published`` publishes, so this is not a theoretical leak.
+    """
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["sync"]["steps"]
+
+    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+    assert checkouts, "expected a checkout step"
+    for step in checkouts:
+        assert step.get("with", {}).get("persist-credentials") is False, step
+        # A token passed to checkout is exactly what persist-credentials would
+        # write to disk; the push step supplies it via env instead.
+        assert "token" not in step.get("with", {}), step
+
+
+@pytest.mark.parametrize(
+    "workflow_path,job",
+    [
+        (".github/workflows/release-please.yml", "release-please"),
+        (".github/workflows/release-metadata-sync.yml", "sync"),
+    ],
+)
+def test_release_workflows_prefer_scoped_app_token(workflow_path: str, job: str) -> None:
+    """A repo-scoped, short-lived app token must be preferred over the PAT.
+
+    The PAT carries a maintainer's entire account and bypasses branch and tag
+    protection (#2955). The app-token step is gated on ``vars.RELEASE_APP_ID``
+    and marked ``continue-on-error`` so an unconfigured app falls back to the
+    existing chain rather than blocking a release.
+    """
+    workflow = yaml.safe_load((ROOT / workflow_path).read_text(encoding="utf-8"))
+    steps = workflow["jobs"][job]["steps"]
+
+    minters = [
+        s for s in steps if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    ]
+    assert len(minters) == 1, steps
+    minter = minters[0]
+    assert minter["id"] == "app-token"
+    assert minter["continue-on-error"] is True
+    assert "vars.RELEASE_APP_ID" in str(minter["if"])
+
+    # Whatever consumes the credential must try the app token first.
+    consumers = [
+        value
+        for step in steps
+        for value in list(step.get("with", {}).values()) + list(step.get("env", {}).values())
+        if "RELEASE_PLEASE_TOKEN" in str(value)
+    ]
+    assert consumers, "expected a step consuming the release credential"
+    for value in consumers:
+        assert str(value).index("steps.app-token.outputs.token") < str(value).index(
+            "secrets.RELEASE_PLEASE_TOKEN"
+        ), value
