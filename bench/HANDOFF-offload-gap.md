@@ -267,6 +267,16 @@ of 1,142 windowgap turns and 1,342 of 1,477 blindguard turns. That is 0.35% and
 0.67% of history: the case `_tail_breakpoints`' own comment calls worthless,
 because adjacent markers cache nearly the same prefix.
 
+Corpus-wide counts confirm the doubling: production writes 15,446 message
+breakpoints against the client's 7,699, exactly the extra one per turn.
+
+But it appears to cost almost nothing. The `1h`→`5m` rewrite above kept the
+extra breakpoint and still landed on -4.8%, the same number as a replay that
+never adds one. So the whole API-side loss is the TTL, and the redundant
+adjacent marker is waste that does not show up in dollars — worth removing for
+clarity, not for savings, and worth measuring on its own before anyone spends
+a session on it.
+
 `shipped-tail-back-05` looks like it tested this and did not. `_spread_shipped`
 skips any request whose message markers are not exactly one, which is true of
 the client and false of `--base forwarded`. It skipped every request and scored
@@ -340,8 +350,43 @@ unexplained. It does not affect the before/after comparison, which holds the
 detector fixed across both runs, but do not read the absolute deferral counts as
 production truth until it is chased down.
 
-The 6.6pp gap itself is therefore still unexplained, and `ctx_offload.rs:626` is
-no longer the obvious suspect.
+**Closed: it was `--force-1h-cache-ttl` (2026-08-21).** Not a defect, and not
+in the offload gate at all — the measured price of a setting the model never
+simulated.
+
+`offload_replay --out DIR` now dumps the pre-gate body as `req-*.json` and the
+post-gate body as `out/<request_id>.json`, so `cachesim.py compare` prices both
+arms with one function. The real gate replayed over blindguard bills **-4.8%**,
+matching the model exactly. The replay runs `offload_anthropic_request` and
+nothing else, so the whole 6.6pp lived in the stages it skips.
+
+Confirmed directly by rewriting production's own forwarded bodies from `1h` to
+`5m` and changing nothing else: **+1.8% becomes -4.8%**, the replay's number.
+Marker counts show why — production writes 15,446 message breakpoints against
+the replay's 7,699, and 15,400 of 15,400 system breakpoints at 1h where the
+client mix has 3,670 at 5m. `--force-1h-cache-ttl true` is set at
+`~/.headroom-flags.sh:232`; the code default is `false` (`config.rs:2425`).
+
+The setting is a straight trade between the two pricing axes:
+
+| | API | subscription |
+| --- | --- | --- |
+| production, 1h | +1.8% | -1.3% |
+| same bodies, 5m | -4.8% | +2.7% |
+
+1h wins by 4.0pp on subscription and loses by 6.6pp on API, which is what
+`cache_ttl.rs:20-30` says it should do: writes count at raw token count for
+rate limits with no TTL distinction, while a 1h write costs 2x base input
+against 1.25x for 5m. Keep it while paying by subscription; turn it off on
+API. Note the swing is not just the multiplier — at 5m the entries expire
+sooner and creates rise 30.8%, and 5m still wins on dollars even paying for
+those extra writes.
+
+Two things this leaves alone. The 3.1%-vs-0.16% rebuild-boundary discrepancy
+below is still unexplained, and the replay reproduced 245 boundaries of 7,839
+(3.1%) again. And `cachesim`'s `offload-gated-*` strategies still model the
+gate alone, so any future arm compared against production carries the same
+blind spot — dump and compare rather than trusting the strategy number.
 
 **Pricing is ruled out as a source (2026-08-21).** `pricing.rs` had Opus 5 at
 the retired Opus 4.1 rates — $15/$1.50 per MTok against the real $5/$0.50, a
