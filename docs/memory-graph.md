@@ -40,6 +40,28 @@ filter do not drop them on arrival.
 Partition rules are the same as for a direct match: the project's own
 partition plus the shared one, current memories only.
 
+### The scoring bug this uncovered
+
+Wiring the flag up exposed that retrieval had never worked at all. The live
+log held 7,265 consecutive `all_below_min_similarity` events — ten results
+found each time — and zero successes.
+
+`rank_to_score` is named for BM25 and written for it, but `CtxStore::search`
+fuses two ranked lists and overwrites `SearchHit::rank` with the negated RRF
+score. With `RRF_K = 60` the best hit obtainable is `2/(RRF_K + 1)` = 0.033,
+so `strength/(1+strength)` returned at most 0.032 against a default
+`min_similarity` of 0.3. The threshold was not mistuned; it sat ten times
+above the highest value the function could return.
+
+Fixed in `3cee05d1` by scaling the fused score by `RRF_K + 1` before the
+squash. `RRF_K` is public now, because anything converting `rank` into a
+similarity has to know which scale it is reading and the field name says the
+wrong one.
+
+Worth carrying forward: an earlier investigation cleared `min_similarity` by
+querying the FTS table directly, where ranks run -3.6 to -9.7 and map to
+0.78-0.91. Testing the index does not tell you what the search path returns.
+
 ### Backfill
 
 The edge table is built from existing records the first time a store opens

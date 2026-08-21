@@ -343,6 +343,17 @@ production truth until it is chased down.
 The 6.6pp gap itself is therefore still unexplained, and `ctx_offload.rs:626` is
 no longer the obvious suspect.
 
+**Pricing is ruled out as a source (2026-08-21).** `pricing.rs` had Opus 5 at
+the retired Opus 4.1 rates — $15/$1.50 per MTok against the real $5/$0.50, a
+3x overstatement, corrected in `85c32900`. That inflated the savings ledger
+(today's booked $9.02 is really $3.12) but it cannot touch this gap. Both
+sides of the comparison are weighted token counts, not dollars: cachesim's
+weights are relative to fresh input = 1.0, and `bench/cachesim.py` contains no
+dollar arithmetic at all — the only `usd` under `bench/` is `ab_replay.py:123`
+reading captured `costUSD`, a different tool. So the 6.6pp is a decision
+divergence, not a pricing-formula difference, and the harness below only has
+to explain where the decisions differ.
+
 **The five `meta`-partition memories are placed (2026-08-19).** The partition
 is now empty. Beacon, AWS and CLAUDE.md went to `default`; Cadence went to
 `default::encore-0000000000000000`; flaky_tests was deleted as stale — its
@@ -597,8 +608,10 @@ Ruled out, each checked directly:
 
 - injection budget — recall blocks peak at 4,060 bytes against 8,192, and
   `injection_budget_overrun` never fires
-- `min_similarity` — score is `|rank|/(1+|rank|)`; real BM25 ranks in this index
-  are -3.6 to -9.7, giving 0.78-0.91 against a 0.3 floor
+- ~~`min_similarity` — score is `|rank|/(1+|rank|)`; real BM25 ranks in this
+  index are -3.6 to -9.7, giving 0.78-0.91 against a 0.3 floor~~ **This was the
+  cause. See the resolution below — the check queried the FTS table directly
+  and never saw the number the search path actually produces.**
 - index completeness — all 434 records are indexed, 3,422 chunks
 - FTS5 syntax — a raw sentence does throw `syntax error near ","`, but
   `store.rs:630` sanitizes before matching
@@ -641,6 +654,36 @@ being sent is by definition not in the cached prefix. Pinned by
 
 This is a real bug but not the one that matters — it only covers the opening
 turns. It does not explain 1,929 turns of nothing.
+
+### Resolved: the score could never reach the floor (2026-08-21)
+
+It was `min_similarity` after all, and the check above is why it took two days
+to see. That check ran BM25 against the FTS table directly and got ranks of
+-3.6 to -9.7. The search path does not return those. `CtxStore::search` fuses
+two ranked lists and overwrites `SearchHit::rank` with the **negated RRF
+score** (`store.rs`, `rrf_search`), and with `RRF_K = 60` the best hit
+obtainable is `2/(RRF_K + 1)` = 0.033. Through `|rank|/(1+|rank|)` that capped
+the output at **0.032** against a floor of **0.3**.
+
+So no result could ever pass, for any query, at any threshold setting above
+0.032. Confirmed in the live log: 7,265 consecutive `all_below_min_similarity`
+events, each reporting ten results found, and not one success.
+
+Fixed in `3cee05d1` by scaling the fused score by `RRF_K + 1` before the
+squash: a single-list leader now scores 0.5, a both-list leader 0.67, and
+roughly the first fifty fused positions clear 0.3. Tests pin the property that
+broke — the best hit RRF can produce must be retrievable.
+
+The trap worth remembering: `SearchHit::rank` is named for BM25 and carries a
+fused score. Anything reading it has to know which scale it is on, and testing
+the index directly will not tell you.
+
+Two things this does not cover. The live proxy had no `HEADROOM_MEMORY_*` in
+its environment, so it ran `auto_tail` rather than the configured `tool` mode —
+`claude-launcher` sources the flags file only in the branch that starts the
+proxy, so a run reusing a live proxy exports nothing. And the backend's own
+tests never caught the scoring bug because they assert on presence and
+ordering, never on absolute score against the threshold.
 
 ## Allocator swap: measured, rejected (2026-08-19)
 
