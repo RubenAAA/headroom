@@ -140,20 +140,31 @@ impl CtxMemoryBackend {
     }
 }
 
-/// Map a BM25 rank (negative, more-negative = better) onto `(0, 1]`.
+/// Map a `SearchHit::rank` onto `(0, 1)`, rising with match strength.
 ///
-/// `1/(1 + |rank|)` is monotone decreasing in `|rank|`, so ordering is
-/// preserved exactly and a perfect hit approaches 1 without ever reaching it.
-/// Callers threshold this against `min_similarity`; it is a ranking signal,
-/// not a probability, and is not comparable across query shapes.
+/// The name says BM25, but `CtxStore::search` fuses two ranked lists and
+/// overwrites `rank` with the negated RRF score (`store.rs`, `rrf_search`).
+/// That number lives on a completely different scale: the best hit reachable
+/// — first place in both lists — is `2/(RRF_K + 1)`, about 0.033, and a
+/// single-list leader is half that.
+///
+/// Feeding those straight into `strength / (1 + strength)` capped the output
+/// at 0.032 while `min_similarity` defaults to 0.3, so *every* memory search
+/// was discarded in full: 7,265 consecutive `all_below_min_similarity` events
+/// in the live log with not one success. Not a threshold that wanted tuning —
+/// a threshold above the highest value the function could return.
+///
+/// So the fused score is scaled by `RRF_K + 1` before the squash, putting a
+/// single-list leader at 0.5 and a both-list leader at 0.67, and letting a
+/// threshold like 0.3 mean roughly "inside the first hundred or so fused
+/// positions". Still a ranking signal rather than a probability, and still
+/// not comparable across query shapes — but now on a scale a caller can
+/// threshold against.
 fn rank_to_score(rank: f64) -> f64 {
-    // FTS5 BM25 rank is negative and *more* negative for a better match, so
-    // similarity has to rise with `|rank|`. The previous `1/(1+|rank|)` did the
-    // opposite: a barely-related row (rank ~ -0.0001) scored ~0.9999 and a
-    // strong one (rank -5) scored 0.17. Every threshold in the caller then read
-    // backwards — `min_similarity` kept the worst hits, and the background
-    // deduper deleted unrelated memories for clearing 0.92.
-    let strength = rank.abs();
+    // Strictly monotone in `|rank|` with no clamp, so ordering survives even
+    // for a raw BM25 rank — a clamp would flatten every strong hit onto 1.0
+    // and lose the ordering the caller depends on.
+    let strength = rank.abs() * (headroom_core::ctx::RRF_K + 1.0);
     strength / (1.0 + strength)
 }
 
@@ -772,6 +783,20 @@ mod tests {
         // certifying the inversion that made every threshold in the caller
         // read backwards.
         assert!(rank_to_score(-10.0) > rank_to_score(-1.0));
+        // The bug that made every memory search return nothing: the best hit
+        // RRF can produce must clear the default `min_similarity` of 0.3.
+        let best_both_lists = 2.0 / (headroom_core::ctx::RRF_K + 1.0);
+        let best_single_list = 1.0 / (headroom_core::ctx::RRF_K + 1.0);
+        assert!(
+            rank_to_score(-best_both_lists) > 0.3,
+            "the best possible hit must be retrievable, got {}",
+            rank_to_score(-best_both_lists)
+        );
+        assert!(
+            rank_to_score(-best_single_list) > 0.3,
+            "a single-list leader must be retrievable too, got {}",
+            rank_to_score(-best_single_list)
+        );
         assert!(rank_to_score(-1.0) <= 1.0);
         assert!(rank_to_score(-1000.0) > 0.0);
         assert!(

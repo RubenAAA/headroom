@@ -47,7 +47,11 @@ const CHUNK_TITLE_MAX_CHARS: usize = 80;
 const WHITESPACE_BREAK_RATIO: f64 = 0.5;
 
 /// Standard Reciprocal Rank Fusion constant (Cormack et al. 2009).
-const RRF_K: f64 = 60.0;
+///
+/// Public because `SearchHit::rank` carries a *fused* score, not a BM25 rank,
+/// and anything mapping that onto a similarity has to know the scale it is
+/// working in: the best possible hit scores `2/(RRF_K + 1)`.
+pub const RRF_K: f64 = 60.0;
 
 /// STOPWORDS — verbatim from store.ts:51.
 const STOPWORDS: &[&str] = &[
