@@ -2137,7 +2137,7 @@ fn record_request_footprint(
 /// sending; `is_body` covers an incomplete response body read). We
 /// deliberately exclude `is_status`/`is_decode`/`is_builder`, which are
 /// not transport-transient and must not be retried.
-fn is_retryable_transport_error(e: &reqwest::Error) -> bool {
+pub(crate) fn is_retryable_transport_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
 }
 
@@ -2499,6 +2499,10 @@ pub(crate) async fn forward_http(
     // response returns.
     let mut original_buffered: bytes::Bytes = bytes::Bytes::new();
 
+    // The body as it goes on the wire, kept for the mid-stream retry below.
+    // Only the intercepting branch has one; the passthrough branch consumes the
+    // client's stream and cannot be re-sent.
+    let mut retry_body: Option<bytes::Bytes> = None;
     let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
         let max = state.config.compression_max_body_bytes as usize;
@@ -3056,6 +3060,12 @@ pub(crate) async fn forward_http(
                                 .unwrap_or_default();
                             let (new_tools, injected) =
                                 handler.inject_memory_tools(Some(&existing), provider);
+                            // Info, not debug: in tool mode this is the only
+                            // proof the model was ever offered memory. Without
+                            // it, "the tools never arrived" and "the model
+                            // chose not to call them" both read as an empty
+                            // log. Logged on both branches for that reason.
+                            let added = new_tools.len().saturating_sub(existing.len());
                             if injected {
                                 if let Some(obj) = value.as_object_mut() {
                                     obj.insert(
@@ -3063,11 +3073,19 @@ pub(crate) async fn forward_http(
                                         serde_json::Value::Array(new_tools),
                                     );
                                     changed = true;
-                                    tracing::debug!(
+                                    tracing::info!(
                                         request_id = %request_id,
-                                        "memory: injected tool definitions"
+                                        event = "memory_tools_injected",
+                                        tools_added = added,
+                                        tools_total = existing.len() + added,
                                     );
                                 }
+                            } else {
+                                tracing::info!(
+                                    request_id = %request_id,
+                                    event = "memory_tools_not_injected",
+                                    tools_present = existing.len(),
+                                );
                             }
                         }
                     }
@@ -3182,6 +3200,30 @@ pub(crate) async fn forward_http(
                         }
                     }
 
+                    // Memory: put back any answer held from a turn that also
+                    // called a client tool. This request carries the client's
+                    // `tool_result`, so the turn can finally be completed —
+                    // and because it goes out as part of this request, the
+                    // cache write it causes is the one this turn needed
+                    // anyway. Prefix replay carries the repaired history
+                    // forward from here.
+                    if let Some(messages) = value.get_mut("messages").and_then(|v| v.as_array_mut())
+                    {
+                        let applied = match crate::memory::deferred::store().lock() {
+                            Ok(mut held) if !held.is_empty() => held.apply(messages),
+                            _ => 0,
+                        };
+                        if applied > 0 {
+                            changed = true;
+                            tracing::info!(
+                                request_id = %request_id,
+                                event = "memory_answer_restored",
+                                restored = applied,
+                                "memory: held answer returned to its turn"
+                            );
+                        }
+                    }
+
                     // Memory: search and inject context into user message tail.
                     // Runs after output shaping, before final serialization.
                     if let Some(handler) = state.memory_handler.as_ref() {
@@ -3199,18 +3241,34 @@ pub(crate) async fn forward_http(
                             if let Some(messages) = value.get("messages").and_then(|v| v.as_array())
                             {
                                 let msgs: Vec<serde_json::Value> = messages.clone();
-                                let user_id = headers_snapshot
+                                let base_user_id = headers_snapshot
                                     .as_ref()
                                     .and_then(|h| h.get("x-headroom-user-id"))
                                     .and_then(|v| v.to_str().ok())
                                     .unwrap_or("default");
+                                // Same partition as the tool path, so switching
+                                // modes cannot make one project's memories
+                                // visible to another.
+                                let user_id = crate::memory::router::scoped_user_id(
+                                    base_user_id,
+                                    &crate::memory::router::RequestContext {
+                                        headers: header_map_to_lowercase_strings(
+                                            headers_snapshot.as_ref(),
+                                        ),
+                                        system_prompt: crate::memory::router::extract_system_prompt(
+                                            &value,
+                                        ),
+                                        base_user_id: base_user_id.to_string(),
+                                        project_root_override: None,
+                                    },
+                                );
                                 // Memory runs last, so it sees whatever the
                                 // expansion and recall stages left. Clipping
                                 // here is cache-safe: this appends to the live
                                 // tail, which is re-sent every turn anyway.
                                 if let Some(context) = handler
                                     .search_and_format_context(
-                                        user_id, &msgs, None, // request_context
+                                        &user_id, &msgs, None, // request_context
                                         None, // ranker
                                         None, // query
                                         None, // budget
@@ -3223,16 +3281,28 @@ pub(crate) async fn forward_http(
                                         )
                                     })
                                 {
-                                    let frozen = value
-                                        .get("system")
-                                        .and_then(|v| v.as_array())
-                                        .map(|a| a.len())
-                                        .unwrap_or(0);
+                                    // `frozen_message_count` indexes into
+                                    // `messages`. This passed the length of the
+                                    // *system* array instead — a count of system
+                                    // blocks standing in for a count of messages.
+                                    // With two system blocks the callee skipped
+                                    // `messages[0..2]`, so a conversation one or
+                                    // two messages long had no eligible tail and
+                                    // got no memory at all.
+                                    //
+                                    // Zero is the honest value here. The real
+                                    // frozen boundary comes from the prefix-replay
+                                    // tracker, which does not run until
+                                    // `apply_prefix_replay` further down. The
+                                    // guard is inert regardless: the callee walks
+                                    // backwards for the last user message, and the
+                                    // turn being sent is by definition not in the
+                                    // cached prefix.
                                     let (new_msgs, bytes) = crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
                                         &msgs,
                                         &context,
                                         provider,
-                                        frozen,
+                                        0,
                                     );
                                     if bytes > 0 {
                                         if let Some(msgs_val) = value.get_mut("messages") {
@@ -3739,6 +3809,23 @@ pub(crate) async fn forward_http(
             body_to_send
         };
 
+        // Ahead of prefix replay, which parks the forwarded message array in
+        // the replay store to overlay onto the next turn. Stripping after that
+        // would leave the store holding a block that never went on the wire,
+        // and every later turn would overlay it back in — the proxy's idea of
+        // the cached prefix drifting from the provider's, which is the shape
+        // of a `cache_recache_observed` mismatch. Running here also means the
+        // tail-breakpoint stage below lands its marker on the block that
+        // really ends the message.
+        let body_to_send = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) {
+            drop_unsigned_reasoning_blocks(body_to_send, &request_id)
+        } else {
+            body_to_send
+        };
+
         // `headers_snapshot` is always `Some` on this buffered branch;
         // `replay_original_messages` is `Some` only when the flag is on
         // and the body carried a messages array.
@@ -4009,6 +4096,8 @@ pub(crate) async fn forward_http(
             }
         }
 
+        retry_body = Some(body_to_send.clone());
+
         // Forward the request with retry on transient errors (429, 529, 5xx).
         let max_attempts = if state.config.retry_enabled {
             state.config.retry_max_attempts.max(1)
@@ -4221,7 +4310,7 @@ pub(crate) async fn forward_http(
         (
             state
                 .client
-                .request(reqwest_method, upstream_url.clone())
+                .request(reqwest_method.clone(), upstream_url.clone())
                 .headers(outgoing_headers.clone())
                 .body(reqwest_body)
                 .send()
@@ -4388,6 +4477,38 @@ pub(crate) async fn forward_http(
             futures_util::stream::iter((!sse_prefix.is_empty()).then(|| Ok(sse_prefix.clone())));
         head.chain(rest)
     };
+    // A stream that dies part-way leaves the turn dead, and the retry loop above
+    // is long gone by then — it only ever saw the headers. This wrapper holds the
+    // opening bytes back so an early drop can start a new request instead of
+    // reaching the client. It sits below CCR and below the telemetry tee, so a
+    // discarded attempt is invisible to both.
+    let upstream_body: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+    > = if let Some(body) = retry_body.filter(|_| {
+        is_sse
+            && status.is_success()
+            && state.config.retry_enabled
+            && state.config.retry_stream_hold_bytes > 0
+            && state.config.retry_max_attempts > 1
+    }) {
+        Box::pin(crate::sse::stream_retry::retry_on_early_drop(
+            upstream_body,
+            crate::sse::stream_retry::RetryContext {
+                client: state.client.clone(),
+                method: reqwest_method.clone(),
+                url: upstream_url.to_string(),
+                headers: outgoing_headers.clone(),
+                body,
+                request_id: request_id.clone(),
+                max_attempts: state.config.retry_max_attempts,
+                base_delay_ms: state.config.retry_base_delay_ms,
+                max_delay_ms: state.config.retry_max_delay_ms,
+                hold_bytes: state.config.retry_stream_hold_bytes,
+            },
+        ))
+    } else {
+        Box::pin(upstream_body)
+    };
     let (upstream_body, ccr_round_usage): (
         std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
         Option<Arc<Mutex<CcrRoundUsage>>>,
@@ -4406,7 +4527,13 @@ pub(crate) async fn forward_http(
             config: state.config.clone(),
             request_id: request_id.clone(),
             shape: crate::sse::ccr_stream::CcrShape::Anthropic,
-            memory: memory_tool_context(&state, &headers_snapshot, Some("anthropic")).await,
+            memory: memory_tool_context(
+                &state,
+                &headers_snapshot,
+                Some("anthropic"),
+                &original_buffered,
+            )
+            .await,
         };
         let (stream, usage) = crate::sse::ccr_stream::rewrite_anthropic_stream(upstream_body, ctx);
         (Box::pin(stream), Some(usage))
@@ -4642,8 +4769,13 @@ pub(crate) async fn forward_http(
                 } else {
                     None
                 };
-                if let Some(memory) =
-                    memory_tool_context(&state, &headers_snapshot, memory_provider).await
+                if let Some(memory) = memory_tool_context(
+                    &state,
+                    &headers_snapshot,
+                    memory_provider,
+                    &original_buffered,
+                )
+                .await
                 {
                     if let Some(provider) = memory_provider {
                         let (resolved, extra) = handle_memory_response(
@@ -4923,6 +5055,17 @@ pub(crate) async fn forward_http(
                 Body::from(format!("upstream response buffering failed: {e}"))
             }
         }
+    } else if is_sse && status.is_success() && matches!(sse_kind, SseStreamKind::Anthropic) {
+        // Last stop before the client. `retry_on_early_drop` above saves the
+        // drops it can still take back; past that point the only thing left to
+        // save is the shape of the reply. This closes an interrupted message
+        // properly — marked as truncated — so a dead connection costs one
+        // short answer instead of the session. It runs above the telemetry
+        // tee, so accounting still books the turn as the incomplete one it was.
+        Body::from_stream(crate::sse::stream_finisher::finish_on_drop(
+            resp_stream,
+            request_id.clone(),
+        ))
     } else {
         Body::from_stream(resp_stream)
     };
@@ -5105,12 +5248,139 @@ fn signed_reasoning_blocks(messages: &[serde_json::Value]) -> Vec<&serde_json::V
         .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
         .flatten()
         .filter(|b| {
-            matches!(
+            let is_reasoning = matches!(
                 b.get("type").and_then(|t| t.as_str()),
                 Some("thinking") | Some("redacted_thinking")
-            )
+            );
+            // Genuinely signed, as the name says. What this guards is
+            // Anthropic's refusal of a *signed* block that came back altered,
+            // and a block with no signature has nothing to violate. Counting
+            // those too would make `drop_unsigned_reasoning_blocks` — the one
+            // stage that is meant to remove them — look like tampering, and
+            // the restore below would put back the block that upstream is
+            // about to refuse.
+            is_reasoning && !is_unsigned_reasoning(b)
         })
         .collect()
+}
+
+/// Drop `thinking` blocks that carry no signature.
+///
+/// The counterpart to `sse::stream_finisher`. When an upstream stream dies
+/// with a thinking block open, the finisher closes that block so the turn ends
+/// cleanly — but the `signature_delta` never arrived, so the block the client
+/// stores is unsigned. Anthropic refuses a thinking block without a valid
+/// signature, which would turn one truncated answer into a conversation that
+/// can no longer be sent at all.
+///
+/// So the blocks the proxy had to cut short are dropped on their way back up.
+/// This runs first among the stages that care, ahead of prefix replay and the
+/// tail breakpoint, so every one of them sees the message array that actually
+/// reaches the provider. Stripping later would leave the replay store holding
+/// a block that never went on the wire and overlaying it back in on every
+/// later turn, which costs a re-cache rather than a refused turn.
+///
+/// `signed_reasoning_blocks` excludes exactly what this removes, so the
+/// tampering guard downstream never mistakes this for a rewrite.
+///
+/// Signed blocks are never touched, and neither is a body without an unsigned
+/// one — which is every body that never met a dropped stream.
+fn drop_unsigned_reasoning_blocks(body_to_send: bytes::Bytes, request_id: &str) -> bytes::Bytes {
+    // Cheap gate: the overwhelming majority of bodies have no reasoning block
+    // at all, and this spares them a parse.
+    const MARKER: &[u8] = b"\"thinking\"";
+    if !body_to_send.windows(MARKER.len()).any(|w| w == MARKER) {
+        return body_to_send;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body_to_send) else {
+        return body_to_send;
+    };
+    let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return body_to_send;
+    };
+    let mut dropped = 0usize;
+    let mut markers_moved = 0usize;
+    for message in messages.iter_mut() {
+        let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        // Removing every block would leave a message with empty content, which
+        // upstream refuses just as firmly as the unsigned block does. Nothing
+        // this proxy writes looks like that — `stream_finisher` always leaves a
+        // text block behind — but history the proxy did not write reaches here
+        // too, and trading one bad turn for a different bad turn is no trade.
+        if content.iter().all(is_unsigned_reasoning) {
+            continue;
+        }
+        // A `cache_control` marker on a doomed block is a cache breakpoint, and
+        // dropping it silently would move the cached prefix boundary and cost a
+        // re-cache on every later turn of the conversation. It rides to the
+        // next surviving block instead — the same carry `thinking_compactor`
+        // makes when it rewrites a block out from under a marker.
+        let mut carried: Option<serde_json::Value> = None;
+        let mut kept: Vec<serde_json::Value> = Vec::with_capacity(content.len());
+        for mut block in content.drain(..) {
+            if is_unsigned_reasoning(&block) {
+                dropped += 1;
+                if let Some(cc) = block.get("cache_control") {
+                    carried = Some(cc.clone());
+                }
+                continue;
+            }
+            if let Some(cc) = carried.take() {
+                // An existing marker wins: a second one here would spend a
+                // breakpoint on the same boundary, and there are only four.
+                if block.get("cache_control").is_none() {
+                    block["cache_control"] = cc;
+                    markers_moved += 1;
+                }
+            }
+            kept.push(block);
+        }
+        // Still carrying means the dropped block was last, so the marker goes
+        // to whatever ends the message now.
+        if let Some(cc) = carried {
+            if let Some(last) = kept.last_mut() {
+                if last.get("cache_control").is_none() {
+                    last["cache_control"] = cc;
+                    markers_moved += 1;
+                }
+            }
+        }
+        *content = kept;
+    }
+    if dropped == 0 {
+        return body_to_send;
+    }
+    let Ok(out) = serde_json::to_vec(&v) else {
+        return body_to_send;
+    };
+    tracing::info!(
+        request_id = %request_id,
+        event = "unsigned_reasoning_blocks_dropped",
+        dropped,
+        markers_moved,
+        "removed thinking blocks with no signature; they are the tail of a \
+         stream that died mid-block and upstream would refuse them"
+    );
+    bytes::Bytes::from(out)
+}
+
+/// A `thinking` block the model never got to sign.
+///
+/// `redacted_thinking` carries opaque `data` rather than a signature and is
+/// always delivered whole, so a block with `data` is complete whatever its
+/// signature says.
+fn is_unsigned_reasoning(block: &serde_json::Value) -> bool {
+    let is_reasoning = matches!(
+        block.get("type").and_then(|t| t.as_str()),
+        Some("thinking") | Some("redacted_thinking")
+    );
+    let unsigned = block
+        .get("signature")
+        .and_then(|s| s.as_str())
+        .is_none_or(|s| s.is_empty());
+    is_reasoning && unsigned && block.get("data").is_none()
 }
 
 /// Put the client's message array back when the outbound body no longer
@@ -5767,6 +6037,19 @@ pub(crate) fn apply_prefix_replay(
         (body, optimized)
     };
 
+    // A side errand shares this conversation's session key but is not a step in
+    // it. Parking it would make it the session's "previous turn", and the next
+    // real turn would diverge at the final message and recache from there.
+    if cache_stabilization::prefix_replay::is_side_errand(&original_messages) {
+        tracing::info!(
+            event = "prefix_replay_side_errand_not_parked",
+            request_id = %request_id,
+            messages = original_messages.len(),
+            "prefix replay: side errand left out of the store"
+        );
+        return final_body;
+    }
+
     store.begin_request(
         request_id,
         session_key,
@@ -6174,6 +6457,41 @@ async fn run_sse_state_machine(
                     }
                 }
             }
+            // A stream can end with its last event unterminated: the framer
+            // only yields a block once it sees the blank line, so a
+            // `message_stop` that straddles the final two chunks sits in the
+            // buffer and the turn reads as unfinished. Supplying the
+            // terminator here costs nothing when the provider sent one.
+            if framer.buffered_len() > 0 {
+                let stranded = framer.buffered_len();
+                framer.push(b"\n\n");
+                while let Some(ev_result) = framer.next_event() {
+                    match ev_result {
+                        Ok(ev) => {
+                            if let Err(e) = state.apply(ev) {
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    error = %e,
+                                    "sse anthropic state-machine apply error"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                error = %e,
+                                "sse framer error"
+                            );
+                        }
+                    }
+                }
+                tracing::warn!(
+                    request_id = %request_id,
+                    event = "sse_tail_flushed",
+                    stranded_bytes = stranded,
+                    "flushed an unterminated trailing event at end of stream"
+                );
+            }
             // Snapshot hidden continuation usage before any cache observer
             // runs. The final streamed usage belongs to the proxy's private
             // continuation request; the first discarded response below is the
@@ -6188,6 +6506,28 @@ async fn run_sse_state_machine(
                     state.usage.cache_read_input_tokens,
                     state.usage.cache_creation_input_tokens,
                 );
+            // The baseline above is the right thing to classify against and the
+            // wrong thing to bill: it drops the continuation rounds, which the
+            // provider charged for and which `savings_pricing_counterfactual`
+            // already counts off the outcome. Hand the observer the full total
+            // so the two events agree on one request's billed usage.
+            if ccr_rounds.rounds > 0 {
+                usage_observer.note_billed_totals(
+                    &request_id,
+                    state
+                        .usage
+                        .input_tokens
+                        .saturating_add(ccr_rounds.input_tokens.max(0) as u64),
+                    state
+                        .usage
+                        .cache_read_input_tokens
+                        .saturating_add(ccr_rounds.cache_read_tokens.max(0) as u64),
+                    state
+                        .usage
+                        .cache_creation_input_tokens
+                        .saturating_add(ccr_rounds.cache_write_tokens.max(0) as u64),
+                );
+            }
 
             // Phase G PR-G3 + H2: emit per-session cache-hit-rate
             // ONLY when the stream completed cleanly with
@@ -6283,6 +6623,21 @@ async fn run_sse_state_machine(
                 blocks = state.blocks.len(),
                 "sse stream closed"
             );
+            // A turn the client will refuse whole: it was told a tool call
+            // was coming and got nothing it can run. Warn here or the only
+            // symptom is "tool call could not be parsed" on the far side,
+            // with a clean `sse stream closed` on this one.
+            if let Some(defect) = state.tool_call_defect() {
+                tracing::warn!(
+                    event = "tool_call_defect",
+                    request_id = %request_id,
+                    kind = defect.kind(),
+                    stop_reason = state.stop_reason.as_deref().unwrap_or(""),
+                    output_tokens = state.usage.output_tokens,
+                    detail = %defect,
+                    "upstream declared a tool call the client cannot execute"
+                );
+            }
             // Same H2 gate the three consumers above use, and for the same
             // reason. Anthropic reports the turn's final `output_tokens` in
             // the `message_delta` that precedes `message_stop`; a stream cut
@@ -6292,7 +6647,16 @@ async fn run_sse_state_machine(
             // cheap one once it is in the ledger. Dropping the turn also
             // under-reports, but visibly: the counter says how many turns the
             // books are missing, and the log below keeps the partial numbers.
-            let stream_completed = state.status == crate::sse::anthropic::StreamStatus::MessageStop;
+            // Anthropic reports the turn's final `output_tokens` in the
+            // `message_delta` that precedes `message_stop`, and only that
+            // delta carries a `stop_reason`. So a stop_reason in hand means
+            // the usage is the final figure and booking it is exact, not the
+            // partial count the comment above warns about — the terminator
+            // that follows carries no usage of its own. Without a stop_reason
+            // the totals really are mid-flight, and the turn is still dropped.
+            let usage_is_final = state.stop_reason.is_some();
+            let stream_completed =
+                state.status == crate::sse::anthropic::StreamStatus::MessageStop || usage_is_final;
             if !stream_completed {
                 crate::observability::record_stream_incomplete("anthropic");
                 // Also booked into the persisted savings state, so the lifetime
@@ -6311,6 +6675,20 @@ async fn run_sse_state_machine(
                     partial_output_tokens = state.usage.output_tokens,
                     "stream ended without message_stop; usage is partial, \
                      so this turn is not booked into cost or savings"
+                );
+            } else if state.status != crate::sse::anthropic::StreamStatus::MessageStop {
+                // Booked on a final stop_reason, but the stream still ended
+                // without its terminator. Say so: the turn's numbers are
+                // right, and the missing tail is a fault worth seeing.
+                tracing::warn!(
+                    request_id = %request_id,
+                    event = "stream_booked_without_message_stop",
+                    provider = "anthropic",
+                    status = ?state.status,
+                    stop_reason = state.stop_reason.as_deref().unwrap_or(""),
+                    output_tokens = state.usage.output_tokens,
+                    "stream ended without message_stop but carried a final \
+                     stop_reason; usage is final, so the turn is booked"
                 );
             }
             // Fold in the CCR continuation rounds, exactly as the buffered
@@ -7535,6 +7913,7 @@ async fn memory_tool_context(
     state: &AppState,
     headers_snapshot: &Option<HeaderMap>,
     provider: Option<&str>,
+    request_body: &bytes::Bytes,
 ) -> Option<MemoryToolContext> {
     let handler = state.memory_handler.as_ref()?;
     if !handler.lock().await.is_initialized() {
@@ -7544,12 +7923,25 @@ async fn memory_tool_context(
         "anthropic" => crate::memory::tool_adapter::Provider::Anthropic,
         _ => crate::memory::tool_adapter::Provider::Openai,
     };
-    let user_id = headers_snapshot
+    let base_user_id = headers_snapshot
         .as_ref()
         .and_then(|h| h.get("x-headroom-user-id"))
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("default")
-        .to_string();
+        .unwrap_or("default");
+    // The project comes from the system prompt's working directory, since
+    // Claude Code sends no project header. It is resolved here rather than read
+    // from `project_context`, which is a thread-local and so cannot be trusted
+    // across an await on a multi-threaded runtime.
+    let parsed: serde_json::Value = serde_json::from_slice(request_body).unwrap_or_default();
+    let user_id = crate::memory::router::scoped_user_id(
+        base_user_id,
+        &crate::memory::router::RequestContext {
+            headers: header_map_to_lowercase_strings(headers_snapshot.as_ref()),
+            system_prompt: crate::memory::router::extract_system_prompt(&parsed),
+            base_user_id: base_user_id.to_string(),
+            project_root_override: None,
+        },
+    );
     Some(MemoryToolContext {
         handler: handler.clone(),
         provider,
@@ -7616,6 +8008,42 @@ pub(crate) async fn handle_memory_response(
         return (body_bytes.clone(), round_usage);
     };
 
+    // A client tool call sharing the turn makes a continuation impossible: it
+    // would send upstream an assistant turn whose client `tool_use` has no
+    // `tool_result` — the client has not run it yet — and upstream rejects the
+    // whole request, losing the memory answer with it. Answer the memory call
+    // now and hold the answer for the next request, which carries that result.
+    // Anthropic only: the holding area works in Anthropic block shapes.
+    if provider == "anthropic" {
+        let (ours, client_ids) = crate::memory::deferred::split_tool_calls(&response);
+        if !ours.is_empty() && !client_ids.is_empty() {
+            let results = {
+                let handler = memory.handler.lock().await;
+                handler
+                    .handle_memory_tool_calls(&response, &memory.user_id, memory.provider, None)
+                    .await
+            };
+            let held = pair_results_with_calls(&ours, &results, &client_ids);
+            let count = held.len();
+            if let Ok(mut store) = crate::memory::deferred::store().lock() {
+                for pending in held {
+                    store.hold(pending);
+                }
+            }
+            tracing::info!(
+                request_id = %request_id,
+                event = "memory_answer_deferred",
+                held = count,
+                client_tool_calls = client_ids.len(),
+                "memory: turn also calls a client tool; holding the answer for \
+                 the next request"
+            );
+            // The calls have run. Leave the turn alone so the client's own tool
+            // call reaches it untouched.
+            return (body_bytes.clone(), round_usage);
+        }
+    }
+
     // Reused purely for its provider-aware message shaping — the CCR handler
     // knows how each provider wants an assistant turn and a tool result
     // expressed, and memory results go back the same way.
@@ -7669,27 +8097,58 @@ pub(crate) async fn handle_memory_response(
             results_count = results.len(),
             "memory: sending continuation request"
         );
-        let Ok(resp) = client
-            .post(upstream_url.clone())
-            .headers(outgoing_headers.clone())
-            .body(continuation_body)
-            .send()
-            .await
-        else {
-            tracing::warn!(
-                request_id = %request_id,
-                "memory: upstream request failed during continuation"
-            );
-            break;
+        // A failed continuation takes the memory call down with it: the block
+        // is already suppressed, so the tool the model asked for never runs and
+        // the turn reaches the client short one tool call. Transport blips and
+        // 429/5xx get another attempt; anything else is a body we built wrong,
+        // so keep what upstream objected to instead of dropping it.
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            match client
+                .post(upstream_url.clone())
+                .headers(outgoing_headers.clone())
+                .body(continuation_body.clone())
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => break Some(r),
+                Ok(r) => {
+                    let status = r.status();
+                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    if retryable && attempt < MEMORY_CONTINUATION_RETRIES {
+                        attempt += 1;
+                        tokio::time::sleep(memory_continuation_backoff(attempt)).await;
+                        continue;
+                    }
+                    let detail = r.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        request_id = %request_id,
+                        status = %status,
+                        attempt,
+                        round = rounds + 1,
+                        detail = %first_bytes(&detail, 600),
+                        "memory: upstream returned error during continuation"
+                    );
+                    break None;
+                }
+                Err(e) => {
+                    if attempt < MEMORY_CONTINUATION_RETRIES && is_retryable_transport_error(&e) {
+                        attempt += 1;
+                        tokio::time::sleep(memory_continuation_backoff(attempt)).await;
+                        continue;
+                    }
+                    tracing::warn!(
+                        request_id = %request_id,
+                        attempt,
+                        round = rounds + 1,
+                        error = %e,
+                        "memory: upstream request failed during continuation"
+                    );
+                    break None;
+                }
+            }
         };
-        if !resp.status().is_success() {
-            tracing::warn!(
-                request_id = %request_id,
-                status = %resp.status(),
-                "memory: upstream returned error during continuation"
-            );
-            break;
-        }
+        let Some(resp) = resp else { break };
         let Ok(bytes) = resp.bytes().await else { break };
         round_usage.add_response(&current_response);
         let Ok(next) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -7699,10 +8158,79 @@ pub(crate) async fn handle_memory_response(
         rounds += 1;
     }
 
+    // The cap is the other way a memory call gets stranded: the block is
+    // suppressed, the round budget runs out, and the tool never runs. Say so —
+    // the alternative is a turn quietly missing work the model asked for.
+    if rounds >= config.ccr_max_retrieval_rounds {
+        let still_pending = {
+            let handler = memory.handler.lock().await;
+            handler.has_memory_tool_calls(&current_response, memory.provider)
+        };
+        if still_pending {
+            tracing::warn!(
+                request_id = %request_id,
+                rounds,
+                "memory: retrieval round cap reached with calls outstanding; \
+                 raise HEADROOM_CCR_MAX_RETRIEVAL_ROUNDS"
+            );
+        }
+    }
+
     match serde_json::to_vec(&current_response) {
         Ok(bytes) => (bytes::Bytes::from(bytes), round_usage),
         Err(_) => (body_bytes.clone(), round_usage),
     }
+}
+
+/// Retries for a memory continuation that fails for a reason that may pass.
+const MEMORY_CONTINUATION_RETRIES: u32 = 2;
+
+/// Backoff before continuation attempt `attempt` (1-based): 250ms, then 500ms.
+fn memory_continuation_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(250u64 << (attempt.saturating_sub(1)).min(4))
+}
+
+/// Leading bytes of an upstream error body, for a log line that has to stay
+/// one line. Upstream puts the useful part first.
+fn first_bytes(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.replace('\n', " ");
+    }
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}…[{} more bytes]",
+        &s[..end].replace('\n', " "),
+        s.len() - end
+    )
+}
+
+/// Match each memory `tool_use` with the `tool_result` answering it.
+///
+/// A call whose answer is missing is skipped: restoring it would put an
+/// unanswered `tool_use` back into the history, which is the failure this
+/// whole path avoids.
+fn pair_results_with_calls(
+    calls: &[serde_json::Value],
+    results: &[serde_json::Value],
+    client_ids: &[String],
+) -> Vec<crate::memory::deferred::PendingMemoryResult> {
+    calls
+        .iter()
+        .filter_map(|call| {
+            let id = call.get("id").and_then(serde_json::Value::as_str)?;
+            let answer = results
+                .iter()
+                .find(|r| r.get("tool_use_id").and_then(serde_json::Value::as_str) == Some(id))?;
+            Some(crate::memory::deferred::PendingMemoryResult::new(
+                call.clone(),
+                answer.clone(),
+                client_ids.to_vec(),
+            ))
+        })
+        .collect()
 }
 
 /// Wrap provider-shaped memory tool results for the continuation array.
@@ -8956,6 +9484,221 @@ mod tests {
             event.values().all(|value| !value.contains(session_key)),
             "the raw session key must never be written to the event: {event:?}"
         );
+    }
+
+    // ── drop_unsigned_reasoning_blocks ───────────────────────────
+    //
+    // The counterpart to `sse::stream_finisher`. These pin the two things that
+    // make it safe to run on every Anthropic turn: it is inert unless a stream
+    // actually died mid-thinking, and when it does fire it does not move the
+    // prompt-cache boundary.
+
+    fn body_with(messages: serde_json::Value) -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"model": "claude", "messages": messages}))
+                .unwrap(),
+        )
+    }
+
+    fn messages_of(body: &bytes::Bytes) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(body).unwrap()["messages"].clone()
+    }
+
+    #[test]
+    fn unsigned_reasoning_drop_is_inert_without_an_unsigned_block() {
+        // No reasoning at all: not even parsed, and byte-identical out.
+        let plain = body_with(serde_json::json!([{"role": "user", "content": "hi"}]));
+        assert_eq!(drop_unsigned_reasoning_blocks(plain.clone(), "r"), plain);
+
+        // A signed block is a real one and must survive untouched.
+        let signed = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "t", "signature": "sig"},
+                {"type": "text", "text": "answer"},
+            ],
+        }]));
+        assert_eq!(drop_unsigned_reasoning_blocks(signed.clone(), "r"), signed);
+
+        // `redacted_thinking` carries `data`, never a signature.
+        let redacted = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "answer"},
+            ],
+        }]));
+        assert_eq!(
+            drop_unsigned_reasoning_blocks(redacted.clone(), "r"),
+            redacted
+        );
+    }
+
+    #[test]
+    fn unsigned_reasoning_is_dropped_and_the_turn_stays_sendable() {
+        // The shape `stream_finisher` leaves behind: thinking cut off before
+        // its signature, then the truncation marker as text.
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "half a thought"},
+                {"type": "text", "text": "[truncated: ...]"},
+            ],
+        }]));
+        let out = drop_unsigned_reasoning_blocks(body, "r");
+        let content = &messages_of(&out)[0]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn a_cache_breakpoint_on_a_dropped_block_moves_rather_than_vanishes() {
+        // The marker sits on the doomed block. Losing it would shift the cached
+        // prefix boundary and cost a re-cache on every later turn.
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "half",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": "tail"},
+            ],
+        }]));
+        let out = drop_unsigned_reasoning_blocks(body, "r");
+        let content = messages_of(&out)[0]["content"].clone();
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        assert_eq!(
+            content[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "the breakpoint should have carried to the surviving block"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_carries_backwards_when_the_dropped_block_was_last() {
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "lead"},
+                {
+                    "type": "thinking",
+                    "thinking": "half",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+        }]));
+        let out = drop_unsigned_reasoning_blocks(body, "r");
+        let content = messages_of(&out)[0]["content"].clone();
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        assert_eq!(
+            content[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_is_never_doubled_onto_a_block_that_has_one() {
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "half",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": "tail",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+        }]));
+        let out = drop_unsigned_reasoning_blocks(body, "r");
+        let content = messages_of(&out)[0]["content"].clone();
+        assert_eq!(
+            content[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+            "the block's own marker wins; breakpoints are a budget of four"
+        );
+    }
+
+    #[test]
+    fn a_message_is_left_alone_when_dropping_would_empty_it() {
+        // Upstream refuses empty content as firmly as it refuses the unsigned
+        // block, so there is nothing to gain by trading one for the other.
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "half"}],
+        }]));
+        assert_eq!(drop_unsigned_reasoning_blocks(body.clone(), "r"), body);
+    }
+
+    #[test]
+    fn dropping_is_idempotent_so_the_prefix_holds_across_turns() {
+        // The property the cache depends on: once a truncated turn is in the
+        // history, every later turn carries it, and each must produce the same
+        // bytes upstream or the prefix moves under the cache every turn.
+        let body = body_with(serde_json::json!([
+            {"role": "user", "content": "q"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "half"},
+                    {"type": "text", "text": "[truncated: ...]"},
+                ],
+            },
+            {"role": "user", "content": "carry on"},
+        ]));
+        let once = drop_unsigned_reasoning_blocks(body, "r");
+        let twice = drop_unsigned_reasoning_blocks(once.clone(), "r");
+        assert_eq!(once, twice, "a second pass must change nothing");
+    }
+
+    #[test]
+    fn the_tampering_guard_does_not_see_an_unsigned_drop_as_a_rewrite() {
+        // `restore_client_reasoning_blocks` reverts the whole message array
+        // when the outbound signed blocks stop matching the client's. If it
+        // counted unsigned ones it would revert this drop every turn — and
+        // with it every byte of compression on that turn.
+        let client: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "real", "signature": "sig"},
+                {"type": "thinking", "thinking": "half"},
+                {"type": "text", "text": "tail"},
+            ],
+        }]))
+        .unwrap();
+        let dropped = drop_unsigned_reasoning_blocks(
+            body_with(serde_json::Value::Array(client.clone())),
+            "r",
+        );
+        let forwarded: Vec<serde_json::Value> =
+            serde_json::from_value(messages_of(&dropped)).unwrap();
+        assert_eq!(
+            signed_reasoning_blocks(&client),
+            signed_reasoning_blocks(&forwarded),
+            "dropping an unsigned block must leave the signed set identical"
+        );
+    }
+
+    #[test]
+    fn a_signed_block_beside_an_unsigned_one_survives_verbatim() {
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "real", "signature": "sig"},
+                {"type": "thinking", "thinking": "half"},
+                {"type": "text", "text": "tail"},
+            ],
+        }]));
+        let out = drop_unsigned_reasoning_blocks(body, "r");
+        let content = messages_of(&out)[0]["content"].clone();
+        assert_eq!(content.as_array().unwrap().len(), 2);
+        assert_eq!(content[0]["signature"], "sig");
+        assert_eq!(content[0]["thinking"], "real");
     }
 
     #[test]

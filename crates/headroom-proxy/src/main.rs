@@ -129,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    spawn_resource_heartbeat();
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -205,4 +207,45 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received");
+}
+
+/// Log the process's own memory and thread count once a minute.
+///
+/// The proxy reported plenty about the traffic it shaped and nothing about
+/// what it cost to run, so a leak or a thread pile-up could only be caught by
+/// watching from outside with `ps`. One line a minute is cheap and gives the
+/// growth a shape after the fact.
+///
+/// Reads `/proc/self/status`, so it is a no-op on platforms without it.
+fn spawn_resource_heartbeat() {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        // The first tick fires at once; skip it so the reading is not taken
+        // before the server has finished coming up.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+                return;
+            };
+            let field = |name: &str| -> u64 {
+                status
+                    .lines()
+                    .find(|l| l.starts_with(name))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            let open_fds = std::fs::read_dir("/proc/self/fd")
+                .map(|d| d.count() as u64)
+                .unwrap_or(0);
+            tracing::info!(
+                event = "resource_heartbeat",
+                rss_mb = field("VmRSS:") / 1024,
+                peak_rss_mb = field("VmHWM:") / 1024,
+                threads = field("Threads:"),
+                open_fds,
+            );
+        }
+    });
 }

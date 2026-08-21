@@ -1213,11 +1213,11 @@ pub struct CliArgs {
     )]
     pub ccr_handle_responses: bool,
 
-    /// CCR: max rounds of retrieve-continue per response. Default `3`.
+    /// CCR: max rounds of retrieve-continue per response. Default `8`.
     #[arg(
         long = "ccr-max-retrieval-rounds",
         env = "HEADROOM_CCR_MAX_RETRIEVAL_ROUNDS",
-        default_value_t = 3
+        default_value_t = 8
     )]
     pub ccr_max_retrieval_rounds: usize,
 
@@ -1257,6 +1257,26 @@ pub struct CliArgs {
         default_value_t = 6
     )]
     pub retry_overload_max_attempts: u32,
+
+    /// Bytes of a streamed response held back before it counts as committed.
+    /// Default `2048`. `0` disables the mid-stream retry.
+    ///
+    /// A body that dies mid-stream cannot be re-sent blind: across 18 observed
+    /// drops the parser had a content block open every time, 1 to 20 output
+    /// tokens in, so a second attempt would splice two generations together.
+    /// Holding the opening bytes keeps the response uncommitted long enough to
+    /// start over instead, and 2 KiB covers the preamble plus roughly a dozen
+    /// deltas — past every drop seen so far.
+    ///
+    /// The trade is time to first paint: this much of every stream arrives in
+    /// one burst rather than token by token. Raise it to cover later drops,
+    /// lower it to hand the first token over sooner.
+    #[arg(
+        long = "retry-stream-hold-bytes",
+        env = "HEADROOM_RETRY_STREAM_HOLD_BYTES",
+        default_value_t = 2048
+    )]
+    pub retry_stream_hold_bytes: usize,
 
     /// Base delay for exponential backoff in milliseconds. Default `1000`.
     #[arg(
@@ -2000,6 +2020,8 @@ pub struct Config {
     /// Max retry attempts per upstream call.
     pub retry_max_attempts: u32,
     pub retry_overload_max_attempts: u32,
+    /// Bytes held back before a streamed response counts as committed.
+    pub retry_stream_hold_bytes: usize,
     /// Base delay for exponential backoff (ms).
     pub retry_base_delay_ms: u64,
     /// Ceiling on backoff delay (ms).
@@ -2275,6 +2297,7 @@ impl Config {
             retry_enabled: args.retry_enabled,
             retry_max_attempts: args.retry_max_attempts,
             retry_overload_max_attempts: args.retry_overload_max_attempts,
+            retry_stream_hold_bytes: args.retry_stream_hold_bytes,
             retry_base_delay_ms: args.retry_base_delay_ms,
             retry_max_delay_ms: args.retry_max_delay_ms,
             cost_tracking_enabled: args.cost_tracking_enabled,
@@ -2447,10 +2470,11 @@ impl Config {
             cache_max_entries: 1000,
             ccr_inject_tool: true,
             ccr_handle_responses: true,
-            ccr_max_retrieval_rounds: 3,
+            ccr_max_retrieval_rounds: 8,
             retry_enabled: true,
             retry_max_attempts: 3,
             retry_overload_max_attempts: 6,
+            retry_stream_hold_bytes: 2048,
             retry_base_delay_ms: 1000,
             retry_max_delay_ms: 30000,
             cost_tracking_enabled: true,
