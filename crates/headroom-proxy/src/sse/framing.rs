@@ -179,6 +179,21 @@ impl SseFramer {
     pub fn take_remaining(&mut self) -> Bytes {
         std::mem::take(&mut self.buf).freeze()
     }
+
+    /// Drain the next complete event as raw bytes, terminator included.
+    ///
+    /// [`SseFramer::next_event`] parses, and in doing so it drops anything
+    /// with no `data:` line — comments, blank events, `: ping` keepalives.
+    /// That is right for a state machine reading for telemetry and wrong for
+    /// anything forwarding bytes on to a client, which owes the client its
+    /// keepalives and the provider's exact spelling of every event. This
+    /// returns the block untouched and leaves parsing to the caller.
+    pub fn next_raw_block(&mut self) -> Option<Bytes> {
+        let (block_end, term_len) = find_double_newline(&self.buf)?;
+        // `split_to` is O(1) on BytesMut; freezing hands out a refcounted
+        // view rather than copying the event.
+        Some(self.buf.split_to(block_end + term_len).freeze())
+    }
 }
 
 /// Errors the framer surfaces. Per project rules we do **not**

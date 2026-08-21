@@ -37,5 +37,7 @@ pub mod ccr_stream;
 pub mod framing;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod stream_finisher;
+pub mod stream_retry;
 
 pub use framing::{FramingError, SseEvent, SseFramer};

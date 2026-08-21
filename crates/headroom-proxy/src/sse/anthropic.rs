@@ -155,6 +155,108 @@ pub enum StateError {
     MissingField { field: &'static str },
 }
 
+/// What a stream said about its tool call versus what it sent.
+///
+/// Each variant is a contradiction the wire format should make impossible,
+/// so any of them means the turn is unusable by the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallDefect {
+    /// `stop_reason` was `tool_use`, but no tool block ever started.
+    Missing { blocks: String },
+    /// A tool block started and never got its `content_block_stop`.
+    Unterminated {
+        index: usize,
+        name: String,
+        partial_len: usize,
+    },
+    /// A tool block completed, but its accumulated input is not JSON.
+    Unparseable {
+        index: usize,
+        name: String,
+        error: String,
+        excerpt: String,
+    },
+}
+
+impl ToolCallDefect {
+    /// Stable tag for grepping and metrics; the detail goes in `Display`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Missing { .. } => "missing",
+            Self::Unterminated { .. } => "unterminated",
+            Self::Unparseable { .. } => "unparseable",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolCallDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { blocks } => write!(
+                f,
+                "stop_reason=tool_use but no tool block arrived; blocks=[{blocks}]"
+            ),
+            Self::Unterminated {
+                index,
+                name,
+                partial_len,
+            } => write!(
+                f,
+                "tool block {index} ({name}) never closed; {partial_len} bytes of input buffered"
+            ),
+            Self::Unparseable {
+                index,
+                name,
+                error,
+                excerpt,
+            } => write!(
+                f,
+                "tool block {index} ({name}) input is not JSON: {error}; input={excerpt}"
+            ),
+        }
+    }
+}
+
+/// Block types whose input arrives as streamed JSON fragments.
+fn is_tool_block(t: &str) -> bool {
+    matches!(t, "tool_use" | "server_tool_use" | "mcp_tool_use")
+}
+
+/// Head and tail of a broken input buffer. JSON usually breaks at the end,
+/// but the head carries the argument names, so keep both and drop the
+/// middle. The excerpt reaches the log, so it is bounded rather than whole.
+fn excerpt(s: &str) -> String {
+    const HEAD: usize = 200;
+    const TAIL: usize = 120;
+    if s.len() <= HEAD + TAIL {
+        return s.to_string();
+    }
+    let head = floor_boundary(s, HEAD);
+    let tail = ceil_boundary(s, s.len() - TAIL);
+    format!(
+        "{}…[{} bytes elided]…{}",
+        &s[..head],
+        tail - head,
+        &s[tail..]
+    )
+}
+
+/// `str::floor_char_boundary` is still unstable; a partial buffer can split
+/// a multi-byte character, so slicing needs these.
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 impl AnthropicStreamState {
     pub fn new() -> Self {
         Self::default()
@@ -394,6 +496,69 @@ impl AnthropicStreamState {
             self.cleared_input_tokens = self.cleared_input_tokens.max(cleared);
         }
         Ok(())
+    }
+
+    /// A tool call this stream promised but did not deliver intact.
+    ///
+    /// When it fires, the client rejects the whole turn with "the model's
+    /// tool call could not be parsed" while the proxy logs an ordinary
+    /// `sse stream closed` — the failure leaves no trace on this side
+    /// unless something looks for the contradiction. Returns `None` for
+    /// every well-formed stream.
+    pub fn tool_call_defect(&self) -> Option<ToolCallDefect> {
+        let mut tool_blocks: Vec<_> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| is_tool_block(&b.block_type))
+            .collect();
+        tool_blocks.sort_by_key(|(i, _)| **i);
+
+        for (index, block) in &tool_blocks {
+            let name = block
+                .metadata
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !block.complete {
+                return Some(ToolCallDefect::Unterminated {
+                    index: **index,
+                    name,
+                    partial_len: block.partial_json.len(),
+                });
+            }
+            // An input small enough to ride along in `content_block_start`
+            // streams no deltas at all, so an empty buffer claims nothing.
+            if block.partial_json.is_empty() {
+                continue;
+            }
+            if let Err(e) = serde_json::from_str::<Value>(&block.partial_json) {
+                return Some(ToolCallDefect::Unparseable {
+                    index: **index,
+                    name,
+                    error: e.to_string(),
+                    excerpt: excerpt(&block.partial_json),
+                });
+            }
+        }
+
+        if tool_blocks.is_empty() && self.stop_reason.as_deref() == Some("tool_use") {
+            return Some(ToolCallDefect::Missing {
+                blocks: self.block_types(),
+            });
+        }
+        None
+    }
+
+    /// Block types in index order, so a log line can say what arrived
+    /// instead of the tool call.
+    fn block_types(&self) -> String {
+        let mut v: Vec<_> = self.blocks.iter().collect();
+        v.sort_by_key(|(i, _)| **i);
+        v.iter()
+            .map(|(_, b)| b.block_type.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 

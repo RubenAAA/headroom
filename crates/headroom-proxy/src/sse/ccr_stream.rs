@@ -542,6 +542,20 @@ pub(crate) fn synthesize_blocks(content: &[Value], start_index: usize) -> Vec<By
     out
 }
 
+/// Whether the terminal `stop_reason` still claims a tool call the client
+/// will never get.
+///
+/// Upstream sets `tool_use` when the model called a tool, but the splice may
+/// have dropped that block — an unresolved proxy tool, most often. The client
+/// treats the pair "stop_reason: tool_use, no tool_use block" as a malformed
+/// turn and discards the whole thing, so the reason has to follow the content.
+pub(crate) fn stop_reason_overclaims_tool_call(
+    resolved_stop: Option<&str>,
+    client_has_tool_call: bool,
+) -> bool {
+    resolved_stop == Some("tool_use") && !client_has_tool_call
+}
+
 /// The closing `message_delta` + `message_stop` for a synthesised turn.
 ///
 /// Usage comes from the final round, matching what the buffered path returns
@@ -579,6 +593,10 @@ struct Rewriter {
     suppressed: HashSet<usize>,
     /// Next free client-facing block index.
     next_client_index: usize,
+    /// Whether a `tool_use` block has already gone out to the client. The
+    /// terminal `stop_reason` has to agree with this or the client rejects
+    /// the turn.
+    client_saw_tool_use: bool,
     /// `message_delta` / `message_stop`, held until we know whether a
     /// continuation has to be spliced in ahead of them.
     withheld: Vec<Bytes>,
@@ -593,6 +611,7 @@ impl Rewriter {
             index_map: HashMap::new(),
             suppressed: HashSet::new(),
             next_client_index: 0,
+            client_saw_tool_use: false,
             withheld: Vec::new(),
             saw_ccr: false,
         }
@@ -626,6 +645,9 @@ impl Rewriter {
                     self.suppressed.insert(index);
                     self.saw_ccr = true;
                     return Vec::new();
+                }
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    self.client_saw_tool_use = true;
                 }
                 let client_index = self.next_client_index;
                 self.next_client_index += 1;
@@ -795,6 +817,40 @@ where
                 already_streamed = dropped[DropReason::AlreadyStreamed as usize],
                 "ccr: dropping blocks the client must not receive from a streamed turn"
             );
+        }
+
+        // A proxy tool we could not resolve is dropped above, but the turn
+        // still carries `stop_reason: tool_use` from upstream. That pair —
+        // a promised tool call with no `tool_use` block — is what the client
+        // reports as "the model's tool call could not be parsed", killing the
+        // whole turn. The buffered path derives the stop reason from surviving
+        // content (see `resolved_message`); the streamed path has to do the
+        // same, counting blocks already on their way to the client.
+        let client_has_tool_call = rw.client_saw_tool_use
+            || emit
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
+        let mut resolved = resolved;
+        if stop_reason_overclaims_tool_call(
+            resolved.get("stop_reason").and_then(Value::as_str),
+            client_has_tool_call,
+        ) {
+            tracing::warn!(
+                event = "ccr_tool_call_dropped_stop_reason_downgraded",
+                request_id = %ctx.request_id,
+                unresolved_proxy_tool = dropped[DropReason::UnresolvedProxyTool as usize],
+                "ccr: turn promised a tool call the client will not receive; \
+                 downgrading stop_reason to end_turn"
+            );
+            resolved["stop_reason"] = json!("end_turn");
+            // Without this the client renders an empty turn and the retrieval
+            // failure looks like the model simply said nothing.
+            if emit.is_empty() {
+                emit.push(json!({
+                    "type": "text",
+                    "text": "The proxy could not complete a context retrieval for this turn.",
+                }));
+            }
         }
 
         // Nothing to add. When the client has had blocks already, that is the
@@ -1172,6 +1228,49 @@ mod tests {
             .into_iter()
             .filter(|b| drop_reason(b, false, live).is_none())
             .collect()
+    }
+
+    /// The 2026-08-20 failure: three memory continuation rounds, the last
+    /// tool call left unresolved and dropped, and `stop_reason: tool_use`
+    /// forwarded regardless. Every client turn shaped like this died with
+    /// "the model's tool call could not be parsed (retry also failed)".
+    #[test]
+    fn a_dropped_tool_call_must_not_leave_stop_reason_claiming_one() {
+        assert!(stop_reason_overclaims_tool_call(Some("tool_use"), false));
+    }
+
+    #[test]
+    fn a_surviving_tool_call_keeps_its_stop_reason() {
+        assert!(!stop_reason_overclaims_tool_call(Some("tool_use"), true));
+    }
+
+    #[test]
+    fn an_ordinary_turn_is_left_alone() {
+        assert!(!stop_reason_overclaims_tool_call(Some("end_turn"), false));
+        assert!(!stop_reason_overclaims_tool_call(None, false));
+    }
+
+    /// The client-facing half of the same decision: a tool block the client
+    /// received counts, a proxy-owned one it never saw does not.
+    #[test]
+    fn only_tool_blocks_the_client_receives_count() {
+        let mut rw = Rewriter::new(true);
+        feed(
+            &mut rw,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"memory_search","input":{}}}"#,
+        );
+        assert!(
+            !rw.client_saw_tool_use,
+            "a suppressed memory tool never reaches the client"
+        );
+
+        feed(
+            &mut rw,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_2","name":"Bash","input":{}}}"#,
+        );
+        assert!(rw.client_saw_tool_use, "a client tool call does");
     }
 
     /// Anthropic signs a `thinking` block against the request that produced it.

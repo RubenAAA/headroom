@@ -279,3 +279,182 @@ fn _ref_event() -> headroom_proxy::sse::SseEvent {
         data: Bytes::from_static(b""),
     }
 }
+
+// ---------------------------------------------------------------------
+// Tool-call defects: the three shapes behind the client-side error
+// "the model's tool call could not be parsed".
+// ---------------------------------------------------------------------
+
+const MSG_START: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+);
+
+/// `message_delta` carrying the stop reason, then `message_stop`.
+fn tail(stop_reason: &str) -> String {
+    format!(
+        concat!(
+            "event: message_delta\n",
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{}\"}},\"usage\":{{\"output_tokens\":50}}}}\n\n",
+            "event: message_stop\n",
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        stop_reason
+    )
+}
+
+#[test]
+fn a_well_formed_tool_call_reports_no_defect() {
+    let mut s = AnthropicStreamState::new();
+    run(&mut s, MSG_START.as_bytes());
+    run(
+        &mut s,
+        concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )
+        .as_bytes(),
+    );
+    run(&mut s, tail("tool_use").as_bytes());
+    assert_eq!(s.tool_call_defect(), None);
+}
+
+#[test]
+fn a_plain_text_answer_reports_no_defect() {
+    let mut s = AnthropicStreamState::new();
+    run(&mut s, MSG_START.as_bytes());
+    run(
+        &mut s,
+        concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )
+        .as_bytes(),
+    );
+    run(&mut s, tail("end_turn").as_bytes());
+    assert_eq!(s.tool_call_defect(), None);
+}
+
+#[test]
+fn stop_reason_tool_use_with_no_tool_block_is_missing() {
+    // The shape seen in production 2026-08-20: 2581 output tokens,
+    // stop_reason=tool_use, and a lone thinking block on the wire.
+    let mut s = AnthropicStreamState::new();
+    run(&mut s, MSG_START.as_bytes());
+    run(
+        &mut s,
+        concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )
+        .as_bytes(),
+    );
+    run(&mut s, tail("tool_use").as_bytes());
+
+    let defect = s.tool_call_defect().expect("must flag the contradiction");
+    assert_eq!(defect.kind(), "missing");
+    assert!(
+        defect.to_string().contains("blocks=[thinking]"),
+        "the log line must name what arrived instead: {defect}"
+    );
+}
+
+#[test]
+fn a_tool_block_without_its_stop_is_unterminated() {
+    let mut s = AnthropicStreamState::new();
+    run(&mut s, MSG_START.as_bytes());
+    run(
+        &mut s,
+        concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Write\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n",
+        )
+        .as_bytes(),
+    );
+    run(&mut s, tail("tool_use").as_bytes());
+
+    let defect = s.tool_call_defect().expect("must flag the open block");
+    assert_eq!(defect.kind(), "unterminated");
+    assert!(defect.to_string().contains("Write"), "{defect}");
+}
+
+#[test]
+fn a_completed_tool_block_with_broken_json_is_unparseable() {
+    let mut s = AnthropicStreamState::new();
+    run(&mut s, MSG_START.as_bytes());
+    run(
+        &mut s,
+        concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"memory_save\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"content\\\": \\\"unclosed\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )
+        .as_bytes(),
+    );
+    run(&mut s, tail("tool_use").as_bytes());
+
+    let defect = s.tool_call_defect().expect("must flag the bad input");
+    assert_eq!(defect.kind(), "unparseable");
+    let msg = defect.to_string();
+    assert!(msg.contains("memory_save"), "{msg}");
+    // The excerpt is what makes the log actionable.
+    assert!(msg.contains("unclosed"), "{msg}");
+}
+
+#[test]
+fn a_long_broken_input_is_elided_but_keeps_both_ends() {
+    let mut s = AnthropicStreamState::new();
+    run(&mut s, MSG_START.as_bytes());
+    run(
+        &mut s,
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"memory_save\",\"input\":{}}}\n\n".as_bytes(),
+    );
+    // 900 bytes of filler between a recognisable head and tail.
+    let payload = format!("{{\"head\": \"{}\", \"tail\"", "x".repeat(900));
+    let delta = format!(
+        "event: content_block_delta\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": payload},
+        })
+    );
+    run(&mut s, delta.as_bytes());
+    run(
+        &mut s,
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            .as_bytes(),
+    );
+    run(&mut s, tail("tool_use").as_bytes());
+
+    let msg = s
+        .tool_call_defect()
+        .expect("must flag the bad input")
+        .to_string();
+    assert!(msg.contains("\"head\""), "head must survive: {msg}");
+    assert!(msg.contains("\"tail\""), "tail must survive: {msg}");
+    assert!(
+        msg.contains("bytes elided"),
+        "middle must be dropped: {msg}"
+    );
+    assert!(
+        msg.len() < 600,
+        "excerpt must stay bounded: {} bytes",
+        msg.len()
+    );
+}
