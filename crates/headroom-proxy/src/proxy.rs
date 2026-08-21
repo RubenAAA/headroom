@@ -2513,7 +2513,12 @@ pub(crate) async fn forward_http(
     // `x-headroom-mode: passthrough` into the gate: such requests take the
     // streaming (byte-faithful) arm and are never buffered or mutated. The
     // decision is refined once the body is parsed (see `decision` below).
-    // license_allows: TODO(license) — no license plumbing in Rust yet.
+    // license_allows: hardcoded true, and staying that way while this binary
+    // has no licensing. Python derives it from a `UsageReporter`, which it
+    // builds only when HEADROOM_LICENSE_KEY is set — so `true` is exactly what
+    // Python computes for every unlicensed deployment, and diverges only for a
+    // key that has expired past its grace period. `main` warns at startup when
+    // a key is set, so the divergence is announced rather than silent.
     let gate_decision = crate::compression_decision::CompressionDecision::decide(
         req.headers(),
         state.config.compression,
@@ -3460,7 +3465,7 @@ pub(crate) async fn forward_http(
         let decision = crate::compression_decision::CompressionDecision::decide(
             decision_headers,
             state.config.compression,
-            true, // license_allows — TODO(license)
+            true, // license_allows — no licensing in this binary; see the gate
             has_messages,
         );
 

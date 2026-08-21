@@ -62,6 +62,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
+    // Licensing lives only in the Python proxy: it reads HEADROOM_LICENSE_KEY,
+    // builds a `UsageReporter`, and lets an expired key past its grace period
+    // turn compression off. This binary has no license plumbing at all, so it
+    // compresses regardless — which is right for every deployment without a
+    // key, and wrong in silence for one with a key that expects enforcement
+    // and usage reporting. Now that the Rust proxy is the default dispatch,
+    // say so rather than letting an operator infer from the Python banner
+    // that a managed deployment is still being metered.
+    if std::env::var("HEADROOM_LICENSE_KEY").is_ok_and(|k| !k.trim().is_empty()) {
+        tracing::warn!(
+            event = "license_key_ignored",
+            "HEADROOM_LICENSE_KEY is set but this proxy has no licensing: \
+             no usage is reported and no expiry is enforced; run the Python \
+             proxy (HEADROOM_USE_PYTHON_PROXY=1) if a managed deployment \
+             needs either"
+        );
+    }
+
     let mut state = AppState::new(config.clone())?;
 
     // PR-D1: resolve AWS credentials at startup via the `aws-config`
