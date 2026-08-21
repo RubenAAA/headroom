@@ -5,6 +5,7 @@
 pub mod backend;
 pub mod ctx_backend;
 pub mod decision;
+pub mod deferred;
 pub mod handler;
 pub mod injection;
 pub mod local_backend;

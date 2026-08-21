@@ -66,6 +66,7 @@ pub fn anthropic_custom_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string", "description": "The information to remember. Be specific and self-contained."},
+                    "scope": {"type": "string", "enum": ["project", "global"], "description": "Where this belongs. 'project' (the default) files it under the current repository. Use 'global' for facts about the user, their preferences, or their tools, which are true whatever they are working on — filing those under one repository hides them everywhere else."},
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Importance score from 0.0 (low) to 1.0 (critical)."},
                     "facts": {"type": "array", "items": {"type": "string"}, "description": "Pre-extracted discrete facts."},
                     "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names referenced in this memory."},
@@ -140,6 +141,7 @@ pub fn openai_tools() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "content": {"type": "string", "description": "The information to remember."},
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "'project' (default) files it under the current repository; 'global' for facts about the user or their tools, true whatever they are working on."},
                         "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Importance score."},
                         "facts": {"type": "array", "items": {"type": "string"}, "description": "Pre-extracted discrete facts."},
                         "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names."},

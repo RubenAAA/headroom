@@ -85,6 +85,40 @@ fn is_basename_allowed(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-'
 }
 
+/// The user id a request's memories live under.
+///
+/// One store serves every project and every account, and the backend partitions
+/// only by `user_id` — so the project has to go in it. Without this a shopkit
+/// memory can answer a headroom question, which is the one thing separate
+/// project memories exist to prevent.
+///
+/// Falls back to the bare user id when no project resolves. That is a shared
+/// pool, which is worse than separation, but it is better than dropping the
+/// write into a partition nothing will ever search again.
+pub fn scoped_user_id(base_user_id: &str, ctx: &RequestContext) -> String {
+    match ProjectResolver::resolve(ctx) {
+        Some((key, _display)) => format!("{base_user_id}{PROJECT_SEPARATOR}{key}"),
+        None => base_user_id.to_string(),
+    }
+}
+
+/// Separates the user id from the project inside a partition key.
+const PROJECT_SEPARATOR: &str = "::";
+
+/// The partition shared by every project for this user.
+///
+/// Not everything worth remembering belongs to a repository. "Never suggest an
+/// API key, this is a Max subscription" and "prefers pytest in Docker" are
+/// facts about the person, and filing them under whichever directory was open
+/// at the time hides them everywhere else. Searches read this alongside the
+/// project's own partition; only a deliberate global save writes to it.
+pub fn shared_partition(scoped_user_id: &str) -> &str {
+    match scoped_user_id.split_once(PROJECT_SEPARATOR) {
+        Some((base, _project)) => base,
+        None => scoped_user_id,
+    }
+}
+
 /// Resolve a request to a (key, display_name) project identity.
 pub struct ProjectResolver;
 
@@ -210,7 +244,9 @@ impl ProjectResolver {
 
     fn identity_from_cwd(raw_cwd: &str) -> Option<(String, String)> {
         let normalised_str = Self::normalize_cwd(raw_cwd)?;
-        let normalised = PathBuf::from(&normalised_str);
+        // The repository, not the directory the session happened to start in.
+        let normalised = Self::repo_root(&PathBuf::from(&normalised_str));
+        let normalised_str = normalised.to_string_lossy().to_string();
         let basename = normalised
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -224,6 +260,59 @@ impl ProjectResolver {
         let digest = sha256_hex(normalised_str.as_bytes());
         let key = format!("{}-{}", &safe_basename, &digest[..16]);
         Some((key, basename))
+    }
+
+    /// Walk up to the repository a directory belongs to.
+    ///
+    /// Keyed on the raw cwd, every worktree and every subdirectory would be its
+    /// own project: `shopkit`, `shopkit/apps/api` and
+    /// `shopkit/.claude/worktrees/access-gates` would each keep a separate set of
+    /// memories for one codebase. A linked worktree's `.git` is a *file*
+    /// pointing into `<main>/.git/worktrees/<name>`, which is what lets them
+    /// fold back onto the repository they came from.
+    ///
+    /// Returns the directory unchanged when nothing above it is a repository —
+    /// a session in a plain directory still gets its own pool.
+    fn repo_root(dir: &Path) -> PathBuf {
+        let mut cursor = Some(dir);
+        while let Some(path) = cursor {
+            let git = path.join(".git");
+            if git.is_dir() {
+                return path.to_path_buf();
+            }
+            if git.is_file() {
+                return Self::main_repo_from_git_file(&git).unwrap_or_else(|| path.to_path_buf());
+            }
+            cursor = path.parent();
+        }
+        dir.to_path_buf()
+    }
+
+    /// The main repository a linked worktree points at, if that is what this is.
+    ///
+    /// Where the worktree sits does not matter — `/home/user/wt-000000` lives
+    /// nowhere near the repository it belongs to, and still names it here.
+    fn main_repo_from_git_file(git_file: &Path) -> Option<PathBuf> {
+        const WORKTREE_MARKER: &str = "/.git/worktrees/";
+        let text = std::fs::read_to_string(git_file).ok()?;
+        let pointer = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+            .trim();
+        // Git writes an absolute pointer by default but a relative one under
+        // `worktree.useRelativePaths`, and that is relative to the worktree.
+        let gitdir = if pointer.starts_with('/') {
+            PathBuf::from(pointer)
+        } else {
+            git_file.parent()?.join(pointer)
+        };
+        let gitdir = gitdir.to_string_lossy();
+        // A submodule's pointer lands in `<super>/.git/modules/<name>` instead,
+        // and a submodule really is its own project. Last occurrence, so a
+        // repository that itself lives inside someone else's worktree still
+        // resolves to itself.
+        let idx = gitdir.rfind(WORKTREE_MARKER)?;
+        Some(PathBuf::from(&gitdir[..idx]))
     }
 
     pub fn sanitize_basename(value: &str) -> String {
@@ -414,6 +503,93 @@ mod tests {
     use serde_json::json;
 
     // --- ProjectResolver ---
+
+    /// One repository, one pool. A subdirectory, a linked worktree and the
+    /// root itself must all resolve to the same project, or a memory saved
+    /// from a worktree is invisible from the checkout that made it.
+    #[test]
+    fn worktrees_and_subdirectories_share_the_repository_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("shopkit");
+        std::fs::create_dir_all(repo.join(".git/worktrees/access-gates")).unwrap();
+        std::fs::create_dir_all(repo.join("apps/api")).unwrap();
+
+        let worktree = tmp.path().join("wt-access-gates");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}/.git/worktrees/access-gates\n", repo.display()),
+        )
+        .unwrap();
+
+        let key = |path: &std::path::Path| {
+            ProjectResolver::resolve(&RequestContext {
+                headers: HashMap::new(),
+                system_prompt: format!("Primary working directory: {}\n", path.display()),
+                base_user_id: "default".to_string(),
+                project_root_override: None,
+            })
+            .expect("cwd resolves")
+            .0
+        };
+
+        let root = key(&repo);
+        assert_eq!(key(&repo.join("apps/api")), root, "subdirectory split off");
+        assert_eq!(key(&worktree), root, "worktree split off");
+        assert!(root.starts_with("shopkit-"), "unexpected key {root}");
+    }
+
+    /// A directory with no repository above it is still its own project —
+    /// separation is the point, and collapsing everything into one pool would
+    /// be worse than a spare partition.
+    #[test]
+    fn a_plain_directory_keeps_its_own_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("beta");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let key = |path: &std::path::Path| {
+            ProjectResolver::resolve(&RequestContext {
+                headers: HashMap::new(),
+                system_prompt: String::new(),
+                base_user_id: "default".to_string(),
+                project_root_override: Some(path.display().to_string()),
+            })
+            .expect("override resolves")
+            .0
+        };
+        assert_ne!(key(&a), key(&b));
+    }
+
+    /// The partition the backend actually uses.
+    #[test]
+    fn scoped_user_id_carries_the_project() {
+        let ctx = |project: &str| RequestContext {
+            headers: HashMap::from([("x-headroom-project-id".to_string(), project.to_string())]),
+            system_prompt: String::new(),
+            base_user_id: "default".to_string(),
+            project_root_override: None,
+        };
+        assert_eq!(scoped_user_id("default", &ctx("shopkit")), "default::shopkit");
+        assert_ne!(
+            scoped_user_id("default", &ctx("shopkit")),
+            scoped_user_id("default", &ctx("headroom"))
+        );
+        // Nothing resolved: one shared pool rather than a lost write.
+        assert_eq!(
+            scoped_user_id(
+                "default",
+                &RequestContext {
+                    headers: HashMap::new(),
+                    system_prompt: String::new(),
+                    base_user_id: "default".to_string(),
+                    project_root_override: None,
+                }
+            ),
+            "default"
+        );
+    }
 
     #[test]
     fn resolve_explicit_project_id() {

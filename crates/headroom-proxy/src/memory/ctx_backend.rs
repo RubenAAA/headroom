@@ -42,6 +42,11 @@ use super::models::Memory;
 
 type BackendError = Box<dyn std::error::Error + Send + Sync>;
 
+/// How deep to read the shared index when a partition's own matches are
+/// buried under another project's. Sized to sweep the whole store rather
+/// than to tune a page: the filter, not the ranking, decides what survives.
+const WIDE_SEARCH_LIMIT: usize = 2000;
+
 /// Memory backend backed by the ctx FTS5 store plus a record sidecar.
 pub struct CtxMemoryBackend {
     /// Record store: the `Memory` values themselves.
@@ -94,6 +99,61 @@ fn rank_to_score(rank: f64) -> f64 {
 }
 
 impl CtxMemoryBackend {
+    /// Top `top_k` matches belonging to `user_id`, read from the first
+    /// `limit` ranked hits of the shared index.
+    fn ranked_for_user(
+        &self,
+        query: &str,
+        user_id: &str,
+        top_k: usize,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchResult>, BackendError> {
+        let opts = SearchOpts {
+            limit,
+            ..Default::default()
+        };
+        let hits = self.index.search(&[query.to_string()], &opts)?;
+
+        let mut out = Vec::new();
+        // A memory is indexed as several chunks, so one memory can match more
+        // than once — and did, filling two of three answer slots with the same
+        // text at ranks 0.031 and 0.032. Keep the best hit only.
+        let mut seen = std::collections::HashSet::new();
+        for hit in hits {
+            if !seen.insert(hit.source.clone()) {
+                continue;
+            }
+            // The source label is the memory id.
+            let Some(memory) = self.load(&hit.source)? else {
+                // Indexed but no record: a crash between the two writes, or a
+                // record deleted without its index entry. Skip rather than
+                // fail the search — a missing memory must not break recall.
+                tracing::debug!(
+                    event = "memory_index_orphan",
+                    memory_id = %hit.source,
+                    "search hit has no record; skipping"
+                );
+                continue;
+            };
+            // The project's own partition, plus the shared one that holds
+            // facts about the user rather than about a codebase.
+            let visible = memory.user_id == user_id
+                || memory.user_id == super::router::shared_partition(user_id);
+            if !visible || !memory.is_current() {
+                continue;
+            }
+            out.push(MemorySearchResult {
+                related_entities: memory.entity_refs.clone(),
+                score: rank_to_score(hit.rank),
+                memory,
+            });
+            if out.len() >= top_k {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     fn load(&self, memory_id: &str) -> Result<Option<Memory>, BackendError> {
         match self.records.get(memory_id)? {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
@@ -165,7 +225,12 @@ impl MemoryBackend for CtxMemoryBackend {
         // enumeration comes from the records instead of the index.
         if query.trim().is_empty() {
             let mut out = Vec::new();
-            for id in self.records.ids_for_user(user_id)? {
+            let shared = super::router::shared_partition(user_id);
+            let mut ids = self.records.ids_for_user(user_id)?;
+            if shared != user_id {
+                ids.extend(self.records.ids_for_user(shared)?);
+            }
+            for id in ids {
                 let Some(memory) = self.load(&id)? else {
                     continue;
                 };
@@ -190,39 +255,20 @@ impl MemoryBackend for CtxMemoryBackend {
         // Over-fetch: hits are filtered by user and validity below, and the
         // index cannot express either, so asking for exactly `top_k` would
         // return fewer after filtering.
-        let opts = SearchOpts {
-            limit: top_k.saturating_mul(4).max(top_k),
-            ..Default::default()
-        };
-        let hits = self.index.search(&[query.to_string()], &opts)?;
-
-        let mut out = Vec::new();
-        for hit in hits {
-            // The source label is the memory id.
-            let Some(memory) = self.load(&hit.source)? else {
-                // Indexed but no record: a crash between the two writes, or a
-                // record deleted without its index entry. Skip rather than
-                // fail the search — a missing memory must not break recall.
-                tracing::debug!(
-                    event = "memory_index_orphan",
-                    memory_id = %hit.source,
-                    "search hit has no record; skipping"
-                );
-                continue;
-            };
-            if memory.user_id != user_id || !memory.is_current() {
-                continue;
-            }
-            out.push(MemorySearchResult {
-                related_entities: memory.entity_refs.clone(),
-                score: rank_to_score(hit.rank),
-                memory,
-            });
-            if out.len() >= top_k {
-                break;
-            }
+        let narrow = top_k.saturating_mul(4).max(top_k);
+        let out = self.ranked_for_user(query, user_id, top_k, narrow)?;
+        if out.len() >= top_k {
+            return Ok(out);
         }
-        Ok(out)
+
+        // One index serves every project, but the partition filter runs after
+        // ranking — so a project holding 37 memories can be pushed off the
+        // first page entirely by one holding 155, and come back empty while a
+        // perfectly good match sits at rank 50. Widen when the narrow page did
+        // not fill, which costs a second query only on the searches that need
+        // one.
+        let wide = self.ranked_for_user(query, user_id, top_k, WIDE_SEARCH_LIMIT)?;
+        Ok(if wide.len() > out.len() { wide } else { out })
     }
 
     async fn update_memory(
@@ -431,7 +477,10 @@ mod tests {
         assert!(rank_to_score(-10.0) > rank_to_score(-1.0));
         assert!(rank_to_score(-1.0) <= 1.0);
         assert!(rank_to_score(-1000.0) > 0.0);
-        assert!(rank_to_score(0.0) < rank_to_score(-0.5), "no match scores lowest");
+        assert!(
+            rank_to_score(0.0) < rank_to_score(-0.5),
+            "no match scores lowest"
+        );
     }
 
     /// Persistence is the other half of the point: the `Vec` backend lost

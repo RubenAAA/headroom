@@ -242,22 +242,45 @@ impl MemoryHandler {
         query: Option<&MemoryQuery>,
         budget: Option<&MemoryInjectionBudget>,
     ) -> Option<String> {
+        // Every exit below used to be silent: the caller sees `None` and cannot
+        // tell a disabled feature from an empty result. Memory retrieved nothing
+        // for weeks and no log said so. One event per branch makes the reason a
+        // single grep.
         if !self.config.inject_context {
+            tracing::info!(
+                event = "memory_inject_skipped",
+                reason = "inject_context_off"
+            );
             return None;
         }
         if self.config.mode == MemoryMode::Tool {
+            tracing::info!(event = "memory_inject_skipped", reason = "mode_is_tool");
             return None;
         }
 
-        let backend = self.backend.as_ref()?;
+        let Some(backend) = self.backend.as_ref() else {
+            tracing::info!(event = "memory_inject_skipped", reason = "no_backend");
+            return None;
+        };
         let (_scope, effective_user_id) = self.resolve_for_request(user_id, request_context);
 
         let query_text = if let Some(q) = query {
             q.to_embedding_input()
         } else {
-            extract_user_query(messages)?
+            match extract_user_query(messages) {
+                Some(q) => q,
+                None => {
+                    tracing::info!(
+                        event = "memory_inject_skipped",
+                        reason = "no_user_query",
+                        messages = messages.len()
+                    );
+                    return None;
+                }
+            }
         };
         if query_text.is_empty() {
+            tracing::info!(event = "memory_inject_skipped", reason = "empty_query");
             return None;
         }
 
@@ -267,7 +290,7 @@ impl MemoryHandler {
             ..Default::default()
         });
 
-        let results = backend
+        let results = match backend
             .search_memories(
                 &query_text,
                 &effective_user_id,
@@ -275,17 +298,46 @@ impl MemoryHandler {
                 true,
             )
             .await
-            .ok()?;
+        {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::info!(
+                    event = "memory_inject_skipped",
+                    reason = "search_failed",
+                    user_id = %effective_user_id,
+                    error = %e
+                );
+                return None;
+            }
+        };
 
         if results.is_empty() {
+            tracing::info!(
+                event = "memory_inject_skipped",
+                reason = "no_results",
+                user_id = %effective_user_id
+            );
             return None;
         }
+        let found = results.len();
 
-        let memory_lines = if let Some(ranker) = ranker {
+        let formatted = if let Some(ranker) = ranker {
             format_with_ranker(results, ranker, &effective_budget)
         } else {
             format_without_ranker(results, &effective_budget)
-        }?;
+        };
+        let Some(memory_lines) = formatted else {
+            // Search hit, then every hit fell below the floor. Distinct from
+            // "no results" and the two used to look identical from outside.
+            tracing::info!(
+                event = "memory_inject_skipped",
+                reason = "all_below_min_similarity",
+                user_id = %effective_user_id,
+                found,
+                min_similarity = effective_budget.min_similarity
+            );
+            return None;
+        };
 
         let scope = self.resolve_scope(user_id, request_context);
         let header = format_memory_block_header(scope.as_ref());
@@ -328,6 +380,7 @@ impl MemoryHandler {
             let id = get_tool_id(tc, provider);
             let input = get_tool_input(tc, provider);
 
+            let started = std::time::Instant::now();
             let content = if name == NATIVE_MEMORY_TOOL_NAME {
                 self.execute_native_memory_tool(&input, user_id).await
             } else if MEMORY_TOOL_NAMES.contains(&name.as_str()) {
@@ -336,6 +389,32 @@ impl MemoryHandler {
             } else {
                 continue;
             };
+
+            // In tool mode this loop is the whole memory feature, and it used
+            // to log nothing. A call that never arrived and a call that
+            // arrived and failed both read as silence, which is why the
+            // "retrieving nothing" question could not be answered from the
+            // log. One line per answered call separates them.
+            let parsed = serde_json::from_str::<Value>(&content).ok();
+            let status = parsed
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("unparsed");
+            let count = parsed
+                .as_ref()
+                .and_then(|v| v.get("count"))
+                .and_then(Value::as_u64);
+            tracing::info!(
+                event = "memory_tool_call",
+                tool = %name,
+                status = %status,
+                count = count.unwrap_or_default(),
+                has_count = count.is_some(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                result_bytes = content.len(),
+                user_id = %user_id,
+            );
 
             results.push(format_tool_result(&id, &content, provider));
         }
@@ -804,6 +883,16 @@ impl MemoryHandler {
             .map(|a| a.to_vec());
 
         let (_scope, effective_user_id) = self.resolve_for_request(user_id, request_context);
+        // A fact about the user or their tools belongs everywhere, not in
+        // whichever repository happened to be open when they said it. A global
+        // save drops the project suffix and lands in the shared partition that
+        // every project's search also reads.
+        let effective_user_id = match input.get("scope").and_then(Value::as_str) {
+            Some("global") => {
+                crate::memory::router::shared_partition(&effective_user_id).to_string()
+            }
+            _ => effective_user_id,
+        };
 
         let backend = match self.backend.as_ref() {
             Some(b) => b,
@@ -893,9 +982,8 @@ impl MemoryHandler {
         if let Some(top) = similar.first() {
             // Compared on words, not on `top.score`: that is a BM25 rank, which
             // sits near 0.03 even for identical text, so this hint never fired.
-            if crate::memory_tail::text_similarity(&top.memory.content, content)
-                >= DEDUP_HINT_THRESHOLD
-            {
+            let overlap = crate::memory_tail::text_similarity(&top.memory.content, content);
+            if overlap >= DEDUP_HINT_THRESHOLD {
                 let src = top
                     .memory
                     .metadata
@@ -912,7 +1000,10 @@ impl MemoryHandler {
                      '{}'. Call memory_update('{}', '<merged content>') to consolidate, \
                      or ignore if these are distinct facts.",
                     top.memory.id,
-                    top.score * 100.0,
+                    // The number that fired the hint, not the BM25 score —
+                    // printing the latter reported "3% match" on a match the
+                    // 45% gate had just passed.
+                    overlap * 100.0,
                     source_info,
                     truncate_str(&top.memory.content, 120),
                     top.memory.id,
@@ -1641,6 +1732,25 @@ mod tests {
         // Should append to index 1 (the live message), not index 0
         assert!(new_msgs[0]["content"].as_str().unwrap() == "frozen");
         assert!(new_msgs[1]["content"].as_str().unwrap().contains("CTX"));
+    }
+
+    #[test]
+    fn tail_anthropic_reaches_a_short_conversation() {
+        // Regression: the proxy passed the length of the *system* array as
+        // `frozen_message_count`. Two system blocks skipped `messages[0..2]`,
+        // so the opening turns of a conversation had no eligible tail and got
+        // no memory at all — silently, because the callee just returns 0 bytes.
+        let msgs = vec![json!({"role": "user", "content": "first turn"})];
+
+        let (untouched, none) =
+            MemoryHandler::append_to_latest_user_tail(&msgs, "CTX", Provider::Anthropic, 2);
+        assert_eq!(none, 0, "what the bug did: nothing was eligible");
+        assert_eq!(untouched[0]["content"].as_str().unwrap(), "first turn");
+
+        let (new_msgs, bytes) =
+            MemoryHandler::append_to_latest_user_tail(&msgs, "CTX", Provider::Anthropic, 0);
+        assert_eq!(bytes, 3);
+        assert!(new_msgs[0]["content"].as_str().unwrap().contains("CTX"));
     }
 
     #[test]
