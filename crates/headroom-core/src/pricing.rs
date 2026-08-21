@@ -80,8 +80,18 @@ const fn per_1m_ttl(
 /// `claude-sonnet-4` entry, and shorter family keys (`claude-`) catch the rest.
 static TABLE: &[(&str, ModelPricing)] = &[
     // ---- Anthropic (cache write: 5m TTL = 1.25x input, 1h TTL = 2.0x) ----
+    ("claude-opus-5", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
+    ("claude-opus-4-8", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
+    ("claude-opus-4-7", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
+    ("claude-opus-4-6", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
+    ("claude-opus-4-5", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
+    // Opus 4 / 4.1 are retired (Bedrock/Google Cloud only) and kept their
+    // original, higher price — do not fold into the claude-opus-4-* rate above.
     ("claude-opus-4", per_1m_ttl(15.0, 75.0, 1.5, 18.75, 30.0)),
-    ("claude-opus", per_1m_ttl(15.0, 75.0, 1.5, 18.75, 30.0)),
+    ("claude-opus", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
+    // Same rates the `claude-` fallback already resolved to, made explicit so a
+    // Sonnet-5 turn is priced by a table entry rather than by a default.
+    ("claude-sonnet-5", per_1m_ttl(2.0, 10.0, 0.2, 2.5, 4.0)),
     ("claude-sonnet-4", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
     ("claude-3-7-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
     ("claude-3-5-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
@@ -219,6 +229,32 @@ mod tests {
     fn opus_family() {
         let p = lookup("claude-opus-4-1-20250805").unwrap();
         assert!((p.input_cost_per_token - 15.0 / 1e6).abs() < 1e-18);
+    }
+
+    #[test]
+    fn generation_5_models_have_their_own_entries() {
+        let opus = lookup("claude-opus-5").unwrap();
+        assert!((opus.input_cost_per_token - 5.0 / 1e6).abs() < 1e-18);
+        assert!((opus.cache_read_cost_per_token.unwrap() - 0.5 / 1e6).abs() < 1e-18);
+        let sonnet = lookup("claude-sonnet-5-20260115").unwrap();
+        assert!((sonnet.input_cost_per_token - 2.0 / 1e6).abs() < 1e-18);
+        assert!((sonnet.cache_read_cost_per_token.unwrap() - 0.2 / 1e6).abs() < 1e-18);
+    }
+
+    #[test]
+    fn opus_4_5_through_4_8_use_current_pricing_not_retired_opus_4_rate() {
+        for id in [
+            "claude-opus-4-5-20260101",
+            "claude-opus-4-6-20260201",
+            "claude-opus-4-7-20260301",
+            "claude-opus-4-8-20260401",
+        ] {
+            let p = lookup(id).unwrap();
+            assert!(
+                (p.input_cost_per_token - 5.0 / 1e6).abs() < 1e-18,
+                "{id} should use $5/MTok, not the retired $15/MTok opus-4 rate"
+            );
+        }
     }
 
     #[test]
