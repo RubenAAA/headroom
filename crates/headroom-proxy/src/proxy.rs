@@ -4450,7 +4450,7 @@ pub(crate) async fn forward_http(
         SseStreamKind::None
     };
 
-    let resp_headers = filter_response_headers(upstream_resp.headers());
+    let mut resp_headers = filter_response_headers(upstream_resp.headers());
 
     // Phase G PR-G3: extract upstream rate-limit headers from this
     // response and record them as gauges. The `provider` label is
@@ -5122,6 +5122,54 @@ pub(crate) async fn forward_http(
                 Body::from(format!("upstream response buffering failed: {e}"))
             }
         }
+    } else if is_sse
+        && status.is_success()
+        && matches!(sse_kind, SseStreamKind::Anthropic)
+        && !client_wants_stream(&original_buffered)
+    {
+        // The client asked for one JSON reply and upstream answered with an
+        // event stream. Handing the SSE body straight back gives a client that
+        // never opted into streaming something it cannot parse. Read the stream
+        // to its end and answer in the shape that was asked for; if it did not
+        // complete, say so with a 502 rather than inventing a partial turn.
+        match buffer_sse_as_message(resp_stream, &request_id).await {
+            Ok(json) => {
+                resp_headers.remove(http::header::CONTENT_TYPE);
+                resp_headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
+                );
+                resp_headers.remove(http::header::CONTENT_LENGTH);
+                Body::from(json)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    event = "upstream_protocol_error",
+                    "upstream sent an event stream for a non-streaming request \
+                     and it did not complete"
+                );
+                status = StatusCode::BAD_GATEWAY;
+                resp_headers.remove(http::header::CONTENT_TYPE);
+                resp_headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
+                );
+                resp_headers.remove(http::header::CONTENT_LENGTH);
+                Body::from(
+                    serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "upstream_protocol_error",
+                            "message": "upstream answered a non-streaming request \
+                                        with an incomplete event stream",
+                        }
+                    })
+                    .to_string(),
+                )
+            }
+        }
     } else if is_sse && status.is_success() && matches!(sse_kind, SseStreamKind::Anthropic) {
         // Last stop before the client. `retry_on_early_drop` above saves the
         // drops it can still take back; past that point the only thing left to
@@ -5737,6 +5785,69 @@ fn is_sse_response(headers: &http::HeaderMap) -> bool {
             media_type.eq_ignore_ascii_case("text/event-stream")
         })
         .unwrap_or(false)
+}
+
+/// Whether the client asked for a streamed answer.
+///
+/// Anthropic treats a missing `stream` as false, so an absent key means the
+/// caller wants one JSON body. An unreadable body is the one case that reads
+/// as `true`: the streaming path is what the proxy did before this check
+/// existed, so a body we cannot parse keeps that behaviour rather than
+/// converting a stream the client may well have wanted.
+fn client_wants_stream(client_body: &bytes::Bytes) -> bool {
+    match serde_json::from_slice::<serde_json::Value>(client_body) {
+        Ok(v) => v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+        Err(_) => true,
+    }
+}
+
+/// Read an Anthropic event stream to its end and rebuild the single JSON reply
+/// it describes.
+///
+/// `Err` when the stream never reached `message_stop`, which is the only
+/// honest answer for a caller that cannot be handed a partial turn: it asked
+/// for one complete message and there is no way to say "half" in that shape.
+async fn buffer_sse_as_message<S, E>(stream: S, request_id: &str) -> Result<Vec<u8>, String>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    use futures_util::StreamExt;
+
+    let mut framer = crate::sse::framing::SseFramer::new();
+    let mut state = crate::sse::anthropic::AnthropicStreamState::new();
+    let mut stream = stream;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
+        framer.push(&chunk);
+        while let Some(event) = framer.next_event() {
+            let event = event.map_err(|e| format!("framing error: {e}"))?;
+            if event.is_done_sentinel() {
+                continue;
+            }
+            // A state error means the stream contradicted itself; the rebuilt
+            // message would be a guess, so fail instead.
+            state
+                .apply(event)
+                .map_err(|e| format!("stream state error: {e}"))?;
+        }
+    }
+
+    if state.status != crate::sse::anthropic::StreamStatus::MessageStop {
+        return Err(format!(
+            "stream ended in {:?} without message_stop",
+            state.status
+        ));
+    }
+
+    let message = crate::sse::ccr_stream::rebuild_message(&state);
+    tracing::debug!(
+        request_id = %request_id,
+        event = "sse_buffered_for_non_streaming_client",
+        "rebuilt a non-streaming reply from an event stream"
+    );
+    serde_json::to_vec(&message).map_err(|e| format!("serialize error: {e}"))
 }
 
 /// Freeze-replay request stage (Anthropic `/v1/messages` buffered path).
