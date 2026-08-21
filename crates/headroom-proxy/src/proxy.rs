@@ -6723,16 +6723,13 @@ async fn run_sse_state_machine(
             // cheap one once it is in the ledger. Dropping the turn also
             // under-reports, but visibly: the counter says how many turns the
             // books are missing, and the log below keeps the partial numbers.
-            // Anthropic reports the turn's final `output_tokens` in the
-            // `message_delta` that precedes `message_stop`, and only that
-            // delta carries a `stop_reason`. So a stop_reason in hand means
-            // the usage is the final figure and booking it is exact, not the
-            // partial count the comment above warns about — the terminator
-            // that follows carries no usage of its own. Without a stop_reason
-            // the totals really are mid-flight, and the turn is still dropped.
-            let usage_is_final = state.stop_reason.is_some();
+            // A `stop_reason` on a `message_delta` is not a terminator. It says
+            // how the model meant to end, not that the stream got there, and
+            // the proxy synthesises stop reasons of its own elsewhere
+            // (`stream_finisher`, `ccr_stream`), so it is the weaker of the two
+            // signals. `message_stop` off the wire is the gate, same as above.
             let stream_completed =
-                state.status == crate::sse::anthropic::StreamStatus::MessageStop || usage_is_final;
+                state.status == crate::sse::anthropic::StreamStatus::MessageStop;
             if !stream_completed {
                 crate::observability::record_stream_incomplete("anthropic");
                 // Also booked into the persisted savings state, so the lifetime
