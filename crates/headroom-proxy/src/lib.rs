@@ -47,6 +47,7 @@ pub mod subscription;
 pub mod tile_optimizer;
 pub mod tool_schema_compaction;
 pub mod turn_hooks;
+pub mod upstream_guard;
 pub mod verbosity_controller;
 pub mod vertex;
 pub mod warmup;

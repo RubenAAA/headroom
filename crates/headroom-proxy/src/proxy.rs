@@ -2338,7 +2338,21 @@ pub(crate) async fn forward_http(
     let upstream_base = match req.extensions().get::<UpstreamOverride>() {
         Some(o) => o.0.clone(),
         None => match header_upstream_override(req.headers()) {
-            Some(u) => u,
+            // WEB-01: the header is client-controlled, so a destination that
+            // resolves into private/loopback/link-local/metadata space would
+            // make the proxy a confused deputy. Ignore the override and use the
+            // configured upstream, as the Python proxy does; set
+            // HEADROOM_ALLOWED_BASE_URLS to permit specific internal endpoints.
+            Some(u) if crate::upstream_guard::is_safe_upstream_url(&u).await => u,
+            Some(u) => {
+                tracing::warn!(
+                    event = "upstream_override_rejected",
+                    header = crate::headers::UPSTREAM_OVERRIDE_HEADER,
+                    value = %u,
+                    "ignoring unsafe x-headroom-base-url; using default upstream"
+                );
+                state.effective_upstream().await
+            }
             None => state.effective_upstream().await,
         },
     };
