@@ -47,6 +47,17 @@ type BackendError = Box<dyn std::error::Error + Send + Sync>;
 /// than to tune a page: the filter, not the ranking, decides what survives.
 const WIDE_SEARCH_LIMIT: usize = 2000;
 
+/// Score given to a memory reached by a shared entity rather than by matching
+/// the query.
+///
+/// Adjacency is not a relevance measurement, so there is no honest number to
+/// compute here. The only job is to clear `min_similarity` (0.3 by default)
+/// so these are not filtered out on arrival. Rank order comes from position
+/// instead: expanded hits are appended after the matched ones and the list is
+/// never re-sorted, so a related memory cannot displace a real match even
+/// when BM25 scored that match below this value.
+const RELATED_SCORE: f64 = 0.35;
+
 /// Memory backend backed by the ctx FTS5 store plus a record sidecar.
 pub struct CtxMemoryBackend {
     /// Record store: the `Memory` values themselves.
@@ -64,10 +75,58 @@ impl CtxMemoryBackend {
     /// lifetime to theirs.
     pub fn open(base_dir: &Path) -> Result<Self, BackendError> {
         std::fs::create_dir_all(base_dir)?;
-        Ok(Self {
+        let backend = Self {
             records: Arc::new(MemoryRecordStore::open(base_dir.join("memories.db"))?),
             index: Arc::new(CtxStore::open(base_dir.join("memories_index.db"))?),
-        })
+        };
+        backend.backfill_entities()?;
+        Ok(backend)
+    }
+
+    /// Build the entity edges for memories saved before the table existed.
+    ///
+    /// Without this the join answers nothing on any store already in use —
+    /// the entities are in the records, just not anywhere queryable. Runs once
+    /// per store, guarded by the schema version, and reads every record to do
+    /// it. That is a full scan, which is affordable here only because these
+    /// stores hold thousands of rows rather than millions.
+    ///
+    /// One unreadable or unwritable record is logged and skipped, since a
+    /// single bad row must not cost the whole expansion. A failure to read the
+    /// table at all propagates: that means the store is broken, and `open`
+    /// already reports those rather than returning a backend that cannot work.
+    fn backfill_entities(&self) -> Result<(), BackendError> {
+        if !self.records.needs_entity_backfill()? {
+            return Ok(());
+        }
+        let mut filled = 0usize;
+        for (id, json) in self.records.all_records()? {
+            let Ok(memory) = serde_json::from_str::<Memory>(&json) else {
+                continue;
+            };
+            if memory.entity_refs.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.records.set_entities(&id, &memory.entity_refs) {
+                tracing::warn!(
+                    event = "memory_entity_backfill_failed",
+                    memory_id = %id,
+                    error = %e,
+                    "skipping one record"
+                );
+                continue;
+            }
+            filled += 1;
+        }
+        self.records.mark_entity_backfill_done()?;
+        if filled > 0 {
+            tracing::info!(
+                event = "memory_entity_backfill",
+                memories = filled,
+                "built entity edges for existing memories"
+            );
+        }
+        Ok(())
     }
 
     /// In-memory instance for tests. Both stores are per-connection, so this
@@ -164,7 +223,63 @@ impl CtxMemoryBackend {
     fn store(&self, memory: &Memory) -> Result<(), BackendError> {
         let json = serde_json::to_string(memory)?;
         self.records.put(&memory.id, &memory.user_id, &json)?;
+        // The entity list lives in the JSON too, but only the edge table can be
+        // queried by entity. Rewritten on every store so the two never drift.
+        self.records.set_entities(&memory.id, &memory.entity_refs)?;
         Ok(())
+    }
+
+    /// Memories sharing an entity with `seeds`, to fill slots BM25 left empty.
+    ///
+    /// The one hop that `include_related` promises: search finds memories by
+    /// the words they contain, this finds the ones that talk about the same
+    /// subject in different words. Nothing here is ranked — adjacency is a yes
+    /// or no — so results keep input order and the caller decides how many to
+    /// take.
+    fn related_to(
+        &self,
+        seeds: &[MemorySearchResult],
+        user_id: &str,
+        want: usize,
+    ) -> Result<Vec<MemorySearchResult>, BackendError> {
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entities: Vec<String> = Vec::new();
+        let mut already: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for seed in seeds {
+            already.insert(seed.memory.id.as_str());
+            entities.extend(seed.memory.entity_refs.iter().cloned());
+        }
+        if entities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for id in self.records.memories_for_entities(&entities)? {
+            if already.contains(id.as_str()) {
+                continue;
+            }
+            let Some(memory) = self.load(&id)? else {
+                // Edge outliving its record. Same call as an orphaned index
+                // entry: skip it, never fail the search over it.
+                continue;
+            };
+            let visible = memory.user_id == user_id
+                || memory.user_id == super::router::shared_partition(user_id);
+            if !visible || !memory.is_current() {
+                continue;
+            }
+            out.push(MemorySearchResult {
+                related_entities: memory.entity_refs.clone(),
+                score: RELATED_SCORE,
+                memory,
+            });
+            if out.len() >= want {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Index a memory's content for search, labelled by its id.
@@ -218,7 +333,7 @@ impl MemoryBackend for CtxMemoryBackend {
         query: &str,
         user_id: &str,
         top_k: usize,
-        _include_related: bool,
+        include_related: bool,
     ) -> Result<Vec<MemorySearchResult>, BackendError> {
         // `memory_list` asks for everything by searching for nothing. BM25 has
         // no answer to that — an empty query matches no documents — so the
@@ -268,7 +383,15 @@ impl MemoryBackend for CtxMemoryBackend {
         // not fill, which costs a second query only on the searches that need
         // one.
         let wide = self.ranked_for_user(query, user_id, top_k, WIDE_SEARCH_LIMIT)?;
-        Ok(if wide.len() > out.len() { wide } else { out })
+        let mut out = if wide.len() > out.len() { wide } else { out };
+
+        // Only once the text index has had both attempts and still left room.
+        // Expansion fills empty slots; it never competes for full ones.
+        if include_related && out.len() < top_k {
+            let want = top_k - out.len();
+            out.extend(self.related_to(&out, user_id, want)?);
+        }
+        Ok(out)
     }
 
     async fn update_memory(
@@ -346,6 +469,180 @@ mod tests {
             .save_memory(content, user, 0.5, None, None, None, None, None)
             .await
             .unwrap()
+    }
+
+    async fn save_with_entities(
+        backend: &CtxMemoryBackend,
+        content: &str,
+        user: &str,
+        entities: &[&str],
+    ) -> Memory {
+        let entities: Vec<String> = entities.iter().map(|e| (*e).to_string()).collect();
+        backend
+            .save_memory(content, user, 0.5, None, Some(&entities), None, None, None)
+            .await
+            .unwrap()
+    }
+
+    /// The point of the join: a memory whose text shares no word with the
+    /// query still arrives, because it names an entity the match named.
+    #[tokio::test]
+    async fn related_memories_arrive_through_a_shared_entity() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        save_with_entities(
+            &backend,
+            "TLS records get corrupted under WSL2",
+            "alice",
+            &["WSL2"],
+        )
+        .await;
+        save_with_entities(
+            &backend,
+            "the loopback interface drops large frames",
+            "alice",
+            &["WSL2"],
+        )
+        .await;
+
+        let found = |results: &[MemorySearchResult], needle: &str| {
+            results.iter().any(|r| r.memory.content.contains(needle))
+        };
+
+        let without = backend
+            .search_memories("TLS corruption", "alice", 5, false)
+            .await
+            .unwrap();
+        assert!(found(&without, "TLS records"), "the direct match is missing");
+        assert!(
+            !found(&without, "loopback"),
+            "expansion must not happen when it was not asked for"
+        );
+
+        let with = backend
+            .search_memories("TLS corruption", "alice", 5, true)
+            .await
+            .unwrap();
+        assert!(found(&with, "TLS records"), "the direct match is missing");
+        assert!(
+            found(&with, "loopback"),
+            "the memory sharing entity WSL2 should have been pulled in"
+        );
+    }
+
+    /// Case is an accident of how a save was worded, not a different subject.
+    #[tokio::test]
+    async fn entity_matching_ignores_case() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        save_with_entities(&backend, "bolt runs on port 7687", "alice", &["Neo4j"]).await;
+        save_with_entities(&backend, "the graph store needs APOC", "alice", &["neo4j"]).await;
+
+        let results = backend
+            .search_memories("bolt port", "alice", 5, true)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|r| r.memory.content.contains("APOC")),
+            "Neo4j and neo4j are one entity"
+        );
+    }
+
+    /// Expansion fills leftover slots; it never costs a real match its place.
+    #[tokio::test]
+    async fn expansion_never_displaces_a_ranked_match() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        save_with_entities(&backend, "redis listens on 6379", "alice", &["redis"]).await;
+        save_with_entities(&backend, "the cache eviction is LRU", "alice", &["redis"]).await;
+
+        let results = backend
+            .search_memories("redis 6379", "alice", 1, true)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "top_k must still be honoured");
+        assert!(
+            results[0].memory.content.contains("6379"),
+            "the ranked match must keep the only slot"
+        );
+    }
+
+    /// Another project's memories stay out, expansion or not.
+    #[tokio::test]
+    async fn expansion_respects_the_user_partition() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        save_with_entities(&backend, "postgres runs on 5432", "alice", &["postgres"]).await;
+        save_with_entities(&backend, "bob's secret postgres note", "bob", &["postgres"]).await;
+
+        let results = backend
+            .search_memories("postgres 5432", "alice", 5, true)
+            .await
+            .unwrap();
+        assert!(
+            !results.iter().any(|r| r.memory.content.contains("bob's")),
+            "expansion must not cross the partition boundary"
+        );
+    }
+
+    /// Deleting a memory must not leave an edge that resurrects it.
+    #[tokio::test]
+    async fn deleting_a_memory_removes_its_entity_edges() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        save_with_entities(&backend, "qdrant holds the vectors", "alice", &["qdrant"]).await;
+        let doomed =
+            save_with_entities(&backend, "qdrant port is 6333", "alice", &["qdrant"]).await;
+
+        backend.delete_memory(&doomed.id).await.unwrap();
+
+        let ids = backend
+            .records
+            .memories_for_entities(&["qdrant".to_string()])
+            .unwrap();
+        assert!(
+            !ids.contains(&doomed.id),
+            "the deleted memory still has an edge"
+        );
+
+        let results = backend
+            .search_memories("vectors", "alice", 5, true)
+            .await
+            .unwrap();
+        assert!(
+            !results.iter().any(|r| r.memory.id == doomed.id),
+            "a deleted memory came back through expansion"
+        );
+    }
+
+    /// Memories written before the edge table existed still get expanded.
+    #[tokio::test]
+    async fn existing_memories_are_backfilled() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        save_with_entities(&backend, "the mirror is an env var", "alice", &["headroom"]).await;
+        save_with_entities(&backend, "downloads must use https", "alice", &["headroom"]).await;
+
+        // Wipe the edges and rearm the marker, leaving the records intact —
+        // exactly the shape of a store that predates this feature.
+        for (id, _) in backend.records.all_records().unwrap() {
+            backend.records.set_entities(&id, &[]).unwrap();
+        }
+        backend.records.reset_entity_backfill().unwrap();
+        assert!(
+            backend
+                .records
+                .memories_for_entities(&["headroom".to_string()])
+                .unwrap()
+                .is_empty(),
+            "the edges should be gone before the backfill runs"
+        );
+
+        backend.backfill_entities().unwrap();
+
+        assert_eq!(
+            backend
+                .records
+                .memories_for_entities(&["headroom".to_string()])
+                .unwrap()
+                .len(),
+            2,
+            "the backfill should have rebuilt both edges from the records"
+        );
     }
 
     #[tokio::test]

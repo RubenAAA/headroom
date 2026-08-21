@@ -12,11 +12,36 @@
 //! Keeping it here rather than in the proxy follows the crate boundary every
 //! other SQLite store already respects: the proxy owns async and policy, core
 //! owns the connections.
+//!
+//! # Entity edges
+//!
+//! A memory carries a list of entities it mentions. Those already live inside
+//! the JSON, so a second copy in `memory_entities` needs a reason: the JSON
+//! cannot be indexed, and the question worth asking of entities runs the other
+//! way — not "which entities does this memory mention" but "which memories
+//! mention this entity". One row per (memory, entity) with an index on the
+//! entity column answers that with a join instead of a scan over every record.
+//!
+//! Entities are matched case-insensitively, so the edge table holds a
+//! lowercased form. The record keeps whatever the caller wrote, because that
+//! is what gets shown back to the model.
 
 use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
+
+/// Schema version once `memory_entities` has been built from existing records.
+const ENTITY_EDGES_VERSION: i64 = 1;
+
+/// Key form for an entity name: trimmed and lowercased.
+///
+/// "Neo4j" and "neo4j" are the same subject, and which one a save happens to
+/// use is an accident of how the model wrote that turn. Matching on the raw
+/// string would split one entity into several and lose the join.
+fn normalize_entity(entity: &str) -> String {
+    entity.trim().to_lowercase()
+}
 
 /// SQLite-backed store of serialized memory records.
 pub struct MemoryRecordStore {
@@ -47,6 +72,14 @@ impl MemoryRecordStore {
               created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id);
+
+            CREATE TABLE IF NOT EXISTS memory_entities (
+              memory_id TEXT NOT NULL,
+              entity    TEXT NOT NULL,
+              PRIMARY KEY (memory_id, entity)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_entity
+              ON memory_entities(entity);
             ",
         )?;
         Ok(Self {
@@ -86,10 +119,112 @@ impl MemoryRecordStore {
 
     /// Remove one record. `true` when a row was actually removed.
     pub fn delete(&self, id: &str) -> rusqlite::Result<bool> {
-        let removed = self
-            .conn()
-            .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        // Edges first. A memory whose edges outlive it would keep answering
+        // entity lookups with an id that `get` cannot resolve.
+        tx.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?1",
+            params![id],
+        )?;
+        let removed = tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(removed > 0)
+    }
+
+    /// Replace the entity edges for one memory.
+    ///
+    /// Delete-then-insert rather than a merge: entity lists are short and are
+    /// rewritten wholesale on every save, so reconciling which ones changed
+    /// would cost more than replacing them. Wrapped in a transaction so a
+    /// reader never sees a memory mid-rewrite with none of its entities.
+    pub fn set_entities(&self, memory_id: &str, entities: &[String]) -> rusqlite::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?1",
+            params![memory_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity) VALUES (?1, ?2)",
+            )?;
+            for entity in entities {
+                let key = normalize_entity(entity);
+                if key.is_empty() {
+                    continue;
+                }
+                stmt.execute(params![memory_id, key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every record in the store, as `(id, json)`.
+    ///
+    /// Only for the entity backfill, which has to look inside records this
+    /// store treats as opaque. The memory subsystem owns that shape, so it
+    /// does the reading; this hands over the rows and stays ignorant.
+    pub fn all_records(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, record FROM memories")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Whether the entity edges still have to be built from existing records.
+    ///
+    /// Answered by `user_version`, not by whether the edge table has rows: a
+    /// store whose memories genuinely name no entities is indistinguishable
+    /// from one that predates the table, and testing for rows would rescan
+    /// every record on every open for as long as that stayed true.
+    pub fn needs_entity_backfill(&self) -> rusqlite::Result<bool> {
+        let version: i64 =
+            self.conn()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        Ok(version < ENTITY_EDGES_VERSION)
+    }
+
+    /// Record that the backfill is done. Call once it has actually run.
+    pub fn mark_entity_backfill_done(&self) -> rusqlite::Result<()> {
+        self.conn()
+            .pragma_update(None, "user_version", ENTITY_EDGES_VERSION)
+    }
+
+    /// Arm the backfill again, so the next open rebuilds every edge.
+    ///
+    /// The repair for edges that have drifted from the records — and how a
+    /// test reaches the pre-backfill state without forging a database file.
+    pub fn reset_entity_backfill(&self) -> rusqlite::Result<()> {
+        self.conn().pragma_update(None, "user_version", 0i64)
+    }
+
+    /// Ids of the memories mentioning any of `entities`.
+    ///
+    /// This is the one-hop expansion: given the entities on the memories a
+    /// search already found, it names the other memories that share them.
+    /// Order is unspecified — the caller ranks, this only reports adjacency.
+    /// An empty `entities` returns nothing rather than everything.
+    pub fn memories_for_entities(&self, entities: &[String]) -> rusqlite::Result<Vec<String>> {
+        let keys: Vec<String> = entities
+            .iter()
+            .map(|e| normalize_entity(e))
+            .filter(|e| !e.is_empty())
+            .collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Built rather than bound as one parameter because SQLite has no array
+        // type; the placeholders are generated, never the values.
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT memory_id FROM memory_entities WHERE entity IN ({placeholders})"
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(keys), |r| r.get::<_, String>(0))?;
+        rows.collect()
     }
 
     /// Every record id belonging to `user_id`. Returned before a bulk delete
