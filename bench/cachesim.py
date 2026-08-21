@@ -23,7 +23,7 @@ Usage:
     cachesim.py validate   <corpus_dir> --log <proxy.log>  # against real billing
     cachesim.py compare    <corpus_dir>                    # both arms, totals
     cachesim.py defects    <corpus_dir> [--top N]          # per-turn attribution
-    cachesim.py damage     <corpus_dir> [--top N]          # what we changed
+    cachesim.py damage     <corpus_dir> [--top N] [--strategy S]  # what we changed
     cachesim.py experiment <corpus_dir> [--base client|forwarded]
 
 See bench/README.md for the workflow. It models cache structure and only that:
@@ -43,6 +43,25 @@ import statistics
 import sys
 from dataclasses import dataclass, field, replace
 
+# Parsing the corpus is a tenth of a run and `orjson` does it in a third of the
+# time, but it is not worth a dependency: fall back when it is absent. Only
+# decoding is delegated. `orjson.dumps` writes UTF-8 where the stdlib escapes to
+# ASCII, which would change every byte count in `_canon` and so every token.
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
+
+
+def _loads(raw: bytes):
+    """Parse JSON bytes, exactly as `json.loads` would."""
+    if _orjson is not None:
+        try:
+            return _orjson.loads(raw)
+        except _orjson.JSONDecodeError:
+            pass  # NaN, huge ints — things orjson refuses and the stdlib takes
+    return json.loads(raw)
+
 # --- Provider constants -----------------------------------------------------
 #
 # Published Anthropic prompt-caching behaviour. These are the knobs that decide
@@ -56,12 +75,31 @@ from dataclasses import dataclass, field, replace
 #
 # `SUBSCRIPTION` is NOT published. Anthropic states no token-denominated budget
 # for Pro/Max and does not say how the 5h and 7d windows weight the classes.
-# The values here are a hypothesis, and the one that matters is `read`: on the
-# API, cache reads do not count toward ITPM rate limits at all. If the
-# subscription windows behave the same way, reads are free rather than a tenth,
-# and since well over 90% of Claude Code tokens are cache reads that changes
-# what is worth optimising. Fit it with `bench/fit_weights.py` before believing
-# any absolute subscription number out of this file.
+# These values were fitted from live traffic by `bench/fit_weights.py fit`,
+# regressing observed 5h-window utilization against the token classes of the
+# turns that fell inside each interval: 2,783 samples over 28.2h, 1,569
+# intervals carrying turns out of 17,152 logged turns in five log files.
+#
+#   `read = 0.10`, on a bootstrap band of 0.04-0.25 that EXCLUDES ZERO. This
+#   file previously assumed `read = 0` on the inference that the windows copy
+#   the published ITPM rule, where cache reads do not count at all. The fit
+#   rejects that: reads are metered against the usage window at roughly the
+#   API's tenth. Since well over 90% of Claude Code tokens are cache reads,
+#   the difference decides whether trading writes for reads is worth anything.
+#
+#   `write_1h = 1.45`, band 1.00-2.00. The band spans both the flat raw-token
+#   reading and the API's 2x dollar premium, so the fit does not settle that
+#   argument; 1.45 is only the best point estimate between them.
+#
+#   `write_5m = 1.25` is NOT fitted. The fit pins it to free the other two
+#   coefficients, so it carries the API value by assumption, not evidence.
+#
+# The fit resolves the 5h window and only the 5h window. Over 7d, utilization
+# moves in 46 intervals against 361 for 5h, and the read band widens to
+# 0.00-0.30 — which does include zero. Any 7d-specific claim is unfitted.
+#
+# R^2 is 0.328. That is a real signal on a noisy meter, not a tight model, so
+# treat differences of a percentage point or two between arms as noise.
 #
 # The proxy's own `billed_fresh_equivalents` uses a third set — reads 0.1, ALL
 # writes 1.25 — which matches neither. `Usage.billed_flat` reproduces it so the
@@ -78,8 +116,8 @@ class Weights:
 
 
 API = Weights(read=0.1, write_5m=1.25, write_1h=2.0, documented=True)
-SUBSCRIPTION_HYPOTHESIS = Weights(read=0.0, write_5m=1.25, write_1h=2.0)
-PROFILES = {"api": API, "subscription": SUBSCRIPTION_HYPOTHESIS}
+SUBSCRIPTION = Weights(read=0.10, write_5m=1.25, write_1h=1.45)
+PROFILES = {"api": API, "subscription": SUBSCRIPTION}
 
 # A prefix shorter than this is never cached, so a breakpoint on it does nothing.
 # 1024 for Sonnet/Opus; Haiku is 2048 and would need a per-model table.
@@ -114,13 +152,19 @@ class Segment:
     digest: bytes
 
 
+# One encoder, reused. `json.dumps` with non-default arguments builds a fresh
+# `JSONEncoder` on every call, and `_canon` runs once per content block per turn
+# per arm — millions of times over a full experiment.
+_ENCODER = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
+
+
 def _canon(value) -> bytes:
     """Stable bytes for a JSON value.
 
     Key order is normalised because the cache key is the content, and two
     serialisations of the same block must not look like different prefixes.
     """
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return _ENCODER.encode(value).encode()
 
 
 def _tokens(raw: bytes, bytes_per_token: float) -> int:
@@ -160,6 +204,11 @@ def _blocks(body: dict):
             yield role, {"type": "text", "text": content}
 
 
+# Requests that asked for more breakpoints than the provider takes, since the
+# last reset. An arm that trips this is scoring a request the API would reject.
+OVER_BUDGET = {"requests": 0, "worst": 0}
+
+
 def flatten(body: dict, bytes_per_token: float) -> list[Segment]:
     """Request body -> the linear segment sequence the cache matches against."""
     segments: list[Segment] = []
@@ -181,9 +230,14 @@ def flatten(body: dict, bytes_per_token: float) -> list[Segment]:
         segments.append(Segment(_tokens(raw, bytes_per_token), ttl, digest))
 
     # More breakpoints than the provider accepts is a request it would reject,
-    # not one it would silently trim. Flagged rather than fixed.
+    # not one it would silently trim. Trimming is what keeps the simulation
+    # going, but an arm that needs it is not a shippable arm, and the count is
+    # reported so nobody reads its score as achievable. `tail-breakpoints-3`
+    # asks for five and scored as though it were the best idea in the file.
     marked = [s for s in segments if s.breakpoint_ttl]
     if len(marked) > MAX_BREAKPOINTS:
+        OVER_BUDGET["requests"] += 1
+        OVER_BUDGET["worst"] = max(OVER_BUDGET["worst"], len(marked))
         for extra in marked[:-MAX_BREAKPOINTS]:
             extra.breakpoint_ttl = None
     return segments
@@ -353,68 +407,320 @@ class Turn:
     body: dict
 
 
-def load_corpus(path: str) -> list[Turn]:
-    """Read a `HEADROOM_CAPTURE_DIR` corpus, ordered as the proxy saw it.
+# Metadata needed to order a turn and find its bodies, without holding either.
+# The corpus outgrew RAM: blindguard is 7.8 GB on disk, and loading it, its
+# forwarded twin, and one strategy's copy at once took the machine down. Every
+# report that walks the whole corpus now streams it instead.
+@dataclass(frozen=True)
+class Entry:
+    seq: int
+    ts: float
+    request_id: str
+    session_key: str
+    path: str
+
+
+_META = re.compile(
+    rb'"seq"\s*:\s*(?P<seq>-?\d+)'
+    rb'|"ts_ms"\s*:\s*(?P<ts>-?[\d.eE+-]+)'
+    rb'|"request_id"\s*:\s*"(?P<rid>[^"\\]*)"'
+    rb'|"session_key"\s*:\s*"(?P<sk>[^"\\]*)"'
+)
+# Enough of an envelope to carry the four metadata fields ahead of `body`.
+_HEAD_BYTES = 4096
+
+
+def _index_one(name: str) -> Entry | None:
+    """Metadata for one envelope, read without parsing its body.
+
+    The body is the whole cost of a parse and none of the value here, so this
+    reads a head slice and picks the fields out of it. Anything the fast path
+    cannot answer for certain falls back to a full parse, so the result is
+    always what `json.load` would have said.
+    """
+    try:
+        with open(name, "rb") as handle:
+            head = handle.read(_HEAD_BYTES)
+    except OSError:
+        return None
+    cut = head.find(b'"body"')
+    if cut != -1:
+        found = {}
+        for m in _META.finditer(head[:cut]):
+            found.update({k: v for k, v in m.groupdict().items() if v is not None})
+        if len(found) == 4:
+            try:
+                return Entry(
+                    seq=int(found["seq"]),
+                    ts=float(found["ts"]) / 1000.0,
+                    request_id=found["rid"].decode(),
+                    session_key=found["sk"].decode(),
+                    path=name,
+                )
+            except (ValueError, UnicodeDecodeError):
+                pass
+    try:
+        with open(name) as handle:
+            env = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return Entry(
+        seq=env.get("seq", 0),
+        ts=env.get("ts_ms", 0) / 1000.0,
+        request_id=env.get("request_id", ""),
+        session_key=env.get("session_key", ""),
+        path=name,
+    )
+
+
+def index_corpus(path: str) -> list[Entry]:
+    """Every turn's metadata, in the order the proxy saw it.
+
+    Same ordering rule as `load_corpus`: `seq` restarts every process, so the
+    sort is on the envelope's timestamp with `seq` breaking ties, and the
+    filesystem's order breaking those.
+    """
+    entries = [e for e in (_index_one(n)
+                           for n in glob.glob(os.path.join(path, "req-*.json")))
+               if e is not None]
+    entries.sort(key=lambda e: (e.ts, e.seq))
+    return entries
+
+
+def _body_at(name: str) -> dict | None:
+    """One request body, or None if it is missing or not a turn.
+
+    The hottest read in a streaming report: twice per turn to pair the arms,
+    then once per turn per strategy.
+    """
+    env = _read_json(name)
+    if env is None:
+        return None
+    body = env.get("body", env)
+    return body if isinstance(body, dict) and "messages" in body else None
+
+
+def client_body(entry: Entry) -> dict | None:
+    return _body_at(entry.path)
+
+
+def forwarded_body(entry: Entry, path: str) -> dict | None:
+    return _body_at(os.path.join(path, "out", f"{entry.request_id}.json"))
+
+
+class StreamScorer:
+    """`score_corpus` for one arm, fed a turn at a time.
+
+    Holds the same `CacheSim` across the whole corpus, because the cache scope
+    is model plus credential and deliberately spans sessions — see the note in
+    `score_corpus`. That is why the corpus cannot be chunked by session.
+    """
+
+    def __init__(self, bytes_per_token: float):
+        self.sim = CacheSim(bytes_per_token=bytes_per_token)
+        self.total = Usage()
+
+    def add(self, turn: Turn) -> Usage:
+        auth = turn.session_key.split(":")[1] if ":" in turn.session_key else ""
+        usage = self.sim.score(turn.body, turn.ts,
+                               scope=f"{turn.body.get('model', '')}\x00{auth}")
+        self.total = self.total + usage
+        return usage
+
+
+# A corpus is read twice over per arm and an `experiment` run has fifty-six of
+# them, so nothing below holds a body longer than it takes to score it. The
+# index carries the envelope and the file name; the body is parsed on demand and
+# dropped as the iterator moves on. Peak memory is one request, not one corpus —
+# which is the difference between a 7.8 GB capture running and the machine
+# swapping itself to death.
+
+# Enough of a capture file to cover the envelope and the head of the body. The
+# fields the index needs all sit before `"body"`, and `"messages"` is the second
+# key of a request, so this settles both questions without parsing megabytes.
+HEAD_BYTES = 8192
+
+
+@dataclass(frozen=True)
+class TurnRef:
+    """One captured turn: everything except the body, plus where to find it."""
+
+    seq: int
+    ts: float
+    request_id: str
+    session_key: str
+    path: str
+
+    def turn(self, body: dict) -> Turn:
+        return Turn(self.seq, self.ts, self.request_id, self.session_key, body)
+
+
+def _read_json(name: str):
+    """Parse a whole file, or None if it is missing or not JSON."""
+    try:
+        with open(name, "rb") as handle:
+            return _loads(handle.read())
+    except (OSError, ValueError):
+        return None
+
+
+def _has_messages(raw: bytes, start: int):
+    """Does the object beginning at `start` carry a top-level `messages` key?
+
+    Returns None when `raw` ends before the answer is settled, so the caller can
+    fall back to a full parse. Scanning beats parsing here by two orders of
+    magnitude and the question is a shallow one: track brace depth and string
+    state, and compare the keys that sit at depth one.
+    """
+    n = len(raw)
+    while start < n and raw[start] in b" \t\r\n":
+        start += 1
+    if start >= n:
+        return None
+    if raw[start] != 0x7B:  # '{'
+        return False
+    i, depth, expect_key = start + 1, 1, True
+    while i < n:
+        c = raw[i]
+        if c == 0x22:  # '"'
+            j = i + 1
+            while j < n and raw[j] != 0x22:
+                j += 2 if raw[j] == 0x5C else 1  # backslash escapes the next
+            if j >= n:
+                return None
+            if depth == 1 and expect_key:
+                if raw[i + 1:j] == b"messages":
+                    return True
+                expect_key = False
+            i = j + 1
+            continue
+        if c in b"{[":
+            depth += 1
+        elif c in b"}]":
+            depth -= 1
+            if depth == 0:
+                return False
+        elif c == 0x2C and depth == 1:  # ','
+            expect_key = True
+        i += 1
+    return None
+
+
+def _index_one(name: str) -> TurnRef | None:
+    """A capture envelope read from the head of its file, body left on disk."""
+    try:
+        with open(name, "rb") as handle:
+            head = handle.read(HEAD_BYTES)
+    except OSError:
+        return None
+    at = head.find(b'"body":')
+    env = None
+    if at >= 0:
+        try:
+            env = _loads(head[:at] + b'"body":null}')
+        except ValueError:
+            env = None
+        else:
+            ok = _has_messages(head, at + len(b'"body":'))
+    if env is None or ok is None:
+        env = _read_json(name)
+        if not isinstance(env, dict):
+            return None
+        body = env.get("body")
+        ok = isinstance(body, dict) and "messages" in body
+    if not ok:
+        return None
+    return TurnRef(
+        seq=env.get("seq", 0),
+        ts=env.get("ts_ms", 0) / 1000.0,
+        request_id=env.get("request_id", ""),
+        session_key=env.get("session_key", ""),
+        path=name,
+    )
+
+
+def index_corpus(path: str) -> list[TurnRef]:
+    """Index a `HEADROOM_CAPTURE_DIR` corpus, ordered as the proxy saw it.
 
     Ordering comes from the `seq` field, not the filename: the capture restarts
     its counter every process and the envelope is the only reliable order.
     """
-    turns = []
-    for name in glob.glob(os.path.join(path, "req-*.json")):
-        try:
-            with open(name) as handle:
-                env = json.load(handle)
-        except (OSError, ValueError):
+    refs = [ref for ref in (_index_one(name) for name
+                            in glob.glob(os.path.join(path, "req-*.json")))
+            if ref is not None]
+    refs.sort(key=lambda r: (r.ts, r.seq))
+    return refs
+
+
+def forwarded_path(path: str, request_id: str) -> str:
+    return os.path.join(path, "out", f"{request_id}.json")
+
+
+def iter_client(refs) -> "iter[Turn]":
+    """Turns carrying what the client sent, one body alive at a time."""
+    for ref in refs:
+        env = _read_json(ref.path)
+        if not isinstance(env, dict):
             continue
         body = env.get("body")
-        if not isinstance(body, dict) or "messages" not in body:
-            continue
-        turns.append(
-            Turn(
-                seq=env.get("seq", 0),
-                ts=env.get("ts_ms", 0) / 1000.0,
-                request_id=env.get("request_id", ""),
-                session_key=env.get("session_key", ""),
-                body=body,
-            )
-        )
-    turns.sort(key=lambda t: (t.ts, t.seq))
-    return turns
+        if isinstance(body, dict) and "messages" in body:
+            yield ref.turn(body)
+
+
+def load_corpus(path: str) -> list[Turn]:
+    """The whole corpus in memory, bodies and all.
+
+    Kept for callers that want random access. Anything that makes a single pass
+    should stream instead — see `index_corpus` and `iter_client`.
+    """
+    return list(iter_client(index_corpus(path)))
 
 
 def with_forwarded_bodies(turns: list[Turn], path: str) -> list[Turn]:
     """The same turns, carrying what the proxy sent instead of what it received.
 
-    The capture writes the inbound body into `req-*.json` and the forwarded one
-    into `out/<request_id>.json`, so the pair is the A/B: identical traffic,
-    identical order, one arm rewritten by the proxy. Turns without a forwarded
-    file are dropped rather than passed through, so neither arm gets credit for
-    a turn the other never saw.
+    Turns without a forwarded file are dropped rather than passed through, so
+    neither arm gets credit for a turn the other never saw.
     """
     out = []
     for turn in turns:
-        name = os.path.join(path, "out", f"{turn.request_id}.json")
-        try:
-            with open(name) as handle:
-                body = json.load(handle)
-        except (OSError, ValueError):
-            continue
+        body = _read_json(forwarded_path(path, turn.request_id))
         if isinstance(body, dict) and "messages" in body:
             out.append(replace(turn, body=body))
     return out
+
+
+def _scored(sim: CacheSim, turns):
+    """Yield `(turn, usage)` in arrival order against one cache."""
+    for turn in turns:
+        # Model plus credential identify the cache; the conversation part of
+        # session_key must NOT be included, or two conversations sharing a
+        # prefix would each miss what the other cached.
+        auth = turn.session_key.split(":")[1] if ":" in turn.session_key else ""
+        yield turn, sim.score(turn.body, turn.ts,
+                              scope=f"{turn.body.get('model', '')}\x00{auth}")
+
+
+def score_arm(turns, bytes_per_token: float) -> Usage:
+    """Total usage for one arm, retaining nothing per turn."""
+    sim = CacheSim(bytes_per_token=bytes_per_token)
+    total = Usage()
+    for _, usage in _scored(sim, turns):
+        total = total + usage
+    return total
+
+
+def score_arm_by_id(turns, bytes_per_token: float) -> dict[str, Usage]:
+    """Per-turn usage for one arm, keyed by request id and nothing more."""
+    return {turn.request_id: usage for turn, usage
+            in _scored(CacheSim(bytes_per_token=bytes_per_token), turns)}
 
 
 def score_corpus(turns: list[Turn], bytes_per_token: float) -> tuple[Usage, list[tuple[Turn, Usage]]]:
     sim = CacheSim(bytes_per_token=bytes_per_token)
     total = Usage()
     per_turn = []
-    for turn in turns:
-        # Model plus credential identify the cache; the conversation part of
-        # session_key must NOT be included, or two conversations sharing a
-        # prefix would each miss what the other cached.
-        auth = turn.session_key.split(":")[1] if ":" in turn.session_key else ""
-        usage = sim.score(turn.body, turn.ts,
-                          scope=f"{turn.body.get('model', '')}\x00{auth}")
+    for turn, usage in _scored(sim, turns):
         per_turn.append((turn, usage))
         total = total + usage
     return total, per_turn
@@ -539,20 +845,55 @@ def report_validation(rows) -> None:
 # --- Comparison -------------------------------------------------------------
 
 
-def report_comparison(turns, path, bytes_per_token, weights) -> int:
+def paired_pass(entries, path, bytes_per_token):
+    """Score both reference arms in one streaming walk of the corpus.
+
+    A turn counts only when both halves of the pair load, so neither arm gets
+    credit for traffic the other never saw. That verdict is per turn and does
+    not depend on any other turn, so deciding it mid-walk is the same as
+    filtering the corpus first — and it costs one pass instead of two corpora
+    held in memory. Returns the two arms, the entries that survived, and the
+    session count.
+    """
+    client_arm = StreamScorer(bytes_per_token)
+    proxy_arm = StreamScorer(bytes_per_token)
+    kept, sessions = [], set()
+    for entry in entries:
+        cbody = client_body(entry)
+        if cbody is None:
+            continue
+        fbody = forwarded_body(entry, path)
+        if fbody is None:
+            continue
+        client_arm.add(replace_body(entry, cbody))
+        proxy_arm.add(replace_body(entry, fbody))
+        kept.append(entry)
+        sessions.add(entry.session_key)
+    return client_arm.total, proxy_arm.total, kept, len(sessions)
+
+
+def replace_body(entry: Entry, body: dict) -> Turn:
+    """A `Turn` for one arm, borrowing the entry's metadata."""
+    return Turn(seq=entry.seq, ts=entry.ts, request_id=entry.request_id,
+                session_key=entry.session_key, body=body)
+
+
+def forwarded_body_of(path: str):
+    """Bind a corpus root so the forwarded loader matches `client_body`'s shape."""
+    return lambda entry: forwarded_body(entry, path)
+
+
+def report_comparison(entries, path, bytes_per_token, weights) -> int:
     """Price the same traffic twice: as the client sent it, as the proxy sent it."""
-    forwarded = with_forwarded_bodies(turns, path)
-    if not forwarded:
+    client_total, proxy_total, kept, sessions = paired_pass(
+        entries, path, bytes_per_token)
+    if not kept:
         print(f"no forwarded bodies under {os.path.join(path, 'out')}", file=sys.stderr)
         return 1
-    kept = {t.request_id for t in forwarded}
-    client = [t for t in turns if t.request_id in kept]
+    client = kept
 
-    arms = {
-        "claude code": score_corpus(client, bytes_per_token)[0],
-        "through proxy": score_corpus(forwarded, bytes_per_token)[0],
-    }
-    print(f"turns {len(client)}, sessions {len({t.session_key for t in client})}, "
+    arms = {"claude code": client_total, "through proxy": proxy_total}
+    print(f"turns {len(client)}, sessions {sessions}, "
           f"bytes/token {bytes_per_token}\n")
     print(f"{'':>16} {'claude code':>16} {'through proxy':>16} {'change':>9}")
     for name, get in (
@@ -631,7 +972,7 @@ def _message_units(body: dict) -> list[tuple[bytes, bytes, int, str]]:
     return units
 
 
-def report_damage(turns, path, top: int) -> int:
+def report_damage(turns, path, top: int, names=None, base: str = "forwarded") -> int:
     """What the proxy changed about the conversation itself, not its price.
 
     `defects` rewards anything that shortens the prefix, which a build that
@@ -642,6 +983,11 @@ def report_damage(turns, path, top: int) -> int:
     It reports, it does not judge. Dropping a pruned tool block or offloading an
     old message is deliberate and shows up here exactly like a bug would — the
     numbers are the input to that judgement, not the judgement.
+
+    With `--strategy`, an unshipped idea is measured the same way: the strategy
+    runs over the chosen base and the result is diffed against what the client
+    sent, so a winner in `experiment` can be checked before anyone ships it.
+    Two arms cannot share a run — each needs its own diff against the client.
     """
     import difflib
 
@@ -650,6 +996,20 @@ def report_damage(turns, path, top: int) -> int:
         print(f"no forwarded bodies under {os.path.join(path, 'out')}", file=sys.stderr)
         return 1
     client = {t.request_id: t for t in turns}
+    label = "live proxy"
+    if names:
+        if len(names) > 1:
+            print("damage takes one --strategy at a time", file=sys.stderr)
+            return 1
+        import strategies
+        kept = {t.request_id for t in forwarded}
+        source = forwarded if base == "forwarded" else [
+            t for t in turns if t.request_id in kept]
+        strategies.reset()
+        forwarded = [replace(t, body=strategies.apply(names[0], t.body, t))
+                     for t in source]
+        label = f"{names[0]} (on {base})"
+    print(f"diffing {label} against what the client sent\n")
 
     kinds = {"dropped": [0, 0], "injected": [0, 0], "rewritten": [0, 0],
              "reminder churn": [0, 0]}
@@ -790,7 +1150,7 @@ def report_defects(turns, path, bytes_per_token, weights, top: int) -> int:
     return 0
 
 
-def report_experiment(turns, path, bytes_per_token, weights, base: str,
+def report_experiment(entries, path, bytes_per_token, weights, base: str,
                       names: list[str] | None) -> int:
     """Price every registered strategy against the same corpus.
 
@@ -801,28 +1161,51 @@ def report_experiment(turns, path, bytes_per_token, weights, base: str,
     """
     import strategies
 
-    forwarded = with_forwarded_bodies(turns, path)
-    kept = {t.request_id for t in forwarded}
-    client = [t for t in turns if t.request_id in kept]
-    if not client:
+    client_total, proxy_total, kept, _ = paired_pass(entries, path, bytes_per_token)
+    if not kept:
         print(f"no paired turns under {path}", file=sys.stderr)
         return 1
-    source = forwarded if base == "forwarded" else client
+    load_source = forwarded_body_of(path) if base == "forwarded" else client_body
 
-    rows = [("claude code", score_corpus(client, bytes_per_token)[0]),
-            ("live proxy", score_corpus(forwarded, bytes_per_token)[0])]
+    rows = [("claude code", client_total, (0, 0)),
+            ("live proxy", proxy_total, (0, 0))]
     for name in names or strategies.REGISTRY:
-        arm = [replace(t, body=strategies.apply(name, t.body)) for t in source]
-        rows.append((f"{name} (on {base})", score_corpus(arm, bytes_per_token)[0]))
+        # Session-aware arms carry state between turns; clear it so an arm is
+        # scored on the corpus and not on whatever ran before it. That state is
+        # module-global, which is why the arms run one after another rather than
+        # in lockstep down a single pass — interleaving them would have each arm
+        # reading the others' state.
+        strategies.reset()
+        OVER_BUDGET.update(requests=0, worst=0)
+        arm = StreamScorer(bytes_per_token)
+        for entry in kept:
+            body = load_source(entry)
+            if body is None:
+                continue
+            turn = replace_body(entry, body)
+            # The body was parsed for this arm alone, so the strategy may
+            # rewrite it where it lies instead of copying it first.
+            turn.body = strategies.apply(name, turn.body, turn, owned=True)
+            arm.add(turn)
+        over = OVER_BUDGET["requests"], OVER_BUDGET["worst"]
+        rows.append((f"{name} (on {base})", arm.total, over))
 
     baseline = rows[0][1].billed_with(weights)
-    print(f"turns {len(client)}, base {base}, bytes/token {bytes_per_token}\n")
+    print(f"turns {len(kept)}, base {base}, bytes/token {bytes_per_token}\n")
     print(f"  {'arm':<34} {'billed':>14} {'vs claude code':>15} {'uncached':>9}")
-    for name, usage in rows:
+    flagged = []
+    for name, usage, over in rows:
         billed = usage.billed_with(weights)
         share = usage.input_tokens / billed if billed else 0
+        mark = "  OVER BUDGET" if over[0] else ""
         print(f"  {name:<34} {billed:>14,.0f} "
-              f"{(billed - baseline) / baseline:>+14.1%} {share:>9.1%}")
+              f"{(billed - baseline) / baseline:>+14.1%} {share:>9.1%}{mark}")
+        if over[0]:
+            flagged.append((name, over))
+    for name, (count, worst) in flagged:
+        print(f"\n  {name} asked for up to {worst} breakpoints on {count:,} "
+              f"requests, over the provider's {MAX_BREAKPOINTS}.\n"
+              "  The API would reject those; the score above is not achievable.")
     print("\n  A winner here is a cache-structure result only. Run `damage` on it\n"
           "  before shipping: deleting the conversation also scores well.")
     return 0
@@ -838,14 +1221,28 @@ def main() -> int:
     parser.add_argument("--log", default=os.path.expanduser("~/headroom-proxy.log"))
     parser.add_argument("--bytes-per-token", type=float, default=DEFAULT_BYTES_PER_TOKEN)
     parser.add_argument("--base", choices=("client", "forwarded"), default="client",
-                        help="what `experiment` applies each strategy to")
+                        help="what `experiment` and `damage` apply each strategy to")
     parser.add_argument("--strategy", action="append",
-                        help="run only these strategies (repeatable)")
+                        help="run only these strategies (repeatable; `damage` takes one)")
     parser.add_argument("--top", type=int, default=10,
                         help="how many worst turns `defects` lists")
     parser.add_argument("--weights", choices=sorted(PROFILES), default="api",
                         help="which weighting to bill under; only `api` is documented")
     args = parser.parse_args()
+
+    # `compare` and `experiment` walk the whole corpus and never need two turns
+    # at once, so they stream it. The rest still materialise, which is fine at
+    # windowgap size and will not survive blindguard.
+    if args.mode in ("compare", "experiment"):
+        entries = index_corpus(args.corpus)
+        if not entries:
+            print(f"no capture envelopes in {args.corpus}", file=sys.stderr)
+            return 1
+        if args.mode == "compare":
+            return report_comparison(entries, args.corpus, args.bytes_per_token,
+                                     PROFILES[args.weights])
+        return report_experiment(entries, args.corpus, args.bytes_per_token,
+                                 PROFILES[args.weights], args.base, args.strategy)
 
     turns = load_corpus(args.corpus)
     if not turns:
@@ -858,16 +1255,9 @@ def main() -> int:
         )
         return 0
 
-    if args.mode == "compare":
-        return report_comparison(turns, args.corpus, args.bytes_per_token,
-                                 PROFILES[args.weights])
-
-    if args.mode == "experiment":
-        return report_experiment(turns, args.corpus, args.bytes_per_token,
-                                 PROFILES[args.weights], args.base, args.strategy)
-
     if args.mode == "damage":
-        return report_damage(turns, args.corpus, args.top)
+        return report_damage(turns, args.corpus, args.top,
+                             args.strategy, args.base)
 
     if args.mode == "defects":
         return report_defects(turns, args.corpus, args.bytes_per_token,

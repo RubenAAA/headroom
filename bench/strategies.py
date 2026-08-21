@@ -24,6 +24,9 @@ that wins before believing it.
 from __future__ import annotations
 
 import copy
+import json
+import inspect
+import hashlib
 import os
 import re
 
@@ -197,6 +200,40 @@ def strip_system(body):
             if isinstance(block, dict):
                 block.pop("cache_control", None)
     return body
+
+
+def _drop_first_system_marker(body) -> bool:
+    """Free one marker from `system`, keeping the later one. True if it moved."""
+    system = body.get("system")
+    if not isinstance(system, list):
+        return False
+    for block in system:
+        if isinstance(block, dict) and block.get("cache_control"):
+            block.pop("cache_control", None)
+            return True
+    return False
+
+
+@strategy("rebalance-1sys-3tail")
+def rebalance_1sys_3tail(body):
+    """Spend one of the two system markers on a third tail marker.
+
+    Anthropic takes four markers and this client already spends all four: two on
+    `system`, two on the message tail. `tail-breakpoints-3` appeared to beat that
+    but asks for five, and the simulator quietly drops the earliest to fit —
+    which means its score was never "three tail markers", it was "one system
+    marker and three tail". That is a legal request nobody had named, so this
+    names it and asks for exactly four.
+    """
+    _drop_first_system_marker(body)
+    return _tail_breakpoints(body, 3)
+
+
+@strategy("rebalance-1sys-2tail")
+def rebalance_1sys_2tail(body):
+    """Control: lose the system marker, do not spend it. Isolates the two halves."""
+    _drop_first_system_marker(body)
+    return _tail_breakpoints(body, 2)
 
 
 @strategy("force-ttl-5m")
@@ -445,6 +482,637 @@ def cache_behind_counter(body):
     return body
 
 
-def apply(name: str, body: dict) -> dict:
-    """Run a strategy on a deep copy, so arms cannot contaminate each other."""
-    return REGISTRY[name](copy.deepcopy(body))
+# --- offload floor -------------------------------------------------------
+#
+# `--ctx-offload-min-bytes` decides which `tool_result` blocks offload can even
+# see. It was tuned when Read results dominated; on Bash-heavy traffic 292 of
+# 301 blocks in a captured body sat UNDER the 4,000-byte floor, so 79% of the
+# tool_result bytes were unreachable whatever the gate did.
+#
+# The digest shape is copied from `ctx_offload.rs`: keep a quarter of the block,
+# clamped to [600, 3072] bytes, then a fixed retrieval footer. Blocks near the
+# floor barely shrink, which is exactly what these arms are here to price.
+
+# Anthropic accepts four cache_control markers per request, total.
+MAX_BREAKPOINTS = 4
+
+PREVIEW_CEILING = 3072
+PREVIEW_FLOOR = 600
+# `digest_footer` in the proxy: marker, hash and the retrieval pointer sentence.
+FOOTER_BYTES = 180
+# The proxy leaves the live tail alone; `--ctx-offload-stale-messages 4`.
+STALE_AFTER = 4
+
+
+
+def _tool_result_text(block):
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(c.get("text", "") for c in content
+                       if isinstance(c, dict) and c.get("type") == "text")
+    return None
+
+
+def _write_digest(block, text) -> bool:
+    """Replace a tool_result with its preview + pointer. False if it would grow."""
+    keep = min(max(len(text) // 4, PREVIEW_FLOOR), PREVIEW_CEILING)
+    footer = "\n…[truncated — retrieval pointer below]\n<headroom:offloaded "
+    digest = text[:keep] + footer + "x" * max(0, FOOTER_BYTES - len(footer))
+    if len(digest) >= len(text):
+        return False
+    if isinstance(block.get("content"), str):
+        block["content"] = digest
+    else:
+        block["content"] = [{"type": "text", "text": digest}]
+    return True
+
+
+def _offload_at(body, min_bytes):
+    """Emulate ctx_offload with the floor moved to `min_bytes`."""
+    messages = body.get("messages") or []
+    cutoff = len(messages) - STALE_AFTER
+    for i, message in enumerate(messages):
+        if i >= cutoff or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            content = block.get("content")
+            if isinstance(content, list):
+                parts = [c for c in content if isinstance(c, dict) and c.get("type") == "text"]
+            elif isinstance(content, str):
+                parts = None
+            else:
+                continue
+            text = content if parts is None else "".join(c.get("text", "") for c in parts)
+            if len(text) < min_bytes:
+                continue
+            keep = min(max(len(text) // 4, PREVIEW_FLOOR), PREVIEW_CEILING)
+            # Carry the proxy's real marker, padded to the real footer length.
+            # `cachesim.py damage` classifies a change by the signature it finds,
+            # so a placeholder footer files the whole arm under "rewritten" and
+            # makes it unreadable next to the live proxy.
+            footer = f"\n…[truncated — retrieval pointer below]\n<headroom:offloaded "
+            digest = text[:keep] + footer + "x" * max(0, FOOTER_BYTES - len(footer))
+            if len(digest) >= len(text):
+                continue          # never inflate a block
+            if parts is None:
+                block["content"] = digest
+            else:
+                block["content"] = [{"type": "text", "text": digest}]
+    return body
+
+
+@strategy("offload-floor-4000")
+def offload_floor_4000(body):
+    """The live setting, as the control for the arms below."""
+    return _offload_at(body, 4000)
+
+
+@strategy("offload-floor-2000")
+def offload_floor_2000(body):
+    """Halve the floor. A 2,000-byte block digests to ~780, so it still pays."""
+    return _offload_at(body, 2000)
+
+
+@strategy("offload-floor-1200")
+def offload_floor_1200(body):
+    """Near the point where the 600-byte preview floor stops shrinking anything."""
+    return _offload_at(body, 1200)
+
+
+@strategy("offload-floor-800")
+def offload_floor_800(body):
+    """Past it: most blocks here cannot shrink, so this should lose."""
+    return _offload_at(body, 800)
+
+
+
+# --- stepped thinking anchor --------------------------------------------
+#
+# `strip-old-thinking` scores +59.9% because its boundary moves every turn: the
+# message that was last is stripped on the next turn, so the bytes change one
+# turn behind the tail and the trailing segment is rewritten each time.
+# `strip-all-thinking` scores -12.7% because nothing ever changes shape — but it
+# is unshippable, an open tool loop needs its signed block back.
+#
+# The difference is not what is stripped, it is how often the strip line moves.
+# Anchor it to a multiple of STEP and it moves once every STEP messages instead
+# of every turn, so the prefix breaks once and then holds. The tail — including
+# any open tool loop — is never touched.
+
+
+def _stepped_thinking(body, step):
+    messages = body.get("messages") or []
+    anchor = (len(messages) // step) * step
+    for i, message in enumerate(messages):
+        if i >= anchor or not isinstance(message.get("content"), list):
+            continue
+        message["content"] = [b for b in message["content"]
+                              if not (isinstance(b, dict) and b.get("type") in THINKING)]
+    return body
+
+
+@strategy("thinking-anchor-25")
+def thinking_anchor_25(body):
+    """Strip behind an anchor that advances every 25 messages."""
+    return _stepped_thinking(body, 25)
+
+
+@strategy("thinking-anchor-50")
+def thinking_anchor_50(body):
+    """As above, advancing every 50 — fewer breaks, more thinking retained."""
+    return _stepped_thinking(body, 50)
+
+
+@strategy("thinking-anchor-100")
+def thinking_anchor_100(body):
+    """Rarest breaks. Approaches noop on conversations shorter than 100."""
+    return _stepped_thinking(body, 100)
+
+
+
+# --- strip old thinking, with the breakpoints moved in front of the cut ---
+#
+# `strip-old-thinking` is +59.9% not because of what it removes but because of
+# where the removal lands relative to the cache markers. A change at message N
+# invalidates every breakpoint at or after N, and the forwarded body puts its
+# tail breakpoints past the strip line, so each turn buys a full rebuild.
+#
+# Prefixes only care about what precedes them. Put the last breakpoint *before*
+# the strip line and the edited region falls into the live zone, which is
+# uncached every turn regardless. If the break is what costs, this recovers it;
+# if the removal itself is the problem, this scores no better and the thinking
+# lever is dead.
+
+
+@strategy("strip-old-thinking-safe-marks")
+def strip_old_thinking_safe_marks(body):
+    """One marker immediately before the cut. The crude version, kept as the
+    control for the arm below: it proves the break is what costs, at the price
+    of leaving everything past that single point uncached."""
+    last = _strip_behind_last_assistant(body)
+    if last is None:
+        return body
+    _clear_message_markers(body)
+    _mark_last_block_before(body, last)
+    return body
+
+
+@strategy("strip-old-thinking-spread-marks")
+def strip_old_thinking_spread_marks(body):
+    """Same cut, but spending the whole breakpoint budget in front of it.
+
+    Anthropic allows four markers per request and the single-marker version
+    wastes the rest, which is why it pushed uncached from 1.4% to 13.8%: one
+    anchor caches one prefix, and everything after it is fresh every turn.
+    Spreading the remainder back through the history gives shorter prefixes
+    that still hit when an edit lands near the tail.
+
+    Every marker stays strictly before the strip line. A marker after the cut
+    is the +59.7% arm.
+    """
+    last = _strip_behind_last_assistant(body)
+    if last is None:
+        return body
+    _clear_message_markers(body)
+    messages = body.get("messages") or []
+    eligible = []
+    for message in messages[:last]:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        eligible.extend(b for b in content if isinstance(b, dict))
+    if not eligible:
+        return body
+    # The client's system markers are left alone and count against the same
+    # limit of four, so only spend what they leave.
+    budget = max(1, MAX_BREAKPOINTS - _system_marker_count(body))
+    n = len(eligible)
+    # Quarters, nearest the cut first — the spacing rule from `_tail_breakpoints`,
+    # anchored to the cut instead of to the tail.
+    for i in range(budget):
+        index = n - 1 - round(i * n / (4 * budget))
+        if 0 <= index < n:
+            eligible[index]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    return body
+
+
+def _system_marker_count(body: dict) -> int:
+    system = body.get("system")
+    if not isinstance(system, list):
+        return 0
+    return sum(1 for b in system if isinstance(b, dict) and b.get("cache_control"))
+
+
+@strategy("strip-old-thinking-tail-marks")
+def strip_old_thinking_tail_marks(body):
+    """Same cut, markers placed the way the client places them: at the tail.
+
+    Holding every marker in front of the cut leaves the newest turn — the
+    assistant message and the tool_results answering it — outside every cached
+    prefix, which is the whole of that 13.8% uncached. But the cut only ever
+    moves by one turn, so a tail marker's prefix is stable from the turn after
+    it is written, exactly as it is for the client.
+    """
+    if _strip_behind_last_assistant(body) is None:
+        return body
+    return _tail_breakpoints(body, MAX_BREAKPOINTS - _system_marker_count(body))
+
+
+def _strip_behind_last_assistant(body):
+    """Drop reasoning behind the newest assistant message. Returns its index."""
+    messages = body.get("messages") or []
+    last = max((i for i, m in enumerate(messages)
+                if m.get("role") == "assistant"), default=-1)
+    if last < 0:
+        return None
+    for i, message in enumerate(messages):
+        if i == last or not isinstance(message.get("content"), list):
+            continue
+        message["content"] = [b for b in message["content"]
+                              if not (isinstance(b, dict) and b.get("type") in THINKING)]
+    return last
+
+
+def _mark_last_block_before(body, limit):
+    messages = body.get("messages") or []
+    for i in range(limit - 1, -1, -1):
+        content = messages[i].get("content")
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            content[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+            return True
+    return False
+
+
+# Whether a strategy is session-aware, by name. `inspect.signature` costs more
+# than some strategies do and the answer never changes.
+_TAKES_TURN: dict[str, bool] = {}
+
+
+def apply(name: str, body: dict, turn=None, owned: bool = False) -> dict:
+    """Run a strategy on a deep copy, so arms cannot contaminate each other.
+
+    A strategy taking a second parameter is session-aware and gets the turn.
+    Those carry state across turns, so callers must `reset()` between arms.
+
+    Pass `owned` when the body was parsed for this call and nobody else holds a
+    reference to it. The copy exists only to keep one arm out of another's way,
+    so a caller that streams a fresh body per arm has already paid for that
+    separation and the copy is pure waste — it was 44% of an experiment run.
+    Nothing here keeps a reference to a body between turns, so an owned body is
+    safe to rewrite where it lies.
+    """
+    fn = REGISTRY[name]
+    takes_turn = _TAKES_TURN.get(name)
+    if takes_turn is None:
+        takes_turn = len(inspect.signature(fn).parameters) > 1
+        _TAKES_TURN[name] = takes_turn
+    if not owned:
+        body = copy.deepcopy(body)
+    return fn(body, turn) if takes_turn else fn(body)
+
+# --- Boundary-gate arms -----------------------------------------------------
+#
+# `ctx_offload`'s PR-J4 gate defers a frozen block's FIRST conversion unless the
+# turn is a rebuild boundary. These arms price that gate by modelling it, and
+# then by modelling its absence, over the same corpus.
+#
+# Live config, from ~/.headroom-flags.sh: stale_margin 4, stale_window 4, so a
+# block within 8 messages of the tail converts freely and anything deeper waits.
+STALE_MARGIN = 4
+STALE_WINDOW = 4
+
+# Per-session state. `apply` resets it between arms; turns arrive in `seq`
+# order, so per-session order holds even though sessions interleave.
+_SEEN: dict[str, set] = {}
+_PREV: dict[str, bool] = {}
+
+
+def reset() -> None:
+    _SEEN.clear()
+    _PREV.clear()
+
+
+def _is_rebuild_boundary(session_key, body) -> bool:
+    """Did the drift detector call this turn a hot-zone rebuild?
+
+    Not inferred from the body. A first guess — "any change at a position both
+    turns share" — scored 98.5% of turns as boundaries, because Claude Code
+    rewrites its own reminders constantly. The live counters say otherwise:
+    over 2,571 logged turns `rebuild_boundary` was true 4 times (0.16%), while
+    `blocks_deferred` summed to 2,494. First conversions arriving by boundary
+    were 5; by the near-tail window, 216.
+
+    So the honest model is that a boundary never comes. A session's first turn
+    counts, since nothing is cached yet, and that alone reproduces the observed
+    rate.
+    """
+    first = session_key not in _PREV
+    _PREV[session_key] = True
+    return first
+
+
+# `headroom_core::tool_exclusion`, mirrored. Two lists, two strengths.
+#
+# VERBATIM results must stay byte-faithful at any distance from the tail: the
+# retrieval tool's own output is here, and offloading it reopens the loop the
+# retrieval closed.
+VERBATIM_EXCLUDE = {"websearch", "webfetch", "web_search", "web_fetch",
+                    "headroom_retrieve"}
+# `--exclude-tools` default CSV. Weaker: `excluded_unless_prior = excluded &&
+# !stale`, so this only protects a block while it is inside `stale_margin` of
+# the tail. Past that the operator's "don't summarise what I'm working with"
+# argument has expired.
+EXCLUDE_TOOLS = {"read", "glob", "grep", "write", "edit", "websearch",
+                 "webfetch", "headroom_retrieve"}
+
+
+def _tool_aliases(name):
+    """Bare name plus MCP wrapper spellings, as `tool_name_aliases` does."""
+    out = {name.lower()}
+    parts = name.split("__", 2)
+    if len(parts) == 3 and parts[0].lower() == "mcp" and parts[1] and parts[2]:
+        out.add(parts[2].lower())
+        out.add(f"mcp_{parts[1]}_{parts[2]}".lower())
+    return out
+
+
+def _tool_names_by_id(body):
+    """tool_use_id -> tool name, which is where the exclusion lists are read."""
+    names = {}
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                names[block.get("id")] = block.get("name") or ""
+    return names
+
+
+def _offload_gated(body, turn, min_bytes, honour_boundary: bool,
+                   honour_exclusions: bool = True,
+                   honour_verbatim: bool = True):
+    messages = body.get("messages") or []
+    if not messages:
+        return body
+    session = getattr(turn, "session_key", "")
+    boundary = _is_rebuild_boundary(session, body)
+    seen = _SEEN.setdefault(session, set())
+    names = (_tool_names_by_id(body)
+             if honour_exclusions or honour_verbatim else {})
+    last_idx = len(messages) - 1
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        distance = last_idx - i
+        is_live = distance == 0
+        near_tail = distance < STALE_MARGIN + STALE_WINDOW
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            text = _tool_result_text(block)
+            if text is None or len(text) <= min_bytes:
+                continue
+            aliases = _tool_aliases(names.get(block.get("tool_use_id"), ""))
+            if honour_verbatim and aliases & VERBATIM_EXCLUDE:
+                continue                # byte-faithful at every distance
+            key = hashlib.sha256(text.encode()).digest()
+            prior = key in seen
+            # `excluded_unless_prior`: an excluded tool is protected only while
+            # it is still within `stale_margin` of the tail.
+            stale = distance >= STALE_MARGIN
+            if (honour_exclusions and not stale and not prior
+                    and aliases & EXCLUDE_TOOLS):
+                continue
+            # The gate, verbatim from `offload_tool_result`: a first conversion
+            # of a frozen block rides a boundary or it waits.
+            if not prior and not is_live and not near_tail:
+                if honour_boundary and not boundary:
+                    continue
+            seen.add(key)
+            _write_digest(block, text)
+    return body
+
+
+@strategy("offload-gated-2000")
+def offload_gated_2000(body, turn):
+    """The live PR-J4 policy, modelled. The control for the arm below."""
+    return _offload_gated(body, turn, 2000, honour_boundary=True)
+
+
+@strategy("offload-ungated-2000")
+def offload_ungated_2000(body, turn):
+    """The same policy with the rebuild-boundary requirement dropped.
+
+    Everything else the gate does is kept: the live tail and the near-tail
+    window still convert freely, and the per-session set still makes a
+    conversion monotonic, so nothing ever flips back from digest to raw.
+    The only change is that a frozen block's first conversion no longer waits
+    for a turn the client was rebuilding anyway.
+    """
+    return _offload_gated(body, turn, 2000, honour_boundary=False)
+
+@strategy("offload-gated-2000-no-exclusions")
+def offload_gated_2000_no_exclusions(body, turn):
+    """The gated arm with the exclusion lists switched off — the earlier,
+    over-optimistic model, kept so the two can be read side by side."""
+    return _offload_gated(body, turn, 2000, honour_boundary=True,
+                          honour_exclusions=False)
+
+
+@strategy("offload-gated-2000-no-tool-list")
+def offload_gated_2000_no_tool_list(body, turn):
+    """Only the `--exclude-tools` half lifted; the verbatim list still holds.
+
+    Splits the two claims in `no-exclusions`. The tool list already stops
+    protecting a block `stale_margin` messages back, so lifting it can only
+    reach blocks within four of the tail. Whatever the full arm saves beyond
+    this line comes from the verbatim list, which is a different bet: those
+    results break when their bytes change at any distance."""
+    return _offload_gated(body, turn, 2000, honour_boundary=True,
+                          honour_exclusions=False, honour_verbatim=True)
+
+
+@strategy("offload-gated-4000")
+def offload_gated_4000(body, turn):
+    """The gated arm at the floor the capture actually ran under, for the
+    like-for-like against the live proxy."""
+    return _offload_gated(body, turn, 4000, honour_boundary=True)
+
+
+
+# --- Where the second message breakpoint goes -------------------------------
+#
+# Live, both message breakpoints land within one message of the tail on every
+# request measured (634 of 634, at 99.4% and 100% of history). Adjacent markers
+# cache nearly the same prefix, so the second one buys almost nothing. These
+# arms keep the count at two and leave the client's system markers alone — only
+# the earlier marker moves back, by a fraction of the history.
+def _spread_pair(body, back):
+    _clear_message_markers(body)
+    blocks = [b for _, b in _content_blocks(body)]
+    if not blocks:
+        return body
+    blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    index = int(round((len(blocks) - 1) * (1.0 - back)))
+    if 0 <= index < len(blocks) - 1:
+        blocks[index]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    return body
+
+
+for _back in (0.02, 0.05, 0.10, 0.17, 0.25, 0.35, 0.50):
+    strategy(f"pair-back-{int(_back * 100):02d}")(
+        (lambda b: lambda body: _spread_pair(body, b))(_back)
+    )
+
+
+def _spread_shipped(body, back):
+    """What the proxy actually does, guards and all.
+
+    Claude Code spends three of Anthropic's four markers: two on `system` and
+    one on the last message block. The fourth is free, so this adds a second
+    message marker a fraction of the history back and touches nothing else.
+    It copies the client's own `cache_control` value rather than writing one,
+    because `pair-back-*` above pins both markers to a 1h TTL and that is a
+    separate lever whose effect would otherwise be read as this one's.
+
+    Skips a request whose message markers are not exactly one: that is a
+    placement this was never measured against, and the proxy refuses it too.
+    """
+    if not (0.0 < back < 1.0):
+        return body
+    positions, marked = [], []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue                    # a bare string carries no block
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if "cache_control" in block:
+                marked.append(len(positions))
+            positions.append(block)
+    if len(marked) != 1 or not positions:
+        return body
+    target = int(round((len(positions) - 1) * (1.0 - back)))
+    if target >= marked[0]:
+        return body                     # nothing earlier to add
+    positions[target]["cache_control"] = copy.deepcopy(
+        positions[marked[0]]["cache_control"]
+    )
+    return body
+
+
+for _back in (0.02, 0.05, 0.10, 0.17, 0.25, 0.35, 0.50):
+    strategy(f"shipped-back-{int(_back * 100):02d}")(
+        (lambda b: lambda body: _spread_shipped(body, b))(_back)
+    )
+
+
+def _marked_positions(body):
+    """Message content blocks in order, and which of them carry a marker."""
+    positions, marked = [], []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if "cache_control" in block:
+                marked.append(len(positions))
+            positions.append(block)
+    return positions, marked
+
+
+@strategy("shipped-tail")
+def shipped_tail(body):
+    """Push the client's single message marker onto the final content block.
+
+    `pair-back-*` does this as a side effect of clearing and re-placing, and
+    scores 0.0% uncached everywhere. This arm isolates that half so the two
+    can be told apart: whatever it recovers is not the fourth breakpoint.
+    """
+    positions, marked = _marked_positions(body)
+    if len(marked) != 1 or marked[0] == len(positions) - 1:
+        return body
+    positions[-1]["cache_control"] = positions[marked[0]].pop("cache_control")
+    return body
+
+
+@strategy("shipped-tail-back-05")
+def shipped_tail_back_05(body):
+    """Both halves: marker on the final block, second one 5% back."""
+    return _spread_shipped(shipped_tail(body), 0.05)
+
+
+def _spread_wire(body, back):
+    """Move the earlier of the two markers the wire carries back through history.
+
+    `_spread_shipped` only fires on a request carrying exactly one message
+    marker, which is what the *client* sends. What goes upstream carries two —
+    the client's plus the proxy's tail one — and they land one block apart on
+    97% of turns, which is the case its own comment calls worthless: adjacent
+    markers cache nearly the same prefix. So on `--base forwarded` that arm
+    skipped every request and scored identical to the live proxy, which read as
+    "no effect" and was really "never ran".
+
+    This works on the pair that actually goes out. The tail marker stays; the
+    other moves back `back` of the history. TTL is carried, not rewritten, so
+    this is one lever and not three.
+    """
+    if not (0.0 < back < 1.0):
+        return body
+    positions, marked = _marked_positions(body)
+    if len(marked) != 2 or not positions:
+        return body
+    keep = marked[-1]
+    target = keep - max(1, round(back * len(positions)))
+    if target < 0 or target == marked[0]:
+        return body
+    ctl = positions[marked[0]].pop("cache_control", None)
+    if ctl is None:
+        return body
+    positions[target]["cache_control"] = ctl
+    return body
+
+
+for _b in (0.02, 0.05, 0.10, 0.25, 0.50):
+    strategy(f"spread-wire-{int(_b * 100):02d}")(
+        (lambda b: lambda body: _spread_wire(body, b))(_b)
+    )
+
+
+def _anchor_1h(body, back):
+    """Spend the free fourth breakpoint on a 1h anchor deep in history.
+
+    The fourth slot buys nothing as a second read point: every turn writes an
+    entry at its own tail, so a conversation already carries a ladder of
+    readable prefixes from its past turns, and an extra marker lands on a rung
+    that exists. What the ladder cannot survive is an idle gap — every rung is
+    5m and only use refreshes it, so six quiet minutes wipes all of them and
+    the next turn rewrites the whole history.
+
+    A 1h marker at `back` through the history is the one rung that outlives
+    that gap. It costs a 2.0x write of the span it closes, once, against a
+    1.25x rewrite of everything on every cold turn.
+    """
+    positions, marked = _marked_positions(body)
+    if len(marked) != 1 or not positions:
+        return body
+    target = int(round((len(positions) - 1) * (1.0 - back)))
+    if target >= marked[0]:
+        return body
+    positions[target]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    return body
+
+
+for _back in (0.10, 0.25, 0.50, 0.75):
+    strategy(f"anchor-1h-{int(_back * 100):02d}")(
+        (lambda b: lambda body: _anchor_1h(body, b))(_back)
+    )

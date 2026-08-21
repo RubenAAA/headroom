@@ -21,6 +21,7 @@ Run `sample` in the background for a few hours of ordinary work, then `fit`.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -98,28 +99,42 @@ def load_samples(path: str, window: str):
     return rows
 
 
-def load_turns(path: str):
-    """(unix ts, token counts) for every booked turn in the log."""
+def log_paths(path: str):
+    """The live log plus its rotations.
+
+    A sampling run of a few hours outlives a rotation easily, and reading only
+    the live file drops every turn older than the last roll. That leaves the
+    design matrix all zeros while the sample side still looks healthy.
+    """
+    return [path] + sorted(glob.glob(path + ".[0-9]*"))
+
+
+def load_turns(paths):
+    """(unix ts, token counts) for every booked turn across `paths`."""
     import datetime
 
     turns = []
-    with open(path, errors="replace") as handle:
-        for line in handle:
-            i = line.find("{")
-            if i < 0:
-                continue
-            try:
-                entry = json.loads(line[i:])
-            except ValueError:
-                continue
-            f = entry.get("fields", {})
-            if f.get("event") != "turn_cost_ledger":
-                continue
-            stamp = entry.get("timestamp")
-            if not stamp:
-                continue
-            ts = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-            turns.append((ts, [float(f.get(c) or 0) for c in CLASSES]))
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, errors="replace") as handle:
+            for line in handle:
+                i = line.find("{")
+                if i < 0:
+                    continue
+                try:
+                    entry = json.loads(line[i:])
+                except ValueError:
+                    continue
+                f = entry.get("fields", {})
+                if f.get("event") != "turn_cost_ledger":
+                    continue
+                stamp = entry.get("timestamp")
+                if not stamp:
+                    continue
+                ts = datetime.datetime.fromisoformat(
+                    stamp.replace("Z", "+00:00")).timestamp()
+                turns.append((ts, [float(f.get(c) or 0) for c in CLASSES]))
     turns.sort()
     return turns
 
@@ -164,15 +179,31 @@ def fit(samples_path: str, log_path: str, window: str) -> int:
         print(f"only {len(samples)} usable samples for window {window} — "
               f"run `fit_weights.py sample` for a few hours first")
         return 1
-    turns = load_turns(log_path)
+    paths = log_paths(log_path)
+    turns = load_turns(paths)
     design, delta, dropped = build_intervals(samples, turns)
 
     span = (samples[-1][0] - samples[0][0]) / 3600
+    booked = int((design.sum(axis=1) > 0).sum())
     print(f"window {window}: {len(samples)} samples over {span:.1f}h, "
           f"{len(delta)} intervals ({dropped} dropped at resets), "
-          f"{len(turns)} booked turns")
+          f"{len(turns)} turns in {len(paths)} log file(s), "
+          f"{booked} intervals carrying turns")
     moved = int((delta > 0).sum())
     print(f"  intervals where utilization moved: {moved}")
+    if booked == 0:
+        stamp = lambda t: time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(t))
+        print(f"\n  No turn lands inside the sampled span, so every predictor is "
+              f"all zeros\n  and no fit is possible. Samples cover "
+              f"{stamp(samples[0][0])}..{stamp(samples[-1][0])};")
+        if turns:
+            print(f"  the logs cover {stamp(turns[0][0])}..{stamp(turns[-1][0])}.")
+        else:
+            print(f"  no turn_cost_ledger line was found in {log_path} or its "
+                  f"rotations.")
+        print("  Sample and log have to run over the same hours — restart "
+              "`sample`\n  and let it run alongside ordinary work.")
+        return 1
     if moved < 8:
         print("\n  Not enough movement to fit anything. The meter reports two "
               "decimals,\n  so it only ticks after real work — keep sampling.")

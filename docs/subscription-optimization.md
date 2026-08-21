@@ -123,6 +123,28 @@ whether 1h writes are counted differently from 5m there. The reasoning above
 infers the subscription window mirrors the ITPM rule, which is the same
 inference this doc makes elsewhere — it is not confirmed.
 
+**Corrected 2026-08-18 in the bench.** `bench/cachesim.py` carried that
+inference for reads (`read = 0`) but not for writes: its `subscription` profile
+kept the dollar spread, 5m at 1.25x and 1h at 2x. That charges the 1h TTL a
+premium the usage window does not levy, and it lands on the one flag gated to
+non-PAYG. On the 7,839-turn blindguard corpus the difference is not cosmetic:
+
+| weighting | client | proxy | change |
+|---|---|---|---|
+| API dollars (read .1, 5m 1.25, 1h 2.0) | 237,000,026 | 241,205,531 | +1.77% |
+| subscription, as it was coded | 84,234,347 | 94,304,192 | +11.95% |
+| subscription, writes at raw token count | 48,938,933 | 49,498,478 | +1.14% |
+
+Forcing 1h moved the write mix from 33% 5m to 96% 1h while total write volume
+*fell*, 47.04M to 46.14M. Priced at raw token count the flag is close to free,
+which is what the ITPM rule predicts; priced with the dollar spread it looks
+like a 12% loss that nobody on a subscription is paying.
+
+The profile is now `read=0, write_5m=1.0, write_1h=1.0`. Still inference.
+`fit_weights.py fit` over 2,783 samples spanning 28.2h returns `R^2 -inf` for
+every predictor including its own free fit, so the regression settles nothing
+yet and the meter has not confirmed any of this.
+
 ### B2 — what actually drifts (39 real captures)
 
 Before building anything, every axis B2 names was measured across the corpus:
