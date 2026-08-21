@@ -967,7 +967,6 @@ mod tests {
         }
     }
 
-
     /// A conversation whose `tool_result` sits at message 1 with `tail` filler
     /// messages after it, so its distance from the tail is what the test varies.
     fn req_with_tail(body: &str, tool: &str, tail: usize) -> Value {
@@ -1013,10 +1012,12 @@ mod tests {
             let body = big_body();
             let mut parsed = req_with_tail(&body, "Read", tail);
             let out = offload_anthropic_request(&mut parsed, &margin_cfg(4), None);
-            assert_eq!(out.blocks_offloaded, 1, "Read at distance {tail} must offload");
+            assert_eq!(
+                out.blocks_offloaded, 1,
+                "Read at distance {tail} must offload"
+            );
         }
     }
-
 
     /// Verbatim exclusions are not distance-sensitive: those results break when
     /// their bytes change at all, so no margin reaches them.
@@ -1363,7 +1364,10 @@ mod tests {
             &window_cfg(4, 4),
             Some(&gate_policy(&far_gate, false)),
         );
-        assert_eq!(out.blocks_offloaded, 0, "distance 20 is outside a band of 8");
+        assert_eq!(
+            out.blocks_offloaded, 0,
+            "distance 20 is outside a band of 8"
+        );
         assert_eq!(first_tool_result_text(&far), body, "content untouched");
     }
 

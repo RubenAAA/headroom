@@ -444,6 +444,46 @@ fn is_opaque_payload(key: &str) -> bool {
 ///
 /// Used only as a comparison/storage-boundary key; the original, unmodified
 /// messages are always what gets forwarded.
+/// Openings that mark a client-side side errand rather than a conversation turn.
+///
+/// Claude Code runs these against the live conversation: it resends the whole
+/// history and appends a synthetic final message asking for something the user
+/// never sees.
+const SIDE_ERRAND_OPENINGS: &[&str] = &["[SUGGESTION MODE:"];
+
+/// Whether this turn is a side errand rather than a step in the conversation.
+///
+/// Such a request shares the session key with the real conversation — same
+/// model, same opening message — so parking it makes it the session's
+/// "previous turn". The next real turn then diverges at the final message and
+/// recaches everything from there. Measured on 2026-08-20: 26 of 90 prefix
+/// divergences in one day, each one a full recache of a prefix that had not
+/// actually changed.
+///
+/// Only the last message is examined: the history in front of it is the real
+/// conversation, which is exactly why the collision happens.
+pub fn is_side_errand(messages: &[Value]) -> bool {
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    if last.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let opening = match last.get("content") {
+        Some(Value::String(s)) => s.as_str(),
+        Some(Value::Array(blocks)) => blocks
+            .first()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .and_then(|b| b.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        _ => "",
+    };
+    SIDE_ERRAND_OPENINGS
+        .iter()
+        .any(|marker| opening.trim_start().starts_with(marker))
+}
+
 pub fn canonicalize_for_prefix_compare(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -5678,5 +5718,64 @@ mod block_shape_tests {
             );
             prev = Some((originals, forwarded));
         }
+    }
+    /// The production shape: Claude Code resends the whole conversation with a
+    /// synthetic final message. Parking it poisoned the session's previous
+    /// turn and cost a full recache on the next real turn.
+    #[test]
+    fn a_suggestion_turn_is_a_side_errand() {
+        let msgs = vec![
+            json!({"role": "user", "content": "real conversation opener"}),
+            json!({"role": "assistant", "content": "an answer"}),
+            json!({"role": "user", "content": [{
+                "type": "text",
+                "text": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nFIRST: Look at the user's recent messages"
+            }]}),
+        ];
+        assert!(is_side_errand(&msgs));
+    }
+
+    #[test]
+    fn the_string_sugar_form_is_caught_too() {
+        let msgs = vec![json!({
+            "role": "user",
+            "content": "[SUGGESTION MODE: Suggest what the user might naturally type next]"
+        })];
+        assert!(is_side_errand(&msgs));
+    }
+
+    #[test]
+    fn an_ordinary_turn_is_not_a_side_errand() {
+        let msgs = vec![
+            json!({"role": "user", "content": "real conversation opener"}),
+            json!({"role": "assistant", "content": "an answer"}),
+            json!({"role": "user", "content": [{"type": "text", "text": "and now do the next thing"}]}),
+        ];
+        assert!(!is_side_errand(&msgs));
+    }
+
+    /// The marker only counts at the head of the newest message. A turn that
+    /// quotes it — this conversation, for one — is still a real turn.
+    #[test]
+    fn a_turn_quoting_the_marker_is_still_a_real_turn() {
+        let msgs = vec![json!({"role": "user", "content": [{
+            "type": "text",
+            "text": "why does [SUGGESTION MODE: ...] show up in the replay logs?"
+        }]})];
+        assert!(!is_side_errand(&msgs));
+    }
+
+    #[test]
+    fn an_assistant_tail_is_never_a_side_errand() {
+        let msgs = vec![json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "[SUGGESTION MODE: ...]"}]
+        })];
+        assert!(!is_side_errand(&msgs));
+    }
+
+    #[test]
+    fn an_empty_conversation_is_not_a_side_errand() {
+        assert!(!is_side_errand(&[]));
     }
 }
