@@ -7,14 +7,16 @@ Top commit scopes: proxy (96), wrap (20), memory (16), transforms (12), install 
 
 Method note: "Rust equivalent exists" means a module with a matching name is present in `crates/`, checked by name search — it does not prove behavioral parity, only that a home for the port exists.
 
+Freshness note (2026-08-21): "not touched" below records what *upstream* did in the range. Local work has since landed on two of these modules — `content_router.rs` (`7dd551ac`, `e539a3b0`) and `savings_tracker.rs` (six commits through `e920e5a8`) — so their rows are partly done. `output_shaper.rs`, `kompress.rs` and `lossless_compaction.rs` remain untouched on both sides. Re-check with `git log --oneline 9af63499..HEAD -- <path>` before picking up a row.
+
 ## Group A — Rust module exists but is now stale (needs porting the upstream Python delta)
 
 | Theme | Python files (+/-) | Rust module | Upstream touched Rust in-range? | Size | What changed |
 |---|---|---|---|---|---|
-| content_router rewrite | `transforms/content_router.py` (+1518/-313) | `crates/headroom-core/src/transforms/content_router.rs` (exists, **not** touched in range) | No | Large | Router dispatch logic rewritten in Python (scope `content_router`/`code`/`router` commits); Rust router is now behind the Python decision logic. |
+| content_router rewrite | `transforms/content_router.py` (+1518/-313) | `crates/headroom-core/src/transforms/content_router.rs` (exists, **not** touched in range; locally updated since — see freshness note) | No | Large | Router dispatch logic rewritten in Python (scope `content_router`/`code`/`router` commits); Rust router was behind the Python decision logic. Partly closed by `7dd551ac` and `e539a3b0` (router/gemini correctness fixes, PHP support, tool-exclusion matching) — re-diff before porting more. |
 | output_shaper policies | `proxy/output_shaper.py` (+279/-282), plus new `output_savings_policy.py`, `output_turn_policy.py`, `output_steering.py`, `request_log_redaction_policy.py`, `memory_query_policy.py`, `auth_policy.py`, `forwarded_policy.py` (all new, 0 prior) | `crates/headroom-proxy/src/output_shaper.rs` (exists, not touched) | No | Large (~1000 lines across new policy files) | Upstream split output-shaping into several small single-purpose "policy" modules (turn policy, steering, redaction, auth, forwarded-header trust) — this is the `proxy/output-shaping`, `auth`, `forwarded_policy` scope work. None of these policy modules exist in Rust yet. |
 | kompress_compressor | `transforms/kompress_compressor.py` (+413/-57) | `crates/headroom-core/src/transforms/kompress.rs` (exists, not touched — but `kompress_remote.py`, new, has no Rust match) | No | Medium | `kompress` scope commits (5) — remote Kompress endpoint support (`transforms/kompress_remote.py`, new file) has no Rust counterpart at all (`headroom_core/src/transforms/kompress.rs` is local-model only). |
-| savings_tracker | `proxy/savings_tracker.py` (+394/-26) | `crates/headroom-core/src/savings_tracker.rs` (exists, not touched) | No | Medium | `savings` scope (5 commits) — savings-sink aggregation and double-count fixes landed only in Python. |
+| savings_tracker | `proxy/savings_tracker.py` (+394/-26) | `crates/headroom-core/src/savings_tracker.rs` (exists, not touched in range; locally rewritten since — see freshness note) | No | Medium | `savings` scope (5 commits) — savings-sink aggregation and double-count fixes landed only in Python. Six local commits through `e920e5a8` have since reworked the Rust tracker (cost accounting, failed-work metrics, cache savings); check what is left rather than porting wholesale. |
 | lossless_compaction | `transforms/lossless_compaction.py` (+180/-5) | `crates/headroom-core/src/transforms/lossless_compaction.rs` (exists, not touched) | No | Small-Medium | `lossless` scope work (shared-prefix folding in grep search, etc.) is Python-only so far. |
 
 ## Group B — Python-only, no Rust equivalent at all (new feature to build or consciously skip)
@@ -69,6 +71,6 @@ Group counts: A = 5 themes (~3,000 Python lines stale vs. existing Rust modules)
 Top 5 by impact:
 1. `cli/wrap.py` (+2760) — CLI agent-wrapper rewrite; no Rust wrapper exists at all (Group B).
 2. `proxy/handlers/openai.py` (+2451) — OpenAI handler + new cold-prefix reasoning-compaction hooks (Group B).
-3. `transforms/content_router.py` (+1518) — router rewrite; Rust `content_router.rs` exists but wasn't touched upstream, now stale (Group A).
+3. `transforms/content_router.py` (+1518) — router rewrite; Rust `content_router.rs` wasn't touched upstream, and local fixes have since closed part of the gap (Group A).
 4. `proxy/handlers/anthropic.py` (+1446) — Anthropic handler: mixed-tool CCR streaming, cache-control fixes (Group B).
 5. New compression-pipeline layer: `compression_batches.py`+`compressor_registry.py`+`config_compressor.py`+`cold_prefix.py` (~1200 combined) — a new L1+L2+L3 dispatch architecture with no Rust equivalent (Group B); worth reading in full before deciding port vs. redesign.

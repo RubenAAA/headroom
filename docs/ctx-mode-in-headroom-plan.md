@@ -1,5 +1,13 @@
 # Plan: Absorb context-mode into the headroom proxy (Rust)
 
+> **Status: DONE — this is a historical record, not a forward-looking plan.**
+> The system described here shipped in `9af63499` (2026-08-06) and has been
+> extended since. It lives in `crates/headroom-proxy/src/memory/`:
+> `ctx_backend.rs`, `handler.rs`, `mod.rs`, `router.rs`, `tool_adapter.rs`,
+> `deferred.rs`. Read this for the reasoning behind the design — especially
+> the cache-safety contract in §0, which still binds. For how the code
+> behaves today, read the code.
+
 Goal: retire the context-mode MCP server + hook fleet and provide **1:1 functionality**
 from inside `headroom-proxy` / `headroom-core` (Rust crates only — the Python proxy is
 not touched), such that:

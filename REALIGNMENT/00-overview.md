@@ -1,5 +1,18 @@
 # 00 — Overview & Wrong Mental Model
 
+> **Historical background — the ICM description below is no longer current architecture.**
+> Everything this doc says about the `IntelligentContextManager` (ICM), scoring, and
+> rolling-window drop-by-score describes the codebase as it stood at the 2026-05-01 audit.
+> Phase B PR-B1 (`967b0db4`, 2026-05-02) retired ICM, `RollingWindow`,
+> `ProgressiveSummarizer`, `MessageScorer`, and `crates/headroom-core/src/scoring/`.
+> No ICM type exists in the tree today — the only remaining hits are tombstone comments
+> in `headroom/proxy/server.py`, `headroom/transforms/pipeline.py`, and
+> `crates/headroom-proxy/src/{proxy,error,compression/mod}.rs`. The live path is
+> live-zone compression in the Rust proxy (`crates/headroom-proxy/src/compression/`),
+> which touches only the latest turn and leaves the frozen prefix byte-identical.
+> Read the ICM sections as the diagnosis that motivated the realignment, not as a
+> description of what runs.
+
 ## Executive summary
 
 Headroom is built on the wrong mental model: **"compression means choosing what to drop from conversation history."** The flagship `IntelligentContextManager` (ICM) tokenizes the entire `messages` array, scores each message for importance, and removes old messages until the budget is hit. It has been wired into the Rust proxy on `/v1/messages` with `frozen_message_count: 0` hardcoded — so every compression event drops messages from index 0, busting the Anthropic prompt cache for every customer that triggers it.

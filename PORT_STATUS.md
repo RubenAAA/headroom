@@ -1,5 +1,13 @@
 # Python To Rust Port Status
 
+> **ARCHIVED — stale as of 2026-07-05, do not trust current numbers.**
+> This snapshot was written by hand during the Phase 0–5 port audit and has no
+> generator script, so nothing refreshes it. The port has moved a long way
+> since: the Rust proxy is the default and production path (see `RUST_DEV.md`
+> and `README.md`), and many modules listed here as partial or missing have
+> landed. Read this only as a record of where the port stood in July 2026.
+> For open work, use `UPSTREAM_PORT_BACKLOG.md`.
+
 Generated: 2026-07-05T02:14:40+02:00
 
 This is the Phase 0 audit artifact. It records the current baseline and maps

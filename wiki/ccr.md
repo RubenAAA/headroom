@@ -69,6 +69,56 @@ When the LLM calls `headroom_retrieve`:
 
 **The client never sees CCR tool calls** — they're handled transparently.
 
+### Answering Every Retrieval
+
+Roughly one retrieval in five used to go unanswered, and an unanswered
+`headroom_retrieve` is worse than no retrieval at all: the client gets a
+`tool_use` block for a tool it does not have and rejects the turn. Three holes
+are now closed.
+
+**Streaming turns.** Retrieval-answering originally existed only on the
+buffered path, so every interactive client — all of which stream — got
+`No such tool available: headroom_retrieve`. The SSE rewriter now watches
+`content_block_start` for proxy-owned tools, suppresses those blocks, and holds
+back `message_delta` and `message_stop` to the end of the stream. If a
+retrieval appeared, it rebuilds the message, resolves it through the same
+handler the buffered path uses, and synthesizes fresh SSE events for whatever
+survives. Blocks already sent live are not re-sent, and `thinking` blocks from
+the continuation are dropped — their signatures will not verify on replay. This
+covers clients on Anthropic `/v1/messages`, including routed local models;
+native OpenAI-shaped streaming clients still fall back to buffered handling.
+
+**Retrieval mixed with a real tool call.** The handler used to give up on the
+whole turn when the model asked for a retrieval *and* a genuine tool in one
+response. Now the retrieval block is replaced in place with a text block
+wrapped in `<retrieved_context>`, and the real tool call is passed through to
+the client untouched.
+
+**Transient upstream failures and bad hashes.** The continuation request retries
+twice with exponential backoff from 250ms on transport errors, 5xx, and 429;
+4xx is not retried. A `headroom_retrieve` call with a malformed or missing hash
+now still counts as a retrieval — the lookup misses and the model gets an error
+result, instead of the call being handed to the client as an ordinary tool. Any
+retrieval that is still unresolved when the rounds run out gets spliced in as a
+failure message rather than left dangling, and a turn that claims
+`stop_reason: tool_use` with no surviving tool block is downgraded to
+`end_turn`.
+
+Outcomes are counted by `proxy_ccr_retrieval_outcomes_total{outcome}`
+(`continuation`, `spliced_mixed`, `unresolved`) and
+`proxy_ccr_continuation_retries_total`.
+
+### Offload and `--exclude-tools`
+
+`--exclude-tools` no longer gates offload. Exclusion exists to keep the
+live-zone compressors — which rewrite content and keep no original — away from
+a file the model is about to edit. Offload keeps the original retrievable, so
+nothing is destroyed and the argument does not carry over. About 1.8x more
+blocks are offload-eligible as a result, and the context tracker's capacity was
+raised to match. The stricter verbatim exclusion, for results that break on any
+byte change, still applies at every distance. `ctx_offloaded_blocks_by_tool_total{tool}`
+breaks offloaded blocks down by source tool.
+
 ### Phase 4: Context Tracker
 
 Across multiple turns, the Context Tracker:
@@ -130,11 +180,15 @@ The older conversation turns, system prompt, and tool definitions — the provid
 # Proxy with CCR enabled (default)
 headroom proxy --port 8787
 
-# Disable CCR response handling
-headroom proxy --no-ccr-responses
+# Tool injection and the compression marker (both on by default)
+headroom proxy --ccr-inject-tool --ccr-inject-marker
 
-# Disable proactive expansion
-headroom proxy --no-ccr-expansion
+# Cap how many retrieval rounds one turn may take (default 8)
+headroom proxy --ccr-max-retrieval-rounds 8
+
+# Multi-turn context tracking and proactive expansion
+headroom proxy --ccr-context-tracking --ccr-proactive-expansion
+headroom proxy --ccr-max-proactive-expansions 2
 ```
 
 ## Why This Matters

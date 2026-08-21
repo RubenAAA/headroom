@@ -6,11 +6,19 @@
 
 **Shape:** 3 PRs. H1 retires the request-path Python; H2 retires Bedrock/Vertex backend; H3 cleans up.
 
-**Pre-requisites:**
-- Phase A–G complete.
-- Real-traffic shadow test (Phase I) shows Rust ≥99.9% byte-equality vs Python on representative traffic.
-- Cache-hit-rate parity with direct upstream confirmed (Phase G observability).
-- All Bedrock/Vertex paths covered by native Rust handlers (Phase D).
+**Pre-requisites:** (status checked 2026-08-21)
+- Phase A–G complete. **Done.** Phase E landed 2026-05-04 (`d8aae382`, `ce37940d`) and now
+  covers the whole surface in `crates/headroom-proxy/src/cache_stabilization/` —
+  `tool_order`, `tool_def_normalize`, `anthropic_cache_control`, `openai_cache_key`,
+  `volatile_detector`, `drift_detector`. Phase F landed from 2026-05-03 (`ca9de93c`);
+  `headroom_core::auth_mode` is wired through `config.rs`, the live-zone compressors, and
+  the Bedrock path.
+- Real-traffic shadow test (Phase I) shows Rust ≥99.9% byte-equality vs Python on representative traffic. **Outstanding** — `crates/headroom-parity/` exists as the harness; the real-traffic run is still to be done.
+- Cache-hit-rate parity with direct upstream confirmed (Phase G observability). **Instrumentation done** (`observability/cache_hit_rate.rs`, `prometheus.rs`); the confirming measurement is still to be done.
+- All Bedrock/Vertex paths covered by native Rust handlers (Phase D). **Done** — `crates/headroom-proxy/src/{bedrock,vertex}/`.
+
+So the only thing still gating H1 is measurement, not missing Rust code. The Rust proxy is
+already the default production path; Python survives as a parity backstop.
 
 ---
 

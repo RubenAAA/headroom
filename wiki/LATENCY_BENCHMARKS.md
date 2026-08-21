@@ -1,5 +1,7 @@
 # Headroom Latency Benchmarks
 
+> **STALE — numbers from v0.3.7, not current.** The current release is v0.35.0. Everything below was measured on the Python implementation in February 2026, before the Rust proxy, parallel message compression, and the hot-path token-counting and hashing work. Treat the table as historical shape only; do not quote these figures as today's performance. They have not been re-run.
+
 Measured compression overhead across content types and sizes to answer: **does the token savings outweigh the processing time?**
 
 Generated: 2026-02-24 01:11 UTC
@@ -11,7 +13,7 @@ Generated: 2026-02-24 01:11 UTC
 - **Python**: 3.11.11
 - **Headroom**: v0.3.7
 
-> **Note:** These benchmarks were captured on v0.3.7. Since then, v0.5.6 added parallel message compression, eliminated redundant token counting, and optimized hot-path hashing. Expect lower latency on current versions. Re-benchmarking is planned.
+> **Note:** These benchmarks were captured on v0.3.7. Since then, v0.5.6 added parallel message compression, eliminated redundant token counting, and optimized hot-path hashing, and the proxy moved to Rust. Expect much lower latency on current versions. Re-benchmarking is still pending.
 
 ## TL;DR
 

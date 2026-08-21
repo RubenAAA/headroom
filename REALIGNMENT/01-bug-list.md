@@ -1,5 +1,13 @@
 # 01 — Comprehensive Bug & Gap List
 
+> **Historical — pre-Rust-cutover snapshot. These are not open bugs in the current system.**
+> Every entry below was filed against the tree as of the 2026-05-01 audit, and the
+> Python-proxy entries cite `headroom/proxy/server.py`, which is no longer the request
+> path. The Rust proxy in `crates/headroom-proxy/` is the default and the production
+> path; the Python server survives only as a parity backstop pending Phase H retirement.
+> Before acting on any entry, check the cited file:line against the Rust proxy — most of
+> the P0/P1 cluster was closed by Phases A–E and the line numbers no longer resolve.
+
 Ranked P0 (cache-killer) → P5 (long tail). Every entry has: title, file:line, evidence, guide §, fix, ROI estimate.
 
 Sources: 10 parallel deep-audit subagents (Rust proxy passthrough; Rust compression correctness; Python proxy + bridges; prefix cache safety; streaming + wire-format; RTK + tests/parity; over-engineering; OpenAI long-tail + Bedrock; Headroom-side injections; auth-mode handling).

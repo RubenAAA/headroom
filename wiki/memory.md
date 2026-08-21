@@ -20,7 +20,7 @@ This is *temporal compression* - instead of carrying 10,000 tokens of conversati
 |---------|----------|----------------|------|
 | **Cross-Agent Memory** | Any agent shares one DB via proxy | Per-agent only | Per-user, no cross-agent |
 | **Agent Provenance** | Tracks which agent saved/updated each memory | No | No |
-| **LLM-Mediated Dedup** | Piggybacks on user's own LLM for merge decisions | No | Separate LLM call ($) |
+| **Restatement Merge** | Merges near-identical saves in place; borderline cases go to the user's own LLM | No | Separate LLM call ($) |
 | **Transparent Proxy** | Zero code changes — just route through proxy | Requires agent framework | Requires SDK integration |
 | **Hierarchical Scoping** | User → Session → Agent → Turn | Flat (per-agent) | Flat (per-user) |
 | **Temporal Versioning** | Full supersession chains | No | No |
@@ -63,7 +63,7 @@ Claude Code                  Codex CLI                  Gemini CLI
                     │  3. Add memory_save/search/update/delete tools                   │
                     │  4. Forward to upstream LLM                                       │
                     │  5. Handle memory tool calls in response                         │
-                    │  6. Async background dedup (>92% cosine → auto-remove)          │
+                    │  6. Merge restatements on save (>=0.70 similarity)              │
                     │                                                                   │
                     └──────────────────────┬───────────────────────────────────────────┘
                                            │
@@ -113,27 +113,83 @@ When an agent updates a memory, the update is tracked:
 }
 ```
 
-### Intelligent Deduplication
+### Merging Restatements on Save
 
-When the LLM calls `memory_save`, headroom:
+Models restate. Ask one to remember the same fact on Tuesday that it remembered
+on Monday and you get two rows saying the same thing in different words. So
+`memory_save` looks before it inserts.
 
-1. **Saves immediately** (zero latency)
-2. **Searches for similar existing memories** (cosine similarity)
-3. **Returns an enriched hint** if duplicates found:
+Every save first searches the store for up to five candidates and scores each
+against the incoming text. The score is a Dice coefficient over word sets —
+lowercased, split on non-alphanumeric boundaries, keeping words longer than
+three characters or containing a digit, so a bare `511` survives but `the` does
+not. It runs locally, costs nothing, and returns the same number every time.
+Calibrated against 37 real memories: the closest genuinely distinct pair scored
+0.397, the median pair 0.255, a reworded duplicate 0.706, and a
+punctuation-only duplicate 1.000.
+
+Two thresholds sit on that scale.
+
+**At 0.70 and above, the save merges.** The longer of the two texts wins and
+replaces the existing memory in place. The id is kept, so anything already
+pointing at that memory still resolves, and the update is logged with the
+reason `merged with a restatement on save`. The response comes back as:
+
+```json
+{
+  "status": "merged",
+  "memory_id": "def456",
+  "note": "Merged with an existing memory (91% overlap)."
+}
+```
+
+**Between 0.45 and 0.70, the save goes through and the LLM gets a hint.**
+This band is too close to ignore and too far apart to merge blindly, so the
+decision goes to the model that is already in the loop — no second model, no
+extra cost:
 
 ```json
 {
   "status": "saved",
   "memory_id": "abc123",
-  "note": "Similar memory exists (id: def456, 89% match, saved by codex):
+  "note": "Similar memory exists (id: def456, 62% match, saved by codex):
            'DB migration tool is alembic'. Call memory_update('def456',
            '<merged content>') to consolidate."
 }
 ```
 
-The LLM then decides whether to merge — using the user's own LLM, not a separate model. No extra cost to headroom.
+Both thresholds are compiled in; there is no flag to change or disable them.
+`global`-scope saves resolve their partition first, so a merge candidate is
+only ever found within the right scope.
 
-4. **Background auto-dedup**: If similarity >92%, the older duplicate is automatically removed (async, non-blocking).
+> **The old background auto-dedup is gone.** Headroom used to fire an async
+> pass after every save that deleted any memory scoring above 0.92 against the
+> new one. That number came from a cosine-similarity backend. The backend in
+> use scores with BM25, whose ranks sit near 0.03 even for near-identical text,
+> so the comparison never meant anything and the pass deleted unrelated
+> memories — 8 of 12 in one concurrency test. It was unwired in August 2026 and
+> replaced by the merge-on-save path above. Nothing calls it.
+
+### Deferred Answers
+
+A model can ask for a memory operation and call one of the client's own tools in
+the same assistant turn. Answering the memory call inline would mean sending a
+continuation whose assistant turn holds a `tool_use` — the client's — with no
+matching `tool_result`, which Anthropic rejects. The client has not run its tool
+yet, so that result does not exist.
+
+Headroom answers the memory call anyway and holds the answer. It records the
+suppressed `tool_use` block, the computed `tool_result`, and the ids of the
+client tool calls that shared the turn. When the next request arrives carrying
+the client's own `tool_result`, the proxy finds that assistant turn by those
+sibling ids and splices both held blocks back in — the `tool_use` into the
+assistant message, the `tool_result` into the user message that follows. The
+history is whole again, and prefix replay carries it forward from there.
+
+Held answers expire after 10 minutes, and at most 32 are kept at once — past
+that the oldest is evicted. If the turn shows up in a shape that cannot be
+filled safely, the answer is dropped rather than spliced into a request that
+would fail. Deferrals are logged as `memory_answer_deferred`.
 
 ### Supported Providers
 
@@ -596,7 +652,7 @@ Headroom Memory uses **Protocol interfaces** (ports) for all components, enablin
 |---------|:--------:|:-----:|:----:|
 | Cross-agent sharing (proxy) | ✅ | ❌ | ❌ |
 | Agent provenance tracking | ✅ | ❌ | ❌ |
-| LLM-mediated dedup (no extra cost) | ✅ | ❌ | ❌ (uses separate LLM) |
+| Restatement merge on save (no extra cost) | ✅ | ❌ | ❌ (uses separate LLM) |
 | Transparent proxy (zero code) | ✅ | ❌ | ❌ |
 | Hierarchical scoping | ✅ | ❌ | ❌ |
 | Temporal versioning | ✅ | ❌ | ❌ |

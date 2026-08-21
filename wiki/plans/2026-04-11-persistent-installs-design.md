@@ -1,5 +1,7 @@
 # Persistent Deployments / Installs Design
 
+> **Superseded — see [wiki/persistent-installs.md](../persistent-installs.md) for the shipped design.** This document is the original plan, kept for history.
+
 ## Problem
 
 Headroom already supports session-oriented usage through `headroom proxy`, `headroom wrap ...`, and the Docker-native wrapper scripts, but there is no first-class way to install Headroom as a durable background runtime. That leaves users to hand-roll launch agents, services, scheduled tasks, or Docker restart policies, and it keeps direct tool usage (`claude`, `codex`, `copilot`, `openclaw`, etc.) tied to explicit `wrap` commands.

@@ -396,6 +396,63 @@ Track spending and enforce budgets:
 - Budget periods: hourly, daily, monthly
 - Automatic request rejection when over budget
 
+### Streaming Reliability
+
+A streaming turn can die in three different ways, and each gets its own handling.
+
+**Mid-stream connection drops.** The upstream body can be torn down after the
+response has started — most often a fatal TLS `BadRecordMac` alert, which under
+WSL2 comes from receive-offload corrupting inbound packets. Because the proxy
+speaks HTTP/2 upstream, one bad record kills every request multiplexed on that
+connection at once. reqwest reports this only as `error decoding response body`,
+so the proxy treats decode errors as retryable drops alongside the usual
+transport errors. See [tls-record-corruption-wsl2.md](https://github.com/headroomlabs-ai/headroom/blob/main/docs/tls-record-corruption-wsl2.md)
+for the host-level fix (`ethtool -K eth0 gro off rx off`).
+
+To retry safely the proxy holds back the first `--retry-stream-hold-bytes`
+(default 2048) of the response. While the stream is still held it is
+*uncommitted*: a drop discards the buffer and re-issues the identical request,
+and the client sees one clean stream with no duplicated prefix. Once the hold
+flushes, the stream is committed and retry is off the table — replaying then
+would splice two generations of output together. Retries back off
+exponentially from `--retry-base-delay-ms` up to `--retry-max-delay-ms`. A
+retry attempt that comes back with a non-2xx status counts as an answer, not a
+stumble, and ends the loop.
+
+**Drops after commit.** Once past the hold there is nothing to retry, so the
+proxy finishes the stream instead of failing it. It closes any open text block,
+appends `[truncated: the connection to the API dropped mid-response]`, and
+emits a synthetic `message_delta` and `message_stop` so the client receives a
+well-formed message. Partial `tool_use` blocks are never forwarded: a block
+still open when the stream dies is dropped whole, and if the turn claimed
+`stop_reason: tool_use` on the strength of it, the stop reason is downgraded to
+`end_turn`. A client handed a turn that promises a tool call it never received
+rejects the whole turn, losing text that was already paid for. Synthesised
+tails are logged as `stream_tail_synthesised`.
+
+**In-band overload.** Anthropic sometimes returns HTTP 200 and then opens the
+SSE body with `event: error` carrying `overloaded_error`. Nothing has been
+forwarded yet, so this is safe to retry — but the outages run long, 27 to 245
+seconds in the turns we sampled. It therefore gets its own budget,
+`--retry-overload-max-attempts` (default 6), separate from the transport budget
+of 3. Three attempts (~3s of waiting) cleared 21% of these turns; six (~31s)
+cleared 69%, which is where the curve bends. The overload budget is never
+allowed to fall below the transport budget.
+
+| Option | Env var | Default | Description |
+|--------|---------|---------|-------------|
+| `--retry` | `HEADROOM_RETRY_ENABLED` | `true` | Master switch for all retry paths |
+| `--retry-max-attempts` | `HEADROOM_RETRY_MAX_ATTEMPTS` | `3` | Transport and status-code retry budget |
+| `--retry-overload-max-attempts` | `HEADROOM_RETRY_OVERLOAD_MAX_ATTEMPTS` | `6` | Budget for in-band `overloaded_error` |
+| `--retry-stream-hold-bytes` | `HEADROOM_RETRY_STREAM_HOLD_BYTES` | `2048` | Bytes held before a stream commits; `0` disables mid-stream retry |
+| `--retry-base-delay-ms` | `HEADROOM_RETRY_BASE_DELAY_MS` | `1000` | Backoff base, shared by all paths |
+| `--retry-max-delay-ms` | `HEADROOM_RETRY_MAX_DELAY_MS` | `30000` | Backoff ceiling, shared by all paths |
+
+Two counters track the outcome: `proxy_upstream_retries_total{path,reason}`
+records that a retry happened, and `proxy_upstream_retries_exhausted_total{path,reason}`
+records the turns where the budget ran out. Watch the second one — the first
+rising on its own is the mechanism working.
+
 ### Prometheus Metrics
 
 Export metrics for monitoring:

@@ -1,8 +1,8 @@
 # Headroom Rust Rewrite — Developer Guide
 
-This document covers the Rust port of Headroom. It is the only new top-level
-doc created in Phase 0; longer-form design/plan writeups live elsewhere and
-are not versioned in this repo.
+This document covers the Rust side of Headroom, which is the default and
+production path. Longer-form design/plan writeups live elsewhere and are not
+versioned in this repo.
 
 ## Workspace layout
 
@@ -11,7 +11,7 @@ Cargo.toml                       # workspace root
 rust-toolchain.toml              # pins stable rustc with rustfmt+clippy
 crates/
   headroom-core/                 # library: shared types + transform trait surface
-  headroom-proxy/                # binary: axum /healthz (Phase 2 grows this)
+  headroom-proxy/                # binary: the production axum proxy
   headroom-py/                   # PyO3 cdylib exposing `headroom._core`
   headroom-parity/               # lib + `parity-run` CLI for Python parity tests
 tests/parity/
@@ -42,41 +42,53 @@ exposes the same targets:
 
 ## Running the proxy
 
-`headroom-proxy` is a transparent reverse proxy. Phase 1 forwards HTTP/1.1,
-HTTP/2, SSE, and WebSocket traffic verbatim to a configured upstream — no
-provider logic yet. The intent is that operators run the existing Python
-proxy on a private port and put `headroom-proxy` on the public port pointed
-at it; end users notice nothing.
+`headroom-proxy` is the production proxy and the default target of the
+`headroom proxy` command. It forwards HTTP/1.1, HTTP/2, SSE, and WebSocket
+traffic to a configured upstream and owns the provider logic — transforms,
+CCR offload, cache stabilization, memory and observability. The legacy Python
+FastAPI server survives only as a fallback behind `HEADROOM_USE_PYTHON_PROXY=1`
+and is not the path to develop against.
 
 ```bash
 # Build
 make build-proxy
 ./target/release/headroom-proxy --help
 
-# Run against a local upstream
+# Run against the model API
 ./target/release/headroom-proxy \
-    --listen 0.0.0.0:8787 \
-    --upstream http://127.0.0.1:8788
+    --listen 127.0.0.1:8787 \
+    --upstream https://api.anthropic.com
 
 # Health checks
 curl -s http://127.0.0.1:8787/healthz            # => {"ok":true,...}
 curl -s http://127.0.0.1:8787/healthz/upstream   # => 200 if upstream reachable
 ```
 
-### Operator runbook (Phase 1 cutover)
+### Operator runbook
 
 ```bash
-# 1. Move the Python proxy to a private port (e.g. 8788)
-HEADROOM_HOST=127.0.0.1 HEADROOM_PORT=8788 python -m headroom.proxy &  # or your existing launcher
+# 1. Install the release binaries (see README.md for the full setup)
+cargo build --release -p headroom-proxy
+install -m755 target/release/headroom-proxy ~/.local/bin/
 
-# 2. Run the Rust proxy on the previously-public port (8787) pointing at it
-./target/release/headroom-proxy --listen 0.0.0.0:8787 --upstream http://127.0.0.1:8788 &
+# 2. Start it — `headroom proxy` launches the Rust binary by default
+headroom proxy &
+# or run the binary directly:
+./target/release/headroom-proxy --listen 127.0.0.1:8787 --upstream https://api.anthropic.com &
 
-# 3. End users keep hitting :8787 unchanged.
-# 4. Confirm passthrough:
+# 3. Point Claude Code at :8787 and confirm the proxy is up:
+curl -s http://127.0.0.1:8787/healthz
 curl -si http://127.0.0.1:8787/v1/models
-# 5. Rollback = stop the Rust proxy and rebind Python back to 8787.
+
+# 4. Stop it with `pkill -f headroom-proxy`.
 ```
+
+The launcher resolves the binary from `HEADROOM_PROXY_BINARY`, then `PATH`,
+then the workspace `target/` directories.
+
+**Legacy fallback.** `HEADROOM_USE_PYTHON_PROXY=1 headroom proxy` still starts
+the Python FastAPI server instead. It lags the Rust path on transforms, CCR and
+cache stabilization; use it only to compare behaviour, never for new work.
 
 ### Configuration flags
 

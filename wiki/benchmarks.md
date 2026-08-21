@@ -2,7 +2,12 @@
 
 Headroom's core promise: **compress context without losing accuracy**. This page shows accuracy benchmarks, compression performance, and real-world production telemetry from 250+ active proxy instances.
 
-!!! success "Key Results"
+!!! warning "STALE — numbers from v0.5.18, not current"
+    The current release is v0.35.0. Every figure on this page was measured on the
+    v0.5.x Python implementation, before the Rust proxy. Nothing here has been re-run.
+    Use it for the shape of the results, not for today's numbers.
+
+!!! success "Key Results (as of v0.5.18)"
     **98.2% recall** on article extraction with **94.9% compression**.
     **52ms median overhead** in production. **1.4 billion tokens saved** across 249 instances.
 
@@ -10,7 +15,7 @@ Headroom's core promise: **compress context without losing accuracy**. This page
 
 ## Compression Performance
 
-Tested on Apple M-series (CPU), headroom v0.5.18. Each test runs `compress()` on realistic tool outputs.
+Tested on Apple M-series (CPU), headroom v0.5.18 — see the staleness note above. Each test runs `compress()` on realistic tool outputs.
 
 | Content Type | Original | Compressed | Saved | Ratio | Latency |
 |---|---|---|---|---|---|

@@ -1,5 +1,18 @@
 # Local Qwen Model Routing Implementation Plan
 
+> **DONE — implemented 2026-07-03 in `a4ea71f4`, then generalized to multiple
+> models the same day in `fe5a3454`. The unchecked boxes below are stale; do
+> not work through them.**
+>
+> The code shipped where this plan said it would: `local_model` and
+> `local_upstream` in `crates/headroom-proxy/src/config.rs`, the handler in
+> `crates/headroom-proxy/src/handlers/local_model.rs`, the `/v1/messages`
+> route in `crates/headroom-proxy/src/proxy.rs`, and coverage in
+> `crates/headroom-proxy/tests/integration_local_model.rs`. The handler has
+> grown well past this plan — a pattern-matched routing fallback, CCR context
+> tracking, cache stabilization — so treat the steps below as the original
+> reasoning, not a description of current behaviour.
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Route requests targeting a local Qwen model through the Headroom proxy by translating between Anthropic Messages API format and OpenAI Chat Completions format, enabling Claude Code to switch between Anthropic and local models via `/model`.

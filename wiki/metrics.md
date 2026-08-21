@@ -109,11 +109,23 @@ curl http://localhost:8787/stats-history
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "generated_at": "2026-03-27T09:10:00Z",
+  "storage_path": "~/.headroom/proxy_savings.json",
   "lifetime": {
     "tokens_saved": 12500,
     "compression_savings_usd": 0.04
+  },
+  "failed_work": {
+    "requests": 2,
+    "upstream_attempts": 5,
+    "forwarded_tokens": 51000,
+    "forwarded_tokens_at_risk": 143000,
+    "provider_reported_input_tokens": 0,
+    "provider_reported_output_tokens": 0,
+    "provider_usage_observed_requests": 1,
+    "by_status": {"529": 2},
+    "last_activity_at": "2026-03-27T09:05:00Z"
   },
   "history": [
     {
@@ -146,6 +158,14 @@ curl http://localhost:8787/stats-history
 compression history. It survives proxy restarts, tolerates missing or malformed
 state files, and powers the historical view in `/dashboard`. It now includes
 hourly, daily, weekly, and monthly chart-ready rollups.
+
+`schema_version` is currently **4**; version 4 added `failed_work`, which counts
+the tokens the proxy forwarded on turns the upstream never completed. The loader
+is additive — an older file still loads, and fields it lacks read as zero. The
+state lives in `~/.headroom/proxy_savings.json` (or wherever
+`HEADROOM_WORKSPACE_DIR` points). The nested lifetime metrics snapshot carries
+its own separate `schema_version`, currently **5**; the two counters move
+independently.
 
 By default, the `history` array is compacted for transport efficiency. Use
 `history_mode=full` when you explicitly need the full retained checkpoint list,

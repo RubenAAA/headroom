@@ -1,8 +1,19 @@
 # Phase J — Frozen-History Offload (CCR re-cache)
 
-**Status:** PROPOSED — design only. NOT approved for implementation. Mutates the
-byte-sacred cache prefix (recoverably); requires sign-off on the threat model
-below before any code.
+**Status:** IN PROGRESS — implementation started 2026-07-03 (`7037c705`, "CTX-3
+deterministic tool_result offload transform") and has been tuned since; latest
+offload commit `4f223054` (2026-08-19). The threat model below was accepted: the
+prefix mutation is recoverable and gated behind ctx mode.
+Shipped so far: `crates/headroom-proxy/src/compression/ctx_offload.rs` (the
+transform), `crates/headroom-proxy/src/ctx/offload_store.rs` (the store),
+`crates/headroom-proxy/src/observability/ctx_offload_by_tool.rs` (per-tool
+counters), covered by `crates/headroom-proxy/tests/ctx_cache_stability.rs`.
+In flight, uncommitted: `crates/headroom-proxy/src/bin/offload_replay.rs`
+(offline corpus replay through the real transform) and
+`crates/headroom-proxy/src/memory/deferred.rs` (holding memory answers for the
+next request), plus the gap analysis in `bench/HANDOFF-offload-gap.md`.
+Note: the shipped marker is `<<ctx:HASH>>`, not the `<<ccr:HASH>>` this design
+sketched — read the marker syntax below as a design draft.
 **Owner:** RubenAAA (fork initiative; not part of the original A–I realignment audit).
 **Depends on:** Phase B (live-zone engine), Phase E (cache-stabilization detectors —
 specifically `drift_detector`), the CCR store (`headroom_core::ccr`).

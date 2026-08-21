@@ -26,6 +26,8 @@ So "Tier 1 + Tier 2" is the right scope for the Phase B big-delete PR; Tier 3 is
 
 **Alternative:** Stop at Tier 1 (just ICM proper). Risk: ~6 K LOC of dead-but-still-imported scoring/relevance machinery; future contributors won't know it's dead.
 
+**RESOLVED (PR-B1, `967b0db4`, 2026-05-02) — with one carve-out.** Tier 1 + Tier 2 went, including `crates/headroom-core/src/scoring/`, but `relevance/` was **kept and repurposed** rather than deleted: it now backs `transforms/relevance_split.rs` (prompt-conditioned KEEP/DROP splitting of tool output, wired into `content_router` and on by default), and its `EmbeddingScorer` owns the shared `bge-small-en-v1.5` ONNX session that `signals/` and magika link against.
+
 ---
 
 ## Q3. MessageScorer Rust port — delete?

@@ -16,21 +16,63 @@ SmartCrusher analyzes JSON arrays and selectively keeps important items:
 4. **Relevant items** - Matches to user's query via BM25/embeddings
 5. **Change points** - Significant transitions in data
 
+### Adaptive Sizing
+
+How many items to keep is not a fixed number. A ten-item array and a
+ten-thousand-item array need different budgets, and so do a repetitive log dump
+and a list where every row says something new.
+
+SmartCrusher builds a cumulative unique-bigram coverage curve over the items in
+importance order — each item contributes its word-level bigrams, and the curve
+records how much new vocabulary has appeared by item *i*. That curve rises fast
+at first, then flattens once the array starts repeating itself. Kneedle finds
+where it bends: normalize both axes to `[0,1]`, then take the point of greatest
+deviation from the diagonal. That knee is where more items stop buying new
+information, and it becomes the item budget.
+
+Three tiers guard it:
+
+- **8 items or fewer**, or 3 or fewer distinct items by SimHash, pass through
+  without analysis.
+- **A knee under 0.05 deviation doesn't count** — that curve is too straight to
+  have a bend. The budget falls back to `n * (0.3 + 0.7 * diversity)`, where
+  diversity is the fraction of items that are genuinely distinct. The same
+  expression acts as a floor whenever diversity runs above 0.7, so a list where
+  every row differs is not cut to the knee.
+- **A zlib check** then raises the budget by about 20% if the kept items
+  compress much better than the full array, which means the sample was more
+  redundant than the whole.
+
+A caller-supplied `bias` multiplier scales the knee — above 1 keeps more, below
+1 compresses harder. The result is clamped to a floor of 3 and to
+`max_items_after_crush`, then split: `first_fraction` to the head of the array,
+`last_fraction` to the tail, and the rest to whatever scored as important.
+
 ### Configuration
 
 ```python
 from headroom import SmartCrusherConfig
 
 config = SmartCrusherConfig(
+    min_items_to_analyze=5,       # Don't analyze arrays smaller than this
     min_tokens_to_crush=200,      # Only compress if > 200 tokens
-    max_items_after_crush=50,     # Keep at most 50 items
-    keep_first=3,                 # Always keep first 3 items
-    keep_last=2,                  # Always keep last 2 items
-    relevance_threshold=0.3,      # Keep items with relevance > 0.3
-    anomaly_std_threshold=2.0,    # Keep items > 2 std dev from mean
-    preserve_errors=True,         # Always keep error items
+    max_items_after_crush=15,     # Cap on the adaptive item budget
+    first_fraction=0.3,           # Share of the budget for the head
+    last_fraction=0.15,           # Share of the budget for the tail
+    variance_threshold=2.0,       # Std devs from mean to count as a change point
+    uniqueness_threshold=0.1,     # Below this unique-ratio a field is near-constant
+    similarity_threshold=0.8,     # Above this, strings cluster together
+    relevance_threshold=0.3,      # Pin items scoring above this against the query
+    preserve_change_points=True,  # Keep detected transitions
+    dedup_identical_items=True,   # Drop identical items before sampling
+    use_feedback_hints=True,      # Let retrieval feedback bias the budget
+    toin_confidence_threshold=0.5,# Min confidence to apply a TOIN recommendation
+    lossless_min_savings_ratio=0.15,  # Below this, fall through to the lossy path
 )
 ```
+
+`max_items_after_crush` is a ceiling, not a target — the adaptive sizer usually
+lands below it. Set it to `0` to remove the cap entirely and let the knee decide.
 
 ### Example
 
@@ -42,7 +84,7 @@ crusher = SmartCrusher(config)
 # Before: 1000 search results (45,000 tokens)
 tool_output = {"results": [...1000 items...]}
 
-# After: ~50 important items (4,500 tokens) - 90% reduction
+# After: ~15 important items (1,400 tokens) - 97% reduction
 compressed = crusher.crush(tool_output, query="user's question")
 ```
 
