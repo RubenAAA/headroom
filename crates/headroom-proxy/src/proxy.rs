@@ -5542,6 +5542,15 @@ fn enforce_cache_control_ttl_order(
     if !body_to_send.windows(LONG_TTL.len()).any(|w| w == LONG_TTL) {
         return body_to_send;
     }
+    // This repairs violations the proxy introduced. On a body no stage rewrote
+    // there is nothing of ours to repair, and editing it would break the
+    // passthrough guarantee, change the client's cache key, and hide a bug in
+    // their request — Anthropic's own 400 is the honest answer. Ordered after
+    // the marker scan so the comparison only runs on bodies that could break
+    // the rule.
+    if body_to_send == original {
+        return body_to_send;
+    }
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body_to_send) else {
         return body_to_send;
     };
