@@ -656,3 +656,38 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bias_is_a_multiplier_tests {
+    use super::*;
+
+    /// Twenty distinct items: enough that the knee sits well above `min_k`.
+    fn varied() -> Vec<String> {
+        (0..20)
+            .map(|i| format!("item {i} with its own distinct payload {}", "x".repeat(i)))
+            .collect()
+    }
+
+    #[test]
+    fn zero_bias_collapses_to_min_k() {
+        // Pins the trap rather than the behaviour: a multiplier of zero sends
+        // the knee to zero, so `k` can only be `min_k`. This is why
+        // live_zone::DEFAULT_BIAS must not be 0.0 — it silently turns adaptive
+        // sizing off instead of leaving it unbiased.
+        let owned = varied();
+        let items: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(compute_optimal_k(&items, 0.0, 3, None), 3);
+    }
+
+    #[test]
+    fn neutral_bias_can_exceed_min_k() {
+        let owned = varied();
+        let items: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let k = compute_optimal_k(&items, 1.0, 3, None);
+        assert!(
+            k > 3,
+            "a neutral bias should let the knee choose, got {k} (== min_k means \
+             adaptive sizing is doing nothing)"
+        );
+    }
+}

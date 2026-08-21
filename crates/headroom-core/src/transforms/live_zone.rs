@@ -155,9 +155,18 @@ pub const CTX_OFFLOAD_MARKER_PREFIX: &str = "<<ctx:";
 /// query string. PR-B3 dispatcher does not yet plumb the user's last
 /// prompt through; PR-F3 will.
 const EMPTY_QUERY: &str = "";
-/// Default relevance bias passed to scoring-aware compressors. Mirrors
-/// the OSS-default behaviour ("no bias").
-const DEFAULT_BIAS: f64 = 0.0;
+/// Default relevance bias passed to scoring-aware compressors.
+///
+/// This multiplies the knee index that `adaptive_sizer::compute_optimal_k`
+/// found, so 1.0 is "keep what the knee said" — matching Python's `moderate`
+/// profile, whose scale runs 0.7 aggressive to 1.5 conservative.
+///
+/// It was 0.0, described as "no bias". Zero is not the neutral value of a
+/// multiplier: `knee * 0.0` is 0, so `k` fell back to `min_k` every time and
+/// adaptive sizing never chose anything. Every array big enough to reach the
+/// knee path was cut to the floor of 3-5 items no matter how much distinct
+/// content it held.
+const DEFAULT_BIAS: f64 = 1.0;
 
 /// Default model name handed to the tokenizer registry when the proxy
 /// could not extract `body["model"]`. Matches the most-common
