@@ -147,8 +147,7 @@ pub fn compute_window_tokens(start_ts: f64, end_ts: f64) -> WindowTokens {
     // by its block count — 19x on one 420K response upstream. Count each
     // response once, keyed by the Anthropic `message.id`. Entries with no id
     // keep the per-line behaviour, so this only ever drops true duplicates.
-    let mut seen_message_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut seen_message_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for path in find_transcript_files() {
         for line in read_transcript_lines(&path) {
@@ -287,7 +286,12 @@ mod tests {
             })
             .to_string()
         };
-        let lines = format!("{}\n{}\n{}\n", block("msg_a"), block("msg_a"), block("msg_b"));
+        let lines = format!(
+            "{}\n{}\n{}\n",
+            block("msg_a"),
+            block("msg_a"),
+            block("msg_b")
+        );
         std::fs::write(projects.join("a.jsonl"), lines).unwrap();
 
         let _guard = crate::subscription::env_guard();

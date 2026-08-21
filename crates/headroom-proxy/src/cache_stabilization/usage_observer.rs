@@ -541,6 +541,14 @@ struct PendingRequest {
     /// PR-E6 drift dimensions observed on this request, when any —
     /// the "why" attached to a re-cache event.
     drift_dims: Option<String>,
+    /// `(input, cache_read, cache_write)` actually billed across every round of
+    /// this request, when the proxy ran more than one. The usage passed to
+    /// [`UsageObserver::complete`] is deliberately the *client baseline* — the
+    /// footprint of the request the client sent — because that is what the next
+    /// client turn can be compared against. A hidden CCR continuation round is
+    /// still real money, so the ledger must add it back or it reports less than
+    /// the bill. `None` on the common single-round path.
+    billed_totals: Option<(u64, u64, u64)>,
 }
 
 /// Return a cause only when the request supplied direct evidence for it.
@@ -862,8 +870,33 @@ impl UsageObserver {
                 forwarded_request_bytes: None,
                 compression_mode: None,
                 prefix,
+                billed_totals: None,
             },
         );
+    }
+
+    /// Record what the provider billed across every round of this request.
+    ///
+    /// Call this only when the proxy issued hidden continuation rounds, and
+    /// before [`UsageObserver::complete`]. Classification still runs on the
+    /// client baseline `complete` is given; only the cost ledger uses these
+    /// totals, so the ledger and the pricing counterfactual agree on one
+    /// request's billed usage.
+    pub fn note_billed_totals(
+        &self,
+        request_id: &str,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    ) {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(request_id) {
+            pending.billed_totals = Some((
+                input_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            ));
+        }
     }
 
     /// Record the wire sizes and the arm this turn ran under.
@@ -1039,9 +1072,18 @@ impl UsageObserver {
         // compare between a run with compression on and one with it off; see
         // `docs/measurement.md`. Reading it alone proves nothing.
         {
-            let billed_fresh_equivalents = input_tokens as f64
-                + (cache_read_input_tokens as f64 * 0.1)
-                + (cache_creation_input_tokens as f64 * 1.25);
+            // Bill every round, not just the client's. When the proxy answered
+            // a retrieval itself, the rounds it added were billed too, and the
+            // baseline above deliberately excludes them.
+            let (billed_input, billed_cache_read, billed_cache_write) =
+                pending.billed_totals.unwrap_or((
+                    input_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                ));
+            let billed_fresh_equivalents = billed_input as f64
+                + (billed_cache_read as f64 * 0.1)
+                + (billed_cache_write as f64 * 1.25);
             // Same window as the hit rate above, and the same reason: the
             // statusline needs it per render and cannot afford to re-read the
             // log. Kept here rather than beside the hit rate because the
@@ -1052,8 +1094,8 @@ impl UsageObserver {
                 inner.recent_cost_samples.pop_front();
             }
             inner.recent_cost_samples.push_back(CostSample {
-                cache_read_tokens: cache_read_input_tokens,
-                cache_write_tokens: cache_creation_input_tokens,
+                cache_read_tokens: billed_cache_read,
+                cache_write_tokens: billed_cache_write,
                 forwarded_bytes: pending.forwarded_request_bytes.unwrap_or(0),
                 billed_fresh_equivalents,
             });
@@ -1061,10 +1103,11 @@ impl UsageObserver {
                 event = "turn_cost_ledger",
                 request_id = %request_id,
                 conversation_key = %pending.conversation_key,
-                // Anthropic's own numbers, unmodified.
-                input_tokens = input_tokens,
-                cache_read_input_tokens = cache_read_input_tokens,
-                cache_creation_input_tokens = cache_creation_input_tokens,
+                // Anthropic's own numbers, summed over every round the proxy
+                // ran and otherwise unmodified.
+                input_tokens = billed_input,
+                cache_read_input_tokens = billed_cache_read,
+                cache_creation_input_tokens = billed_cache_write,
                 // Which TTL the provider actually billed the write at. The
                 // proxy asks for the 1-hour tier on the prefix, but asking is
                 // not granting, and the flat creation count above cannot tell
@@ -2259,6 +2302,34 @@ mod prefix_on_recache_event_tests {
             .find(|l| l.contains("savings_placement"))
             .expect("placement event");
         assert!(line.contains("freed_past_cache_boundary=true"), "{line}");
+    }
+
+    /// A hidden continuation round is billed like any other. The ledger is
+    /// handed the client baseline for classification, so without the totals it
+    /// reports less cache read than the pricing counterfactual, which sums
+    /// every round off the outcome.
+    #[test]
+    fn the_cost_ledger_bills_continuation_rounds() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+        tracing::subscriber::with_default(sub, || {
+            let obs = UsageObserver::new();
+            obs.begin_request("ccr-1", "conv-ccr".into(), None, None, None);
+            obs.note_wire_bytes("ccr-1", 100_000, 90_000, "all_messages");
+            // Client turn read 200k; the continuation round read another 150k.
+            obs.note_billed_totals("ccr-1", 20, 350_000, 4_000);
+            obs.complete("ccr-1", 10, 200_000, 4_000, None);
+        });
+        let joined = cap.lock().unwrap().fields.join("\n");
+        let line = joined
+            .lines()
+            .find(|l| l.contains("turn_cost_ledger"))
+            .unwrap_or_else(|| panic!("no ledger event; captured:\n{joined}"));
+        assert!(line.contains("cache_read_input_tokens=350000"), "{line}");
+        assert!(line.contains("input_tokens=20"), "{line}");
+        // 20 + 350000*0.1 + 4000*1.25 = 40020
+        assert!(line.contains("billed_fresh_equivalents=40020"), "{line}");
     }
 
     /// The ledger exists because every other savings figure here is produced

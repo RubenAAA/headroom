@@ -232,8 +232,7 @@ fn estimate_input_cost_usd(
     let unc = coerce_int(uncached_input_tokens);
     // Effective write count: a reported split that overshoots the total wins,
     // matching how `cache_write_tokens_and_cost` prices it.
-    let cw =
-        cw_total.max(coerce_int(cache_write_5m_tokens) + coerce_int(cache_write_1h_tokens));
+    let cw = cw_total.max(coerce_int(cache_write_5m_tokens) + coerce_int(cache_write_1h_tokens));
     let use_breakdown = (cr + cw + unc) > 0;
     let chargeable = if use_breakdown {
         cr + cw + unc
@@ -412,12 +411,31 @@ struct State {
     failed_work: FailedWork,
     display_session: DisplaySession,
     history: Vec<HistoryEntry>,
+    /// `history` already rendered as JSON, one entry per element.
+    ///
+    /// Rendering the whole history was the bulk of a save, and a request saves
+    /// several times, so this is kept in step by `push_history` and
+    /// `trim_history` instead of being rebuilt each time. It only mirrors
+    /// pushes and removals, which is all `history` ever sees. Editing an
+    /// entry in place would leave this stale, so don't.
+    history_rendered: Vec<Value>,
     projects: BTreeMap<String, ProjectEntry>,
     /// Durable cache-behaviour counters. The tracker owns loading and saving
     /// these, per `persistent_metrics`'s own contract; without a home here
     /// they were a finished port with no call site, and nothing about cache
     /// busts survived a proxy restart.
     metrics: crate::persistent_metrics::PersistentMetricsState,
+}
+
+/// Rebuild the rendered mirror when it has fallen out of step with `history`.
+///
+/// Two cases reach this: a state just loaded from disk, where the mirror
+/// starts empty, and a history replaced wholesale. Both are one-off, so the
+/// rebuild cost lands once rather than on every save.
+fn sync_history_rendered(st: &mut State) {
+    if st.history_rendered.len() != st.history.len() {
+        st.history_rendered = st.history.iter().map(history_entry_value).collect();
+    }
 }
 
 /// Persist bounded proxy compression savings history.
@@ -579,7 +597,7 @@ impl SavingsTracker {
             total_input_tokens: st.lifetime.total_input_tokens,
             total_input_cost_usd: st.lifetime.total_input_cost_usd,
         };
-        st.history.push(entry);
+        Self::push_history(&mut st, entry);
         self.trim_history(&mut st, ts);
         self.save(&mut st);
         true
@@ -699,7 +717,7 @@ impl SavingsTracker {
                 total_input_tokens: st.lifetime.total_input_tokens,
                 total_input_cost_usd: st.lifetime.total_input_cost_usd,
             };
-            st.history.push(entry);
+            Self::push_history(&mut st, entry);
             self.trim_history(&mut st, ts);
         }
 
@@ -1129,26 +1147,55 @@ impl SavingsTracker {
 
     // ── history maintenance ──
 
+    /// Append an entry and render it into the mirror in one step, so the two
+    /// vectors cannot fall out of step.
+    fn push_history(st: &mut State, entry: HistoryEntry) {
+        sync_history_rendered(st);
+        st.history_rendered.push(history_entry_value(&entry));
+        st.history.push(entry);
+    }
+
     fn trim_history(&self, st: &mut State, reference: DateTime<Utc>) {
         if st.history.is_empty() {
             return;
         }
+        sync_history_rendered(st);
         if self.max_history_age_days > 0 {
             let cutoff = reference - Duration::days(self.max_history_age_days);
-            let mut filtered: Vec<HistoryEntry> = st
+            // One timestamp pass, then drop the same slots from both vectors.
+            // This used to clone every surviving entry into a fresh vector on
+            // every push, which on a full history was thousands of struct
+            // clones per request.
+            let keep: Vec<bool> = st
                 .history
                 .iter()
-                .filter(|item| parse_timestamp(&item.timestamp).unwrap_or_else(utc_now) >= cutoff)
-                .cloned()
+                .map(|item| parse_timestamp(&item.timestamp).unwrap_or_else(utc_now) >= cutoff)
                 .collect();
-            if filtered.is_empty() {
-                filtered = vec![st.history.last().unwrap().clone()];
+            if keep.iter().any(|k| *k) {
+                let mut i = 0;
+                st.history.retain(|_| {
+                    let k = keep[i];
+                    i += 1;
+                    k
+                });
+                let mut i = 0;
+                st.history_rendered.retain(|_| {
+                    let k = keep[i];
+                    i += 1;
+                    k
+                });
+            } else {
+                // Everything aged out. Keep the newest point rather than
+                // leaving nothing behind.
+                let last = st.history.len() - 1;
+                st.history.drain(..last);
+                st.history_rendered.drain(..last);
             }
-            st.history = filtered;
         }
         if self.max_history_points > 0 && st.history.len() > self.max_history_points {
             let start = st.history.len() - self.max_history_points;
-            st.history = st.history[start..].to_vec();
+            st.history.drain(..start);
+            st.history_rendered.drain(..start);
         }
     }
 
@@ -1358,6 +1405,8 @@ impl SavingsTracker {
             failed_work: normalize_failed_work(raw.get("failed_work")),
             display_session: normalize_display_session(raw.get("display_session")),
             history,
+            // Rendered on first use; `sync_history_rendered` fills it.
+            history_rendered: Vec::new(),
             projects: normalize_projects(raw.get("projects")),
             // Absent on files written before the metrics landed; `new`
             // treats a missing blob as a fresh zeroed state, so an older
@@ -1393,20 +1442,36 @@ impl SavingsTracker {
         // leave a timestamp behind claiming it did.
         let previous_saved_at = st.metrics.state().persistence.last_saved_at.clone();
         st.metrics.set_last_saved_at(Some(to_utc_iso(utc_now())));
-        let payload = json!({
-            "schema_version": SCHEMA_VERSION,
-            "lifetime": lifetime_value(&st.lifetime),
-            "failed_work": failed_work_value(&st.failed_work),
-            "display_session": display_session_value(&st.display_session),
-            "history": st.history.iter().map(history_entry_value).collect::<Vec<_>>(),
-            "projects": projects_persist_value(&st.projects),
-            "lifetime_metrics": st.metrics.to_dict(),
+        // Serialised from borrowed parts rather than assembled into a `Value`
+        // first, so the rendered history goes straight to the writer instead
+        // of being cloned into the payload. Field order here is the file's key
+        // order, so it matches what `json!` used to emit.
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            schema_version: i64,
+            lifetime: Value,
+            failed_work: Value,
+            display_session: Value,
+            history: &'a [Value],
+            projects: Value,
             // Kept out of `lifetime_metrics` because that blob's shape is
             // asserted byte-exact against Python's and these counters are
             // Rust-only.
-            "lifetime_footprint": st.metrics.footprint_to_dict(),
+            lifetime_metrics: Value,
+            lifetime_footprint: Value,
+        }
+        sync_history_rendered(st);
+        let serialised = serde_json::to_string_pretty(&Payload {
+            schema_version: SCHEMA_VERSION,
+            lifetime: lifetime_value(&st.lifetime),
+            failed_work: failed_work_value(&st.failed_work),
+            display_session: display_session_value(&st.display_session),
+            history: &st.history_rendered,
+            projects: projects_persist_value(&st.projects),
+            lifetime_metrics: st.metrics.to_dict(),
+            lifetime_footprint: st.metrics.footprint_to_dict(),
         });
-        let Ok(json_data) = serde_json::to_string_pretty(&payload) else {
+        let Ok(json_data) = serialised else {
             st.metrics.set_last_saved_at(previous_saved_at);
             return;
         };
@@ -2155,6 +2220,29 @@ mod tests {
         assert_eq!(r["tools_never_called"], 0);
         assert_eq!(r["never_called_bytes"], 0);
         assert_eq!(r["drop_mcp_servers_suggestion"], serde_json::json!([]));
+    }
+
+    /// A tool absent from one request but sent by another client recently must
+    /// survive: subagents send narrower tool sets than the session that spawned
+    /// them.
+    #[test]
+    fn a_tool_missing_from_one_request_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let t = tracker(&path);
+        t.record_tools(
+            &[
+                ("Bash".to_string(), 400),
+                ("mcp__ctx__search".to_string(), 2_000),
+            ],
+            &[],
+        );
+        // A subagent turn carrying only Bash.
+        t.record_tools(&[("Bash".to_string(), 400)], &[("Bash".to_string(), 1)]);
+
+        let r = t.tool_inventory_report();
+        assert_eq!(r["tools_defined"], 2);
+        assert_eq!(r["tools_never_called"], 1);
     }
 
     /// A savings file written before the metrics existed must load, not throw

@@ -33,6 +33,14 @@ pub const MAX_TRACKED_MODELS: usize = 200;
 pub const MAX_TRACKED_TOOLS: usize = 400;
 /// Never-called tools listed in a snapshot, biggest first.
 pub const MAX_LISTED_UNUSED_TOOLS: usize = 15;
+
+/// How long a tool stays in the inventory after it was last seen in a request.
+///
+/// Without this the inventory is append-forever: a tool dropped by
+/// `--prune-drop-mcp`, or retired from an MCP server, sits in the report as a
+/// never-called cost the operator has in fact already removed. Seven days is
+/// long enough to span a client that only runs occasionally.
+pub const TOOL_INVENTORY_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 /// Models kept after pruning, and models exposed by a snapshot.
 pub const MAX_EXPOSED_MODELS: usize = 100;
 /// Labels are truncated to this many characters before use as a map key.
@@ -199,6 +207,16 @@ fn get<'a>(map: Option<&'a Map<String, Value>>, key: &str) -> Option<&'a Value> 
 pub struct CountMap(Vec<(String, i64)>);
 
 impl CountMap {
+    /// Drop every entry `keep` rejects.
+    ///
+    /// Distinct from [`Self::compact`], which folds small entries into
+    /// `other`. A tool that has aged out is not a small count to be preserved
+    /// in aggregate; it is gone, and summing it into `other` would keep its
+    /// bytes in the totals.
+    pub fn retain<F: Fn(&str, i64) -> bool>(&mut self, keep: F) {
+        self.0.retain(|(name, value)| keep(name, *value));
+    }
+
     /// The count stored under `key`, or `0`.
     pub fn get(&self, key: &str) -> i64 {
         self.0
@@ -518,6 +536,10 @@ pub struct ToolInventoryState {
     pub definition_bytes: CountMap,
     /// Times the model actually called each tool.
     pub calls: CountMap,
+    /// Unix seconds when each tool was last seen defined on a request, so a
+    /// tool that is no longer sent can age out instead of being reported
+    /// forever as an unused cost.
+    pub last_seen: CountMap,
 }
 
 /// Prefix-cache counters.
@@ -769,12 +791,23 @@ impl PersistentMetricsState {
             unbooked_turns: coerce_int(get(raw_wire, "unbooked_turns")),
         };
         let raw_tools = dict_or_empty(get(raw, "tool_inventory"));
+        let definition_bytes =
+            normalize_count_map(get(raw_tools, "definition_bytes"), MAX_TRACKED_TOOLS);
+        let mut last_seen = normalize_count_map(get(raw_tools, "last_seen"), MAX_TRACKED_TOOLS);
+        // A file written before `last_seen` existed has no timestamps. Treat
+        // its tools as seen now rather than as aged out, so an upgrade does not
+        // blank the inventory; anything genuinely gone falls out of the window
+        // on its own.
+        if last_seen.is_empty() && !definition_bytes.is_empty() {
+            let seeded_at = utc_now().timestamp();
+            for (name, _) in definition_bytes.iter() {
+                last_seen.observe_max(name, seeded_at);
+            }
+        }
         self.state.tool_inventory = ToolInventoryState {
-            definition_bytes: normalize_count_map(
-                get(raw_tools, "definition_bytes"),
-                MAX_TRACKED_TOOLS,
-            ),
+            definition_bytes,
             calls: normalize_count_map(get(raw_tools, "calls"), MAX_TRACKED_TOOLS),
+            last_seen,
         };
     }
 
@@ -824,20 +857,50 @@ impl PersistentMetricsState {
     /// Definition sizes are max-seen (the same schema rides every turn); calls
     /// accumulate.
     pub fn record_tools(&mut self, definitions: &[(String, i64)], calls: &[(String, i64)]) {
+        let seen_at = utc_now().timestamp();
         for (name, bytes) in definitions {
             self.state
                 .tool_inventory
                 .definition_bytes
                 .observe_max(name, clamp_int(*bytes));
+            self.state
+                .tool_inventory
+                .last_seen
+                .observe_max(name, seen_at);
         }
         for (name, count) in calls {
             self.state.tool_inventory.calls.add(name, clamp_int(*count));
         }
+        self.age_out_tools(seen_at);
         self.state
             .tool_inventory
             .definition_bytes
             .compact(MAX_TRACKED_TOOLS);
         self.state.tool_inventory.calls.compact(MAX_TRACKED_TOOLS);
+        self.state
+            .tool_inventory
+            .last_seen
+            .compact(MAX_TRACKED_TOOLS);
+    }
+
+    /// Forget tools no request has carried for [`TOOL_INVENTORY_RETENTION_SECS`].
+    ///
+    /// Driven by `last_seen` rather than by the tool list of the request in
+    /// hand: subagents and other clients legitimately send narrower tool sets,
+    /// and dropping everything absent from one request would erase the main
+    /// session's inventory on the next subagent spawn.
+    fn age_out_tools(&mut self, now_secs: i64) {
+        let cutoff = now_secs - TOOL_INVENTORY_RETENTION_SECS;
+        let inv = &mut self.state.tool_inventory;
+        inv.last_seen.retain(|_, seen_at| seen_at >= cutoff);
+        let live: Vec<String> = inv
+            .last_seen
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let is_live = |name: &str| live.iter().any(|kept| kept == name);
+        inv.definition_bytes.retain(|name, _| is_live(name));
+        inv.calls.retain(|name, _| is_live(name));
     }
 
     /// Tool definitions the model never called, biggest first, with the totals
@@ -872,6 +935,11 @@ impl PersistentMetricsState {
                 .map(|(name, bytes)| serde_json::json!({"name": name, "bytes": bytes}))
                 .collect::<Vec<_>>(),
             "drop_mcp_servers_suggestion": suggest_droppable_servers(inv),
+            "scope": format!(
+                "tools seen on a request in the last {} days; one dropped from the \
+                 client config ages out rather than being reported forever",
+                TOOL_INVENTORY_RETENTION_SECS / 86_400
+            ),
         })
     }
 
@@ -1507,6 +1575,7 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
             MAX_TRACKED_TOOLS,
         ),
         calls: normalize_count_map(get(raw_tools, "calls"), MAX_TRACKED_TOOLS),
+        last_seen: normalize_count_map(get(raw_tools, "last_seen"), MAX_TRACKED_TOOLS),
     };
 
     let raw_models = dict_or_empty(get(source, "models"));
@@ -1537,6 +1606,70 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
 
 #[cfg(test)]
 mod tests {
+    /// A tool nothing has sent for longer than the retention window must leave
+    /// the inventory. Kept forever, it tells the operator to prune something
+    /// they already pruned.
+    #[test]
+    fn a_tool_unseen_past_the_window_ages_out() {
+        let stale = utc_now().timestamp() - TOOL_INVENTORY_RETENTION_SECS - 1;
+        let footprint = serde_json::json!({
+            "tool_inventory": {
+                "definition_bytes": {"mcp__gone__old": 5_000, "Bash": 400},
+                "calls": {"Bash": 3},
+                "last_seen": {"mcp__gone__old": stale, "Bash": utc_now().timestamp()},
+            }
+        });
+        let mut state = PersistentMetricsState::new(None);
+        state.load_footprint(Some(&footprint));
+
+        // Any subsequent request re-stamps what it carries and ages out the rest.
+        state.record_tools(&[("Bash".to_string(), 400)], &[]);
+
+        let report = state.tool_inventory_report();
+        assert_eq!(report["tools_defined"], 1, "only the tool still in use");
+        assert_eq!(report["definition_bytes_total"], 400);
+        assert_eq!(report["tools_never_called"], 0);
+    }
+
+    /// The aged-out tool must not survive as part of `other`: folding it in
+    /// would keep its bytes in the totals under a name nobody can act on.
+    #[test]
+    fn aging_out_removes_bytes_rather_than_folding_them() {
+        let stale = utc_now().timestamp() - TOOL_INVENTORY_RETENTION_SECS - 1;
+        let footprint = serde_json::json!({
+            "tool_inventory": {
+                "definition_bytes": {"mcp__gone__old": 5_000},
+                "calls": {},
+                "last_seen": {"mcp__gone__old": stale},
+            }
+        });
+        let mut state = PersistentMetricsState::new(None);
+        state.load_footprint(Some(&footprint));
+        state.record_tools(&[("Bash".to_string(), 400)], &[]);
+
+        let report = state.tool_inventory_report();
+        assert_eq!(report["definition_bytes_total"], 400);
+        assert_eq!(report["never_called_bytes"], 400);
+    }
+
+    /// A footprint written before `last_seen` existed must keep its inventory,
+    /// not have it read as "never seen" and dropped on the first request.
+    #[test]
+    fn a_footprint_without_last_seen_keeps_its_tools() {
+        let footprint = serde_json::json!({
+            "tool_inventory": {
+                "definition_bytes": {"mcp__ctx__search": 2_000},
+                "calls": {"mcp__ctx__search": 4},
+            }
+        });
+        let mut state = PersistentMetricsState::new(None);
+        state.load_footprint(Some(&footprint));
+        state.record_tools(&[("Bash".to_string(), 400)], &[]);
+
+        let report = state.tool_inventory_report();
+        assert_eq!(report["tools_defined"], 2, "grandfathered, not erased");
+    }
+
     // Every expected value below was measured by running the Python
     // reference (`headroom/proxy/persistent_metrics.py`) on the same input,
     // not derived by hand.
