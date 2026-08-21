@@ -24,10 +24,22 @@ fn messages_body() -> serde_json::Value {
     })
 }
 
+/// Permit the loopback mock servers these tests point the override at.
+///
+/// WEB-01 makes the default policy reject a client-chosen upstream that
+/// resolves to loopback or private space, which is what a wiremock server is.
+/// A bare host allowlists every safe scheme and port for that host, so one
+/// value serves every test here and setting it twice is harmless — which
+/// matters because the env is process-global and these tests run in parallel.
+fn allow_loopback_overrides() {
+    std::env::set_var("HEADROOM_ALLOWED_BASE_URLS", "127.0.0.1");
+}
+
 /// Header present → the request is forwarded to the overridden upstream,
 /// not the configured default upstream.
 #[tokio::test]
 async fn header_present_routes_to_override_upstream() {
+    allow_loopback_overrides();
     let default_upstream = MockServer::start().await;
     let override_upstream = MockServer::start().await;
 
@@ -125,6 +137,7 @@ async fn empty_or_whitespace_header_uses_default_upstream() {
 /// (no doubled slash, correct upstream).
 #[tokio::test]
 async fn trailing_slash_is_stripped() {
+    allow_loopback_overrides();
     let override_upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
