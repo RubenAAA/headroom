@@ -324,6 +324,17 @@ fn download(url: &str, dest: &Path) -> Result<(), Error> {
         std::fs::create_dir_all(parent)?;
     }
     let final_url = mirror_url(url);
+    // Refuse plaintext. A SHA-256 pin catches a tampered payload, but only
+    // where a pin exists, and it does nothing about what an eavesdropper on
+    // the way learns. Checked after mirror substitution so it covers both an
+    // http:// asset URL and an http:// HEADROOM_BINARIES_MIRROR.
+    if !final_url.starts_with("https://") {
+        return Err(BinaryError::new(format!(
+            "refusing to download over a non-https URL: {final_url}\n\
+             (set {HEADROOM_BINARIES_MIRROR} to an https:// origin)"
+        ))
+        .into());
+    }
     let mut resp = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?
@@ -749,5 +760,31 @@ mod tests {
     #[test]
     fn which_unknown_tool_is_none() {
         assert!(which("__missing_headroom_tool__").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod https_only_download_tests {
+    use super::*;
+
+    /// The guard sits before the request is built, so this needs no network.
+    #[test]
+    fn plaintext_urls_are_refused() {
+        let dir = std::env::temp_dir().join("headroom-https-guard-test");
+        let dest = dir.join("tool");
+        for url in [
+            "http://example.com/tool.tar.gz",
+            "ftp://example.com/tool.tar.gz",
+        ] {
+            let err = download(url, &dest).expect_err("must refuse plaintext");
+            assert!(
+                err.to_string().contains("non-https"),
+                "wrong error for {url}: {err}"
+            );
+        }
+        assert!(
+            !dest.exists(),
+            "nothing should have been written for a refused URL"
+        );
     }
 }
