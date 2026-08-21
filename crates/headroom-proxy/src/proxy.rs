@@ -1249,11 +1249,59 @@ pub fn build_app(state: AppState) -> Router {
         router = router.nest("/ctx", crate::ctx::endpoints::router());
     }
 
+    // WEB-02: drop a caller-supplied memory identity unless the caller is on
+    // loopback. Applied before the counter so it wraps every route, and done
+    // here rather than at each reader so a new reader cannot miss it.
+    router = router.layer(axum::middleware::from_fn(strip_untrusted_identity));
+
     // Count every inbound request, including ones that fall through to the
     // catch-all. Applied last so it wraps the whole router.
     router = router.layer(axum::middleware::from_fn(track_inbound_request));
 
     router.fallback(any(catch_all)).with_state(state)
+}
+
+/// Whether a caller at `client_ip` may choose its own memory partition.
+///
+/// `None` means the peer address is unknown, which is not evidence of loopback,
+/// so it fails closed — unlike [`crate::loopback_guard::is_loopback_host`],
+/// which treats `None` as local for the benefit of test clients.
+fn identity_header_is_trusted(client_ip: Option<&str>) -> bool {
+    client_ip.is_some_and(|ip| crate::loopback_guard::is_loopback_host(Some(ip)))
+}
+
+/// Remove `x-headroom-user-id` unless the caller is on loopback.
+///
+/// The header picks the memory partition, and a caller cannot prove its own
+/// authority to select one, so honoring it from a remote caller lets anyone
+/// read or write another user's memories. Mirrors Python's
+/// `resolve_memory_identity`, which trusts the header only from loopback.
+/// Remote callers fall back to the reader's own default partition.
+///
+/// Missing peer metadata is not evidence of loopback, so it fails closed —
+/// unlike [`crate::loopback_guard::is_loopback_host`], which treats `None` as
+/// local for the benefit of test clients.
+async fn strip_untrusted_identity(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    const USER_ID_HEADER: &str = "x-headroom-user-id";
+    if req.headers().contains_key(USER_ID_HEADER) {
+        let client_ip = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string());
+        if !identity_header_is_trusted(client_ip.as_deref()) {
+            req.headers_mut().remove(USER_ID_HEADER);
+            tracing::warn!(
+                event = "identity_header_stripped",
+                header = USER_ID_HEADER,
+                client_ip = client_ip.as_deref().unwrap_or("unknown"),
+                "ignoring x-headroom-user-id from a non-loopback caller"
+            );
+        }
+    }
+    next.run(req).await
 }
 
 /// Count an inbound request for the lifetime of its handler.
@@ -10364,3 +10412,34 @@ mod timing_field_tests {
     }
 }
 
+#[cfg(test)]
+mod identity_trust_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_callers_may_choose_their_partition() {
+        for ip in ["127.0.0.1", "::1", "127.0.0.53", "localhost"] {
+            assert!(
+                identity_header_is_trusted(Some(ip)),
+                "{ip} should be trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_callers_may_not() {
+        for ip in ["10.0.0.5", "192.168.1.20", "8.8.8.8", "2606:4700::1111"] {
+            assert!(
+                !identity_header_is_trusted(Some(ip)),
+                "{ip} must not be trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_peer_fails_closed() {
+        // The loopback guard treats None as local; partition selection must not.
+        assert!(crate::loopback_guard::is_loopback_host(None));
+        assert!(!identity_header_is_trusted(None));
+    }
+}
