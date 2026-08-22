@@ -45,7 +45,7 @@ impl MemoryRanker for RecencyBoostRanker {
             return vec![];
         }
 
-        let now = now_secs();
+        let now = day_start_secs(now_secs());
         let mut boosted: Vec<(usize, MemoryCandidate, f64)> = candidates
             .iter()
             .enumerate()
@@ -86,6 +86,15 @@ impl RecencyBoostRanker {
             }
         }
     }
+}
+
+/// `secs` rounded down to the start of its UTC day.
+///
+/// A memory created earlier today then reads as future-dated and takes the
+/// neutral 1.0 factor — which is also the maximum, so the newest memories
+/// still rank highest.
+fn day_start_secs(secs: f64) -> f64 {
+    (secs / 86_400.0).floor() * 86_400.0
 }
 
 /// Current time as seconds since UNIX epoch.
@@ -175,6 +184,30 @@ mod tests {
         let factor_30 = ranker.recency_factor(now, Some(now - 86400.0 * 30.0));
         assert!((factor_0 - 1.0).abs() < 0.001);
         assert!((factor_30 - 0.368).abs() < 0.01);
+    }
+
+    #[test]
+    fn ranking_is_stable_across_calls_within_a_day() {
+        // Injected memory text has to be byte-identical between two rankings
+        // of the same candidates, or a re-injection rewrites a cached prefix.
+        let ranker = RecencyBoostRanker::default();
+        let now = now_secs();
+        let candidates = vec![
+            candidate(0.50, Some(now - 86400.0 * 10.0)),
+            candidate(0.51, Some(now - 86400.0 * 10.5)),
+            candidate(0.49, Some(now - 86400.0 * 3.0)),
+        ];
+        let first = ranker.rank(&candidates);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = ranker.rank(&candidates);
+        let scores = |r: &[MemoryCandidate]| r.iter().map(|c| c.score.to_bits()).collect::<Vec<_>>();
+        assert_eq!(scores(&first), scores(&second));
+    }
+
+    #[test]
+    fn day_start_is_a_multiple_of_a_day() {
+        assert_eq!(day_start_secs(86_400.0 * 3.0 + 12_345.0), 86_400.0 * 3.0);
+        assert_eq!(day_start_secs(86_400.0 * 3.0), 86_400.0 * 3.0);
     }
 
     #[test]

@@ -131,6 +131,26 @@ pub async fn background_dedup(
 /// unchanged.
 ///
 /// Mirrors `MemoryHandler._append_to_latest_user_tail`.
+/// Opening line of every injected memory block, in all four scope wordings
+/// (`memory/handler.rs:1461-1474`). Used as the sentinel rather than a new
+/// marker of its own: adding one would change the injected bytes and recache
+/// every conversation already carrying a block.
+const MEMORY_BLOCK_MARKER: &str = "## Relevant Memories";
+
+/// Whether a message already carries an injected memory block, in either
+/// content shape.
+fn contains_memory_block(message: &Value) -> bool {
+    match message.get("content") {
+        Some(Value::String(s)) => s.contains(MEMORY_BLOCK_MARKER),
+        Some(Value::Array(blocks)) => blocks.iter().any(|b| {
+            b.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.contains(MEMORY_BLOCK_MARKER))
+        }),
+        _ => false,
+    }
+}
+
 pub fn append_to_latest_user_tail(
     messages: &mut Vec<Value>,
     context_text: &str,
@@ -138,6 +158,22 @@ pub fn append_to_latest_user_tail(
     frozen_message_count: usize,
 ) -> usize {
     if messages.is_empty() || context_text.is_empty() {
+        return 0;
+    }
+
+    // Refuse to inject twice into the same message. Both providers append to
+    // the latest user message, so that one message is the whole question —
+    // scanning the array would find the blocks earlier turns legitimately
+    // carry and suppress every injection after the first.
+    //
+    // Nothing reaches here twice today: CCR and memory continuations POST
+    // their own body and never re-enter the interception path. This is what
+    // makes routing them back through it safe, and it costs one scan.
+    if messages
+        .iter()
+        .rfind(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
+        .is_some_and(contains_memory_block)
+    {
         return 0;
     }
 
@@ -272,6 +308,39 @@ mod tests {
         let mut msgs = vec![json!({"role": "user", "content": "hello"})];
         let n = append_to_latest_user_tail(&mut msgs, "", "anthropic", 0);
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn tail_refuses_to_inject_twice_into_the_same_message() {
+        let block = "## Relevant Memories for This User\n- something";
+        for content in [
+            json!(format!("hello\n\n{block}")),
+            json!([{"type": "text", "text": "hello"},
+                   {"type": "text", "text": block}]),
+        ] {
+            let mut msgs = vec![json!({"role": "user", "content": content})];
+            let before = msgs.clone();
+            for provider in ["anthropic", "openai"] {
+                assert_eq!(
+                    append_to_latest_user_tail(&mut msgs, block, provider, 0),
+                    0
+                );
+            }
+            assert_eq!(msgs, before, "a refused injection must not touch the body");
+        }
+    }
+
+    #[test]
+    fn tail_still_injects_when_an_earlier_turn_carries_a_block() {
+        // Every turn after the first has old blocks behind it. Suppressing on
+        // those would turn injection into a once-per-conversation event.
+        let mut msgs = vec![
+            json!({"role": "user", "content": "old\n\n## Relevant Memories for This User\n- a"}),
+            json!({"role": "assistant", "content": "ok"}),
+            json!({"role": "user", "content": "new"}),
+        ];
+        let n = append_to_latest_user_tail(&mut msgs, "## Relevant Memories (scope: global)", "anthropic", 0);
+        assert!(n > 0);
     }
 
     #[test]
