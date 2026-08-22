@@ -102,7 +102,7 @@ pub(crate) struct CcrStreamContext {
     /// The request as forwarded upstream, in that upstream's own shape.
     /// `stream` is forced off on the copy used for continuations so those
     /// rounds come back as plain JSON.
-    pub original_request: Bytes,
+    pub forwarded_request: Bytes,
     pub ccr_store: Arc<dyn headroom_core::ccr::CcrStore>,
     pub config: Arc<crate::config::Config>,
     pub request_id: String,
@@ -917,16 +917,16 @@ async fn resolve_retrieval(
 
     // Continuation rounds must come back as JSON — this code synthesises the
     // client's stream itself and has no use for a second SSE body to splice.
-    let continuation_request = match serde_json::from_slice::<Value>(&ctx.original_request) {
+    let continuation_request = match serde_json::from_slice::<Value>(&ctx.forwarded_request) {
         Ok(mut v) => {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("stream".into(), json!(false));
             }
             serde_json::to_vec(&v)
                 .map(Bytes::from)
-                .unwrap_or_else(|_| ctx.original_request.clone())
+                .unwrap_or_else(|_| ctx.forwarded_request.clone())
         }
-        Err(_) => ctx.original_request.clone(),
+        Err(_) => ctx.forwarded_request.clone(),
     };
 
     let (resolved_bytes, mut usage) = crate::proxy::handle_ccr_response(

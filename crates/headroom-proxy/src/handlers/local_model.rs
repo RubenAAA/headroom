@@ -3052,7 +3052,7 @@ async fn handle_streaming_response(
                     }
                 },
                 outgoing_headers: ccr.headers,
-                original_request: ccr.request_body,
+                forwarded_request: ccr.request_body,
                 ccr_store: ccr.store,
                 config: ccr.config,
                 request_id: ccr.request_id,

@@ -2585,6 +2585,19 @@ pub(crate) async fn forward_http(
     // Only the intercepting branch has one; the passthrough branch consumes the
     // client's stream and cannot be re-sent.
     let mut retry_body: Option<bytes::Bytes> = None;
+
+    // The same bytes again, kept for the CCR and memory continuation rounds.
+    // A separate binding because `retry_body` is moved by the stream-retry
+    // filter below, and because the two want it for opposite reasons: the
+    // retry resends it unchanged, the continuation appends to it.
+    //
+    // Continuations used to start from `original_buffered`, the raw client
+    // request. That threw away every transform — injected tools, offloaded
+    // content, routed model — so each continuation round presented the
+    // provider with a prefix it had never cached. `None` on the passthrough
+    // branch, which never builds a forwarded body; callers fall back to the
+    // original there, which is what it was.
+    let mut forwarded_body: Option<bytes::Bytes> = None;
     let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
         let max = state.config.compression_max_body_bytes as usize;
@@ -4208,6 +4221,7 @@ pub(crate) async fn forward_http(
         }
 
         retry_body = Some(body_to_send.clone());
+        forwarded_body = retry_body.clone();
 
         // Forward the request with retry on transient errors (429, 529, 5xx).
         let max_attempts = if state.config.retry_enabled {
@@ -4620,6 +4634,11 @@ pub(crate) async fn forward_http(
     } else {
         Box::pin(upstream_body)
     };
+    // What every continuation round below appends to: the bytes the provider
+    // saw and cached, falling back to the client's own body on the passthrough
+    // branch, which forwards nothing of its own.
+    let continuation_base = forwarded_body.clone().unwrap_or_else(|| original_buffered.clone());
+
     let (upstream_body, ccr_round_usage): (
         std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
         Option<Arc<Mutex<CcrRoundUsage>>>,
@@ -4628,7 +4647,7 @@ pub(crate) async fn forward_http(
             client: state.client.clone(),
             upstream_url: upstream_url.clone(),
             outgoing_headers: outgoing_headers.clone(),
-            original_request: original_buffered.clone(),
+            forwarded_request: continuation_base.clone(),
             ccr_store: state
                 .ctx_offload
                 .as_ref()
@@ -4853,7 +4872,7 @@ pub(crate) async fn forward_http(
                         let ccr_store = state.ctx_offload.as_ref().unwrap().store.ccr();
                         let (resolved, extra) = handle_ccr_response(
                             &body_bytes,
-                            &original_buffered,
+                            &continuation_base,
                             &upstream_url,
                             &state.client,
                             ccr_store.as_ref(),
@@ -4891,7 +4910,7 @@ pub(crate) async fn forward_http(
                     if let Some(provider) = memory_provider {
                         let (resolved, extra) = handle_memory_response(
                             &body_bytes,
-                            &original_buffered,
+                            &continuation_base,
                             &upstream_url,
                             &state.client,
                             &memory,
@@ -7650,11 +7669,6 @@ async fn apply_response_hooks(
 /// Returns the final response body bytes. Only operates on non-streaming,
 /// Anthropic-shaped responses for now (the primary CCR path).
 ///
-/// NOTE: The compression pipeline is NOT re-applied to continuation
-/// requests. The original request was already compressed before being
-/// sent upstream; continuation requests append tool results to the
-/// already-compressed message array. Re-compressing would be wasteful
-/// and could break cache keys.
 /// Move the message breakpoint onto the tail of a continuation body.
 ///
 /// The first round's marker sits on what was then the last block. Each round
@@ -7723,9 +7737,19 @@ fn extend_or_push(
     items.push(entry);
 }
 
+/// The compression pipeline is not re-applied to continuation requests, and
+/// must not be: `forwarded_request` is the body that already went upstream,
+/// transforms and all, so each round only appends the assistant turn and its
+/// tool results to a prefix the provider has already cached.
+///
+/// It has to be the forwarded body for that to hold. Passing the client's raw
+/// request instead — which this did until 2026-08-22 — drops every injected
+/// tool, every offloaded block and any routed model, so the continuation
+/// presents a prefix the provider never saw and every round after a
+/// transformed turn misses cache.
 pub(crate) async fn handle_ccr_response(
     body_bytes: &bytes::Bytes,
-    original_request: &bytes::Bytes,
+    forwarded_request: &bytes::Bytes,
     upstream_url: &url::Url,
     client: &reqwest::Client,
     ccr_store: &dyn headroom_core::ccr::CcrStore,
@@ -7774,7 +7798,7 @@ pub(crate) async fn handle_ccr_response(
     }
 
     let mut current_response = response.clone();
-    let mut current_request: serde_json::Value = match serde_json::from_slice(original_request) {
+    let mut current_request: serde_json::Value = match serde_json::from_slice(forwarded_request) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -8268,7 +8292,7 @@ pub(crate) struct MemoryToolContext {
 /// left alone, because we cannot fabricate the client's half.
 pub(crate) async fn handle_memory_response(
     body_bytes: &bytes::Bytes,
-    original_request: &bytes::Bytes,
+    forwarded_request: &bytes::Bytes,
     upstream_url: &url::Url,
     client: &reqwest::Client,
     memory: &MemoryToolContext,
@@ -8296,7 +8320,7 @@ pub(crate) async fn handle_memory_response(
         }
     }
 
-    let Ok(mut current_request) = serde_json::from_slice::<serde_json::Value>(original_request)
+    let Ok(mut current_request) = serde_json::from_slice::<serde_json::Value>(forwarded_request)
     else {
         tracing::warn!(
             request_id = %request_id,
@@ -8638,8 +8662,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Original request (Responses shape uses `input[]`).
-        let original_request = bytes::Bytes::from(
+        // The forwarded request (Responses shape uses `input[]`).
+        let forwarded_request = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "model": "gpt-x",
                 "input": [{"type": "message", "role": "user", "content": "hi"}]
@@ -8673,7 +8697,7 @@ mod tests {
 
         let out = handle_ccr_response(
             &upstream_reply,
-            &original_request,
+            &forwarded_request,
             &upstream_url,
             &client,
             &store as &dyn headroom_core::ccr::CcrStore,
