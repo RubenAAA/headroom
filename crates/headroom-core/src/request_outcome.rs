@@ -757,6 +757,38 @@ mod tests {
         }
     }
 
+    /// Make every callsite in this binary emit, whichever test reaches it
+    /// first.
+    ///
+    /// `tracing` settles a callsite's `Interest` the first time that call site
+    /// fires and caches it for the life of the process. Several tests here
+    /// reach the `request_failed_accounting` callsite with no subscriber
+    /// installed, and the no-op subscriber answers `Interest::never` — after
+    /// which the macro short-circuits before building the event and no
+    /// subscriber ever sees it again. That is a race on test order, and it
+    /// cost roughly 4% of runs.
+    ///
+    /// `with_default` cannot prevent it: it sets a thread-local dispatcher
+    /// that the global rebuild path never walks. Rebuilding the cache is not
+    /// enough either — another thread can re-register the callsite against no
+    /// subscriber in the gap before the event fires, which is why that fix
+    /// left the failure rate unchanged.
+    ///
+    /// Registering a permissive global dispatcher does hold. Every later
+    /// registration answers against it rather than the no-op subscriber, so
+    /// the callsite cannot be poisoned again; the rebuild then clears any
+    /// poisoning from before this ran. Events still reach whatever
+    /// `with_default` subscriber a test installs on its own thread.
+    fn permit_every_callsite() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Fails only if something else already claimed the global slot,
+            // which is just as good for our purpose.
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
     /// Item 6: a failed turn must leave a trace naming what it cost. Skipping
     /// the success funnel is correct; skipping it *silently* is what made the
     /// savings figures improve as behaviour got worse.
@@ -794,6 +826,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
         let lines = Arc::new(Mutex::new(Vec::new()));
         let sub = tracing_subscriber::registry().with(Sink(lines.clone()));
+        permit_every_callsite();
         tracing::subscriber::with_default(sub, || {
             emit_request_outcome(
                 &RecordingSink::default(),

@@ -330,4 +330,37 @@ mod tests {
         assert_eq!(store.get_at(&hash, 111), None);
         assert_eq!(store.len(), 0, "expired row must be purged");
     }
+
+    /// The ceiling's whole point: a row that keeps being read still dies on
+    /// time. Each `get_at` below restarts the idle clock, so idleness can
+    /// never be what ends it — only `created_at + max_lifetime` can.
+    ///
+    /// This used to live in `tests/ccr_backends.rs` as real sleeps against a
+    /// 3s ceiling. It read the wall clock, and on WSL2 `CLOCK_REALTIME` steps
+    /// backwards by 100-150ms under load, which was enough to carry a row
+    /// past a boundary it should have failed. Injecting `now` asserts the
+    /// same property and cannot drift.
+    #[test]
+    fn touches_cannot_carry_a_row_past_its_max_lifetime() {
+        // Idle window 5s, ceiling 10s, created and last read at 100.
+        let (_dir, store, hash) = store_with_row(5, 10, 100, 100);
+
+        // Read every 4s: always inside the idle window, so the row survives
+        // each time and its idle clock is pushed forward to `now`.
+        for now in [104, 108] {
+            assert_eq!(
+                store.get_at(&hash, now).as_deref(),
+                Some("payload"),
+                "a read inside the idle window must hit at t={now}"
+            );
+        }
+
+        // Idleness alone would keep it alive to 113. The ceiling ends it at 111.
+        assert_eq!(
+            store.get_at(&hash, 111),
+            None,
+            "constant access must not extend an entry past its max lifetime"
+        );
+        assert_eq!(store.len(), 0, "expired row must be purged");
+    }
 }
