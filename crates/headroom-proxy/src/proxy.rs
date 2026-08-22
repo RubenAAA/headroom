@@ -7655,6 +7655,39 @@ async fn apply_response_hooks(
 /// sent upstream; continuation requests append tool results to the
 /// already-compressed message array. Re-compressing would be wasteful
 /// and could break cache keys.
+/// Move the message breakpoint onto the tail of a continuation body.
+///
+/// The first round's marker sits on what was then the last block. Each round
+/// appends an assistant turn and its tool results behind it, so without this
+/// the marker drifts backwards through the request and everything after it is
+/// written fresh on the round that follows.
+///
+/// `push_marker_to_tail` relocates the existing marker object rather than
+/// adding one, so calling it every round cannot breach Anthropic's cap of four
+/// and carries whatever TTL the pin gave it. It returns false when the marker
+/// is already at the tail, which is the common case on the first round.
+///
+/// Anthropic only: no other shape here has `cache_control`.
+fn retail_continuation_breakpoint(
+    request: &mut serde_json::Value,
+    provider: &str,
+    config: &Config,
+    request_id: &str,
+    round: usize,
+) {
+    if provider != "anthropic" || !config.cache_tail_breakpoint {
+        return;
+    }
+    if cache_stabilization::message_breakpoints::push_marker_to_tail(request) {
+        tracing::debug!(
+            request_id = %request_id,
+            event = "continuation_tail_breakpoint",
+            round = round,
+            "moved the message breakpoint onto the continuation tail"
+        );
+    }
+}
+
 /// Map a continuation handler's provider label onto the drift detector's
 /// shape enum. `None` for a label neither knows, which skips the check
 /// rather than hashing a body under the wrong shape rules.
@@ -7897,6 +7930,14 @@ pub(crate) async fn handle_ccr_response(
             );
             break;
         }
+
+        retail_continuation_breakpoint(
+            &mut current_request,
+            provider,
+            config,
+            request_id,
+            rounds + 1,
+        );
 
         // Re-send to upstream.
         let continuation_body = match serde_json::to_vec(&current_request) {
@@ -8348,6 +8389,14 @@ pub(crate) async fn handle_memory_response(
             items,
             tool_result_msg,
             &["_memory_tool_results", "_openai_responses_tool_results"],
+        );
+
+        retail_continuation_breakpoint(
+            &mut current_request,
+            provider,
+            config,
+            request_id,
+            rounds + 1,
         );
 
         let Ok(continuation_body) = serde_json::to_vec(&current_request) else {

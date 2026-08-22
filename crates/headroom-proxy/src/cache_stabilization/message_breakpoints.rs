@@ -111,6 +111,24 @@ mod tests {
         assert_eq!(marked_indices(&body), vec![19]);
     }
 
+    /// A CCR chain appends behind the marker every round. Called per round it
+    /// keeps up, and the count stays at one however many rounds run — which is
+    /// what keeps this inside Anthropic's cap of four markers.
+    #[test]
+    fn the_marker_follows_the_tail_across_continuation_rounds() {
+        let mut body = body_marked_at(4, 3);
+        for round in 0..5 {
+            let items = body["messages"].as_array_mut().unwrap();
+            items.push(json!({"role": "assistant", "content": [
+                {"type": "text", "text": format!("turn{round}")}]}));
+            items.push(json!({"role": "user", "content": [
+                {"type": "text", "text": format!("result{round}")}]}));
+            assert!(push_marker_to_tail(&mut body), "round {round} had work to do");
+            let last = body["messages"].as_array().unwrap().len() - 1;
+            assert_eq!(marked_indices(&body), vec![last]);
+        }
+    }
+
     /// The common case, and the reason this is cheap: 97% of captured requests
     /// already have the marker where it belongs.
     #[test]
