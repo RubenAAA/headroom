@@ -624,6 +624,40 @@ fn hex_prefix(bytes: &[u8], take: usize) -> String {
 /// Comma-joined list of which dimensions drifted between `prev` and
 /// `curr`. The order is fixed (`system`, `tools`, `early_messages`)
 /// so log queries can match deterministically.
+/// Warn if a continuation round disturbed the hot zone it inherited.
+///
+/// Continuation rounds POST straight to the upstream and never pass the
+/// forwarding path, so `observe_outbound_drift` cannot see them. They do not
+/// need it: a continuation only appends, so the answer is not "did this drift
+/// from the previous turn" but "did this round leave the prefix it started
+/// from alone". That is a comparison against `base`, and it needs no session
+/// key and no LRU.
+///
+/// Silent on the good path. A line here means continuation rounds are paying
+/// full input price for a prefix the provider had already cached.
+pub fn check_continuation_prefix(
+    base: &StructuralHash,
+    continuation: &serde_json::Value,
+    kind: ApiKind,
+    request_id: &str,
+    round: usize,
+) {
+    let current = compute_structural_hash(continuation, kind);
+    let dims = drift_dims(base, &current);
+    if !dims.is_empty() {
+        tracing::warn!(
+            event = "continuation_prefix_moved",
+            request_id = %request_id,
+            round = round,
+            drift_dims = %dims,
+            base_hash_prefix = %structural_hash_log_prefix(base),
+            current_hash_prefix = %structural_hash_log_prefix(&current),
+            "continuation round changed the cache hot zone it inherited; \
+             this round cannot hit the prefix the first round cached"
+        );
+    }
+}
+
 fn drift_dims(prev: &StructuralHash, curr: &StructuralHash) -> String {
     let mut dims: Vec<&'static str> = Vec::with_capacity(3);
     if prev.system != curr.system {

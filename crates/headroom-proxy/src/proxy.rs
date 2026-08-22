@@ -7655,6 +7655,18 @@ async fn apply_response_hooks(
 /// sent upstream; continuation requests append tool results to the
 /// already-compressed message array. Re-compressing would be wasteful
 /// and could break cache keys.
+/// Map a continuation handler's provider label onto the drift detector's
+/// shape enum. `None` for a label neither knows, which skips the check
+/// rather than hashing a body under the wrong shape rules.
+fn continuation_api_kind(provider: &str) -> Option<ApiKind> {
+    match provider {
+        "anthropic" => Some(ApiKind::Anthropic),
+        "openai" => Some(ApiKind::OpenAiChat),
+        "openai_responses" => Some(ApiKind::OpenAiResponses),
+        _ => None,
+    }
+}
+
 /// Append a CCR continuation entry to the running item array.
 ///
 /// Most provider shapes return a single message dict, which is pushed as-is.
@@ -7740,6 +7752,12 @@ pub(crate) async fn handle_ccr_response(
             return (body_bytes.clone(), round_usage);
         }
     };
+
+    // The hot zone as the provider cached it on the first round. Every
+    // continuation is checked against this, since none of them reach the
+    // forwarding path where outbound drift is observed.
+    let base_kind = continuation_api_kind(provider);
+    let base_hash = base_kind.map(|kind| compute_structural_hash(&current_request, kind));
 
     // Which offloaded Reads the conversation has already invalidated. Computed
     // once from the request as it arrived: continuation rounds only append tool
@@ -7900,6 +7918,16 @@ pub(crate) async fn handle_ccr_response(
             results_count = results.len(),
             "ccr: sending continuation request"
         );
+
+        if let (Some(base), Some(kind)) = (base_hash.as_ref(), base_kind) {
+            cache_stabilization::drift_detector::check_continuation_prefix(
+                base,
+                &current_request,
+                kind,
+                request_id,
+                rounds + 1,
+            );
+        }
 
         // A continuation that fails is not a soft outcome: the retrieval is
         // already parsed and the content already fetched, and giving up here
@@ -8236,6 +8264,12 @@ pub(crate) async fn handle_memory_response(
         return (body_bytes.clone(), round_usage);
     };
 
+    // As in `handle_ccr_response`: continuations bypass the forwarding path,
+    // so the only place their prefix can be checked is here, against the body
+    // the first round already had cached.
+    let base_kind = continuation_api_kind(provider);
+    let base_hash = base_kind.map(|kind| compute_structural_hash(&current_request, kind));
+
     // A client tool call sharing the turn makes a continuation impossible: it
     // would send upstream an assistant turn whose client `tool_use` has no
     // `tool_result` — the client has not run it yet — and upstream rejects the
@@ -8325,6 +8359,15 @@ pub(crate) async fn handle_memory_response(
             results_count = results.len(),
             "memory: sending continuation request"
         );
+        if let (Some(base), Some(kind)) = (base_hash.as_ref(), base_kind) {
+            cache_stabilization::drift_detector::check_continuation_prefix(
+                base,
+                &current_request,
+                kind,
+                request_id,
+                rounds + 1,
+            );
+        }
         // A failed continuation takes the memory call down with it: the block
         // is already suppressed, so the tool the model asked for never runs and
         // the turn reaches the client short one tool call. Transport blips and
