@@ -154,3 +154,112 @@ Transient capacity errors from upstream, not proxy bugs. Request IDs: `d656d8fc`
 - P3-35 in `REALIGNMENT/01-bug-list.md` — No cache-bust drift detector telemetry
 - P3-35a (added 2026-07-08) — Drift detector blind spot: `drift_dims=null` recache events (likely false alarms from subagent closing)
 - **`/clear` command false alarm:** User-triggered `/clear` resets conversation context, causing recache warning with "unknown cause" — should be info level with explanation
+
+---
+
+# Hypothesis ledger — 2026-08-22
+
+The July analysis above named three causes without measuring how much each
+accounts for. This section is a running ledger instead: one entry per
+hypothesis, each carrying its status and the evidence that put it there. A
+refuted entry stays in the file. The point is that nobody tests it twice.
+
+**Measurement window.** Proxy PID 56134, started 13:21 local on 2026-08-22
+(09:21 UTC — the log timestamps in UTC and the process start prints local,
+which is worth knowing before writing any filter over it). 502 requests, 27
+recache events, two conversations involved. `restart-headroom.sh` does not
+roll `~/headroom-proxy.log`, so anything read from that file without a
+timestamp filter mixes in older builds.
+
+**The whole loss, this window: 14,207 tokens across 20 turns.** Small. Worth
+sizing before anyone spends a week on it.
+
+| Attribution | Events |
+|---|---|
+| `unexplained_after_replay` | 20 |
+| `prefix_content_diverged` | 4 |
+| `aftershock_of_diverged_prefix` | 2 |
+| `early_messages` | 1 |
+
+## H1 — The proxy moves the cache hot zone. REFUTED
+
+The reason `outbound_drift_state` and `observe_outbound_drift` were built:
+the inbound hash is taken before any stage runs, so proxy-caused movement in
+`system`, `tools` or the first three messages could not appear in
+`drift_dims`.
+
+It is not happening. Across 502 requests the outbound detector logged 8
+first-request events and 2 drift events, and both drift events paired 1:1
+with an inbound drift on the same session about 60ms earlier — the client
+moved, and we carried it. The `origin: "proxy"` branch has never fired.
+
+The instrument works; the answer is no. Keep it — it is what lets the next
+person skip this hypothesis in one query.
+
+## H2 — Volatile content (UUIDs, timestamps) deep in history. REFUTED as the main cause
+
+The July table blamed "UUIDs, timestamps in messages[3+]" for 20+ unknown
+events. Measured: 3 of 27 recached turns carried any volatile finding, against
+a base rate of 15/502 (3%) across all requests. Enriched roughly fourfold, so
+the effect is real, but it is six findings and cannot account for twenty
+events.
+
+Locations on recached turns ran `messages[16]` to `messages[107]` — all past
+the hot zone, so widening the drift hash to cover them would explain three
+events and no more.
+
+## H3 — Subagent close or `/clear` resets the conversation. REFUTED for these events
+
+The July hypothesis. It does not fit this window. All 20 events land
+mid-conversation with message counts growing monotonically (3, 15, 19, 40,
+48, 59, 67, 73, 81, 91, 97, 111, 113, 121, 123) and an active prefix-replay
+chain reaching `chain_id` 25. A context reset would restart that chain, not
+deepen it.
+
+It may still explain events in other windows. It does not explain these.
+
+## H4 — Something writes a cache block that is never read. OPEN, and the strongest lead
+
+`classify_turn` (`usage_observer.rs:385-404`) computes
+`wasted = min(prev.read + prev.write − read, write)`.
+
+In 18 of 20 events `wasted_tokens` equals a `cache_creation` figure exactly:
+
+- **6 events** match the *previous* turn's write (243, 239, 240, 239, 209,
+  248). Exact equality here means `cache_read` came back precisely equal to
+  the previous turn's read — the block written last turn was not read this
+  turn, at all. That is a block paid for and never used.
+- **12 events** equal *this* turn's write, which is the clamp in the formula
+  binding, so they only tell us the shortfall was at least that large.
+
+The six exact matches are the sharp signal, and the repeated ~240-token
+figure suggests one fixed block rather than a drifting prefix.
+
+## Measured and uniform, so not discriminating
+
+Prefix replay's stable window ends exactly one message short of the end
+(`total − stable == 1`) on all 20 events. That is by design — the newest
+message is new — and it holds on clean turns too, so it separates nothing on
+its own. Recorded here so it is not mistaken for a finding.
+
+Unexplained turns are *shorter* conversations than average (median 67
+messages against 308) with higher output (691 tokens against 273). Neither
+has an explanation yet.
+
+## Open, untested
+
+- **H5 — proxy injection into the latest user message breaks the next turn's
+  prefix.** We mutate the newest message; the client resends it unmutated
+  next turn. Prefix replay exists to paper over exactly this, and these
+  events are all `unexplained_*after_replay*`, so if it is the cause then
+  replay is not restoring what it should. Needs captured request bodies to
+  test; log fields cannot settle it.
+- **H6 — the second tail breakpoint writes a block nothing reads.** The proxy
+  runs `--cache-tail-breakpoints 2`. A marker at the very tail creates a block
+  holding the newest content, and if the next turn cannot reuse it the cost
+  repeats every turn. Fits the constant ~240-token figure. Also needs
+  captured bodies.
+
+`HEADROOM_CAPTURE_DIR` is unset on the running proxy, so no request bodies
+exist for this window. Testing H5 or H6 means enabling capture and waiting
+for a recurrence.
