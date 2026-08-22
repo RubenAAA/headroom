@@ -469,6 +469,36 @@ pub fn observe_drift(
     session_key: &str,
     current: StructuralHash,
 ) -> Option<String> {
+    observe(state, session_key, current, Origin::Inbound)
+}
+
+/// The same comparison run over the body the proxy forwards, against its own
+/// `DriftState`.
+///
+/// Split out for the event names alone. Both readings happen on every request,
+/// and reusing `observe_drift` would double `cache_drift_observed` — every
+/// existing count of that name would silently become a count of two passes
+/// over different bodies. `_outbound` keeps the two greppable apart.
+pub fn observe_outbound_drift(
+    state: &DriftState,
+    session_key: &str,
+    current: StructuralHash,
+) -> Option<String> {
+    observe(state, session_key, current, Origin::Outbound)
+}
+
+#[derive(Clone, Copy)]
+enum Origin {
+    Inbound,
+    Outbound,
+}
+
+fn observe(
+    state: &DriftState,
+    session_key: &str,
+    current: StructuralHash,
+    origin: Origin,
+) -> Option<String> {
     let session_prefix = session_key_log_prefix(session_key);
     let mut cache = match state.cache.lock() {
         Ok(c) => c,
@@ -486,12 +516,20 @@ pub fn observe_drift(
     };
     match cache.get(session_key).copied() {
         None => {
-            tracing::info!(
-                event = "cache_drift_first_request",
-                session_key_hash = %session_prefix,
-                current_hash_prefix = %structural_hash_log_prefix(&current),
-                "cache_drift detector observed a new session"
-            );
+            match origin {
+                Origin::Inbound => tracing::info!(
+                    event = "cache_drift_first_request",
+                    session_key_hash = %session_prefix,
+                    current_hash_prefix = %structural_hash_log_prefix(&current),
+                    "cache_drift detector observed a new session"
+                ),
+                Origin::Outbound => tracing::info!(
+                    event = "cache_drift_first_request_outbound",
+                    session_key_hash = %session_prefix,
+                    current_hash_prefix = %structural_hash_log_prefix(&current),
+                    "cache_drift detector observed a new session on the forwarded body"
+                ),
+            }
             cache.put(session_key.to_string(), current);
             None
         }
@@ -503,17 +541,32 @@ pub fn observe_drift(
                 cache.put(session_key.to_string(), current);
                 None
             } else {
-                tracing::warn!(
-                    event = "cache_drift_observed",
-                    session_key_hash = %session_prefix,
-                    drift_dims = %dims,
-                    // Empty unless the early window moved; the other two
-                    // axes are single values with nothing to break down.
-                    early_drift = %early_drift_detail(&previous, &current),
-                    previous_hash_prefix = %structural_hash_log_prefix(&previous),
-                    current_hash_prefix = %structural_hash_log_prefix(&current),
-                    "cache_drift detector observed structural change between turns of the same session"
-                );
+                match origin {
+                    Origin::Inbound => tracing::warn!(
+                        event = "cache_drift_observed",
+                        session_key_hash = %session_prefix,
+                        drift_dims = %dims,
+                        // Empty unless the early window moved; the other two
+                        // axes are single values with nothing to break down.
+                        early_drift = %early_drift_detail(&previous, &current),
+                        previous_hash_prefix = %structural_hash_log_prefix(&previous),
+                        current_hash_prefix = %structural_hash_log_prefix(&current),
+                        "cache_drift detector observed structural change between turns of the same session"
+                    ),
+                    // INFO, not WARN. The forwarded hot zone moving is expected
+                    // whenever the inbound one did; only the case where the
+                    // client held still is interesting, and the classifier —
+                    // not the log reader — is what separates those.
+                    Origin::Outbound => tracing::info!(
+                        event = "cache_drift_observed_outbound",
+                        session_key_hash = %session_prefix,
+                        drift_dims = %dims,
+                        early_drift = %early_drift_detail(&previous, &current),
+                        previous_hash_prefix = %structural_hash_log_prefix(&previous),
+                        current_hash_prefix = %structural_hash_log_prefix(&current),
+                        "cache_drift detector observed structural change in the body the proxy forwarded"
+                    ),
+                }
                 cache.put(session_key.to_string(), current);
                 Some(dims)
             }

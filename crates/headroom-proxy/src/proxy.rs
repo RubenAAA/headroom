@@ -69,6 +69,15 @@ pub struct AppState {
     /// request body — so this can be cloned freely into every handler
     /// path that buffers the body.
     pub drift_state: DriftState,
+    /// The same detector, run over the body the proxy actually forwards.
+    ///
+    /// `drift_state` is fed the inbound body, before any stage has touched
+    /// it, so proxy-caused movement in the hot zone cannot appear there —
+    /// which left every recache we caused ourselves in the classifier's
+    /// `unexplained_after_replay` bucket. Comparing the two answers "did we
+    /// do this?" directly. Separate LRU, because the two hash sequences are
+    /// different and sharing one would make each overwrite the other.
+    pub outbound_drift_state: DriftState,
     /// B2: per-session record of the tool order last forwarded upstream,
     /// bounded to 1000 sessions. Read and written once per Anthropic
     /// request, after tools are final.
@@ -557,6 +566,7 @@ impl AppState {
             client,
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
+            outbound_drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             tool_order_state: cache_stabilization::tool_order::ToolOrderStore::default(),
             replay_store,
             working_dir_pins: cache_stabilization::working_dir::WorkingDirPins::new(
@@ -2706,6 +2716,10 @@ pub(crate) async fn forward_http(
         // inside the parse below so it shares that parse and is identical
         // to the drift detector's key by construction.
         let mut request_session_key = String::new();
+        // Kept so the outbound hash below is taken with the same shape rules
+        // as the inbound one. `None` means no session identity, and nothing
+        // downstream observes drift either way.
+        let mut request_api_kind: Option<ApiKind> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
             // PR-E5: volatile-content detector. Emits one WARN per
             // finding (capped at 10) for content that busts cache
@@ -2765,6 +2779,7 @@ pub(crate) async fn forward_http(
 
             if let Some((kind, session_key, conversation)) = session_identity {
                 request_session_key = session_key.clone();
+                request_api_kind = Some(kind);
                 let hash = compute_structural_hash(&parsed, kind);
                 let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
                 rebuild_boundary = drift_dims.is_some();
@@ -4166,6 +4181,30 @@ pub(crate) async fn forward_http(
                     .count_text(&String::from_utf8_lossy(&body_to_send))
                     as i64;
             }
+        }
+
+        // Second drift reading, on the bytes that leave. Every mutation stage
+        // has run by here, so a hot-zone change the client did not make is
+        // ours: memory injection, context injection, prefix replay, the
+        // breakpoint move. The classifier prefers the inbound dims when both
+        // moved, so this only ever speaks for a turn the client held still on.
+        //
+        // Costs one more parse of the outbound body. The pipeline above
+        // already parses and re-serializes it several times, so this is a
+        // small addition to a cost that is already paid.
+        if let Some(kind) = request_api_kind {
+            let outbound_dims = serde_json::from_slice::<serde_json::Value>(&body_to_send)
+                .ok()
+                .and_then(|sent| {
+                    cache_stabilization::drift_detector::observe_outbound_drift(
+                        &state.outbound_drift_state,
+                        &request_session_key,
+                        compute_structural_hash(&sent, kind),
+                    )
+                });
+            state
+                .usage_observer
+                .note_outbound_drift(&request_id, outbound_dims);
         }
 
         retry_body = Some(body_to_send.clone());

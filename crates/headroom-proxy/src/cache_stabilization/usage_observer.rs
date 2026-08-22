@@ -541,6 +541,10 @@ struct PendingRequest {
     /// PR-E6 drift dimensions observed on this request, when any —
     /// the "why" attached to a re-cache event.
     drift_dims: Option<String>,
+    /// The same dimensions measured on the body actually sent, after every
+    /// proxy stage has run. Set by `note_outbound_drift`; `None` on a turn
+    /// that never reached the forwarding path.
+    outbound_drift_dims: Option<String>,
     /// `(input, cache_read, cache_write)` actually billed across every round of
     /// this request, when the proxy ran more than one. The usage passed to
     /// [`UsageObserver::complete`] is deliberately the *client baseline* — the
@@ -567,6 +571,7 @@ struct RecacheAttribution<'a> {
 
 fn recache_attribution<'a>(
     drift_dims: Option<&'a str>,
+    outbound_drift_dims: Option<&'a str>,
     replay_skip: Option<ReplaySkipEvidence>,
     replay_applied: Option<ReplayAppliedEvidence>,
     previous_turn_diverged: bool,
@@ -585,6 +590,23 @@ fn recache_attribution<'a>(
             reason: Some(dims),
             origin: None,
             scope: None,
+            counts_as_waste: true,
+        };
+    }
+
+    // The client's hot zone held still and ours did not, so the mutation was
+    // ours. Checked after client drift, never before: when both moved, the
+    // client's edit is the cause and the proxy only carried it forward.
+    //
+    // This is the one attribution the classifier could not make. Everything
+    // the proxy does — tool injection, context injection, prefix replay, the
+    // breakpoint move — runs after the inbound hash is taken, so a recache it
+    // caused was indistinguishable from one nobody could explain.
+    if let Some(dims) = outbound_drift_dims.filter(|dims| !dims.is_empty()) {
+        return RecacheAttribution {
+            reason: Some(dims),
+            origin: Some("proxy"),
+            scope: Some("forwarded_hot_zone"),
             counts_as_waste: true,
         };
     }
@@ -863,6 +885,7 @@ impl UsageObserver {
                 conversation_key,
                 session_key_hash,
                 drift_dims,
+                outbound_drift_dims: None,
                 replay_skip: None,
                 replay_applied: None,
                 compression: None,
@@ -960,6 +983,24 @@ impl UsageObserver {
         let mut inner = self.lock();
         if let Some(pending) = inner.pending.get_mut(request_id) {
             pending.replay_applied = Some(evidence);
+        }
+    }
+
+    /// Record drift measured on the body the proxy is about to send.
+    ///
+    /// `begin_request` carries the drift the *client* caused, measured before
+    /// the proxy touches anything. That is the only drift the detector could
+    /// ever see, so every recache the proxy inflicted on itself landed in the
+    /// residual bucket — `unexplained_after_replay`, 85% of events, with the
+    /// classifier structurally unable to say whether it was to blame.
+    ///
+    /// Hashing the outbound body closes that: the same hot zone, the same
+    /// comparison, one turn later in the pipeline. Inbound quiet plus outbound
+    /// drift means the mutation was ours.
+    pub fn note_outbound_drift(&self, request_id: &str, dims: Option<String>) {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(request_id) {
+            pending.outbound_drift_dims = dims;
         }
     }
 
@@ -1234,6 +1275,7 @@ impl UsageObserver {
                 inner.recache_events_total += 1;
                 let attribution = recache_attribution(
                     pending.drift_dims.as_deref(),
+                    pending.outbound_drift_dims.as_deref(),
                     pending.replay_skip,
                     pending.replay_applied,
                     previous_turn_diverged,
@@ -1506,7 +1548,7 @@ mod tests {
 
     #[test]
     fn a_turn_after_a_divergence_names_the_previous_turn() {
-        let a = recache_attribution(None, None, Some(applied_evidence()), true);
+        let a = recache_attribution(None, None, None, Some(applied_evidence()), true);
         assert_eq!(a.reason, Some("aftershock_of_diverged_prefix"));
         assert_eq!(a.origin, Some("previous_turn"));
         assert!(a.counts_as_waste, "the rewrite is still real waste");
@@ -1514,9 +1556,42 @@ mod tests {
 
     #[test]
     fn without_a_previous_divergence_the_residual_stays_unexplained() {
-        let a = recache_attribution(None, None, Some(applied_evidence()), false);
+        let a = recache_attribution(None, None, None, Some(applied_evidence()), false);
         assert_eq!(a.reason, Some("unexplained_after_replay"));
         assert_eq!(a.origin, Some("unknown"));
+    }
+
+    #[test]
+    fn a_quiet_inbound_with_a_moved_outbound_is_charged_to_the_proxy() {
+        // The hole this closes: the inbound hash is taken before any proxy
+        // stage runs, so a recache the proxy itself caused used to fall
+        // through every branch and land in the residual.
+        let a = recache_attribution(
+            None,
+            Some("tools,messages[0]"),
+            None,
+            Some(applied_evidence()),
+            false,
+        );
+        assert_eq!(a.reason, Some("tools,messages[0]"));
+        assert_eq!(a.origin, Some("proxy"));
+        assert!(a.counts_as_waste, "our own rewrite is waste like any other");
+    }
+
+    #[test]
+    fn client_drift_wins_when_both_hot_zones_moved() {
+        // The proxy carries the client's edit forward, so the outbound hash
+        // moves whenever the inbound one did. Blaming the proxy for that
+        // would misattribute nearly every ordinary recache.
+        let a = recache_attribution(
+            Some("system"),
+            Some("system,tools"),
+            None,
+            Some(applied_evidence()),
+            false,
+        );
+        assert_eq!(a.reason, Some("system"));
+        assert_eq!(a.origin, None);
     }
 
     #[test]
@@ -1537,7 +1612,7 @@ mod tests {
             Some(&prior),
             &current,
         );
-        let a = recache_attribution(None, Some(skip), Some(applied_evidence()), true);
+        let a = recache_attribution(None, None, Some(skip), Some(applied_evidence()), true);
         assert_eq!(a.reason, Some("prefix_content_diverged"));
     }
 
