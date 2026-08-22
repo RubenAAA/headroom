@@ -263,3 +263,57 @@ has an explanation yet.
 `HEADROOM_CAPTURE_DIR` is unset on the running proxy, so no request bodies
 exist for this window. Testing H5 or H6 means enabling capture and waiting
 for a recurrence.
+
+## Is the classifier calling things waste that are not? Mostly the opposite
+
+Worth stating the bias deliberately, because it decides which way to fix
+anything found here: flagging a turn that turns out to be benign costs a
+look, while filing a fixable loss as expected hides it for good. Prefer the
+first. Every entry below was checked in that direction.
+
+**The TTL path was already fixed and is correct now.** `classify_turn` files
+a bust as `TtlExpiry` when the gap exceeds the TTL it is told about. Left at
+the 5-minute default while the proxy pins 1h, every bust in the 5m–1h gap
+reads as a legitimate expiry — `proxy.rs:580-582` records that this hid about
+3% of daily creation. `with_cache_ttl(observed_cache_ttl)` now passes the
+pinned value, and the running proxy has `--force-1h-cache-ttl true`.
+
+**The slack early return hides nothing here. REFUTED.** `classify_turn`
+returns `Healthy` when the re-write is under `RECACHE_SLACK_TOKENS` (64),
+on the reasoning that nothing meaningful was billed. That could in principle
+swallow a small loss repeated every turn. Measured across this window: **0
+turn-pairs** hit it with a read shortfall above the slack. Not a leak.
+
+**The clamp is right, not conservative.** `wasted = min(shortfall, write)`
+caps reported waste at what was actually paid to re-create. Without it a
+conversation that simply got shorter would report the entire missing read as
+waste. Twelve of the twenty events sit on this clamp, which means their true
+shortfall was larger — but the extra was never billed, so it is not waste.
+
+**Turns escaping accounting. REFUTED.** If a turn never reached `complete()`
+its loss would be invisible. Measured: 577 requests forwarded, 577 booked,
+2 unbooked. Booking is not the leak.
+
+## H7 — The classifier under-reports. OPEN, and the number is not yet trustworthy
+
+Pairing each request with the previous request under the same
+`conversation_key` finds 35 pairs with a read shortfall above the slack, all
+inside the 1h TTL, together re-writing 26,051 tokens — none of them flagged.
+That is nearly double the 14,207 the classifier does report. 23 of the 35
+show the message count growing by one or two, which looks like an ordinary
+continuing stream.
+
+**Do not quote that number yet.** The observer does not pair turns the way
+this check does. `match_stream` picks among several streams held under one
+conversation key by matching message content, so a naive
+previous-request-in-the-same-conversation pairing can compare across two
+streams and invent a shortfall that never happened. Message counts one or two
+apart do not rule that out — two streams of similar depth look identical from
+outside.
+
+Settling it needs the classifier to say which stream it matched. The recache
+and ledger events carry `conversation_key` but no stream identity, so no
+outside check can reproduce the pairing. **Emitting the matched stream index
+on the booking event is the cheapest next instrument in this whole
+investigation** — it is a few fields, and it converts H7 from an argument into
+a query.
