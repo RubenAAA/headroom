@@ -2729,6 +2729,11 @@ pub(crate) async fn forward_http(
         // inside the parse below so it shares that parse and is identical
         // to the drift detector's key by construction.
         let mut request_session_key = String::new();
+        // Same reason, for the conversation the turn belongs to. The
+        // fingerprint below is diffed turn-against-turn offline, and the
+        // session key alone cannot separate two conversations sharing one
+        // session — which is exactly the fan-out case.
+        let mut request_conversation_key = String::new();
         // Kept so the outbound hash below is taken with the same shape rules
         // as the inbound one. `None` means no session identity, and nothing
         // downstream observes drift either way.
@@ -2792,6 +2797,7 @@ pub(crate) async fn forward_http(
 
             if let Some((kind, session_key, conversation)) = session_identity {
                 request_session_key = session_key.clone();
+                request_conversation_key = conversation.clone();
                 request_api_kind = Some(kind);
                 let hash = compute_structural_hash(&parsed, kind);
                 let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
@@ -4270,6 +4276,7 @@ pub(crate) async fn forward_http(
                     event = "turn_cache_fingerprint",
                     request_id = %request_id,
                     session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(&request_session_key),
+                    conversation_key = %request_conversation_key,
                     model = %model,
                     // Both are cache-key inputs that sit ahead of message 0, so
                     // a change in either voids the whole prefix.
