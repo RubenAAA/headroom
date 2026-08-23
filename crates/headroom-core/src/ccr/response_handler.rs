@@ -6,7 +6,6 @@
 //!
 //! Mirrors Python's `headroom.ccr.response_handler`.
 
-use std::collections::HashMap;
 
 use serde_json::{json, Value};
 

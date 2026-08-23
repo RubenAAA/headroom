@@ -2724,7 +2724,7 @@ fn extract_text_message(body: &Value) -> String {
 
 /// Handle a request by routing through `mimo run` subprocess.
 async fn handle_mimo_run(
-    state: AppState,
+    _state: AppState,
     original: &Value,
     model_name: &str,
     mimo_model: &str,

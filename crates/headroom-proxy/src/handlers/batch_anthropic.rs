@@ -25,7 +25,6 @@
 //!   Google/OpenAI batch handlers record none either).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;

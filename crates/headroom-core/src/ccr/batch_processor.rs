@@ -7,7 +7,7 @@
 //! HTTP continuation calls are delegated to the proxy layer.
 
 use super::batch_store::BatchRequestContext;
-use super::response_handler::{CCRResponseHandler, CcrToolCall, ResponseHandlerConfig};
+use super::response_handler::{CCRResponseHandler, ResponseHandlerConfig};
 use super::tool_injection::CCR_TOOL_NAME;
 
 use serde_json::Value;

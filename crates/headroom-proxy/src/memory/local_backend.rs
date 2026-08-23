@@ -5,11 +5,9 @@
 //! makes the memory system functional in the Rust proxy without
 //! requiring SQLite or external services.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 
 use super::backend::{MemoryBackend, MemorySearchResult};
 use super::models::Memory;

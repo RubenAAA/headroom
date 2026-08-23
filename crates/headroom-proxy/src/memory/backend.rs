@@ -6,7 +6,6 @@
 //!
 //! Mirrors the public API of Python's `LocalBackend`.
 
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 

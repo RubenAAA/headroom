@@ -8,7 +8,6 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 pub const RECORD_DIR_ENV: &str = "HEADROOM_PROBE_RECORD_DIR";
 
@@ -87,6 +86,7 @@ pub fn probe_recorder_from_env() -> Option<CompressionEventRecorder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn is_auditable_path_logic() {

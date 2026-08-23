@@ -481,12 +481,13 @@ impl ToolSignature {
             }
             Value::Array(arr) => {
                 let mut nested = false;
-                let mut arrays = false;
                 let mut max_d = depth;
                 if let Some(first) = arr.first() {
-                    let (_, n, a, d) = Self::analyze_json(first, depth + 1);
+                    // The array flag the child reports is discarded on purpose:
+                    // this node IS an array, so the answer is `true` whatever
+                    // the child holds.
+                    let (_, n, _, d) = Self::analyze_json(first, depth + 1);
                     nested = n;
-                    arrays = a;
                     max_d = d;
                 }
                 (0, nested, true, max_d)
@@ -1992,7 +1993,7 @@ pub fn kompress_size_gate_exceeded(content: &str) -> bool {
 
 fn try_kompress(
     content: &str,
-    config: &ContentRouterConfig,
+    _config: &ContentRouterConfig,
     context: &str,
     chain: &[String],
 ) -> (String, usize, Vec<String>) {

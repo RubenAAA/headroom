@@ -34,7 +34,7 @@ fn is_fresh(meta: &SourceMeta, ttl: Duration) -> bool {
     // Parse SQLite datetime("now") format: "YYYY-MM-DD HH:MM:SS" (UTC).
     // We approximate by parsing the timestamp and comparing to now.
     let indexed = parse_sqlite_datetime(&meta.indexed_at);
-    let now = SystemTime::now()
+    let _now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     match indexed {
@@ -111,7 +111,7 @@ async fn ssrf_check(url: &str) -> Result<(), String> {
         check_ip(&ip)?;
     }
     // For hostnames, we do a quick DNS check to prevent SSRF via rebinding.
-    let host_clone = host.clone();
+    let _host_clone = host.clone();
     let addrs = tokio::net::lookup_host(format!("{host}:443"))
         .await
         .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?;

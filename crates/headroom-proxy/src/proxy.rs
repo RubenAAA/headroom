@@ -1206,8 +1206,8 @@ pub fn build_app(state: AppState) -> Router {
     // layer rejects non-loopback callers with 404 (not 403 — invisible to
     // external scanners). Matches Python's `require_loopback` dependency.
     {
-        use axum::extract::{ConnectInfo, MatchedPath};
-        use axum::http::{HeaderMap, StatusCode};
+        use axum::extract::ConnectInfo;
+        use axum::http::StatusCode;
         use axum::middleware::{self, Next};
         use axum::response::{IntoResponse, Response};
 
@@ -2338,7 +2338,7 @@ pub(crate) async fn forward_http(
     req.extensions_mut().insert(auth_mode);
 
     // Resolve client IP through trusted gateway CIDRs.
-    let client_ip = crate::forwarded_headers::resolve_client_ip(
+    let _client_ip = crate::forwarded_headers::resolve_client_ip(
         Some(&client_addr.ip().to_string()),
         req.headers(),
         &state.trusted_gateway_cidrs,
@@ -8891,7 +8891,7 @@ fn endpoint_str(endpoint: &compression::CompressibleEndpoint) -> &'static str {
 }
 
 fn extract_tool_name(body: &[u8], endpoint: compression::CompressibleEndpoint) -> Option<String> {
-    use sha2::{Digest, Sha256};
+    
     match endpoint {
         compression::CompressibleEndpoint::AnthropicMessages => {
             let v: serde_json::Value = serde_json::from_slice(body).ok()?;

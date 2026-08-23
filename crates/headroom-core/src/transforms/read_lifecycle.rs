@@ -7,7 +7,6 @@
 //! context is factually wrong. A Read becomes SUPERSEDED when the same file is
 //! re-Read — the content is redundant. Both are provably safe to replace.
 
-use hex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

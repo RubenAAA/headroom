@@ -7,7 +7,6 @@
 //! the provider cache while its file is active. Once the file has been quiet
 //! for `quiesce_turns`, the content is replaced with a CCR-backed marker.
 
-use hex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

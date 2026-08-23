@@ -5,7 +5,7 @@
 //!
 //! Mirrors Python's `headroom.memory.storage_router`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 

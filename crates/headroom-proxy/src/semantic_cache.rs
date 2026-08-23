@@ -4,7 +4,7 @@
 //! Uses `tokio::sync::RwLock` for async-safe access.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -237,7 +237,7 @@ impl SemanticCache {
         model: &str,
         response_body: Vec<u8>,
         response_headers: HashMap<String, String>,
-        tokens_saved: u64,
+        _tokens_saved: u64,
         extra: &serde_json::Map<String, Value>,
     ) {
         let key = Self::compute_key(messages, model, extra);
