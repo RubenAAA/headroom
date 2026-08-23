@@ -140,6 +140,44 @@ impl WorkingDirPins {
         note_at_tail(body, &live_dir, &held[0]);
         Some(live_dir)
     }
+
+    /// Rewrite `system`'s working-directory lines to the held value and hand
+    /// back what was there, without latching a pin or adding the tail note.
+    ///
+    /// The drift hash is taken on the client's body, but `hold` rewrites those
+    /// same lines before the body goes upstream. Hashing the unpinned form made
+    /// a `cd` look like a hot-zone change, so the stored prefix was dropped and
+    /// the whole preamble re-cached — the write the pin exists to stop. Hash
+    /// this view instead, then put the original back: the caller only borrowed
+    /// the body to look at it.
+    pub fn preview(&self, body: &mut Value, conversation_key: &str) -> Option<Value> {
+        let live = read_dirs(body.get("system")?);
+        if live.is_empty() {
+            return None;
+        }
+
+        let held = {
+            let pins = self.pins.lock().expect("WorkingDirPins mutex poisoned");
+            // `peek` so looking does not count as use; `hold` does the `get`
+            // that keeps this conversation warm in the cache.
+            match pins.peek(conversation_key) {
+                Some((held, latched)) if latched.elapsed() <= PIN_TTL => held.clone(),
+                _ => return None,
+            }
+        };
+
+        if held == live || held.len() != live.len() {
+            return None;
+        }
+
+        let system = body.get("system")?.clone();
+        if !write_dirs(body.get_mut("system")?, &held) {
+            // Half-written: put the original back before giving up.
+            *body.get_mut("system")? = system;
+            return None;
+        }
+        Some(system)
+    }
 }
 
 /// Every working directory named in `system`, in the order they appear.
@@ -412,5 +450,56 @@ mod tests {
     fn a_trailing_directory_with_no_newline_is_read() {
         let system = json!([{"type": "text", "text": "Working directory: /repo"}]);
         assert_eq!(read_dirs(&system), vec!["/repo"]);
+    }
+
+    /// The drift hash is taken before `hold` runs, so it has to be able to see
+    /// the pinned form. A `cd` that `hold` will paper over must leave `system`
+    /// hashing the same as the turn before it.
+    #[test]
+    fn preview_shows_the_directory_the_hold_will_forward() {
+        let pins = WorkingDirPins::new(4);
+        let mut first = body("/repo", "user");
+        assert_eq!(pins.hold(&mut first, "conv"), None);
+        let pinned_system = first.get("system").unwrap().clone();
+
+        let mut moved = body("/repo/sub", "user");
+        let original = pins
+            .preview(&mut moved, "conv")
+            .expect("a pinned conversation that moved");
+        assert_eq!(moved.get("system").unwrap(), &pinned_system);
+
+        // The caller only borrowed the body; put it back exactly as it came in.
+        *moved.get_mut("system").unwrap() = original;
+        assert_eq!(dirs(&moved), vec!["/repo/sub", "/repo/sub"]);
+    }
+
+    #[test]
+    fn preview_does_not_latch_a_pin() {
+        let pins = WorkingDirPins::new(4);
+        let mut b = body("/repo", "user");
+        assert_eq!(pins.preview(&mut b, "conv"), None);
+        assert_eq!(dirs(&b), vec!["/repo", "/repo"]);
+        // Still first sight for `hold`, which is what latches.
+        assert_eq!(pins.hold(&mut b, "conv"), None);
+        let mut moved = body("/elsewhere", "user");
+        assert_eq!(pins.hold(&mut moved, "conv").as_deref(), Some("/elsewhere"));
+    }
+
+    /// Extra environment lines arriving with the move — entering a git worktree
+    /// adds two — are a real change to the cached bytes. `preview` pins the
+    /// path it can pin; the hash still differs, and the rebuild is correct.
+    #[test]
+    fn preview_declines_when_the_preamble_shape_changed() {
+        let pins = WorkingDirPins::new(4);
+        let mut first = body("/repo", "user");
+        assert_eq!(pins.hold(&mut first, "conv"), None);
+
+        let mut moved = json!({
+            "system": [
+                {"type": "text", "text": "Working directory: /repo/wt"},
+            ],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
+        });
+        assert_eq!(pins.preview(&mut moved, "conv"), None);
     }
 }

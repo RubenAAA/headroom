@@ -611,3 +611,90 @@ documented behaviour does not exist: after a hot-zone change the store keeps its
 prefix and the chain id carries across the boundary. This is a live candidate
 for part of the 58-turn residue above — worth wiring or worth deleting from the
 doc, but not worth leaving as a claim that is not true.
+
+# Two causes found and fixed — 2026-08-24
+
+Measured on a 1,622-request capture (`~/headroom-capture-alpha`) and on the
+proxy log since the 20:30 restart. Method: hash every message of every turn
+with `cache_control` stripped, then compare each turn against the one before it
+in the same session. `cache_control` has to go, because the tail breakpoint
+moves every turn by design and swamps everything else.
+
+| | pairs |
+|---|---|
+| clean append | 1,593 |
+| tail edit, 2 messages deep or less | 114 |
+| **deep divergence** | **3** |
+
+Three. And those three are the whole `prefix_content_diverged` class:
+143,630 tokens, the largest remaining waste on the current build.
+
+## The working-directory pin ran after the hash that judged it
+
+`hold` fires correctly — the log carries `working_directory_held` on both
+worktree turns. But `compute_structural_hash` runs about 1,100 lines earlier,
+on the client's body, and `replay_store.invalidate` (`proxy.rs:2847`) threw the
+stored prefix away 17ms before the pin restored the very line it tripped on.
+The turn then forwarded with `replay_skipped: no_previous_turn` and re-cached
+46,707 tokens.
+
+The rule was already written down, above the billing-header pin
+(`proxy.rs:2696`): "This has to run here, ahead of the fingerprint below and
+the prefix-replay capture further down, so every stage sees the pinned form."
+The working-directory hold was the one stage breaking it.
+
+Fixed with `WorkingDirPins::preview`: rewrite `system` to the held directory,
+hash that, put the client's `system` straight back. It shares `hold`'s decline
+conditions — no pin, expired pin, changed line count — so the two can never
+disagree about what will be forwarded.
+
+**Entering a git worktree is not covered, and should not be.** Claude Code adds
+two lines alongside the path ("This is a git worktree…", "The git stash stack
+is shared…"). Pinning the path alone still leaves those changed, so `preview`
+declines and the rebuild is correct. Holding them would tell the model it is
+not in a worktree while it is.
+
+## A `SubagentStart` hook deleted a message 48 positions deep
+
+All three deep divergences are the same `role: "system"` message:
+
+```
+prior[151] user      <teammate-message teammate_id="team-lead" …>
+prior[152] system    SubagentStart hook additional context: Code discovery…
+…
+cur[199]   user      <teammate-message teammate_id="team-lead" …>
+cur[200]   system    SubagentStart hook additional context: Code discovery…
+```
+
+A long-lived teammate agent, woken again by `SendMessage`. The hook fires on
+every wake and appends its reminder at the tail; Claude Code deletes the older
+copy rather than duplicate it. That deletion shifts every message after it, and
+one of the three cost 132,539 tokens.
+
+The text was identical on every firing — no per-invocation content at all — so
+a hook bought nothing over static context. Removed the `cbm-subagent-reminder`
+entry from `acme-api/.claude/settings.local.json` and moved the two sentences to
+that project's `CLAUDE.md`.
+
+`CLAUDE.md` does not reach the `system` block, as it happens — it arrives as a
+`<system-reminder>` inside `messages[0]`, the front of the array, which is the
+most stable position there is. Verified in the capture: all three files
+(`~/.claude`, `~/meta`, `acme-api`) appear there, in 961 of 961 teammate
+conversations and 184 of 184 main ones under acme-api. So subagents do get it,
+once, at 0.1x forever.
+
+Scoping: `codebase-memory-mcp` runs only in acme-api, so the guidance stays in
+that project's `CLAUDE.md` and not in the user-level one. One wiring existed
+(the project's `settings.local.json`), which every config dir reads, so
+`.claude`, `.claude-personal` and `.claude-work` are all covered by the single
+edit. The script itself survives, unwired, at `hooks/cbm-subagent-reminder`
+under `.claude-personal` and `.claude-work`; its header says
+"Installed by codebase-memory-mcp", so check the wiring again after that
+server next installs.
+
+## Correction to the entry above
+
+"`SessionReplayStore::invalidate` has no production caller" is no longer true.
+It is called at `proxy.rs:2847`, on the rebuild boundary, exactly as the module
+doc describes — and calling it a beat too early is what caused the first bug on
+this page.

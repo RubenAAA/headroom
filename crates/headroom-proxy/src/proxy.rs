@@ -2755,7 +2755,7 @@ pub(crate) async fn forward_http(
         // as the inbound one. `None` means no session identity, and nothing
         // downstream observes drift either way.
         let mut request_api_kind: Option<ApiKind> = None;
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
+        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
             // PR-E5: volatile-content detector. Emits one WARN per
             // finding (capped at 10) for content that busts cache
             // (timestamps, UUIDs, ID-named fields).
@@ -2816,7 +2816,24 @@ pub(crate) async fn forward_http(
                 request_session_key = session_key.clone();
                 request_conversation_key = conversation.clone();
                 request_api_kind = Some(kind);
+                // Hash the body the way it will be forwarded. The
+                // working-directory hold rewrites `system` further down, so
+                // hashing the client's own form calls a `cd` a hot-zone change
+                // and drops the stored prefix — the re-cache the hold exists to
+                // stop. Put the client's `system` back straight after: nothing
+                // below here may see the pinned view.
+                let previewed = if state.config.hold_working_directory
+                    && state.config.prefix_replay
+                    && matches!(kind, ApiKind::Anthropic)
+                {
+                    state.working_dir_pins.preview(&mut parsed, &session_key)
+                } else {
+                    None
+                };
                 let hash = compute_structural_hash(&parsed, kind);
+                if let (Some(original), Some(slot)) = (previewed, parsed.get_mut("system")) {
+                    *slot = original;
+                }
                 let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
                 rebuild_boundary = drift_dims.is_some();
 
