@@ -146,3 +146,55 @@ second appearing at all means drops are landing past the hold and the number
 wants raising — or, given the fix is now applied at boot, that the offload
 settings did not stick (check `ethtool -k eth0`) or the corruption is
 happening before the checksum, which points at `networkingMode=mirrored`.
+
+## Reproduced away from Anthropic — 2026-08-24
+
+The offload settings did stick. `ethtool -k eth0` reads `gro`, `rx`, `tso` and
+`gso` all off, applied by the `[boot] command`. BadRecordMac carried on
+regardless: 34 events in a day, 16 of them past the hold.
+
+So the second branch is the live one, and `scripts/tls-corruption-repro.sh`
+tests it. Concurrent 300KB uploads, eight of them multiplexed over one HTTP/2
+connection, aimed at `speed.cloudflare.com/__up`:
+
+```
+batches 546, requests 4368
+bad_record_mac / decrypt errors : 15
+curl: (56) OpenSSL SSL_read: OpenSSL/3.0.13:
+      error:0A0003FC:SSL routines::sslv3 alert bad record mac
+```
+
+0.34% against the proxy's 0.85% over the same day — the same order, at an
+endpoint that is not Anthropic, through OpenSSL 3.0.13 rather than the proxy's
+rustls. That clears the proxy, clears rustls 0.23.41 and h2 0.4.16, and clears
+the route to the provider. What is left is this instance, on the way out, which
+is the case for `networkingMode=mirrored`.
+
+One caveat kept on the record: both endpoints sit behind Cloudflare, so a fault
+at that edge is not formally excluded. Two unrelated TLS stacks failing the
+same way makes the local explanation much the stronger one.
+
+### The drops are per connection, not per request
+
+Worth knowing before reading any burst as an outage. All 34 events fall in 12
+distinct 100ms buckets, and one bucket killed eight requests in the same
+millisecond:
+
+| time | requests killed together |
+|---|---|
+| 20:04:04 | 8 |
+| 20:02:38 | 6 |
+| 20:06:13 | 4 |
+| 20:05:50 | 3 |
+
+One connection's TLS state breaks and every stream multiplexed on it dies at
+once. The 20 "drops" between 20:02 and 20:06 were four connection failures.
+A reproducer that opened one connection per request would not show this, which
+is why the script uses `curl --parallel` in a single process.
+
+### It tracks load
+
+Median throughput in a minute carrying a BadRecordMac is 41.5 req/min against
+9.0 overall. Not deterministic, though: 20:03 ran 171 requests clean, and so
+did 13:16 (135) and 11:56-11:58 (95-112). Close to necessary, plainly not
+sufficient.
