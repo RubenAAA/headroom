@@ -317,3 +317,297 @@ outside check can reproduce the pairing. **Emitting the matched stream index
 on the booking event is the cheapest next instrument in this whole
 investigation** — it is a few fields, and it converts H7 from an argument into
 a query.
+
+## Instruments added 2026-08-22 (shipped, not yet read against traffic)
+
+Two events, no classification changes. Both exist to turn the open
+hypotheses above into queries.
+
+**`cache_recache_observed` now names the stream it compared against.** Three
+fields on all four arms plus `cache_recache_ttl_expiry`:
+`matched_stream_msgs` (the depth of the tracked stream the arithmetic used,
+`-1` for no match), `turn_msgs` (this turn's depth), and `streams_tracked`.
+This is the instrument H7 asked for. Any outside check can now reproduce the
+observer's pairing instead of guessing at it, so the 26,051 figure can be
+recomputed against the real pairs rather than against
+previous-request-in-the-same-conversation. Until that recount runs, the
+figure stays unquoted.
+
+**`cache_stream_unmatched` (INFO) names the turn that matched nothing.** A
+turn shorter than every tracked stream is filed `FirstTurn` and reports no
+waste however much the provider re-wrote. For a subagent forking off a shared
+opener that is correct — it had no prefix to reuse. For anything that
+shortened a conversation it meant to continue it is a silent loss, and the
+two are indistinguishable from inside `match_stream`. The event does not
+guess; it prints `turn_msgs`, `longest_tracked`, `streams_tracked` and both
+token counts so the cases can be separated after the fact.
+
+Scale of the hole, from the unit test: a turn at depth 20 arriving after a
+stream at depth 40 wrote 26,000 tokens and reported zero waste. In the
+2026-08-22 window only one turn qualified and it wrote 0 tokens, so this is
+real in code and unexercised in that window. Whether it is ever exercised is
+now countable rather than arguable.
+
+## Where the tokens actually go — 2026-08-23
+
+Measured over 82MB of logs, 2026-08-20 to 08-22: 14,290 turns, 45.9M tokens of
+cache creation. Attribution by cause:
+
+| cause | turns | creation | share |
+|---|---|---|---|
+| replay applied (healthy) | 13,604 | 31.7M | 68.9% |
+| cold start, no stored prefix — legitimate | 363 | 11.0M | 23.9% |
+| **no held stream leads the turn** | **51** | **2.59M** | **5.6%** |
+| declined, real chain, content diverged | 271 | 0.52M | 1.1% |
+| shorter than stored prefix | 7 | 0.15M | 0.3% |
+
+91.4% of consecutive turn-pairs get full reuse. The system is mostly working,
+and the loss is concentrated: 51 turns carry 2.59M tokens, ~50k each. That is
+the one number worth chasing.
+
+### Refuted, with the numbers that killed each
+
+**H-marker: the tail breakpoint moving orphans the previous block.** Both
+markers do slide forward every turn and no path re-declares an old position
+(`place_tail_cache_breakpoints`, `prefix_replay.rs:1726`). But `cache_control`
+is in `NON_SEMANTIC_KEYS` (`prefix_replay.rs:391`) and is stripped before any
+prefix comparison, and the provider matches on content, not marker parity.
+Dead.
+
+**H-slack: `TAIL_EDIT_SLACK = 2` is off by one.** The tail-edit rescue needs
+the divergence within 2 messages of the stored prefix's end. Gap distribution
+across 288 divergences: 219 at gap 1, 56 at gap 2, **4 at gap 3**, worth 8,476
+tokens. Raising the slack recovers nothing. Dead.
+
+**H-race: concurrent turns lose each other's writes.** Real, but not a defect
+and not ours. Of 143 pairs where the previous turn's write was never read, 106
+were requests that started before the previous one finished — 53.7% overlap
+against a 0.8% base rate, a 67x enrichment. Those are parallel subagents under
+one `conversation_key`; pairing them by time order is invalid, so most of that
+apparent 304k loss is an artifact of the offline pairing, not a real loss.
+**Any log query that pairs turns by conversation key and time order is wrong
+wherever subagents run.** Pair by stream.
+
+**H-retry: the losses follow dropped streams.** Of 12 equal-length in-place
+divergences, 0 had any retry, overload, error or stream-drop event on the
+previous turn. Dead.
+
+### What the divergences actually are
+
+`prefix_replay_not_replayed` already carries `diff_shape_stored` /
+`diff_shape_current`, which went unread until now. Across 319 diverged turns:
+
+- 116 — blocks **appended** to an existing message, mostly
+  `tool_result` -> `tool_result,text`. The client attaching a
+  `<system-reminder>` to a message it already sent. Client behaviour.
+- 76 — same shape, content edited inside.
+- 59 — stored says `string`, current says `thinking,tool_use`: **different
+  speakers at the same index**, so the comparison was against another stream
+  entirely. 44 of these are `chain_id == 0`.
+- 8 — blocks removed.
+
+60.7% of all divergences sit at exactly `len-2`, and 100% of the equal-length
+ones do. `len-2` is the assistant message; `len-1` is the user tool_result.
+
+### The open question, and the instrument for it
+
+`chain_id == 0` from `previous_turn_for` is deliberate and correct: it means no
+held stream leads this turn, so the store refuses to splice rather than merge
+two unrelated runs (`prefix_replay.rs:2544-2552`). The question is why a
+*continuing* stream finds nothing held. Three causes need opposite answers — a
+genuinely new stream (nothing to do), an entry evicted under
+`MAX_ALTERNATE_PREFIXES` (16) or `MAX_ALTERNATE_MESSAGES` (4,000), or a real
+divergence after a long agreement.
+
+Eviction is counted only in `proxy_cache_replay_alternates_evicted_total`,
+which is lazily registered and absent from `/metrics` on a fresh process, so it
+could not answer this retroactively.
+
+Added `prefix_replay_no_stream_leads_turn` on that arm: `alternates_held`,
+`held_messages`, `primary_prefix_msgs`, `current_msgs`, `best_agreement_msgs`
+and both caps. `best_agreement_msgs` is the discriminator — 0 means eviction or
+a brand-new stream, a long run means identity was nearly there. This needs the
+new binary running; the 08-22 restart predates it.
+
+## Root cause found — 2026-08-23
+
+**`MAX_ALTERNATE_PREFIXES = 16` was the only bound that ever bit, and it threw
+away the most expensive prefix in the store.**
+
+Reproduced without traffic, in a unit test. A 300-message conversation, then
+subagents at 30 messages each:
+
+```
+main=300 sub= 30: LOST after 17 subagent turns (held  480/4000, cap 16)
+main=300 sub=100: LOST after 17 subagent turns (held 1600/4000, cap 16)
+main=300 sub=250: LOST after 16 subagent turns (held 3750/4000, cap 16)
+```
+
+The parent is dropped after 17 subagent turns while the store holds 480
+messages against a 4,000 budget — 12% of the bound the code calls "the bound
+that actually matters". The count ceiling bit first in every shape tested.
+
+Two things combine. Eviction takes the least-recently-*displaced* entry, on the
+reasoning that it "has actually gone quiet"; a parent waiting on its fan-out
+looks exactly like that. And the parent is the largest entry in the store, so
+the cheapest thing to keep by count is the most expensive thing to lose by
+tokens. Its next turn then finds no stream leading it, takes the `chain_id == 0`
+path, and re-caches everything — the 51 turns and 2.59M tokens above, ~50k
+each.
+
+**Fix: raise the ceiling to 128** so the message budget governs, which is what
+the design intended. Memory is unchanged: it is bounded by
+`MAX_ALTERNATE_MESSAGES`, not by the count.
+
+The number is sized against the data, not picked round. Distinct streams per
+session across the same logs — `chain_id` increments once per new stream, so
+its max per session measures exactly this:
+
+| | streams |
+|---|---|
+| median | 0 |
+| p90 / p95 / p99 | 4 / 6 / 11 |
+| max observed | 29 |
+| sessions over 16 | 2 of 344 (0.58%) |
+| sessions over 32 | 0 |
+
+128 is 4.4x the busiest session ever seen. Note that `alternates_held` in the
+logs maxes at exactly 16 — the old ceiling clipping its own distribution, which
+is why the count had to be measured through `chain_id` instead.
+
+Subagent *turns* are not the quantity that matters: a stream taking many turns
+is promoted back to primary on each one and consumes no extra slot. Only
+distinct streams do.
+
+Pinned by `a_parent_conversation_outlives_a_large_fan_out`. It fails at 16 and
+passes at 64, so the defect cannot come back quietly.
+
+### Eviction order — fixed too
+
+The raised ceiling does nothing for a session that genuinely exhausts the
+4,000-message budget; recency ordering still dropped the parent first. Recency
+turned out to be the wrong signal outright. An entry's position records how
+many *other* streams have taken a turn since, so a parent blocked behind a
+fan-out ages exactly as fast as one that has finished.
+
+Size is the better predictor, and the logs say so plainly. Grouping turns into
+streams by `(conversation_key, chain_id)`, the chance a stream ever takes
+another turn against how much it has cached:
+
+| stream size (cached tokens) | n | median turns | P(>=2 turns) | P(>=10) |
+|---|---|---|---|---|
+| 0-10k | 30 | 1 | 0% | 0% |
+| 10-30k | 68 | 1 | 16% | 1% |
+| 30-60k | 224 | 2 | 51% | 8% |
+| 60-120k | 483 | 5 | 76% | 28% |
+| 120k+ | 275 | 13 | 92% | 57% |
+
+Monotonic across every bucket, log-log r = 0.54 over 1,080 streams. Because the
+budget is counted in messages and tokens track messages, value per unit of
+budget is exactly that probability, so the budget belongs to the large streams
+— and dropping a small one costs close to nothing, since it was never coming
+back.
+
+Eviction now selects by size descending with recency as the tiebreak, and skips
+rather than stops, so a small stream can still use the room a rejected large one
+left. Pinned by `the_budget_goes_to_the_stream_most_likely_to_return`, which
+fails under recency-only ordering.
+
+## Auditing the "healthy" bucket — 2026-08-23
+
+That row never meant the provider reused the prefix; it meant the replay gate
+applied one. Pairing turns **by stream** (`conversation_key`, `chain_id`) rather
+than by time order, 95.2% of within-stream pairs get full reuse and 606 do not,
+carrying 2,555,900 tokens. Broken down:
+
+| bucket | turns | tokens |
+|---|---|---|
+| replay applied and still lost | 58 | 1,294,086 |
+| TTL expiry (already named) | 4 | 527,616 |
+| overlapped a still-running turn | 377 | 408,980 |
+| replay declined (counted elsewhere) | 160 | 323,458 |
+| idle past 1h | 2 | 1,760 |
+
+**A request can emit both `prefix_replay_applied` and
+`prefix_replay_not_replayed`.** Reading either alone misclassifies the turn —
+73.4% of these shortfalls emitted both, and my first pass filed all of them as
+"applied". Check for the decline first.
+
+### Refuted here
+
+- **TTL.** 217 of 218 sequential shortfalls followed a 1h write, with gaps in
+  seconds. Not expiry.
+- **The proxy rewriting the front of history.** `messages_rewritten` touches
+  index <=3 on 95.4% of shortfalls and 95.2% of healthy turns — identical, so
+  it discriminates nothing. Rewriting the front is universal and normally
+  harmless.
+- **Context offload volume.** Lower on the residue (7 blocks) than on healthy
+  turns (12), the wrong direction for a cause.
+
+### The residue and its instrument
+
+58 turns, 1.29M tokens, median 488 but p90 94,841 — a few very large misses
+dominate, several reading 0 tokens seconds after a 1h write. No logged event
+separates them from healthy turns. `ctx_inject_too_deep_for_first_sight` has a
+large lift (12% vs 0.06%) but covers 7 turns and cannot account for the bulk.
+
+The reason nothing explains them is that the deciding fact was never recorded:
+whether the bytes forwarded still matched the prefix the replay believed it had
+spliced in. Everything between those two points — breakpoint placement, memory
+injection, context injection, PAYG rewrites — is supposed to leave the settled
+prefix alone, and nothing checked that it did.
+
+Added `forwarded_prefix_mutated_after_replay` (WARN), which digests each message
+as the replay stage leaves it and again just before forwarding, and names the
+first index that moved. The last two messages are excluded as this turn's live
+tail. A companion `forwarded_prefix_length_changed_after_replay` catches
+messages added or removed.
+
+This is a single-request invariant, so it needs no cross-turn state and no
+waiting: if it fires, a proxy stage is corrupting a cached prefix and the index
+names which. If it never fires, the proxy is exonerated and the residue is
+provider-side.
+
+## Older threads, closed — 2026-08-23
+
+**Concurrent turns now have a name.** 72% of overlapping turn-pairs lose cache
+against a ~5% baseline (377 pairs, 408,980 tokens), and 374 of them had a replay
+applied — the splice was right, the timing was not: the provider had not
+committed the previous turn's write because that turn was still streaming
+(median 3.4s left). These were landing in `unexplained_after_replay`.
+
+`recache_attribution` now returns `concurrent_turn_in_flight` / origin `client`.
+Read from the observer's own pending map, not from timestamps — this machine's
+wall clock steps backwards under load. **Still counted as waste**: the tokens
+were genuinely re-billed, and filing 409k tokens as expected would retire them
+into a bucket nobody reads. Checked after every structural cause, so a real edit
+still wins. Pinned by `a_turn_racing_its_own_conversation_is_named_but_still_billed`
+and `a_named_cause_outranks_concurrency`.
+
+**Both crush flags are dead.** `--min-tokens-to-crush` (`config.rs:1326`,
+default 200) and `--max-items-after-crush` (`config.rs:1334`, default 15) are
+declared, copied into the runtime `Config`, and never read by the request path.
+The live `SmartCrusher` is built once from `SmartCrusherConfig::default()` at
+`live_zone.rs:607`, so the CLI values cannot reach it. Same three-layer pattern
+as the previously documented dead flag. Changing either from the command line
+has no effect on forwarded requests.
+
+**The 3.1% vs 0.16% rebuild-boundary gap is a denominator mismatch, not a
+disagreement.** Both come from the same condition — `observe_drift(...).is_some()`
+(`drift_detector.rs:467`), used identically by the replay path
+(`proxy.rs:2797`) and the J4 offload gate (`proxy.rs:3086`). There is no second
+definition. 0.16% (4 of 2,571) counts only turns that emitted a `ctx_offload`
+line, which fires solely when a turn had an offload candidate
+(`proxy.rs:3113`). 3.1% (245 of 7,839) counts every turn in the replay corpus
+(`offload_replay.rs:213-235`). Narrow subset versus whole corpus. Neither
+number is wrong; quoting them side by side is.
+
+**`SessionReplayStore::invalidate` has no production caller.** It is an
+ordinary `pub fn` (`prefix_replay.rs:2692`), and the module doc
+(`prefix_replay.rs:68-71`) says it "is called on a rebuild boundary to drop the
+stored prefix" so a stale prefix cannot be replayed after the provider's cache
+died. Every call site is in tests (`prefix_replay.rs:3558, 3763, 4501`). The
+documented behaviour does not exist: after a hot-zone change the store keeps its
+prefix and the chain id carries across the boundary. This is a live candidate
+for part of the 58-turn residue above — worth wiring or worth deleting from the
+doc, but not worth leaving as a claim that is not true.
