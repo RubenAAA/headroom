@@ -257,7 +257,24 @@ impl AppState {
             // Don't auto-follow redirects: pass them through verbatim.
             .redirect(reqwest::redirect::Policy::none())
             // Pool needs to be allowed to be idle for long-lived streams.
-            .pool_idle_timeout(std::time::Duration::from_secs(90));
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            // An SSE turn can go quiet for a minute while the model thinks,
+            // and nothing on this connection says so. Measured 2026-08-23:
+            // 9 streams died mid-body with `error decoding response body`,
+            // 2.4s to 82s in, every one of them after a 200 — so the socket
+            // was alive when the turn began and something in the path
+            // dropped it while it was silent. Keepalives make the flow speak
+            // during that silence.
+            //
+            // The h2 pings ride the same connection the stream does, so a
+            // dead path is detected rather than waited on. `while_idle` is
+            // what makes them fire during the pause that causes this.
+            .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            // Covers the HTTP/1.1 path too, which the h2 settings do not
+            // reach — including when a CONNECT proxy forces `http1_only`.
+            .tcp_keepalive(std::time::Duration::from_secs(20));
         // Provider-only HTTP proxy: scoped to this upstream client so
         // routing never leaks into the process environment (which tool
         // executions inherit). HTTP/2 is disabled when a proxy is set so
