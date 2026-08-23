@@ -368,6 +368,23 @@ impl SessionsStore {
         .optional()
     }
 
+    /// The oldest recorded turn for a conversation, if any.
+    ///
+    /// Says how deep the conversation already was when this proxy first saw
+    /// it. A conversation first met past the first-sight limit was declined an
+    /// injection by design and will never have a row, which is not the same
+    /// fault as a row that went missing.
+    pub fn first_prefix_turn(&self, conv_id: &str) -> rusqlite::Result<Option<u64>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT turn_n FROM conv_prefix_chain
+             WHERE conv_id = ?1 ORDER BY turn_n ASC LIMIT 1",
+            params![conv_id],
+            |r| Ok(r.get::<_, i64>(0)? as u64),
+        )
+        .optional()
+    }
+
     /// The recorded prefix hash at a specific turn, if any.
     pub fn prefix_at(&self, conv_id: &str, turn_n: u64) -> rusqlite::Result<Option<String>> {
         let conn = self.conn();

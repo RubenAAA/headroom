@@ -244,14 +244,42 @@ impl InjectEngine {
             _ => None,
         };
         if let Some(turn_n) = prior_turn {
-            tracing::warn!(
-                event = "ctx_inject_row_miss",
-                request_id = %request_id,
-                conv = %conv_id,
-                last_turn = turn_n,
-                current_turn,
-                "injection row missing for a known conversation; injecting nothing (fail-safe)"
-            );
+            // A conversation first met past the first-sight limit was declined
+            // below and no row was ever written for it, so every later turn
+            // finds a prefix chain and no injection — which reads exactly like
+            // a row that went missing. It is not one, and it will repeat for
+            // the life of the conversation. Measured 2026-08-23: all 3
+            // conversations that logged this had been declined for depth
+            // ~20 minutes earlier.
+            //
+            // Decision-free: both arms inject nothing, so the forwarded bytes
+            // are identical either way and no cache can move on this.
+            let never_eligible = sessions
+                .first_prefix_turn(conv_id)
+                .ok()
+                .flatten()
+                .is_some_and(|first| first > MAX_FIRST_SIGHT_MESSAGES);
+            if never_eligible {
+                tracing::debug!(
+                    event = "ctx_inject_declined_at_first_sight",
+                    request_id = %request_id,
+                    conv = %conv_id,
+                    last_turn = turn_n,
+                    current_turn,
+                    limit = MAX_FIRST_SIGHT_MESSAGES,
+                    "no injection row because this conversation was first seen \
+                     too deep to build one; injecting nothing"
+                );
+            } else {
+                tracing::warn!(
+                    event = "ctx_inject_row_miss",
+                    request_id = %request_id,
+                    conv = %conv_id,
+                    last_turn = turn_n,
+                    current_turn,
+                    "injection row missing for a known conversation; injecting nothing (fail-safe)"
+                );
+            }
             return None;
         }
 
@@ -582,6 +610,53 @@ mod tests {
             .find(|line| line.contains("ctx_inject_row_miss"))
             .unwrap_or_else(|| panic!("row-miss event missing from:\n{joined}"));
         assert!(event.contains("request_id=req-row-miss"), "{event}");
+    }
+
+    /// A conversation first met past the first-sight limit never had a row to
+    /// lose, so its later turns must not be reported as losing one. The
+    /// forwarded body is untouched either way — only the log level moves.
+    #[test]
+    fn a_conversation_first_seen_too_deep_is_not_a_row_miss() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        // Deep now, and deep the first time we saw it.
+        let mut msgs = vec![json!({"role":"user","content":"hi"})];
+        for i in 0..60 {
+            msgs.push(json!({"role":"assistant","content":format!("a{i}")}));
+            msgs.push(json!({"role":"user","content":format!("u{i}")}));
+        }
+        let req = json!({"system": "sys", "messages": msgs});
+        let conv = identity::conversation_key(&req, "sk");
+        // The oldest turn we ever recorded is already past the limit — this
+        // proxy met the conversation mid-flight — and it sits strictly behind
+        // the current turn, so the row-miss arm is the one reached.
+        let current = identity::message_count(&req);
+        sessions_of(&eng)
+            .record_prefix(&conv, current - 2, "h")
+            .unwrap();
+
+        let mut r = req.clone();
+        let capture = EventCapture::default();
+        let lines = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!eng.maybe_inject_for_request(
+                &mut r,
+                "sk",
+                PROJECT,
+                &big_budget(),
+                "req-too-deep",
+            ));
+        });
+        // Same fail-safe, same bytes.
+        assert_eq!(r["messages"][0]["content"], json!("hi"));
+        let joined = lines.lock().unwrap().join("\n");
+        assert!(
+            !joined.contains("ctx_inject_row_miss"),
+            "declined-at-first-sight must not report a missing row:\n{joined}"
+        );
     }
 
     /// A deep body with no stored decision is a lost row, whatever the prefix
