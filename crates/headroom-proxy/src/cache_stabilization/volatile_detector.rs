@@ -47,7 +47,7 @@
 //!   walker. Bedrock / Vertex / etc. follow in a Phase E
 //!   follow-up — this PR keeps the surface tight.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
@@ -266,7 +266,21 @@ pub fn emit_volatile_warnings(
         }
     }
 
+    // Byte-identical findings collapse to one line. A body can hold the same
+    // value at one location several times over, and repeating it says nothing
+    // the first line did not. Distinct samples still each get a line: several
+    // example timestamps in one docstring are several facts, which is what
+    // `several_samples_at_one_location_are_judged_together` fixes in place.
+    // Measured over 2026-08-23: 36 of 356 lines were exact repeats.
+    let mut emitted: HashSet<(&str, &str, &str)> = HashSet::new();
     for finding in findings {
+        if !emitted.insert((
+            finding.kind.as_str(),
+            finding.location.as_str(),
+            finding.sample.as_str(),
+        )) {
+            continue;
+        }
         // Warn unless this location is known to be holding still. A first
         // sighting (`None`) has nothing to contradict it, so it warns.
         let unchanged = matches!(verdicts.get(finding.location.as_str()), Some(Some(false)));
