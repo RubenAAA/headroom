@@ -2797,6 +2797,22 @@ pub(crate) async fn forward_http(
                 let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
                 rebuild_boundary = drift_dims.is_some();
 
+                // The hot zone changed, so every prefix this session had
+                // cached shares a preamble the provider no longer holds —
+                // including the alternates, which are prefixes for the same
+                // dead cache. Drop them before `apply_prefix_replay` runs
+                // below, so the next turn opens a fresh chain instead of
+                // splicing bytes against a cache that is gone.
+                if rebuild_boundary {
+                    state.replay_store.invalidate(&session_key);
+                    tracing::info!(
+                        event = "prefix_replay_invalidated_on_rebuild",
+                        request_id = %request_id,
+                        session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(&session_key),
+                        "dropped stored prefix at a drift/rebuild boundary"
+                    );
+                }
+
                 // CTX-7: park conversation identity + drift dims under
                 // the request id so the response-side usage observer
                 // can classify this turn's billed usage against the

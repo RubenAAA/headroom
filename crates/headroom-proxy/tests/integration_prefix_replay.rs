@@ -116,6 +116,24 @@ fn turn2_body(big: &Value) -> Value {
     })
 }
 
+/// Turn 3 keeps turn 2's history but changes the system prompt. That is a
+/// cache hot-zone change, so the drift detector reports a rebuild boundary and
+/// the prefix the provider had cached no longer exists.
+fn turn3_body_after_drift(big: &Value) -> Value {
+    json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "system": "you are a terse assistant",
+        "messages": [
+            big,
+            {"role": "assistant", "content": "done."},
+            {"role": "user", "content": "next step please"},
+            {"role": "assistant", "content": "on it."},
+            {"role": "user", "content": "and again"},
+        ],
+    })
+}
+
 fn messages_of(body: &[u8]) -> Vec<Value> {
     let v: Value = serde_json::from_slice(body).expect("upstream body is JSON");
     v.get("messages")
@@ -242,6 +260,65 @@ async fn replay_preserves_previous_compressed_provider_prefix() {
             "text": "next step please",
             "cache_control": {"type": "ephemeral"},
         }])
+    );
+
+    proxy.shutdown().await;
+}
+
+/// A drift/rebuild boundary means the provider dropped the prefix this session
+/// had cached. Replaying the stored bytes past that point splices a prefix
+/// against a cache that no longer exists, so the store must be invalidated
+/// there — the behaviour the module doc promised but nothing called.
+#[tokio::test]
+async fn a_rebuild_boundary_drops_the_stored_prefix() {
+    let upstream = MockServer::start().await;
+    let captured = mount_anthropic_sse_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+        c.prefix_replay = true;
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let big = big_tool_result_message();
+    let original_payload = tool_result_content(&big);
+
+    post_turn(&client, &proxy.url(), &turn1_body(&big)).await;
+    let fwd1 = messages_of(&captured.lock().unwrap()[0]);
+    assert_ne!(
+        tool_result_content(&fwd1[0]),
+        original_payload,
+        "precondition: turn 1 must actually compress the tool_result"
+    );
+
+    // Wait for turn 1 to commit, confirmed by turn 2 actually replaying it.
+    // Without that confirmation the turn-3 assertion below would also pass on
+    // an empty store, and prove nothing.
+    let turn2 = turn2_body(&big);
+    let mut replayed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        post_turn(&client, &proxy.url(), &turn2).await;
+        let got = messages_of(captured.lock().unwrap().last().unwrap());
+        if without_cache_control(&got[0]) == without_cache_control(&fwd1[0]) {
+            replayed = true;
+            break;
+        }
+    }
+    assert!(replayed, "precondition: turn 2 must replay the stored prefix");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // ── turn 3: same history, different system prompt → hot-zone drift ──
+    // Posted exactly once: the hash settles at the new value immediately, so
+    // a retry loop would only see post-boundary turns.
+    post_turn(&client, &proxy.url(), &turn3_body_after_drift(&big)).await;
+    let fwd3 = messages_of(captured.lock().unwrap().last().unwrap());
+
+    assert_eq!(
+        tool_result_content(&fwd3[0]),
+        original_payload,
+        "turn 3 replayed the turn-1 compressed prefix across a rebuild \
+         boundary — the stored prefix outlived the cache it belonged to"
     );
 
     proxy.shutdown().await;
