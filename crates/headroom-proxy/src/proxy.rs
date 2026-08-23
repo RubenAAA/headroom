@@ -3967,6 +3967,12 @@ pub(crate) async fn forward_http(
             _ => body_to_send,
         };
 
+        // Snapshot the prefix as the replay stage leaves it, to be checked
+        // against what actually goes out. See [`message_digests`]. Gated the
+        // same way as the outbound drift reading below, since both want a body
+        // whose shape this code understands.
+        let post_replay_digests = request_api_kind.and_then(|_| message_digests(&body_to_send));
+
         // PR-E4: OpenAI `prompt_cache_key` auto-injection.
         //
         // Universal safety contract: only mutate when the caller
@@ -4234,6 +4240,102 @@ pub(crate) async fn forward_http(
             state
                 .usage_observer
                 .note_outbound_drift(&request_id, outbound_dims);
+        }
+
+        // The invariant, checked rather than assumed: nothing between the
+        // replay stage and here may disturb a message the provider has already
+        // cached. Measured over the 2026-08-20/22 logs, 58 turns lost 1.29M
+        // tokens with the replay reported applied and the cache dead anyway,
+        // and no logged event told them apart from healthy turns — because the
+        // one fact that would have is whether the bytes still matched.
+        //
+        // Only the settled prefix is checked. The last two messages are this
+        // turn's own live tail and are expected to move.
+        // One fingerprint per turn of everything the provider's cache key
+        // depends on. The 58 residue turns had replay applied and the cache
+        // dead with nothing to tell them apart from healthy turns; rather than
+        // one instrument per guess, log the facts and diff turn-against-turn
+        // offline, which also catches causes not yet guessed at.
+        if request_api_kind.is_some() {
+            if let (Some((model, markers, breakpoints)), Some((sys, tools))) = (
+                cache_key_fingerprint(&body_to_send),
+                preamble_digests(&body_to_send),
+            ) {
+                let beta = headers_snapshot
+                    .as_ref()
+                    .and_then(|h| h.get("anthropic-beta"))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                tracing::info!(
+                    event = "turn_cache_fingerprint",
+                    request_id = %request_id,
+                    session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(&request_session_key),
+                    model = %model,
+                    // Both are cache-key inputs that sit ahead of message 0, so
+                    // a change in either voids the whole prefix.
+                    system_digest = %format!("{sys:016x}"),
+                    tools_digest = %format!("{tools:016x}"),
+                    markers = %markers,
+                    breakpoints = breakpoints,
+                    // Cross-turn stability of the forwarded messages. Within-turn
+                    // rewrites are expected and harmless if deterministic; only a
+                    // ladder checkpoint that moves between turns costs cache.
+                    prefix_ladder = %prefix_digest_ladder(&body_to_send).unwrap_or_default(),
+                    beta_digest = %short_hash(beta),
+                    // Which account sent the turn. The provider's cache is per
+                    // credential, so a `/login` account switch recaches every
+                    // live conversation — legitimate, but indistinguishable
+                    // from waste unless it is recorded. Hashed, never the key.
+                    auth_digest = %headers_snapshot
+                        .as_ref()
+                        .and_then(|h| h.get("authorization").or_else(|| h.get("x-api-key")))
+                        .and_then(|v| v.to_str().ok())
+                        .map(short_hash)
+                        .unwrap_or_default(),
+                    msgs = serde_json::from_slice::<serde_json::Value>(&body_to_send)
+                        .ok()
+                        .and_then(|v| v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()))
+                        .unwrap_or(0),
+                    "cache-key inputs of the request as forwarded"
+                );
+            }
+        }
+
+        // A within-turn preamble check lived here and was removed: it compared
+        // post-replay against post-transform bytes, and the tool prune, schema
+        // compaction and stable-order stages all run in that gap by design, so
+        // it fired on 44 of 44 turns while proving only that they ran. What the
+        // cache actually depends on is whether the *forwarded* preamble differs
+        // between turns, which `turn_cache_fingerprint` records above. Measured
+        // over 41 consecutive pairs, `tools_digest` and `system_digest` changed
+        // zero times, so the stages are deterministic and the preamble is not a
+        // recache source.
+
+        if let (Some(before), Some(after)) = (
+            post_replay_digests.as_ref(),
+            request_api_kind.and_then(|_| message_digests(&body_to_send)),
+        ) {
+            // The per-message content check that lived here was removed for the
+            // same reason as the preamble one: comparing within a turn fires for
+            // every deterministic stage that runs after replay, and all of them
+            // are. It named image optimization rewriting message 2 on every turn
+            // of a conversation — real, and harmless, because
+            // `optimize_content_block_cached` is a pure function of the image
+            // bytes (`tile_optimizer.rs:405`), so the same bytes forward each
+            // turn. Cross-turn stability is the property that matters and
+            // `prefix_ladder` measures it.
+            //
+            // A change in message *count* is still worth a warning: it shifts
+            // every later message regardless of what any stage computed.
+            if before.len() != after.len() {
+                tracing::warn!(
+                    event = "forwarded_prefix_length_changed_after_replay",
+                    request_id = %request_id,
+                    messages_before = before.len(),
+                    messages_after = after.len(),
+                    "a stage after prefix replay added or removed messages"
+                );
+            }
         }
 
         retry_body = Some(body_to_send.clone());
@@ -5767,6 +5869,144 @@ fn describe_upstream_error(body: &[u8]) -> (String, String) {
 /// `content-type` against `text/event-stream` (with optional
 /// parameters). RFC 7231 §3.1.1.1: media types compare
 /// case-insensitive on the type/subtype tokens.
+/// One cheap digest per message, in order.
+///
+/// Used to check a single invariant inside one request: whatever the prefix
+/// replay spliced in must still be there when the bytes go out. Everything
+/// between those two points — breakpoint placement, memory injection, context
+/// injection, PAYG rewrites — is supposed to leave the settled prefix alone,
+/// and nothing verified that it did.
+///
+/// Returns `None` for a body without a `messages` array, which is not the
+/// shape this checks.
+/// Every property of the forwarded request that the provider's cache key
+/// depends on, in one line, so the residue can be diffed turn-against-turn
+/// offline instead of needing a separate instrument per hypothesis.
+///
+/// Returns `(model, marker_map, breakpoints)`. `marker_map` names each
+/// `cache_control` position and its TTL — `sys:1h,m12:1h,m30:5m` — because a
+/// breakpoint that moves behind the settled prefix, or a fifth one that pushes
+/// an earlier one out, kills the read while every byte still matches.
+fn cache_key_fingerprint(body: &[u8]) -> Option<(String, String, usize)> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let model = parsed
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("?")
+        .to_string();
+
+    let ttl_of = |v: &serde_json::Value| {
+        v.get("cache_control")
+            .and_then(|c| c.get("ttl"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("5m")
+            .to_string()
+    };
+    let mut marks: Vec<String> = Vec::new();
+    let mut scan = |label: String, container: Option<&serde_json::Value>| {
+        let Some(blocks) = container.and_then(|c| c.as_array()) else {
+            return;
+        };
+        for (i, b) in blocks.iter().enumerate() {
+            if b.get("cache_control").is_some() {
+                marks.push(format!("{label}[{i}]:{}", ttl_of(b)));
+            }
+        }
+    };
+    scan("sys".into(), parsed.get("system"));
+    scan("tools".into(), parsed.get("tools"));
+
+    if let Some(msgs) = parsed.get("messages").and_then(|m| m.as_array()) {
+        for (i, m) in msgs.iter().enumerate() {
+            if m.get("cache_control").is_some() {
+                marks.push(format!("m{i}:{}", ttl_of(m)));
+            }
+            if let Some(blocks) = m.get("content").and_then(|c| c.as_array()) {
+                for (j, b) in blocks.iter().enumerate() {
+                    if b.get("cache_control").is_some() {
+                        marks.push(format!("m{i}.{j}:{}", ttl_of(b)));
+                    }
+                }
+            }
+        }
+    }
+    let count = marks.len();
+    Some((model, marks.join(","), count))
+}
+
+/// Cumulative digests of the forwarded message prefix at doubling depths —
+/// `1:a1b2,2:c3d4,4:...,8:...`. Two turns of one conversation share every
+/// checkpoint up to the point where their forwarded bytes first differ, so the
+/// smallest depth whose digest moved localizes the divergence without logging
+/// a digest per message.
+///
+/// This is the one property the whole cache rests on: the forwarded prefix is
+/// byte-stable turn over turn, except for the tail this turn appends.
+fn prefix_digest_ladder(body: &[u8]) -> Option<String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = parsed.get("messages")?.as_array()?;
+    let mut hasher = DefaultHasher::new();
+    let mut out = Vec::new();
+    let mut depth = 1usize;
+    for (i, m) in messages.iter().enumerate() {
+        cache_stabilization::prefix_replay::canonicalize_for_prefix_compare(m)
+            .to_string()
+            .hash(&mut hasher);
+        if i + 1 == depth {
+            out.push(format!("{depth}:{:04x}", hasher.finish() & 0xffff));
+            depth *= 2;
+        }
+    }
+    Some(out.join(","))
+}
+
+/// Digests of the two fields that precede every message in the provider's
+/// cached prefix. A change to either kills the whole cache, and no message
+/// digest can see it — `tools` and `system` are rewritten by four stages that
+/// run after the replay stage (`maybe_prune_tools`, `maybe_compact_tool_
+/// schemas`, the stable tool order pass, and `maybe_inject_context_management`).
+fn preamble_digests(body: &[u8]) -> Option<(u64, u64)> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let digest = |v: Option<&serde_json::Value>| {
+        let mut hasher = DefaultHasher::new();
+        match v {
+            Some(v) => {
+                cache_stabilization::prefix_replay::canonicalize_for_prefix_compare(v)
+                    .to_string()
+                    .hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+        hasher.finish()
+    };
+    Some((digest(parsed.get("system")), digest(parsed.get("tools"))))
+}
+
+fn message_digests(body: &[u8]) -> Option<Vec<u64>> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = parsed.get("messages")?.as_array()?;
+    Some(
+        messages
+            .iter()
+            .map(|m| {
+                let mut hasher = DefaultHasher::new();
+                // The same projection prefix replay compares on, not the raw
+                // bytes. `maybe_push_tail_breakpoint` moves the cache_control
+                // marker after the replay stage on nearly every turn, and the
+                // provider's prefix key ignores it — hashing it raw reports a
+                // mutation on almost every request and hides real ones.
+                cache_stabilization::prefix_replay::canonicalize_for_prefix_compare(m)
+                    .to_string()
+                    .hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect(),
+    )
+}
+
 /// First 12 hex chars of the SHA-256 of `value`. Enough to tell two prefixes
 /// apart in a log without carrying their bytes.
 fn short_hash(value: &str) -> String {
