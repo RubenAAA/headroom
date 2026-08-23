@@ -508,6 +508,13 @@ impl ReplaySkipEvidence {
 #[derive(Debug, Clone)]
 struct PendingRequest {
     conversation_key: String,
+    /// Another turn of this same conversation was still in flight when this
+    /// one began.
+    ///
+    /// Read from the pending map rather than from timestamps: this machine's
+    /// wall clock steps backwards under load, and the map already knows the
+    /// answer exactly.
+    concurrent_with_in_flight: bool,
     /// The *drift detector's* session hash, parked verbatim so a recache
     /// event joins to the drift and volatile events on the same request.
     /// It must be `drift_detector::session_key_log_prefix(session_key)` and
@@ -575,6 +582,7 @@ fn recache_attribution<'a>(
     replay_skip: Option<ReplaySkipEvidence>,
     replay_applied: Option<ReplayAppliedEvidence>,
     previous_turn_diverged: bool,
+    concurrent_with_in_flight: bool,
 ) -> RecacheAttribution<'a> {
     if replay_skip.is_some_and(ReplaySkipEvidence::is_inbound_tail_replacement) {
         return RecacheAttribution {
@@ -632,6 +640,27 @@ fn recache_attribution<'a>(
     // messages (see `overlay_survives_moved_cache_control_marker`). Blaming the
     // provider here would assert something the evidence does not carry, and
     // that misreading is what sends people hunting a provider bug.
+    // Another turn of this conversation was still running when this one
+    // started, so the write it should have read may not have been committed
+    // yet. Measured over the 2026-08-20/22 logs: 72% of overlapping turn-pairs
+    // lose cache against a ~5% baseline, 377 pairs and 408,980 tokens, and 374
+    // of them had a prefix replay applied — the splice was right, the timing
+    // was not.
+    //
+    // Still counted as waste. The tokens were genuinely re-billed, and calling
+    // it expected would retire 409k tokens into a bucket nobody looks at; if
+    // the fan-out that causes it turns out to be avoidable, that is a saving,
+    // not a fact of life. Checked after every structural cause, so a real edit
+    // still wins the attribution.
+    if reason.is_none() && concurrent_with_in_flight {
+        return RecacheAttribution {
+            reason: Some("concurrent_turn_in_flight"),
+            origin: Some("client"),
+            scope: Some("provider_cache_timing"),
+            counts_as_waste: true,
+        };
+    }
+
     if reason.is_none() && replay_applied.is_some() {
         // The turn before this one diverged. That is a cause, and naming it
         // keeps a divergence's aftershock out of the residual bucket — the
@@ -879,9 +908,17 @@ impl UsageObserver {
         drift_dims: Option<String>,
         prefix: Option<PrefixFingerprint>,
     ) {
-        self.lock().pending.put(
+        let mut inner = self.lock();
+        // Anything else already running under this key means the provider may
+        // not have committed that turn's cache write yet.
+        let concurrent_with_in_flight = inner
+            .pending
+            .iter()
+            .any(|(_, p)| p.conversation_key == conversation_key);
+        inner.pending.put(
             request_id.to_string(),
             PendingRequest {
+                concurrent_with_in_flight,
                 conversation_key,
                 session_key_hash,
                 drift_dims,
@@ -1178,6 +1215,8 @@ impl UsageObserver {
             idle_gap,
             previous_forwarded_request_bytes,
             previous_turn_diverged,
+            matched_stream_msgs,
+            streams_tracked,
         ) = {
             if inner.conversations.get(&pending.conversation_key).is_none() {
                 inner
@@ -1189,6 +1228,37 @@ impl UsageObserver {
                 .get_mut(&pending.conversation_key)
                 .expect("just inserted");
             let matched = match_stream(streams, turn_msgs);
+            // A turn shorter than every tracked stream matches nothing and is
+            // filed `FirstTurn`, which reports no waste however much the
+            // provider re-wrote. That is right for a subagent forking off a
+            // shared opener — it had no prefix to reuse — and wrong for
+            // anything that shortened a conversation it meant to continue.
+            //
+            // The two are indistinguishable from here, so this does not guess:
+            // it makes the case countable. Silence was the problem; a turn that
+            // re-wrote a large prefix and reported nothing looked identical to
+            // a turn that cost nothing.
+            if matched.is_none() && !streams.is_empty() {
+                tracing::info!(
+                    event = "cache_stream_unmatched",
+                    request_id = %request_id,
+                    conversation_key = %pending.conversation_key,
+                    turn_msgs = turn_msgs.unwrap_or(0),
+                    longest_tracked = streams.iter().filter_map(|r| r.msgs).max().unwrap_or(0),
+                    streams_tracked = streams.len(),
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    "turn was shorter than every tracked stream; booked as a \
+                     first turn, so its cache write is not counted as waste"
+                );
+            }
+            // Which stream this turn was paired against, carried out so the
+            // booking event can name it. Without this a recache says only that
+            // the numbers did not add up, never which prefix the arithmetic
+            // was done against — and with up to 8 streams per key, that is the
+            // difference between a finding and an argument.
+            let matched_stream_msgs = matched.and_then(|i| streams[i].msgs);
+            let streams_tracked = streams.len();
             let outcome = match matched {
                 None => (TurnClass::FirstTurn, 0, Duration::ZERO, None, false),
                 Some(i) => {
@@ -1243,7 +1313,16 @@ impl UsageObserver {
                     streams.push(record);
                 }
             }
-            outcome
+            let (class, expected, gap, bytes, diverged) = outcome;
+            (
+                class,
+                expected,
+                gap,
+                bytes,
+                diverged,
+                matched_stream_msgs,
+                streams_tracked,
+            )
         };
 
         match class {
@@ -1265,6 +1344,11 @@ impl UsageObserver {
                     request_id = %request_id,
                     conversation_key = %pending.conversation_key,
                     session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                    // Which tracked stream the arithmetic was done against.
+                    // `-1` = matched nothing, so this was booked a first turn.
+                    matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+                    turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+                    streams_tracked = streams_tracked,
                     cache_creation_input_tokens = cache_creation_input_tokens,
                     idle_seconds = idle_gap.as_secs(),
                     "prefix re-written after cache TTL expiry (idle > 5 min); expected, not a defect"
@@ -1279,6 +1363,7 @@ impl UsageObserver {
                     pending.replay_skip,
                     pending.replay_applied,
                     previous_turn_diverged,
+                    pending.concurrent_with_in_flight,
                 );
                 let charged_wasted_tokens = if attribution.counts_as_waste {
                     wasted_tokens
@@ -1345,6 +1430,11 @@ impl UsageObserver {
                         request_id = %request_id,
                         conversation_key = %event.conversation_key,
                         session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                        // Which tracked stream the arithmetic was done against.
+                        // `-1` = matched nothing, so this was booked a first turn.
+                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+                        streams_tracked = streams_tracked,
                         drift_dims = event.drift_dims.as_deref().unwrap_or(""),
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         // `-1` for "not a divergence". The index says how much
@@ -1382,6 +1472,11 @@ impl UsageObserver {
                         request_id = %request_id,
                         conversation_key = %event.conversation_key,
                         session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                        // Which tracked stream the arithmetic was done against.
+                        // `-1` = matched nothing, so this was booked a first turn.
+                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+                        streams_tracked = streams_tracked,
                         drift_dims = event.drift_dims.as_deref().unwrap_or(""),
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         attribution_reason = "inbound_tail_replaced",
@@ -1403,6 +1498,11 @@ impl UsageObserver {
                         request_id = %request_id,
                         conversation_key = %event.conversation_key,
                         session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                        // Which tracked stream the arithmetic was done against.
+                        // `-1` = matched nothing, so this was booked a first turn.
+                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+                        streams_tracked = streams_tracked,
                         attribution_reason = "unexplained_after_replay",
                         origin = "unknown",
                         scope = "replayed_prefix",
@@ -1440,6 +1540,11 @@ impl UsageObserver {
                         request_id = %request_id,
                         conversation_key = %event.conversation_key,
                         session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                        // Which tracked stream the arithmetic was done against.
+                        // `-1` = matched nothing, so this was booked a first turn.
+                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+                        streams_tracked = streams_tracked,
                         drift_dims = "",
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         attribution_reason = "",
@@ -1548,7 +1653,7 @@ mod tests {
 
     #[test]
     fn a_turn_after_a_divergence_names_the_previous_turn() {
-        let a = recache_attribution(None, None, None, Some(applied_evidence()), true);
+        let a = recache_attribution(None, None, None, Some(applied_evidence()), true, false);
         assert_eq!(a.reason, Some("aftershock_of_diverged_prefix"));
         assert_eq!(a.origin, Some("previous_turn"));
         assert!(a.counts_as_waste, "the rewrite is still real waste");
@@ -1556,9 +1661,44 @@ mod tests {
 
     #[test]
     fn without_a_previous_divergence_the_residual_stays_unexplained() {
-        let a = recache_attribution(None, None, None, Some(applied_evidence()), false);
+        let a = recache_attribution(None, None, None, Some(applied_evidence()), false, false);
         assert_eq!(a.reason, Some("unexplained_after_replay"));
         assert_eq!(a.origin, Some("unknown"));
+    }
+
+    /// A turn that began while another turn of the same conversation was still
+    /// running gets its own name, and still counts as waste.
+    ///
+    /// Measured over the 2026-08-20/22 logs: 72% of overlapping turn-pairs lose
+    /// cache against a ~5% baseline — 377 pairs, 408,980 tokens — and 374 of
+    /// them had a replay applied, so the splice was right and only the timing
+    /// was wrong. Before this they landed in `unexplained_after_replay`, which
+    /// is where a cause goes to be forgotten.
+    #[test]
+    fn a_turn_racing_its_own_conversation_is_named_but_still_billed() {
+        let a = recache_attribution(None, None, None, Some(applied_evidence()), false, true);
+        assert_eq!(a.reason, Some("concurrent_turn_in_flight"));
+        assert_eq!(a.origin, Some("client"));
+        assert!(
+            a.counts_as_waste,
+            "the tokens were re-billed; calling this expected would retire 409k \
+             tokens into a bucket nobody reads"
+        );
+    }
+
+    /// Concurrency is the explanation of last resort. A structural cause the
+    /// evidence actually names must win, or a real edit hides behind a race.
+    #[test]
+    fn a_named_cause_outranks_concurrency() {
+        let a = recache_attribution(
+            Some("system"),
+            None,
+            None,
+            Some(applied_evidence()),
+            false,
+            true,
+        );
+        assert_eq!(a.reason, Some("system"));
     }
 
     #[test]
@@ -1571,6 +1711,7 @@ mod tests {
             Some("tools,messages[0]"),
             None,
             Some(applied_evidence()),
+            false,
             false,
         );
         assert_eq!(a.reason, Some("tools,messages[0]"));
@@ -1588,6 +1729,7 @@ mod tests {
             Some("system,tools"),
             None,
             Some(applied_evidence()),
+            false,
             false,
         );
         assert_eq!(a.reason, Some("system"));
@@ -1612,7 +1754,7 @@ mod tests {
             Some(&prior),
             &current,
         );
-        let a = recache_attribution(None, None, Some(skip), Some(applied_evidence()), true);
+        let a = recache_attribution(None, None, Some(skip), Some(applied_evidence()), true, false);
         assert_eq!(a.reason, Some("prefix_content_diverged"));
     }
 
@@ -2599,6 +2741,54 @@ mod prefix_on_recache_event_tests {
             .find(|l| l.contains("attribution_reason=unexplained_after_replay"))
             .unwrap_or_else(|| panic!("no unexplained event; captured:\n{joined}"));
         assert!(line.contains("replay_skipped=no_previous_turn"), "{line}");
+    }
+
+    /// A turn shorter than every tracked stream is booked a first turn and
+    /// reports no waste. That may be right — a subagent forking off a shared
+    /// opener had no prefix to reuse — but it is silent either way, and
+    /// silence was how a re-written prefix came to look free. The event does
+    /// not judge the turn; it makes the case countable.
+    #[test]
+    fn a_turn_shorter_than_every_stream_is_named_not_swallowed() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+
+        let fp = |msgs: usize| PrefixFingerprint {
+            head: "hhhhhhhhhhhhhhhh".into(),
+            body: "dddddddddddddddd".into(),
+            stable: "ssssssssssssssss".into(),
+            stable_msgs: msgs,
+        };
+
+        tracing::subscriber::with_default(sub, || {
+            let obs = UsageObserver::new();
+            obs.begin_request("s1", "conv-short".into(), None, None, Some(fp(40)));
+            obs.complete("s1", 10_000, 30_000, 41_000, None);
+            // Half the length: matches nothing, so no waste is reported
+            // however much the provider re-wrote.
+            obs.begin_request("s2", "conv-short".into(), None, None, Some(fp(20)));
+            obs.complete("s2", 0, 25_000, 26_000, None);
+        });
+
+        let joined = cap.lock().unwrap().fields.join("\n");
+        let line = joined
+            .lines()
+            .find(|l| l.contains("cache_stream_unmatched"))
+            .unwrap_or_else(|| panic!("no unmatched event; captured:\n{joined}"));
+        assert!(line.contains("turn_msgs=20"), "{line}");
+        assert!(line.contains("longest_tracked=40"), "{line}");
+        assert!(line.contains("cache_creation_input_tokens=26000"), "{line}");
+        // The first turn had nothing to match against and is not the case
+        // this event is for.
+        assert_eq!(
+            joined
+                .lines()
+                .filter(|l| l.contains("cache_stream_unmatched"))
+                .count(),
+            1,
+            "{joined}"
+        );
     }
 
     /// A turn parked without a fingerprint must not print a stale or invented
