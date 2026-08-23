@@ -810,13 +810,28 @@ where
                     );
                 }
             }
-            tracing::warn!(
-                request_id = %ctx.request_id,
-                unresolved_proxy_tool = dropped[DropReason::UnresolvedProxyTool as usize],
-                continuation_thinking = dropped[DropReason::ContinuationThinking as usize],
-                already_streamed = dropped[DropReason::AlreadyStreamed as usize],
-                "ccr: dropping blocks the client must not receive from a streamed turn"
-            );
+            // Only an unresolved proxy tool is a fault. The other two are the
+            // splice working: a continuation round's thinking and a block the
+            // client already has must not go out twice. Measured over
+            // 2026-08-23, 209 of 215 events were continuation thinking alone,
+            // which drowned the 2 that mattered.
+            if dropped[DropReason::UnresolvedProxyTool as usize] > 0 {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    unresolved_proxy_tool = dropped[DropReason::UnresolvedProxyTool as usize],
+                    continuation_thinking = dropped[DropReason::ContinuationThinking as usize],
+                    already_streamed = dropped[DropReason::AlreadyStreamed as usize],
+                    "ccr: dropped a proxy tool call the client expected; the turn \
+                     promises a tool_use block that will not arrive"
+                );
+            } else {
+                tracing::debug!(
+                    request_id = %ctx.request_id,
+                    continuation_thinking = dropped[DropReason::ContinuationThinking as usize],
+                    already_streamed = dropped[DropReason::AlreadyStreamed as usize],
+                    "ccr: dropping blocks the client must not receive from a streamed turn"
+                );
+            }
         }
 
         // A proxy tool we could not resolve is dropped above, but the turn
