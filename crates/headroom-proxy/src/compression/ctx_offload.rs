@@ -93,6 +93,36 @@ pub struct CtxOffloadConfig {
     ///
     /// [`headroom_core::tool_exclusion::is_verbatim_excluded`] still applies at
     /// any distance: those results break when their bytes change at all.
+    ///
+    /// # This band is inert while prefix replay is on
+    ///
+    /// Measured 2026-08-24 over a 2,649-request capture. Offload runs at
+    /// `proxy.rs:3144` and `apply_prefix_replay` at `proxy.rs:3995`, and
+    /// `overlay_cached_prefix` takes its prefix from
+    /// `previous_forwarded_messages`, so any conversion this band makes inside
+    /// the replayed prefix is thrown away before the body goes upstream.
+    ///
+    /// The two never overlap. 96% of turns add two or three messages, so the
+    /// fresh tail is two or three deep, while the band starts at
+    /// `stale_margin` = 4. Across consecutive forwarded turns, 10,235 eligible
+    /// blocks stayed un-offloaded and exactly **one** converted late.
+    ///
+    /// Lowering the margin does not rescue it. `tool_result` blocks land on
+    /// even distances, distance 0 is the live zone that must stay verbatim, and
+    /// distance 2 is unreplayed only on the 27% of turns adding three messages.
+    /// 253 of 10,485 eligible sightings (2.3MB of 101.5MB) ever sit where a
+    /// conversion would survive.
+    ///
+    /// Converting the rest means paying a rebuild, and it does not pay back:
+    /// re-creating a median 108,911 tokens to free 5,257 breaks even after 125
+    /// turns against a median conversation of 58. Four of 18 conversations with
+    /// a backlog would have repaid it.
+    ///
+    /// `bench/cachesim.py` cannot price this — it applies a strategy uniformly
+    /// to the client body and models no replay, so `stale_margin` 1 and 4 score
+    /// byte-identical there. Its 5.6pp "headroom" for offloading the backlog is
+    /// a counterfactual where the block was never forwarded verbatim, which no
+    /// setting reaches.
     pub stale_margin: usize,
     /// How many messages past `stale_margin` a first conversion may happen on an
     /// ordinary turn instead of waiting for a rebuild boundary. `0` waits
