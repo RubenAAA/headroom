@@ -98,10 +98,35 @@ const MIN_CACHED_TOKENS: u64 = 1024;
 ///
 /// Sized against real fan-out, not a guess: a `capture-beta` run puts 8 subagents
 /// on one session, and each needs its own prefix or it busts the cache on every
-/// turn it takes. 16 leaves room for that plus the parent and a few more
-/// without the ceiling ever being the thing that bites. The count alone is not
-/// the real bound — see [`MAX_ALTERNATE_MESSAGES`].
-const MAX_ALTERNATE_PREFIXES: usize = 16;
+/// turn it takes. The count alone is not the real bound — see
+/// [`MAX_ALTERNATE_MESSAGES`].
+///
+/// Was 16, which made this the *only* bound that ever bit. Measured
+/// 2026-08-23: a main conversation is dropped after exactly 17 subagent turns
+/// while the store holds 480 messages against a 4,000 budget — 12% of the
+/// bound that was supposed to govern. Eviction takes the least-recently-
+/// displaced entry, and a main conversation waiting on a fan-out is precisely
+/// that, so the largest and most expensive prefix in the store was the first
+/// one thrown away. In the 2026-08-20/22 logs, 51 turns found no stream leading
+/// them and re-cached 2.59M tokens, 5.6% of all cache creation, ~50k a turn.
+///
+/// This is a memory backstop, not a policy: it exists only to bound per-entry
+/// `Vec` overhead across a 1000-session store, and it must never be the thing
+/// that decides which stream survives. That job belongs to
+/// [`MAX_ALTERNATE_MESSAGES`], which bounds the actual weight — the count does
+/// not change how much is held.
+///
+/// Sized so it cannot bind in practice rather than picked round. Distinct
+/// streams per session over the same logs: median 0, p90 4, p95 6, p99 11, max
+/// 29; two sessions of 344 (0.58%) went past 16 and none past 32. 128 is 4.4x
+/// the observed maximum. Above roughly 40 streams the message budget takes over
+/// on any realistic prefix length (128 streams of 30 messages is 3,840, already
+/// at the 4,000 budget), so the backstop stays out of the way by construction.
+///
+/// If a session ever does hit this ceiling, that is worth knowing rather than
+/// absorbing: `prefix_replay_no_stream_leads_turn` prints both bounds so the
+/// binding one can be read straight off the event.
+const MAX_ALTERNATE_PREFIXES: usize = 128;
 
 /// The bound that actually matters: total messages held across a session's
 /// alternate prefixes.
@@ -2038,22 +2063,54 @@ impl PrefixReplayTracker {
             self.alternates.retain(|(_, o, _)| o != &displaced.1);
             self.alternates.insert(0, displaced);
             let held_before_caps = self.alternates.len();
-            self.alternates.truncate(MAX_ALTERNATE_PREFIXES);
-            // Then trim to the message budget, dropping the
-            // least-recently-displaced first. A stream that keeps taking turns
-            // is promoted back to primary on each one, so what falls off the
-            // end is what has actually gone quiet.
+            // Spend the budget on the streams most likely to come back for it.
+            //
+            // Recency alone used to decide this, on the reasoning that what
+            // falls off the end has gone quiet. It does not: an entry's
+            // position records how many *other* streams have taken a turn
+            // since, so a parent waiting on a fan-out ages exactly as fast as
+            // one that has finished, and it is the largest and costliest entry
+            // held. That is how a 300-message conversation came to be evicted
+            // by 30-message subagents.
+            //
+            // Size is the better predictor, and measurably so. Over the
+            // 2026-08-20/22 logs, the chance a stream ever takes another turn
+            // rises monotonically with how much it has cached: 0% under 10k
+            // tokens, 16% at 10-30k, 51% at 30-60k, 76% at 60-120k, 92% above
+            // that (n=1,080, log-log r=0.54). Since the budget is counted in
+            // messages and tokens track messages, value per unit of budget is
+            // just that probability — so the budget belongs to the big streams,
+            // and dropping a small one costs almost nothing.
+            //
+            // Recency still breaks ties, so among equals the freshest wins.
+            let mut order: Vec<usize> = (0..self.alternates.len()).collect();
+            order.sort_by_key(|&i| (std::cmp::Reverse(self.alternates[i].1.len()), i));
             let mut held = 0usize;
-            let mut keep = 0usize;
-            for (_, orig, _) in &self.alternates {
-                let next = held.saturating_add(orig.len());
-                if keep > 0 && next > MAX_ALTERNATE_MESSAGES {
+            let mut keep = vec![false; self.alternates.len()];
+            let mut kept = 0usize;
+            for &i in &order {
+                let size = self.alternates[i].1.len();
+                if kept >= MAX_ALTERNATE_PREFIXES {
                     break;
                 }
+                let next = held.saturating_add(size);
+                // Skip rather than stop: a smaller stream can still fit in the
+                // room a rejected larger one left behind. Always keep one, even
+                // if it alone is over budget, so a session is never left with
+                // nothing to replay against.
+                if kept > 0 && next > MAX_ALTERNATE_MESSAGES {
+                    continue;
+                }
                 held = next;
-                keep += 1;
+                keep[i] = true;
+                kept += 1;
             }
-            self.alternates.truncate(keep);
+            let mut seen = 0usize;
+            self.alternates.retain(|_| {
+                let keeping = keep[seen];
+                seen += 1;
+                keeping
+            });
             // An evicted stream busts on its next turn and cannot say why — it
             // reports a miss with no stored prefix to name. The drop is the only
             // place it can be counted, and whether either cap is worth raising
@@ -2545,11 +2602,49 @@ impl SessionReplayStore {
             // overlay to report against, but the chain id is 0: this turn
             // continues none of them, and saying otherwise would put two
             // unrelated runs of turns under one name.
-            None => Ok((
-                tracker.last_original_messages.clone(),
-                tracker.last_forwarded_messages.clone(),
-                0,
-            )),
+            None => {
+                // This arm is where the money goes. Measured over the
+                // 2026-08-20/22 logs it took 51 turns — 0.36% of traffic — and
+                // 2.59M tokens of cache creation, 5.6% of the total, at ~50k
+                // per turn. Every one of them re-cached a large prefix because
+                // the store held nothing that led the turn.
+                //
+                // Three things produce that and they need opposite answers: a
+                // genuinely new stream (correct, nothing to do), a stream whose
+                // entry was evicted under the alternates caps (raise a cap), and
+                // one that agreed for a long run and then broke (a real
+                // divergence). Only the longest agreeing run tells them apart,
+                // so it is computed here, on a path that already declined.
+                let best_agreement = std::iter::once(&tracker.last_original_messages)
+                    .chain(tracker.alternates.iter().map(|(_, o, _)| o))
+                    .map(|o| canonical_agreement_len(o, &canonical_current))
+                    .max()
+                    .unwrap_or(0);
+                tracing::info!(
+                    event = "prefix_replay_no_stream_leads_turn",
+                    alternates_held = tracker.alternates.len(),
+                    held_messages = tracker
+                        .alternates
+                        .iter()
+                        .map(|(_, o, _)| o.len())
+                        .sum::<usize>(),
+                    primary_prefix_msgs = tracker.last_original_messages.len(),
+                    current_msgs = current_originals.len(),
+                    // 0 means no held stream shares even an opening with this
+                    // turn, which is what an eviction or a brand-new stream
+                    // looks like. A long run means identity was nearly there.
+                    best_agreement_msgs = best_agreement,
+                    max_alternate_prefixes = MAX_ALTERNATE_PREFIXES,
+                    max_alternate_messages = MAX_ALTERNATE_MESSAGES,
+                    "no held stream leads this turn; replaying nothing and \
+                     re-caching the prefix"
+                );
+                Ok((
+                    tracker.last_original_messages.clone(),
+                    tracker.last_forwarded_messages.clone(),
+                    0,
+                ))
+            }
         }
     }
 
@@ -4244,6 +4339,89 @@ mod interleaved_stream_tests {
         assert!(
             t.alternates.len() < MAX_ALTERNATE_PREFIXES,
             "the message budget must bite before the count ceiling here"
+        );
+    }
+
+    /// A main conversation must survive a fan-out that outnumbers it.
+    ///
+    /// The defect this pins, measured 2026-08-23: with the count ceiling at 16,
+    /// a long conversation was dropped after exactly 17 subagent turns while
+    /// the store held 480 messages against a 4,000 budget. Eviction takes the
+    /// least-recently-displaced entry and a parent waiting on its subagents is
+    /// exactly that, so the most expensive prefix held was the first discarded.
+    /// Its next turn then found nothing leading it and re-cached the lot —
+    /// worth 2.59M tokens across 51 turns in the 2026-08-20/22 logs.
+    ///
+    /// The ceiling must not be what bites; the message budget must.
+    #[test]
+    fn a_parent_conversation_outlives_a_large_fan_out() {
+        let store = SessionReplayStore::new(8);
+        let main = stream("main", 300);
+        turn(&store, "m1", &main);
+        // 64 streams is 2.2x the busiest session measured over the 2026-08-20/22
+        // logs (max 29 distinct streams, p99 11), each the size of a real
+        // subagent, and 1,920 messages — well inside the 4,000 budget. Neither
+        // bound has any business firing here.
+        for i in 0..64 {
+            turn(&store, &format!("s{i}"), &stream(&format!("sub{i}"), 30));
+        }
+        let mut next = main.clone();
+        next.push(msg("main next turn"));
+        let (_, _, chain_id) = store
+            .previous_turn_for("S", &next)
+            .expect("the parent's prefix must still be held");
+        assert_ne!(
+            chain_id, 0,
+            "the parent was evicted by a fan-out that fits the message budget,              so its next turn re-caches the whole prefix"
+        );
+        let guard = store.trackers.lock().unwrap();
+        let held: usize = guard
+            .peek("S")
+            .expect("tracker")
+            .alternates
+            .iter()
+            .map(|(_, o, _)| o.len())
+            .sum();
+        assert!(
+            held <= MAX_ALTERNATE_MESSAGES,
+            "held {held} messages, budget is {MAX_ALTERNATE_MESSAGES}"
+        );
+        // The count is a memory backstop, not the thing that picks a winner.
+        // If it ever starts binding before the budget, this is the defect
+        // returning under a larger number rather than a fix.
+        assert!(
+            held < MAX_ALTERNATE_MESSAGES,
+            "the message budget must be what bites, never the count ceiling"
+        );
+    }
+
+    /// The case the raised ceiling does not reach: a session that genuinely
+    /// runs out of message budget must spend what is left on the stream most
+    /// likely to want it back.
+    ///
+    /// Measured over the 2026-08-20/22 logs, a stream's chance of ever taking
+    /// another turn climbs with its size — 0% under 10k cached tokens, 92%
+    /// above 120k. Recency ordering spent the budget the other way round,
+    /// evicting the one entry almost certain to return.
+    #[test]
+    fn the_budget_goes_to_the_stream_most_likely_to_return() {
+        let store = SessionReplayStore::new(8);
+        let main = stream("main", 2_000);
+        turn(&store, "m1", &main);
+        // Enough large subagents to blow the budget several times over, each
+        // more recently active than the parent.
+        for i in 0..12 {
+            turn(&store, &format!("s{i}"), &stream(&format!("sub{i}"), 600));
+        }
+        let mut next = main.clone();
+        next.push(msg("main next turn"));
+        let (_, _, chain_id) = store
+            .previous_turn_for("S", &next)
+            .expect("a prefix comes back either way");
+        assert_ne!(
+            chain_id, 0,
+            "the parent was evicted to hold smaller, more recent streams that \
+             are far less likely to take another turn"
         );
     }
 
