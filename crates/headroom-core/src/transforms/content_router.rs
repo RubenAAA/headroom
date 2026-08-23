@@ -3430,7 +3430,7 @@ mod tests {
         let mut config = ContentRouterConfig::default();
         config.enable_smart_crusher = false;
         let content = "[1, 2, 3]";
-        let (compressed, tokens, chain) = apply_strategy(
+        let (compressed, _tokens, chain) = apply_strategy(
             content,
             CompressionStrategy::SmartCrusher,
             &config,
@@ -3733,7 +3733,7 @@ mod tests {
         let mut config = ContentRouterConfig::default();
         config.enable_code_aware = false;
         let content = "function hello() { return 42; }";
-        let (compressed, tokens, chain) = apply_strategy(
+        let (compressed, _tokens, chain) = apply_strategy(
             content,
             CompressionStrategy::CodeAware,
             &config,
@@ -3788,7 +3788,7 @@ mod tests {
         let mut config = ContentRouterConfig::default();
         config.enable_kompress = false;
         let content = "col1,col2,col3\n1,2,3\n4,5,6";
-        let (compressed, tokens, chain) = apply_strategy(
+        let (compressed, _tokens, chain) = apply_strategy(
             content,
             CompressionStrategy::Kompress,
             &config,
@@ -3806,7 +3806,7 @@ mod tests {
         let mut config = ContentRouterConfig::default();
         config.enable_kompress = false;
         let content = "just some plain text content here";
-        let (compressed, tokens, chain) =
+        let (compressed, _tokens, chain) =
             apply_strategy(content, CompressionStrategy::Text, &config, "", None, 1.0);
         // Text maps to Kompress which is disabled → passthrough
         assert_eq!(compressed, content);

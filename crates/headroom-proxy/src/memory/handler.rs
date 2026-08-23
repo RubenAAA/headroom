@@ -1585,7 +1585,7 @@ mod tests {
             use_native_tool: true,
             ..Default::default()
         };
-        let mut h = MemoryHandler::new(config, "test");
+        let h = MemoryHandler::new(config, "test");
         let defs = h.compute_memory_tool_definitions(Provider::Anthropic);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0]["type"], tool_adapter::NATIVE_MEMORY_TOOL_TYPE);
@@ -1597,7 +1597,7 @@ mod tests {
             inject_tools: false,
             ..Default::default()
         };
-        let mut h = MemoryHandler::new(config, "test");
+        let h = MemoryHandler::new(config, "test");
         let defs = h.compute_memory_tool_definitions(Provider::Anthropic);
         assert!(defs.is_empty());
     }

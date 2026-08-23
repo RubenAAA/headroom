@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn batch_context_is_expired() {
-        let mut ctx = BatchContext::new(
+        let ctx = BatchContext::new(
             "b1".to_string(),
             "anthropic".to_string(),
             Duration::from_millis(1),

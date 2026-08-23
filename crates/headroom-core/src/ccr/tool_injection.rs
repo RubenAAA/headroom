@@ -932,7 +932,7 @@ mod tests {
         let hash = &hashes[0];
 
         // Inject tool definition
-        let tool_def = create_ccr_tool_definition("anthropic");
+        let _tool_def = create_ccr_tool_definition("anthropic");
 
         // Simulate LLM calling the retrieve tool
         let tool_call = json!({

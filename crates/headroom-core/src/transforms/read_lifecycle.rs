@@ -1296,7 +1296,7 @@ mod tests {
         let mgr = ReadLifecycleManager::new(config, None);
         let lc = large_content();
 
-        let mut messages = vec![
+        let messages = vec![
             make_anthropic_read("r1", "/src/app.py"),
             make_anthropic_tool_result("r1", &lc),
             // Second read is full-file (no offset/limit) — supersedes partial

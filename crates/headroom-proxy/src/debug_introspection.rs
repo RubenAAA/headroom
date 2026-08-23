@@ -99,7 +99,6 @@ pub fn serialize_ws_sessions_debug(ws_sessions: &WebSocketSessionRegistry) -> se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn collect_runtime_metrics_returns_valid_data() {

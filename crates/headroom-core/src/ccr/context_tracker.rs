@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn calculate_relevance_keyword_overlap() {
-        let mut tracker = ContextTracker::new(None);
+        let tracker = ContextTracker::new(None);
         let context = CompressedContext {
             hash_key: "test".to_string(),
             turn_number: 1,
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn calculate_relevance_substring_bonus() {
-        let mut tracker = ContextTracker::new(None);
+        let tracker = ContextTracker::new(None);
         let context = CompressedContext {
             hash_key: "test".to_string(),
             turn_number: 1,
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn calculate_relevance_tool_name_bonus() {
-        let mut tracker = ContextTracker::new(None);
+        let tracker = ContextTracker::new(None);
         let context = CompressedContext {
             hash_key: "test".to_string(),
             turn_number: 1,
@@ -868,7 +868,7 @@ mod tests {
 
         // Query from ws-a should only find ws-a entries
         let recs = tracker.analyze_query("auth", None, "ws-a");
-        for rec in &recs {
+        for _rec in &recs {
             // All recommendations should be from the requested workspace
             // (format_expansions adds workspace label when multiple workspaces exist)
         }

@@ -146,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn dedup_rejects_duplicate_key() {
         let compressor = BackgroundCompressor::new(10);
-        let noop = Arc::new(AtomicUsize::new(0));
+        let _noop = Arc::new(AtomicUsize::new(0));
 
         let job1 = CompressionJob {
             key: "dup".to_string(),

@@ -239,7 +239,7 @@ mod tests {
         let c1 = candidate(0.5, Some(now - 86400.0 * 5.0)); // 5 days ago
         let c2 = candidate(0.8, Some(now - 86400.0 * 5.0)); // same age, higher cosine
                                                             // With fast decay (1 day), 5-day-old content gets heavily penalized
-        let ranked_fast = fast_decay.rank(&[c1.clone(), c2.clone()]);
+        let _ranked_fast = fast_decay.rank(&[c1.clone(), c2.clone()]);
         // c2 still wins because its cosine is higher, but let's check
         // that the boost factor differs
         let f1_fast = fast_decay.recency_factor(now, Some(now - 86400.0 * 5.0));
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn candidates_not_mutated() {
         let ranker = RecencyBoostRanker::default();
-        let mut candidates = vec![candidate(0.5, Some(now_secs() - 1000.0))];
+        let candidates = vec![candidate(0.5, Some(now_secs() - 1000.0))];
         let original_score = candidates[0].score;
         let _ranked = ranker.rank(&candidates);
         assert_eq!(candidates[0].score, original_score);
