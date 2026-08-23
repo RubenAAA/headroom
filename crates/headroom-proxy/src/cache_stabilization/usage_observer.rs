@@ -594,10 +594,13 @@ fn recache_attribution<'a>(
     }
 
     if let Some(dims) = drift_dims.filter(|dims| !dims.is_empty()) {
+        // The dims come from the inbound hash, taken before the proxy touches
+        // anything, so whatever moved was moved by the client. The dims name
+        // which part of the hot zone it was.
         return RecacheAttribution {
             reason: Some(dims),
-            origin: None,
-            scope: None,
+            origin: Some("client"),
+            scope: Some("hot_zone"),
             counts_as_waste: true,
         };
     }
@@ -680,10 +683,12 @@ fn recache_attribution<'a>(
             counts_as_waste: true,
         };
     }
+    // Every reason left is a replay-skip: the body the client sent no longer
+    // continues the prefix we stored for it, so the store is what went stale.
     RecacheAttribution {
         reason,
-        origin: None,
-        scope: None,
+        origin: reason.map(|_| "client"),
+        scope: reason.map(|_| "stored_prefix"),
         counts_as_waste: true,
     }
 }
@@ -1733,7 +1738,10 @@ mod tests {
             false,
         );
         assert_eq!(a.reason, Some("system"));
-        assert_eq!(a.origin, None);
+        // Named, not blank: the inbound hash moved, and only the client can
+        // move that.
+        assert_eq!(a.origin, Some("client"));
+        assert_eq!(a.scope, Some("hot_zone"));
     }
 
     #[test]
