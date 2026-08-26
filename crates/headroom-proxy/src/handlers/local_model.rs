@@ -340,7 +340,7 @@ async fn apply_ctx_request_transforms(
         crate::cache_stabilization::usage_observer::conversation_key(parsed, &session_key),
         // Same hash the drift detector just logged for this session, so routed
         // recache events join to their drift events like the Claude path's do.
-        Some(crate::cache_stabilization::drift_detector::session_key_log_prefix(&session_key)),
+        Some(session_key.as_str()),
         drift_dims,
         Some(crate::cache_stabilization::usage_observer::prefix_fingerprint(parsed)),
     );

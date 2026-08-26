@@ -515,13 +515,10 @@ struct PendingRequest {
     /// wall clock steps backwards under load, and the map already knows the
     /// answer exactly.
     concurrent_with_in_flight: bool,
-    /// The *drift detector's* session hash, parked verbatim so a recache
-    /// event joins to the drift and volatile events on the same request.
-    /// It must be `drift_detector::session_key_log_prefix(session_key)` and
-    /// nothing else: an earlier attempt logged `hash(conversation_key)` under
-    /// this name, which is a different value that joins to nothing and reads
-    /// as "these events are unrelated". `None` when the request never reached
-    /// the drift gate.
+    /// The *drift detector's* session hash, so a recache event joins to the
+    /// drift and volatile events on the same request. Only
+    /// [`UsageObserver::begin_request`] fills this, and it derives the hash
+    /// itself. `None` when the request never reached the drift gate.
     session_key_hash: Option<String>,
     /// Why prefix replay declined on this turn, when it did. Set after
     /// [`UsageObserver::begin_request`] because the replay decision happens
@@ -905,11 +902,16 @@ impl UsageObserver {
 
     /// Request side: park the conversation key + drift dims under the
     /// request id so [`complete`](Self::complete) can correlate.
+    ///
+    /// Takes the raw `session_key` and hashes it here rather than accepting a
+    /// pre-computed hash. Callers used to pass the digest, and one of them
+    /// passed `hash(conversation_key)` — a different value that joined to
+    /// nothing. There is now no way to hand this the wrong hash.
     pub fn begin_request(
         &self,
         request_id: &str,
         conversation_key: String,
-        session_key_hash: Option<String>,
+        session_key: Option<&str>,
         drift_dims: Option<String>,
         prefix: Option<PrefixFingerprint>,
     ) {
@@ -925,7 +927,8 @@ impl UsageObserver {
             PendingRequest {
                 concurrent_with_in_flight,
                 conversation_key,
-                session_key_hash,
+                session_key_hash: session_key
+                    .map(super::drift_detector::session_key_log_prefix),
                 drift_dims,
                 outbound_drift_dims: None,
                 replay_skip: None,
@@ -2431,7 +2434,7 @@ mod prefix_on_recache_event_tests {
             obs.begin_request(
                 "r1",
                 "conv-x".into(),
-                Some("ssssssssssssssss".into()),
+                Some("sess-x"),
                 Some("tools".into()),
                 Some(fp.clone()),
             );
@@ -2440,7 +2443,7 @@ mod prefix_on_recache_event_tests {
             obs.begin_request(
                 "r2",
                 "conv-x".into(),
-                Some("ssssssssssssssss".into()),
+                Some("sess-x"),
                 Some("tools".into()),
                 Some(fp.clone()),
             );
@@ -2471,8 +2474,9 @@ mod prefix_on_recache_event_tests {
         );
         // The join key. A recache event that cannot be matched to the drift
         // event explaining it is why items 5 and 11 stayed open for a week.
+        let expected = super::super::drift_detector::session_key_log_prefix("sess-x");
         assert!(
-            line.contains("session_key_hash=ssssssssssssssss"),
+            line.contains(&format!("session_key_hash={expected}")),
             "session key missing: {line}"
         );
     }

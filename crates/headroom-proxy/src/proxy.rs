@@ -2914,12 +2914,7 @@ pub(crate) async fn forward_http(
                 state.usage_observer.begin_request(
                     &request_id,
                     conversation,
-                    // The drift detector's own hash, not a re-derivation:
-                    // a recache event is only joinable to the drift event
-                    // that explains it if both print the same value.
-                    Some(cache_stabilization::drift_detector::session_key_log_prefix(
-                        &session_key,
-                    )),
+                    Some(session_key.as_str()),
                     drift_dims,
                     Some(cache_stabilization::usage_observer::prefix_fingerprint(
                         &parsed,
