@@ -39,10 +39,20 @@ impl MemoryInjectionBudget {
         if text.len() <= char_budget {
             return text.to_string();
         }
+        // The budget counts bytes, but a memory entry holds whatever the user
+        // wrote, in any script. Slicing at a byte that falls inside a
+        // multi-byte character panics, and this runs on the request thread —
+        // the task dies, hyper aborts the connection, and the client sees
+        // ECONNRESET and retries into the same memory and the same panic.
+        // Walk back to a boundary first.
+        let mut end = char_budget;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
         // Truncate at the last newline at or before the budget
-        match text[..char_budget].rfind('\n') {
+        match text[..end].rfind('\n') {
             Some(pos) if pos > 0 => text[..pos + 1].to_string(),
-            _ => text[..char_budget].to_string(),
+            _ => text[..end].to_string(),
         }
     }
 
@@ -91,6 +101,40 @@ mod tests {
     }
 
     #[test]
+    /// A memory entry is whatever the user wrote, in any script, and the
+    /// budget counts bytes. This panicked in production: a Cyrillic entry put
+    /// a two-byte character across byte 4096, the slice panicked on the
+    /// request thread, hyper aborted the connection, and the client retried
+    /// into the same memory and the same panic — a reset loop that could not
+    /// clear itself.
+    #[test]
+    fn apply_to_text_cuts_on_a_char_boundary_not_a_byte_count() {
+        let b = MemoryInjectionBudget {
+            max_tokens: 2,
+            ..Default::default()
+        };
+        // Budget is 8 bytes. Four 2-byte characters put a boundary at 8, so
+        // pad by one byte to push a character across it.
+        let text = format!("x{}", "и".repeat(8));
+        let out = b.apply_to_text(&text);
+        assert!(text.starts_with(&out), "the cut must be a prefix");
+        assert!(out.len() <= 8, "cut past the budget: {}", out.len());
+    }
+
+    /// The same, with no ASCII lead-in and no newline to fall back on.
+    #[test]
+    fn apply_to_text_survives_a_multibyte_run_with_no_newline() {
+        let b = MemoryInjectionBudget {
+            max_tokens: 1,
+            ..Default::default()
+        };
+        for pad in 0..4 {
+            let text = format!("{}{}", "x".repeat(pad), "\u{1f600}".repeat(4));
+            let out = b.apply_to_text(&text);
+            assert!(text.starts_with(&out), "pad={pad}");
+        }
+    }
+
     fn apply_to_text_hard_cut_when_no_newline() {
         let b = MemoryInjectionBudget {
             max_tokens: 2,
