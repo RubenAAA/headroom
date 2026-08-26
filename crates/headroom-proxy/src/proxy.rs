@@ -8467,10 +8467,18 @@ pub(crate) async fn handle_ccr_response(
         };
 
         if !resp.status().is_success() {
+            // The status alone does not say which part of the request the
+            // provider refused, and a 4xx here means the body this proxy built
+            // is wrong — so the body of the refusal is the whole diagnosis.
+            // The memory continuation below already logs it; this site did not,
+            // which left every retrieval failure unreadable after the fact.
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
             tracing::warn!(
                 request_id = %request_id,
                 attempts = attempt + 1,
-                status = %resp.status(),
+                status = %status,
+                detail = %detail.chars().take(2000).collect::<String>(),
                 "ccr: upstream returned error during continuation"
             );
             break;
