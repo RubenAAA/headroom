@@ -1998,6 +1998,60 @@ fn maybe_pin_cache_ttl(body: bytes::Bytes, request_id: &str, split: bool) -> byt
     }
 }
 
+/// Count the image blocks in the client's own messages, and the placeholders
+/// left where it has already dropped one.
+///
+/// Claude Code sheds an aged-out image by rewriting its `tool_result` to the
+/// literal `[image]`. That edits a message deep in the prefix, so everything
+/// after it re-caches: 107,003 tokens on 2026-08-24, logged as
+/// `early_messages` drift. Two ways out, and the cheaper one depends on
+/// numbers nobody has: holding the image costs its tokens re-read every
+/// remaining turn, dropping it early costs one rebuild in sessions that might
+/// never have collapsed at all.
+///
+/// So measure before choosing. `image_blocks` is the tax holding would carry,
+/// `collapsed_blocks` marks the turn the client let go, and the gap to the
+/// next rebuild boundary — already in the log as
+/// `prefix_replay_invalidated_on_rebuild` and `no_previous_turn` — is how long
+/// that tax would run. Counting only; nothing here changes what is forwarded.
+fn image_census(messages: &[serde_json::Value]) -> (usize, usize, usize) {
+    let mut images = 0usize;
+    let mut collapsed = 0usize;
+    let mut b64_bytes = 0usize;
+    for message in messages {
+        let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            // An image arrives inside a `tool_result`'s own content array, or
+            // on its own as a top-level block.
+            let inner = block.get("content").and_then(|c| c.as_array());
+            let candidates = inner
+                .map(|v| v.as_slice())
+                .unwrap_or(std::slice::from_ref(block));
+            for candidate in candidates {
+                match candidate.get("type").and_then(|t| t.as_str()) {
+                    Some("image") => {
+                        images += 1;
+                        b64_bytes += candidate
+                            .get("source")
+                            .and_then(|s| s.get("data"))
+                            .and_then(|d| d.as_str())
+                            .map_or(0, str::len);
+                    }
+                    Some("text")
+                        if candidate.get("text").and_then(|t| t.as_str()) == Some("[image]") =>
+                    {
+                        collapsed += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (images, collapsed, b64_bytes)
+}
+
 /// Hold this conversation's working-directory line still, restating the live
 /// directory at the message tail.
 ///
@@ -3072,6 +3126,41 @@ pub(crate) async fn forward_http(
         } else {
             None
         };
+
+        // The client's own bytes, before ctx_offload and the working-directory
+        // hold rewrite them, which is the form whose collapse costs the rebuild.
+        if let Some(messages) = replay_original_messages.as_deref() {
+            let (image_blocks, collapsed_blocks, image_b64_bytes) = image_census(messages);
+            if image_blocks > 0 || collapsed_blocks > 0 {
+                // What makes the client let go of an image is still unknown.
+                // Message count is out: one session collapsed at 235 messages
+                // while another held six images past 385. Prompt size is out
+                // too — 172,658 tokens at the collapse against 230,693 without
+                // one — and so is the fraction of the window, since both of
+                // those sessions ran the 1M context. Record the window anyway,
+                // so the next collapse is judged against something written
+                // down rather than remembered.
+                let beta = headers_snapshot
+                    .as_ref()
+                    .and_then(|h| h.get("anthropic-beta"))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                tracing::info!(
+                    request_id = %request_id,
+                    event = "image_prefix_census",
+                    session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(
+                        &request_session_key
+                    ),
+                    message_count = messages.len(),
+                    image_blocks,
+                    collapsed_blocks,
+                    image_b64_bytes,
+                    context_1m = beta.contains("context-1m"),
+                    anthropic_beta = %beta,
+                    "images the client is carrying in its prefix"
+                );
+            }
+        }
 
         let buffered = if matches!(
             endpoint,
@@ -10619,6 +10708,67 @@ mod waste_signal_wiring_tests {
             crate::observability::proxy_counters::waste_signal_tokens_for_test("html_noise"),
             before
         );
+    }
+}
+
+#[cfg(test)]
+mod image_census_tests {
+    use super::*;
+
+    /// The two forms of the same screenshot: what the client sends when it
+    /// still holds the image, and what it sends once it has let go. Both are
+    /// counted, on their own axis, so the turn the client collapses is visible
+    /// in the log without guessing from a diff.
+    #[test]
+    fn counts_live_images_and_the_placeholders_left_behind() {
+        let messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_live",
+                    "content": [{
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+                    }]
+                }]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_collapsed",
+                    "content": [{"type": "text", "text": "[image]"}]
+                }]
+            }),
+        ];
+
+        assert_eq!(image_census(&messages), (1, 1, 4));
+    }
+
+    /// Ordinary text must not read as either, or every turn logs a census.
+    #[test]
+    fn ignores_text_that_merely_mentions_an_image() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "the [image] above shows the panel"}]
+        })];
+
+        assert_eq!(image_census(&messages), (0, 0, 0));
+    }
+
+    /// A top-level image, not wrapped in a tool_result, still counts.
+    #[test]
+    fn counts_an_image_attached_straight_to_the_message() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image", "source": {"type": "base64", "data": "AAAAAAAA"}}
+            ]
+        })];
+
+        assert_eq!(image_census(&messages), (1, 0, 8));
     }
 }
 
