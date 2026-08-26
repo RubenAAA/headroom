@@ -33,6 +33,22 @@ fn handler(dir: &std::path::Path) -> MemoryHandler {
 
 /// Drive one tool call the way a real turn does: hand the handler an assistant
 /// response carrying the `tool_use`, and read back what it answers with.
+/// [`call`] under an explicit partition key, the way the proxy drives it.
+async fn call_as(
+    handler: &MemoryHandler,
+    user_id: &str,
+    tool: &str,
+    input: serde_json::Value,
+) -> String {
+    let response = json!({
+        "content": [{"type": "tool_use", "id": "t1", "name": tool, "input": input}]
+    });
+    let results = handler
+        .handle_memory_tool_calls(&response, user_id, Provider::Anthropic, None)
+        .await;
+    serde_json::to_string(&results).unwrap()
+}
+
 async fn call(handler: &MemoryHandler, tool: &str, input: serde_json::Value) -> String {
     let response = json!({
         "content": [{"type": "tool_use", "id": "t1", "name": tool, "input": input}]
@@ -282,3 +298,274 @@ async fn a_listed_memory_is_the_one_that_was_saved() {
     );
 }
 
+
+/// A restatement at a DIFFERENT scope must not be merged into.
+///
+/// Project search also reads the shared partition, so a `scope: "project"` save
+/// that restates a global memory used to update the global row and report
+/// "merged". The caller asked for a project memory, got none, and was told the
+/// save had succeeded — observed 2026-08-26 on a acme-notifier fact that merged
+/// at 86% overlap into a global record and stayed unfindable from the project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restatement_at_another_scope_is_not_merged_into() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    // Production hands the handler an ALREADY-scoped user id; `scope: "global"`
+    // then strips the project suffix off it. Both saves therefore run under one
+    // session but land in two partitions, which is the case that broke.
+    let scoped = "default::acme-notifier-9bd76697d7e95fae";
+    let content = "the gitlab token lives in the acme-api env file, not in acme-notifier";
+    let global = call_as(
+        &handler,
+        scoped,
+        "memory_save",
+        json!({"content": content, "scope": "global"}),
+    )
+    .await;
+    assert!(!global.contains("merged"), "nothing to merge into: {global}");
+
+    let project = call_as(
+        &handler,
+        scoped,
+        "memory_save",
+        json!({"content": format!("{content}."), "scope": "project"}),
+    )
+    .await;
+
+    assert!(
+        !project.contains("\"merged\""),
+        "a save must not merge across a scope boundary: {project}"
+    );
+    assert!(
+        project.contains("saved"),
+        "the project-scoped save must actually happen: {project}"
+    );
+    assert!(
+        project.contains("scope_note"),
+        "and must name the neighbour it declined to merge into: {project}"
+    );
+}
+
+/// A fact about a sibling repository can be filed there from here.
+///
+/// Scope follows the session's cwd and a subagent inherits it, so before this
+/// the only way to record a acme-notifier fact from a acme-api session was to
+/// start a second session in the other directory. Observed 2026-08-26.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_project_files_the_memory_under_that_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    // A real repository root, so `ProjectResolver` resolves it the way it
+    // resolves a live session's cwd.
+    let other = dir.path().join("sibling-repo");
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+
+    let here = "default::somewhere-else-0000000000000000";
+    let saved = call_as(
+        &handler,
+        here,
+        "memory_save",
+        json!({"content": "the sibling ships only a yarn.lock, so npm ci fails",
+               "project": other.display().to_string()}),
+    )
+    .await;
+    assert!(saved.contains("saved"), "the save must land: {saved}");
+
+    // Findable from the sibling, and absent from the session that wrote it.
+    let from_sibling = call_as(
+        &handler,
+        &format!(
+            "default::sibling-repo-{}",
+            &sha256_hex(other.to_string_lossy().as_bytes())[..16]
+        ),
+        "memory_search",
+        json!({"query": "yarn.lock npm ci"}),
+    )
+    .await;
+    assert!(
+        from_sibling.contains("yarn.lock"),
+        "the sibling must find its own fact: {from_sibling}"
+    );
+
+    let from_here = call_as(&handler, here, "memory_search", json!({"query": "yarn.lock npm ci"})).await;
+    assert!(
+        !from_here.contains("yarn.lock"),
+        "and the writing session must not keep it: {from_here}"
+    );
+}
+
+/// Naming a project and asking for global at once is a contradiction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_and_a_global_scope_together_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    let out = call(
+        &handler,
+        "memory_save",
+        json!({"content": "anything at all", "project": "/tmp", "scope": "global"}),
+    )
+    .await;
+    assert!(out.contains("error"), "the contradiction must be refused: {out}");
+    assert!(out.contains("contradict"), "and must say why: {out}");
+}
+
+/// A blank `project` is not a request for one — it falls back to the session's
+/// own scope rather than erroring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_project_falls_back_to_the_session_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    let out = call(
+        &handler,
+        "memory_save",
+        json!({"content": "anything at all", "project": "   "}),
+    )
+    .await;
+    // A blank path is no path: it falls back to the session's own scope.
+    assert!(out.contains("saved"), "blank is not a request: {out}");
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn an_entity_filter_drops_the_memories_that_do_not_name_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    call(
+        &handler,
+        "memory_save",
+        json!({
+            "content": "Postgres on the analytics host keeps raw_payloads for 30 days.",
+            "title": "postgres retention",
+            "entities": ["postgres"],
+        }),
+    )
+    .await;
+    call(
+        &handler,
+        "memory_save",
+        json!({
+            "content": "Redis on the analytics host evicts the session cache under memory pressure.",
+            "title": "redis eviction",
+            "entities": ["redis"],
+        }),
+    )
+    .await;
+
+    let both = call(
+        &handler,
+        "memory_search",
+        json!({"query": "analytics host"}),
+    )
+    .await;
+    assert!(
+        both.contains("raw_payloads") && both.contains("session cache"),
+        "both memories must be reachable without a filter; got: {both}"
+    );
+
+    let narrowed = call(
+        &handler,
+        "memory_search",
+        json!({"query": "analytics host", "entities": ["Redis"]}),
+    )
+    .await;
+    assert!(
+        narrowed.contains("session cache"),
+        "the filter must keep the memory that names the entity; got: {narrowed}"
+    );
+    assert!(
+        !narrowed.contains("raw_payloads"),
+        "the filter must drop the memory that does not; got: {narrowed}"
+    );
+}
+
+#[tokio::test]
+async fn an_entity_filter_keeps_an_untagged_memory_that_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    // Saved without any entity tag at all. The model supplies those by hand and
+    // frequently does not, so a filter that trusted the tag alone would lose
+    // the one memory that answers the question.
+    call(
+        &handler,
+        "memory_save",
+        json!({
+            "content": "Clickhouse rejects a nullable column in the sort key.",
+            "title": "clickhouse sort key",
+        }),
+    )
+    .await;
+
+    let narrowed = call(
+        &handler,
+        "memory_search",
+        json!({"query": "sort key", "entities": ["clickhouse"]}),
+    )
+    .await;
+    assert!(
+        narrowed.contains("nullable column"),
+        "a memory that mentions the entity in its text must survive the filter; got: {narrowed}"
+    );
+}
+
+/// Reads the live store. Ignored by default; run with `--ignored` after any
+/// migration that rewrites records on disk.
+#[tokio::test]
+#[ignore]
+async fn the_live_store_still_answers_a_search() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap() + "/.claude-work/context-mode/memory",
+    );
+    if !dir.join("memories.db").exists() {
+        eprintln!("no live store at {}; nothing to check", dir.display());
+        return;
+    }
+    let handler = handler(&dir);
+
+    let found = call_as(
+        &handler,
+        "default::headroom-19c7bd8b32ee09dd",
+        "memory_search",
+        json!({"query": "cache TTL", "top_k": 5}),
+    )
+    .await;
+    eprintln!("live search: {found}");
+    // The tool result nests the payload as an escaped string, so match on that.
+    assert!(
+        found.contains(r#"\"status\":\"found\""#),
+        "the live store must still answer; got: {found}"
+    );
+}
+
+#[tokio::test]
+async fn a_project_path_that_does_not_exist_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = handler(dir.path());
+
+    let out = call(
+        &handler,
+        "memory_save",
+        json!({
+            "content": "The staging warehouse keeps raw events for 14 days.",
+            "title": "staging retention",
+            "project": "~/definitely-not-a-repo-9f3a2b",
+        }),
+    )
+    .await;
+
+    assert!(
+        !out.contains("saved"),
+        "a mistyped project must not open a partition nobody will search: {out}"
+    );
+}

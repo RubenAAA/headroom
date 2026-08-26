@@ -37,6 +37,26 @@ const DEDUP_MERGE_THRESHOLD: f64 = 0.70;
 /// it. Above the 0.397 of the closest distinct real pair, so it stays rare.
 const DEDUP_HINT_THRESHOLD: f64 = 0.45;
 
+/// How many extra rows to pull when `memory_search` filters by entity.
+///
+/// The filter runs over what the backend returned, so the fetch has to be wider
+/// than the answer or the filter just decimates one BM25 page. Four is enough
+/// to survive a filter that keeps a quarter of what it sees and cheap enough
+/// that the widened fetch never dominates the call.
+const ENTITY_FILTER_OVERFETCH: usize = 4;
+
+/// `~/x` → `$HOME/x`. The model writes paths the way the user says them, and
+/// `ProjectResolver` needs a real one.
+fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{}/{rest}", home.trim_end_matches('/')),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
 // ─── Configuration ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -887,8 +907,75 @@ impl MemoryHandler {
         // whichever repository happened to be open when they said it. A global
         // save drops the project suffix and lands in the shared partition that
         // every project's search also reads.
-        let effective_user_id = match input.get("scope").and_then(Value::as_str) {
-            Some("global") => {
+        // An explicit `project` files the memory under a repository other than
+        // the one this session is rooted in. Without it a fact about a sibling
+        // checkout cannot be saved where it belongs: scope follows the session's
+        // cwd, a subagent inherits that cwd, and the only workaround was to
+        // start a second session in the other directory. Observed 2026-08-26 on
+        // a acme-notifier fact written from a acme-api session.
+        //
+        // Resolution goes through `ProjectResolver` rather than composing a key
+        // here, so an explicit path walks up to its repository root exactly as a
+        // session's own cwd does and the two can never disagree.
+        let requested_project = input
+            .get("project")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let scope = input.get("scope").and_then(Value::as_str);
+        if requested_project.is_some() && scope == Some("global") {
+            return serde_json::json!({
+                "status": "error",
+                "error": "`project` and `scope: \"global\"` contradict each other: one files \
+                          the memory under a specific repository, the other under none. \
+                          Drop whichever you did not mean.",
+            })
+            .to_string();
+        }
+        let effective_user_id = match (requested_project, scope) {
+            (Some(path), _) => {
+                let base =
+                    crate::memory::router::shared_partition(&effective_user_id).to_string();
+                let root = expand_home(path);
+                // The resolver hashes whatever it is handed; it never asks the
+                // filesystem. A mistyped path therefore resolves cleanly to a
+                // partition of its own, the save reports success, and nobody
+                // ever searches there again. Fail loudly instead.
+                if !std::path::Path::new(&root).is_dir() {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error": format!(
+                            "`project` path {path:?} is not a directory on this machine, \
+                             so a memory filed under it would be unreachable. \
+                             Check the path."
+                        ),
+                    })
+                    .to_string();
+                }
+                let ctx = RequestContext {
+                    headers: HashMap::new(),
+                    system_prompt: String::new(),
+                    base_user_id: base.clone(),
+                    project_root_override: Some(root),
+                };
+                let scoped = crate::memory::router::scoped_user_id(&base, &ctx);
+                if scoped == base {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error": format!(
+                            "`project` path {path:?} did not resolve to a repository. \
+                             Pass an absolute path to a directory that exists."
+                        ),
+                    })
+                    .to_string();
+                }
+                scoped
+            }
+            // A fact about the user or their tools belongs everywhere, not in
+            // whichever repository happened to be open when they said it. A
+            // global save drops the project suffix and lands in the shared
+            // partition that every project's search also reads.
+            (None, Some("global")) => {
                 crate::memory::router::shared_partition(&effective_user_id).to_string()
             }
             _ => effective_user_id,
@@ -909,8 +996,29 @@ impl MemoryHandler {
             .search_memories(content, &effective_user_id, 5, false)
             .await
             .unwrap_or_default();
+        // Only a duplicate in the SAME partition may be merged into. Project
+        // search also reads the shared partition, so without this a
+        // `scope: "project"` save that restates a global memory updates the
+        // global row and reports "merged" — the caller asked for a project
+        // memory, got none, and was told the save succeeded. Observed
+        // 2026-08-26 on a acme-notifier fact: 86% word overlap, merged into a
+        // global record, and the record kept `entity_refs: []` so no project
+        // search could ever find it.
+        //
+        // A near-duplicate on the other side of the boundary is still worth
+        // saying out loud, so it is named below rather than silently ignored.
+        let cross_scope_neighbour = existing
+            .iter()
+            .find(|r| {
+                r.memory.user_id != effective_user_id
+                    && crate::memory_tail::text_similarity(&r.memory.content, content)
+                        >= DEDUP_MERGE_THRESHOLD
+            })
+            .map(|r| r.memory.id.clone());
         if let Some(dupe) = existing.iter().find(|r| {
-            crate::memory_tail::text_similarity(&r.memory.content, content) >= DEDUP_MERGE_THRESHOLD
+            r.memory.user_id == effective_user_id
+                && crate::memory_tail::text_similarity(&r.memory.content, content)
+                    >= DEDUP_MERGE_THRESHOLD
         }) {
             let merged = if content.len() > dupe.memory.content.len() {
                 content
@@ -979,6 +1087,19 @@ impl MemoryHandler {
             "content": truncate_str(&memory.content, 100),
         });
 
+        // A restatement of something held at a different scope. Merging into it
+        // would have thrown away the scope this save asked for, so a new record
+        // was written — say so, because two rows saying one thing is a cost the
+        // caller should get to weigh.
+        if let Some(other) = cross_scope_neighbour {
+            result["scope_note"] = serde_json::json!(format!(
+                "A memory at a different scope ({other}) says much the same thing. \
+                 It was left alone rather than merged, because merging would have \
+                 filed this fact where you did not ask for it. Delete whichever \
+                 one is redundant."
+            ));
+        }
+
         if let Some(top) = similar.first() {
             // Compared on words, not on `top.score`: that is a BM25 rank, which
             // sits near 0.03 even for identical text, so this hint never fired.
@@ -1039,6 +1160,31 @@ impl MemoryHandler {
             .and_then(Value::as_bool)
             .unwrap_or(true);
 
+        // The schema has advertised `entities` as a filter since this tool
+        // existed, and nothing read it — a caller that narrowed a search got no
+        // narrowing and no way to tell. Wired up 2026-08-26.
+        let wanted_entities: Vec<String> = input
+            .get("entities")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Ask for more than `top_k` when filtering, so the filter narrows the
+        // corpus rather than whatever ten rows BM25 happened to rank first.
+        // Without this, asking for one entity and ten results usually returns
+        // nothing: the ten seeds are chosen before the filter ever runs.
+        let fetch_k = if wanted_entities.is_empty() {
+            top_k
+        } else {
+            top_k.saturating_mul(ENTITY_FILTER_OVERFETCH).max(top_k)
+        };
+
         let (_scope, effective_user_id) = self.resolve_for_request(user_id, request_context);
 
         let backend = match self.backend.as_ref() {
@@ -1050,13 +1196,38 @@ impl MemoryHandler {
         };
 
         let results = match backend
-            .search_memories(query, &effective_user_id, top_k, include_related)
+            .search_memories(query, &effective_user_id, fetch_k, include_related)
             .await
         {
             Ok(r) => r,
             Err(e) => {
                 return serde_json::json!({"status": "error", "error": e.to_string()}).to_string()
             }
+        };
+
+        // Match on the content as well as on `entity_refs`. Tagging is
+        // best-effort — the model supplies those names when it saves, and it
+        // often does not — so filtering on the tag alone would hide a memory
+        // that is plainly about the thing asked for. That is the failure mode
+        // worth engineering against: a filter that silently loses the right
+        // answer is worse than one that keeps a near miss.
+        let results: Vec<_> = if wanted_entities.is_empty() {
+            results.into_iter().collect()
+        } else {
+            results
+                .into_iter()
+                .filter(|r| {
+                    let content = r.memory.content.to_lowercase();
+                    wanted_entities.iter().any(|want| {
+                        content.contains(want)
+                            || r.memory
+                                .entity_refs
+                                .iter()
+                                .any(|have| have.to_lowercase() == *want)
+                    })
+                })
+                .take(top_k)
+                .collect()
         };
 
         serde_json::json!({

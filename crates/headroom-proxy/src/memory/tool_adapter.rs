@@ -67,6 +67,7 @@ pub fn anthropic_custom_tools() -> Vec<Value> {
                 "properties": {
                     "content": {"type": "string", "description": "The information to remember. Be specific and self-contained."},
                     "scope": {"type": "string", "enum": ["project", "global"], "description": "Where this belongs. 'project' (the default) files it under the current repository. Use 'global' for facts about the user, their preferences, or their tools, which are true whatever they are working on — filing those under one repository hides them everywhere else."},
+                    "project": {"type": "string", "description": "Absolute path to a DIFFERENT repository, when the fact belongs to one you are not working in — a sibling checkout, say. Defaults to the current repository. Cannot be combined with scope 'global'."},
                     "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Importance score from 0.0 (low) to 1.0 (critical)."},
                     "facts": {"type": "array", "items": {"type": "string"}, "description": "Pre-extracted discrete facts."},
                     "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names referenced in this memory."},
@@ -83,7 +84,7 @@ pub fn anthropic_custom_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language search query."},
-                    "entities": {"type": "array", "items": {"type": "string"}, "description": "Filter to memories mentioning these entities."},
+                    "entities": {"type": "array", "items": {"type": "string"}, "description": "Narrow the results to memories that name one of these, in a tag or in the text itself. Omit to search everything."},
                     "include_related": {"type": "boolean", "description": "Also retrieve connected memories."},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum number of memories to retrieve (default 10)."},
                 },
@@ -142,6 +143,7 @@ pub fn openai_tools() -> Vec<Value> {
                     "properties": {
                         "content": {"type": "string", "description": "The information to remember."},
                         "scope": {"type": "string", "enum": ["project", "global"], "description": "'project' (default) files it under the current repository; 'global' for facts about the user or their tools, true whatever they are working on."},
+                        "project": {"type": "string", "description": "Absolute path to a different repository, when the fact belongs to one you are not working in. Cannot be combined with scope 'global'."},
                         "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Importance score."},
                         "facts": {"type": "array", "items": {"type": "string"}, "description": "Pre-extracted discrete facts."},
                         "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names."},
