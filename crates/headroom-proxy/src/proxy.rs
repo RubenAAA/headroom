@@ -4556,20 +4556,8 @@ pub(crate) async fn forward_http(
                                 } else {
                                     "backoff"
                                 };
-                                let delay_ms = retry_after.unwrap_or_else(|| {
-                                    let base = state.config.retry_base_delay_ms;
-                                    let max = state.config.retry_max_delay_ms;
-                                    let backoff = base.saturating_mul(1u64 << attempt).min(max);
-                                    // Apply 50-150% jitter to prevent thundering-herd
-                                    let jitter = 50u64
-                                        + (std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .subsec_nanos()
-                                            as u64
-                                            % 101);
-                                    backoff.saturating_mul(jitter) / 100
-                                });
+                                let delay_ms =
+                                    retry_after.unwrap_or_else(|| backoff_ms(&state, attempt));
                                 tracing::warn!(
                                     request_id = %request_id,
                                     status = status,
@@ -4609,9 +4597,7 @@ pub(crate) async fn forward_http(
                         let (prefix, leading_error) = peek_leading_sse_error(&mut r).await;
                         if let Some(kind) = leading_error {
                             if attempt + 1 < overload_max_attempts {
-                                let base = state.config.retry_base_delay_ms;
-                                let max = state.config.retry_max_delay_ms;
-                                let delay_ms = base.saturating_mul(1u64 << attempt).min(max);
+                                let delay_ms = backoff_ms(&state, attempt);
                                 tracing::warn!(
                                     request_id = %request_id,
                                     error_type = %kind,
@@ -4645,17 +4631,7 @@ pub(crate) async fn forward_http(
                     Err(e) => {
                         let is_retryable = is_retryable_transport_error(&e);
                         if is_retryable && attempt + 1 < max_attempts {
-                            let base = state.config.retry_base_delay_ms;
-                            let max = state.config.retry_max_delay_ms;
-                            let backoff = base.saturating_mul(1u64 << attempt).min(max);
-                            // Apply 50-150% jitter to prevent thundering-herd
-                            let jitter = 50u64
-                                + (std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .subsec_nanos() as u64
-                                    % 101);
-                            let delay_ms = backoff.saturating_mul(jitter) / 100;
+                            let delay_ms = backoff_ms(&state, attempt);
                             tracing::warn!(
                                 request_id = %request_id,
                                 error = %e,
@@ -7050,6 +7026,23 @@ impl OutcomeContext {
     fn attempted(&self, provider_input_tokens: i64) -> i64 {
         self.sizes(provider_input_tokens).0
     }
+}
+
+/// How long to wait before retry number `attempt` (0-based), in milliseconds.
+///
+/// Every retry site in the proxy used to inline this formula, and the copies
+/// had drifted: two jittered, the in-band-SSE branch did not, and the local
+/// model's transport branch ignored the configured base entirely and applied no
+/// ceiling. `headroom_core::retry::jitter_delay_ms` was written to be the one
+/// copy and had no caller at all. Jitter is not decoration here — an overloaded
+/// upstream returns 529 to every in-flight request at once, and unjittered
+/// backoff sends them all back in the same millisecond.
+pub(crate) fn backoff_ms(state: &AppState, attempt: u32) -> u64 {
+    headroom_core::retry::jitter_delay_ms(
+        state.config.retry_base_delay_ms as i64,
+        state.config.retry_max_delay_ms as i64,
+        attempt,
+    ) as u64
 }
 
 /// Latch time-to-first-byte on the first upstream chunk. Every SSE arm calls

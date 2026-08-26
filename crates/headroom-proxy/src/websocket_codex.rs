@@ -514,21 +514,6 @@ fn first_frame_timeout() -> Duration {
     Duration::from_secs_f64(secs.max(0.001))
 }
 
-/// 50-150% jittered exponential backoff. Port of `helpers.jitter_delay_ms`,
-/// using the same nanos-based jitter source as the HTTP retry loop.
-fn jitter_delay_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
-    let capped = base_ms
-        .saturating_mul(1u64 << attempt.min(20))
-        .min(max_ms.max(base_ms));
-    let jitter = 50u64
-        + (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64
-            % 101);
-    capped.saturating_mul(jitter) / 100
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // Session state
 // ─────────────────────────────────────────────────────────────────────────
@@ -1164,11 +1149,7 @@ async fn connect_upstream_with_retry(
                     Ok(Ok(_)) => unreachable!("handled above"),
                 };
                 if attempt + 1 < attempts {
-                    let delay = jitter_delay_ms(
-                        state.config.retry_base_delay_ms,
-                        state.config.retry_max_delay_ms,
-                        attempt,
-                    );
+                    let delay = crate::proxy::backoff_ms(&state, attempt);
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
             }
@@ -1919,11 +1900,7 @@ async fn ws_http_fallback(
                     "ws http fallback request failed"
                 );
                 if attempt + 1 < attempts {
-                    let delay = jitter_delay_ms(
-                        ctx.state.config.retry_base_delay_ms,
-                        ctx.state.config.retry_max_delay_ms,
-                        attempt,
-                    );
+                    let delay = crate::proxy::backoff_ms(&ctx.state, attempt);
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
             }
