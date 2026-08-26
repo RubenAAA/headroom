@@ -402,6 +402,7 @@ pub(crate) async fn forward_vertex_request(
             tracing::warn!(
                 request_id = %rid_for_stream,
                 error = %e,
+                cause = ?e,
                 "vertex upstream stream error mid-response"
             );
             Err(e)

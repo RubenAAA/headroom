@@ -57,6 +57,34 @@ const CLIENT_QUEUE_DEPTH: usize = 64;
 /// Appended to the reply so a truncated answer never reads as a finished one.
 const TRUNCATION_MARKER: &str = "\n\n[truncated: the connection to the API dropped mid-response]";
 
+/// The marker for a drop that took an unfinished tool call with it.
+///
+/// A discarded `tool_use` is the expensive case and it used to read exactly
+/// like the cheap one. The turn ends well-formed, `stop_reason` is `end_turn`,
+/// and the call never ran — so an `Agent` lost this way is indistinguishable
+/// from a subagent that finished and chose to report nothing, and a lost
+/// `SendMessage` looks like a teammate sitting idle. Measured 2026-08-26 at
+/// 07:59:16: one dropped `Agent` block, 443 discarded blocks behind it, and
+/// nothing in the reply that said so.
+///
+/// Naming the call is what makes it recoverable. The model reads this on its
+/// next turn and re-issues the call itself, which is the only repair available
+/// here — the tokens are gone and the block cannot be rebuilt from a fragment.
+fn tool_truncation_marker(tool_name: Option<&str>) -> String {
+    match tool_name {
+        Some(name) => format!(
+            "\n\n[truncated: the connection to the API dropped mid-response. \
+             A pending `{name}` tool call was discarded and did NOT run. \
+             Re-issue it if it is still wanted.]"
+        ),
+        None => format!(
+            "\n\n[truncated: the connection to the API dropped mid-response. \
+             A pending tool call was discarded and did NOT run. \
+             Re-issue it if it is still wanted.]"
+        ),
+    }
+}
+
 /// The kind of content block currently open on the wire.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -75,6 +103,8 @@ struct Wire {
     saw_message_stop: bool,
     /// Index and kind of the block currently open, on the wire or withheld.
     open: Option<(u64, Kind)>,
+    /// Name of the open `tool_use` block, for the marker when it is discarded.
+    open_tool_name: Option<String>,
     /// Highest block index the client has seen, for placing a new tail block.
     max_index: u64,
     /// Whether any block index has been seen at all.
@@ -121,12 +151,25 @@ impl Wire {
                     "tool_use" | "server_tool_use" | "mcp_tool_use" => Kind::ToolUse,
                     _ => Kind::Opaque,
                 };
+                // The name arrives on the opening frame and nowhere else, so it
+                // has to be taken here or it is gone by the time the block is
+                // discarded.
+                self.open_tool_name = (kind == Kind::ToolUse)
+                    .then(|| {
+                        v.pointer("/content_block/name")
+                            .and_then(|n| n.as_str())
+                            .map(str::to_owned)
+                    })
+                    .flatten();
                 self.open = Some((index, kind));
                 self.max_index = self.max_index.max(index);
                 self.any_block = true;
             }
             "content_block_stop" => {
                 self.open = None;
+                // The block completed, so its name is no longer the name of
+                // anything that was lost.
+                self.open_tool_name = None;
             }
             "message_delta" => {
                 if let Some(n) = v.pointer("/usage/output_tokens").and_then(|n| n.as_u64()) {
@@ -150,12 +193,19 @@ impl Wire {
             return Vec::new();
         }
         let mut out = Vec::new();
+        // What the marker says. A drop that discarded a tool call has to name
+        // it: that is the difference between a turn the model can repair and
+        // one that reads as finished.
+        let marker: String = match self.open {
+            Some((_, Kind::ToolUse)) => tool_truncation_marker(self.open_tool_name.as_deref()),
+            _ => TRUNCATION_MARKER.to_string(),
+        };
         // Where the marker goes. An open text block can take it directly;
         // anything else has to be closed first and the marker given its own
         // block after it.
         let marker_index = match self.open {
             Some((index, Kind::Text)) => {
-                out.push(delta_event(index, TRUNCATION_MARKER));
+                out.push(delta_event(index, &marker));
                 out.push(stop_event(index));
                 None
             }
@@ -171,7 +221,7 @@ impl Wire {
         };
         if let Some(index) = marker_index {
             out.push(start_event(index));
-            out.push(delta_event(index, TRUNCATION_MARKER.trim_start()));
+            out.push(delta_event(index, marker.trim_start()));
             out.push(stop_event(index));
         }
         // `end_turn` rather than a truer-sounding reason: it is the one stop
@@ -391,6 +441,27 @@ where
                         "dropped an incomplete tool block; downgrading \
                          stop_reason to end_turn so the client keeps the turn"
                     );
+                    // Downgrading alone leaves a turn that is well-formed,
+                    // carries the text, and is missing only the call — which
+                    // reads exactly like a model that decided not to make one.
+                    // The marker is what tells the difference, and it goes in
+                    // before the delta so it lands inside this message.
+                    //
+                    // A fresh index: the discarded block's own never reached
+                    // the client, but a later block may have taken a higher
+                    // one, and a stop for an index the client never opened is
+                    // the one thing it cannot parse.
+                    let index = wire.max_index + 1;
+                    let marker = tool_truncation_marker(wire.open_tool_name.as_deref());
+                    for frame in [
+                        start_event(index),
+                        delta_event(index, marker.trim_start()),
+                        stop_event(index),
+                    ] {
+                        if tx.send(Ok(frame)).await.is_err() {
+                            return client_gone(&request_id);
+                        }
+                    }
                     rewrite_stop_reason(&v, "end_turn")
                 } else {
                     raw
@@ -417,6 +488,7 @@ where
                 tracing::debug!(
                     request_id = %request_id,
                     error = %e,
+                    cause = ?e,
                     "transport error after the message ended; not forwarded"
                 );
                 return;
@@ -428,6 +500,7 @@ where
             tracing::debug!(
                 request_id = %request_id,
                 error = %e,
+                cause = ?e,
                 "stream dropped before any message started; passing the error down"
             );
             let _ = tx.send(Err(e)).await;
@@ -436,7 +509,15 @@ where
         tracing::warn!(
             request_id = %request_id,
             event = "stream_tail_synthesised",
-            error = drop_err.map_or("body ended early".to_string(), |e| e.to_string()),
+            error = drop_err
+                .as_ref()
+                .map_or("body ended early".to_string(), |e| e.to_string()),
+            // `Display` on a `reqwest::Error` is only "error decoding response
+            // body" — the source chain, which is the part that names the TLS
+            // alert or the broken pipe, is `Debug`-only. Without this every
+            // turn that actually reached the user truncated was the one turn
+            // whose cause we could not read: 8 of 8 between 08-24 and 08-26.
+            cause = ?drop_err,
             discarded_tool_blocks = discarded,
             output_tokens = wire.output_tokens,
             "upstream stream died mid-message; closing the turn cleanly so the \
@@ -677,6 +758,79 @@ mod tests {
         );
         assert!(
             !out.contains("\"index\":1"),
+            "partial tool block leaked:\n{out}"
+        );
+    }
+
+    /// The 2026-08-26 07:59:16 incident: a stream died with an `Agent` block
+    /// open, and the turn came back well-formed, empty, and silent about it.
+    #[test]
+    fn a_dropped_tool_call_is_named_in_the_marker() {
+        let out = drive(&[
+            START,
+            TEXT_START,
+            TEXT_DELTA,
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Agent\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"prompt\"}}\n\n",
+            // The connection dies here.
+        ]);
+        assert!(
+            out.contains("Agent"),
+            "the discarded call must be named, or a lost subagent reads as a \
+             silent one:\n{out}"
+        );
+        assert!(
+            out.contains("did NOT run"),
+            "the marker must say the call never happened:\n{out}"
+        );
+        assert!(out.contains("hi"), "text already paid for was lost:\n{out}");
+        assert!(
+            !out.contains("partial_json"),
+            "a half-built tool call reached the client:\n{out}"
+        );
+    }
+
+    /// A drop that took no tool call with it keeps the plain marker: there is
+    /// nothing to re-issue, and saying otherwise would send the model chasing
+    /// a call it never made.
+    #[test]
+    fn a_plain_text_drop_keeps_the_generic_marker() {
+        let out = drive(&[START, TEXT_START, TEXT_DELTA]);
+        assert!(
+            out.contains("dropped mid-response]"),
+            "generic marker missing:\n{out}"
+        );
+        assert!(
+            !out.contains("did NOT run"),
+            "invented a discarded tool call:\n{out}"
+        );
+    }
+
+    /// The other route to the same silence: upstream finished the message and
+    /// claimed `tool_use`, but the block was discarded on the way.
+    #[test]
+    fn a_downgraded_turn_says_the_call_was_discarded() {
+        let out = drive(&[
+            START,
+            TEXT_START,
+            TEXT_DELTA,
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Agent\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]);
+        assert!(
+            out.contains("Agent") && out.contains("did NOT run"),
+            "a downgraded turn must still say what it lost:\n{out}"
+        );
+        assert!(
+            out.contains("\"stop_reason\":\"end_turn\""),
+            "the downgrade itself must survive:\n{out}"
+        );
+        assert!(
+            !out.contains("\"index\":1,\"content_block\""),
             "partial tool block leaked:\n{out}"
         );
     }

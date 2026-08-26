@@ -5013,7 +5013,15 @@ pub(crate) async fn forward_http(
             Ok(b)
         }
         Err(e) => {
-            tracing::warn!(request_id = %rid, error = %e, "upstream stream error mid-response");
+            // `cause` for the same reason as `stream_finisher`: the source
+            // chain is `Debug`-only and it is the only thing that separates a
+            // TLS record failure from an idle drop.
+            tracing::warn!(
+                request_id = %rid,
+                error = %e,
+                cause = ?e,
+                "upstream stream error mid-response"
+            );
             Err(e)
         }
     });

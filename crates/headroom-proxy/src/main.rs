@@ -5,6 +5,7 @@
 //! `--upstream`. See RUST_DEV.md for the operator runbook.
 
 use std::net::SocketAddr;
+use std::time::UNIX_EPOCH;
 
 use clap::Parser;
 use headroom_proxy::config::CliArgs;
@@ -28,7 +29,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     headroom_proxy::config::warn_on_shadowed_routes(&config.model_routes);
 
+    // Before the first turn, because that is the only time it can be acted on:
+    // a NIC left with receive offload on corrupts TLS records for the whole
+    // session, and the turns it kills are paid for.
+    headroom_proxy::net_offload::warn_if_offload_corrupts_tls();
+
+    // Identity, so a log line can be tied to the process and the build that
+    // wrote it. The log outlives any one run — it is appended across restarts
+    // and reboots — and carried exactly one `headroom-proxy starting` marker
+    // across five files and 22 runs, so "scope the measurement by process
+    // start", which is the rule every re-cache number here depends on, could
+    // not actually be followed. Version alone does not separate two builds of
+    // the same version; the binary's size and mtime do.
+    let (binary_len, binary_mtime) = std::env::current_exe()
+        .and_then(|path| path.metadata())
+        .map(|meta| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            (meta.len(), mtime)
+        })
+        .unwrap_or((0, 0));
+
     tracing::info!(
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        binary_len = binary_len,
+        binary_mtime = binary_mtime,
         listen = %config.listen,
         upstream = %config.upstream,
         upstream_timeout_s = config.upstream_timeout.as_secs(),
