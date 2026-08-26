@@ -698,3 +698,278 @@ server next installs.
 It is called at `proxy.rs:2847`, on the rebuild boundary, exactly as the module
 doc describes — and calling it a beat too early is what caused the first bug on
 this page.
+
+## `2:block[0]` — open, and instrumented rather than guessed (2026-08-26)
+
+Three `early_messages` recaches cost **312,861 tokens** between 2026-08-24 and
+08-25 and all three read the same one-line verdict: `2:block[0]`. Slot 2's first
+block was rewritten, the block count held, and nothing said which block that
+was. All three prefixes had been evicted before anyone asked.
+
+What the three have in common: deep conversations (235, 166 and 187 messages),
+one event each, and an `actual_cache_read` of **21,663 on all three** — the
+system and tools survive, everything after them is rewritten. The drift verdict
+lands about two minutes ahead of the recache.
+
+### What it is not
+
+**Not the withdrawn scaffolding fixed the same day.** Replaying the withdrawal
+against the 40 stored conversations that carry early scaffolding produces
+`1:string,2:blocks 3->2` (20), `1:string,2:blocks 2->1` (19) and
+`1:string,2:blocks 4->3` (1). A bare `2:block[0]` never appears. The
+`ephemeral_spans` fix does not touch this bucket.
+
+**Not a tool result rewritten on disk.** Across 14 transcripts that have a
+`tool-results/` directory, no `tool_use_id` ever changes its stub-ness: Claude
+Code substitutes `<persisted-output>` when it writes the result, never later.
+
+**Not the interleaving that produces most `2:block[0]` lines.** 92 of them are
+logged, but 86 belong to one session where the hash ping-pongs between five
+fixed values (`75707f61` ↔ `ba4dff8a` ↔ `2c95db55`) and `current_message_count`
+walks backwards — 4, 9, 11, 9, 13, 11, 14, 21. Those are separate request
+streams sharing a session key, and they cost 31,178 tokens over 32 events. The
+expensive three are `novel`: a hash that session had never held before.
+
+Worth knowing while reading drift lines: across every rotated log, **61% of
+drift verdicts (90 of 148) return to a structural hash already seen in that
+session**. A conversation that mutated its history does not mutate back twice a
+second. They are cheap (68,819 tokens) and the pipeline already has a name for
+them — `concurrent_turn_in_flight`, 207 events, 109,127 tokens — so the drift
+detector is claiming events that classifier would have taken.
+
+### The instrument
+
+`MessageShape` now carries a `BlockTag` per block: the block's type and the
+serialized size of the canonicalized block. `early_drift` reads
+`2:block[0] tool_result 4195B->1202B` instead of `2:block[0]`. Eight bytes per
+block, diagnostic only, never read by the drift decision. A truncation, a
+rewrite and a type substitution are three different defects and the line now
+tells them apart.
+
+### Where the money actually is
+
+Recache cost by `attribution_reason` over every rotated log:
+
+| events | wasted | reason / `replay_skipped` |
+|---|---|---|
+| 113 | 2,107,191 | `prefix_content_diverged` / same |
+| 49 | 1,018,190 | `early_messages` / `no_previous_turn` |
+| 536 | 527,163 | `unexplained_after_replay` / — |
+| 207 | 109,127 | `concurrent_turn_in_flight` / — |
+
+`early_messages / no_previous_turn` is the drift detector invalidating the store
+and the next turn finding nothing. `prefix_content_diverged` is twice its size
+and has not been read yet.
+
+## `prefix_content_diverged` — 95% of it was one predicate (2026-08-26)
+
+The 2026-08-24 entry above closed this class at three events and two causes.
+It reopened. Scoped by process start, the waste never went away:
+
+| window | started | events | wasted |
+|---|---|---|---|
+| 18 | 2026-08-23 20:54 | 12 | 665,481 |
+| 19 | 2026-08-24 12:02 | 8 | 200,538 |
+| 21 | 2026-08-25 08:07 | 34 | 357,669 |
+| 22 | 2026-08-26 06:54 | 19 | 467,348 |
+
+Window 22 is the process running now, on the current build.
+
+### One signature, and it is exact
+
+Of 102 content-divergence declines since 2026-08-25, 88 splice and cost little.
+The 14 that recover nothing are the same 14 three times over:
+
+- `replayed_prefix_msgs == 0` ⟺ `chain_id == 0` — no held chain, so
+  `replay_upto` is 0 and the whole stored prefix goes
+- 12 of the 14 report `first_diff_path: role`, `diff_shape_stored: string`,
+  stored head `system`, current head `assistant`
+
+That is a withdrawn `role: "system"` message: every message behind it shifts by
+one and the index-aligned compare meets an assistant where it stored a system.
+**1,998,513 tokens over 33 turns, 95% of all `prefix_content_diverged` waste on
+record** — 98% of it since 2026-08-25.
+
+### Why the existing guard missed them
+
+`align_over_withdrawn_scaffolding` was already there and already correct in
+shape. It asked `is_pure_client_scaffolding`, which keys on the
+`<system-reminder>` wrapper. The wrapper is optional.
+
+Of the 3,050 `role: "system"` messages across the 114 stored prefixes, 593 carry
+the tag and **81% do not**. The bare ones are output-style banners, `PreToolUse`
+hook context, skill and agent listings and `Note:` file notices. Claude Code
+sends the **same** `PreToolUse:Bash` text both ways — 468 tagged, 656 bare — so
+the tag cannot be the test.
+
+Counted 2026-08-26 against a store the proxy is still writing to, so the totals
+drift between readings; the ratio holds.
+
+`role` can. The Messages API carries the system prompt in a top-level field, so
+a `role: "system"` entry inside `messages` never comes from the user or the
+model. Index 0 is excluded: an OpenAI-Chat body puts its real system prompt
+there, and losing that is a changed prompt. The proxy's own converters
+(`handlers/gemini.rs`, `handlers/batch.rs`, `handlers/local_model.rs`) all push
+theirs first, and none of the 114 stored conversations opens with one.
+
+### Measured
+
+`is_client_scaffolding_message` replaces the tag test in the replay comparator
+and in the drift detector's early window. Replaying the withdrawal against every
+persisted conversation:
+
+```
+conversations holding scaffolding: 101
+  prefix survives the withdrawal BEFORE: 64
+  prefix survives the withdrawal AFTER : 101
+```
+
+Reproduce with `price_the_role_predicate_against_persisted_conversations` in
+`tests/early_reminder_drift_proof.rs`.
+
+The cost of the blindness is unchanged and already documented above: replay
+forwards the stored copy, so a withdrawn banner stays on the wire inside the
+cached prefix at 0.1x. Watch `outbound_body_bytes` against
+`client_request_bytes`; a ratio past ~1.2 means the accumulation is real.
+
+## Accumulation watch — read, and clear
+
+That threshold sat above with no reading behind it for two days. Taken
+2026-08-26 over 29,321 priced turns:
+
+```
+day          turns   median     p90     max   over 1.2
+2026-08-20      42    0.895   0.924   1.002      0
+2026-08-22    3575    0.964   0.983   1.202      1
+2026-08-23    6987    0.955   0.996   1.112      0
+2026-08-24    6646    0.965   0.988   1.172      0
+2026-08-25    6440    0.967   0.989   1.213      1
+2026-08-26    5631    0.968   0.984   1.056      0
+```
+
+Forwarded bodies run 3-4% **smaller** than what the client sent, flat across six
+days, and two turns out of 29,321 crossed 1.2. Nothing accumulates.
+
+Read it again once the `role` predicate has been live a few days: it widens what
+replay forwards from the stored copy, so it is exactly the change that could
+move this number.
+
+## `unexplained_after_replay` — closed, nothing to chase
+
+536 events, 527,163 tokens. The largest bucket nobody had opened, and it is not
+a re-cache at all.
+
+Every event carries `matched_stream_msgs == turn_msgs == prefix_stable_msgs`:
+the stored prefix matched the turn end to end, the replay went out, and the
+provider read back a little less than the ledger expected. The distribution says
+the same thing twice:
+
+```
+median   690        p90 2,034        p99 6,223        max 9,161
+   0-  200:  12 events      2,014 tokens   0.4%
+ 200- 1000: 344 events    170,793 tokens  32.4%
+1000- 5000: 173 events    306,104 tokens  58.1%
+5000-20000:   7 events     48,252 tokens   9.2%
+    20000+:   0 events
+```
+
+No tail. `prefix_content_diverged` put 1,998,513 tokens into 33 turns; the worst
+single turn here is 9,161, and the total is a flat ~700 spread over 536 turns.
+That is a breakpoint landing a block short of the divergence, or a 5m block
+ageing out under a 1h one — the granularity of the provider's own accounting,
+not a prefix we broke.
+
+Leave it. Re-open if the max reaches five figures, which would mean something
+real had started hiding behind the name.
+
+## `concurrent_turn_in_flight` — the name is honest
+
+208 events, 150,652 tokens, median 241. Cheap enough to ignore, but it had been
+taken on trust: the flag is set in `begin_request` from any other *pending*
+entry under the same conversation key, and `pending` is a 512-slot LRU with no
+timeout. A turn that never calls `complete` — client disconnect, upstream error
+— leaves an entry behind that would mark every later turn on that key as
+concurrent until the LRU pushed it out. That failure mode would be invisible in
+the counts and would quietly absorb waste with some other cause.
+
+It is not happening. Timing every flagged event against the nearest other turn
+on its own key:
+
+```
+                          flagged (208)      other reasons (752)
+sibling within  2s          44.7%                 34.0%
+sibling within 10s          93.3%                 81.2%
+sibling within 60s         100.0%                 94.6%
+sibling beyond 60s             0                    40 events
+```
+
+Not one flagged event has its nearest sibling more than a minute away, where the
+control bucket has a 5% tail out to ten minutes. A stale pending entry would
+show up precisely as a flagged event standing alone in time, and there are none.
+
+The attribution also still predicts what it claims to. Over all 29,432 turns,
+splitting on whether another turn on the same key completed within 2s:
+
+```
+overlapping    2,034 turns    349 re-cached   17.16%
+alone         27,398 turns    611 re-cached    2.23%
+```
+
+Overlap raises the re-cache rate 7.7x. The mechanism in the code comment is
+real, the label points at it, and the bucket is small. Nothing to do.
+
+## Pre-restart baseline (2026-08-26)
+
+Captured before the restart that puts the scaffolding predicate, the `BlockTag`
+instrument and the transport `cause` fields into the running process. Nothing
+below is live yet, so this is the "before" column and the only one that will
+ever be measurable.
+
+```
+reason                                    all-time            2026-08-26
+prefix_content_diverged        116 ev    2,108,921     20 ev      468,393
+early_messages                  53 ev    1,129,413      3 ev      317,384
+unexplained_after_replay       537 ev      527,269     71 ev       60,962
+system                           9 ev      183,268      1 ev       34,549
+tools                            5 ev      166,873      1 ev       67,512
+concurrent_turn_in_flight      208 ev      150,652     44 ev       55,816
+shorter_than_stored_prefix       3 ev       31,460      0 ev            0
+system,early_messages           11 ev       12,479      0 ev            0
+aftershock_of_diverged_prefix   15 ev        6,915      0 ev            0
+TOTAL                          957 ev    4,317,250    140 ev    1,004,616
+```
+
+Read the all-time column with care: it spans several binaries. `86bd3fc2` added
+the `origin` field partway through, so 42 events and 401,156 tokens before
+08-24 carry a reason with no origin and cannot be split into client-caused and
+proxy-caused. The 08-26 column is one day and one binary, and is the honest
+comparison point.
+
+Two predictions worth holding the authors to, both from the scaffolding
+predicate:
+
+- `prefix_content_diverged` should mostly go. 1,998,513 of its 2,108,921 tokens
+  are the withdrawal the predicate now steps over.
+- `early_messages` should fall a long way too, and this has *not* been priced.
+  Its worst turn, 145,891 tokens on 08-26T08:28:32, is the same withdrawal seen
+  from the drift detector's side, and the early-window filter now skips
+  scaffolding. The top ten events hold ~930k of the 1,129k; the median is 1,349.
+  If the number does not move, the filter is not reaching this path and that is
+  the next thing to find out.
+
+### Why the process now logs its own identity
+
+Scoping a measurement "by process start" is the rule every number on this page
+depends on, and it could not actually be followed. The log is appended across
+restarts and reboots — five files, 22 runs — and carried exactly one
+`headroom-proxy starting` marker in the current file, at 06:54:34Z, while the
+process that wrote most of that file began at 07:26:23Z. Boot time checks out
+(`/proc/stat` btime agrees with `/proc/uptime` to 0.09s), so this is not clock
+drift; a run genuinely reached the log without announcing itself, and why is
+still open.
+
+`main.rs` now puts `pid`, `version`, `binary_len` and `binary_mtime` on the
+starting line. Version alone cannot separate two builds of `0.1.0`; size and
+mtime can. After the restart, "which binary produced this event" is answerable
+from the log instead of from memory — which is how the counts on this page went
+stale once already.

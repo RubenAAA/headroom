@@ -81,6 +81,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
+use super::ephemeral_spans::{
+    block_carries_ephemeral_span, is_client_scaffolding_message, is_ephemeral_client_block,
+    is_ephemeral_client_text, split_ephemeral_spans, split_trailing_ephemeral_spans,
+    take_trailing_ephemeral_spans, SYSTEM_REMINDER_OPEN_TAG,
+};
 use serde_json::Value;
 
 /// Production session capacity — matches the drift detector's 1000.
@@ -218,82 +223,6 @@ fn is_proactive_expansion_block(block: &Value) -> bool {
             .is_some_and(is_proactive_expansion_text)
 }
 
-/// A `<system-reminder>` the client attaches to the newest message and withdraws
-/// on the following turn.
-///
-/// Same shape of problem as a proactive expansion, arrived at from the other
-/// end. Measured 2026-08-09: the client hangs one of these off a `tool_result`
-/// for exactly one turn, so the provider caches a prefix ending in a block that
-/// will not be there next time. The prefix then breaks at that message and
-/// everything after it is re-written — 95 turns, 4,353,443 tokens, an average of
-/// 45,826 re-written for a few hundred bytes of reminder, 19% of the day's
-/// input bill.
-///
-/// Nothing here removes or moves the block: the model still sees it, in place,
-/// on the turn it arrives. It is only kept out of the *cached* region, which is
-/// where its disappearance does the damage.
-const SYSTEM_REMINDER_OPEN_TAG: &str = "<system-reminder>";
-
-const SYSTEM_REMINDER_CLOSE_TAG: &str = "</system-reminder>";
-
-fn is_ephemeral_client_text(text: &str) -> bool {
-    text.trim_start().starts_with(SYSTEM_REMINDER_OPEN_TAG)
-}
-
-fn is_ephemeral_client_block(block: &Value) -> bool {
-    block.get("type").and_then(Value::as_str) == Some("text")
-        && block
-            .get("text")
-            .and_then(Value::as_str)
-            .is_some_and(is_ephemeral_client_text)
-}
-
-/// Lift every `<system-reminder>…</system-reminder>` span out of `text`.
-///
-/// Returns the remaining text and the spans, in order. The client does not
-/// always give a reminder its own block: it also arrives inline, in the middle
-/// of a plain string message. [`is_ephemeral_client_text`] only sees the block
-/// form, because it tests the *start* of the text, so an inline one survived
-/// into the comparison key on the turn it arrived and vanished from it on the
-/// turn the client re-shaped or withdrew it. The two keys then differed at that
-/// message — always the newest one, so always the tail of the stored prefix —
-/// and the whole prefix was re-written. Measured 2026-08-13 in one session:
-/// four declines, 507,201 tokens, 67% of everything that session cached.
-///
-/// A span that never closes is left alone. The client always closes these, and
-/// swallowing to end-of-text would eat real content on a malformed one.
-fn split_ephemeral_spans(text: &str) -> (String, Vec<String>) {
-    let mut kept = String::with_capacity(text.len());
-    let mut spans = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find(SYSTEM_REMINDER_OPEN_TAG) {
-        let Some(close) = rest[open..].find(SYSTEM_REMINDER_CLOSE_TAG) else {
-            break;
-        };
-        let end = open + close + SYSTEM_REMINDER_CLOSE_TAG.len();
-        kept.push_str(&rest[..open]);
-        spans.push(rest[open..end].to_string());
-        rest = &rest[end..];
-    }
-    kept.push_str(rest);
-    if spans.is_empty() {
-        return (kept, spans);
-    }
-    // Lifting a span leaves the whitespace that separated it from the real
-    // text. The client's own block-form version of the same message does not
-    // carry that whitespace, so without this the two shapes still differ by a
-    // newline — and differ in the forwarded bytes, not just the key.
-    (kept.trim().to_string(), spans)
-}
-
-fn block_carries_ephemeral_span(block: &Value) -> bool {
-    block.get("type").and_then(Value::as_str) == Some("text")
-        && block
-            .get("text")
-            .and_then(Value::as_str)
-            .is_some_and(|t| t.contains(SYSTEM_REMINDER_OPEN_TAG))
-}
-
 /// Edge whitespace off a text block, for the comparison key only.
 ///
 /// The forwarding side never calls this: trimming there would rewrite the
@@ -323,46 +252,42 @@ fn trim_text_block(block: Value) -> Option<Value> {
     Some(block)
 }
 
-/// Scaffolding at the END of `text`: the spans that trail it, and the prose
-/// before them. `None` when a span sits in the middle of prose.
+/// Match the stored prefix against this turn, stepping over scaffolding the
+/// client has since withdrawn. Returns how many of THIS turn's messages the
+/// stored prefix covers, or `None` when they genuinely disagree.
 ///
-/// The permissive [`split_ephemeral_spans`] is right for the comparison key and
-/// wrong for anything that rewrites bytes. A turn that merely QUOTES the tag —
-/// writing test cases for this file will do it — had the span lifted out of the
-/// middle of its prose, and a block that held nothing else was left as `""`.
-/// The model then read its own words back as an empty block.
+/// The index-aligned compare this backs up cannot survive a withdrawal. The
+/// client drops one scaffolding message out of the middle of history and every
+/// message behind it shifts by one, so the compare meets an `assistant` message
+/// where it stored a `system` one and calls the whole prefix diverged. Measured
+/// on 2026-08-26: 7 of 16 content-divergence declines were this, first diff on
+/// `role` every time, one of them 37,448 tokens.
 ///
-/// Only a span the client appended may be moved, and an appended one is always
-/// at the end. Anything else is prose that happens to contain the characters.
-fn split_trailing_ephemeral_spans(text: &str) -> Option<(String, Vec<String>)> {
-    let first_open = text.find(SYSTEM_REMINDER_OPEN_TAG)?;
-    let (prose, trailing) = text.split_at(first_open);
-    let (leftover, spans) = split_ephemeral_spans(trailing);
-    // Anything left after the first span means prose follows it, so the spans
-    // are embedded rather than appended. Leave the whole block alone.
-    if spans.is_empty() || !leftover.is_empty() {
+/// Only the STORED side may be stepped over. A skip there is free — the caller
+/// forwards `prev_fwd` whole, so the withdrawn message still goes out, holding
+/// the provider's cached bytes exactly as they were. Stepping over a message on
+/// the CURRENT side would mean not forwarding something the client sent, which
+/// is how reminders get lost; the caller declines to those instead.
+fn align_over_withdrawn_scaffolding(
+    previous_originals: &[Value],
+    current_originals: &[Value],
+) -> Option<usize> {
+    let mut current_index = 0usize;
+    for (stored_index, stored) in previous_originals.iter().enumerate() {
+        let stored_canonical = canonicalize_for_prefix_compare(stored);
+        if current_originals
+            .get(current_index)
+            .is_some_and(|current| canonicalize_for_prefix_compare(current) == stored_canonical)
+        {
+            current_index += 1;
+            continue;
+        }
+        if is_client_scaffolding_message(stored_index, stored) {
+            continue;
+        }
         return None;
     }
-    Some((prose.trim_end().to_string(), spans))
-}
-
-/// [`split_trailing_ephemeral_spans`] for one block: what remains of it (`None`
-/// when it held nothing else) and the spans taken. The outer `None` means the
-/// block must not be touched at all.
-fn take_trailing_ephemeral_spans(block: &Value) -> Option<(Option<Value>, Vec<String>)> {
-    if !block_carries_ephemeral_span(block) {
-        return None;
-    }
-    let text = block.get("text").and_then(Value::as_str)?;
-    let (prose, spans) = split_trailing_ephemeral_spans(text)?;
-    if prose.is_empty() {
-        return Some((None, spans));
-    }
-    let mut kept = block.clone();
-    if let Some(obj) = kept.as_object_mut() {
-        obj.insert("text".to_string(), Value::String(prose));
-    }
-    Some((Some(kept), spans))
+    Some(current_index)
 }
 
 /// Strip reminder spans from a text block, dropping the block when only
@@ -1002,6 +927,22 @@ pub enum ReplaySkip {
     /// The optimized output is shorter than the stored prefix — the pipeline
     /// dropped messages the prefix covers.
     OptimizedShorterThanPrefix,
+    /// The optimized output holds fewer messages than the client sent, so
+    /// `optimized[i]` is no longer this turn's message `i`.
+    ///
+    /// Everything here indexes the two lists against each other: the stored
+    /// prefix is measured against `current_original_messages` and the tail is
+    /// then taken from `optimized_messages` at the same offset. That only works
+    /// because the passes in front of this one rewrite messages in place and
+    /// append at the tail — none of them deletes from the middle.
+    ///
+    /// It held on every turn it could be measured (89 records carrying both
+    /// counts on 2026-08-26, delta 0 in all of them), and it was an unchecked
+    /// assumption for as long as the splice has existed. A pass that starts
+    /// dropping a message would silently shift the tail and splice the wrong
+    /// bytes onto the cached prefix, which is a correctness fault rather than a
+    /// lost cache hit. So it is checked, and declining is the safe answer.
+    OptimizedShorterThanOriginals,
     /// The leading messages changed under canonicalization, so replaying the
     /// stored bytes would forward content the client did not send.
     ///
@@ -1042,6 +983,7 @@ impl ReplaySkip {
             ReplaySkip::ForwardedCountMismatch => "forwarded_count_mismatch",
             ReplaySkip::ShorterThanStoredPrefix => "shorter_than_stored_prefix",
             ReplaySkip::OptimizedShorterThanPrefix => "optimized_shorter_than_prefix",
+            ReplaySkip::OptimizedShorterThanOriginals => "optimized_shorter_than_originals",
             ReplaySkip::PrefixContentDiverged { .. } => "prefix_content_diverged",
         }
     }
@@ -1076,49 +1018,67 @@ pub fn overlay_cached_prefix_reported(
     if prev_fwd.len() != n {
         return (optimized_messages, Some(ReplaySkip::ForwardedCountMismatch));
     }
-    if current_original_messages.len() < n {
+    // The index correspondence the splice rests on: `optimized[i]` is this
+    // turn's message `i`. The passes in front rewrite in place and append at
+    // the tail, so this is a floor and not an equality — a list that came back
+    // SHORTER than the client's means something was dropped and the tail has
+    // shifted under us.
+    //
+    // Held on `n` so a pipeline that collapsed the stored prefix away keeps its
+    // own name; this covers what that check cannot see, a drop past the prefix.
+    if optimized_messages.len() >= n && optimized_messages.len() < current_original_messages.len() {
         return (
             optimized_messages,
-            Some(ReplaySkip::ShorterThanStoredPrefix),
+            Some(ReplaySkip::OptimizedShorterThanOriginals),
         );
     }
-    if optimized_messages.len() < n {
-        return (
-            optimized_messages,
-            Some(ReplaySkip::OptimizedShorterThanPrefix),
-        );
-    }
-    // Append-only guard on CONTENT ONLY (#1852): compare with the shared
-    // canonicalizer so the guard is robust to ALL per-turn transport /
-    // annotation churn — cache_control movement, litellm `caller`, streaming
-    // `index`, string↔block content shape, etc.
-    //
-    // Deliberately blind to `<system-reminder>` churn: the canonicalizer
-    // filters those spans out, so a reminder the client attached or withdrew
-    // inside this region does not count as divergence and the turn still
-    // replays. That is the whole point. Claude Code withdraws a reminder from
-    // the message it decorated a turn earlier, which lands in the prefix TAIL
-    // where the breakpoints are, so treating it as divergence rebuilds nearly
-    // the whole prefix — measured 2026-08-16 at 151k creation against 18k read
-    // on a single turn, eleven turns of savings for one withdrawn span.
-    //
-    // The cost of the blindness is that replay forwards the stored copy, so a
-    // withdrawn reminder stays on the wire and history keeps one per decorated
-    // message. Those bytes sit INSIDE the cached prefix and bill at 0.1x. The
-    // 382%-of-client-body growth recorded here on 2026-08-11 was read as the
-    // price of this and it was not: it was the relocation pass parking its
-    // block past the last breakpoint at 1.0x, 64% of all billed weight when it
-    // was finally measured on 2026-08-16. Relocation is gone. Watch
-    // `outbound_body_bytes` against `client_request_bytes` — a ratio climbing
-    // past ~1.2 means the accumulation is real after all and this is wrong.
-    if current_original_messages[..n]
-        .iter()
-        .map(canonicalize_for_prefix_compare)
-        .ne(prev_orig.iter().map(canonicalize_for_prefix_compare))
-    {
-        // Locate the first disagreement. The whole-slice compare above already
-        // told us there is one; this only runs on the decline path, so the
-        // per-message walk never touches a turn that replays cleanly.
+    // Match the stored prefix to this turn before measuring either against the
+    // other by index. With no withdrawal in the way this walks the two in step
+    // and lands on `n`, which is the compare the guard below used to do on its
+    // own; with one it lands short, and the tail is taken from there. The two
+    // length checks under this stay where they are: they read `n` against this
+    // turn, and a withdrawal makes that comparison the wrong one to fail on.
+    let Some(consumed) = align_over_withdrawn_scaffolding(prev_orig, current_original_messages)
+    else {
+        if current_original_messages.len() < n {
+            return (
+                optimized_messages,
+                Some(ReplaySkip::ShorterThanStoredPrefix),
+            );
+        }
+        if optimized_messages.len() < n {
+            return (
+                optimized_messages,
+                Some(ReplaySkip::OptimizedShorterThanPrefix),
+            );
+        }
+        // Append-only guard on CONTENT ONLY (#1852): compare with the shared
+        // canonicalizer so the guard is robust to ALL per-turn transport /
+        // annotation churn — cache_control movement, litellm `caller`, streaming
+        // `index`, string↔block content shape, etc.
+        //
+        // Deliberately blind to `<system-reminder>` churn: the canonicalizer
+        // filters those spans out, so a reminder the client attached or withdrew
+        // inside this region does not count as divergence and the turn still
+        // replays. That is the whole point. Claude Code withdraws a reminder from
+        // the message it decorated a turn earlier, which lands in the prefix TAIL
+        // where the breakpoints are, so treating it as divergence rebuilds nearly
+        // the whole prefix — measured 2026-08-16 at 151k creation against 18k read
+        // on a single turn, eleven turns of savings for one withdrawn span.
+        //
+        // The cost of the blindness is that replay forwards the stored copy, so a
+        // withdrawn reminder stays on the wire and history keeps one per decorated
+        // message. Those bytes sit INSIDE the cached prefix and bill at 0.1x. The
+        // 382%-of-client-body growth recorded here on 2026-08-11 was read as the
+        // price of this and it was not: it was the relocation pass parking its
+        // block past the last breakpoint at 1.0x, 64% of all billed weight when it
+        // was finally measured on 2026-08-16. Relocation is gone. Watch
+        // `outbound_body_bytes` against `client_request_bytes` — a ratio climbing
+        // past ~1.2 means the accumulation is real after all and this is wrong.
+        // Locate the first disagreement. The alignment walk above already told
+        // us there is one — it accepts everything an index-aligned compare
+        // accepts, and more — so this only runs on the decline path and never
+        // touches a turn that replays cleanly.
         let first_diff_index = (0..n)
             .find(|&i| {
                 canonicalize_for_prefix_compare(&current_original_messages[i])
@@ -1168,6 +1128,12 @@ pub fn overlay_cached_prefix_reported(
         let mut out = prev_fwd[..replay_upto].to_vec();
         out.extend_from_slice(&optimized_messages[replay_upto..]);
         return (out, Some(skip));
+    };
+    if optimized_messages.len() < consumed {
+        return (
+            optimized_messages,
+            Some(ReplaySkip::OptimizedShorterThanPrefix),
+        );
     }
     // Replay the cached (compressed) prefix verbatim; keep this turn's tail.
     //
@@ -1185,8 +1151,15 @@ pub fn overlay_cached_prefix_reported(
     // the read. The `ReminderInsidePrefix` decline that stood here went with
     // it — it guarded the strip, and with history holding its own spans it
     // would fire on every turn.
+    //
+    // `prev_fwd` goes out whole even when the walk stepped over a withdrawn
+    // scaffolding message, so that message is still on the wire. That is the
+    // point: those are the bytes the provider cached, and the client dropping
+    // the message does not change what is sitting in the cache. `consumed` is
+    // where this turn's own messages resume, which is `n` unless something was
+    // withdrawn.
     let mut out = prev_fwd.to_vec();
-    out.extend_from_slice(&optimized_messages[n..]);
+    out.extend_from_slice(&optimized_messages[consumed..]);
     (out, None)
 }
 
@@ -2772,6 +2745,7 @@ impl SessionReplayStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_stabilization::ephemeral_spans::is_pure_client_scaffolding;
     use serde_json::json;
 
     fn text_msg(role: &str, text: &str) -> Value {
@@ -3018,6 +2992,290 @@ mod tests {
         assert_eq!(
             out, optimized,
             "diverged prefix must return input unchanged"
+        );
+    }
+
+    fn scaffolding_msg(role: &str) -> Value {
+        json!({
+            "role": role,
+            "content": "<system-reminder>\nskills available\n</system-reminder>",
+        })
+    }
+
+    /// The client withdrawing a standalone reminder message must not cost the
+    /// prefix. Every message behind it shifts by one, which an index-aligned
+    /// compare reads as a divergence at that point — 7 of 16 content
+    /// divergences on 2026-08-26, one of them 37,448 tokens.
+    #[test]
+    fn overlay_replays_across_a_withdrawn_scaffolding_message() {
+        let u0 = text_msg("user", "first");
+        let scaffold = scaffolding_msg("system");
+        let a1 = text_msg("assistant", "reply");
+        let u2 = text_msg("user", "second");
+        let prev_orig = vec![u0.clone(), scaffold.clone(), a1.clone(), u2.clone()];
+        let prev_fwd = vec![
+            text_msg("user", "first-c"),
+            scaffold.clone(),
+            text_msg("assistant", "reply-c"),
+            text_msg("user", "second-c"),
+        ];
+
+        // The client has dropped the reminder and added a turn.
+        let a3 = text_msg("assistant", "newest");
+        let current_orig = vec![u0, a1, u2, a3.clone()];
+        let optimized = current_orig.clone();
+
+        let (out, skip) = overlay_cached_prefix_reported(
+            optimized,
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+        );
+        assert!(skip.is_none(), "withdrawal must not decline: {skip:?}");
+        assert_eq!(out[..4], prev_fwd[..], "cached bytes replayed verbatim");
+        assert_eq!(out[4], a3, "this turn's own tail follows");
+        assert_eq!(out.len(), 5);
+        assert!(
+            out.contains(&scaffold),
+            "the withdrawn reminder still goes out: it is in the cached prefix"
+        );
+    }
+
+    /// The same withdrawal, on the form Claude Code actually sends most of the
+    /// time: a `role: "system"` message with no `<system-reminder>` wrapper at
+    /// all. Four in five of the stored ones look like this — output-style
+    /// banners, hook context, skill listings — and keying on the tag left every
+    /// one of them stranding the whole prefix. See
+    /// [`is_client_scaffolding_message`] for the counts.
+    #[test]
+    fn overlay_replays_across_a_withdrawn_untagged_system_message() {
+        let u0 = text_msg("user", "first");
+        let banner = json!({
+            "role": "system",
+            "content": "PreToolUse:Bash hook additional context: check the path first",
+        });
+        let a1 = text_msg("assistant", "reply");
+        let u2 = text_msg("user", "second");
+        let prev_orig = vec![u0.clone(), banner.clone(), a1.clone(), u2.clone()];
+        let prev_fwd = vec![
+            text_msg("user", "first-c"),
+            banner.clone(),
+            text_msg("assistant", "reply-c"),
+            text_msg("user", "second-c"),
+        ];
+
+        let a3 = text_msg("assistant", "newest");
+        let current_orig = vec![u0, a1, u2, a3.clone()];
+        let optimized = current_orig.clone();
+
+        let (out, skip) = overlay_cached_prefix_reported(
+            optimized,
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+        );
+        assert!(
+            skip.is_none(),
+            "an untagged banner is scaffolding too: {skip:?}"
+        );
+        assert_eq!(out[..4], prev_fwd[..], "cached bytes replayed verbatim");
+        assert_eq!(out[4], a3);
+    }
+
+    /// An OpenAI-Chat body opens with its real system prompt. Losing that is a
+    /// changed prompt, not withdrawn scaffolding, and the prefix has to go.
+    #[test]
+    fn overlay_declines_when_the_opening_system_prompt_is_withdrawn() {
+        let sys = json!({"role": "system", "content": "You are a helpful assistant."});
+        let u1 = text_msg("user", "first");
+        let a2 = text_msg("assistant", "reply");
+        let prev_orig = vec![sys, u1.clone(), a2.clone()];
+        let prev_fwd = prev_orig.clone();
+
+        let current_orig = vec![u1, a2, text_msg("user", "second")];
+        let optimized = current_orig.clone();
+
+        let (_, skip) = overlay_cached_prefix_reported(
+            optimized,
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+        );
+        assert!(
+            skip.is_some(),
+            "a withdrawn opening system prompt must not be stepped over"
+        );
+    }
+
+    /// Stepping over stored scaffolding must not turn into stepping over a real
+    /// edit hiding behind it.
+    #[test]
+    fn overlay_still_declines_a_real_edit_behind_withdrawn_scaffolding() {
+        let u0 = text_msg("user", "first");
+        let prev_orig = vec![
+            u0.clone(),
+            scaffolding_msg("system"),
+            text_msg("assistant", "reply"),
+        ];
+        let prev_fwd = vec![
+            text_msg("user", "first-c"),
+            scaffolding_msg("system"),
+            text_msg("assistant", "reply-c"),
+        ];
+        let current_orig = vec![
+            u0,
+            text_msg("assistant", "EDITED"),
+            text_msg("user", "next"),
+        ];
+        let optimized = current_orig.clone();
+
+        let (_, skip) = overlay_cached_prefix_reported(
+            optimized,
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+        );
+        assert!(
+            matches!(skip, Some(ReplaySkip::PrefixContentDiverged { .. })),
+            "an edited message is still a divergence: {skip:?}"
+        );
+    }
+
+    /// Scaffolding the client has just ATTACHED inside the prefix is not
+    /// stepped over. Doing so would leave it off the wire, which is how
+    /// reminders get lost; declining only costs cache.
+    #[test]
+    fn overlay_declines_rather_than_drop_newly_attached_scaffolding() {
+        let u0 = text_msg("user", "first");
+        let a1 = text_msg("assistant", "reply");
+        let prev_orig = vec![u0.clone(), a1.clone()];
+        let prev_fwd = vec![
+            text_msg("user", "first-c"),
+            text_msg("assistant", "reply-c"),
+        ];
+        let current_orig = vec![u0, scaffolding_msg("system"), a1, text_msg("user", "next")];
+        let optimized = current_orig.clone();
+
+        let (out, skip) = overlay_cached_prefix_reported(
+            optimized,
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+        );
+        assert!(
+            skip.is_some(),
+            "must not silently drop an attached reminder"
+        );
+        assert!(
+            out.contains(&scaffolding_msg("system")),
+            "the attached reminder stays on the wire"
+        );
+    }
+
+    /// A pass that deletes from mid-history would shift the tail under the
+    /// splice. Nothing does today; the point is that it cannot start doing it
+    /// quietly.
+    #[test]
+    fn overlay_declines_when_the_pipeline_dropped_a_message() {
+        let u0 = text_msg("user", "first");
+        let a1 = text_msg("assistant", "reply");
+        let prev_orig = vec![u0.clone()];
+        let prev_fwd = vec![text_msg("user", "first-c")];
+        let current_orig = vec![u0.clone(), a1, text_msg("user", "next")];
+        // The pipeline handed back one message fewer than the client sent.
+        let optimized = vec![u0, text_msg("user", "next")];
+
+        let (out, skip) = overlay_cached_prefix_reported(
+            optimized.clone(),
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+        );
+        assert_eq!(
+            skip,
+            Some(ReplaySkip::OptimizedShorterThanOriginals),
+            "a shifted tail must decline, not splice"
+        );
+        assert_eq!(out, optimized, "and hand back what it was given");
+    }
+
+    #[test]
+    fn scaffolding_is_the_message_with_no_prose_of_its_own() {
+        assert!(is_pure_client_scaffolding(&scaffolding_msg("system")));
+        assert!(is_pure_client_scaffolding(&scaffolding_msg("user")));
+        // The model quotes these tags when it discusses them. Its own words are
+        // not scaffolding, whatever they contain.
+        assert!(!is_pure_client_scaffolding(&scaffolding_msg("assistant")));
+        // Prose of its own means the client would be sending it regardless.
+        assert!(!is_pure_client_scaffolding(&json!({
+            "role": "user",
+            "content": "do the thing\n<system-reminder>note</system-reminder>",
+        })));
+        assert!(!is_pure_client_scaffolding(&text_msg("user", "plain")));
+        // One block, reminder first and the user's real prompt after it. The
+        // block-level "starts with a reminder" test passes this; treating it as
+        // scaffolding would step over a genuine turn.
+        assert!(!is_pure_client_scaffolding(&json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "<system-reminder>note</system-reminder>\nplease do the thing",
+            }],
+        })));
+        // Reminder blocks alongside a real one are not scaffolding either.
+        assert!(!is_pure_client_scaffolding(&json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<system-reminder>note</system-reminder>"},
+                {"type": "text", "text": "please do the thing"},
+            ],
+        })));
+        // Block form of the standalone carrier still counts.
+        assert!(is_pure_client_scaffolding(&json!({
+            "role": "system",
+            "content": [{"type": "text", "text": "<system-reminder>note</system-reminder>"}],
+        })));
+    }
+
+    /// The predicate is what stands between a withdrawal and a real turn, so a
+    /// message it misreads is a message stepped over. This is the shape that
+    /// nearly got through.
+    #[test]
+    fn overlay_declines_when_a_real_turn_opens_with_a_reminder() {
+        let u0 = text_msg("user", "first");
+        let carrier = json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "<system-reminder>note</system-reminder>\nthe real prompt",
+            }],
+        });
+        let prev_orig = vec![u0.clone(), carrier, text_msg("assistant", "reply")];
+        let prev_fwd = vec![
+            text_msg("user", "first-c"),
+            text_msg("user", "carrier-c"),
+            text_msg("assistant", "reply-c"),
+        ];
+        // The client has edited that turn away, not withdrawn scaffolding.
+        let current_orig = vec![u0, text_msg("assistant", "reply"), text_msg("user", "next")];
+        let optimized = current_orig.clone();
+
+        let (_, skip) = overlay_cached_prefix_reported(
+            optimized,
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+        );
+        assert!(
+            matches!(skip, Some(ReplaySkip::PrefixContentDiverged { .. })),
+            "a turn carrying real prose must not be stepped over: {skip:?}"
         );
     }
 

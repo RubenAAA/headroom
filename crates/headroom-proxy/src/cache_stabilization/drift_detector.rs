@@ -90,6 +90,10 @@ use axum::http::HeaderMap;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 
+use super::ephemeral_spans::{
+    block_carries_ephemeral_span, is_client_scaffolding_message, take_trailing_ephemeral_spans,
+};
+
 /// Which provider's body shape we're hashing. The walker is shaped
 /// per provider because the cache hot zone lives in different fields:
 /// Anthropic uses `body.system`/`body.tools`/`body.messages`, OpenAI
@@ -127,6 +131,16 @@ pub struct StructuralHash {
     /// only that the slot changed. Purely diagnostic — the drift
     /// decision reads [`StructuralHash::early_messages`].
     pub early_shapes: [Option<MessageShape>; EARLY_MESSAGES_WINDOW],
+    /// The same window hashed the way it was before 2026-08-26: raw slots,
+    /// reminder spans left in. Read for one purpose — counting how often the
+    /// scaffolding fix stops an invalidation that would otherwise have
+    /// happened — and never for the drift decision.
+    ///
+    /// This is a measurement scaffold with a job to finish. Once
+    /// `early_scaffolding_absorbed` has run long enough to price the change,
+    /// delete the field, `legacy_early_message_hashes`, and the branch in
+    /// `observe` that reads them.
+    pub early_messages_legacy: [Option<[u8; 32]>; EARLY_MESSAGES_WINDOW],
 }
 
 /// How many message-shaped items count as the "early" prefix that
@@ -139,6 +153,64 @@ pub const EARLY_MESSAGES_WINDOW: usize = 3;
 /// Claude Code and the Codex CLI; a change past that still shows up as
 /// drift, just without a block index attached.
 pub const EARLY_BLOCKS_WINDOW: usize = 8;
+
+/// What one early block *is*, alongside the hash of what it says.
+///
+/// A hash answers "did this change" and stops there. Three of the most
+/// expensive drift events on record read `2:block[0]` — slot 2's first block
+/// rewritten — and the bodies were long gone by the time anyone asked which
+/// block that was. Carrying the type and the size costs eight bytes per block
+/// and turns the next occurrence into an answer instead of an investigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockTag {
+    /// The block's `type` field, mapped to a fixed vocabulary so the
+    /// descriptor stays `Copy`. Anything unrecognised reads `other`.
+    pub kind: BlockKind,
+    /// Serialized length of the canonicalized block, saturating at `u32::MAX`.
+    /// A size delta is what separates a truncation from a rewrite.
+    pub bytes: u32,
+}
+
+/// The block types worth telling apart in a drift line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    Text,
+    Thinking,
+    RedactedThinking,
+    ToolUse,
+    ToolResult,
+    Image,
+    Document,
+    Other,
+}
+
+impl BlockKind {
+    fn of(block: &serde_json::Value) -> Self {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => Self::Text,
+            Some("thinking") => Self::Thinking,
+            Some("redacted_thinking") => Self::RedactedThinking,
+            Some("tool_use") => Self::ToolUse,
+            Some("tool_result") => Self::ToolResult,
+            Some("image") => Self::Image,
+            Some("document") => Self::Document,
+            _ => Self::Other,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Thinking => "thinking",
+            Self::RedactedThinking => "redacted_thinking",
+            Self::ToolUse => "tool_use",
+            Self::ToolResult => "tool_result",
+            Self::Image => "image",
+            Self::Document => "document",
+            Self::Other => "other",
+        }
+    }
+}
 
 /// Block-level fingerprint of one early message.
 ///
@@ -161,6 +233,9 @@ pub struct MessageShape {
     pub blocks: Option<usize>,
     /// One hash per block, capped at [`EARLY_BLOCKS_WINDOW`].
     pub block_hashes: [Option<[u8; 8]>; EARLY_BLOCKS_WINDOW],
+    /// What each hashed block is and how big it is. Diagnostic only —
+    /// the drift decision never reads it.
+    pub block_tags: [Option<BlockTag>; EARLY_BLOCKS_WINDOW],
 }
 
 /// Compute a [`StructuralHash`] for the body shape implied by `kind`.
@@ -177,6 +252,7 @@ pub fn compute_structural_hash(body: &serde_json::Value, kind: ApiKind) -> Struc
         tools,
         early_messages,
         early_shapes,
+        early_messages_legacy: legacy_early_message_hashes(body, kind),
     }
 }
 
@@ -309,9 +385,80 @@ fn conversation_messages(body: &serde_json::Value, kind: ApiKind) -> Vec<&serde_
     }
 }
 
-/// Hash each of the first [`EARLY_MESSAGES_WINDOW`] conversation
+/// [`early_message_hashes`] as it behaved before the scaffolding fix: every
+/// message slotted by raw index, every reminder span left in.
+///
+/// Kept only so the fix can be counted against the behaviour it replaced.
+fn legacy_early_message_hashes(
+    body: &serde_json::Value,
+    kind: ApiKind,
+) -> [Option<[u8; 32]>; EARLY_MESSAGES_WINDOW] {
+    let mut out = [None; EARLY_MESSAGES_WINDOW];
+    for (slot, msg) in conversation_messages(body, kind)
+        .into_iter()
+        .take(EARLY_MESSAGES_WINDOW)
+        .enumerate()
+    {
+        let msg = string_content_as_block(msg);
+        out[slot] = Some(hash_value(&canonicalize_for_hash(&msg, false)));
+    }
+    out
+}
+
+/// A message with the `<system-reminder>` spans trailing its blocks removed.
+///
+/// The message-level counterpart to skipping a scaffolding-only message: the
+/// client also hangs a span off a message it already sent, which rewrites that
+/// slot's hash without changing anything the conversation said.
+fn without_trailing_spans(msg: &serde_json::Value) -> Cow<'_, serde_json::Value> {
+    let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+        return Cow::Borrowed(msg);
+    };
+    if !blocks.iter().any(block_carries_ephemeral_span) {
+        return Cow::Borrowed(msg);
+    }
+    let kept: Vec<serde_json::Value> = blocks
+        .iter()
+        .filter_map(|block| match take_trailing_ephemeral_spans(block) {
+            // The block must not be touched: a span embedded in prose is prose.
+            None => Some(block.clone()),
+            Some((kept, _)) => kept,
+        })
+        .collect();
+    let mut out = msg.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("content".to_string(), serde_json::Value::Array(kept));
+    }
+    Cow::Owned(out)
+}
+
+/// Hash each of the first [`EARLY_MESSAGES_WINDOW`] *substantive* conversation
 /// messages individually (canonicalized). Slots the conversation has
 /// not grown into yet stay `None`.
+///
+/// Ephemeral client scaffolding is skipped rather than slotted, and the spans
+/// hanging off the messages that remain are stripped before hashing. Both
+/// exist because this hash decides whether to drop the session's whole stored
+/// prefix, and Claude Code's reminder churn lands squarely in this window: 80
+/// of 87 stored prefixes on 2026-08-26 carried a reminder in messages 0-2, and
+/// 34 held the withdrawable standalone `role: "system"` form at index 1.
+///
+/// Without the skip, one withdrawal shifts every later slot and the detector
+/// reads a conversation that did not change as a rebuild boundary. Measured
+/// 2026-08-23/26: 5 events, 430,296 tokens, worst turn 145,891 — every one of
+/// them within 137s of the previous turn, so the provider's 1h cache was alive
+/// and the invalidation, not the client, is what threw it away.
+///
+/// The judgment this overturns is real and was right when written: the note on
+/// [`string_content_as_block`] calls a reminder deleted from settled history
+/// "the real thing", on 2026-08-11 data. The relocation pass that normalised
+/// these away for every subsystem was removed five days later, on 2026-08-16,
+/// and `prefix_replay` alone was given the job. It runs after this hash, and
+/// this hash had already dropped the prefix it would have replayed.
+///
+/// Nothing else is loosened. An edit to real early content, a rewritten
+/// `thinking` block, and a changed `system` or `tools` axis all still read as
+/// drift — see `the_fix_absorbs_the_withdrawal_without_blinding_the_detector`.
 fn early_message_hashes(
     body: &serde_json::Value,
     kind: ApiKind,
@@ -323,10 +470,14 @@ fn early_message_hashes(
     let mut shapes = [None; EARLY_MESSAGES_WINDOW];
     for (slot, msg) in conversation_messages(body, kind)
         .into_iter()
+        .enumerate()
+        .filter(|(index, msg)| !is_client_scaffolding_message(*index, msg))
+        .map(|(_, msg)| msg)
         .take(EARLY_MESSAGES_WINDOW)
         .enumerate()
     {
         let msg = string_content_as_block(msg);
+        let msg = without_trailing_spans(&msg);
         out[slot] = Some(hash_value(&canonicalize_for_hash(&msg, false)));
         shapes[slot] = Some(message_shape(&msg));
     }
@@ -377,13 +528,23 @@ fn string_content_as_block(msg: &serde_json::Value) -> Cow<'_, serde_json::Value
 /// breakpoint move.
 fn message_shape(msg: &serde_json::Value) -> MessageShape {
     let mut block_hashes = [None; EARLY_BLOCKS_WINDOW];
+    let mut block_tags = [None; EARLY_BLOCKS_WINDOW];
     let blocks = match msg.get("content") {
         Some(serde_json::Value::Array(arr)) => {
             for (i, block) in arr.iter().take(EARLY_BLOCKS_WINDOW).enumerate() {
-                let full = hash_value(&canonicalize_for_hash(block, false));
+                let canonical = canonicalize_for_hash(block, false);
+                let full = hash_value(&canonical);
                 let mut short = [0u8; 8];
                 short.copy_from_slice(&full[..8]);
                 block_hashes[i] = Some(short);
+                block_tags[i] = Some(BlockTag {
+                    kind: BlockKind::of(block),
+                    bytes: serde_json::to_vec(&canonical)
+                        .map(|b| b.len())
+                        .unwrap_or(0)
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                });
             }
             Some(arr.len())
         }
@@ -392,6 +553,7 @@ fn message_shape(msg: &serde_json::Value) -> MessageShape {
     MessageShape {
         blocks,
         block_hashes,
+        block_tags,
     }
 }
 
@@ -536,6 +698,25 @@ fn observe(
         Some(previous) => {
             let dims = drift_dims(&previous, &current);
             if dims.is_empty() {
+                // The fix earning its keep: this turn holds still only because
+                // the early window now steps over withdrawn client scaffolding.
+                // Before 2026-08-26 it read as a rebuild boundary and dropped
+                // the session's whole stored prefix. Counted here rather than
+                // inferred from re-cache events, which are far too rare to
+                // price a change against — 9 in three days.
+                if matches!(origin, Origin::Inbound)
+                    && early_window_drifted(
+                        &previous.early_messages_legacy,
+                        &current.early_messages_legacy,
+                    )
+                {
+                    tracing::info!(
+                        event = "early_scaffolding_absorbed",
+                        session_key_hash = %session_prefix,
+                        "withdrawn client scaffolding in the early window no longer \
+                         reads as drift; the stored prefix survives"
+                    );
+                }
                 // Stable (append-only growth included). No event.
                 // Update LRU recency by reinserting.
                 cache.put(session_key.to_string(), current);
@@ -749,12 +930,45 @@ fn shape_delta(prev: &MessageShape, curr: &MessageShape) -> String {
                 // sits past the window we fingerprint.
                 format!("block[>{}]", EARLY_BLOCKS_WINDOW - 1)
             } else {
-                format!("block[{}]", changed.join(","))
+                format!("block[{}]{}", changed.join(","), block_deltas(prev, curr, &changed))
             }
         }
         // One side had blocks and the other a bare string, or both are
         // strings — either way there is no index to give.
         _ => "string".to_string(),
+    }
+}
+
+/// What the rewritten blocks were, and how their size moved.
+///
+/// Reads ` tool_result 4195B->1202B`, or ` thinking 812B` when only the bytes
+/// held still. Empty when neither side tagged the block, so a caller that
+/// prints it unconditionally is safe.
+fn block_deltas(prev: &MessageShape, curr: &MessageShape, changed: &[String]) -> String {
+    let parts: Vec<String> = changed
+        .iter()
+        .filter_map(|i| i.parse::<usize>().ok())
+        .filter_map(|i| match (prev.block_tags.get(i)?, curr.block_tags.get(i)?) {
+            (Some(p), Some(c)) if p.kind == c.kind && p.bytes == c.bytes => {
+                Some(format!("{} {}B", p.kind.name(), p.bytes))
+            }
+            (Some(p), Some(c)) if p.kind == c.kind => {
+                Some(format!("{} {}B->{}B", p.kind.name(), p.bytes, c.bytes))
+            }
+            (Some(p), Some(c)) => Some(format!(
+                "{} {}B->{} {}B",
+                p.kind.name(),
+                p.bytes,
+                c.kind.name(),
+                c.bytes
+            )),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join("+"))
     }
 }
 
@@ -949,7 +1163,7 @@ mod tests {
             {"type": "text", "text": "stable"},
             {"type": "text", "text": "rewritten"},
         ]));
-        assert_eq!(detail(&before, &after), "0:block[1]");
+        assert_eq!(detail(&before, &after), "0:block[1] text 33B->34B");
     }
 
     /// Claude Code relocates its cache breakpoint to the newest block
@@ -975,7 +1189,39 @@ mod tests {
     fn a_string_body_reads_as_the_one_block_it_is() {
         let before = anthropic_body("s", json!([]), vec!["first"]);
         let after = anthropic_body("s", json!([]), vec!["second"]);
-        assert_eq!(detail(&before, &after), "0:block[0]");
+        assert_eq!(detail(&before, &after), "0:block[0] text 30B->31B");
+    }
+
+    /// The three most expensive `early_messages` drifts on record (312,861
+    /// tokens over 2026-08-24/25) all read `2:block[0]` and nothing more, and
+    /// the bodies were evicted before anyone could ask which block that was.
+    /// The line now says what the block is and how its size moved, which is
+    /// what separates a truncation from a rewrite.
+    #[test]
+    fn a_rewritten_block_names_its_type_and_size() {
+        let before = blocks_body(json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": "the whole file"},
+        ]));
+        let after = blocks_body(json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": "trunc"},
+        ]));
+        assert_eq!(
+            detail(&before, &after),
+            "0:block[0] tool_result 68B->59B",
+            "a shrinking tool_result must read as one"
+        );
+    }
+
+    /// A block replaced by one of another type is a different defect from a
+    /// block edited in place, so the line has to distinguish them.
+    #[test]
+    fn a_block_that_changed_type_says_so() {
+        let before = blocks_body(json!([{"type": "thinking", "thinking": "", "signature": "sig"}]));
+        let after = blocks_body(json!([{"type": "text", "text": "hello"}]));
+        assert_eq!(
+            detail(&before, &after),
+            "0:block[0] thinking 51B->text 30B"
+        );
     }
 
     #[test]
@@ -1425,11 +1671,19 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_reminder_block_is_drift_and_names_the_slot() {
-        // The expensive case, measured live on 2026-08-11: the client
-        // deletes a <system-reminder> block from settled history and
-        // every cached token after it is rebilled. Two blocks never
-        // collapse, so this keeps its structure and its detail.
+    fn a_dropped_reminder_block_is_no_longer_drift() {
+        // Reversed on 2026-08-26. This case was `early_messages` drift, on
+        // 2026-08-11 data, and that was right at the time: the relocation pass
+        // normalised reminders away for every subsystem, so one reaching the
+        // hash meant something else had moved.
+        //
+        // Relocation was removed on 2026-08-16 — it cost 64% of all billed
+        // weight — and `prefix_replay` alone was given the job of absorbing
+        // this churn. But drift runs first and drops the stored prefix, so the
+        // replay that would have preserved the cache never got to see the turn.
+        // The withdrawal was free at message 47 and cost a full re-cache at
+        // message 1: 5 events, 430,296 tokens, 2026-08-23/26, every one within
+        // 137s of the previous turn against a 1h cache TTL.
         let with_reminder = json!({"model": "m", "system": "s", "tools": [], "messages": [
             {"role": "user", "content": [{"type": "text", "text": "opener"}]},
             {"role": "user", "content": [
@@ -1443,11 +1697,67 @@ mod tests {
         ]});
         let h1 = compute_structural_hash(&with_reminder, ApiKind::Anthropic);
         let h2 = compute_structural_hash(&without, ApiKind::Anthropic);
+        assert_eq!(
+            drift_dims(&h1, &h2),
+            "",
+            "a withdrawn reminder must not read as a rebuild boundary"
+        );
+    }
+
+    #[test]
+    fn a_dropped_real_block_is_drift_and_names_the_slot() {
+        // The other half of the test above, and the reason the detail exists:
+        // a block that is not scaffolding still moves the count and still
+        // names the slot. Two blocks never collapse, so the structure holds.
+        let with_block = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "opener"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "real turn"},
+                {"type": "text", "text": "a second thing the user said"},
+            ]},
+        ]});
+        let without = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "opener"}]},
+            {"role": "user", "content": [{"type": "text", "text": "real turn"}]},
+        ]});
+        let h1 = compute_structural_hash(&with_block, ApiKind::Anthropic);
+        let h2 = compute_structural_hash(&without, ApiKind::Anthropic);
         assert_eq!(drift_dims(&h1, &h2), "early_messages");
         assert_eq!(
             early_drift_detail(&h1, &h2),
             "1:blocks 2->1",
             "the detail must name the slot and the block count that moved"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_scaffolding_message_does_not_shift_the_window() {
+        // The costliest shape in the logs: the standalone `role: "system"`
+        // bare-string reminder, held at index 1 by 34 of 87 stored prefixes on
+        // 2026-08-26. Withdrawing it used to slide every later message up a
+        // slot, which the detector read as two rewritten messages at once —
+        // logged as `1:blocks 1->2,2:blocks 2->1`.
+        let with_scaffolding = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "opener"}]},
+            {"role": "system", "content": "<system-reminder>skills available</system-reminder>"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "..."},
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]},
+        ]});
+        let without = json!({"model": "m", "system": "s", "tools": [], "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "opener"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "..."},
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+            ]},
+        ]});
+        let h1 = compute_structural_hash(&with_scaffolding, ApiKind::Anthropic);
+        let h2 = compute_structural_hash(&without, ApiKind::Anthropic);
+        assert_eq!(
+            drift_dims(&h1, &h2),
+            "",
+            "withdrawing a scaffolding-only message must not shift the window"
         );
     }
 

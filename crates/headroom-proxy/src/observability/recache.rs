@@ -9,7 +9,8 @@
 //!
 //! `reason` is bounded to a fixed vocabulary derived from direct
 //! attribution evidence: structural drift dimensions, causal replay-skip
-//! reasons, and `unknown` when no such evidence exists.
+//! reasons, cache-timing races, and `unknown` when no such evidence
+//! exists.
 
 use std::sync::OnceLock;
 
@@ -63,6 +64,7 @@ fn reason_label(attribution_reason: Option<&str>) -> &'static str {
         Some("inbound_tail_replaced") => "inbound_tail_replaced",
         Some("unexplained_after_replay") => "unexplained_after_replay",
         Some("aftershock_of_diverged_prefix") => "aftershock_of_diverged_prefix",
+        Some("concurrent_turn_in_flight") => "concurrent_turn_in_flight",
         Some("prefix_content_diverged") => "prefix_content_diverged",
         Some("forwarded_count_mismatch") => "forwarded_count_mismatch",
         Some("shorter_than_stored_prefix") => "shorter_than_stored_prefix",
@@ -117,6 +119,12 @@ mod tests {
         assert_eq!(
             reason_label(Some("reminder_inside_prefix")),
             "reminder_inside_prefix"
+        );
+        // A timing race is not structural drift, and must not land in that
+        // bucket on the dashboard.
+        assert_eq!(
+            reason_label(Some("concurrent_turn_in_flight")),
+            "concurrent_turn_in_flight"
         );
         assert_eq!(reason_label(Some("weird_future_dim")), "structural_drift");
         assert_eq!(reason_label(None), "unknown");
