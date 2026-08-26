@@ -87,6 +87,9 @@ outside. "Came back before its own sub-checks had reported" is a dropped
 
 ## The fix
 
+> Superseded for mirrored networking. `eth0` is the right interface only under
+> NAT. See "It came back — 2026-08-26" at the end for the form that survives.
+
 ```
 sudo ethtool -K eth0 gro off rx off tso off gso off
 ```
@@ -198,3 +201,81 @@ Median throughput in a minute carrying a BadRecordMac is 41.5 req/min against
 9.0 overall. Not deterministic, though: 20:03 ran 171 requests clean, and so
 did 13:16 (135) and 11:56-11:58 (95-112). Close to necessary, plainly not
 sufficient.
+
+## It came back — 2026-08-26
+
+`BadRecordMac` at 07:29:50, and at 07:59:16 a turn died with an `Agent` block
+open: 443 discarded blocks, `output_tokens: 2`, and a reply that said nothing
+about any of it. That is the "subagent finished and reported nothing" symptom,
+seen from outside.
+
+Three things had regressed, none of them in the proxy.
+
+**The ethtool clause was gone from `/etc/wsl.conf`.** What was left is the
+hugepage echo alone:
+
+```
+command = "echo always > /sys/kernel/mm/transparent_hugepage/enabled"
+```
+
+**Restoring it verbatim would have done nothing.** `.wslconfig` now carries
+`networkingMode=mirrored`, which was this document's own recommendation. Under
+mirroring `eth0` is `DOWN` and the Windows adapters are mirrored in beside it,
+so traffic leaves by whichever one holds the default route:
+
+```
+ip route get 192.0.2.10  ->  via 192.0.2.1 dev eth3
+```
+
+Every offload was on for that interface, including one the original fix never
+turned off:
+
+```
+rx-checksumming: on           generic-receive-offload: on
+tcp-segmentation-offload: on  generic-segmentation-offload: on
+large-receive-offload: on
+```
+
+**The stream hold was back at its 2048 default.** The raise to 8192 recorded
+above was never written into how the proxy is launched.
+
+### Why a boot command was always going to rot
+
+Under mirroring the interface set is dynamic. `eth3` is a phone hotspot, `eth4`
+a VPN at MTU 1420, and the numbering moves as the machine changes network. A
+fix pinned to one interface name stops working the moment that name means
+something else, and a `[boot] command` cannot touch an interface that appears
+after boot at all.
+
+So apply it per interface, on arrival, with a udev rule:
+
+```
+# /etc/udev/rules.d/70-wsl-disable-offload.rules
+ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", \
+  RUN+="/usr/sbin/ethtool -K %k gro off rx off tso off gso off lro off"
+```
+
+`systemd=true` is already set in `wsl.conf`, so udev is running. For the
+interfaces that are up right now, between turns rather than mid-stream:
+
+```
+sudo ethtool -K eth3 gro off rx off tso off gso off lro off
+sudo ethtool -K eth4 gro off rx off tso off gso off lro off
+```
+
+### What the proxy does about it now
+
+`sse/stream_finisher.rs` used to end a drop that discarded a tool call the same
+way it ended a drop that lost only text: truncation marker, `stop_reason:
+end_turn`, well-formed turn. For text that is right. For a tool call it erased
+the only difference between a call that was lost and one the model chose not to
+make, which is why a dead `Agent` read as an idle one.
+
+The marker now names the call and says it did not run, on both routes into that
+state — the synthesised tail, and the `stop_reason` downgrade for when upstream
+finished the message but the block was discarded on the way. The model reads it
+on its next turn and re-issues the call, which is the only repair available:
+the tokens are gone and a half-built block cannot be rebuilt.
+
+`net_offload.rs` checks the offload flags at startup and prints the commands
+when they are wrong, so a session is not begun on a NIC that will corrupt it.

@@ -1265,16 +1265,24 @@ pub struct CliArgs {
     /// drops the parser had a content block open every time, 1 to 20 output
     /// tokens in, so a second attempt would splice two generations together.
     /// Holding the opening bytes keeps the response uncommitted long enough to
-    /// start over instead, and 2 KiB covers the preamble plus roughly a dozen
-    /// deltas — past every drop seen so far.
+    /// start over instead.
     ///
     /// The trade is time to first paint: this much of every stream arrives in
     /// one burst rather than token by token. Raise it to cover later drops,
     /// lower it to hand the first token over sooner.
+    ///
+    /// 2 KiB was the first figure and it was too small — a drop at 2279 bytes
+    /// truncated a turn, and the observed drop points run 641, 1129, 2122,
+    /// 2279. The raise to 8 KiB was recorded in
+    /// `docs/tls-record-corruption-wsl2.md` but only ever passed on the command
+    /// line, so it reverted the moment the proxy was started without the flag —
+    /// which is how it was back at 2048 on 2026-08-26 while the same corruption
+    /// was live. The default is the fix; a figure that has to be remembered is
+    /// not one.
     #[arg(
         long = "retry-stream-hold-bytes",
         env = "HEADROOM_RETRY_STREAM_HOLD_BYTES",
-        default_value_t = 2048
+        default_value_t = 8192
     )]
     pub retry_stream_hold_bytes: usize,
 

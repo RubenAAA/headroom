@@ -1,0 +1,27 @@
+# Turn off the NIC offload that corrupts TLS records under WSL2.
+#
+# See docs/tls-record-corruption-wsl2.md. generic-receive-offload and
+# large-receive-offload merge inbound packets before the kernel sees them;
+# rx-checksumming lets the NIC assert a checksum the kernel then skips
+# verifying. Between them a corrupted byte reaches TLS, TLS kills the
+# connection, and with HTTP/2 every stream multiplexed on it dies at once.
+#
+# Install:
+#   sudo cp deploy/wsl/70-wsl-disable-offload.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --subsystem-match=net --action=add
+#
+# Why udev rather than a [boot] command in /etc/wsl.conf. Under
+# networkingMode=mirrored the Windows adapters are mirrored in and the
+# interface set is dynamic: a hotspot, a wifi link and a VPN come and go, and
+# the default route moves between them. A boot command runs once, against
+# whatever exists at that moment, and cannot touch an interface that appears
+# later — which is why the fix silently stopped applying when eth0 went down
+# and the traffic moved to eth3. A rule fires per interface, on arrival.
+#
+# tso and gso are transmit-side and not the cause. They are turned off with the
+# rest because it costs nothing on API traffic and it matches the command
+# written down in the doc.
+
+ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", \
+  RUN+="/usr/sbin/ethtool -K %k gro off rx off tso off gso off lro off"

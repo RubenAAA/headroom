@@ -31,6 +31,7 @@ pub mod memory_tail;
 pub mod model_router;
 pub mod model_sanitize;
 pub mod modes;
+pub mod net_offload;
 pub mod observability;
 pub mod output_shaper;
 pub mod probe_recorder;
