@@ -13,7 +13,14 @@ use axum::Json;
 use bytes::Bytes;
 use headroom_core::auth_mode::{classify as classify_auth_mode, AuthMode};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+// The Gemini content-shape conversions live with the Gemini handler; the
+// batch path is a second caller, not a second owner. They were copied here
+// once and the two copies had already drifted apart in local variable names.
+use crate::handlers::gemini::{
+    gemini_contents_to_messages, messages_to_gemini_contents, rebuild_gemini_contents,
+};
 
 use crate::compression::live_zone_openai::compress_openai_chat_request;
 use crate::compression::Outcome;
@@ -116,132 +123,6 @@ pub(crate) async fn forward_to_upstream(
     let resp_headers = resp.headers().clone();
     let resp_body = resp.bytes().await.map_err(ProxyError::Upstream)?;
     response_from_upstream(status, resp_headers, resp_body)
-}
-
-/// Check if a Gemini content entry has non-text parts.
-pub fn has_non_text_parts(content: &Value) -> bool {
-    content
-        .get("parts")
-        .and_then(Value::as_array)
-        .map(|parts| {
-            parts.iter().any(|part| {
-                part.get("inlineData").is_some()
-                    || part.get("fileData").is_some()
-                    || part.get("functionCall").is_some()
-                    || part.get("functionResponse").is_some()
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Convert Gemini contents[] format to OpenAI messages[] format for compression.
-pub fn gemini_contents_to_messages(
-    contents: &[Value],
-    system_instruction: Option<&Value>,
-) -> (Vec<Value>, HashSet<usize>) {
-    let mut messages = Vec::new();
-    let mut preserved_indices = HashSet::new();
-
-    if let Some(system_instruction) = system_instruction {
-        let text_parts = text_parts(system_instruction);
-        if !text_parts.is_empty() {
-            messages.push(json!({
-                "role": "system",
-                "content": text_parts.join("\n"),
-            }));
-        }
-    }
-
-    for (idx, content) in contents.iter().enumerate() {
-        if has_non_text_parts(content) {
-            preserved_indices.insert(idx);
-        }
-
-        let role = match content
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("user")
-        {
-            "model" => "assistant",
-            other => other,
-        };
-        let text_parts = text_parts(content);
-        if !text_parts.is_empty() {
-            messages.push(json!({
-                "role": role,
-                "content": text_parts.join("\n"),
-            }));
-        }
-    }
-
-    (messages, preserved_indices)
-}
-
-/// Convert OpenAI messages[] format back to Gemini contents[] plus systemInstruction.
-pub fn messages_to_gemini_contents(messages: &[Value]) -> (Vec<Value>, Option<Value>) {
-    let mut contents = Vec::new();
-    let mut system_instruction = None;
-
-    for msg in messages {
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-        let content = match msg.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => String::new(),
-        };
-
-        if role == "system" {
-            system_instruction = Some(json!({"parts": [{"text": content}]}));
-            continue;
-        }
-
-        let gemini_role = if role == "assistant" { "model" } else { "user" };
-        contents.push(json!({
-            "role": gemini_role,
-            "parts": [{"text": content}],
-        }));
-    }
-
-    (contents, system_instruction)
-}
-
-fn text_parts(content: &Value) -> Vec<String> {
-    content
-        .get("parts")
-        .and_then(Value::as_array)
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn rebuild_gemini_contents(
-    original_contents: &[Value],
-    preserved_indices: &HashSet<usize>,
-    preserved_contents: &HashMap<usize, Value>,
-    optimized_contents: Vec<Value>,
-) -> Vec<Value> {
-    let mut optimized_iter = optimized_contents.into_iter();
-    let mut result = Vec::new();
-
-    for (idx, original_content) in original_contents.iter().enumerate() {
-        let had_text = !text_parts(original_content).is_empty();
-        if preserved_indices.contains(&idx) {
-            if let Some(preserved) = preserved_contents.get(&idx) {
-                result.push(preserved.clone());
-            }
-            if had_text {
-                let _ = optimized_iter.next();
-            }
-        } else if let Some(optimized) = optimized_iter.next() {
-            result.push(optimized);
-        }
-    }
-
-    result
 }
 
 pub(crate) fn compression_auth_mode(headers: &HeaderMap) -> AuthMode {
@@ -961,22 +842,4 @@ mod tests {
         assert_eq!(stats, BatchJsonlStats::default());
     }
 
-    #[test]
-    fn test_has_non_text_parts() {
-        assert!(has_non_text_parts(&json!({
-            "parts": [{"text": "look"}, {"inlineData": {"mimeType": "image/png", "data": "abc"}}]
-        })));
-        assert!(has_non_text_parts(&json!({
-            "parts": [{"fileData": {"fileUri": "gs://bucket/file", "mimeType": "image/png"}}]
-        })));
-        assert!(has_non_text_parts(&json!({
-            "parts": [{"functionCall": {"name": "lookup", "args": {}}}]
-        })));
-        assert!(has_non_text_parts(&json!({
-            "parts": [{"functionResponse": {"name": "lookup", "response": {}}}]
-        })));
-        assert!(!has_non_text_parts(&json!({
-            "parts": [{"text": "plain"}]
-        })));
-    }
 }

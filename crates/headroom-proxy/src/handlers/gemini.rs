@@ -89,7 +89,7 @@ pub fn has_non_text_parts(content: &Value) -> bool {
 }
 
 /// Extract text parts from a Gemini content entry.
-fn text_parts(content: &Value) -> Vec<String> {
+pub fn text_parts(content: &Value) -> Vec<String> {
     content
         .get("parts")
         .and_then(Value::as_array)
@@ -298,6 +298,135 @@ fn count_message_tokens(messages: &[Value]) -> usize {
         .sum()
 }
 
+// ─── Shared request shape ──────────────────────────────────────────────────
+
+/// A parsed Gemini request, in the form all three routes work from.
+///
+/// `generateContent`, `streamGenerateContent` and `countTokens` each used to
+/// open with their own copy of this parse. The copies stayed in step, but only
+/// because nobody touched them.
+struct GeminiRequest {
+    body_json: Value,
+    contents: Vec<Value>,
+    /// OpenAI-shaped messages, which is what the compressors speak.
+    messages: Vec<Value>,
+    /// Indices of `contents` entries held back from compression because they
+    /// carry non-text parts; `preserved_contents` holds the originals.
+    preserved_indices: HashSet<usize>,
+    preserved_contents: HashMap<usize, Value>,
+    original_tokens: usize,
+    upstream_headers: HashMap<String, String>,
+}
+
+/// Parse a Gemini body, or hand back the error response to return instead.
+fn parse_gemini_request(body: &Bytes, headers: &HeaderMap) -> Result<GeminiRequest, Response> {
+    let body_json: Value = serde_json::from_slice(body).map_err(|e| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("Invalid request body: {e}"),
+            400,
+        )
+    })?;
+
+    let contents = body_json
+        .get("contents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let (messages, preserved_indices) =
+        gemini_contents_to_messages(&contents, body_json.get("systemInstruction"));
+    let preserved_contents: HashMap<usize, Value> = preserved_indices
+        .iter()
+        .map(|&idx| (idx, contents[idx].clone()))
+        .collect();
+    let original_tokens = count_message_tokens(&messages);
+
+    Ok(GeminiRequest {
+        body_json,
+        contents,
+        messages,
+        preserved_indices,
+        preserved_contents,
+        original_tokens,
+        upstream_headers: strip_headroom_headers(headers),
+    })
+}
+
+/// What compressing a Gemini request produced.
+struct GeminiCompressed {
+    /// The body to forward — the original when nothing shrank.
+    output_body: Value,
+    tokens_saved: usize,
+    transforms_applied: Vec<String>,
+}
+
+impl GeminiRequest {
+    /// Compress the live messages and fold the result back into Gemini shape.
+    ///
+    /// The preserved non-text entries go back at their original indices, so a
+    /// request that mixes images and text keeps its ordering.
+    fn compress(
+        &self,
+        state: &AppState,
+        model: &str,
+        headers: &HeaderMap,
+        request_id: &str,
+    ) -> GeminiCompressed {
+        let auth_mode = auth_mode_for_gemini(headers);
+        let decision = crate::compression_decision::CompressionDecision::decide(
+            headers,
+            state.config.compression,
+            true,
+            !self.messages.is_empty(),
+        );
+
+        let mut optimized_messages = self.messages.clone();
+        let mut tokens_saved = 0usize;
+        let mut transforms_applied: Vec<String> = Vec::new();
+
+        if decision.should_compress {
+            if let Some((compressed, before, after)) = compress_messages(
+                &self.messages,
+                model,
+                state.config.compression_mode,
+                auth_mode,
+                request_id,
+            ) {
+                optimized_messages = compressed;
+                tokens_saved = before.saturating_sub(after);
+                transforms_applied.push("gemini_openai_compression".to_string());
+            }
+        }
+
+        let mut output_body = self.body_json.clone();
+        if optimized_messages != self.messages {
+            let (opt_contents, opt_sys) = messages_to_gemini_contents(&optimized_messages);
+            let rebuilt = rebuild_gemini_contents(
+                &self.contents,
+                &self.preserved_indices,
+                &self.preserved_contents,
+                opt_contents,
+            );
+            output_body["contents"] = Value::Array(rebuilt);
+            if let Some(sys) = opt_sys {
+                output_body["systemInstruction"] = sys;
+            } else if output_body.get("systemInstruction").is_some() {
+                output_body
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("systemInstruction");
+            }
+        }
+
+        GeminiCompressed {
+            output_body,
+            tokens_saved,
+            transforms_applied,
+        }
+    }
+}
+
 // ─── Unified dispatcher ────────────────────────────────────────────────────
 
 /// Unified dispatcher for `POST /v1beta/models/*model_action`.
@@ -387,92 +516,30 @@ async fn handle_generate_content_inner(
     let request_id = crate::proxy::ensure_request_id(&headers);
     let start = std::time::Instant::now();
 
-    // Parse body
-    let body_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Invalid request body: {e}"),
-                400,
-            );
-        }
+    let req = match parse_gemini_request(&body, &headers) {
+        Ok(req) => req,
+        Err(response) => return response,
     };
 
-    let contents = body_json
-        .get("contents")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let system_instruction = body_json.get("systemInstruction");
-
-    // Strip internal headers
-    let upstream_headers = strip_headroom_headers(&headers);
-
-    // Convert to OpenAI messages for compression
-    let (messages, preserved_indices) = gemini_contents_to_messages(&contents, system_instruction);
-    let preserved_contents: HashMap<usize, Value> = preserved_indices
-        .iter()
-        .map(|&idx| (idx, contents[idx].clone()))
-        .collect();
-
-    let original_tokens = count_message_tokens(&messages);
-
-    // Early exit: all content has non-text parts
-    if preserved_indices.len() == contents.len() {
-        return forward_to_gemini_upstream(&state, &model, &upstream_headers, &body_json, &query)
-            .await;
-    }
-
-    // Compression decision
-    let auth_mode = auth_mode_for_gemini(&headers);
-    let has_messages = !messages.is_empty();
-    let decision = crate::compression_decision::CompressionDecision::decide(
-        &headers,
-        state.config.compression,
-        true,
-        has_messages,
-    );
-
-    let mut optimized_messages = messages.clone();
-    let mut tokens_saved = 0usize;
-    let mut transforms_applied: Vec<String> = Vec::new();
-
-    if decision.should_compress {
-        if let Some((compressed, before, after)) = compress_messages(
-            &messages,
+    // Nothing here is text, so there is nothing to compress.
+    if req.preserved_indices.len() == req.contents.len() {
+        return forward_to_gemini_upstream(
+            &state,
             &model,
-            state.config.compression_mode,
-            auth_mode,
-            &request_id,
-        ) {
-            optimized_messages = compressed;
-            tokens_saved = before.saturating_sub(after);
-            transforms_applied.push("gemini_openai_compression".to_string());
-        }
+            &req.upstream_headers,
+            &req.body_json,
+            &query,
+        )
+        .await;
     }
 
-    // Convert back to Gemini format if optimized
-    let mut output_body = body_json.clone();
-    if optimized_messages != messages {
-        let (opt_contents, opt_sys) = messages_to_gemini_contents(&optimized_messages);
-        let rebuilt = rebuild_gemini_contents(
-            &contents,
-            &preserved_indices,
-            &preserved_contents,
-            opt_contents,
-        );
-        output_body["contents"] = Value::Array(rebuilt);
-        if let Some(sys) = opt_sys {
-            output_body["systemInstruction"] = sys;
-        } else if output_body.get("systemInstruction").is_some() {
-            output_body
-                .as_object_mut()
-                .unwrap()
-                .remove("systemInstruction");
-        }
-    }
+    let GeminiCompressed {
+        output_body,
+        tokens_saved,
+        transforms_applied,
+    } = req.compress(&state, &model, &headers, &request_id);
+    let original_tokens = req.original_tokens;
+    let upstream_headers = req.upstream_headers;
 
     // Forward to upstream
     let is_streaming = query.alt.as_deref() == Some("sse")
@@ -504,7 +571,7 @@ async fn handle_generate_content_inner(
         &state,
         "POST",
         &upstream_url,
-        upstream_headers,
+        upstream_headers.clone(),
         &output_body,
     )
     .await;
@@ -603,87 +670,24 @@ async fn handle_stream_generate_content_inner(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let upstream_headers = strip_headroom_headers(&headers);
     let request_id = crate::proxy::ensure_request_id(&headers);
 
-    let body_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Invalid request body: {e}"),
-                400,
-            );
-        }
+    let req = match parse_gemini_request(&body, &headers) {
+        Ok(req) => req,
+        Err(response) => return response,
     };
-
-    let contents = body_json
-        .get("contents")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let system_instruction = body_json.get("systemInstruction");
-
-    let (messages, preserved_indices) = gemini_contents_to_messages(&contents, system_instruction);
-    let preserved_contents: HashMap<usize, Value> = preserved_indices
-        .iter()
-        .map(|&idx| (idx, contents[idx].clone()))
-        .collect();
-
-    let original_tokens = count_message_tokens(&messages);
-
-    // Compression
-    let auth_mode = auth_mode_for_gemini(&headers);
-    let decision = crate::compression_decision::CompressionDecision::decide(
-        &headers,
-        state.config.compression,
-        true,
-        !messages.is_empty(),
-    );
-
-    let mut optimized_messages = messages.clone();
-    let mut tokens_saved = 0usize;
-    let mut transforms_applied: Vec<String> = Vec::new();
-
-    if decision.should_compress {
-        if let Some((compressed, before, after)) = compress_messages(
-            &messages,
-            &model,
-            state.config.compression_mode,
-            auth_mode,
-            &request_id,
-        ) {
-            optimized_messages = compressed;
-            tokens_saved = before.saturating_sub(after);
-            transforms_applied.push("gemini_openai_compression".to_string());
-        }
-    }
-
-    let mut output_body = body_json.clone();
-    if optimized_messages != messages {
-        let (opt_contents, opt_sys) = messages_to_gemini_contents(&optimized_messages);
-        let rebuilt = rebuild_gemini_contents(
-            &contents,
-            &preserved_indices,
-            &preserved_contents,
-            opt_contents,
-        );
-        output_body["contents"] = Value::Array(rebuilt);
-        if let Some(sys) = opt_sys {
-            output_body["systemInstruction"] = sys;
-        } else if output_body.get("systemInstruction").is_some() {
-            output_body
-                .as_object_mut()
-                .unwrap()
-                .remove("systemInstruction");
-        }
-    }
+    let GeminiCompressed {
+        output_body,
+        tokens_saved,
+        transforms_applied,
+    } = req.compress(&state, &model, &headers, &request_id);
+    let original_tokens = req.original_tokens;
 
     // Forward as streaming
     forward_streaming(
         &state,
         &model,
-        &upstream_headers,
+        &req.upstream_headers,
         &output_body,
         &query,
         &request_id,
@@ -708,84 +712,30 @@ async fn handle_count_tokens_inner(
     let request_id = crate::proxy::ensure_request_id(&headers);
     let start = std::time::Instant::now();
 
-    let body_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Invalid request body: {e}"),
-                400,
-            );
-        }
+    let req = match parse_gemini_request(&body, &headers) {
+        Ok(req) => req,
+        Err(response) => return response,
     };
 
-    let contents = body_json
-        .get("contents")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let system_instruction = body_json.get("systemInstruction");
-
-    let upstream_headers = strip_headroom_headers(&headers);
-
-    let (messages, preserved_indices) = gemini_contents_to_messages(&contents, system_instruction);
-    let preserved_contents: HashMap<usize, Value> = preserved_indices
-        .iter()
-        .map(|&idx| (idx, contents[idx].clone()))
-        .collect();
-
-    let original_tokens = count_message_tokens(&messages);
-
-    // Early exit: all non-text
-    if preserved_indices.len() == contents.len() {
-        return forward_to_gemini_upstream(&state, &model, &upstream_headers, &body_json, &query)
-            .await;
-    }
-
-    // Compression for countTokens
-    let auth_mode = auth_mode_for_gemini(&headers);
-    let decision = crate::compression_decision::CompressionDecision::decide(
-        &headers,
-        state.config.compression,
-        true,
-        !messages.is_empty(),
-    );
-
-    let mut optimized_messages = messages.clone();
-    let mut transforms_applied: Vec<String> = Vec::new();
-
-    if decision.should_compress {
-        if let Some((compressed, _, _)) = compress_messages(
-            &messages,
+    // Nothing here is text, so there is nothing to compress.
+    if req.preserved_indices.len() == req.contents.len() {
+        return forward_to_gemini_upstream(
+            &state,
             &model,
-            state.config.compression_mode,
-            auth_mode,
-            &request_id,
-        ) {
-            optimized_messages = compressed;
-            transforms_applied.push("gemini_openai_compression".to_string());
-        }
+            &req.upstream_headers,
+            &req.body_json,
+            &query,
+        )
+        .await;
     }
 
-    let mut output_body = body_json.clone();
-    if optimized_messages != messages {
-        let (opt_contents, opt_sys) = messages_to_gemini_contents(&optimized_messages);
-        let rebuilt = rebuild_gemini_contents(
-            &contents,
-            &preserved_indices,
-            &preserved_contents,
-            opt_contents,
-        );
-        output_body["contents"] = Value::Array(rebuilt);
-        if let Some(sys) = opt_sys {
-            output_body["systemInstruction"] = sys;
-        } else if output_body.get("systemInstruction").is_some() {
-            output_body
-                .as_object_mut()
-                .unwrap()
-                .remove("systemInstruction");
-        }
-    }
+    let GeminiCompressed {
+        output_body,
+        transforms_applied,
+        ..
+    } = req.compress(&state, &model, &headers, &request_id);
+    let original_tokens = req.original_tokens;
+    let upstream_headers = req.upstream_headers;
 
     // Forward to upstream countTokens
     let upstream_url = format!(
@@ -826,6 +776,11 @@ async fn handle_count_tokens_inner(
                 original_tokens = original_tokens,
                 compressed_tokens = compressed_tokens,
                 tokens_saved = tokens_saved,
+                // countTokens has no upstream field to forward these on, but
+                // the saving it reports is meaningless without knowing which
+                // rewrites produced it. The other two handlers pass theirs to
+                // the upstream call; this one logs them.
+                transforms_applied = %transforms_applied.join(","),
                 latency_ms = latency,
                 "Gemini countTokens completed"
             );
@@ -1052,6 +1007,25 @@ async fn forward_streaming(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn has_non_text_parts_file_data_and_function_response() {
+        assert!(has_non_text_parts(&json!({
+            "parts": [{"text": "look"}, {"inlineData": {"mimeType": "image/png", "data": "abc"}}]
+        })));
+        assert!(has_non_text_parts(&json!({
+            "parts": [{"fileData": {"fileUri": "gs://bucket/file", "mimeType": "image/png"}}]
+        })));
+        assert!(has_non_text_parts(&json!({
+            "parts": [{"functionCall": {"name": "lookup", "args": {}}}]
+        })));
+        assert!(has_non_text_parts(&json!({
+            "parts": [{"functionResponse": {"name": "lookup", "response": {}}}]
+        })));
+        assert!(!has_non_text_parts(&json!({
+            "parts": [{"text": "plain"}]
+        })));
+    }
 
     #[test]
     fn has_non_text_parts_inline_data() {
