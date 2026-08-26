@@ -10647,6 +10647,9 @@ fn waste_signals_for_request(
 ///
 /// Only signals that fired are emitted — a zero for every signal on every
 /// request would inflate the label space without adding information.
+// The signals are computed and logged; this emits them to Prometheus, which
+// no caller has asked for yet.
+#[allow(dead_code)]
 fn record_waste_signals(signals: &[(String, i64)]) {
     for (signal, tokens) in signals {
         if *tokens > 0 {

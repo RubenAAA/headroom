@@ -42,6 +42,9 @@ impl std::fmt::Display for ReadState {
 struct FileOperation {
     msg_index: usize,
     tool_call_id: String,
+    /// Which tool produced the operation. Recorded for attribution the
+    /// lifecycle report does not break out yet.
+    #[allow(dead_code)]
     tool_name: String,
     file_path: String,
     /// "read" | "edit" | "write"
@@ -648,7 +651,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const LARGE_CONTENT: &str = "x"; // Will be repeated to exceed min_size_bytes
     const SMALL_CONTENT: &str = "tiny";
 
     fn large_content() -> String {

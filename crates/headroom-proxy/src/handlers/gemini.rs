@@ -47,13 +47,6 @@ pub(crate) fn gemini_output_tokens(usage_meta: &Value) -> u64 {
     }
 }
 
-/// Parse a `model:action` path segment (e.g. `"gemini-2.0-flash:generateContent"`)
-/// into `(model, action)`. Returns `None` if there is no `:` separator.
-pub(crate) fn split_model_action(model_action: &str) -> Option<(&str, &str)> {
-    let (model, action) = model_action.rsplit_once(':')?;
-    Some((action, model)) // rsplit_once returns (before, after) so action is first
-}
-
 /// Parse `model:action` where the action is the part AFTER the last colon.
 /// For `"gemini-2.0-flash:generateContent"` returns `("gemini-2.0-flash", "generateContent")`.
 pub(crate) fn parse_model_and_action(model_action: &str) -> Option<(&str, &str)> {

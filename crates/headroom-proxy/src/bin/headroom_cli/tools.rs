@@ -500,6 +500,8 @@ fn move_file(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+// Backs a `tools which` subcommand that is not registered yet.
+#[allow(dead_code)]
 fn which(tool: &str) -> Result<Option<PathBuf>, Error> {
     let reg = registry()?;
     let Some(entry) = reg.tools.get(tool) else {

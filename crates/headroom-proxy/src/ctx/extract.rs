@@ -81,6 +81,7 @@ fn content_blocks(msg: &Value) -> Vec<Value> {
 }
 
 /// Null-safe string extraction.
+#[allow(dead_code)]
 fn safe_str(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }

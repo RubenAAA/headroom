@@ -28,6 +28,9 @@ const SENSITIVE_HEADER_PARTS: &[&str] = &[
 const SENSITIVE_QUERY_PARTS: &[&str] = &["key", "token", "secret", "signature", "code"];
 
 /// A sanitized HTTP request/response pair captured by the harness.
+// Captured in full so the diff can widen without re-recording; the current
+// report reads only some of these.
+#[allow(dead_code)]
 pub struct CapturedExchange {
     pub lane: String,
     pub sequence: i64,

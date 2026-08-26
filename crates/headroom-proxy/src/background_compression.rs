@@ -36,6 +36,9 @@ pub struct BackgroundCompressor {
     tx: mpsc::Sender<CompressionJob>,
     pending: Arc<Mutex<HashSet<String>>>,
     stats: Arc<Mutex<BackgroundStats>>,
+    /// The bound the channel was built with, kept for a queue-depth report
+    /// that does not exist yet.
+    #[allow(dead_code)]
     max_queue: usize,
 }
 

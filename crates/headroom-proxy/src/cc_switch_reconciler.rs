@@ -68,6 +68,9 @@ pub struct CCSwitchReconciler {
     dynamic_upstream: DynamicUpstream,
     route_official: bool,
     path: PathBuf,
+    /// For skipping a reconcile when the file has not changed. The loop
+    /// re-reads unconditionally today.
+    #[allow(dead_code)]
     last_mtime_ns: Option<i64>,
     running: Arc<AtomicBool>,
 }

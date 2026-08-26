@@ -124,6 +124,8 @@ impl Default for MemoryConfig {
 
 pub struct MemoryHandler {
     config: MemoryConfig,
+    /// Recorded at construction for per-agent scoping; not read yet.
+    #[allow(dead_code)]
     agent_type: String,
     backend: Option<Arc<dyn MemoryBackend>>,
     router: Option<BackendRouter>,
