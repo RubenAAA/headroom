@@ -7028,6 +7028,48 @@ impl OutcomeContext {
     }
 }
 
+/// Book a completed OpenAI-shaped stream.
+///
+/// Chat Completions and the Responses API report the same three numbers under
+/// different names; once they have been read, the outcome is identical, and the
+/// two copies of this literal were byte-for-byte the same bar a comment. The
+/// Anthropic arm is deliberately not folded in — it also carries cache-write
+/// tiers, a wire footprint, and CCR continuation totals that neither OpenAI
+/// shape has.
+fn emit_openai_stream_outcome(
+    ctx: &OutcomeContext,
+    request_id: &str,
+    ttfb_ms: f64,
+    input_tok: i64,
+    cached_tok: i64,
+    output_tok: i64,
+) {
+    let outcome = headroom_core::request_outcome::RequestOutcome {
+        request_id: request_id.to_string(),
+        provider: ctx.provider.clone(),
+        model: ctx.model.clone(),
+        original_tokens: ctx.sizes(input_tok).0,
+        optimized_tokens: ctx.sizes(input_tok).1,
+        output_tokens: output_tok,
+        tokens_saved: ctx.tokens_saved,
+        attempted_input_tokens: ctx.attempted(input_tok),
+        cache_read_tokens: cached_tok,
+        // Both providers report a total that includes the cached prefix, unlike
+        // Anthropic's `input_tokens`, so the uncached remainder is a subtraction.
+        uncached_input_tokens: input_tok.saturating_sub(cached_tok),
+        total_latency_ms: ctx.total_latency_ms,
+        overhead_ms: ctx.overhead_ms,
+        ttfb_ms,
+        transforms_applied: ctx.transforms_applied.clone(),
+        num_messages: ctx.num_messages,
+        tags: ctx.tags.clone(),
+        client: ctx.client.clone(),
+        project: ctx.project.clone(),
+        ..Default::default()
+    };
+    headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
+}
+
 /// How long to wait before retry number `attempt` (0-based), in milliseconds.
 ///
 /// Every retry site in the proxy used to inline this formula, and the copies
@@ -7529,30 +7571,14 @@ async fn run_sse_state_machine(
                 } else {
                     (0, 0, 0)
                 };
-                let outcome = headroom_core::request_outcome::RequestOutcome {
-                    request_id: request_id.clone(),
-                    provider: ctx.provider.clone(),
-                    model: ctx.model.clone(),
-                    original_tokens: ctx.sizes(input_tok).0,
-                    optimized_tokens: ctx.sizes(input_tok).1,
-                    output_tokens: output_tok,
-                    tokens_saved: ctx.tokens_saved,
-                    attempted_input_tokens: ctx.attempted(input_tok),
-                    cache_read_tokens: cached_tok,
-                    // `prompt_tokens` is the total and includes the cached
-                    // prefix, unlike Anthropic's `input_tokens`.
-                    uncached_input_tokens: input_tok.saturating_sub(cached_tok),
-                    total_latency_ms: ctx.total_latency_ms,
-                    overhead_ms: ctx.overhead_ms,
+                emit_openai_stream_outcome(
+                    ctx,
+                    &request_id,
                     ttfb_ms,
-                    transforms_applied: ctx.transforms_applied.clone(),
-                    num_messages: ctx.num_messages,
-                    tags: ctx.tags.clone(),
-                    client: ctx.client.clone(),
-                    project: ctx.project.clone(),
-                    ..Default::default()
-                };
-                headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
+                    input_tok,
+                    cached_tok,
+                    output_tok,
+                );
             }
         }
         SseStreamKind::OpenAiResponses => {
@@ -7705,30 +7731,14 @@ async fn run_sse_state_machine(
                 } else {
                     (0, 0, 0)
                 };
-                let outcome = headroom_core::request_outcome::RequestOutcome {
-                    request_id: request_id.clone(),
-                    provider: ctx.provider.clone(),
-                    model: ctx.model.clone(),
-                    original_tokens: ctx.sizes(input_tok).0,
-                    optimized_tokens: ctx.sizes(input_tok).1,
-                    output_tokens: output_tok,
-                    tokens_saved: ctx.tokens_saved,
-                    attempted_input_tokens: ctx.attempted(input_tok),
-                    cache_read_tokens: cached_tok,
-                    // `input_tokens` here is the total and includes the cached
-                    // prefix, unlike Anthropic's field of the same name.
-                    uncached_input_tokens: input_tok.saturating_sub(cached_tok),
-                    total_latency_ms: ctx.total_latency_ms,
-                    overhead_ms: ctx.overhead_ms,
+                emit_openai_stream_outcome(
+                    ctx,
+                    &request_id,
                     ttfb_ms,
-                    transforms_applied: ctx.transforms_applied.clone(),
-                    num_messages: ctx.num_messages,
-                    tags: ctx.tags.clone(),
-                    client: ctx.client.clone(),
-                    project: ctx.project.clone(),
-                    ..Default::default()
-                };
-                headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
+                    input_tok,
+                    cached_tok,
+                    output_tok,
+                );
             }
         }
         SseStreamKind::None => {}
