@@ -38,6 +38,8 @@ pub mod probe_recorder;
 pub mod project_context;
 pub mod proxy;
 pub mod request_logger;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod responses_items;
 pub mod runtime_env;
 pub mod semantic_cache;

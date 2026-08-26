@@ -1115,64 +1115,9 @@ mod tests {
 
     #[test]
     fn build_streaming_upstream_uses_region_default() {
-        use crate::config::Config;
-        let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
-        config.bedrock_region = "eu-west-1".to_string();
-        let state = AppState {
-            started_at: std::time::Instant::now(),
-            config: std::sync::Arc::new(config),
-            client: reqwest::Client::new(),
-            bedrock_credentials: None,
-            // PR-E6: drift detector is unused by this URL-builder
-            // unit test; small capacity to satisfy the struct shape.
-            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
-            outbound_drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
-            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
-            tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
-            replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
-            working_dir_pins: crate::cache_stabilization::working_dir::WorkingDirPins::new(8),
-            usage_observer: std::sync::Arc::new(
-                crate::cache_stabilization::usage_observer::UsageObserver::new(),
-            ),
-            codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
-            ctx_observer: None,
-            ctx_offload: None,
-            ctx_inject: None,
-            ccr_context_tracker: None,
-            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
-                None, "monthly",
-            )),
-            savings_tracker: std::sync::Arc::new(
-                headroom_core::savings_tracker::SavingsTracker::new(None, false),
-            ),
-            request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
-            // PR-D4: unit tests for the Bedrock URL builder don't
-            // touch the Vertex route, but `AppState` is one struct
-            // — supply a dummy token source so the test compiles.
-            vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
-                "test".to_string(),
-            )),
-            dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
-            ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::ws_session_registry::WebSocketSessionRegistry::new(),
-            )),
-            rate_limiter: None,
-            semantic_cache: None,
-            memory_handler: None,
-            probe_recorder: None,
-            compression_feedback: None,
-            trusted_gateway_cidrs: vec![],
-            background_compressor: None,
-            compression_failure_action: crate::compression_failure::CompressionFailureAction {
-                refuse: false,
-                reason: "test".into(),
-                frame_bytes: 0,
-            },
-            batch_context_store: std::sync::Arc::new(headroom_core::ccr::BatchContextStore::new(
-                std::time::Duration::from_secs(86_400),
-                10_000,
-            )),
-        };
+        let state = crate::test_support::test_state(|config| {
+            config.bedrock_region = "eu-west-1".to_string();
+        });
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
             .parse()
             .unwrap();
@@ -1200,59 +1145,9 @@ mod tests {
 
     #[test]
     fn build_streaming_upstream_supports_converse_stream_action() {
-        use crate::config::Config;
-        let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
-        config.bedrock_region = "eu-west-1".to_string();
-        let state = AppState {
-            started_at: std::time::Instant::now(),
-            config: std::sync::Arc::new(config),
-            client: reqwest::Client::new(),
-            bedrock_credentials: None,
-            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
-            outbound_drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
-            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
-            tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
-            replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
-            working_dir_pins: crate::cache_stabilization::working_dir::WorkingDirPins::new(8),
-            usage_observer: std::sync::Arc::new(
-                crate::cache_stabilization::usage_observer::UsageObserver::new(),
-            ),
-            codex_rate_limits: crate::codex_rate_limits::CodexRateLimitStore::new(),
-            ctx_observer: None,
-            ctx_offload: None,
-            ctx_inject: None,
-            ccr_context_tracker: None,
-            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
-                None, "monthly",
-            )),
-            savings_tracker: std::sync::Arc::new(
-                headroom_core::savings_tracker::SavingsTracker::new(None, false),
-            ),
-            request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
-            vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
-                "test".to_string(),
-            )),
-            dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
-            ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::ws_session_registry::WebSocketSessionRegistry::new(),
-            )),
-            rate_limiter: None,
-            semantic_cache: None,
-            memory_handler: None,
-            probe_recorder: None,
-            compression_feedback: None,
-            trusted_gateway_cidrs: vec![],
-            background_compressor: None,
-            compression_failure_action: crate::compression_failure::CompressionFailureAction {
-                refuse: false,
-                reason: "test".into(),
-                frame_bytes: 0,
-            },
-            batch_context_store: std::sync::Arc::new(headroom_core::ccr::BatchContextStore::new(
-                std::time::Duration::from_secs(86_400),
-                10_000,
-            )),
-        };
+        let state = crate::test_support::test_state(|config| {
+            config.bedrock_region = "eu-west-1".to_string();
+        });
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
             .parse()
             .unwrap();
