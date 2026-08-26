@@ -217,6 +217,9 @@ headroom.db
 headroom_*.db
 *.jsonl
 !tests/fixtures/*.jsonl
+# Recorded transcripts the tests replay. The rule above is anchored at the
+# repo root, so it misses fixtures under a crate.
+!**/tests/fixtures/**/*.jsonl
 docker/differential-network-capture/captures/
 
 # Documentation build

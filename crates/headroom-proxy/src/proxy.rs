@@ -160,6 +160,13 @@ pub struct AppState {
     pub dynamic_upstream: crate::cc_switch_reconciler::DynamicUpstream,
     /// WebSocket session registry for /debug/ws-sessions and relay tracking.
     pub ws_sessions: Arc<Mutex<crate::ws_session_registry::WebSocketSessionRegistry>>,
+    /// Live Cursor-agent conversations, and the tools each has on offer.
+    ///
+    /// Held on the state rather than per-request because a conversation
+    /// outlives the request that opened it: when the model reaches for a tool
+    /// the response ends and the agent process stays blocked until a later
+    /// request brings the result back. See `crate::cursor`.
+    pub cursor_bridge: Arc<crate::cursor::bridge::Bridge>,
     /// Memory handler: orchestrates memory tool injection, context search,
     /// and tool call execution. `Some` only when `config.memory_enabled`.
     pub memory_handler: Option<Arc<tokio::sync::Mutex<crate::memory::handler::MemoryHandler>>>,
@@ -619,6 +626,7 @@ impl AppState {
             )),
             request_logger: Arc::new(crate::request_logger::RequestLogger::new(None)),
             dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
+            cursor_bridge: Arc::new(crate::cursor::bridge::Bridge::new()),
             ws_sessions: Arc::new(Mutex::new(
                 crate::ws_session_registry::WebSocketSessionRegistry::new(),
             )),
@@ -1268,6 +1276,22 @@ pub fn build_app(state: AppState) -> Router {
             .layer(middleware::from_fn(loopback_guard));
 
         router = router.merge(debug_router);
+
+        // The MCP endpoint Cursor's agent calls back into, sharing the guard
+        // above. It hands out whatever tools a conversation advertised and then
+        // blocks on them, so it belongs behind the same loopback gate.
+        //
+        // Mounted unconditionally: it answers nothing for a conversation that
+        // was never opened, and only a `cursor:` model route opens one, so an
+        // installation not using Cursor carries a dead path and no state.
+        router = router.merge(
+            Router::new()
+                .route(
+                    "/mcp/{conversation}",
+                    post(crate::cursor::endpoint::handle_mcp),
+                )
+                .layer(middleware::from_fn(loopback_guard)),
+        );
     }
 
     // CTX-5/6: mount /ctx/* endpoints when the offload store is available.
@@ -8619,7 +8643,7 @@ fn leading_event_error_type(event: &[u8]) -> Option<&'static str> {
 /// Build the memory context for a request, or `None` when memory is off or
 /// uninitialised. Mirrors the gate on the injection site, so the proxy resolves
 /// exactly the turns it injected into.
-async fn memory_tool_context(
+pub(crate) async fn memory_tool_context(
     state: &AppState,
     headers_snapshot: &Option<HeaderMap>,
     provider: Option<&str>,

@@ -178,6 +178,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     spawn_resource_heartbeat();
 
+    // Reap Cursor conversations abandoned mid-tool. Each one is a live
+    // `cursor-agent` process blocked on a tool result that is not coming, and
+    // parking a new one sweeps the old, so this timer only matters on a proxy
+    // that has gone quiet — which is exactly when a forgotten process would sit
+    // longest.
+    //
+    // Not spawned at all without a `cursor:` route. The sweep would be a no-op
+    // over an empty map, but a task that cannot do anything is a task that
+    // still has to be explained to whoever reads the process next.
+    if config
+        .model_routes
+        .iter()
+        .any(|route| route.cursor_agent.is_some())
+    {
+        let bridge = state.cursor_bridge.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let reaped = bridge
+                    .reap_idle(headroom_proxy::cursor::bridge::MAX_PARK)
+                    .await;
+                if reaped > 0 {
+                    tracing::info!(
+                        event = "cursor_reaper_swept",
+                        reaped,
+                        "reaped abandoned cursor conversations"
+                    );
+                }
+            }
+        });
+    }
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

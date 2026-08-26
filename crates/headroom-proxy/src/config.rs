@@ -715,6 +715,14 @@ pub struct CliArgs {
     )]
     pub memory_enabled: bool,
 
+    /// Path to the `cursor-agent` CLI, for `MODEL=cursor:ID` routes.
+    ///
+    /// Defaults to `agent` on `PATH`. Worth setting explicitly when the proxy
+    /// runs as a service: a service has the system `PATH`, not the login
+    /// shell's, and the CLI installs into `~/.local/bin`.
+    #[arg(long, env = "HEADROOM_CURSOR_AGENT_BINARY", default_value = "agent")]
+    pub cursor_agent_binary: String,
+
     /// Freeze-replay: replay the previously-forwarded (compressed) prefix
     /// byte-identical each turn so the provider prompt cache stays warm
     /// (ports Python `PrefixCacheTracker` / `overlay_cached_prefix`). Anthropic
@@ -1108,7 +1116,7 @@ pub struct CliArgs {
     /// without one it goes to `/v1/chat/completions`. Codex needs the former.
     ///
     /// Examples:
-    ///   --extra-model-route "MiMo-V2.5=https://api.xiaomimimo.com/anthropic"
+    ///   --extra-model-route "claude-grok-4.6=cursor:cursor-grok-4.6-high"
     ///   --extra-model-route "codex-*=https://api.openai.com/v1:openai"
     ///   --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra"
     #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
@@ -1596,9 +1604,10 @@ pub struct ModelRoute {
     pub upstream: Option<Url>,
     /// Whether to translate Anthropic format → OpenAI format.
     pub translate: bool,
-    /// When set, route through `mimo run` subprocess instead of HTTP.
-    /// The value is the model ID to pass to `mimo run -m`.
-    pub mimo_run: Option<String>,
+    /// When set, route through the `cursor-agent` CLI instead of an HTTP
+    /// upstream. The value is the Cursor model id, e.g.
+    /// `cursor-grok-4.6-high`. See `crate::cursor`.
+    pub cursor_agent: Option<String>,
     /// When set, overrides the `model` field sent to the upstream after
     /// translation. Lets `model_prefix` be a discoverable id (e.g.
     /// `claude-codex-5.5`, satisfying Claude Code's gateway-discovery
@@ -1617,7 +1626,7 @@ impl ModelRoute {
 }
 
 /// Parse `MODEL_NAME=UPSTREAM_URL[:translate[:TARGET_MODEL_ID]]` or
-/// `MODEL_NAME=mimo:MODEL_ID` into a `ModelRoute`. `TARGET_MODEL_ID` lets
+/// `MODEL_NAME=cursor:MODEL_ID` into a `ModelRoute`. `TARGET_MODEL_ID` lets
 /// `MODEL_NAME` be a discoverable id (e.g. `claude-codex-5.5`, to satisfy
 /// Claude Code's gateway-discovery filter) while the real upstream model id
 /// (e.g. `gpt-5.5`) differs.
@@ -1736,19 +1745,19 @@ const TRANSLATE_KEYWORDS: [&str; 2] = ["translate", "openai"];
 
 fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
     let (model, rest) = spec.split_once('=').ok_or_else(|| {
-        format!("expected MODEL=URL[:translate[:TARGET_ID]] or MODEL=mimo:ID, got: {spec}")
+        format!("expected MODEL=URL[:translate[:TARGET_ID]] or MODEL=cursor:ID, got: {spec}")
     })?;
     let model = model.trim().to_string();
     let prefix_match = model.ends_with('*');
 
-    // Check for `mimo:MODEL_ID` special syntax
-    if let Some(mimo_model) = rest.strip_prefix("mimo:") {
+    // `cursor:MODEL_ID` selects the subprocess transport, which has no URL.
+    if let Some(cursor_model) = rest.strip_prefix("cursor:") {
         return Ok(ModelRoute {
             model_prefix: model,
             prefix_match,
             upstream: None,
             translate: false,
-            mimo_run: Some(mimo_model.trim().to_string()),
+            cursor_agent: Some(cursor_model.trim().to_string()),
             target_model: None,
         });
     }
@@ -1786,7 +1795,7 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
         prefix_match,
         upstream: Some(upstream),
         translate,
-        mimo_run: None,
+        cursor_agent: None,
         target_model,
     })
 }
@@ -1990,6 +1999,8 @@ pub struct Config {
     pub max_injection_bytes: usize,
     /// Memory system: master switch. When false, no memory operations run.
     pub memory_enabled: bool,
+    /// Path to the `cursor-agent` CLI, for `MODEL=cursor:ID` routes.
+    pub cursor_agent_binary: String,
     /// Memory injection mode: "auto_tail" (append to user message) or "tool" (model calls memory_search).
     pub memory_mode: String,
     /// Inject memory tool definitions into requests.
@@ -2266,6 +2277,7 @@ impl Config {
             mechanical_effort: args.mechanical_effort,
             max_injection_bytes: args.max_injection_bytes,
             memory_enabled: args.memory_enabled,
+            cursor_agent_binary: args.cursor_agent_binary.clone(),
             memory_mode: std::env::var("HEADROOM_MEMORY_MODE")
                 .unwrap_or_else(|_| "auto_tail".to_string()),
             memory_inject_tools: std::env::var("HEADROOM_MEMORY_INJECT_TOOLS")
@@ -2464,6 +2476,7 @@ impl Config {
             mechanical_effort: "low".to_string(),
             max_injection_bytes: crate::injection_budget::DEFAULT_MAX_INJECTION_BYTES,
             memory_enabled: false,
+            cursor_agent_binary: "agent".to_string(),
             memory_mode: "auto_tail".to_string(),
             memory_inject_tools: true,
             memory_inject_context: true,

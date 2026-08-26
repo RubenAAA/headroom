@@ -148,7 +148,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 prefix_match: false,
                 upstream: Some(Url::parse("https://api.openai.com/v1").unwrap()),
                 translate: true,
-                mimo_run: None,
+                cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
             },
             ModelRoute {
@@ -156,15 +156,15 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 prefix_match: true,
                 upstream: Some(Url::parse("https://api.openai.com/v1").unwrap()),
                 translate: true,
-                mimo_run: None,
+                cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
             },
             ModelRoute {
-                model_prefix: "anthropic-mimo".to_string(),
+                model_prefix: "anthropic-routed".to_string(),
                 prefix_match: false,
                 upstream: None,
                 translate: false,
-                mimo_run: Some("MiMo-V2.5".to_string()),
+                cursor_agent: Some("cursor-grok-4.6-high".to_string()),
                 target_model: None,
             },
         ];
@@ -190,7 +190,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
 
     assert!(ids.contains(&"claude-local".to_string()));
     assert!(ids.contains(&"claude-codex-5.5".to_string()));
-    assert!(ids.contains(&"anthropic-mimo".to_string()));
+    assert!(ids.contains(&"anthropic-routed".to_string()));
     assert!(!ids.contains(&"codex-*".to_string()));
 
     proxy.shutdown().await;
@@ -210,7 +210,8 @@ async fn codex_translate_route_uses_responses_endpoint() {
             prefix_match: false,
             upstream: Some(upstream_url.clone()),
             translate: true,
-            mimo_run: None,
+
+            cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
         }];
     })
@@ -273,7 +274,8 @@ async fn codex_translate_route_buffers_non_stream_responses() {
             prefix_match: false,
             upstream: Some(upstream_url.clone()),
             translate: true,
-            mimo_run: None,
+
+            cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
         }];
     })
@@ -341,7 +343,7 @@ async fn over_cap_retry_after_returns_immediately_and_preserves_header() {
                 prefix_match: false,
                 upstream: Some(upstream_url.clone()),
                 translate: true,
-                mimo_run: None,
+                cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
             }];
         },

@@ -74,6 +74,7 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
             "test".to_string(),
         )),
         dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
+        cursor_bridge: std::sync::Arc::new(crate::cursor::bridge::Bridge::new()),
         ws_sessions: std::sync::Arc::new(std::sync::Mutex::new(
             crate::ws_session_registry::WebSocketSessionRegistry::new(),
         )),

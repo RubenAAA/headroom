@@ -989,7 +989,7 @@ async fn resolve_retrieval(
     match &ctx.shape {
         CcrShape::Anthropic => resolved,
         CcrShape::RoutedChat { anthropic_request } => {
-            crate::handlers::local_model::openai_to_anthropic_response(&resolved, anthropic_request)
+            crate::openai::response::openai_to_anthropic_response(&resolved, anthropic_request)
         }
         CcrShape::RoutedResponses { anthropic_request } => {
             responses_output_as_anthropic_turn(&resolved, anthropic_request)
@@ -1050,6 +1050,31 @@ mod tests {
     /// was built with `false` regardless of the turn's memory context, so a
     /// `memory_search` block streamed through and the client answered "No such
     /// tool available".
+    /// The other half of the same fact, and the shape of the routed-path bug:
+    /// a rewriter told the turn has no memory context passes the block
+    /// straight through. `handle_streaming_response` built its
+    /// `CcrStreamContext` with a hardcoded `memory: None` on the belief that
+    /// routed requests never carry memory tools — they do, injected at the
+    /// `codex_memory_tools` site — so every Codex turn that called
+    /// `memory_search` reached the client, which answered "No such tool
+    /// available: memory_search".
+    #[test]
+    fn a_memory_block_reaches_the_client_when_the_turn_claims_no_memory() {
+        const START: &str = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"memory_search","input":{}}}"#;
+
+        let mut rw = Rewriter::new(false);
+        feed(
+            &mut rw,
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"m","model":"claude","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+        );
+        assert!(
+            !feed(&mut rw, "content_block_start", START).is_empty(),
+            "with no memory context the block is not ours to own, and it reaches \
+             the client — which is exactly the failure this documents"
+        );
+    }
+
     #[test]
     fn memory_block_events_are_suppressed_when_memory_is_enabled() {
         const START: &str = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"memory_search","input":{}}}"#;
