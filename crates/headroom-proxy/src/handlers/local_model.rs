@@ -1141,6 +1141,15 @@ async fn handle_streaming_response(
                 // not own the block, `memory_search` streamed through to a
                 // client that has never heard of it, and the turn died with
                 // `No such tool available: memory_search`.
+                //
+                // Nothing types the agreement between the two sites, so it
+                // rests on a gate relation: `memory_tool_context` asks only
+                // that the handler exist and be initialized, while injection
+                // asks that *and* that the tool array grew. The rewriter's
+                // view is therefore a superset of what was injected, and the
+                // only way the two can disagree is the harmless way — the
+                // rewriter watches for a tool the model was never handed.
+                // Narrowing this gate would reopen the bug above.
                 memory: ccr.memory,
             };
             let (rewritten, _usage) =

@@ -40,6 +40,14 @@ impl Default for TransformResult {
 /// Trait that all message transforms implement.
 ///
 /// Mirrors Python's `Transform` ABC from `headroom.transforms.base`.
+///
+/// Nothing implements this yet. It belongs to the same unwired group as
+/// [`crate::transforms::compressor_registry`] and
+/// `content_router::apply_strategy`: ported for parity, and useful only on
+/// per-token API pricing, where paying a compressor to shrink a request buys
+/// something. On a subscription the arithmetic does not work, so the flags
+/// that would switch these on are off, and no caller was ever written. Kept
+/// deliberately — this is staged work, not a leftover.
 pub trait Transform {
     /// Human-readable name for this transform.
     fn name(&self) -> &str;

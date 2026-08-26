@@ -3,6 +3,16 @@
 //! This is the *name-addressable* seam for compressors: built-in compressors are
 //! registered explicitly, and a caller opts in to a specific set of them by name.
 //!
+//! # Unwired on purpose
+//!
+//! Nothing outside this file names it, and neither does anything name
+//! `content_router::apply_strategy`, its only intended caller. That is not rot.
+//! A registry of paid external compressors earns its keep on per-token API
+//! pricing, where trading a compression call for a smaller request saves money.
+//! On a subscription it saves nothing, so the flags that would switch it on are
+//! off and no call site was written. Wire it behind those flags, as the Python
+//! version does, rather than deleting it.
+//!
 //! # Pure-data contract
 //!
 //! The compressor boundary is deliberately **pure data in / data out**. No
