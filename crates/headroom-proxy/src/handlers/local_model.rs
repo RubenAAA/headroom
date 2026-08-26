@@ -525,7 +525,6 @@ pub async fn handle_messages(
     } else {
         1
     };
-    let base_delay_ms = state.config.retry_base_delay_ms;
     let max_delay_ms = state.config.retry_max_delay_ms;
     let mut refreshed = false;
     let mut attempt: u32 = 0;
@@ -583,9 +582,10 @@ pub async fn handle_messages(
                             )
                         })
                         .unwrap_or_else(|| {
-                            std::time::Duration::from_millis(
-                                base_delay_ms.saturating_mul(2u64.saturating_pow(attempt - 1)),
-                            )
+                            std::time::Duration::from_millis(crate::proxy::backoff_ms(
+                                &state,
+                                attempt - 1,
+                            ))
                         })
                         .min(std::time::Duration::from_millis(max_delay_ms));
                     tracing::warn!(
@@ -610,8 +610,20 @@ pub async fn handle_messages(
                 break r;
             }
             Err(e) => {
-                if attempt < max_attempts {
-                    let backoff = std::time::Duration::from_millis(250 * 2u64.pow(attempt - 1));
+                // Same filter the Claude path uses: a decode or builder error
+                // is not transient and gets no retry, only the transport-level
+                // ones do. This arm used to retry every error alike, which
+                // spent the whole budget re-sending a request that could not
+                // succeed and delayed the 502 the caller was owed.
+                let is_retryable = crate::proxy::is_retryable_transport_error(&e);
+                if is_retryable && attempt < max_attempts {
+                    // Was a hardcoded 250ms doubling with no ceiling, which
+                    // ignored `retry_base_delay_ms` and could outrun
+                    // `retry_max_delay_ms`. Same backoff as every other site now.
+                    let backoff = std::time::Duration::from_millis(crate::proxy::backoff_ms(
+                        &state,
+                        attempt - 1,
+                    ));
                     tracing::warn!(
                         event = "local_model_upstream_retry",
                         error = %e,
@@ -628,9 +640,17 @@ pub async fn handle_messages(
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
+                if is_retryable {
+                    crate::observability::record_upstream_retry_exhausted(
+                        "local_model",
+                        crate::observability::retry_reason::TRANSPORT,
+                    );
+                }
                 tracing::warn!(
                     event = "local_model_upstream_error",
                     error = %e,
+                    retryable = is_retryable,
+                    attempts = attempt,
                     upstream = %upstream_url,
                     "failed to connect to local model upstream"
                 );
