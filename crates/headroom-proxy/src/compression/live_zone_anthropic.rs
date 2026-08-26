@@ -455,100 +455,24 @@ pub fn compress_anthropic_request(
             }
         }
         Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
-            // Aggregate manifest into the proxy's `Compressed` payload.
-            // PR-B4 reports token counts via the same tokenizer the
-            // dispatcher used to gate per-block acceptance — so the
-            // saving the proxy logs is the saving the cache will
-            // actually see.
-            //
-            // H1 + C5 remediation:
-            //   - Per-strategy `(before, after)` aggregate populated
-            //     from the manifest so the proxy emits one
-            //     `proxy_compression_ratio_by_strategy` sample with
-            //     the right numbers per strategy (instead of the
-            //     same aggregate ratio per strategy, which was the
-            //     pre-fix behavior).
-            //   - Every `BlockAction::RejectedNotSmaller` increments
-            //     the `proxy_compression_rejected_by_token_check_total`
-            //     counter so dashboards can attribute "compressor ran
-            //     but kept the original" cases.
-            let mut original_bytes_total: usize = 0;
-            let mut compressed_bytes_total: usize = 0;
-            let mut original_tokens_total: usize = 0;
-            let mut compressed_tokens_total: usize = 0;
-            let mut strategies: Vec<&'static str> = Vec::new();
-            let mut per_strategy_tokens: Vec<PerStrategyTokens> = Vec::new();
-            for entry in &manifest.block_outcomes {
-                match entry.action {
-                    BlockAction::Compressed {
-                        strategy,
-                        original_bytes,
-                        compressed_bytes,
-                        original_tokens,
-                        compressed_tokens,
-                    } => {
-                        original_bytes_total += original_bytes;
-                        compressed_bytes_total += compressed_bytes;
-                        original_tokens_total += original_tokens;
-                        compressed_tokens_total += compressed_tokens;
-                        if !strategies.contains(&strategy) {
-                            strategies.push(strategy);
-                        }
-                        // H1: accumulate per-strategy tokens (one
-                        // entry per strategy; multiple blocks of
-                        // the same strategy sum).
-                        if let Some(slot) = per_strategy_tokens
-                            .iter_mut()
-                            .find(|s| s.strategy == strategy)
-                        {
-                            slot.original_tokens += original_tokens;
-                            slot.compressed_tokens += compressed_tokens;
-                        } else {
-                            per_strategy_tokens.push(PerStrategyTokens {
-                                strategy,
-                                original_tokens,
-                                compressed_tokens,
-                            });
-                        }
-                    }
-                    BlockAction::RejectedNotSmaller { strategy, .. } => {
-                        // C5: surface the tokenizer-validated
-                        // rejection in the dedicated counter.
-                        crate::observability::record_compression_rejected_by_token_check(strategy);
-                    }
-                    BlockAction::NoCompressionApplied {
-                        declined_by: Some(ref strategy),
-                        ..
-                    } => {
-                        // A compressor ran and could not shrink the block, so
-                        // the dispatcher declined it before the tokenizer saw
-                        // it. Counted separately because it is the work the
-                        // size gate absorbs: if this rises while accepted
-                        // compression holds steady, the gate is doing its job;
-                        // if accepted compression falls with it, the gate is
-                        // declining work that pays.
-                        crate::observability::record_compression_declined_no_shrink(
-                            strategy.as_str(),
-                        );
-                    }
-                    _ => {}
-                }
-            }
+            // PR-B4 reports token counts via the same tokenizer the dispatcher
+            // used to gate per-block acceptance, so the saving logged here is
+            // the saving the cache will actually see.
+            let mut totals = crate::compression::manifest_totals::aggregate(
+                &manifest,
+                request_id,
+                "/v1/messages",
+            );
             // Stitch in the PR-E1 / PR-E2 / PR-E3 strategy tags so
             // downstream log/metrics layers attribute the
             // normalization / auto-placement to its distinct
             // cache-stabilization surface rather than to a live-zone
             // compressor that didn't actually run.
             for strategy in normalization_applied.strategies() {
-                if !strategies.contains(&strategy) {
-                    strategies.push(strategy);
-                }
+                totals.push_strategy(strategy);
             }
             if e3_applied {
-                let s = "e3_anthropic_cache_control";
-                if !strategies.contains(&s) {
-                    strategies.push(s);
-                }
+                totals.push_strategy("e3_anthropic_cache_control");
             }
             let body_bytes_in = body.len();
             let new_body_bytes = Bytes::copy_from_slice(new_body.get().as_bytes());
@@ -568,23 +492,24 @@ pub fn compress_anthropic_request(
                 messages_total = manifest.messages_total,
                 latest_user_message_index = ?manifest.latest_user_message_index,
                 live_zone_blocks = block_count,
-                live_zone_strategies = ?strategies,
-                live_zone_block_original_bytes = original_bytes_total,
-                live_zone_block_compressed_bytes = compressed_bytes_total,
-                live_zone_block_original_tokens = original_tokens_total,
-                live_zone_block_compressed_tokens = compressed_tokens_total,
+                live_zone_strategies = ?totals.strategies,
+                live_zone_block_original_bytes = totals.original_bytes,
+                live_zone_block_compressed_bytes = totals.compressed_bytes,
+                live_zone_block_original_tokens = totals.original_tokens,
+                live_zone_block_compressed_tokens = totals.compressed_tokens,
+                had_compressor_error = totals.had_compressor_error,
                 model = model,
                 "anthropic live-zone dispatch"
             );
             Outcome::Compressed {
                 body: new_body_bytes,
-                tokens_before: original_tokens_total,
-                tokens_after: compressed_tokens_total,
-                strategies_applied: strategies,
+                tokens_before: totals.original_tokens,
+                tokens_after: totals.compressed_tokens,
+                strategies_applied: totals.strategies,
                 // PR-E3 surfaces tool-slot location(s); PR-B7 will
                 // append CCR retrieval markers when wired.
                 markers_inserted: e3_locations,
-                per_strategy_tokens,
+                per_strategy_tokens: totals.per_strategy_tokens,
             }
         }
         Err(LiveZoneError::BodyNotJson(_)) => {

@@ -37,6 +37,7 @@ pub mod context_editing;
 pub mod cross_turn;
 pub mod ctx_offload;
 pub mod live_zone_anthropic;
+pub(crate) mod manifest_totals;
 pub mod live_zone_openai;
 pub mod live_zone_responses;
 pub mod model_limits;
