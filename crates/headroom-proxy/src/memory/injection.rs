@@ -100,7 +100,6 @@ mod tests {
         assert!(result.ends_with('\n'));
     }
 
-    #[test]
     /// A memory entry is whatever the user wrote, in any script, and the
     /// budget counts bytes. This panicked in production: a Cyrillic entry put
     /// a two-byte character across byte 4096, the slice panicked on the
@@ -135,6 +134,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn apply_to_text_hard_cut_when_no_newline() {
         let b = MemoryInjectionBudget {
             max_tokens: 2,

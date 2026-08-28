@@ -11,6 +11,7 @@ pub mod injection;
 pub mod local_backend;
 pub mod models;
 pub mod query;
+pub mod query_translation;
 pub mod ranker;
 pub mod router;
 pub mod tool_adapter;

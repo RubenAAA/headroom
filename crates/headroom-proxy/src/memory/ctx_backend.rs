@@ -182,13 +182,41 @@ impl CtxMemoryBackend {
             limit,
             ..Default::default()
         };
-        let hits = self.index.search(&[query.to_string()], &opts)?;
+        // A Russian question reaches only Russian memories: porter does not
+        // stem Cyrillic, and 93% of what is stored is English. Search the
+        // English rendering as well as the original, never instead of it, so
+        // the Russian memories that already matched keep matching.
+        //
+        // Two searches interleaved rather than one call with both queries.
+        // `CtxStore::search` merges a query list in first-seen order, and
+        // trigram matches substrings, so a Russian sentence fills the limit
+        // with chunks that merely contain `почему` or `как` — measured, it
+        // took all five slots and truncated the translation away entirely.
+        // Interleaving means neither rendering can starve the other.
+        let hits = match super::query_translation::to_english(query) {
+            Some(english) => {
+                tracing::debug!(
+                    event = "memory_query_translated",
+                    english = %english,
+                    "searching the English rendering alongside the original"
+                );
+                let original = self.index.search(&[query.to_string()], &opts)?;
+                let rendered = self.index.search(&[english], &opts)?;
+                interleave(original, rendered, limit)
+            }
+            None => self.index.search(&[query.to_string()], &opts)?,
+        };
 
         let mut out = Vec::new();
         // A memory is indexed as several chunks, so one memory can match more
         // than once — and did, filling two of three answer slots with the same
         // text at ranks 0.031 and 0.032. Keep the best hit only.
         let mut seen = std::collections::HashSet::new();
+        // Same text under a different id, from saves that predate the dedup in
+        // `save_memory`. Those copies are already in the store and rank
+        // together, so the id filter above never sees them. Hits arrive best
+        // first, so the first copy through is the one worth keeping.
+        let mut seen_content = std::collections::HashSet::new();
         for hit in hits {
             if !seen.insert(hit.source.clone()) {
                 continue;
@@ -210,6 +238,9 @@ impl CtxMemoryBackend {
             let visible = memory.user_id == user_id
                 || memory.user_id == super::router::shared_partition(user_id);
             if !visible || !memory.is_current() {
+                continue;
+            }
+            if !seen_content.insert(memory.content.clone()) {
                 continue;
             }
             out.push(MemorySearchResult {
@@ -331,6 +362,28 @@ impl MemoryBackend for CtxMemoryBackend {
         };
         if let Some(ents) = entities {
             memory.entity_refs = ents.to_vec();
+        }
+        // Saving text that is already stored used to mint a second id, and
+        // nothing downstream could tell the copies apart: the index dedups by
+        // source label, so both ranked, and three copies of one memory took
+        // three of the top five slots for `proxy`. Return the memory that is
+        // already there instead. Superseded and expired copies do not count —
+        // re-saving text that was retired is a new memory, not a duplicate.
+        for id in self
+            .records
+            .ids_with_content(&memory.user_id, &memory.content)?
+        {
+            let Some(existing) = self.load(&id)? else {
+                continue;
+            };
+            if existing.is_current() {
+                tracing::debug!(
+                    event = "memory_save_duplicate",
+                    memory_id = %existing.id,
+                    "content already stored; returning the existing memory"
+                );
+                return Ok(existing);
+            }
         }
         // Record first: a memory that exists but is not yet searchable is a
         // weaker failure than an index entry pointing at nothing.
@@ -468,6 +521,39 @@ impl MemoryBackend for CtxMemoryBackend {
 
     async fn close(&self) -> Result<(), BackendError> {
         Ok(())
+    }
+}
+
+/// Take from `a` and `b` in turn, dropping repeats, up to `limit`.
+///
+/// Both lists arrive best-first. Alternating gives each rendering of the query
+/// the same claim on the top slots, which is the point: whichever one the user
+/// typed, the other is a guess, and a guess that can be shut out entirely is
+/// not worth making.
+fn interleave(
+    a: Vec<headroom_core::ctx::SearchHit>,
+    b: Vec<headroom_core::ctx::SearchHit>,
+    limit: usize,
+) -> Vec<headroom_core::ctx::SearchHit> {
+    let mut out = Vec::with_capacity(limit.min(a.len() + b.len()));
+    let mut seen = std::collections::HashSet::new();
+    let mut a = a.into_iter();
+    let mut b = b.into_iter();
+    loop {
+        let mut added = false;
+        for next in [a.next(), b.next()] {
+            let Some(hit) = next else { continue };
+            added = true;
+            if seen.insert(format!("{}::{}", hit.source, hit.title)) {
+                out.push(hit);
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+        if !added {
+            return out;
+        }
     }
 }
 
@@ -654,6 +740,72 @@ mod tests {
             2,
             "the backfill should have rebuilt both edges from the records"
         );
+    }
+
+    /// The store held three copies of one memory because `memory_save` minted
+    /// a fresh id each time it was called with text it already had.
+    #[tokio::test]
+    async fn saving_the_same_text_twice_keeps_one_memory() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        let first = save(&backend, "the proxy listens on port 8787", "alice").await;
+        let second = save(&backend, "the proxy listens on port 8787", "alice").await;
+        assert_eq!(first.id, second.id, "the second save must not mint an id");
+
+        let results = backend
+            .search_memories("proxy port", "alice", 10, false)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "one memory, one slot");
+    }
+
+    /// Two users saving the same sentence are two memories; the dedup is per
+    /// partition, or one project's note would silently answer for another's.
+    #[tokio::test]
+    async fn the_same_text_under_two_users_stays_two_memories() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        let a = save(&backend, "the proxy listens on port 8787", "alice").await;
+        let b = save(&backend, "the proxy listens on port 8787", "bob").await;
+        assert_ne!(a.id, b.id);
+    }
+
+    /// Retiring a memory and saving the same words again is a new memory, not
+    /// a duplicate — otherwise the store would hand back the retired copy.
+    #[tokio::test]
+    async fn re_saving_retired_text_makes_a_new_memory() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        let first = save(&backend, "the proxy listens on port 8787", "alice").await;
+
+        let mut retired = first.clone();
+        // `is_current` reads `valid_until` and nothing else, so that is the
+        // field that retires a memory.
+        retired.valid_until = Some("2020-01-01T00:00:00Z".to_string());
+        backend.store(&retired).unwrap();
+
+        let second = save(&backend, "the proxy listens on port 8787", "alice").await;
+        assert_ne!(first.id, second.id);
+    }
+
+    /// The copies already in the live store predate the dedup above, so search
+    /// has to collapse them too. Written straight through `store`/`index` to
+    /// build the state `save_memory` will no longer produce.
+    #[tokio::test]
+    async fn duplicate_copies_already_stored_take_one_slot() {
+        let backend = CtxMemoryBackend::in_memory().unwrap();
+        for _ in 0..3 {
+            let copy = Memory {
+                content: "the proxy listens on port 8787".to_string(),
+                user_id: "alice".to_string(),
+                ..Memory::default()
+            };
+            backend.store(&copy).unwrap();
+            backend.index(&copy).unwrap();
+        }
+
+        let results = backend
+            .search_memories("proxy port", "alice", 10, false)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "three identical copies, one slot");
     }
 
     #[tokio::test]

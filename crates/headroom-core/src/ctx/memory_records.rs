@@ -227,6 +227,27 @@ impl MemoryRecordStore {
         rows.collect()
     }
 
+    /// Ids of `user_id`'s records whose content is byte-identical to `content`.
+    ///
+    /// Saving the same text twice mints a second id, and the index dedups by
+    /// source label, so both copies survive and both rank. In the live store
+    /// that put three copies of one memory into the top five for `proxy`.
+    /// Matching on the JSON field rather than a stored hash keeps this free of
+    /// a migration; the table is small and SQLite scans it in microseconds.
+    pub fn ids_with_content(
+        &self,
+        user_id: &str,
+        content: &str,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM memories
+             WHERE user_id = ?1 AND json_extract(record, '$.content') = ?2",
+        )?;
+        let rows = stmt.query_map(params![user_id, content], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// Every record id belonging to `user_id`. Returned before a bulk delete
     /// so the caller can clear the matching index entries too.
     pub fn ids_for_user(&self, user_id: &str) -> rusqlite::Result<Vec<String>> {
