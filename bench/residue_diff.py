@@ -12,9 +12,9 @@ died anyway, and no logged event told them apart from healthy turns.
 
     python3 bench/residue_diff.py [logfile]
 """
-import sys, json, re, collections
+import os, sys, json, re, collections
 
-LOG = sys.argv[1] if len(sys.argv) > 1 else "/home/user/headroom-proxy.log"
+LOG = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/headroom-proxy.log")
 
 # Fields carried by the fingerprint. `markers` is the breakpoint map, e.g.
 # "sys[0]:1h,m12:1h,m30.2:5m" — a moved or evicted breakpoint shows up here.

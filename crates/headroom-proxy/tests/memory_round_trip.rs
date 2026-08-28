@@ -304,7 +304,7 @@ async fn a_listed_memory_is_the_one_that_was_saved() {
 /// Project search also reads the shared partition, so a `scope: "project"` save
 /// that restates a global memory used to update the global row and report
 /// "merged". The caller asked for a project memory, got none, and was told the
-/// save had succeeded — observed 2026-08-26 on a acme-notifier fact that merged
+/// save had succeeded — observed 2026-08-26 on an acme-notifier fact that merged
 /// at 86% overlap into a global record and stayed unfindable from the project.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restatement_at_another_scope_is_not_merged_into() {
@@ -350,7 +350,7 @@ async fn a_restatement_at_another_scope_is_not_merged_into() {
 /// A fact about a sibling repository can be filed there from here.
 ///
 /// Scope follows the session's cwd and a subagent inherits it, so before this
-/// the only way to record a acme-notifier fact from a acme-api session was to
+/// the only way to record an acme-notifier fact from an acme-api session was to
 /// start a second session in the other directory. Observed 2026-08-26.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_explicit_project_files_the_memory_under_that_repository() {

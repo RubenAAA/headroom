@@ -399,9 +399,9 @@ reading captured `costUSD`, a different tool. So the 6.6pp is a decision
 divergence, not a pricing-formula difference, and the harness below only has
 to explain where the decisions differ.
 
-**The five `meta`-partition memories are placed (2026-08-19).** The partition
+**The five `workspace`-partition memories are placed (2026-08-19).** The partition
 is now empty. Beacon, AWS and CLAUDE.md went to `default`; Cadence went to
-`default::encore-0000000000000000`; flaky_tests was deleted as stale — its
+`default::cadence-0000000000000000`; flaky_tests was deleted as stale — its
 whole payload was "fixed as of 2026-03-24, PROJ-519".
 
 `default` is the right home for cross-repo reference because

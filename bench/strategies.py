@@ -72,8 +72,12 @@ def noop(body):
     return body
 
 
-MEMORY_DIR = os.path.expanduser(
-    "~/.claude-work/projects/-home-user-headroom/memory"
+# Claude Code files a project's auto-memory under the cwd with every separator
+# flattened to a dash. Override when the config root is not `~/.claude`.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MEMORY_DIR = os.environ.get(
+    "HEADROOM_BENCH_MEMORY_DIR",
+    os.path.expanduser(f"~/.claude/projects/{_REPO.replace('/', '-')}/memory"),
 )
 _INDEX_LINE = re.compile(r"^\s*- \[[^\]]+\]\([^)]+\.md\)", re.M)
 

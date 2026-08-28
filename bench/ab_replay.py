@@ -62,7 +62,7 @@ import uuid
 PROXY_URL = "http://127.0.0.1:8787"
 BASE_PORT = 8799
 BASE_URL = f"http://127.0.0.1:{BASE_PORT}"
-CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "/home/user/.claude-work")
+CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
 PROXY_BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "headroom-proxy")
 
 # Every tool the client might offer. Naming them all leaves the model with no

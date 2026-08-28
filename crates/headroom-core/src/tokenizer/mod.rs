@@ -463,7 +463,7 @@ mod tests {
         let msgs = vec![serde_json::json!({
             "role": "user",
             "content": "hello",
-            "name": "ruben"
+            "name": "alice"
         })];
         let count = tok.count_messages(&msgs);
         let msgs_no_name = vec![serde_json::json!({
@@ -471,7 +471,7 @@ mod tests {
             "content": "hello"
         })];
         let count_no_name = tok.count_messages(&msgs_no_name);
-        // Name field adds count_text("ruben") + 1
+        // Name field adds count_text("alice") + 1
         assert!(count > count_no_name);
     }
 

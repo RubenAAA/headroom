@@ -11,7 +11,7 @@ actually work, each validated against real captures.
 
 ## How Claude Code uses the prompt cache (from client source)
 
-Source: `meta/claude-code-main/services/api/claude.ts`, `promptCacheBreakDetection.ts`.
+Source: `claude-code-main/services/api/claude.ts`, `promptCacheBreakDetection.ts`.
 
 A `/v1/messages` request carries up to **4 `cache_control` (ephemeral) breakpoints**:
 - up to **2 on `system`**

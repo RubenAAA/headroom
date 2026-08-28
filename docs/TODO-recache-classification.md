@@ -679,7 +679,7 @@ that project's `CLAUDE.md`.
 `CLAUDE.md` does not reach the `system` block, as it happens — it arrives as a
 `<system-reminder>` inside `messages[0]`, the front of the array, which is the
 most stable position there is. Verified in the capture: all three files
-(`~/.claude`, `~/meta`, `acme-api`) appear there, in 961 of 961 teammate
+(`~/.claude`, `~/workspace`, `acme-api`) appear there, in 961 of 961 teammate
 conversations and 184 of 184 main ones under acme-api. So subagents do get it,
 once, at 0.1x forever.
 

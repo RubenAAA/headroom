@@ -914,7 +914,7 @@ impl MemoryHandler {
         // checkout cannot be saved where it belongs: scope follows the session's
         // cwd, a subagent inherits that cwd, and the only workaround was to
         // start a second session in the other directory. Observed 2026-08-26 on
-        // a acme-notifier fact written from a acme-api session.
+        // an acme-notifier fact written from an acme-api session.
         //
         // Resolution goes through `ProjectResolver` rather than composing a key
         // here, so an explicit path walks up to its repository root exactly as a
@@ -1003,7 +1003,7 @@ impl MemoryHandler {
         // `scope: "project"` save that restates a global memory updates the
         // global row and reports "merged" — the caller asked for a project
         // memory, got none, and was told the save succeeded. Observed
-        // 2026-08-26 on a acme-notifier fact: 86% word overlap, merged into a
+        // 2026-08-26 on an acme-notifier fact: 86% word overlap, merged into a
         // global record, and the record kept `entity_refs: []` so no project
         // search could ever find it.
         //

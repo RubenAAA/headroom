@@ -7,7 +7,7 @@
 #
 #   "statusLine": {
 #     "type": "command",
-#     "command": "/home/user/headroom/scripts/statusline-cache-health.sh"
+#     "command": "/path/to/headroom/scripts/statusline-cache-health.sh"
 #   }
 #
 # Shows: <model> | <cwd basename> | cache ✓ NN%   (healthy)

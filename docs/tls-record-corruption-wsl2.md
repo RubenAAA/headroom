@@ -224,7 +224,7 @@ mirroring `eth0` is `DOWN` and the Windows adapters are mirrored in beside it,
 so traffic leaves by whichever one holds the default route:
 
 ```
-ip route get 192.0.2.10  ->  via 192.0.2.1 dev eth3
+ip route get 198.51.100.10  ->  via 192.0.2.1 dev eth3
 ```
 
 Every offload was on for that interface, including one the original fix never

@@ -15,18 +15,42 @@ use headroom_proxy::memory::handler::{MemoryConfig, MemoryHandler, MemoryMode};
 use headroom_proxy::memory::tool_adapter::Provider;
 use serde_json::json;
 
-const MEMORY_DIR: &str = "/home/user/.claude-work/projects/-home-user-headroom/memory";
+/// The auto-memory directory of one project, e.g.
+/// `~/.claude/projects/<slug>/memory`. Set `HEADROOM_TEST_MEMORY_DIR` to run
+/// the import tests against it; they skip when it is unset.
+fn memory_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HEADROOM_TEST_MEMORY_DIR").map(std::path::PathBuf::from)
+}
 
-/// Every config root's memory dir is a symlink into here, so this one tree
-/// holds the memories of all projects and all three accounts.
-const CANONICAL_DIR: &str = "/home/user/.claude-memory";
-const LIVE_STORE: &str = "/home/user/.claude-personal/context-mode/memory";
+/// Every config root's memory dir is a symlink into one tree, which therefore
+/// holds the memories of all projects and all accounts. Point
+/// `HEADROOM_TEST_CANONICAL_MEMORY_DIR` at it to run the seeder.
+fn canonical_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HEADROOM_TEST_CANONICAL_MEMORY_DIR").map(std::path::PathBuf::from)
+}
+
+/// The live ctx-mode store the seeding tests write to and read back, named by
+/// `HEADROOM_TEST_LIVE_STORE`.
+fn live_store() -> Option<std::path::PathBuf> {
+    std::env::var_os("HEADROOM_TEST_LIVE_STORE").map(std::path::PathBuf::from)
+}
+
+/// Claude Code's project slug: the cwd with every separator flattened to a
+/// dash. Built from `$HOME` so the live-store tests name this machine's
+/// checkouts without a path being written down here.
+fn home_slug(repo: &str) -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/{repo}").replace('/', "-")
+}
 
 /// (project slug, file) for every real memory in the canonical store.
 /// `.snapshots/` holds pre-overwrite backups, and MEMORY.md is the index.
 fn canonical_memory_files() -> Vec<(String, std::path::PathBuf)> {
     let mut out = Vec::new();
-    let Ok(roots) = std::fs::read_dir(CANONICAL_DIR) else {
+    let Some(canonical) = canonical_dir() else {
+        return out;
+    };
+    let Ok(roots) = std::fs::read_dir(canonical) else {
         return out;
     };
     for root in roots.flatten() {
@@ -53,11 +77,18 @@ fn canonical_memory_files() -> Vec<(String, std::path::PathBuf)> {
 
 /// Projects that have since moved. A slug names where a project *was*, and a
 /// directory that no longer exists resolves to nothing, so its memories would
-/// be stranded. the user supplies the new location.
-const MOVED_PROJECTS: [(&str, &str); 1] = [(
-    "-home-user-team-workspace-departments-analytics",
-    "/home/user/meta/team-workspace/internal/analytics",
-)];
+/// be stranded. Only the operator knows where each one went, so the mapping
+/// comes in through `HEADROOM_TEST_MOVED_PROJECTS` as
+/// `<slug>=<new path>` pairs separated by commas.
+fn moved_projects() -> Vec<(String, String)> {
+    let Ok(raw) = std::env::var("HEADROOM_TEST_MOVED_PROJECTS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(slug, path)| (slug.trim().to_string(), path.trim().to_string()))
+        .collect()
+}
 
 /// The directory a project's sessions actually ran in.
 ///
@@ -65,16 +96,18 @@ const MOVED_PROJECTS: [(&str, &str); 1] = [(
 /// is guesswork once a directory name contains a dash of its own. The session
 /// transcripts record the real thing, so read it from there.
 fn cwd_for_slug(slug: &str) -> Option<String> {
-    if let Some((_, moved_to)) = MOVED_PROJECTS.iter().find(|(dead, _)| *dead == slug) {
+    if let Some((_, moved_to)) = moved_projects().into_iter().find(|(dead, _)| dead == slug) {
         return Some(moved_to.to_string());
     }
-    const ROOTS: [&str; 3] = [
-        "/home/user/.claude",
-        "/home/user/.claude-personal",
-        "/home/user/.claude-work",
-    ];
-    for root in ROOTS {
-        let dir = std::path::Path::new(root).join("projects").join(slug);
+    // Every config root Claude Code may have written transcripts under. The
+    // directory names are fixed; only the home in front of them is not.
+    let home = std::env::var("HOME").ok()?;
+    let roots = [".claude", ".claude-personal", ".claude-work"];
+    for root in roots {
+        let dir = std::path::Path::new(&home)
+            .join(root)
+            .join("projects")
+            .join(slug);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -181,7 +214,10 @@ fn partition_for_slug(slug: &str) -> Option<String> {
 /// Load every real memory file. Returns the names that went in.
 async fn load_real_memories(handler: &MemoryHandler) -> Vec<String> {
     let mut names = Vec::new();
-    let Ok(entries) = std::fs::read_dir(MEMORY_DIR) else {
+    let Some(dir) = memory_dir() else {
+        return names;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return names;
     };
     for entry in entries.flatten() {
@@ -230,9 +266,11 @@ fn is_merge(result: &str) -> bool {
 #[tokio::test]
 #[ignore = "writes to the live store"]
 async fn seed_the_live_store() {
-    let dir = std::path::Path::new(LIVE_STORE);
-    assert!(dir.is_dir(), "{LIVE_STORE} is not a directory");
-    let handler = handler(dir, 5);
+    let Some(dir) = live_store().filter(|d| d.is_dir()) else {
+        eprintln!("HEADROOM_TEST_LIVE_STORE unset or not a directory; skipping");
+        return;
+    };
+    let handler = handler(&dir, 5);
 
     let mut saved = 0usize;
     let mut merged = 0usize;
@@ -298,8 +336,13 @@ async fn seed_the_live_store() {
 #[tokio::test]
 #[ignore = "reads the live store"]
 async fn live_store_recall() {
-    let handler = handler(std::path::Path::new(LIVE_STORE), 5);
-    let headroom = partition_for_slug("-home-user-headroom").expect("headroom project resolves");
+    let Some(dir) = live_store().filter(|d| d.is_dir()) else {
+        eprintln!("HEADROOM_TEST_LIVE_STORE unset or not a directory; skipping");
+        return;
+    };
+    let handler = handler(&dir, 5);
+    let headroom =
+        partition_for_slug(&home_slug("headroom")).expect("headroom project resolves");
 
     let mut hits = 0;
     let mut misses = Vec::new();
@@ -329,9 +372,13 @@ async fn live_store_recall() {
 #[tokio::test]
 #[ignore = "reads the live store"]
 async fn projects_cannot_see_each_other() {
-    let handler = handler(std::path::Path::new(LIVE_STORE), 20);
-    let headroom = partition_for_slug("-home-user-headroom").expect("headroom resolves");
-    let shopkit = partition_for_slug("-home-user-shopkit").expect("shopkit resolves");
+    let Some(dir) = live_store().filter(|d| d.is_dir()) else {
+        eprintln!("HEADROOM_TEST_LIVE_STORE unset or not a directory; skipping");
+        return;
+    };
+    let handler = handler(&dir, 20);
+    let headroom = partition_for_slug(&home_slug("headroom")).expect("headroom resolves");
+    let shopkit = partition_for_slug(&home_slug("shopkit")).expect("shopkit resolves");
     assert_ne!(headroom, shopkit);
 
     // Ask each project a question only the *other* one can answer.
@@ -385,16 +432,20 @@ async fn projects_cannot_see_each_other() {
     );
 }
 
-/// Seed only the projects listed in [`MOVED_PROJECTS`].
+/// Seed only the projects named by [`moved_projects`].
 ///
 /// Separate from the full seeder so a directory that moves later can be added
 /// and imported without re-saving the whole corpus.
 #[tokio::test]
 #[ignore = "writes to the live store"]
 async fn seed_relocated_projects() {
-    let handler = handler(std::path::Path::new(LIVE_STORE), 5);
-    for (slug, _) in MOVED_PROJECTS {
-        let user_id = partition_for_slug(slug).expect("the new location resolves");
+    let Some(dir) = live_store().filter(|d| d.is_dir()) else {
+        eprintln!("HEADROOM_TEST_LIVE_STORE unset or not a directory; skipping");
+        return;
+    };
+    let handler = handler(&dir, 5);
+    for (slug, _) in moved_projects() {
+        let user_id = partition_for_slug(&slug).expect("the new location resolves");
         for (file_slug, path) in canonical_memory_files() {
             if file_slug != slug {
                 continue;
@@ -422,9 +473,9 @@ async fn seed_relocated_projects() {
 ///
 /// The unit test builds two layouts by hand; this one asks the disk. It walks
 /// the real checkouts — `shopkit/.worktrees/*`, `acme-api/.claude/worktrees/*`
-/// and loose ones like `/home/user/wt-000000` that live nowhere near the
-/// repository they belong to — and fails on any that would open a partition of
-/// its own. Ignored because it depends on this machine's checkouts.
+/// and loose ones like `~/wt-000000` that live nowhere near the repository they
+/// belong to — and fails on any that would open a partition of its own.
+/// Ignored because it depends on this machine's checkouts.
 #[tokio::test]
 #[ignore = "reads this machine's worktrees"]
 async fn every_real_worktree_folds_into_its_repository() {
@@ -440,9 +491,10 @@ async fn every_real_worktree_folds_into_its_repository() {
         )
     };
 
+    let home = std::env::var("HOME").expect("HOME is set");
     let found = std::process::Command::new("find")
         .args([
-            "/home/user",
+            home.as_str(),
             "-maxdepth",
             "6",
             "-name",
@@ -597,9 +649,9 @@ async fn a_global_memory_is_visible_from_every_project() {
     );
 }
 
-/// Two repositories can share a name — `ai-first` is a per-department
-/// convention at meta. The path decides the partition, so they must not
-/// collide however alike the names are.
+/// Two repositories can share a name — `ai-first` is a directory name some
+/// workspaces repeat once per department. The path decides the partition, so
+/// they must not collide however alike the names are.
 #[tokio::test]
 async fn repositories_with_the_same_name_do_not_collide() {
     let tmp = tempfile::tempdir().unwrap();
