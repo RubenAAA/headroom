@@ -228,6 +228,9 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "WebSearch",
         "WebFetch",
         "headroom_retrieve",
+        # Copilot CLI's file-read tool (its `Read` equivalent): raw file bytes
+        # the model byte-patches against.
+        "view",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
@@ -253,6 +256,10 @@ DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "web_search",
         "web_fetch",
         "headroom_retrieve",
+        # `view` (Copilot CLI file read) must stay BYTE-EXACT: the model produces
+        # line/byte-precise edits against it, and even "lossless" JSON rewrites
+        # or cross-turn dedup folds break old_str matching and force re-reads.
+        "view",
     }
 )
 

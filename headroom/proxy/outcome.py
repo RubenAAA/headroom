@@ -25,6 +25,7 @@ actually reports.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -455,10 +456,17 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             from headroom.proxy.output_savings import get_recorder
 
             _rec = get_recorder()
-            _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
-            output_tokens_saved_est = _rec.estimate_request_savings(
-                outcome.transforms_applied, outcome.output_tokens
-            )
+
+            def _record_and_estimate() -> int:
+                _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+                return _rec.estimate_request_savings(
+                    outcome.transforms_applied, outcome.output_tokens
+                )
+
+            # Both calls take the recorder lock, and the every-Nth record also
+            # does a full read-modify-write of the ledger file — run them
+            # together off the event loop (#18) so a slow flush can't stall it.
+            output_tokens_saved_est = await asyncio.to_thread(_record_and_estimate)
         except Exception:  # pragma: no cover - defensive
             pass
 

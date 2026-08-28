@@ -147,7 +147,7 @@ def test_single_cache_miss_deadline_starts_before_kompress_load(monkeypatch, cap
             return [[i % 2 == 0 for i in range(len(row))] for row in input_ids]
 
     model = _Model()
-    compressor = KompressCompressor(config=KompressConfig(enable_ccr=False))
+    compressor = KompressCompressor(config=KompressConfig(enable_ccr=False, min_input_words=10))
     monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
     load_state = {"calls": 0}
 

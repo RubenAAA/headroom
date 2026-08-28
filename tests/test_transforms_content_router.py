@@ -517,7 +517,7 @@ def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         content_router_module,
         "split_into_sections",
-        lambda content: [
+        lambda content, isolate=(): [
             SimpleNamespace(
                 content="print('x')",
                 content_type=ContentType.SOURCE_CODE,
@@ -1785,3 +1785,23 @@ def test_detect_content_overrides_html_misroute_for_grep_and_logs(
         "</section></main></body></html>"
     )
     assert _detect_content(html).content_type is ContentType.HTML
+
+
+def test_datetime_prefixed_user_prompt_survives_router() -> None:
+    """Regression (2026-08-23): interactive wrap-copilot prompts were deleted.
+
+    Copilot CLI prepends ``<current_datetime>…</current_datetime>`` to every
+    interactive user turn; the ISO timestamp matched the grep ``file:line:``
+    detector, the one-line prompt classified as SEARCH_RESULTS, and
+    SearchCompressor kept only the datetime line — the model received no
+    request and answered "How can I help you today?". The router must never
+    route this shape to the search line-filter and must keep the prose.
+    """
+    prompt = (
+        "<current_datetime>2026-08-23T09:57:59.792+02:00</current_datetime>\n"
+        "\n"
+        "Please update the PR desc and check .overlay/ for hints."
+    )
+    result = ContentRouter().compress(prompt)
+    assert result.strategy_used is not CompressionStrategy.SEARCH
+    assert "Please update the PR desc" in result.compressed

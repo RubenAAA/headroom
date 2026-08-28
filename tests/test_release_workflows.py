@@ -339,23 +339,35 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
     import subprocess
 
     for crate in ("headroom-py", "headroom-proxy", "headroom-core"):
-        result = subprocess.run(
-            [
-                "cargo",
-                "tree",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-p",
-                crate,
-                "-i",
-                "native-tls",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-p",
+                    crate,
+                    "-i",
+                    "native-tls",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            pytest.skip("cargo is unavailable in this environment")
+        # Same environment gates as the openssl-sys dual above: a cargo
+        # failure that is not "package did not match" means the Linux wheel
+        # target is unavailable here, not that native-tls came back.
         not_in_tree = result.returncode != 0 and "did not match any packages" in result.stderr
+        if result.returncode != 0 and "package ID specification `native-tls` did not match" not in (
+            result.stderr + result.stdout
+        ):
+            pytest.skip(
+                "cargo dependency tree for the Linux wheel target is unavailable in this environment"
+            )
         assert not_in_tree, (
             f"native-tls is back in {crate}'s build tree — likely some "
             f"crate's `default-features = true` re-enabled native-tls "
