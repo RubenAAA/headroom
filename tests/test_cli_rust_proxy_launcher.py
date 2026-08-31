@@ -113,13 +113,61 @@ def test_active_unsupported_flag_fails_loudly_under_rust(monkeypatch):
 
     result = CliRunner().invoke(
         main,
-        ["proxy", "--memory"],
+        ["proxy", "--code-graph"],
         env={"HEADROOM_PROXY_BINARY": "/tmp/headroom-proxy"},
     )
 
     assert result.exit_code != 0
     assert "not supported by the Rust proxy in Phase 1" in result.output
-    assert "--memory" in result.output
+    assert "--code-graph" in result.output
+
+
+def test_memory_runs_on_the_rust_proxy(monkeypatch):
+    """`--memory` used to be refused outright, which left the Rust proxy's
+    working memory implementation unreachable from the launcher."""
+    monkeypatch.delenv("HEADROOM_USE_PYTHON_PROXY", raising=False)
+    captured: dict[str, object] = {}
+
+    def fake_run(command, env):  # noqa: ANN001
+        captured["env"] = env
+        return _Completed()
+
+    monkeypatch.setattr(proxy_mod.subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(
+        main,
+        ["proxy", "--memory", "--memory-top-k", "25", "--no-memory-context"],
+        env={"HEADROOM_PROXY_BINARY": "/tmp/headroom-proxy"},
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert env["HEADROOM_MEMORY_ENABLED"] == "1"
+    assert env["HEADROOM_MEMORY_TOP_K"] == "25"
+    assert env["HEADROOM_MEMORY_INJECT_CONTEXT"] == "0"
+    assert "HEADROOM_MEMORY_INJECT_TOOLS" not in env
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--memory", "--memory-storage", "global"], "--memory-storage"),
+        (["--memory", "--memory-project-root", "/tmp/x"], "--memory-project-root"),
+        (["--memory", "--memory-qdrant-url", "http://q:6333"], "--memory-qdrant-*"),
+    ],
+)
+def test_a_store_the_rust_proxy_cannot_open_is_still_refused(monkeypatch, argv, expected):
+    monkeypatch.delenv("HEADROOM_USE_PYTHON_PROXY", raising=False)
+
+    result = CliRunner().invoke(
+        main,
+        ["proxy", *argv],
+        env={"HEADROOM_PROXY_BINARY": "/tmp/headroom-proxy"},
+    )
+
+    assert result.exit_code != 0
+    assert expected in result.output
 
 
 def test_rust_proxy_env_forwarding(monkeypatch):

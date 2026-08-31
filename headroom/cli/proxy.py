@@ -18,7 +18,7 @@ from headroom.providers.registry import (
     resolve_api_targets,
     resolve_extra_headers,
 )
-from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
+from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_TOKEN, normalize_proxy_mode
 
 from .main import main
 
@@ -320,8 +320,23 @@ def _rust_proxy_unsupported_reasons(options: dict[str, Any]) -> list[str]:
         reasons.append("--enable-kompress-openai")
     if options["code_graph"]:
         reasons.append("--code-graph")
+    # The Rust proxy runs memory itself: the master switch reaches it as
+    # HEADROOM_MEMORY_ENABLED, and --memory-top-k / --no-memory-tools /
+    # --no-memory-context / --memory-db-path as the env vars it reads for
+    # them. What it has no equivalent for is a store other than the FTS one it
+    # opens under the ctx directory, so those options still belong here.
     if options["memory"]:
-        reasons.append("--memory and related memory flags")
+        if str(options["memory_storage"]).lower() != "project":
+            reasons.append(f"--memory-storage {options['memory_storage']}")
+        if options["memory_project_root"]:
+            reasons.append("--memory-project-root")
+        if (
+            options["memory_qdrant_url"]
+            or options["memory_qdrant_host"]
+            or options["memory_qdrant_port"]
+            or options["memory_qdrant_api_key"]
+        ):
+            reasons.append("--memory-qdrant-*")
     if options["learn"]:
         reasons.append("--learn")
     if options["backend"] not in ("anthropic", "bedrock"):
@@ -432,6 +447,17 @@ def _run_rust_proxy_from_options(options: dict[str, Any]) -> None:
         )
     )
     env["HEADROOM_MEMORY_ENABLED"] = "1" if memory_enabled else "0"
+    if memory_enabled:
+        # The Rust proxy takes these as env vars only; there is no CLI flag on
+        # that side to carry them.
+        if options.get("no_memory_tools"):
+            env["HEADROOM_MEMORY_INJECT_TOOLS"] = "0"
+        if options.get("no_memory_context"):
+            env["HEADROOM_MEMORY_INJECT_CONTEXT"] = "0"
+        if options.get("memory_top_k") is not None:
+            env["HEADROOM_MEMORY_TOP_K"] = str(options["memory_top_k"])
+        if options.get("memory_db_path"):
+            env["HEADROOM_MEMORY_DB_PATH"] = str(options["memory_db_path"])
 
     # cache_ttl / cache_max_entries: forward from parent env only — no
     # CLI flags exist for these yet; the Rust proxy uses its defaults

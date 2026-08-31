@@ -172,8 +172,22 @@ async fn the_call_is_answered_by_the_proxy_and_never_reaches_the_client() {
         "the client must get the continued answer: {client_saw}"
     );
     assert!(
-        !client_saw.contains("memory_search"),
+        !client_saw.contains("\"type\":\"tool_use\""),
         "the client must never see a tool it does not have: {client_saw}"
+    );
+}
+
+#[tokio::test]
+async fn the_answered_call_leaves_a_receipt_in_the_turn() {
+    let dir = TempDir::new().unwrap();
+    let (client_saw, _upstream_saw, _) = run_turn(&dir).await;
+
+    // Without this line the call is invisible to the client, so the next
+    // request — which the client rebuilds from its own transcript — shows the
+    // model a claim with no tool output behind it.
+    assert!(
+        client_saw.contains("[headroom memory]") && client_saw.contains("memory_search("),
+        "the turn must record the call the proxy answered: {client_saw}"
     );
 }
 

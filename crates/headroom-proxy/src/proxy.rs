@@ -8801,6 +8801,8 @@ pub(crate) async fn handle_memory_response(
     let shaper = CCRResponseHandler::new(None);
     let mut current_response = response;
     let mut rounds = 0;
+    // Kept across rounds: the client sees one turn, not one per round.
+    let mut trace: Vec<String> = Vec::new();
 
     while rounds < config.ccr_max_retrieval_rounds {
         let results: Vec<serde_json::Value> = {
@@ -8815,6 +8817,11 @@ pub(crate) async fn handle_memory_response(
         if results.is_empty() {
             break;
         }
+        trace.extend(memory_trace_lines(
+            &current_response,
+            &results,
+            memory.provider,
+        ));
 
         // `handle_memory_tool_calls` returns provider-shaped tool results
         // already; wrap them the way the continuation array expects.
@@ -8944,6 +8951,25 @@ pub(crate) async fn handle_memory_response(
         }
     }
 
+    // Anthropic only: this is the shape whose client keeps a transcript and
+    // replays it, and the only one whose stream splice passes an added block
+    // through (see `sse::ccr_stream::drop_reason`). Leading, because the calls
+    // ran before the answer was written.
+    if provider == "anthropic" && !trace.is_empty() {
+        if let Some(content) = current_response
+            .get_mut("content")
+            .and_then(|v| v.as_array_mut())
+        {
+            content.insert(
+                0,
+                serde_json::json!({
+                    "type": "text",
+                    "text": format!("[headroom memory]\n{}", trace.join("\n")),
+                }),
+            );
+        }
+    }
+
     match serde_json::to_vec(&current_response) {
         Ok(bytes) => (bytes::Bytes::from(bytes), round_usage),
         Err(_) => (body_bytes.clone(), round_usage),
@@ -8999,6 +9025,203 @@ fn pair_results_with_calls(
             ))
         })
         .collect()
+}
+
+/// One line per memory call the proxy answered, for the client's transcript.
+///
+/// The proxy runs `memory_*` itself and splices back only the continuation's
+/// final answer, so neither the call nor its result ever reaches the client.
+/// The client rebuilds the next request from its own transcript, where the
+/// model then reads a bare claim with no tool output behind it. A session on
+/// 2026-08-31 read that back and concluded it had fabricated four searches it
+/// had in fact run, all of which the `memory_tool_call` log recorded. These
+/// lines are the receipt: short enough to carry every turn, specific enough to
+/// check against that log.
+fn memory_trace_lines(
+    response: &serde_json::Value,
+    results: &[serde_json::Value],
+    provider: crate::memory::tool_adapter::Provider,
+) -> Vec<String> {
+    use serde_json::Value;
+
+    // Char-safe, because a query can end mid-codepoint and this string goes
+    // into a response body.
+    fn clip(s: &str, max: usize) -> String {
+        if s.chars().count() <= max {
+            return s.replace('\n', " ");
+        }
+        let head: String = s.chars().take(max).collect();
+        format!("{}…", head.replace('\n', " "))
+    }
+
+    let mut lines = Vec::new();
+    for call in crate::memory::tool_adapter::extract_tool_calls(response, provider) {
+        let Some(name) = call.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !crate::memory::tool_adapter::MEMORY_TOOL_NAMES.contains(&name) {
+            continue;
+        }
+        let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+        // The argument worth showing differs per tool, and only the first one
+        // present is worth the width.
+        let arg = call
+            .get("input")
+            .and_then(|input| {
+                ["query", "content", "new_content", "memory_id"]
+                    .iter()
+                    .find_map(|key| input.get(*key).and_then(Value::as_str))
+            })
+            .map(|s| clip(s, 60))
+            .unwrap_or_default();
+
+        let outcome = results
+            .iter()
+            .find(|r| r.get("tool_use_id").and_then(Value::as_str) == Some(id))
+            .and_then(|r| r.get("content").and_then(Value::as_str))
+            .and_then(|c| serde_json::from_str::<Value>(c).ok())
+            .map(|parsed| {
+                let status = parsed
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unparsed");
+                if status == "error" {
+                    let detail = parsed.get("error").and_then(Value::as_str).unwrap_or("");
+                    return format!("error: {}", clip(detail, 80));
+                }
+                if let Some(n) = parsed.get("count").and_then(Value::as_u64) {
+                    return format!("{n} result{}", if n == 1 { "" } else { "s" });
+                }
+                match parsed.get("memory_id").and_then(Value::as_str) {
+                    Some(memory_id) => format!("{status} {memory_id}"),
+                    None => status.to_string(),
+                }
+            })
+            // A call with no matching result was answered by nothing, which is
+            // exactly the case the receipt exists to make visible.
+            .unwrap_or_else(|| "no answer".to_string());
+
+        if arg.is_empty() {
+            lines.push(format!("{name} → {outcome}"));
+        } else {
+            lines.push(format!("{name}(\"{arg}\") → {outcome}"));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod memory_trace_tests {
+    use super::memory_trace_lines;
+    use crate::memory::tool_adapter::Provider;
+    use serde_json::json;
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+        json!({"type": "tool_use", "id": id, "name": name, "input": input})
+    }
+
+    fn result(id: &str, content: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "tool_result",
+            "tool_use_id": id,
+            "content": content.to_string(),
+        })
+    }
+
+    #[test]
+    fn search_reports_the_query_and_the_count() {
+        let response = json!({"content": [call("t1", "memory_search", json!({"query": "raw_payloads"}))]});
+        let results = vec![result("t1", json!({"status": "found", "count": 19}))];
+        assert_eq!(
+            memory_trace_lines(&response, &results, Provider::Anthropic),
+            vec!["memory_search(\"raw_payloads\") → 19 results"]
+        );
+    }
+
+    #[test]
+    fn save_reports_the_id_so_a_later_turn_can_quote_it() {
+        let response = json!({"content": [call("t1", "memory_save", json!({"content": "the proxy runs on 8787"}))]});
+        let results = vec![result("t1", json!({"status": "saved", "memory_id": "m-42"}))];
+        assert_eq!(
+            memory_trace_lines(&response, &results, Provider::Anthropic),
+            vec!["memory_save(\"the proxy runs on 8787\") → saved m-42"]
+        );
+    }
+
+    #[test]
+    fn one_result_is_singular() {
+        let response = json!({"content": [call("t1", "memory_search", json!({"query": "q"}))]});
+        let results = vec![result("t1", json!({"status": "found", "count": 1}))];
+        assert_eq!(
+            memory_trace_lines(&response, &results, Provider::Anthropic),
+            vec!["memory_search(\"q\") → 1 result"]
+        );
+    }
+
+    #[test]
+    fn an_error_says_so_rather_than_reading_as_a_hit() {
+        let response = json!({"content": [call("t1", "memory_search", json!({"query": "q"}))]});
+        let results = vec![result("t1", json!({"status": "error", "error": "backend not initialized"}))];
+        assert_eq!(
+            memory_trace_lines(&response, &results, Provider::Anthropic),
+            vec!["memory_search(\"q\") → error: backend not initialized"]
+        );
+    }
+
+    #[test]
+    fn a_call_nothing_answered_is_named_not_hidden() {
+        let response = json!({"content": [call("t1", "memory_search", json!({"query": "q"}))]});
+        assert_eq!(
+            memory_trace_lines(&response, &[], Provider::Anthropic),
+            vec!["memory_search(\"q\") → no answer"]
+        );
+    }
+
+    #[test]
+    fn client_tools_sharing_the_turn_are_not_ours_to_report() {
+        let response = json!({
+            "content": [
+                call("t1", "Bash", json!({"command": "ls"})),
+                call("t2", "memory_list", json!({})),
+            ]
+        });
+        let results = vec![result("t2", json!({"status": "ok", "count": 44}))];
+        assert_eq!(
+            memory_trace_lines(&response, &results, Provider::Anthropic),
+            vec!["memory_list → 44 results"]
+        );
+    }
+
+    #[test]
+    fn results_are_paired_by_id_not_by_position() {
+        let response = json!({
+            "content": [
+                call("t1", "memory_search", json!({"query": "first"})),
+                call("t2", "memory_search", json!({"query": "second"})),
+            ]
+        });
+        let results = vec![
+            result("t2", json!({"status": "found", "count": 2})),
+            result("t1", json!({"status": "found", "count": 7})),
+        ];
+        assert_eq!(
+            memory_trace_lines(&response, &results, Provider::Anthropic),
+            vec![
+                "memory_search(\"first\") → 7 results",
+                "memory_search(\"second\") → 2 results",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_query_is_clipped_on_a_char_boundary() {
+        let query = "Ünicode ".repeat(20);
+        let response = json!({"content": [call("t1", "memory_search", json!({"query": query}))]});
+        let results = vec![result("t1", json!({"status": "found", "count": 0}))];
+        let lines = memory_trace_lines(&response, &results, Provider::Anthropic);
+        assert!(lines[0].starts_with("memory_search(\"Ünicode"), "{lines:?}");
+        assert!(lines[0].ends_with("…\") → 0 results"), "{lines:?}");
+    }
 }
 
 /// Wrap provider-shaped memory tool results for the continuation array.

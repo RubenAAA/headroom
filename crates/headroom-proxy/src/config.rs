@@ -712,6 +712,7 @@ pub struct CliArgs {
         env = "HEADROOM_MEMORY_ENABLED",
         default_value_t = false,
         action = clap::ArgAction::Set,
+        value_parser = parse_bool_flag,
     )]
     pub memory_enabled: bool,
 
@@ -1536,6 +1537,22 @@ pub struct CliArgs {
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration `{s}`: {e}"))
+}
+
+/// A boolean written the way a shell writes one, not only clap's spelling.
+///
+/// Clap's own bool parser takes `true`/`false` and nothing else. The launcher
+/// in `headroom/cli/proxy.py` sets `HEADROOM_MEMORY_ENABLED` to `1` or `0` on
+/// every run, so the proxy refused to start with `invalid value '0'` — with
+/// memory off as readily as on.
+fn parse_bool_flag(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "expected a boolean (true/false, 1/0, yes/no, on/off), got `{other}`"
+        )),
+    }
 }
 
 fn parse_rollout_channel(value: &str) -> Result<String, String> {
