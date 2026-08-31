@@ -383,10 +383,12 @@ fn compress_response_create_frame(
         None => false,
     };
     let inner = if wrapped {
-        parsed.get("response").expect("checked above")
+        parsed.get_mut("response").expect("checked above")
     } else {
-        &parsed
+        &mut parsed
     };
+    let additional_tools_restore_plan =
+        crate::handlers::responses::lift_codex_additional_tools(inner, request_id);
     let inner_bytes = match serde_json::to_vec(inner) {
         Ok(b) => Bytes::from(b),
         Err(_) => {
@@ -405,6 +407,11 @@ fn compress_response_create_frame(
             strategies_applied,
             ..
         } => {
+            let body = crate::handlers::responses::restore_codex_additional_tools_body(
+                body,
+                additional_tools_restore_plan.as_ref(),
+                request_id,
+            );
             let text = if wrapped {
                 let Ok(new_inner) = serde_json::from_slice::<Value>(&body) else {
                     return FrameCompression::Passthrough {
@@ -686,8 +693,14 @@ impl OutcomeSink for CodexWsOutcomeSink {
     }
 
     fn record_output_savings(&self, transforms: &[String], output_tokens: i64) {
-        let recorder = headroom_core::output_savings::get_recorder();
-        recorder.record_from_labels(transforms, output_tokens);
+        // Every `flush_every`th call writes the ledger to disk, and this runs on
+        // the task handling the request. `std::fs::write` + `rename` on a tokio
+        // worker stalls every other request that thread is driving, so hand it
+        // to the blocking pool the way `record_savings_ledger` already does.
+        let transforms = transforms.to_vec();
+        tokio::task::spawn_blocking(move || {
+            headroom_core::output_savings::get_recorder().record_from_labels(&transforms, output_tokens);
+        });
     }
 
     fn record_failed(&self, outcome: &RequestOutcome) {
@@ -2300,6 +2313,41 @@ mod tests {
             }
             other => panic!("expected Compressed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn frame_additional_tools_are_restored_for_stateful_sessions() {
+        let mut inner = big_compressible_inner();
+        inner["input"].as_array_mut().unwrap().insert(
+            1,
+            json!({
+                "type": "additional_tools",
+                "id": "tool-transcript-item",
+                "tools": [{
+                    "type": "function",
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+        let raw = json!({"type": "response.create", "response": inner}).to_string();
+        let out =
+            compress_response_create_frame(&raw, CompressionMode::LiveZone, AuthMode::Payg, RID);
+        let FrameCompression::Compressed { text, .. } = out else {
+            panic!("expected compressed frame, got {out:?}");
+        };
+        let forwarded: Value = serde_json::from_str(&text).unwrap();
+        let response = &forwarded["response"];
+        assert!(response.get("tools").is_none());
+        let carrier = response["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "additional_tools")
+            .expect("tool carrier restored into the transcript");
+        assert_eq!(carrier["id"], "tool-transcript-item");
+        assert_eq!(carrier["tools"][0]["name"], "shell");
     }
 
     #[test]

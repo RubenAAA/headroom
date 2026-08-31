@@ -11,11 +11,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct EventCapture(pub(crate) Arc<Mutex<Vec<String>>>);
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _: tracing_subscriber::layer::Context<'_, S>,
-    ) {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         use tracing::field::{Field, Visit};
         struct Visitor(String);
         impl Visit for Visitor {
@@ -48,6 +44,9 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
         started_at: std::time::Instant::now(),
         config: std::sync::Arc::new(config),
         client: reqwest::Client::new(),
+        caller_clients: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(128).unwrap(),
+        ))),
         bedrock_credentials: None,
         drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
         outbound_drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
@@ -66,9 +65,9 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
         cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
             None, "monthly",
         )),
-        savings_tracker: std::sync::Arc::new(
-            headroom_core::savings_tracker::SavingsTracker::new(None, false),
-        ),
+        savings_tracker: std::sync::Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+            None, false,
+        )),
         request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(None)),
         vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
             "test".to_string(),

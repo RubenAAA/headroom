@@ -42,6 +42,74 @@ use crate::codex::{
 
 
 
+/// Pick the upstream credential for a matched route, returning the headers and
+/// whether they carry ChatGPT auth.
+///
+/// Codex headers are built from process-wide config — the auth file, the
+/// `codex_cli_rs` originator, the ChatGPT bearer token — so they are only
+/// right for a route actually bound for Codex. A route naming its own
+/// credential says it is not, and gets that credential instead. A route naming
+/// none keeps the old behavior, which is what makes this opt-in.
+fn upstream_auth_headers(
+    auth_env: Option<&str>,
+    client_headers: &HeaderMap,
+    codex_auth_file: Option<&str>,
+) -> Result<(HeaderMap, bool), Response> {
+    match auth_env {
+        Some(var) => Ok((route_auth_headers(var)?, false)),
+        None => Ok(resolve_codex_routing_headers(
+            client_headers,
+            codex_auth_file,
+        )),
+    }
+}
+
+/// Build upstream headers for a route that carries its own credential.
+///
+/// `var` is the name of an environment variable, not a token — see
+/// [`crate::config::ModelRoute::auth_env`]. It is read here, once per request,
+/// so an operator can rotate the token by restarting the shell that exports
+/// it without touching the route table.
+///
+/// A missing or empty variable is an error rather than a header left off. The
+/// silent version sends an unauthenticated request and gets back an upstream
+/// 401, which reads like a bad token rather than a missing one.
+fn route_auth_headers(var: &str) -> Result<HeaderMap, Response> {
+    let deny = |detail: String| -> Response {
+        tracing::error!(
+            event = "model_route_auth_env_unusable",
+            env_var = %var,
+            "route credential unusable"
+        );
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(detail))
+            .expect("static response")
+    };
+
+    let token = match std::env::var(var) {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            return Err(deny(format!(
+                "model route names ${var} for its credential, but that \
+                 environment variable is unset or empty"
+            )))
+        }
+    };
+
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert(
+        http::header::CONTENT_TYPE,
+        "application/json".parse().expect("valid header"),
+    );
+    // A token with a newline or a stray control character would otherwise be
+    // rejected deep inside the client with a message naming no variable.
+    let value = http::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+        .map_err(|_| deny(format!("${var} is not usable as an Authorization header")))?;
+    upstream_headers.insert(http::header::AUTHORIZATION, value);
+    Ok(upstream_headers)
+}
+
 fn apply_target_model_override(
     mut body: Value,
     target_model: Option<&str>,
@@ -160,7 +228,11 @@ pub async fn handle_messages(
         .model_routes
         .iter()
         .find(|r| r.matches(body_model))
-        .and_then(|r| r.cursor_agent.clone());
+        .and_then(|r| {
+            // The effort travels per request, so the model id is resolved here
+            // rather than at parse time.
+            r.resolve_cursor_agent(crate::output_shaper::requested_effort(&parsed))
+        });
 
     if let Some(ref cursor_model) = cursor_model {
         let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
@@ -176,7 +248,7 @@ pub async fn handle_messages(
         (&state.config.local_model, &state.config.local_upstream)
     {
         if body_model == model.as_str() {
-            Some((upstream.clone(), true, None))
+            Some((upstream.clone(), true, None, None))
         } else {
             None
         }
@@ -190,11 +262,18 @@ pub async fn handle_messages(
             .model_routes
             .iter()
             .find(|r| r.matches(body_model))
-            .and_then(|r| Some((r.upstream.clone()?, r.translate, r.target_model.clone())))
+            .and_then(|r| {
+                Some((
+                    r.upstream.clone()?,
+                    r.translate,
+                    r.target_model.clone(),
+                    r.auth_env.clone(),
+                ))
+            })
     });
 
-    let (upstream, translate, target_model) = match matched {
-        Some((u, t, tm)) => (u.clone(), t, tm),
+    let (upstream, translate, target_model, auth_env) = match matched {
+        Some((u, t, tm, ae)) => (u.clone(), t, tm, ae),
         None => {
             // No route matched — delegate to standard forwarder.
             let mut builder = Request::builder().method(method).uri(uri);
@@ -222,8 +301,14 @@ pub async fn handle_messages(
         }
     };
 
-    let (upstream_headers, is_chatgpt_auth) =
-        resolve_codex_routing_headers(&headers, state.config.codex_auth_file.as_deref());
+    let (upstream_headers, is_chatgpt_auth) = match upstream_auth_headers(
+        auth_env.as_deref(),
+        &headers,
+        state.config.codex_auth_file.as_deref(),
+    ) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
 
     if !translate {
         // No translation needed — forward Anthropic format directly to the upstream.
@@ -806,6 +891,35 @@ async fn resolve_routed_ccr(
     }
 }
 
+/// Run both resolvers over a routed turn until a pass changes nothing.
+///
+/// Each of them only runs the calls standing when it starts, and either one's
+/// continuation can come back asking for the other — a `memory_search` the
+/// proxy answered can leave the model asking for a `headroom_retrieve` that
+/// retrieval has already passed by. Running them once each, in a fixed order,
+/// left that call with nobody to run it. See `MAX_RESOLVER_ALTERNATIONS`.
+async fn resolve_routed_proxy_tools(
+    response: &Value,
+    ccr: &RoutedCcr,
+) -> (Value, crate::proxy::CcrRoundUsage) {
+    let mut body = response.clone();
+    let mut rounds = crate::proxy::CcrRoundUsage::default();
+    for _ in 0..crate::proxy::MAX_RESOLVER_ALTERNATIONS {
+        let before = body.clone();
+
+        let (next, ccr_rounds) = resolve_routed_ccr(&body, ccr).await;
+        rounds.absorb(ccr_rounds);
+        let (next, mem_rounds) = resolve_routed_memory(&next, ccr).await;
+        rounds.absorb(mem_rounds);
+        body = next;
+
+        if body == before {
+            break;
+        }
+    }
+    (body, rounds)
+}
+
 /// Run any `memory_*` call the model made, in the upstream's own shape.
 ///
 /// The twin of [`resolve_routed_ccr`]. `handle_memory_response` was already
@@ -963,12 +1077,7 @@ async fn handle_buffered_response(
     // is booked: the continuation rounds are billed too, and booking the first
     // round's usage as the turn's would under-report the retrieval.
     let (openai_body, ccr_rounds) = match ccr {
-        Some(ccr) => {
-            let (body, mut rounds) = resolve_routed_ccr(&openai_body, &ccr).await;
-            let (body, mem_rounds) = resolve_routed_memory(&body, &ccr).await;
-            rounds.absorb(mem_rounds);
-            (body, rounds)
-        }
+        Some(ccr) => resolve_routed_proxy_tools(&openai_body, &ccr).await,
         None => (openai_body, crate::proxy::CcrRoundUsage::default()),
     };
 
@@ -1019,12 +1128,7 @@ async fn handle_buffered_responses_response(
     // too, and booking the first round's usage as the turn's would under-report
     // the retrieval. Same ordering as the chat arm.
     let (resolved, ccr_rounds) = match ccr {
-        Some(ccr) => {
-            let (body, mut rounds) = resolve_routed_ccr(&responses_turn, &ccr).await;
-            let (body, mem_rounds) = resolve_routed_memory(&body, &ccr).await;
-            rounds.absorb(mem_rounds);
-            (body, rounds)
-        }
+        Some(ccr) => resolve_routed_proxy_tools(&responses_turn, &ccr).await,
         None => (responses_turn, crate::proxy::CcrRoundUsage::default()),
     };
 
@@ -1745,6 +1849,275 @@ mod tests {
                 .get("ChatGPT-Account-ID")
                 .and_then(|v| v.to_str().ok()),
             Some("acct-from-jwt")
+        );
+    }
+    /// Serializes the cases below: `set_var` is process-wide.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Writes a Codex auth file, so every case below is a choice the route made
+    /// rather than the absence of anything to choose.
+    fn codex_auth() -> (tempfile::TempDir, String) {
+        let payload = json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-do-not-leak"}
+        });
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("auth.json"),
+            json!({"tokens": {"access_token": token}}).to_string(),
+        )
+        .unwrap();
+        (dir, token)
+    }
+
+    fn header(h: &HeaderMap, name: &str) -> Option<String> {
+        h.get(name).and_then(|v| v.to_str().ok()).map(String::from)
+    }
+
+    /// The bug this exists to stop: with `--codex-auth-file` set, an xAI route
+    /// used to be handed the ChatGPT bearer token and the Codex originator and
+    /// send both to `api.x.ai`.
+    #[test]
+    fn a_route_credential_replaces_codex_auth_entirely() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, _codex_token) = codex_auth();
+        let auth_path = dir.path().join("auth.json");
+        std::env::set_var("HEADROOM_TEST_ROUTE_KEY", "xai-route-token");
+
+        let (h, is_chatgpt) =
+            upstream_auth_headers(Some("HEADROOM_TEST_ROUTE_KEY"), &HeaderMap::new(), auth_path.to_str())
+                .expect("the variable is set");
+
+        assert!(!is_chatgpt, "a route credential is not ChatGPT auth");
+        assert_eq!(
+            header(&h, "authorization").as_deref(),
+            Some("Bearer xai-route-token")
+        );
+        assert_eq!(header(&h, "originator"), None);
+        assert_eq!(header(&h, "ChatGPT-Account-ID"), None);
+        assert_eq!(header(&h, "user-agent"), None);
+        std::env::remove_var("HEADROOM_TEST_ROUTE_KEY");
+    }
+
+    /// The other half: a route naming no credential still gets Codex headers,
+    /// or the test above would pass on a function that never routes anywhere.
+    #[test]
+    fn a_route_without_a_credential_still_gets_codex_headers() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, codex_token) = codex_auth();
+        let auth_path = dir.path().join("auth.json");
+
+        let (h, is_chatgpt) = upstream_auth_headers(None, &HeaderMap::new(), auth_path.to_str())
+            .expect("codex headers never fail");
+
+        assert!(is_chatgpt);
+        assert_eq!(
+            header(&h, "authorization"),
+            Some(format!("Bearer {codex_token}"))
+        );
+        assert_eq!(header(&h, "ChatGPT-Account-ID").as_deref(), Some("acct-do-not-leak"));
+        assert!(header(&h, "originator").is_some());
+    }
+
+    /// An unset variable means a typo in the flags file. Sending the request
+    /// without the header turns that into an upstream 401, which reads like a
+    /// revoked token and sends the operator looking in the wrong place.
+    #[test]
+    fn an_unset_variable_is_reported_rather_than_dropped() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("HEADROOM_TEST_MISSING_KEY");
+
+        let err = upstream_auth_headers(Some("HEADROOM_TEST_MISSING_KEY"), &HeaderMap::new(), None)
+            .expect_err("unset variable");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A variable exported as empty is the same mistake wearing a different
+    /// hat, and `Bearer ` is a header no upstream wants.
+    #[test]
+    fn an_empty_variable_is_reported_too() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("HEADROOM_TEST_EMPTY_KEY", "   ");
+        let err = upstream_auth_headers(Some("HEADROOM_TEST_EMPTY_KEY"), &HeaderMap::new(), None)
+            .expect_err("empty variable");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        std::env::remove_var("HEADROOM_TEST_EMPTY_KEY");
+    }
+
+    /// A token pasted into a shell often keeps its trailing newline, which
+    /// `HeaderValue` refuses. Trim it rather than fail on it.
+    #[test]
+    fn a_trailing_newline_is_trimmed_off_the_token() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("HEADROOM_TEST_NEWLINE_KEY", "xai-token\n");
+        let (h, _) = upstream_auth_headers(Some("HEADROOM_TEST_NEWLINE_KEY"), &HeaderMap::new(), None)
+            .expect("trimmed");
+        assert_eq!(header(&h, "authorization").as_deref(), Some("Bearer xai-token"));
+        std::env::remove_var("HEADROOM_TEST_NEWLINE_KEY");
+    }
+}
+
+/// The handoff between the two resolvers, on the shape that broke in the field.
+///
+/// A turn asks for `memory_search`; the proxy answers it and continues; the
+/// model comes back asking for `headroom_retrieve`. Retrieval has already had
+/// its turn by then, so before the alternation loop that second call stood
+/// unresolved — the splice dropped it and downgraded the turn to `end_turn`,
+/// and the user got an apology instead of the content.
+#[cfg(test)]
+mod resolver_alternation_tests {
+    use super::*;
+    use headroom_core::ccr::backends::InMemoryCcrStore;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const HASH: &str = "abc123def456abc123def456";
+    const CONTENT: &str = "the original large content";
+
+    fn memory_ctx() -> crate::proxy::MemoryToolContext {
+        let mut handler = crate::memory::handler::MemoryHandler::new(
+            crate::memory::handler::MemoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            "test",
+        );
+        // An empty in-process store: what a search returns does not matter
+        // here, only that the call resolves and the turn continues.
+        handler.set_backend(Arc::new(
+            crate::memory::local_backend::LocalMemoryBackend::new(),
+        ));
+        crate::proxy::MemoryToolContext {
+            handler: Arc::new(tokio::sync::Mutex::new(handler)),
+            provider: crate::memory::tool_adapter::Provider::Openai,
+            user_id: "u1".to_string(),
+        }
+    }
+
+    /// One chat-completions turn carrying a single tool call by name.
+    fn turn_calling(name: &str, arguments: &str) -> Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        })
+    }
+
+    #[tokio::test]
+    async fn a_retrieval_asked_for_by_a_memory_continuation_still_runs() {
+        let store = InMemoryCcrStore::new();
+        headroom_core::ccr::CcrStore::put(&store, HASH, CONTENT);
+
+        let server = MockServer::start().await;
+        // First continuation — the answer to `memory_search`. The model uses it
+        // to decide it now wants the offloaded content.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(turn_calling(
+                "headroom_retrieve",
+                &format!("{{\"hash\":\"{HASH}\"}}"),
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Second continuation — the answer to `headroom_retrieve`. Reaching
+        // this at all is the thing under test.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 6},
+            })))
+            .mount(&server)
+            .await;
+
+        let ccr = RoutedCcr {
+            store: Arc::new(store),
+            memory: Some(memory_ctx()),
+            client: reqwest::Client::new(),
+            upstream_url: format!("{}/v1/chat/completions", server.uri()),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "gpt-x",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            ),
+            config: Arc::new(crate::config::Config::for_test(
+                server.uri().parse().unwrap(),
+            )),
+            request_id: "req-alt".to_string(),
+            responses_shape: false,
+        };
+
+        let opening = turn_calling("memory_search", "{\"query\":\"anything\"}");
+        let (resolved, rounds) = resolve_routed_proxy_tools(&opening, &ccr).await;
+
+        let message = &resolved["choices"][0]["message"];
+        assert_eq!(
+            message["content"], "done",
+            "the second continuation never ran: {resolved}"
+        );
+        assert!(
+            message.get("tool_calls").is_none_or(|c| c
+                .as_array()
+                .is_none_or(std::vec::Vec::is_empty)),
+            "a proxy tool call survived to the client: {resolved}"
+        );
+        assert_eq!(
+            rounds.rounds, 2,
+            "both continuations are billed and neither reaches the client"
+        );
+    }
+
+    /// A turn with nothing for either resolver must not cost an upstream call,
+    /// or the loop would tax every ordinary turn for a case that is rare.
+    #[tokio::test]
+    async fn a_turn_needing_neither_resolver_makes_no_upstream_call() {
+        let server = MockServer::start().await;
+        let ccr = RoutedCcr {
+            store: Arc::new(InMemoryCcrStore::new()),
+            memory: Some(memory_ctx()),
+            client: reqwest::Client::new(),
+            upstream_url: format!("{}/v1/chat/completions", server.uri()),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(b"{}".to_vec()),
+            config: Arc::new(crate::config::Config::for_test(
+                server.uri().parse().unwrap(),
+            )),
+            request_id: "req-none".to_string(),
+            responses_shape: false,
+        };
+
+        let plain = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop",
+            }]
+        });
+        let (resolved, rounds) = resolve_routed_proxy_tools(&plain, &ccr).await;
+
+        assert_eq!(resolved, plain);
+        assert_eq!(rounds.rounds, 0);
+        assert!(
+            server.received_requests().await.unwrap_or_default().is_empty(),
+            "an idle pass must not call upstream"
         );
     }
 }

@@ -202,7 +202,7 @@ pub async fn fetch_and_index(
     }
 
     // Fetch the URL.
-    let client = reqwest::Client::builder()
+    let client = crate::ssl_context::client_builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()

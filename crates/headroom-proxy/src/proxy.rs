@@ -1,6 +1,7 @@
 //! Core reverse-proxy router and HTTP forwarding handler.
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use url::Url;
@@ -55,6 +56,12 @@ use headroom_core::compression_policy::CompressionPolicy;
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
+    /// Bounded pool of transports for caller-selected upstreams. A cache key
+    /// contains the hostname and the complete approved address set, so a DNS
+    /// change receives a new client and cannot reuse a connection pinned to a
+    /// different resolution.
+    pub(crate) caller_clients:
+        Arc<Mutex<lru::LruCache<CallerClientKey, reqwest::Client>>>,
     /// PR-D1: AWS credentials resolved at startup via the
     /// `aws-config` default chain. `None` when the proxy boots
     /// without AWS creds available (operator running locally
@@ -235,6 +242,67 @@ const MAX_MESSAGE_ARRAY_LENGTH: usize = 10_000;
 /// costs is the model's answer; three attempts covers the overload bursts that
 /// produced every observed continuation failure.
 const CCR_CONTINUATION_RETRIES: u32 = 2;
+const CALLER_CLIENT_CACHE_CAPACITY: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CallerClientKey {
+    host: String,
+    addresses: Vec<SocketAddr>,
+}
+
+/// Transport settings shared by trusted and caller-selected upstreams.
+///
+/// Caller-selected destinations add a pinned DNS override and disable proxies
+/// below, but retain the same TLS roots, timeouts, keepalives, redirect policy,
+/// and response behavior as the normal upstream client.
+fn upstream_client_builder(config: &Config) -> reqwest::ClientBuilder {
+    crate::ssl_context::client_builder()
+        .connect_timeout(config.upstream_connect_timeout)
+        .timeout(config.upstream_timeout)
+        // Upstream redirects are forwarded to the client. In particular, a
+        // caller-selected public endpoint cannot redirect this process into a
+        // private network.
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .tcp_keepalive(std::time::Duration::from_secs(20))
+}
+
+/// Build the request-scoped transport for a caller-selected upstream.
+///
+/// `resolve_to_addrs` preserves the URL hostname for Host/SNI while forcing
+/// reqwest's connector to use the already-validated addresses. `no_proxy`
+/// prevents an ambient or provider proxy from resolving the target a second
+/// time beyond this process's policy boundary.
+fn caller_upstream_client(
+    state: &AppState,
+    upstream: &crate::upstream_guard::ResolvedCallerUpstream,
+) -> Result<reqwest::Client, ProxyError> {
+    let mut key_addresses = upstream.addresses().to_vec();
+    key_addresses.sort_unstable();
+    key_addresses.dedup();
+    let key = CallerClientKey {
+        host: upstream.host().to_string(),
+        addresses: key_addresses,
+    };
+    let mut clients = state
+        .caller_clients
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(client) = clients.get(&key) {
+        return Ok(client.clone());
+    }
+
+    let client = upstream_client_builder(&state.config)
+        .no_proxy()
+        .resolve_to_addrs(upstream.host(), upstream.addresses())
+        .build()
+        .map_err(ProxyError::Upstream)?;
+    clients.put(key, client.clone());
+    Ok(client)
+}
 
 impl AppState {
     /// The CCR store, when offload is configured and `--ccr-inject-marker` is on.
@@ -258,30 +326,7 @@ impl AppState {
         self.ctx_offload.as_ref().map(|r| r.store.ccr())
     }
     pub fn new(config: Config) -> Result<Self, ProxyError> {
-        let mut client_builder = reqwest::Client::builder()
-            .connect_timeout(config.upstream_connect_timeout)
-            .timeout(config.upstream_timeout)
-            // Don't auto-follow redirects: pass them through verbatim.
-            .redirect(reqwest::redirect::Policy::none())
-            // Pool needs to be allowed to be idle for long-lived streams.
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            // An SSE turn can go quiet for a minute while the model thinks,
-            // and nothing on this connection says so. Measured 2026-08-23:
-            // 9 streams died mid-body with `error decoding response body`,
-            // 2.4s to 82s in, every one of them after a 200 — so the socket
-            // was alive when the turn began and something in the path
-            // dropped it while it was silent. Keepalives make the flow speak
-            // during that silence.
-            //
-            // The h2 pings ride the same connection the stream does, so a
-            // dead path is detected rather than waited on. `while_idle` is
-            // what makes them fire during the pause that causes this.
-            .http2_keep_alive_interval(std::time::Duration::from_secs(20))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
-            .http2_keep_alive_while_idle(true)
-            // Covers the HTTP/1.1 path too, which the h2 settings do not
-            // reach — including when a CONNECT proxy forces `http1_only`.
-            .tcp_keepalive(std::time::Duration::from_secs(20));
+        let mut client_builder = upstream_client_builder(&config);
         // Provider-only HTTP proxy: scoped to this upstream client so
         // routing never leaks into the process environment (which tool
         // executions inherit). HTTP/2 is disabled when a proxy is set so
@@ -588,6 +633,9 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             client,
+            caller_clients: Arc::new(Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(CALLER_CLIENT_CACHE_CAPACITY).expect("non-zero capacity"),
+            ))),
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             outbound_drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
@@ -859,8 +907,14 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
     }
 
     fn record_output_savings(&self, transforms: &[String], output_tokens: i64) {
-        let recorder = headroom_core::output_savings::get_recorder();
-        recorder.record_from_labels(transforms, output_tokens);
+        // Every `flush_every`th call writes the ledger to disk, and this runs on
+        // the task handling the request. `std::fs::write` + `rename` on a tokio
+        // worker stalls every other request that thread is driving, so hand it
+        // to the blocking pool the way `record_savings_ledger` already does.
+        let transforms = transforms.to_vec();
+        tokio::task::spawn_blocking(move || {
+            headroom_core::output_savings::get_recorder().record_from_labels(&transforms, output_tokens);
+        });
     }
 
     fn record_failed(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
@@ -1300,16 +1354,36 @@ pub fn build_app(state: AppState) -> Router {
         router = router.nest("/ctx", crate::ctx::endpoints::router());
     }
 
+    // Everything below is layered AFTER the fallback is set, and the order is
+    // load-bearing: `Router::layer` wraps the routes registered up to the call,
+    // so a layer added above `fallback` does not see the catch-all at all.
+    // `/v1/messages` is not a registered route — it falls through — so layering
+    // earlier leaves the proxy's busiest path unwrapped.
+    //
+    // Innermost to outermost: identity strip, request counter, auth gate.
+    let router = router.fallback(any(catch_all));
+
     // WEB-02: drop a caller-supplied memory identity unless the caller is on
-    // loopback. Applied before the counter so it wraps every route, and done
-    // here rather than at each reader so a new reader cannot miss it.
-    router = router.layer(axum::middleware::from_fn(strip_untrusted_identity));
+    // loopback. Done here rather than at each reader so a new reader cannot
+    // miss it — and the readers that matter (`handle_memory_response`, the
+    // routed transforms) sit behind the catch-all.
+    let router = router.layer(axum::middleware::from_fn(strip_untrusted_identity));
 
     // Count every inbound request, including ones that fall through to the
-    // catch-all. Applied last so it wraps the whole router.
-    router = router.layer(axum::middleware::from_fn(track_inbound_request));
+    // catch-all.
+    let router = router.layer(axum::middleware::from_fn(track_inbound_request));
 
-    router.fallback(any(catch_all)).with_state(state)
+    // Require `HEADROOM_PROXY_TOKEN` from non-loopback callers. Outermost, so
+    // one gate covers both transports: a WebSocket upgrade arrives as an
+    // ordinary HTTP GET and only becomes a socket inside the handler. A
+    // rejected caller is not counted as proxy traffic, because it never
+    // reached the proxy.
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::proxy_auth::proxy_auth_gate,
+        ))
+        .with_state(state)
 }
 
 /// Whether a caller at `client_ip` may choose its own memory partition.
@@ -2113,6 +2187,22 @@ fn hold_working_directory(
     }
 }
 
+/// How many times retrieval and memory may hand work back to each other.
+///
+/// Each resolver only runs the calls standing when it starts, and either one's
+/// continuation can come back asking for the other: a `memory_search` answered
+/// server-side can leave the model asking for a `headroom_retrieve`, and that
+/// call arrives after retrieval has already had its turn. Running the pair once
+/// in a fixed order left such a call with nobody to run it, so the splice
+/// dropped it and downgraded the turn.
+///
+/// This bounds the alternation between the two, which is not the same quantity
+/// as `--ccr-max-retrieval-rounds` — that one bounds a chain of calls of the
+/// *same* kind, and each resolver still applies it internally. Handoffs are
+/// rare, so a small fixed number covers them; a pass with nothing to do costs
+/// no upstream call, only a parse.
+pub(crate) const MAX_RESOLVER_ALTERNATIONS: usize = 4;
+
 /// Upstream usage from CCR continuation rounds the client never sees.
 ///
 /// `handle_ccr_response` resolves a `headroom_retrieve` call server-side by
@@ -2331,13 +2421,23 @@ fn append_anthropic_beta(headers: &mut http::HeaderMap, beta: &str) {
 #[derive(Clone, Debug)]
 pub struct UpstreamOverride(pub url::Url);
 
+/// A chosen upstream and the only transport permitted to connect to it.
+/// Keeping these together prevents later retry/continuation paths from
+/// accidentally switching a caller-controlled URL back to the trusted client.
+struct SelectedUpstream {
+    base: url::Url,
+    client: reqwest::Client,
+}
+
 /// Resolve a per-request upstream override from the `x-headroom-base-url`
 /// request header. Returns `None` when the header is absent, empty, or
 /// whitespace-only (after trimming), or when the value does not parse as a
 /// URL — in all those cases the caller falls back to the default upstream.
 /// The value is trimmed and a single trailing `/` is stripped, matching the
 /// Python proxy's `.strip().rstrip("/")` contract.
-fn header_upstream_override(headers: &HeaderMap) -> Option<url::Url> {
+async fn header_upstream_override(
+    headers: &HeaderMap,
+) -> Option<crate::upstream_guard::ResolvedCallerUpstream> {
     let raw = headers
         .get(crate::headers::UPSTREAM_OVERRIDE_HEADER)
         .and_then(|v| v.to_str().ok())?;
@@ -2346,7 +2446,19 @@ fn header_upstream_override(headers: &HeaderMap) -> Option<url::Url> {
         return None;
     }
     match url::Url::parse(trimmed) {
-        Ok(u) => Some(u),
+        Ok(url) => {
+            let resolved =
+                crate::upstream_guard::ResolvedCallerUpstream::resolve(url.clone()).await;
+            if resolved.is_none() {
+                tracing::warn!(
+                    event = "upstream_override_rejected",
+                    header = crate::headers::UPSTREAM_OVERRIDE_HEADER,
+                    value = %url,
+                    "ignoring unsafe x-headroom-base-url; using default upstream"
+                );
+            }
+            resolved
+        }
         Err(e) => {
             tracing::warn!(
                 event = "upstream_override_parse_failed",
@@ -2488,28 +2600,24 @@ pub(crate) async fn forward_http(
     // per-request `x-headroom-base-url` header (mirrors the Python proxy):
     // trim whitespace and strip a trailing `/`; an empty/whitespace-only
     // value or an unparseable URL falls through to the default upstream.
-    let upstream_base = match req.extensions().get::<UpstreamOverride>() {
-        Some(o) => o.0.clone(),
-        None => match header_upstream_override(req.headers()) {
-            // WEB-01: the header is client-controlled, so a destination that
-            // resolves into private/loopback/link-local/metadata space would
-            // make the proxy a confused deputy. Ignore the override and use the
-            // configured upstream, as the Python proxy does; set
-            // HEADROOM_ALLOWED_BASE_URLS to permit specific internal endpoints.
-            Some(u) if crate::upstream_guard::is_safe_upstream_url(&u).await => u,
-            Some(u) => {
-                tracing::warn!(
-                    event = "upstream_override_rejected",
-                    header = crate::headers::UPSTREAM_OVERRIDE_HEADER,
-                    value = %u,
-                    "ignoring unsafe x-headroom-base-url; using default upstream"
-                );
-                state.effective_upstream().await
-            }
-            None => state.effective_upstream().await,
+    let selected_upstream = match req.extensions().get::<UpstreamOverride>() {
+        Some(o) => SelectedUpstream {
+            base: o.0.clone(),
+            client: state.client.clone(),
+        },
+        None => match header_upstream_override(req.headers()).await {
+            Some(resolved) => SelectedUpstream {
+                client: caller_upstream_client(&state, &resolved)?,
+                base: resolved.url().clone(),
+            },
+            None => SelectedUpstream {
+                base: state.effective_upstream().await,
+                client: state.client.clone(),
+            },
         },
     };
-    let upstream_url = build_upstream_url(&upstream_base, &uri)?;
+    let upstream_url = build_upstream_url(&selected_upstream.base, &uri)?;
+    let upstream_client = selected_upstream.client;
 
     // Forwarded-Host: prefer client's Host. Forwarded-Proto: assume http for
     // now (we don't terminate TLS in this binary; if a TLS terminator is in
@@ -3062,6 +3170,20 @@ pub(crate) async fn forward_http(
                 }
             }
         }
+
+        // Codex 0.149+ carries tool definitions in `input` items rather than
+        // top-level `tools`. Lift after read-only identity/cache observers have
+        // seen the client's own shape, but before every mutating tool consumer
+        // (memory injection, normalization, shaping, compaction, accounting).
+        // The restore plan stays live until the last pre-wire stage.
+        let (buffered, additional_tools_restore_plan) = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::OpenAiResponses
+        ) {
+            crate::handlers::responses::lift_codex_additional_tools_body(buffered, &request_id)
+        } else {
+            (buffered, None)
+        };
 
         // Mirror the enforcement-flag override already applied to
         // CompressionPolicy at request entry (line ~416): when
@@ -3744,13 +3866,43 @@ pub(crate) async fn forward_http(
                         // Cross-turn verbatim de-dup post-pass over
                         // `role == "tool"` message content (no-op unless
                         // `--enable-cross-turn-dedup` is set).
-                        compression::apply_cross_turn_dedup(
-                            outcome,
-                            &buffered,
-                            &state.config,
-                            "/v1/chat/completions",
-                            &request_id,
-                        )
+                        //
+                        // Folding rewrites a repeated span to a bare
+                        // `[↑NL same as msg M]` pointer, which only helps if
+                        // the model can resolve the reference. On the
+                        // streaming chat path it cannot: this path does not
+                        // intercept tool calls, so the retrieval tool is never
+                        // injected, and OpenAI-compatible clients never show
+                        // the model numbered messages. The pointer then reads
+                        // as deleted content and models retry-loop on output
+                        // they think went missing.
+                        //
+                        // Same predicate that gates the retrieval tool itself
+                        // upstream in this function; recomputed because that
+                        // binding is out of scope by here.
+                        let client_streams = serde_json::from_slice::<serde_json::Value>(&buffered)
+                            .ok()
+                            .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
+                            .unwrap_or(false);
+                        if client_streams {
+                            tracing::debug!(
+                                event = "cross_turn_dedup_skipped",
+                                request_id = %request_id,
+                                path = "/v1/chat/completions",
+                                reason = "pointers_unrecoverable_on_stream",
+                                "skipping cross-turn dedup: a folded pointer cannot be \
+                                 resolved on the streaming chat path"
+                            );
+                            outcome
+                        } else {
+                            compression::apply_cross_turn_dedup(
+                                outcome,
+                                &buffered,
+                                &state.config,
+                                "/v1/chat/completions",
+                                &request_id,
+                            )
+                        }
                     }
                 }
                 // PR-C3: OpenAI Responses (`/v1/responses`). The Responses
@@ -4324,6 +4476,16 @@ pub(crate) async fn forward_http(
             body_to_send
         };
 
+        // The lift is an internal normalization, never a wire-format change.
+        // Restore after every tool consumer and request hook, but before wire
+        // accounting, retries, continuations, and the actual upstream send.
+        let body_to_send =
+            crate::handlers::responses::restore_codex_additional_tools_body(
+                body_to_send,
+                additional_tools_restore_plan.as_ref(),
+                &request_id,
+            );
+
         // Wire footprint. The last measurement before the body leaves, so it
         // covers every stage — compression, routing, prune, replay, TTL, hooks
         // — not just the compression dispatcher that `tok_saved` is measured
@@ -4513,8 +4675,7 @@ pub(crate) async fn forward_http(
             let mut attempts_made = 0i64;
             for attempt in 0..loop_attempts {
                 attempts_made = i64::from(attempt + 1);
-                let resp = state
-                    .client
+                let resp = upstream_client
                     .request(reqwest_method.clone(), upstream_url.clone())
                     .headers(outgoing_headers.clone())
                     .body(body_to_send.clone())
@@ -4676,8 +4837,7 @@ pub(crate) async fn forward_http(
             TryStreamExt::map_err(req.into_body().into_data_stream(), std::io::Error::other);
         let reqwest_body = reqwest::Body::wrap_stream(body_stream);
         (
-            state
-                .client
+            upstream_client
                 .request(reqwest_method.clone(), upstream_url.clone())
                 .headers(outgoing_headers.clone())
                 .body(reqwest_body)
@@ -4862,7 +5022,7 @@ pub(crate) async fn forward_http(
         Box::pin(crate::sse::stream_retry::retry_on_early_drop(
             upstream_body,
             crate::sse::stream_retry::RetryContext {
-                client: state.client.clone(),
+                client: upstream_client.clone(),
                 method: reqwest_method.clone(),
                 url: upstream_url.to_string(),
                 headers: outgoing_headers.clone(),
@@ -4887,7 +5047,7 @@ pub(crate) async fn forward_http(
         Option<Arc<Mutex<CcrRoundUsage>>>,
     ) = if ccr_stream_eligible {
         let ctx = crate::sse::ccr_stream::CcrStreamContext {
-            client: state.client.clone(),
+            client: upstream_client.clone(),
             upstream_url: upstream_url.clone(),
             outgoing_headers: outgoing_headers.clone(),
             forwarded_request: continuation_base.clone(),
@@ -5100,6 +5260,35 @@ pub(crate) async fn forward_http(
                 // hook is registered and calls the model again.
                 let mut turn_hook_usage = TurnHookUsage::default();
 
+                // Memory tools: same contract as CCR below. The proxy
+                // injects `memory_search` and friends, so the proxy runs them —
+                // the client has never heard of them. Resolved up here because
+                // it depends only on the request, and the pair below runs more
+                // than once.
+                let memory_provider = if path_for_log.contains("/v1/messages") {
+                    Some("anthropic")
+                } else if path_for_log.contains("/v1/chat/completions") {
+                    Some("openai")
+                } else if path_for_log.contains("/v1/responses") {
+                    Some("openai_responses")
+                } else {
+                    None
+                };
+                let memory_ctx = memory_tool_context(
+                    &state,
+                    &headers_snapshot,
+                    memory_provider,
+                    &original_buffered,
+                )
+                .await;
+
+                // Retrieval and memory each run only the calls standing when
+                // they start, and either one's continuation can come back
+                // asking for the other. Alternate until a whole pass changes
+                // nothing. See `MAX_RESOLVER_ALTERNATIONS`.
+                for _ in 0..MAX_RESOLVER_ALTERNATIONS {
+                    let before = body_bytes.clone();
+
                 // CCR response handling: detect headroom_retrieve tool
                 // calls, fetch from CCR store, and continue conversation.
                 if state.config.ccr_handle_responses
@@ -5125,7 +5314,7 @@ pub(crate) async fn forward_http(
                             &body_bytes,
                             &continuation_base,
                             &upstream_url,
-                            &state.client,
+                            &upstream_client,
                             ccr_store.as_ref(),
                             &state.config,
                             &request_id,
@@ -5134,45 +5323,31 @@ pub(crate) async fn forward_http(
                         )
                         .await;
                         body_bytes = resolved;
-                        ccr_round_usage = extra;
+                        ccr_round_usage.absorb(extra);
                     }
                 }
 
-                // Memory tools: same contract as CCR above. The proxy injects
-                // `memory_search` and friends, so the proxy runs them — the
-                // client has never heard of them.
-                let memory_provider = if path_for_log.contains("/v1/messages") {
-                    Some("anthropic")
-                } else if path_for_log.contains("/v1/chat/completions") {
-                    Some("openai")
-                } else if path_for_log.contains("/v1/responses") {
-                    Some("openai_responses")
-                } else {
-                    None
-                };
-                if let Some(memory) = memory_tool_context(
-                    &state,
-                    &headers_snapshot,
-                    memory_provider,
-                    &original_buffered,
-                )
-                .await
+                if let (Some(memory), Some(provider)) =
+                    (memory_ctx.as_ref(), memory_provider)
                 {
-                    if let Some(provider) = memory_provider {
-                        let (resolved, extra) = handle_memory_response(
-                            &body_bytes,
-                            &continuation_base,
-                            &upstream_url,
-                            &state.client,
-                            &memory,
-                            &state.config,
-                            &request_id,
-                            &outgoing_headers,
-                            provider,
-                        )
-                        .await;
-                        body_bytes = resolved;
-                        ccr_round_usage.absorb(extra);
+                    let (resolved, extra) = handle_memory_response(
+                        &body_bytes,
+                        &continuation_base,
+                        &upstream_url,
+                        &upstream_client,
+                        memory,
+                        &state.config,
+                        &request_id,
+                        &outgoing_headers,
+                        provider,
+                    )
+                    .await;
+                    body_bytes = resolved;
+                    ccr_round_usage.absorb(extra);
+                }
+
+                    if body_bytes == before {
+                        break;
                     }
                 }
 
@@ -5199,7 +5374,7 @@ pub(crate) async fn forward_http(
                         provider,
                         &usage_provider,
                         &upstream_url,
-                        &state.client,
+                        &upstream_client,
                         &outgoing_headers,
                         &request_id,
                     )
@@ -11428,7 +11603,7 @@ mod timing_field_tests {
             template: serde_json::json!({"model": "claude-x", "messages": []}),
             // Reserved as invalid by RFC 6890; nothing is listening.
             upstream_url: "http://192.0.2.1:1/v1/messages".parse().unwrap(),
-            client: reqwest::Client::builder()
+            client: crate::ssl_context::client_builder()
                 .timeout(std::time::Duration::from_millis(200))
                 .build()
                 .unwrap(),

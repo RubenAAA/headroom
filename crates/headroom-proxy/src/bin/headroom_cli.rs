@@ -362,7 +362,7 @@ fn client() -> reqwest::blocking::Client {
     {
         headers.insert("x-headroom-cwd", cwd);
     }
-    reqwest::blocking::Client::builder()
+    headroom_proxy::ssl_context::blocking_client_builder()
         .default_headers(headers)
         .timeout(std::time::Duration::from_secs(30))
         .build()

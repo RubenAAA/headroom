@@ -68,6 +68,247 @@ use std::net::SocketAddr;
 use crate::observability;
 use crate::proxy::{forward_http, AppState};
 
+const CODEX_ADDITIONAL_TOOLS_LIFT_ENV: &str = "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT";
+
+#[derive(Debug, Clone)]
+struct AdditionalToolsCarrier {
+    kept_index: usize,
+    item: serde_json::Map<String, serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+}
+
+/// Enough information to put Codex's transcript item back after the internal
+/// tools consumers have run. The carrier index is relative to the items that
+/// survived the lift, so it remains valid when compression rewrites input.
+#[derive(Debug, Clone)]
+pub(crate) struct AdditionalToolsRestorePlan {
+    carriers: Vec<AdditionalToolsCarrier>,
+}
+
+fn env_value_enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+fn codex_additional_tools_lift_enabled() -> bool {
+    env_value_enabled(
+        std::env::var(CODEX_ADDITIONAL_TOOLS_LIFT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn value_is_truthy(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(serde_json::Value::Array(value)) => !value.is_empty(),
+        Some(serde_json::Value::Object(value)) => !value.is_empty(),
+        Some(serde_json::Value::Number(_)) => true,
+    }
+}
+
+/// Lift Codex `additional_tools` transcript items into top-level `tools` for
+/// Headroom's internal normalizers, shapers, and accounting. This is an
+/// internal representation only; callers must restore the returned plan
+/// before forwarding.
+pub(crate) fn lift_codex_additional_tools(
+    payload: &mut serde_json::Value,
+    request_id: &str,
+) -> Option<AdditionalToolsRestorePlan> {
+    let object = payload.as_object_mut()?;
+    if value_is_truthy(object.get("tools")) {
+        return None;
+    }
+    let items = object.get("input")?.as_array()?;
+    // Read the opt-out only after finding a carrier. This keeps an environment
+    // lookup off the overwhelmingly common request shape.
+    if !items.iter().any(|item| {
+        item.get("type").and_then(serde_json::Value::as_str) == Some("additional_tools")
+    }) || !codex_additional_tools_lift_enabled()
+    {
+        return None;
+    }
+
+    let mut lifted = Vec::new();
+    let mut kept = Vec::with_capacity(items.len());
+    let mut carriers = Vec::new();
+    for item in items {
+        let carrier_tools = item
+            .as_object()
+            .filter(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("additional_tools")
+            })
+            .and_then(|item| item.get("tools"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|tools| !tools.is_empty());
+        if let Some(tools) = carrier_tools {
+            let mut metadata = item.as_object().expect("carrier checked above").clone();
+            metadata.remove("tools");
+            carriers.push(AdditionalToolsCarrier {
+                kept_index: kept.len(),
+                item: metadata,
+                tools: tools.clone(),
+            });
+            lifted.extend(tools.iter().cloned());
+        } else {
+            kept.push(item.clone());
+        }
+    }
+    if lifted.is_empty() {
+        return None;
+    }
+
+    let count = lifted.len();
+    object.insert("tools".to_string(), serde_json::Value::Array(lifted));
+    object.insert("input".to_string(), serde_json::Value::Array(kept));
+    tracing::info!(
+        event = "codex_additional_tools_lifted",
+        %request_id,
+        tool_count = count,
+        "lifted Codex additional_tools for internal request processing"
+    );
+    Some(AdditionalToolsRestorePlan { carriers })
+}
+
+/// Restore a lifted payload to the transcript shape Codex sent. Idempotent:
+/// if a carrier already owns tools, a second restore is a no-op.
+pub(crate) fn restore_codex_additional_tools(
+    payload: &mut serde_json::Value,
+    plan: &AdditionalToolsRestorePlan,
+) -> Result<usize, &'static str> {
+    let object = payload.as_object_mut().ok_or("payload is not an object")?;
+    let items = object
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("payload input is not an array")?;
+    if items.iter().any(|item| {
+        item.get("type").and_then(serde_json::Value::as_str) == Some("additional_tools")
+            && value_is_truthy(item.get("tools"))
+    }) {
+        return Ok(0);
+    }
+
+    let tools = object
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let original_total: usize = plan.carriers.iter().map(|entry| entry.tools.len()).sum();
+    let slices: Vec<Vec<serde_json::Value>> = if tools.is_empty() {
+        // A consumer emptied the array. Restoring the original definitions is
+        // safer than forwarding a stateful session with no tool transcript.
+        plan.carriers
+            .iter()
+            .map(|entry| entry.tools.clone())
+            .collect()
+    } else if tools.len() == original_total {
+        let mut offset = 0;
+        plan.carriers
+            .iter()
+            .map(|entry| {
+                let end = offset + entry.tools.len();
+                let slice = tools[offset..end].to_vec();
+                offset = end;
+                slice
+            })
+            .collect()
+    } else {
+        // Deferral or injection changed the count, so the original carrier
+        // boundaries are stale. Put the whole set in the first carrier.
+        let mut changed = vec![Vec::new(); plan.carriers.len()];
+        if let Some(first) = changed.first_mut() {
+            *first = tools;
+        }
+        changed
+    };
+
+    let mut restored_items = items.clone();
+    let mut restored = 0;
+    let mut shift = 0;
+    for (entry, tool_slice) in plan.carriers.iter().zip(slices) {
+        if tool_slice.is_empty() {
+            continue;
+        }
+        let mut carrier = entry.item.clone();
+        carrier.insert(
+            "type".to_string(),
+            serde_json::Value::String("additional_tools".to_string()),
+        );
+        restored += tool_slice.len();
+        carrier.insert("tools".to_string(), serde_json::Value::Array(tool_slice));
+        let position = (entry.kept_index + shift).min(restored_items.len());
+        restored_items.insert(position, serde_json::Value::Object(carrier));
+        shift += 1;
+    }
+    if restored == 0 {
+        return Err("restore plan produced no tool definitions");
+    }
+    object.insert(
+        "input".to_string(),
+        serde_json::Value::Array(restored_items),
+    );
+    object.remove("tools");
+    Ok(restored)
+}
+
+pub(crate) fn lift_codex_additional_tools_body(
+    body: Bytes,
+    request_id: &str,
+) -> (Bytes, Option<AdditionalToolsRestorePlan>) {
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (body, None);
+    };
+    let Some(plan) = lift_codex_additional_tools(&mut payload, request_id) else {
+        return (body, None);
+    };
+    match serde_json::to_vec(&payload) {
+        Ok(serialized) => (Bytes::from(serialized), Some(plan)),
+        Err(error) => {
+            tracing::warn!(
+                event = "codex_additional_tools_lift_failed",
+                %request_id,
+                %error,
+                "failed to serialize lifted Codex request; forwarding original shape"
+            );
+            (body, None)
+        }
+    }
+}
+
+pub(crate) fn restore_codex_additional_tools_body(
+    body: Bytes,
+    plan: Option<&AdditionalToolsRestorePlan>,
+    request_id: &str,
+) -> Bytes {
+    let Some(plan) = plan else {
+        return body;
+    };
+    let restored = serde_json::from_slice::<serde_json::Value>(&body)
+        .map_err(|_| "forwarded payload is not JSON")
+        .and_then(|mut payload| {
+            restore_codex_additional_tools(&mut payload, plan)?;
+            serde_json::to_vec(&payload)
+                .map(Bytes::from)
+                .map_err(|_| "restored payload could not be serialized")
+        });
+    match restored {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(
+                event = "codex_additional_tools_restore_failed",
+                %request_id,
+                reason = error,
+                "failed to restore Codex additional_tools; forwarding internally lifted shape"
+            );
+            body
+        }
+    }
+}
+
 /// Axum POST handler for `/v1/responses`. Buffers the body, stitches
 /// a fresh `Request<Body>` together, and forwards via
 /// [`forward_http`]. Compression dispatch + SSE telemetry is handled
@@ -212,6 +453,7 @@ fn accepts_sse(headers: &HeaderMap) -> bool {
 mod tests {
     use super::*;
     use http::HeaderValue;
+    use serde_json::json;
 
     #[test]
     fn accepts_sse_explicit() {
@@ -257,5 +499,71 @@ mod tests {
     fn no_accept_header_returns_false() {
         let h = HeaderMap::new();
         assert!(!accepts_sse(&h));
+    }
+
+    #[test]
+    fn additional_tools_lift_and_restore_preserve_relative_slots() {
+        let mut payload = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "message", "id": "before"},
+                {"type": "additional_tools", "id": "carrier-a", "tools": [{"name": "shell"}]},
+                {"type": "message", "id": "middle"},
+                {"type": "additional_tools", "id": "carrier-b", "tools": [{"name": "read"}]},
+                {"type": "message", "id": "after"}
+            ]
+        });
+        let plan = lift_codex_additional_tools(&mut payload, "req-test").expect("lifted");
+        assert_eq!(
+            payload["tools"],
+            json!([{"name": "shell"}, {"name": "read"}])
+        );
+        assert_eq!(payload["input"].as_array().unwrap().len(), 3);
+
+        assert_eq!(restore_codex_additional_tools(&mut payload, &plan), Ok(2));
+        assert!(payload.get("tools").is_none());
+        let input = payload["input"].as_array().unwrap();
+        assert_eq!(input[0]["id"], "before");
+        assert_eq!(input[1]["id"], "carrier-a");
+        assert_eq!(input[2]["id"], "middle");
+        assert_eq!(input[3]["id"], "carrier-b");
+        assert_eq!(input[4]["id"], "after");
+    }
+
+    #[test]
+    fn additional_tools_restore_is_idempotent() {
+        let mut payload = json!({
+            "input": [{"type": "additional_tools", "tools": [{"name": "shell"}]}]
+        });
+        let plan = AdditionalToolsRestorePlan {
+            carriers: vec![AdditionalToolsCarrier {
+                kept_index: 0,
+                item: serde_json::Map::new(),
+                tools: vec![json!({"name": "shell"})],
+            }],
+        };
+        assert_eq!(restore_codex_additional_tools(&mut payload, &plan), Ok(0));
+        assert_eq!(payload["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn additional_tools_classic_encoding_is_untouched() {
+        let mut payload = json!({
+            "tools": [{"name": "classic"}],
+            "input": [{"type": "additional_tools", "tools": [{"name": "carrier"}]}]
+        });
+        let original = payload.clone();
+        assert!(lift_codex_additional_tools(&mut payload, "req-test").is_none());
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn additional_tools_opt_out_values_match_python() {
+        for value in ["0", "false", "FALSE", " no ", "Off"] {
+            assert!(!env_value_enabled(Some(value)), "{value}");
+        }
+        assert!(env_value_enabled(None));
+        assert!(env_value_enabled(Some("1")));
+        assert!(env_value_enabled(Some("yes")));
     }
 }

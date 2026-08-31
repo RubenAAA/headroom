@@ -838,9 +838,22 @@ where
             .unwrap_or_default();
         let mut emit: Vec<Value> = Vec::with_capacity(content.len());
         let mut dropped = [0usize; DropReason::ALL.len()];
+        // The first one is enough to name in the message; a turn dropping two
+        // different proxy tools has the same cause as one dropping either.
+        let mut unresolved_tool: Option<String> = None;
         for block in content {
             match drop_reason(&block, memory_enabled, &live_blocks) {
-                Some(reason) => dropped[reason as usize] += 1,
+                Some(reason) => {
+                    dropped[reason as usize] += 1;
+                    if matches!(reason, DropReason::UnresolvedProxyTool)
+                        && unresolved_tool.is_none()
+                    {
+                        unresolved_tool = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                }
                 None => emit.push(block),
             }
         }
@@ -903,12 +916,21 @@ where
                  downgrading stop_reason to end_turn"
             );
             resolved["stop_reason"] = json!("end_turn");
-            // Without this the client renders an empty turn and the retrieval
-            // failure looks like the model simply said nothing.
-            if emit.is_empty() {
+            // Without this the client renders an empty turn and the failure
+            // looks like the model simply said nothing.
+            //
+            // Two guards, both learned from this firing wrongly. The turn has
+            // to be empty *to the client*, not merely to this round — blocks
+            // already streamed are content, and appending an apology under
+            // them told the user a turn had failed when they had just watched
+            // it succeed. And the wording has to match the cause: over
+            // 2026-08-28, five of the six firings had
+            // `unresolved_proxy_tool == 0`, so five users were told a
+            // retrieval had failed when no retrieval was dropped at all.
+            if emit.is_empty() && rw.next_client_index == 0 {
                 emit.push(json!({
                     "type": "text",
-                    "text": "The proxy could not complete a context retrieval for this turn.",
+                    "text": empty_turn_text(unresolved_tool.as_deref()),
                 }));
             }
         }
@@ -922,7 +944,7 @@ where
             synthesize_blocks(
                 &[json!({
                     "type": "text",
-                    "text": "The proxy could not complete a context retrieval for this turn.",
+                    "text": empty_turn_text(unresolved_tool.as_deref()),
                 })],
                 rw.next_client_index,
             )
@@ -989,23 +1011,33 @@ async fn resolve_retrieval(
         Err(_) => ctx.forwarded_request.clone(),
     };
 
-    let (resolved_bytes, mut usage) = crate::proxy::handle_ccr_response(
-        &turn_bytes,
-        &continuation_request,
-        &ctx.upstream_url,
-        &ctx.client,
-        ctx.ccr_store.as_ref(),
-        &ctx.config,
-        &ctx.request_id,
-        &ctx.outgoing_headers,
-        provider,
-    )
-    .await;
-
     // Memory tools run after retrieval, on whatever the retrieval left. A turn
-    // can reach for both, and the client can run neither.
-    let resolved_bytes = match &ctx.memory {
-        Some(memory) => {
+    // can reach for both, and the client can run neither — but neither can the
+    // answer to one be the end of it, because a resolved memory call can leave
+    // the model asking for a retrieval that retrieval has already passed by.
+    // So alternate rather than run each once, and stop as soon as a whole pass
+    // changes nothing. See `MAX_RESOLVER_ALTERNATIONS`.
+    let mut resolved_bytes = turn_bytes.clone();
+    let mut usage = crate::proxy::CcrRoundUsage::default();
+    for _ in 0..crate::proxy::MAX_RESOLVER_ALTERNATIONS {
+        let before = resolved_bytes.clone();
+
+        let (bytes, extra) = crate::proxy::handle_ccr_response(
+            &resolved_bytes,
+            &continuation_request,
+            &ctx.upstream_url,
+            &ctx.client,
+            ctx.ccr_store.as_ref(),
+            &ctx.config,
+            &ctx.request_id,
+            &ctx.outgoing_headers,
+            provider,
+        )
+        .await;
+        usage.absorb(extra);
+        resolved_bytes = bytes;
+
+        if let Some(memory) = &ctx.memory {
             let (bytes, extra) = crate::proxy::handle_memory_response(
                 &resolved_bytes,
                 &continuation_request,
@@ -1019,10 +1051,13 @@ async fn resolve_retrieval(
             )
             .await;
             usage.absorb(extra);
-            bytes
+            resolved_bytes = bytes;
         }
-        None => resolved_bytes,
-    };
+
+        if resolved_bytes == before {
+            break;
+        }
+    }
 
     if let Ok(mut guard) = round_usage.lock() {
         *guard = usage;

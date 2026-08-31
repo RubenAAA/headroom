@@ -40,6 +40,7 @@ pub mod output_shaper;
 pub mod probe_recorder;
 pub mod project_context;
 pub mod proxy;
+pub mod proxy_auth;
 pub mod request_logger;
 pub mod routed;
 #[cfg(test)]

@@ -81,9 +81,16 @@ pub const DEFAULT_CHUNK_WORDS: usize = 350;
 /// Keep a word when its max per-token score exceeds this. Matches the
 /// ONNX `get_keep_mask` hard-coded `> 0.5`.
 pub const DEFAULT_SCORE_THRESHOLD: f32 = 0.5;
-/// Inputs shorter than this many words pass through untouched — too
-/// little signal for the model and the per-call cost dominates.
+/// Hard floor. Inputs shorter than this many words pass through
+/// untouched — too little signal for the model and the per-call cost
+/// dominates. [`KompressConfig::min_words`] is clamped up to it.
 pub const MIN_WORDS: usize = 10;
+/// Default for [`KompressConfig::min_words`]. Word-dropping below this
+/// size is a net loss: the CCR retrieval marker alone is ~20 words, and
+/// short blocks are disproportionately instruction-like (sanitizer
+/// banners, section headers) where dropped words read as garbling rather
+/// than compression. Mirrors Python `KompressConfig.min_input_words`.
+pub const DEFAULT_MIN_WORDS: usize = 64;
 /// Max ModernBERT sequence length per chunk (truncation bound).
 pub const MAX_SEQ_LEN: usize = 512;
 
@@ -172,6 +179,7 @@ pub struct KompressConfig {
     pub tokenizer_repo: String,
     pub chunk_words: usize,
     pub score_threshold: f32,
+    /// Configurable floor, clamped up to [`MIN_WORDS`] at the check.
     pub min_words: usize,
 }
 
@@ -182,7 +190,7 @@ impl Default for KompressConfig {
             tokenizer_repo: DEFAULT_TOKENIZER_REPO.to_string(),
             chunk_words: DEFAULT_CHUNK_WORDS,
             score_threshold: DEFAULT_SCORE_THRESHOLD,
-            min_words: MIN_WORDS,
+            min_words: DEFAULT_MIN_WORDS,
         }
     }
 }
@@ -442,7 +450,7 @@ impl Kompress {
     fn compress_inner(&self, content: &str, target_ratio: Option<f64>) -> KompressResult {
         let words: Vec<&str> = content.split_whitespace().collect();
         let n_words = words.len();
-        if n_words < self.config.min_words {
+        if n_words < self.config.min_words.max(MIN_WORDS) {
             return self.passthrough(content, n_words);
         }
 
@@ -781,7 +789,18 @@ mod tests {
         assert_eq!(c.tokenizer_repo, "answerdotai/ModernBERT-base");
         assert_eq!(c.chunk_words, 350);
         assert_eq!(c.score_threshold, 0.5);
-        assert_eq!(c.min_words, 10);
+        assert_eq!(c.min_words, 64);
+    }
+
+    /// The floor is configurable, but never below the historical hard clamp:
+    /// under it the model has too little signal to score anything usefully.
+    #[test]
+    fn a_floor_below_the_hard_clamp_is_raised_to_it() {
+        let config = KompressConfig {
+            min_words: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.min_words.max(MIN_WORDS), MIN_WORDS);
     }
 
     #[test]

@@ -247,6 +247,20 @@ impl Translator {
         out
     }
 
+    /// Open a new Anthropic message for the HTTP response about to start.
+    ///
+    /// A parked conversation keeps its translator, so `started` is still true
+    /// from the response that parked it and `ensure_started` would emit
+    /// nothing. Every Anthropic response has to begin with `message_start` —
+    /// a strict client rejects one that does not, and a non-streaming caller
+    /// has nothing to build a message out of.
+    pub(crate) fn begin_response(&mut self) {
+        self.started = false;
+        // A distinct response is a distinct message, so it gets its own id
+        // rather than reusing the one the client already saw closed.
+        self.message_id = format!("msg_cursor_{:016x}", rand_u64());
+    }
+
     fn ensure_started(&mut self) -> Vec<String> {
         if self.started {
             return Vec::new();
@@ -588,5 +602,66 @@ mod tests {
         assert_eq!(t.outcome, Some(Outcome::EndTurn));
         assert_eq!(t.usage.input_tokens, 17882);
         assert_eq!(t.usage.cache_read_input_tokens, 27136);
+    }
+}
+
+#[cfg(test)]
+mod resumed_response_tests {
+    use super::*;
+
+    /// A parked conversation keeps its translator, so without a reset the
+    /// second HTTP response opens with `content_block_start` and no
+    /// `message_start` — invalid Anthropic SSE, and nothing a non-streaming
+    /// caller can assemble a message from.
+    #[test]
+    fn a_resumed_response_starts_a_new_message() {
+        let mut t = Translator::new("cursor-grok-4.6-high").with_fixed_id("msg_first");
+
+        let first: Vec<String> = t.push_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let names = |frames: &[String]| -> Vec<String> {
+            frames
+                .iter()
+                .filter_map(|f| f.lines().next())
+                .map(|l| l.trim_start_matches("event: ").to_string())
+                .collect()
+        };
+        assert_eq!(names(&first).first().map(String::as_str), Some("message_start"));
+
+        // Same translator, as a parked driver would have.
+        let again: Vec<String> = t.push_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"more"}]}}"#,
+        );
+        assert!(
+            !names(&again).contains(&"message_start".to_string()),
+            "mid-response frames must not reopen the message"
+        );
+
+        t.begin_response();
+        let resumed: Vec<String> = t.push_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"after tool"}]}}"#,
+        );
+        assert_eq!(
+            names(&resumed).first().map(String::as_str),
+            Some("message_start"),
+            "the resumed response has to open its own message"
+        );
+    }
+
+    /// Two responses are two messages. Reusing the id would have the client
+    /// merging a closed message with a new one.
+    #[test]
+    fn the_resumed_message_gets_its_own_id() {
+        let mut t = Translator::new("cursor-grok-4.6-high").with_fixed_id("msg_first");
+        let _ = t.push_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#);
+        t.begin_response();
+        let frames = t.push_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#);
+        let start = frames.iter().find(|f| f.starts_with("event: message_start")).expect("a start");
+        assert!(
+            !start.contains("msg_first"),
+            "the second message reused the first id: {start}"
+        );
+        assert!(start.contains("msg_cursor_"));
     }
 }

@@ -26,7 +26,7 @@ pub struct HttpSubscriptionFetcher {
 
 impl HttpSubscriptionFetcher {
     pub fn new(timeout: Duration) -> Self {
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::ssl_context::blocking_client_builder()
             .timeout(timeout)
             .build()
             .expect("failed to build subscription HTTP client");

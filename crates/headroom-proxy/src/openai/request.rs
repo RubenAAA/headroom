@@ -266,7 +266,21 @@ pub(crate) fn anthropic_to_openai_responses_request(
     // ResponsesApiRequest has no such field and the real CLI never sends it.
     // Map Anthropic's thinking budget onto Responses reasoning effort so the
     // client's thinking setting isn't silently upgraded to the backend default.
-    if let Some(thinking) = anthropic.get("thinking") {
+    // `output_config.effort` is what `/effort` and `--effort` set, and it is
+    // sent whatever `thinking` says. Claude Code now sends
+    // `thinking: {"type": "adaptive"}` with no budget, so reading only the
+    // budget below meant the client's effort never reached the backend at all.
+    let selector_effort = crate::output_shaper::requested_effort(anthropic).map(|e| match e {
+        // The Responses API takes minimal/low/medium/high. Anything above
+        // `high` in Claude Code's vocabulary lands on `high` rather than being
+        // dropped for being unrecognised.
+        "xhigh" | "max" => "high",
+        other => other,
+    });
+    if let Some(effort) = selector_effort {
+        openai["reasoning"] = json!({"effort": effort, "summary": "auto"});
+        openai["stream_options"] = json!({"reasoning_summary_delivery": "sequential_cutoff"});
+    } else if let Some(thinking) = anthropic.get("thinking") {
         if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
             let effort = match thinking.get("budget_tokens").and_then(|v| v.as_u64()) {
                 Some(b) if b <= 4096 => "low",
@@ -1316,5 +1330,71 @@ mod tests {
             output["messages"][1]["tool_calls"][0]["function"]["name"],
             "bash"
         );
+    }
+}
+
+#[cfg(test)]
+mod selector_effort_tests {
+    use super::*;
+
+    fn body(extra: Value) -> Value {
+        let mut b = json!({
+            "model": "claude-codex-5.6-sol",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        for (k, v) in extra.as_object().expect("object") {
+            b[k.as_str()] = v.clone();
+        }
+        b
+    }
+
+    fn out(extra: Value) -> Value {
+        anthropic_to_openai_responses_request(&body(extra), false).expect("translates")
+    }
+
+    /// The regression this fixes: Claude Code sends `thinking.type = adaptive`
+    /// with no budget, so the budget branch never fired and `/effort` reached
+    /// the backend as nothing at all.
+    #[test]
+    fn an_adaptive_thinking_request_still_carries_its_effort() {
+        let o = out(json!({
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "low"},
+        }));
+        assert_eq!(o["reasoning"]["effort"], "low");
+    }
+
+    /// `xhigh` is a Claude Code level; the Responses API stops at `high`.
+    #[test]
+    fn xhigh_is_clamped_rather_than_dropped() {
+        let o = out(json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "xhigh"},
+        }));
+        assert_eq!(o["reasoning"]["effort"], "high");
+    }
+
+    /// What the client asked for beats what its budget implies.
+    #[test]
+    fn the_selector_wins_over_the_thinking_budget() {
+        let o = out(json!({
+            "thinking": {"type": "enabled", "budget_tokens": 30000},
+            "output_config": {"effort": "low"},
+        }));
+        assert_eq!(o["reasoning"]["effort"], "low");
+    }
+
+    /// A client that names no effort keeps the old budget-derived behaviour.
+    #[test]
+    fn without_a_selector_the_budget_still_decides() {
+        let o = out(json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}));
+        assert_eq!(o["reasoning"]["effort"], "low");
+    }
+
+    /// No effort and no thinking means no `reasoning` field, as before.
+    #[test]
+    fn a_plain_request_sends_no_reasoning_field() {
+        assert!(out(json!({})).get("reasoning").is_none());
     }
 }

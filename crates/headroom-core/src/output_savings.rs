@@ -351,20 +351,68 @@ impl SavingsLedger {
             .unwrap_or_else(|| self.estimate_from_baseline())
     }
 
+    /// Write the ledger, leaving either the old file or the new one behind.
+    ///
+    /// A plain `write` truncates first, so a crash or a concurrent reader
+    /// mid-write sees a half-written file — and `load` treats unparseable JSON
+    /// as an empty ledger, so the savings history would silently reset to
+    /// zero. Writing to a temporary beside the target and renaming makes the
+    /// swap atomic; the pid and process-local sequence in the suffix keep
+    /// concurrent writers from sharing a temporary. Same shape as
+    /// `subscription::tracker`.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
-        std::fs::write(path, json)
+        static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{sequence}", std::process::id()));
+        let result = (|| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Load from disk, returning a fresh empty ledger on missing/corrupt file.
     pub fn load(path: &Path) -> SavingsLedger {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return SavingsLedger::default();
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return SavingsLedger::default();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "output-savings ledger unreadable; starting empty"
+                );
+                return SavingsLedger::default();
+            }
         };
-        serde_json::from_str(&text).unwrap_or_default()
+        match serde_json::from_str(&text) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "output-savings ledger corrupt; starting empty"
+                );
+                SavingsLedger::default()
+            }
+        }
     }
 }
 
@@ -836,5 +884,31 @@ mod tests {
             recorder_with_baseline(dir.path().join("f.json"), "claude|b1|v2", &[90, 100, 110]);
         let other = stratum_label("treatment", "zz|b|v");
         assert_eq!(rec.estimate_request_savings(&[other], 60), 40);
+    }
+
+    /// A truncating write leaves a half-file behind on a crash, and `load`
+    /// reads unparseable JSON as an empty ledger — so a torn write silently
+    /// resets the savings history. The rename makes that unrepresentable.
+    #[test]
+    fn save_leaves_no_temporary_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("ledger.json");
+
+        let ledger = SavingsLedger::default();
+        ledger.save(&path).expect("save");
+
+        assert!(path.exists(), "ledger written");
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary left behind: {leftovers:?}");
+
+        // Overwriting an existing ledger must also land whole.
+        ledger.save(&path).expect("second save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        serde_json::from_str::<SavingsLedger>(&text).expect("reloads as valid JSON");
     }
 }

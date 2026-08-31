@@ -27,13 +27,49 @@ const TOOL_POLICY: &str = "\
 TOOL POLICY — read this before anything else.
 
 You are the reasoning engine for a host process. You do not have direct access \
-to this machine. Your built-in file, search, edit and shell tools are DISABLED; \
-anything they return is a stale cache and must not be trusted or quoted.
+to this machine. Your own built-in file, search, edit and shell tools are \
+DISABLED; anything they return is a stale cache and must not be trusted or \
+quoted.
 
-The ONLY working tools are the ones provided by the `headroom` MCP server. \
-Every file read, every search, every command, every edit goes through them. If \
-you need a tool and cannot see it, say so plainly instead of falling back to a \
-built-in one.
+The host's tools reach you as dynamic tools. Discovering them and calling them \
+through whatever dynamic-tool mechanism you have is the correct and expected \
+way to work — it is not a workaround. Their names are the host's names, such \
+as Bash, Read, Edit and Grep.
+
+If a discovery call comes back empty, that is a fault on the host side, not a \
+signal to look somewhere else. Do not go hunting for another server, resource \
+list or namespace, and do not retry the same discovery more than twice. Say \
+plainly that the host tools did not load and stop, so the fault is visible \
+instead of buried under retries.
+
+An empty or unhelpful tool result is an answer, not a reason to try again with \
+reshaped arguments. If two attempts at a piece of work come back with \
+nothing, stop and report what you tried and what came back.
+
+";
+
+/// The short form sent on every resumed turn.
+///
+/// `TOOL_POLICY` is onboarding text: it opens with "read this before anything
+/// else" and spends most of its length explaining how to find the tools. Sent
+/// again on every resume, it was itself the circling — the agent re-read it,
+/// re-made its plan, spent the turn announcing that plan, made one call, and
+/// arrived back here. Six turns of that in the log for one conversation.
+///
+/// A resume is the middle of a turn the agent already started, so it needs the
+/// opposite instruction: keep going, and stop narrating. The constraints are
+/// restated in one sentence because that much does have to survive, but
+/// nothing here invites a fresh plan.
+const RESUME_POLICY: &str = "\
+CONTINUE. What follows is the result of the tool call you just made. This turn \
+is already under way.
+
+Still true from the start of this conversation: your own built-in tools are \
+disabled, and the host's tools are the dynamic ones.
+
+Do not re-plan. Do not restate your plan. Do not announce what you are about \
+to do. Act on the result below, and when the work is finished say what you \
+did.
 
 ";
 
@@ -67,6 +103,8 @@ pub(crate) async fn handle(
                 // Put the driver back and start fresh below.
                 state.cursor_bridge.park_driver(&key, driver).await;
             } else {
+                let mut driver = driver;
+                driver.begin_response();
                 tracing::debug!(
                     event = "cursor_turn_resumed",
                     conversation = %key,
@@ -76,15 +114,24 @@ pub(crate) async fn handle(
                 if let Some(tools) = parsed.get("tools").and_then(Value::as_array) {
                     session.set_tools(tools.clone()).await;
                 }
-                return stream_driver(state.clone(), key, driver);
+                return drive(state.clone(), key, driver, wants_stream(parsed)).await;
             }
         }
     }
 
     let (session, inbox) = state.cursor_bridge.open(&key).await;
+    let mut tool_count = 0usize;
     if let Some(tools) = parsed.get("tools").and_then(Value::as_array) {
+        tool_count = tools.len();
         session.set_tools(tools.clone()).await;
     }
+    tracing::info!(
+        event = "cursor_turn_started",
+        conversation = %key,
+        model = %cursor_model,
+        tools = tool_count,
+        "starting a cursor turn"
+    );
 
     let port = state.config.listen.port();
     let mcp_url = format!("http://127.0.0.1:{port}/mcp/{key}");
@@ -104,11 +151,13 @@ pub(crate) async fn handle(
         prompt: build_prompt(parsed, session.as_ref()).await,
         mcp_url: Some(mcp_url.clone()),
         timeout: None,
-        // Built-in tools are capped at read-only. The tool policy is what
-        // actually redirects the model; this is the backstop for when it does
-        // not listen, and it is the difference between an unapproved read and
-        // an unapproved write.
-        read_only: true,
+        // The workspace is an empty scratch directory, so the agent's own
+        // file tools see nothing and every real read or write goes to the host
+        // over the bridge, where the user approves it. The one way out of the
+        // scratch directory is the agent's shell, so that gets sandboxed. What
+        // this must not do is restrict the *mode*: `--mode ask` was the reason
+        // the agent answered with a plan every turn instead of doing the work.
+        sandbox: true,
     };
 
     let running = match spawn(&state.config.cursor_agent_binary, &turn).await {
@@ -121,7 +170,7 @@ pub(crate) async fn handle(
     };
 
     let convo = Conversation::new(session, inbox, running, workspace);
-    stream_driver(state, key, convo)
+    drive(state, key, convo, wants_stream(parsed)).await
 }
 
 /// Stream one response off a driver, and decide what becomes of the driver when
@@ -131,8 +180,166 @@ pub(crate) async fn handle(
 /// a pause parks it for the next request, an end reaps it, and a client that
 /// hangs up reaps it too — otherwise it would sit blocked on a tool call that
 /// nobody is ever going to answer.
-fn stream_driver(state: AppState, key: String, mut convo: Conversation) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
+/// Anthropic defaults `stream` to false, and a client that left it off wants
+/// one JSON object back. Mirrors `handlers::local_model`, which has always
+/// separated what it reads from the upstream from what it writes to the
+/// client; this path used to stream at everyone regardless.
+fn wants_stream(parsed: &Value) -> bool {
+    parsed
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+async fn drive(state: AppState, key: String, convo: Conversation, stream: bool) -> Response {
+    if stream {
+        stream_driver(state, key, convo)
+    } else {
+        collect_driver(state, key, convo).await
+    }
+}
+
+/// Run the turn to its end and answer with the single message it adds up to.
+///
+/// The agent is driven exactly as [`stream_driver`] drives it — same frames,
+/// same parking on a tool call — and the frames are folded back into a message
+/// here rather than written to the wire. Driving it differently would mean two
+/// transports to keep honest.
+async fn collect_driver(state: AppState, key: String, convo: Conversation) -> Response {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
+    spawn_driver(state, key, convo, tx);
+
+    let mut frames = Vec::new();
+    while let Some(frame) = rx.recv().await {
+        match frame {
+            Ok(f) => frames.push(f),
+            Err(e) => return error_response(&format!("cursor agent failed: {e}")),
+        }
+    }
+
+    match message_from_frames(&frames) {
+        Some(message) => Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(message.to_string()))
+            .unwrap_or_else(|_| error_response("could not build the response")),
+        None => error_response("the cursor agent produced no message"),
+    }
+}
+
+/// Fold the SSE frames of one turn back into an Anthropic message.
+///
+/// The deltas are the only place the content exists — the agent streams and
+/// nothing upstream keeps a whole copy — so this reassembles rather than reads
+/// a field. Unknown event types are skipped: a new one should not empty the
+/// response.
+fn message_from_frames(frames: &[String]) -> Option<Value> {
+    let mut message: Option<Value> = None;
+    let mut blocks: Vec<Value> = Vec::new();
+    // `input_json_delta` arrives as text and is only valid JSON once complete,
+    // so tool arguments are buffered per block and parsed at the end.
+    let mut json_buf: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+
+    for frame in frames {
+        for line in frame.lines() {
+            let Some(raw) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(raw) else {
+                continue;
+            };
+            let idx = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            match event.get("type").and_then(|v| v.as_str()) {
+                Some("message_start") => message = event.get("message").cloned(),
+                Some("content_block_start") => {
+                    if let Some(block) = event.get("content_block").cloned() {
+                        while blocks.len() <= idx {
+                            blocks.push(Value::Null);
+                        }
+                        blocks[idx] = block;
+                    }
+                }
+                Some("content_block_delta") => {
+                    let Some(delta) = event.get("delta") else {
+                        continue;
+                    };
+                    let Some(block) = blocks.get_mut(idx) else {
+                        continue;
+                    };
+                    match delta.get("type").and_then(|v| v.as_str()) {
+                        Some("text_delta") => append_str(block, "text", delta.get("text")),
+                        Some("thinking_delta") => {
+                            append_str(block, "thinking", delta.get("thinking"))
+                        }
+                        Some("signature_delta") => {
+                            append_str(block, "signature", delta.get("signature"))
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(part) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                json_buf.entry(idx).or_default().push_str(part);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("message_delta") => {
+                    let msg = message.as_mut()?;
+                    if let Some(delta) = event.get("delta").and_then(|v| v.as_object()) {
+                        for (k, v) in delta {
+                            msg[k.as_str()] = v.clone();
+                        }
+                    }
+                    if let Some(usage) = event.get("usage") {
+                        msg["usage"] = usage.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for (idx, raw) in json_buf {
+        if let Some(block) = blocks.get_mut(idx) {
+            // An empty-argument tool call streams no delta at all, and the
+            // `{}` the start frame carries is already right.
+            if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+                block["input"] = parsed;
+            }
+        }
+    }
+
+    let mut message = message?;
+    message["content"] = Value::Array(blocks.into_iter().filter(|b| !b.is_null()).collect());
+    Some(message)
+}
+
+fn append_str(block: &mut Value, field: &str, add: Option<&Value>) {
+    let Some(add) = add.and_then(|v| v.as_str()) else {
+        return;
+    };
+    let slot = block
+        .get(field)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    block[field] = Value::String(slot + add);
+}
+
+/// Drive one turn, writing its SSE frames into `tx`.
+///
+/// Both transports use this, so a streamed turn and a collected one park,
+/// shut down and reap the agent the same way.
+///
+/// Three ways out, and they differ only in what happens to the agent process:
+/// a pause parks it for the next request, an end reaps it, and a receiver that
+/// has gone away reaps it too — otherwise it would sit blocked on a tool call
+/// that nobody is ever going to answer.
+fn spawn_driver(
+    state: AppState,
+    key: String,
+    mut convo: Conversation,
+    tx: tokio::sync::mpsc::Sender<Result<String, std::io::Error>>,
+) {
     let bridge = state.cursor_bridge.clone();
     tokio::spawn(async move {
         loop {
@@ -164,6 +371,11 @@ fn stream_driver(state: AppState, key: String, mut convo: Conversation) -> Respo
             }
         }
     });
+}
+
+fn stream_driver(state: AppState, key: String, convo: Conversation) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
+    spawn_driver(state, key, convo, tx);
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Response::builder()
@@ -182,8 +394,13 @@ fn stream_driver(state: AppState, key: String, mut convo: Conversation) -> Respo
 async fn build_prompt(parsed: &Value, session: &Session) -> String {
     let resuming = session.chat_id().await.is_some();
     let mut out = String::new();
+    // Every turn carries a policy — sending it once meant a conversation
+    // already going in circles could never be corrected — but not the same
+    // one. Turn one is being onboarded; a resume is mid-turn and needs to be
+    // told to carry on rather than to read the rules again. See
+    // `RESUME_POLICY` for what re-sending the long form actually did.
+    out.push_str(if resuming { RESUME_POLICY } else { TOOL_POLICY });
     if !resuming {
-        out.push_str(TOOL_POLICY);
         if let Some(system) = system_text(parsed) {
             out.push_str("HOST INSTRUCTIONS\n\n");
             out.push_str(&system);
@@ -317,8 +534,21 @@ mod tests {
         let prompt = prompt_for(&body, Some("chat-1")).await;
         assert!(prompt.contains("second question"));
         assert!(!prompt.contains("first question"), "history is Cursor's job");
-        assert!(!prompt.contains("TOOL POLICY"), "the policy was set on turn one");
-        assert!(!prompt.contains("sys"), "the system prompt went with turn one");
+        assert!(
+            !prompt.contains("HOST INSTRUCTIONS"),
+            "the system prompt went with turn one"
+        );
+        // A policy still goes out — sending one only on turn one meant a
+        // conversation already ignoring it could never be corrected — but the
+        // short form, which says carry on rather than start over.
+        assert!(
+            prompt.starts_with("CONTINUE"),
+            "a resume needs the short form: {prompt}"
+        );
+        assert!(
+            !prompt.contains("TOOL POLICY"),
+            "re-sending the onboarding text is what made it re-plan every turn"
+        );
     }
 
     #[tokio::test]
@@ -342,7 +572,123 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_transcript_does_not_panic() {
-        assert!(!prompt_for(&json!({}), None).await.is_empty(), "the policy still goes out");
-        assert!(prompt_for(&json!({"messages": []}), Some("c")).await.is_empty());
+        assert!(
+            !prompt_for(&json!({}), None).await.is_empty(),
+            "the policy still goes out"
+        );
+        // A resumed turn with nothing new still carries a policy, which is
+        // the whole point of repeating one.
+        let resumed = prompt_for(&json!({"messages": []}), Some("c")).await;
+        assert!(resumed.starts_with("CONTINUE"));
+        assert!(!resumed.contains("[user]"), "and no transcript beyond it");
+    }
+}
+
+#[cfg(test)]
+mod non_streaming_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn frame(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    #[test]
+    fn stream_defaults_to_false_the_way_anthropic_does() {
+        assert!(!wants_stream(&json!({"model": "m"})));
+        assert!(!wants_stream(&json!({"stream": false})));
+        assert!(wants_stream(&json!({"stream": true})));
+    }
+
+    /// Text and thinking arrive only as deltas, so the fold has to concatenate
+    /// them; reading a field would return the empty string the start frame
+    /// carries.
+    #[test]
+    fn text_and_thinking_deltas_are_concatenated() {
+        let frames = vec![
+            frame("message_start", json!({"type": "message_start", "message": {
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "cursor-grok-4.6-high", "content": [], "stop_reason": null}})),
+            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}})),
+            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "let me "}})),
+            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "count"}})),
+            frame("content_block_start", json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}})),
+            frame("content_block_delta", json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "39"}})),
+            frame("content_block_delta", json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "1"}})),
+            frame("message_delta", json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}})),
+            frame("message_stop", json!({"type": "message_stop"})),
+        ];
+
+        let msg = message_from_frames(&frames).expect("a message");
+        assert_eq!(msg["id"], "msg_1");
+        assert_eq!(msg["content"][0]["thinking"], "let me count");
+        assert_eq!(msg["content"][1]["text"], "391");
+        assert_eq!(msg["stop_reason"], "end_turn");
+        assert_eq!(msg["usage"]["output_tokens"], 7);
+    }
+
+    /// Tool arguments stream as JSON text that is only parseable once whole.
+    /// Applying each fragment as it lands would leave `input` a string.
+    #[test]
+    fn tool_input_is_parsed_from_the_whole_json_not_the_fragments() {
+        let frames = vec![
+            frame("message_start", json!({"type": "message_start",
+                "message": {"id": "msg_2", "content": []}})),
+            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}})),
+            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}})),
+            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "\"Yerevan\"}"}})),
+            frame("message_delta", json!({"type": "message_delta",
+                "delta": {"stop_reason": "tool_use"}})),
+        ];
+
+        let msg = message_from_frames(&frames).expect("a message");
+        assert_eq!(msg["content"][0]["type"], "tool_use");
+        assert_eq!(msg["content"][0]["input"], json!({"city": "Yerevan"}));
+        assert_eq!(msg["stop_reason"], "tool_use");
+    }
+
+    /// A tool taking no arguments streams no delta. The `{}` from the start
+    /// frame is already right and must survive.
+    #[test]
+    fn a_tool_call_with_no_arguments_keeps_its_empty_input() {
+        let frames = vec![
+            frame("message_start", json!({"type": "message_start", "message": {"content": []}})),
+            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "t", "name": "now", "input": {}}})),
+        ];
+        let msg = message_from_frames(&frames).expect("a message");
+        assert_eq!(msg["content"][0]["input"], json!({}));
+    }
+
+    /// A turn that produced nothing must not be answered with a half-built
+    /// object the client would have to guess about.
+    #[test]
+    fn no_message_start_means_no_message() {
+        assert!(message_from_frames(&[]).is_none());
+        assert!(message_from_frames(&[frame("ping", json!({"type": "ping"}))]).is_none());
+    }
+
+    /// An event type nobody has taught this about should cost the response
+    /// nothing.
+    #[test]
+    fn an_unknown_event_is_skipped_rather_than_fatal() {
+        let frames = vec![
+            frame("message_start", json!({"type": "message_start", "message": {"content": []}})),
+            frame("something_new", json!({"type": "something_new", "index": 0, "wat": true})),
+            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": "ok"}})),
+        ];
+        let msg = message_from_frames(&frames).expect("a message");
+        assert_eq!(msg["content"][0]["text"], "ok");
     }
 }

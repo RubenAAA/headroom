@@ -26,6 +26,9 @@ pub struct AgentSavingsProfile {
     pub max_items_after_crush: u32,
     pub smart_crusher_with_compaction: bool,
     pub force_kompress: bool,
+    /// Forward `HEADROOM_PROTECT_READS`: keep file reads (`cat`, `sed -n`,
+    /// `head`) byte-exact so the agent patches from what the file holds.
+    pub protect_reads: bool,
     pub proxy_mode: &'static str,
     pub accuracy_guard: &'static str,
 }
@@ -66,6 +69,7 @@ impl AgentSavingsProfile {
             ),
             ("HEADROOM_FORCE_KOMPRESS", flag(self.force_kompress)),
             ("HEADROOM_ACCURACY_GUARD", self.accuracy_guard.to_string()),
+            ("HEADROOM_PROTECT_READS", flag(self.protect_reads)),
         ];
         if let Some(ratio) = self.target_ratio {
             env.push(("HEADROOM_TARGET_RATIO", format!("{ratio:.2}")));
@@ -88,6 +92,7 @@ const PROFILES: &[AgentSavingsProfile] = &[
         max_items_after_crush: 8,
         smart_crusher_with_compaction: false,
         force_kompress: true,
+        protect_reads: false,
         proxy_mode: "token",
         accuracy_guard: "strict",
     },
@@ -103,6 +108,7 @@ const PROFILES: &[AgentSavingsProfile] = &[
         max_items_after_crush: 15,
         smart_crusher_with_compaction: true,
         force_kompress: false,
+        protect_reads: false,
         proxy_mode: "token",
         accuracy_guard: "strict",
     },
@@ -120,6 +126,9 @@ const PROFILES: &[AgentSavingsProfile] = &[
         max_items_after_crush: 15,
         smart_crusher_with_compaction: true,
         force_kompress: false,
+        // The one profile that turns it on: a coding session's working set is
+        // the files it is about to patch.
+        protect_reads: true,
         proxy_mode: "token",
         accuracy_guard: "strict",
     },
@@ -135,6 +144,7 @@ const PROFILES: &[AgentSavingsProfile] = &[
         max_items_after_crush: 15,
         smart_crusher_with_compaction: true,
         force_kompress: false,
+        protect_reads: false,
         proxy_mode: "token",
         accuracy_guard: "strict",
     },

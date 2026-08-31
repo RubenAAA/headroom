@@ -40,6 +40,12 @@ pub(crate) struct Conversation {
 }
 
 impl Conversation {
+    /// Start a fresh Anthropic message for the next HTTP response. See
+    /// [`super::translate::Translator::begin_response`].
+    pub(crate) fn begin_response(&mut self) {
+        self.running.translator.begin_response();
+    }
+
     pub(crate) fn new(
         session: Arc<Session>,
         inbox: UnboundedReceiver<ParkedCall>,
@@ -234,7 +240,7 @@ mod tests {
         assert_eq!(got[1].0, "b");
     }
 
-    use super::super::agent::{spawn, AgentTurn};
+    use super::super::agent::{spawn_stub, AgentTurn};
     use super::super::bridge::{handle_rpc, Bridge, ToolOutcome};
 
     /// A stand-in for `cursor-agent` that speaks, then blocks the way the real
@@ -287,7 +293,7 @@ mod tests {
             })])
             .await;
 
-        let running = spawn(
+        let running = spawn_stub(
             stub.to_str().unwrap(),
             &AgentTurn {
                 model: "cursor-grok-4.6-high".into(),
@@ -296,7 +302,7 @@ mod tests {
                 prompt: "what is the marker?".into(),
                 mcp_url: Some("http://127.0.0.1:0/mcp/conv-1".into()),
                 timeout: None,
-                read_only: false,
+                sandbox: false,
             },
         )
         .await
@@ -396,7 +402,7 @@ mod tests {
         let stub = stub_agent(dir.path(), &gate);
         let bridge = Bridge::new();
         let (session, inbox) = bridge.open("conv-2").await;
-        let running = spawn(
+        let running = spawn_stub(
             stub.to_str().unwrap(),
             &AgentTurn {
                 model: "m".into(),
@@ -405,7 +411,7 @@ mod tests {
                 prompt: "hi".into(),
                 mcp_url: None,
                 timeout: None,
-                read_only: false,
+                sandbox: false,
             },
         )
         .await

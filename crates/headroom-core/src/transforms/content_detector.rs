@@ -705,6 +705,23 @@ fn try_detect_html(content: &str) -> Option<DetectionResult> {
     ))
 }
 
+/// True when a line looks like `path:line:content` grep output.
+///
+/// The bare `^[^\s:]+:\d+:` shape also matches ISO-8601 timestamps
+/// (`…T09:57:59…`) and the XML-ish wrappers harnesses prepend to user turns
+/// (Copilot CLI's `<current_datetime>…` line), which misroutes prose to the
+/// SearchCompressor — and that compressor keeps only matching lines, deleting
+/// the rest. So the pre-colon segment must additionally look like a file path:
+/// no angle brackets and no `=` (rules out markup tags and `key=value:12:` log
+/// lines).
+fn is_search_result_line(line: &str) -> bool {
+    if !SEARCH_RESULT_PATTERN.is_match(line) {
+        return false;
+    }
+    let prefix = line.split(':').next().unwrap_or("");
+    !prefix.contains('<') && !prefix.contains('>') && !prefix.contains('=')
+}
+
 pub fn try_detect_search(content: &str) -> Option<DetectionResult> {
     let lines: Vec<&str> = content.split('\n').take(100).collect();
     if lines.is_empty() {
@@ -712,11 +729,17 @@ pub fn try_detect_search(content: &str) -> Option<DetectionResult> {
     }
     let mut matching_lines: u32 = 0;
     for line in &lines {
-        if !line.trim().is_empty() && SEARCH_RESULT_PATTERN.is_match(line) {
+        if !line.trim().is_empty() && is_search_result_line(line) {
             matching_lines += 1;
         }
     }
-    if matching_lines == 0 {
+    // Absolute floor: a single coincidental `word:digits:` line (a timestamp,
+    // a URL, a time literal inside prose) must not classify a whole payload as
+    // search results — the SearchCompressor drops every non-matching line, so
+    // a false positive is data loss. A genuine one-line grep result loses
+    // nothing by staying uncompressed: all of its lines match, so the
+    // compressor would have kept it verbatim anyway.
+    if matching_lines < 2 {
         return None;
     }
     let non_empty_lines = lines.iter().filter(|l| !l.trim().is_empty()).count() as u32;
@@ -1061,6 +1084,46 @@ mod tests {
         let r = detect_content_type(content);
         assert_eq!(r.content_type, ContentType::SearchResults);
         assert!(r.confidence >= 0.6);
+    }
+
+    /// Regression: wrap-copilot ate one-line interactive prompts (2026-08-23).
+    /// Copilot CLI prepends `<current_datetime>…</current_datetime>` to every
+    /// interactive turn. That single line matches the bare `file:line:`
+    /// pattern, so a datetime plus a one-line prompt classified as search
+    /// results (1 match / 2 lines = 50% ≥ 30%) and the SearchCompressor
+    /// deleted the prompt — the model received only the timestamp.
+    #[test]
+    fn a_datetime_prefixed_user_message_is_not_search_output() {
+        let incident = "<current_datetime>2026-08-23T09:57:59.792+02:00</current_datetime>\n\n\
+                        Please update the PR desc and check .overlay/ for hints.";
+        assert!(try_detect_search(incident).is_none());
+        assert_ne!(
+            detect_content_type(incident).content_type,
+            ContentType::SearchResults
+        );
+    }
+
+    #[test]
+    fn one_coincidental_line_is_not_enough() {
+        assert!(try_detect_search("src/foo.py:12:def foo():").is_none());
+        assert!(try_detect_search(
+            "Meeting at 09:30:00 tomorrow.\nBring the reports.\nDo not forget coffee."
+        )
+        .is_none());
+
+        let two = "src/foo.py:12:def foo():\nsrc/bar.py:34:    foo()";
+        let r = try_detect_search(two).expect("two genuine grep lines still classify");
+        assert_eq!(r.content_type, ContentType::SearchResults);
+    }
+
+    /// Markup and `key=value` lines are not file paths, even carrying `:\d+:`.
+    #[test]
+    fn tag_like_and_key_value_prefixes_are_rejected() {
+        assert!(try_detect_search(
+            "<log time=\"10:00:00\">started</log>\n<log time=\"10:00:01\">stopped</log>"
+        )
+        .is_none());
+        assert!(try_detect_search("timeout=30:12:retried\ntimeout=31:12:retried").is_none());
     }
 
     #[test]

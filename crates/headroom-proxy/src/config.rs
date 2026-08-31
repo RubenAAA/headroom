@@ -1102,7 +1102,7 @@ pub struct CliArgs {
     pub local_upstream: Option<Url>,
 
     /// Additional model routes. Each value is
-    /// `MODEL_NAME=UPSTREAM_URL[:openai[:TARGET_MODEL_ID]]`, where `:openai`
+    /// `MODEL_NAME=UPSTREAM_URL[:openai[:TARGET_MODEL_ID]][:auth=ENV_VAR]`, where `:openai`
     /// (or its older spelling `:translate`) means "translate Anthropic format
     /// to OpenAI format". Model names ending in `*` are prefix-matched. Can be
     /// given multiple times or as a comma-separated list in
@@ -1116,10 +1116,17 @@ pub struct CliArgs {
     /// (`/v1/responses`, or the ChatGPT Codex backend under Codex auth);
     /// without one it goes to `/v1/chat/completions`. Codex needs the former.
     ///
+    /// `:auth=ENV_VAR` names the environment variable holding this route's
+    /// bearer token — the name, so nothing written here is a secret. It also
+    /// declares the route is not Codex-bound: without it, a route inherits
+    /// whatever `--codex-auth-file` set up, which would send a live ChatGPT
+    /// token and a `codex_cli_rs` originator to whatever host the URL names.
+    ///
     /// Examples:
     ///   --extra-model-route "claude-grok-4.6=cursor:cursor-grok-4.6-high"
     ///   --extra-model-route "codex-*=https://api.openai.com/v1:openai"
     ///   --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra"
+    ///   --extra-model-route "claude-grok-4.6=https://api.x.ai/v1:openai:grok-4.6:auth=XAI_API_KEY"
     #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
     pub extra_model_routes: Vec<String>,
 
@@ -1624,15 +1631,62 @@ pub struct ModelRoute {
     /// When set, route through the `cursor-agent` CLI instead of an HTTP
     /// upstream. The value is the Cursor model id, e.g.
     /// `cursor-grok-4.6-high`. See `crate::cursor`.
+    ///
+    /// A `{effort}` in the id is replaced per request with the level the
+    /// client asked for, so `cursor-grok-4.6-{effort}` lets one alias cover
+    /// every tier and `/effort` drive it. See
+    /// [`ModelRoute::resolve_cursor_agent`].
     pub cursor_agent: Option<String>,
     /// When set, overrides the `model` field sent to the upstream after
     /// translation. Lets `model_prefix` be a discoverable id (e.g.
     /// `claude-codex-5.5`, satisfying Claude Code's gateway-discovery
     /// filter) while the real upstream model id (e.g. `gpt-5.5`) differs.
     pub target_model: Option<String>,
+    /// Name of the environment variable holding this route's bearer token.
+    ///
+    /// The *name*, never the token: the flags file that spells these routes
+    /// out is a plain shell script the operator edits and greps, and it holds
+    /// no secrets today. The value is read once per request, at the moment the
+    /// upstream headers are built.
+    ///
+    /// Setting this also declares the route is not Codex-bound, so it never
+    /// gets the ChatGPT bearer token, the `codex_cli_rs` originator or the
+    /// Codex session headers. Without it the route keeps the old behavior:
+    /// Codex headers when `--codex-auth-file` is set, the caller's
+    /// `Authorization` otherwise.
+    pub auth_env: Option<String>,
 }
 
+/// The placeholder a cursor route uses to take its effort from the request.
+pub const EFFORT_PLACEHOLDER: &str = "{effort}";
+
+/// Cursor's own tier names, which are also Claude Code's `/effort` levels.
+const CURSOR_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+
 impl ModelRoute {
+    /// The Cursor model id to run, with `{effort}` filled in.
+    ///
+    /// `effort` is what the client asked for. Cursor's tiers happen to be
+    /// spelled exactly like Claude Code's levels, so the two line up without a
+    /// table; `max` is the one level Claude Code has and Cursor does not, and
+    /// it lands on `xhigh` rather than naming a model that does not exist.
+    ///
+    /// Falls back to `high` — Cursor's plain "Grok 4.6", the tier the id
+    /// without a suffix means — when the client named nothing usable. A
+    /// missing effort should not silently demote the model.
+    pub fn resolve_cursor_agent(&self, effort: Option<&str>) -> Option<String> {
+        let id = self.cursor_agent.as_deref()?;
+        if !id.contains(EFFORT_PLACEHOLDER) {
+            return Some(id.to_string());
+        }
+        let level = match effort {
+            Some("max") => "xhigh",
+            Some(e) if CURSOR_EFFORTS.contains(&e) => e,
+            _ => "high",
+        };
+        Some(id.replace(EFFORT_PLACEHOLDER, level))
+    }
+
     pub fn matches(&self, model: &str) -> bool {
         if self.prefix_match {
             model.starts_with(self.model_prefix.trim_end_matches('*'))
@@ -1691,24 +1745,33 @@ pub fn parse_bedrock_model_map(raw: Option<&str>) -> HashMap<String, String> {
 ///
 /// Only warns when Codex auth is actually configured, so operators legitimately
 /// pointing a route at a chat-completions backend are not nagged.
+fn is_ambiguous_codex_route(route: &ModelRoute) -> bool {
+    // A route carrying its own credential is not Codex-bound, so it never sees
+    // the ChatGPT bearer token this warning is about.
+    route.auth_env.is_none()
+        && route.translate
+        && route.target_model.is_none()
+        && route
+            .upstream
+            .as_ref()
+            .and_then(|u| u.host_str())
+            .is_some_and(|h| h == "api.openai.com")
+}
+
 pub fn warn_on_ambiguous_codex_routes(routes: &[ModelRoute], codex_auth_file: Option<&str>) {
     if codex_auth_file.is_none() {
         return;
     }
     for route in routes {
-        if route.translate && route.target_model.is_none() {
-            if let Some(upstream) = &route.upstream {
-                if upstream.host_str() == Some("api.openai.com") {
-                    tracing::warn!(
-                        model = %route.model_prefix,
-                        upstream = %upstream,
-                        "model route translates to OpenAI but has no TARGET_MODEL_ID, so it \
-                         routes to /v1/chat/completions, not the agentic Responses API. \
-                         Codex auth is configured, which suggests this was meant to be \
-                         '<url>:openai:<target-model-id>'."
-                    );
-                }
-            }
+        if is_ambiguous_codex_route(route) {
+            tracing::warn!(
+                model = %route.model_prefix,
+                upstream = ?route.upstream,
+                "model route translates to OpenAI but has no TARGET_MODEL_ID, so it \
+                 routes to /v1/chat/completions, not the agentic Responses API. \
+                 Codex auth is configured, which suggests this was meant to be \
+                 '<url>:openai:<target-model-id>'."
+            );
         }
     }
 }
@@ -1760,9 +1823,46 @@ fn shadowed_routes(routes: &[ModelRoute]) -> Vec<(&str, &str)> {
 /// [`warn_on_ambiguous_codex_routes`].
 const TRANSLATE_KEYWORDS: [&str; 2] = ["translate", "openai"];
 
+/// The `:auth=` marker introducing a route's own credential.
+const AUTH_MARKER: &str = ":auth=";
+
+/// Split a trailing `:auth=ENV_VAR` off a route spec's right-hand side.
+///
+/// Taken before the translate keywords are scanned, because that scan treats
+/// everything after `:translate:` as the target model id and would otherwise
+/// swallow the marker whole.
+///
+/// The name has to look like a shell variable — `[A-Za-z_][A-Za-z0-9_]*` — so
+/// a target model id containing `:auth=` (there is no such id, but the parser
+/// should not depend on that) can never be mistaken for one.
+fn split_auth_env(rest: &str) -> Result<(&str, Option<String>), String> {
+    let Some(idx) = rest.rfind(AUTH_MARKER) else {
+        return Ok((rest, None));
+    };
+    let name = rest[idx + AUTH_MARKER.len()..].trim();
+    if name.is_empty() {
+        return Err(format!("expected an env-var name after {AUTH_MARKER} in {rest}"));
+    }
+    let shaped = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !shaped {
+        return Err(format!(
+            "'{name}' is not an environment variable name. {AUTH_MARKER} takes the \
+             name of the variable holding the token, not the token itself."
+        ));
+    }
+    Ok((&rest[..idx], Some(name.to_string())))
+}
+
 fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
     let (model, rest) = spec.split_once('=').ok_or_else(|| {
-        format!("expected MODEL=URL[:translate[:TARGET_ID]] or MODEL=cursor:ID, got: {spec}")
+        format!(
+            "expected MODEL=URL[:translate[:TARGET_ID]][:auth=ENV_VAR] or \
+             MODEL=cursor:ID, got: {spec}"
+        )
     })?;
     let model = model.trim().to_string();
     let prefix_match = model.ends_with('*');
@@ -1776,8 +1876,11 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
             translate: false,
             cursor_agent: Some(cursor_model.trim().to_string()),
             target_model: None,
+            auth_env: None,
         });
     }
+
+    let (rest, auth_env) = split_auth_env(rest)?;
 
     // Check for a trailing `:<kw>` or `:<kw>:TARGET_ID` suffix, where `<kw>`
     // is any of TRANSLATE_KEYWORDS (but not `://` from the scheme).
@@ -1814,6 +1917,7 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
         translate,
         cursor_agent: None,
         target_model,
+        auth_env,
     })
 }
 
@@ -2700,6 +2804,67 @@ mod model_route_tests {
         assert!(parse_model_route("model=not-a-url").is_err());
         assert!(parse_model_route("model=https://api.openai.com/v1:translate:").is_err());
     }
+
+    /// `:auth=` comes off before the translate keywords are scanned, because
+    /// that scan claims everything after `:translate:` as the target model id.
+    #[test]
+    fn auth_env_parses_off_every_form() {
+        for (spec, translate, target) in [
+            ("m=https://api.x.ai/v1:auth=XAI_API_KEY", false, None),
+            ("m=https://api.x.ai/v1:openai:auth=XAI_API_KEY", true, None),
+            (
+                "m=https://api.x.ai/v1:openai:grok-4.6:auth=XAI_API_KEY",
+                true,
+                Some("grok-4.6"),
+            ),
+            (
+                "m=https://api.x.ai/v1:translate:grok-4.6:auth=XAI_API_KEY",
+                true,
+                Some("grok-4.6"),
+            ),
+        ] {
+            let r = parse_model_route(spec).expect("spec parses");
+            assert_eq!(r.auth_env.as_deref(), Some("XAI_API_KEY"), "for {spec}");
+            assert_eq!(r.translate, translate, "for {spec}");
+            assert_eq!(r.target_model.as_deref(), target, "for {spec}");
+            assert_eq!(
+                r.upstream.as_ref().unwrap().as_str(),
+                "https://api.x.ai/v1",
+                "for {spec}"
+            );
+        }
+    }
+
+    /// Every existing spelling keeps parsing to no credential, which is what
+    /// makes the flag opt-in rather than a behavior change for routes already
+    /// in someone's flags file.
+    #[test]
+    fn a_route_without_the_marker_carries_no_credential() {
+        for spec in [
+            "m=https://api.openai.com/v1",
+            "m=https://api.openai.com/v1:openai",
+            "m=https://api.openai.com/v1:openai:gpt-5.5",
+            "m=cursor:cursor-grok-4.6-high",
+        ] {
+            let r = parse_model_route(spec).expect("spec parses");
+            assert!(r.auth_env.is_none(), "for {spec}");
+        }
+    }
+
+    /// The whole point of taking a name is that the flags file holds no
+    /// secrets. A pasted token does not look like a variable name, so say so
+    /// at startup rather than exporting it to an upstream.
+    #[test]
+    fn a_literal_token_is_rejected() {
+        for spec in [
+            "m=https://api.x.ai/v1:openai:grok-4.6:auth=xai-abc123.def-456",
+            "m=https://api.x.ai/v1:openai:grok-4.6:auth=sk-proj-AAAA/BBBB",
+            "m=https://api.x.ai/v1:openai:grok-4.6:auth=",
+            "m=https://api.x.ai/v1:openai:grok-4.6:auth=9LIVES",
+        ] {
+            assert!(parse_model_route(spec).is_err(), "for {spec}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2959,20 +3124,13 @@ mod ambiguous_codex_route_tests {
     /// OpenAI, no target model, Codex auth configured. Everything else is a
     /// legitimate configuration and must stay quiet.
     ///
-    /// `tracing` output is not captured here, so these assert the predicate the
-    /// function branches on rather than the emitted line.
+    /// `tracing` output is not captured here, so these run the predicate the
+    /// function branches on rather than reading the emitted line.
     fn would_warn(spec: &str, codex_auth: Option<&str>) -> bool {
         if codex_auth.is_none() {
             return false;
         }
-        routes(spec).iter().any(|r| {
-            r.translate
-                && r.target_model.is_none()
-                && r.upstream
-                    .as_ref()
-                    .and_then(|u| u.host_str())
-                    .is_some_and(|h| h == "api.openai.com")
-        })
+        routes(spec).iter().any(is_ambiguous_codex_route)
     }
 
     #[test]
@@ -2995,6 +3153,18 @@ mod ambiguous_codex_route_tests {
     #[test]
     fn without_codex_auth_nothing_warns() {
         assert!(!would_warn("m=https://api.openai.com/v1:openai", None));
+    }
+
+    /// The warning exists because a Codex-bound route would be handed a
+    /// ChatGPT bearer token. A route naming its own credential is never handed
+    /// one, so the advice would be wrong — it would push the operator toward
+    /// `/v1/responses` when chat-completions is what they asked for.
+    #[test]
+    fn a_route_with_its_own_credential_does_not_warn() {
+        assert!(!would_warn(
+            "m=https://api.openai.com/v1:openai:auth=OPENAI_API_KEY",
+            Some("/home/u/.codex/auth.json")
+        ));
     }
 
     /// A non-OpenAI upstream is someone else's gateway; not our business.
@@ -3059,5 +3229,103 @@ mod rollout_input_tests {
         }
         assert!(!config.enable_responses_streaming);
         assert!(!config.enable_bedrock_native);
+    }
+}
+
+#[cfg(test)]
+mod live_flags_file_tests {
+    use super::*;
+
+    /// The routes actually written in `~/.headroom-flags.sh`. A bad spec is
+    /// only logged and skipped at startup, so a typo there is a route that
+    /// silently never matches.
+    #[test]
+    fn the_grok_cursor_routes_parse() {
+        for (spec, cursor_id) in [
+            ("claude-grok-4.6=cursor:cursor-grok-4.6-{effort}", "cursor-grok-4.6-{effort}"),
+            ("claude-grok-4.6-xhigh=cursor:cursor-grok-4.6-xhigh", "cursor-grok-4.6-xhigh"),
+            ("claude-grok-4.6-high=cursor:cursor-grok-4.6-high", "cursor-grok-4.6-high"),
+            ("claude-grok-4.6-low=cursor:cursor-grok-4.6-low", "cursor-grok-4.6-low"),
+        ] {
+            let r = parse_model_route(spec).expect("spec parses");
+            assert_eq!(r.cursor_agent.as_deref(), Some(cursor_id), "for {spec}");
+            assert!(r.upstream.is_none(), "a cursor route has no HTTP upstream");
+            assert!(r.auth_env.is_none(), "the subscription needs no key");
+            assert!(!r.translate);
+            assert!(r.matches(spec.split('=').next().unwrap()));
+        }
+    }
+
+    /// The effort-driven alias is an exact match, so the pinned ones beside it
+    /// are still reachable. A `*` there would have swallowed them.
+    #[test]
+    fn the_effort_alias_does_not_shadow_the_pinned_ones() {
+        let open = parse_model_route("claude-grok-4.6=cursor:cursor-grok-4.6-{effort}").unwrap();
+        for pinned in ["claude-grok-4.6-xhigh", "claude-grok-4.6-high", "claude-grok-4.6-low"] {
+            assert!(!open.matches(pinned), "{pinned} was swallowed");
+        }
+        assert!(open.matches("claude-grok-4.6"));
+    }
+}
+
+#[cfg(test)]
+mod cursor_effort_tests {
+    use super::*;
+
+    fn route(spec: &str) -> ModelRoute {
+        parse_model_route(spec).expect("spec parses")
+    }
+
+    /// One alias, every tier — the point of the placeholder.
+    #[test]
+    fn the_placeholder_takes_the_requested_level() {
+        let r = route("claude-grok-4.6=cursor:cursor-grok-4.6-{effort}");
+        for level in ["low", "medium", "high", "xhigh"] {
+            assert_eq!(
+                r.resolve_cursor_agent(Some(level)).as_deref(),
+                Some(format!("cursor-grok-4.6-{level}").as_str())
+            );
+        }
+    }
+
+    /// `max` is the one level Claude Code has and Cursor does not. Passing it
+    /// through would name a model that does not exist.
+    #[test]
+    fn max_lands_on_the_top_tier_cursor_actually_has() {
+        let r = route("claude-grok-4.6=cursor:cursor-grok-4.6-{effort}");
+        assert_eq!(
+            r.resolve_cursor_agent(Some("max")).as_deref(),
+            Some("cursor-grok-4.6-xhigh")
+        );
+    }
+
+    /// No effort, or one nobody recognises, must not silently demote the
+    /// model. `high` is what the un-suffixed Cursor id means.
+    #[test]
+    fn an_absent_or_unknown_level_falls_back_to_high() {
+        let r = route("claude-grok-4.6=cursor:cursor-grok-4.6-{effort}");
+        for level in [None, Some("turbo"), Some("")] {
+            assert_eq!(
+                r.resolve_cursor_agent(level).as_deref(),
+                Some("cursor-grok-4.6-high"),
+                "for {level:?}"
+            );
+        }
+    }
+
+    /// A pinned id is a deliberate choice and the request must not move it.
+    #[test]
+    fn a_route_without_the_placeholder_ignores_the_effort() {
+        let r = route("claude-grok-4.6-low=cursor:cursor-grok-4.6-low");
+        assert_eq!(
+            r.resolve_cursor_agent(Some("xhigh")).as_deref(),
+            Some("cursor-grok-4.6-low")
+        );
+    }
+
+    #[test]
+    fn an_http_route_has_no_cursor_model_to_resolve() {
+        let r = route("m=https://api.openai.com/v1:openai:gpt-5.6");
+        assert!(r.resolve_cursor_agent(Some("high")).is_none());
     }
 }

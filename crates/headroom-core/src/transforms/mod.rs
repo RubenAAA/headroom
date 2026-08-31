@@ -44,6 +44,7 @@ pub mod observability;
 pub mod pipeline;
 pub mod read_lifecycle;
 pub mod read_maturation;
+pub mod read_protection;
 pub mod recommendations;
 pub mod relevance_split;
 pub mod safety;

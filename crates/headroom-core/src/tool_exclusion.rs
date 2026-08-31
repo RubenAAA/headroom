@@ -23,6 +23,7 @@ pub const DEFAULT_EXCLUDE_TOOLS: &[&str] = &[
     "Edit",
     "WebSearch",
     "WebFetch",
+    "view",
     "headroom_retrieve",
     // Lowercase variants for case-insensitive matching.
     "read",
@@ -46,7 +47,7 @@ pub const DEFAULT_EXCLUDE_TOOLS: &[&str] = &[
 /// of the model acting on a summary of a file rather than the file. Pass
 /// `--exclude-tools ""` to compress them anyway.
 pub const DEFAULT_EXCLUDE_TOOLS_CSV: &str =
-    "Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,headroom_retrieve";
+    "Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,headroom_retrieve";
 
 /// Excluded tools whose results must stay *byte-faithful* — not merely
 /// uncompressed. Even the excluded-tool lossless fold rewrites formatted JSON,
@@ -60,6 +61,7 @@ pub const DEFAULT_VERBATIM_EXCLUDE_TOOLS: &[&str] = &[
     "WebFetch",
     "web_search",
     "web_fetch",
+    "view",
     "headroom_retrieve",
 ];
 

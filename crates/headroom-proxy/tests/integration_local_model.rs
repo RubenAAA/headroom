@@ -150,6 +150,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 translate: true,
                 cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
+                auth_env: None,
             },
             ModelRoute {
                 model_prefix: "codex-*".to_string(),
@@ -158,6 +159,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 translate: true,
                 cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
+                auth_env: None,
             },
             ModelRoute {
                 model_prefix: "anthropic-routed".to_string(),
@@ -166,6 +168,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 translate: false,
                 cursor_agent: Some("cursor-grok-4.6-high".to_string()),
                 target_model: None,
+                auth_env: None,
             },
         ];
     })
@@ -213,6 +216,7 @@ async fn codex_translate_route_uses_responses_endpoint() {
 
             cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
+            auth_env: None,
         }];
     })
     .await;
@@ -277,6 +281,7 @@ async fn codex_translate_route_buffers_non_stream_responses() {
 
             cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
+            auth_env: None,
         }];
     })
     .await;
@@ -345,6 +350,7 @@ async fn over_cap_retry_after_returns_immediately_and_preserves_header() {
                 translate: true,
                 cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
+                auth_env: None,
             }];
         },
         move |mut state| {

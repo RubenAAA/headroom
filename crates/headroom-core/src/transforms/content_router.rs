@@ -3263,6 +3263,24 @@ mod tests {
         assert_eq!(ct, ContentType::SearchResults);
     }
 
+    /// Regression (2026-08-23): interactive wrap-copilot prompts were deleted.
+    /// Copilot CLI prepends `<current_datetime>…</current_datetime>` to every
+    /// interactive user turn; the ISO timestamp matched the grep `file:line:`
+    /// detector, the one-line prompt classified as search results, and the
+    /// SearchCompressor kept only the datetime line — the model received no
+    /// request and answered "How can I help you today?".
+    #[test]
+    fn detect_content_native_datetime_prefixed_prompt() {
+        let content = "<current_datetime>2026-08-23T09:57:59.792+02:00</current_datetime>\n\n\
+                       Please update the PR desc and check .overlay/ for hints.";
+        let ct = detect_content_native(content);
+        assert_ne!(ct, ContentType::SearchResults);
+        assert_ne!(
+            strategy_from_detection(ct, true),
+            CompressionStrategy::Search
+        );
+    }
+
     #[test]
     fn detect_content_native_diff() {
         let content = "diff --git a/f.py b/f.py\nindex 123..456 100644\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-old\n+new";

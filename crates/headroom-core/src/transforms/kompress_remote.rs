@@ -33,7 +33,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::compressor_registry::{CompressInput, CompressOutput, Compressor, CompressorDescriptor};
-use super::kompress::{KompressResult, DEFAULT_MODEL_ID, MIN_WORDS};
+use super::kompress::{KompressResult, DEFAULT_MIN_WORDS, DEFAULT_MODEL_ID, MIN_WORDS};
 
 /// Accept-any-shrink CCR gate, identical to Python's `KompressCompressor
 /// .compress`: only store + mark when the shrink is worth the retrieval
@@ -92,6 +92,9 @@ pub struct RemoteKompressConfig {
     /// Store the original in the proxy-local CCR store and append a retrieval
     /// marker when the shrink clears [`CCR_RATIO_GATE`].
     pub enable_ccr: bool,
+    /// Same floor contract as the in-process compressor: configurable, and
+    /// clamped up to [`MIN_WORDS`] at the check.
+    pub min_words: usize,
 }
 
 impl Default for RemoteKompressConfig {
@@ -99,6 +102,7 @@ impl Default for RemoteKompressConfig {
         Self {
             model_id: DEFAULT_MODEL_ID.to_string(),
             enable_ccr: true,
+            min_words: DEFAULT_MIN_WORDS,
         }
     }
 }
@@ -124,7 +128,7 @@ pub enum RemoteOutcome {
     /// The endpoint answered. `Some(hash)` when the result cleared the CCR
     /// gate and was stored, so a retrieval marker is appended.
     Compressed(Option<String>),
-    /// Input was below [`MIN_WORDS`]; returned verbatim with no round trip.
+    /// Input was below the configured floor; returned verbatim with no round trip.
     TooShort,
     /// Transport, status, or parse failure. Content returned verbatim.
     FailedOpen(String),
@@ -278,8 +282,11 @@ impl RemoteKompressCompressor {
     ) -> (KompressResult, RemoteOutcome) {
         let n_words = content.split_whitespace().count();
         // Below this the in-process compressor passes through verbatim; mirror
-        // it so we never pay a round-trip on a trivially small block.
-        if n_words < MIN_WORDS {
+        // it so we never pay a round-trip on a trivially small block. Dropping
+        // words from a short block is a net loss anyway — the retrieval marker
+        // alone is ~20 words, and short blocks are disproportionately
+        // instruction-like, where the drops read as garbling.
+        if n_words < self.config.min_words.max(MIN_WORDS) {
             return (self.passthrough(content, n_words), RemoteOutcome::TooShort);
         }
 
@@ -588,14 +595,24 @@ mod tests {
         }
     }
 
-    /// 12 words — clears the 10-word gate.
+    /// 12 words — clears the hard 10-word clamp, not the 64-word default.
     const LONG: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima";
+
+    /// The seams under test here are transport, metadata and CCR, none of
+    /// which run on a block the floor turns away. Drop the floor to its clamp
+    /// so a 12-word fixture still reaches them.
+    fn test_config() -> RemoteKompressConfig {
+        RemoteKompressConfig {
+            min_words: MIN_WORDS,
+            ..Default::default()
+        }
+    }
 
     fn client(transport: Arc<StubTransport>) -> RemoteKompressCompressor {
         RemoteKompressCompressor::new(
             "https://kompress.example.com",
             Some("s3cret"),
-            RemoteKompressConfig::default(),
+            test_config(),
             transport,
         )
     }
@@ -697,7 +714,7 @@ mod tests {
     fn short_input_passes_through_without_a_round_trip() {
         let transport = StubTransport::ok(r#"{"compressed": "never used"}"#);
         let c = client(transport.clone());
-        // 9 words, one below MIN_WORDS.
+        // 9 words, one below the clamp this config sits at.
         let short = "one two three four five six seven eight nine";
         let (r, outcome) = c.compress_remote(short, None);
         assert_eq!(transport.call_count(), 0, "must not call the endpoint");
@@ -921,7 +938,7 @@ mod tests {
             None,
             RemoteKompressConfig {
                 enable_ccr: false,
-                ..Default::default()
+                ..test_config()
             },
             StubTransport::ok(body),
         )
@@ -1036,5 +1053,43 @@ mod tests {
         assert!(c.is_ready());
         assert_eq!(c.ready_backend(), Some("remote"));
         assert_eq!(c.preload(), "remote");
+    }
+    #[test]
+    fn the_default_floor_matches_the_in_process_compressor() {
+        assert_eq!(RemoteKompressConfig::default().min_words, DEFAULT_MIN_WORDS);
+    }
+
+    #[test]
+    fn a_block_under_the_default_floor_never_leaves_the_process() {
+        // 12 words: over the hard clamp, under the default floor. The default
+        // config must turn it away without a round trip.
+        let transport = StubTransport::ok(r#"{"compressed": "never used"}"#);
+        let c = RemoteKompressCompressor::new(
+            "https://x",
+            None,
+            RemoteKompressConfig::default(),
+            transport.clone(),
+        );
+        let (r, outcome) = c.compress_remote(LONG, None);
+        assert_eq!(transport.call_count(), 0);
+        assert_eq!(outcome, RemoteOutcome::TooShort);
+        assert_eq!(r.compressed, LONG);
+    }
+
+    #[test]
+    fn a_floor_below_the_clamp_is_raised_to_it() {
+        let transport = StubTransport::ok(r#"{"compressed": "never used"}"#);
+        let c = RemoteKompressCompressor::new(
+            "https://x",
+            None,
+            RemoteKompressConfig {
+                min_words: 0,
+                ..Default::default()
+            },
+            transport.clone(),
+        );
+        let (_, outcome) = c.compress_remote("one two three", None);
+        assert_eq!(transport.call_count(), 0, "3 words is still below the clamp");
+        assert_eq!(outcome, RemoteOutcome::TooShort);
     }
 }

@@ -67,7 +67,7 @@ pub struct DeviceAuth {
 }
 
 fn post_json(url: &str, body: &Value) -> Result<Value, Error> {
-    let resp = reqwest::blocking::Client::builder()
+    let resp = headroom_proxy::ssl_context::blocking_client_builder()
         .timeout(Duration::from_secs(10))
         .build()?
         .post(url)

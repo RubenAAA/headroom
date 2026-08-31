@@ -13,10 +13,10 @@
 //!    on top of the default/system trust store, matching Node.js behavior)
 //!
 //! Strict-mode toggle (`HEADROOM_TLS_STRICT`):
-//! Setting `HEADROOM_TLS_STRICT=0` disables strict X.509 verification
-//! flags. Chain validation, signature checks, expiry, and hostname
-//! verification all stay on — this is strictly narrower than disabling
-//! verify. Default is strict (the flag stays set).
+//! The variable is accepted for configuration parity with the Python proxy,
+//! but reqwest's rustls backend has no equivalent to OpenSSL's
+//! `VERIFY_X509_STRICT` flag. Normal chain, signature, expiry, and hostname
+//! validation therefore remains enabled for every value.
 //!
 //! Mirrors Python's `headroom.proxy.ssl_context`.
 
@@ -36,19 +36,11 @@ const TLS_STRICT_OFF_VALUES: &[&str] = &["0", "false", "no", "off"];
 
 /// Whether the `HEADROOM_TLS_STRICT` env var disables strict mode.
 pub fn tls_strict_disabled() -> bool {
-    std::env::var(TLS_STRICT_ENV)
+    let value = std::env::var(TLS_STRICT_ENV)
         .unwrap_or_default()
         .trim()
-        .to_lowercase()
-        .as_str()
-        == "0"
-        || TLS_STRICT_OFF_VALUES.contains(
-            &std::env::var(TLS_STRICT_ENV)
-                .unwrap_or_default()
-                .trim()
-                .to_lowercase()
-                .as_str(),
-        )
+        .to_ascii_lowercase();
+    TLS_STRICT_OFF_VALUES.contains(&value.as_str())
 }
 
 /// Result of CA bundle detection.
@@ -116,45 +108,90 @@ pub fn find_ca_bundle() -> CaBundleResult {
     CaBundleResult::Default
 }
 
-/// Configure a `reqwest::ClientBuilder` with the detected CA bundle.
-///
-/// This is the Rust equivalent of Python's `build_httpx_verify()`.
-/// For both replacement and additive semantics, the custom CA
-/// certificates are added to the trust store via reqwest's API.
-/// reqwest always keeps system roots; the custom CAs are additive
-/// in practice (matching the common corporate-CA deployment pattern).
-pub fn configure_client_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    match find_ca_bundle() {
-        CaBundleResult::Replacement(path) | CaBundleResult::Additive(path) => {
-            match load_certificates_from_file(&path) {
+/// Apply the common CA policy to either reqwest builder flavour. Keeping the
+/// implementation in one macro matters here: async and blocking reqwest use
+/// distinct builder types, but expose the same TLS methods.
+macro_rules! configure_tls_builder {
+    ($builder:expr) => {{
+        let builder = $builder;
+        match find_ca_bundle() {
+            CaBundleResult::Replacement(path) => match load_certificates_from_file(&path) {
                 Ok(certs) => {
-                    let mut b = builder;
+                    // SSL_CERT_FILE / REQUESTS_CA_BUNDLE replace the trust
+                    // store. Without this call reqwest would silently keep its
+                    // built-in WebPKI roots and turn replacement into additive
+                    // semantics.
+                    let mut configured = builder.tls_built_in_root_certs(false);
                     for cert in certs {
-                        b = b.add_root_certificate(cert);
+                        configured = configured.add_root_certificate(cert);
                     }
-                    b
+                    configured
                 }
-                Err(e) => {
+                Err(error) => {
                     tracing::warn!(
-                        error = %e,
+                        %error,
                         path = %path.display(),
-                        "Failed to load additive CA certificates, using default TLS"
+                        semantics = "replacement",
+                        "failed to load CA certificates; using default TLS"
                     );
                     builder
                 }
+            },
+            CaBundleResult::Additive(path) => match load_certificates_from_file(&path) {
+                Ok(certs) => {
+                    let mut configured = builder;
+                    for cert in certs {
+                        configured = configured.add_root_certificate(cert);
+                    }
+                    configured
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        semantics = "additive",
+                        "failed to load CA certificates; using default TLS"
+                    );
+                    builder
+                }
+            },
+            CaBundleResult::Default => {
+                if tls_strict_disabled() {
+                    // rustls has no OpenSSL VERIFY_X509_STRICT flag to clear.
+                    // It keeps chain, signature, expiry, and hostname checks
+                    // enabled, which is the security contract of this toggle.
+                    tracing::info!(
+                        event = "ssl_x509_strict_disabled",
+                        reason = "env_toggle",
+                        "TLS strict compatibility toggle accepted; rustls validation remains enabled"
+                    );
+                }
+                builder
             }
         }
-        CaBundleResult::Default => {
-            if tls_strict_disabled() {
-                tracing::info!(
-                    event = "ssl_x509_strict_disabled",
-                    reason = "env_toggle",
-                    "TLS strict mode disabled via env var"
-                );
-            }
-            builder
-        }
-    }
+    }};
+}
+
+/// Configure an asynchronous reqwest builder with Headroom's CA policy.
+pub fn configure_client_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    configure_tls_builder!(builder)
+}
+
+/// Configure a blocking reqwest builder with Headroom's CA policy.
+pub fn configure_blocking_client_tls(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::blocking::ClientBuilder {
+    configure_tls_builder!(builder)
+}
+
+/// The canonical constructor for every asynchronous outbound HTTP client.
+pub fn client_builder() -> reqwest::ClientBuilder {
+    configure_client_tls(reqwest::Client::builder())
+}
+
+/// The canonical constructor for every blocking outbound HTTP client.
+pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
+    configure_blocking_client_tls(reqwest::blocking::Client::builder())
 }
 
 /// Load PEM-encoded CA certificates from a file.

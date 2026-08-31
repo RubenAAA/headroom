@@ -31,6 +31,22 @@ fn effort_rank(s: &str) -> Option<i32> {
     }
 }
 
+/// The effort the client asked for, if it named one.
+///
+/// Claude Code's `/effort` and `--effort` travel as `output_config.effort` —
+/// `low`, `medium`, `high` or `xhigh` — on every request, including ones for a
+/// routed alias. `thinking` comes alongside as `{"type": "adaptive"}` and
+/// carries no budget, so a reader looking only at `thinking.budget_tokens`
+/// sees nothing and the setting is silently lost.
+pub fn requested_effort(body: &Value) -> Option<&str> {
+    let effort = body
+        .get("output_config")?
+        .get("effort")?
+        .as_str()?
+        .trim();
+    effort_rank(effort).map(|_| effort)
+}
+
 const STEERING_SENTINEL: &str = "<headroom_output_shaping>";
 const STEERING_SUFFIX: &str = "</headroom_output_shaping>";
 
@@ -530,5 +546,45 @@ mod tests {
         let result = shape_request(&mut body, true, 2, true, "low");
         assert!(!result.changed);
         assert_eq!(body, snapshot);
+    }
+}
+
+#[cfg(test)]
+mod requested_effort_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact shape Claude Code 2.1.250 sends for a routed alias, captured
+    /// off the wire: the effort is in `output_config`, and `thinking` is
+    /// adaptive with no budget to read.
+    #[test]
+    fn the_effort_is_read_from_the_shape_claude_code_sends() {
+        let body = json!({
+            "model": "claude-codex-5.6-sol",
+            "max_tokens": 32000,
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "xhigh"},
+        });
+        assert_eq!(requested_effort(&body), Some("xhigh"));
+    }
+
+    #[test]
+    fn a_body_without_an_effort_reports_none() {
+        assert_eq!(requested_effort(&json!({"model": "m"})), None);
+        assert_eq!(requested_effort(&json!({"output_config": {}})), None);
+        assert_eq!(
+            requested_effort(&json!({"output_config": {"format": "json"}})),
+            None
+        );
+    }
+
+    /// An unrecognised level is reported as absent rather than passed on to a
+    /// backend that would reject it.
+    #[test]
+    fn an_unknown_level_is_not_reported() {
+        assert_eq!(
+            requested_effort(&json!({"output_config": {"effort": "turbo"}})),
+            None
+        );
     }
 }

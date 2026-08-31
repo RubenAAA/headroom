@@ -79,8 +79,17 @@ pub(crate) struct AgentTurn {
     /// Cap on a single turn. `None` waits forever, which is only right when
     /// the caller has its own deadline.
     pub timeout: Option<Duration>,
-    /// Restrict the agent's built-in tools to read-only.
-    pub read_only: bool,
+    /// Confine the agent's own shell to Cursor's sandbox.
+    ///
+    /// This used to be `read_only`, which spent `--mode ask` on the job. Ask
+    /// mode is not a tool restriction — the CLI calls it "Q&A style for
+    /// explanations and questions", and it takes the agent out of its own
+    /// loop. The agent then answered every turn with a plan instead of the
+    /// work, said so in its reasoning, and the conversation went in circles.
+    /// The workspace is an empty scratch directory, so the built-in file tools
+    /// have nothing to reach anyway; what needed containing was the shell, and
+    /// `--sandbox` is the flag for that.
+    pub sandbox: bool,
 }
 
 impl AgentTurn {
@@ -98,9 +107,9 @@ impl AgentTurn {
         if self.mcp_url.is_some() {
             args.push("--approve-mcps".into());
         }
-        if self.read_only {
-            args.push("--mode".into());
-            args.push("ask".into());
+        if self.sandbox {
+            args.push("--sandbox".into());
+            args.push("enabled".into());
         }
         if let Some(chat) = &self.resume {
             args.push("--resume".into());
@@ -252,6 +261,30 @@ impl RunningTurn {
     }
 }
 
+/// [`spawn`], retrying the one failure a test stub provokes that says nothing
+/// about the code under test.
+///
+/// Writing an executable opens a window in which a `fork` on another test
+/// thread inherits the descriptor it was written through. The kernel then
+/// refuses to `exec` that inode with `ETXTBSY` until the forked child reaches
+/// its own `exec` and closes the inherited copy. Nothing on this side can
+/// prevent the inheritance, so wait it out.
+#[cfg(test)]
+pub(crate) async fn spawn_stub(
+    binary: &str,
+    turn: &AgentTurn,
+) -> Result<RunningTurn, std::io::Error> {
+    for _ in 0..100 {
+        match spawn(binary, turn).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            other => return other,
+        }
+    }
+    spawn(binary, turn).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +297,7 @@ mod tests {
             prompt: prompt.into(),
             mcp_url: None,
             timeout: None,
-            read_only: false,
+            sandbox: false,
         }
     }
 
@@ -279,19 +312,27 @@ mod tests {
         // Nothing was asked for, so nothing extra is passed.
         assert!(!args.contains(&"--approve-mcps".to_string()));
         assert!(!args.contains(&"--resume".to_string()));
-        assert!(!args.contains(&"--mode".to_string()));
+        assert!(!args.contains(&"--sandbox".to_string()));
+        assert!(
+            !args.contains(&"--mode".to_string()),
+            "ask and plan both take the agent out of its own loop"
+        );
     }
 
     #[test]
-    fn asking_for_mcp_or_resume_or_read_only_adds_exactly_those_flags() {
+    fn asking_for_mcp_or_resume_or_sandbox_adds_exactly_those_flags() {
         let mut t = turn("hi");
         t.mcp_url = Some("http://127.0.0.1:1/mcp".into());
         t.resume = Some("chat-7".into());
-        t.read_only = true;
+        t.sandbox = true;
         let args = t.args();
         assert!(args.contains(&"--approve-mcps".to_string()));
-        assert!(args.contains(&"--mode".to_string()));
-        assert!(args.contains(&"ask".to_string()));
+        assert!(args.contains(&"--sandbox".to_string()));
+        assert!(args.contains(&"enabled".to_string()));
+        assert!(
+            !args.contains(&"--mode".to_string()),
+            "containment must not cost the agent loop"
+        );
         let at = args.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(args[at + 1], "chat-7", "the chat id follows its flag");
     }
@@ -413,7 +454,7 @@ mod tests {
              Do not use any tools.",
         );
         t.workspace = dir.path().to_path_buf();
-        t.read_only = true;
+        t.sandbox = true;
 
         let mut running = spawn("agent", &t).await.expect("agent must be on PATH");
         let mut all = String::new();

@@ -111,6 +111,10 @@ use super::content_router::detect_content_native;
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
+use super::read_protection::{
+    is_read_command, read_output_should_be_protected, read_protection_enabled,
+    tool_call_command_text,
+};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
@@ -426,6 +430,10 @@ pub enum ExclusionReason {
     /// still gets a byte-reversible fold when its shape supports one,
     /// so this reason means "nothing shrank it", not "never touched".
     ExcludedTool,
+    /// Block is the output of a file read (`cat`, `sed -n`, `head`) whose
+    /// content is not confidently data, and `HEADROOM_PROTECT_READS` is on.
+    /// The agent is about to patch these bytes and needs them exactly.
+    ProtectedRead,
 }
 
 /// Aggregated per-request manifest. Always populated, regardless of
@@ -1475,6 +1483,11 @@ enum ToolGuard {
     /// Excluded tool: no lossy compressor, but a self-verified
     /// reversible fold may still shrink it.
     LosslessOnly,
+    /// The tool call was a file read and `HEADROOM_PROTECT_READS` is on.
+    /// Unlike the guards above this one is provisional: it is settled by the
+    /// CONTENT of the result, which the planner only has further down, so it
+    /// does not short-circuit here.
+    ProtectedRead,
 }
 
 /// Map assistant `tool_use` ids to the guard their `tool_result` needs.
@@ -1499,6 +1512,9 @@ enum ToolGuard {
 /// collision risk is accepted rather than special-cased.
 fn collect_tool_guards(messages: &[Value], exclude_tools: &[String]) -> HashMap<String, ToolGuard> {
     let mut guards = HashMap::new();
+    // Read once per request rather than per block: the flag cannot change
+    // mid-walk, and every `tool_use` would otherwise re-read the environment.
+    let protect_reads = read_protection_enabled();
     for msg in messages {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
@@ -1513,14 +1529,24 @@ fn collect_tool_guards(messages: &[Value], exclude_tools: &[String]) -> HashMap<
             ) else {
                 continue;
             };
+            let excluded = is_tool_excluded(name, exclude_tools.iter().map(String::as_str));
             let guard = if is_ccr_retrieve_tool(name) {
                 ToolGuard::CcrRetrieve
-            } else if !is_tool_excluded(name, exclude_tools.iter().map(String::as_str)) {
-                continue;
-            } else if is_verbatim_excluded(name) {
+            } else if excluded && is_verbatim_excluded(name) {
                 ToolGuard::Verbatim
-            } else {
+            } else if protect_reads
+                && block
+                    .get("input")
+                    .is_some_and(|input| is_read_command(&tool_call_command_text(input)))
+            {
+                // Ahead of `LosslessOnly`: a fold is reversible for us, but the
+                // agent reads the folded form and patches from it, so a read has
+                // to reach the model as the bytes the file actually holds.
+                ToolGuard::ProtectedRead
+            } else if excluded {
                 ToolGuard::LosslessOnly
+            } else {
+                continue;
             };
             guards.insert(id.to_string(), guard);
         }
@@ -1675,9 +1701,10 @@ fn plan_block_replacements(
                 });
                 continue;
             }
-            Some(ToolGuard::LosslessOnly) | None => {}
+            Some(ToolGuard::LosslessOnly) | Some(ToolGuard::ProtectedRead) | None => {}
         }
         let lossless_only = tool_guard == Some(ToolGuard::LosslessOnly);
+        let protected_read = tool_guard == Some(ToolGuard::ProtectedRead);
 
         if HOT_ZONE_BLOCK_TYPES.iter().any(|t| *t == block_type) {
             slots.push(PlanSlot {
@@ -1771,6 +1798,20 @@ fn plan_block_replacements(
 
         let inner_field_start_in_body = block_offset_in_body + inner_field_offset_in_block;
         let inner_field_end_in_body = inner_field_start_in_body + inner_field_str.len();
+
+        // The command said this was a file read; the content decides whether it
+        // is protected. Data — a JSON array, a diff, a build log — goes back to
+        // its own compressor, because nobody patches those byte for byte.
+        if protected_read && read_output_should_be_protected(&unescaped) {
+            slots.push(PlanSlot {
+                block_index: block_idx,
+                kind: SlotKind::Excluded {
+                    block_type,
+                    reason: ExclusionReason::ProtectedRead,
+                },
+            });
+            continue;
+        }
 
         let content_byte_range = (inner_field_start_in_body, inner_field_end_in_body);
         slots.push(PlanSlot {
@@ -3728,14 +3769,39 @@ pub fn compress_openai_responses_live_zone(
     // after parallel local commands; compressing only the last one
     // leaves large same-frame payloads untouched.
     let mut headroom_retrieve_call_ids: HashSet<&str> = HashSet::new();
+    // Calls whose output is a file read the agent will patch from. Codex runs
+    // shell commands two ways — as a `function_call` carrying JSON arguments,
+    // and as its native `local_shell_call` carrying an `action` — so both
+    // shapes have to be read or protection covers only half the harness.
+    let protect_reads = read_protection_enabled();
+    let mut read_command_call_ids: HashSet<&str> = HashSet::new();
+    let mut verbatim_tool_call_ids: HashSet<&str> = HashSet::new();
     for item in items {
-        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        let type_tag = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if type_tag == "function_call" {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                if name == "headroom_retrieve" || name.ends_with("__headroom_retrieve") {
+                    headroom_retrieve_call_ids.insert(call_id);
+                }
+                if is_verbatim_excluded(name) {
+                    verbatim_tool_call_ids.insert(call_id);
+                }
+            }
+        }
+        if !protect_reads {
             continue;
         }
-        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-        if name == "headroom_retrieve" || name.ends_with("__headroom_retrieve") {
-            if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
-                headroom_retrieve_call_ids.insert(call_id);
+        let command = match type_tag {
+            "function_call" => item.get("arguments").map(tool_call_command_text),
+            "local_shell_call" => item.get("action").map(tool_call_command_text),
+            _ => None,
+        };
+        if let (Some(command), Some(call_id)) =
+            (command, item.get("call_id").and_then(Value::as_str))
+        {
+            if is_read_command(&command) {
+                read_command_call_ids.insert(call_id);
             }
         }
     }
@@ -3817,6 +3883,42 @@ pub fn compress_openai_responses_live_zone(
                     content_type: "output_item",
                     byte_count: slot.content_text.len(),
                     threshold_bytes: RESPONSES_OUTPUT_MIN_BYTES,
+                },
+            });
+            continue;
+        }
+        // The command said this was a file read; the content settles it. Data
+        // goes back to its own compressor — nobody patches a build log byte
+        // for byte.
+        let is_protected_read = items
+            .get(msg_idx)
+            .and_then(|item| item.get("call_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| read_command_call_ids.contains(id))
+            && read_output_should_be_protected(&slot.content_text);
+        if is_protected_read {
+            block_outcomes.push(BlockOutcome {
+                message_index: msg_idx,
+                block_index: slot.block_index,
+                block_type: slot.block_type.clone(),
+                action: BlockAction::Excluded {
+                    reason: ExclusionReason::ProtectedRead,
+                },
+            });
+            continue;
+        }
+        let is_verbatim_tool = items
+            .get(msg_idx)
+            .and_then(|item| item.get("call_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| verbatim_tool_call_ids.contains(id));
+        if is_verbatim_tool {
+            block_outcomes.push(BlockOutcome {
+                message_index: msg_idx,
+                block_index: slot.block_index,
+                block_type: slot.block_type.clone(),
+                action: BlockAction::Excluded {
+                    reason: ExclusionReason::ExcludedTool,
                 },
             });
             continue;

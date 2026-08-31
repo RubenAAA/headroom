@@ -293,6 +293,215 @@ keeping four generations.
   them the same way: every `ccr_inject_marker=False` call site also passes
   `ccr_enabled=False`.
 
+## 9. Round of 2026-08-28 — upstream `32d7ca45..` (v0.36.2..v0.37.0, 40 commits)
+
+Merged at `78240da9`. Twelve commits touch no Python source (CI bumps, docs, a
+Windows process-tree fix). Of the 28 that do, sixteen patch subsystems Rust
+does not have — `wrap`, `learn`, `doctor`, the dashboard, MCP/Serena,
+`session_engine`, the `/v1/compress` sidecar, the memory graph adapter, Copilot
+provider routing — so they are a scoping question, not a gap. Two are answered
+by the Rust design and are covered in 9.3 below. Every Rust-applicable gap
+identified in this round is now ported.
+
+Ported this round, committed 2026-09-01 and untested against production:
+`27b4e2d1` (proxy token on every route and transport, `proxy_auth.rs`),
+`7c0b8860` and the resolve-timeout half of `3e3c4094` (`upstream_guard.rs`),
+`b9d7dcc3` (atomic ledger write, and the flush moved to `spawn_blocking`),
+`9c30b629` (cross-turn dedup skipped on streaming chat), `8884d873` (the
+64-word Kompress floor), `7784bb18` (datetime-prefixed prompts no longer typed
+as grep output), `4408e881` (`HEADROOM_PROTECT_READS`, including Copilot
+`view` and both local-shell wire shapes), `25ca5808` + `1617f839` (Codex
+`additional_tools` lift/restore), and `36cc8001` (corporate CA trust on every
+outbound reqwest client). The caller-supplied upstream property from
+`3e3c4094` is enforced at the connection boundary too: the approved DNS answer
+set is pinned into the reqwest transport that performs the request.
+
+Two commits look like gaps and are not. `split_into_sections` and
+`extract_json_block` (`content_router.rs:1105`, `:1154`) carry the pre-fix
+bracket-counting bug from `8884d873`, but neither has a caller outside its own
+tests, so nothing reaches it. Verify with
+`grep -rn 'split_into_sections\|extract_json_block' crates/ --include=*.rs`
+before spending time there.
+
+### 9.1 Codex `additional_tools` — DONE (2026-08-28)
+
+Implemented a shared lift/restore plan in
+`crates/headroom-proxy/src/handlers/responses.rs`. The HTTP Responses funnel
+lifts after read-only identity/semantic-cache observers and before every tool
+consumer, then restores before wire accounting, retries, continuations, and
+send. The dedicated Codex WebSocket compressor uses the same helpers, so a
+stateful session retains its transcript-owned tools. Restore is idempotent,
+keeps carrier-relative positions, falls back to the original definitions if a
+consumer empties `tools`, and warns/fails open if restoration cannot be
+completed. `HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=0` accepts the same false
+spellings as Python.
+
+Coverage includes pure multi-carrier lift/restore cases, classic top-level
+tools no-op, the opt-out parser, a stateful WebSocket frame, and an HTTP
+integration test proving the tools are internally normalized and leave the
+proxy back in `additional_tools` form.
+
+<details><summary>Original scoping notes</summary>
+
+Upstream `25ca5808` (the lift) and `1617f839` (the restore, which fixes the
+regression the lift caused). `grep -rn additional_tools crates/ --include=*.rs`
+is empty.
+
+Codex CLI 0.149.0 stopped sending a top-level `tools` array on `/v1/responses`
+for the models its capability cache flags, `gpt-5.6-sol` among them. The
+definitions ride inside `input` as items of type `additional_tools`. Every
+tools consumer downstream — schema compaction, the output-shaper stratum,
+tools token accounting — reads `payload["tools"]` and nothing else, so those
+requests classify as "notools" and record zero tool-schema savings while
+forwarding correctly. Nobody sees an error; the savings just stop.
+
+The shape of the fix, from `headroom/proxy/handlers/openai.py:794` and `:872`:
+
+1. **Lift**, before shaping and compression. No-op when `tools` is already
+   present, so classic-encoding clients are untouched and a future Codex
+   reverting the change costs nothing. Concatenate each carrier's `tools` into
+   a top-level array, drop the carriers from `input`, and record a restore plan
+   holding each carrier's index *among the items that survive the lift* — not
+   its original index. Compression rewrites the transcript, and the relative
+   slot is what stays valid.
+2. **Restore**, immediately before forwarding. This is the part `1617f839` had
+   to add after `25ca5808` shipped alone. `tools` is a per-request parameter;
+   `additional_tools` is an `input` item and therefore part of the transcript.
+   A stateful session — the Codex TUI or app-server over WebSocket — declares
+   its tools once and relies on the transcript afterwards, so forwarding the
+   lifted shape leaves turn one working and every later turn without shell or
+   filesystem access. Stateless HTTP hid this, which is why it shipped.
+   The restore must be idempotent: return early when any carrier already
+   holds tools, or a second pass duplicates every definition.
+3. Log a warning when a restore plan exists and the restore fails. That case
+   forwards the lifted shape and will cost a stateful client its tools, so it
+   must never pass quietly.
+4. Both steps wrapped so a failure never breaks forwarding, and the plan kept
+   on the failure path — if the lift raised after mutating the payload, the
+   restore is what undoes it.
+
+Env opt-out `HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=0`, checked only after the
+carrier is found so the flag costs nothing on the common path.
+
+Rust seam: `crates/headroom-proxy/src/handlers/responses.rs:75`
+(`handle_responses`) for the lift, and the forwarding point in the same
+function for the restore. The compression funnel it feeds already exists.
+Upstream's tests are in `tests/test_openai_responses_additional_tools.py` and
+port directly.
+
+</details>
+
+### 9.2 Corporate CA trust — DONE (2026-08-28)
+
+All production async and blocking reqwest builders now start from the
+TLS-aware constructors in `ssl_context.rs`: the main proxy upstream, ctx
+fetch, Copilot device auth, CLI tools download, CLI client, and subscription
+tracker. `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` now have actual replacement
+semantics (`tls_built_in_root_certs(false)`); `NODE_EXTRA_CA_CERTS` remains
+additive. A source-wiring integration test rejects any future direct reqwest
+builder outside `ssl_context.rs`.
+
+<details><summary>Original scoping notes</summary>
+
+Upstream `36cc8001` made Copilot's token refresh honor a corporate CA bundle.
+The Rust side has the harder half already: `ssl_context.rs:126`
+`configure_client_tls` reads `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` as
+replacements and `NODE_EXTRA_CA_CERTS` as an additive bundle, and handles
+`HEADROOM_TLS_STRICT`. It has **zero callers**:
+
+```
+grep -rn configure_client_tls crates/ --include=*.rs
+```
+
+returns only the definition. Every outbound client builds its own TLS:
+
+| Client | Site |
+|---|---|
+| main proxy upstream | `proxy.rs:261` |
+| a second proxy client | `proxy.rs:11221` |
+| ctx fetch | `ctx/fetch.rs:205` |
+| Copilot device auth | `bin/headroom_cli/copilot_auth.rs:70` |
+| CLI tools fetch | `bin/headroom_cli/tools.rs:338` |
+| CLI | `bin/headroom_cli.rs:365` |
+| subscription tracker | `subscription.rs:29` |
+
+Behind a TLS-inspecting corporate proxy every one of these fails, and the
+symptom is a certificate error from whichever ran first. The work is small —
+route each builder through `configure_client_tls` — but it is seven sites, and
+each needs a look at whether it should trust the operator's bundle. The three
+CLI ones talk to GitHub and the tools registry, so probably yes. Worth a test
+that fails if a new `reqwest::Client::builder()` appears without it; otherwise
+the eighth site will skip it too.
+
+</details>
+
+### 9.3 Caller-supplied upstreams — DONE (2026-08-28)
+
+The guard now reaches the connection boundary rather than stopping at a URL
+wrapper. `ResolvedCallerUpstream` carries the original hostname URL plus the
+exact `SocketAddr` set returned by its bounded DNS lookup; every answer is
+rejected if any one points inward unless the operator explicitly allowlisted
+the destination. `forward_http` builds/selects a caller-only reqwest transport
+with `resolve_to_addrs`, so Host/TLS SNI retain the hostname while the connector
+can use only those approved addresses. That closes the validate-then-resolve
+DNS-rebinding window.
+
+Caller-selected transports disable ambient/provider proxies and automatic
+redirect following, and every retry, streamed retry, CCR/memory continuation,
+and turn-hook re-drive keeps the selected transport. A bounded 128-entry cache
+keyed by hostname plus the complete approved address set preserves connection
+pooling without letting a later DNS answer reuse the earlier transport.
+Coverage includes loopback/metadata rejection, mixed-answer rejection,
+transition-address cases, hostname-based pinned routing, redirect refusal, and
+provider-proxy bypass.
+
+<details><summary>Original scoping notes</summary>
+
+`3e3c4094` closed an SSRF where some resolution paths validated a
+caller-supplied upstream and others did not. Upstream's answer was to move the
+guard into the resolution helpers themselves — `proxy_routes.py`,
+`proxy_targets.py`, `registry.py` all switched to
+`is_safe_upstream_url_async`, so a path cannot resolve without validating.
+
+Rust does not have this bug. `header_upstream_override` (`proxy.rs:2360`) has
+exactly one call site (`:2513`), and `is_safe_upstream_url` runs on it at
+`:2519`. The WebSocket path never reads `x-headroom-base-url` at all:
+`websocket.rs` builds its upstream from `state.config.upstream`. The only
+other `UpstreamOverride` setter, `foundry/mod.rs:152`, comes from operator
+config rather than caller input. The related Vertex SSRF (`7c0b8860`) misses
+Rust for the same kind of reason — the proxy never builds a regional hostname
+from `location`, it joins a path onto the base the operator configured
+(`config.rs:1049`).
+
+So there is nothing to fix. What there is, is a gap between how the two
+codebases hold the property. Python enforces it: skipping the guard means not
+resolving. Rust achieves it by having one call site that happens to be
+correct, and nothing stops a second one appearing. The header is caller-
+controlled, the guard is a free function, and the reviewer who adds the next
+override path has to know to call it.
+
+Two ways to close that, in rising cost:
+
+- A test that asserts `header_upstream_override` has one caller and it is
+  guarded. Cheap, and it fails loudly when someone adds the second.
+- Make the guard structural: have the override return a type that can only be
+  built by passing through `is_safe_upstream_url`, so an unvalidated upstream
+  cannot be expressed. Larger, and it ends the class rather than the instance.
+
+The timeout half of `3e3c4094` is already ported: `RESOLVE_TIMEOUT` (5s) wraps
+`lookup_host` in `upstream_guard.rs` and logs
+`upstream_guard_resolve_timeout`, matching Python's bounded `getaddrinfo`.
+
+</details>
+
+### 9.4 Completion verification
+
+`cargo test -p headroom-core --lib --tests`: 2056 passed, 2 ignored, plus all
+core integration binaries green. `cargo test -p headroom-proxy --lib --tests`:
+1794 library tests passed, 1 ignored, plus every proxy integration binary green
+(only explicitly live-store/operator-data tests ignored). `cargo check -p headroom-proxy
+--all-targets` and `git diff --check` are green.
+
 ## Notes on methodology (for whoever picks this up)
 
 - Cross-checked every item against **all** branches in the repo (not just

@@ -377,7 +377,26 @@ pub(crate) async fn handle_rpc(session: &Session, request: &Value) -> Option<Val
             "serverInfo": {"name": "headroom", "version": env!("CARGO_PKG_VERSION")},
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": session.mcp_tools().await})),
+        "tools/list" => {
+            let tools = session.mcp_tools().await;
+            // An empty list here is the failure the model reports as
+            // "discovery returned nothing", and it was previously invisible:
+            // the cursor path logged neither what it registered nor what it
+            // served, so the symptom could only be guessed at.
+            if tools.is_empty() {
+                tracing::warn!(
+                    event = "cursor_mcp_tools_empty",
+                    "the agent asked for the host tools and there were none to give it"
+                );
+            } else {
+                tracing::debug!(
+                    event = "cursor_mcp_tools_listed",
+                    count = tools.len(),
+                    "served the host tool list to the agent"
+                );
+            }
+            Ok(json!({"tools": tools}))
+        }
         "tools/call" => {
             let name = request
                 .pointer("/params/name")
@@ -391,6 +410,11 @@ pub(crate) async fn handle_rpc(session: &Session, request: &Value) -> Option<Val
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                tracing::info!(
+                    event = "cursor_mcp_tool_call",
+                    tool = %name,
+                    "agent called a host tool"
+                );
                 Ok(session.park(&name, args).await.to_mcp_result())
             }
         }
@@ -595,39 +619,61 @@ mod tests {
         assert_eq!(session.chat_id().await.as_deref(), Some("cf8812c0"));
     }
 
-    use super::super::agent::{spawn, AgentTurn, Workspace};
+    use super::super::agent::{spawn_stub, AgentTurn, Workspace};
     use super::super::turn::Conversation;
 
     /// A driver whose agent sits doing nothing, so it can be parked and reaped
     /// without the test depending on a real CLI.
+    /// A stub agent that reads its prompt and then idles, written once per
+    /// test process.
+    ///
+    /// Once, and kept, because it is a `#!/bin/sh` script: the kernel execs
+    /// `/bin/sh` with the path, and `sh` opens that path *by name*. A
+    /// per-driver `TempDir` dropped as soon as the helper returned took the
+    /// script with it, and the child died on "cannot open .../stub" — the
+    /// inode stays alive for a binary exec'd directly, not for a shebang.
+    /// Writing it once also narrows the `ETXTBSY` window to a single write per
+    /// process; [`spawn_stub`] covers what is left of it.
+    fn stub_agent() -> std::path::PathBuf {
+        static STUB: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = STUB.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let stub = dir.path().join("stub");
+            std::fs::write(&stub, "#!/bin/sh\ncat > /dev/null\nsleep 300\n").expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+            dir
+        });
+        dir.path().join("stub")
+    }
+
     async fn idle_driver(bridge: &Bridge, key: &str) -> Conversation {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let stub = dir.path().join("stub");
-        std::fs::write(&stub, "#!/bin/sh\ncat > /dev/null\nsleep 300\n").expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
+        let stub = stub_agent();
+        // The workspace outlives the child because the `Conversation` holds
+        // it, which is the order production uses too (`handler.rs`). Spawning
+        // into a directory already deleted left every stub shouting
+        // "getcwd() failed" across the test output.
+        let workspace = Workspace::create(None).expect("workspace");
         let (session, inbox) = bridge.open(key).await;
-        let running = spawn(
+        let running = spawn_stub(
             stub.to_str().unwrap(),
             &AgentTurn {
                 model: "m".into(),
-                workspace: dir.path().to_path_buf(),
+                workspace: workspace.path().to_path_buf(),
                 resume: None,
                 prompt: "hi".into(),
                 mcp_url: None,
                 timeout: None,
-                read_only: true,
+                sandbox: true,
             },
         )
         .await
         .expect("spawn");
-        // Safe to drop now: the child is already exec'd, and on Unix the kernel
-        // holds the inode open whatever happens to the directory entry.
-        drop(dir);
-        Conversation::new(session, inbox, running, Workspace::create(None).expect("workspace"))
+        Conversation::new(session, inbox, running, workspace)
     }
 
     /// A conversation abandoned mid-tool leaves a live agent process behind.

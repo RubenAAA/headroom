@@ -335,7 +335,7 @@ fn download(url: &str, dest: &Path) -> Result<(), Error> {
         ))
         .into());
     }
-    let mut resp = reqwest::blocking::Client::builder()
+    let mut resp = headroom_proxy::ssl_context::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?
         .get(&final_url)

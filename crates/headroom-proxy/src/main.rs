@@ -211,6 +211,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
+    // Binding a non-loopback interface with no token leaves every `/v1/*`
+    // route reachable from the surrounding network — the shape the 0.0.0.0
+    // container image has by default. Say so at boot, where an operator will
+    // see it, rather than leaving it to be discovered.
+    if config.proxy_token.is_none()
+        && !headroom_proxy::loopback_guard::is_loopback_host(Some(
+            &config.listen.ip().to_string(),
+        ))
+    {
+        tracing::warn!(
+            event = "proxy_open_bind",
+            host = %config.listen.ip(),
+            "bound to a non-loopback interface with no HEADROOM_PROXY_TOKEN; \
+             the /v1/* routes are reachable WITHOUT authentication"
+        );
+    }
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
