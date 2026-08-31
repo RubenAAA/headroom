@@ -8948,6 +8948,14 @@ pub(crate) async fn handle_memory_response(
                 "memory: retrieval round cap reached with calls outstanding; \
                  raise HEADROOM_CCR_MAX_RETRIEVAL_ROUNDS"
             );
+            // The log says it to the operator; the trace says it to the model,
+            // which otherwise writes its answer as if the lookup had happened.
+            for name in pending_memory_call_names(&current_response, memory.provider) {
+                trace.push(format!(
+                    "{name} → not run: retrieval round cap ({}) reached",
+                    config.ccr_max_retrieval_rounds
+                ));
+            }
         }
     }
 
@@ -9037,6 +9045,22 @@ fn pair_results_with_calls(
 /// had in fact run, all of which the `memory_tool_call` log recorded. These
 /// lines are the receipt: short enough to carry every turn, specific enough to
 /// check against that log.
+/// Names of the memory calls still unanswered in `response`, in call order.
+fn pending_memory_call_names(
+    response: &serde_json::Value,
+    provider: crate::memory::tool_adapter::Provider,
+) -> Vec<String> {
+    crate::memory::tool_adapter::extract_tool_calls(response, provider)
+        .into_iter()
+        .filter_map(|call| {
+            call.get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| crate::memory::tool_adapter::MEMORY_TOOL_NAMES.contains(name))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 fn memory_trace_lines(
     response: &serde_json::Value,
     results: &[serde_json::Value],
@@ -9112,7 +9136,7 @@ fn memory_trace_lines(
 
 #[cfg(test)]
 mod memory_trace_tests {
-    use super::memory_trace_lines;
+    use super::{memory_trace_lines, pending_memory_call_names};
     use crate::memory::tool_adapter::Provider;
     use serde_json::json;
 
@@ -9221,6 +9245,25 @@ mod memory_trace_tests {
         let lines = memory_trace_lines(&response, &results, Provider::Anthropic);
         assert!(lines[0].starts_with("memory_search(\"Ünicode"), "{lines:?}");
         assert!(lines[0].ends_with("…\") → 0 results"), "{lines:?}");
+    }
+
+    #[test]
+    fn pending_names_lists_only_unrun_memory_tools() {
+        let response = json!({"content": [
+            call("t1", "memory_search", json!({"query": "hosts"})),
+            call("t2", "Read", json!({"file_path": "/tmp/x"})),
+            call("t3", "memory_save", json!({"content": "a fact"})),
+        ]});
+        assert_eq!(
+            pending_memory_call_names(&response, Provider::Anthropic),
+            vec!["memory_search".to_string(), "memory_save".to_string()],
+        );
+    }
+
+    #[test]
+    fn pending_names_is_empty_without_memory_calls() {
+        let response = json!({"content": [call("t1", "Read", json!({"file_path": "/tmp/x"}))]});
+        assert!(pending_memory_call_names(&response, Provider::Anthropic).is_empty());
     }
 }
 

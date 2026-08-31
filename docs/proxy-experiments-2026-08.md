@@ -417,6 +417,9 @@ savings on every request. That is an owner's decision, not a defect to fix.
   — most subagent traffic — would otherwise never hear from the detector.
   Suppressing the first sighting too was tried and dropped for that reason.
   Memory is a bounded LRU, 256 conversations by 64 locations.
+  *Superseded 2026-09-01:* the first sighting reports at INFO as
+  `volatile_content_suspected` and no longer warns. See item 1 of
+  `TODO-proxy-followups.md` for the measurement that forced it.
 - **6 (fix):** a turn that fails upstream still skips the savings, cost and PERF
   sinks — a failed request must not inflate the save-rate — but it no longer
   leaves *no* trace. `emit_request_outcome` emits `request_failed_accounting`

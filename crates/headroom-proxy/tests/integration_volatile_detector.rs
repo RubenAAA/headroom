@@ -4,9 +4,10 @@
 //! request whose system prompt embeds an ISO-8601 timestamp, then
 //! asserts that:
 //!
-//!   1. A structured `volatile_content_detected` WARN log was
+//!   1. A structured `volatile_content_suspected` INFO log was
 //!      emitted (captured via a `tracing_subscriber` JSON layer
-//!      with an in-memory `MakeWriter`).
+//!      with an in-memory `MakeWriter`), and that a first sighting
+//!      does not claim a cache bust it has no evidence for.
 //!   2. The bytes that arrived at the upstream are byte-equal to
 //!      the bytes the client sent — the detector observes only,
 //!      it never mutates.
@@ -75,9 +76,10 @@ mod tracing_capture {
             let subscriber = tracing_subscriber::fmt()
                 .json()
                 .with_writer(writer)
-                // WARN gives us volatile_content_detected without
-                // flooding the buffer with INFO/DEBUG noise.
-                .with_max_level(tracing::Level::WARN)
+                // INFO gives us volatile_content_suspected (a first
+                // sighting) as well as the WARN a confirmed change
+                // would emit, without DEBUG noise.
+                .with_max_level(tracing::Level::INFO)
                 .finish();
             // Best-effort install: tests in other binaries may have
             // already set a default subscriber. We only need *some*
@@ -98,7 +100,7 @@ mod tracing_capture {
         let proxy = start_proxy_with(&upstream.uri(), |c| {
             c.compression = true;
             c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
-            c.log_level = "warn".into();
+            c.log_level = "info".into();
         })
         .await;
 
@@ -124,9 +126,17 @@ mod tracing_capture {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let logs = String::from_utf8(buf.lock().unwrap().clone()).expect("logs are utf-8");
+        // A first sighting is a suspicion, not a confirmed bust: nothing has
+        // been seen twice yet, so nothing can be said to have changed. WARN is
+        // reserved for a value observed to move (unit-tested in
+        // `volatile_detector::change_suppression_tests`).
         assert!(
-            logs.contains("volatile_content_detected"),
-            "expected volatile_content_detected event in logs; got: {logs}",
+            logs.contains("volatile_content_suspected"),
+            "expected volatile_content_suspected event in logs; got: {logs}",
+        );
+        assert!(
+            !logs.contains("volatile_content_detected"),
+            "a first sighting must not claim a cache bust; got: {logs}",
         );
         assert!(
             logs.contains("iso8601_timestamp"),

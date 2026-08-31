@@ -195,13 +195,12 @@ fn sample_digest(sample: &str) -> u64 {
 /// placeholder UUID in a tool docstring. Static text cannot bust a cache, and
 /// at 7 warnings per request the noise was burying the findings that matter.
 ///
-/// A location's first sighting still warns: nothing has been observed to
-/// contradict it yet, and the warning is how a customer learns their prompt
-/// carries volatile-shaped content at all. That leaves roughly one warning per
-/// site per conversation instead of one per site per request — on the measured
-/// window, 37 in place of 4,004. Silencing the first sighting too was tried and
-/// dropped: it makes the detector invisible on any conversation that only ever
-/// sends one request, which is most subagent traffic.
+/// A location's first sighting is still reported, at INFO rather than WARN, so
+/// a customer can still learn their prompt carries volatile-shaped content.
+/// Silencing it outright was tried and dropped: it makes the detector invisible
+/// on any conversation that only ever sends one request, which is most subagent
+/// traffic. Leaving it at WARN was also wrong — see [`emit_one`] for the
+/// measurement. WARN now means the value was seen to move.
 pub fn emit_volatile_warnings(
     findings: &[VolatileFinding],
     request_id: &str,
@@ -212,12 +211,14 @@ pub fn emit_volatile_warnings(
     // change check cannot run and every finding is reported as before.
     let Some(conversation) = conversation_key.filter(|c| !c.is_empty()) else {
         for finding in findings {
+            // No conversation means no second sighting can ever arrive, so the
+            // verdict stays open rather than being asserted as a change.
             emit_one(
                 finding,
                 request_id,
                 session_key_hash,
                 conversation_key,
-                true,
+                None,
             );
         }
         return;
@@ -281,27 +282,36 @@ pub fn emit_volatile_warnings(
         )) {
             continue;
         }
-        // Warn unless this location is known to be holding still. A first
-        // sighting (`None`) has nothing to contradict it, so it warns.
-        let unchanged = matches!(verdicts.get(finding.location.as_str()), Some(Some(false)));
+        let verdict = verdicts.get(finding.location.as_str()).copied().flatten();
         emit_one(
             finding,
             request_id,
             session_key_hash,
             conversation_key,
-            !unchanged,
+            verdict,
         );
     }
 }
 
+/// `verdict` is the three-way answer to "did this location move?":
+/// `Some(true)` it changed, `Some(false)` it held still, `None` nothing to
+/// compare against yet.
+///
+/// Only a confirmed change warns. A first sighting reports at INFO, because it
+/// is a suspicion and the live logs say most suspicions are wrong: measured
+/// 2026-08-31, 81 locations were seen with more than one sample and every one
+/// of those samples came from a single request — a block holding several dates,
+/// not a value churning between turns. Not one location was ever observed
+/// changing. Warning on the suspicion put 589 lines a day at WARN with nothing
+/// behind them, which buries the confirmed case this detector exists to find.
 fn emit_one(
     finding: &VolatileFinding,
     request_id: &str,
     session_key_hash: Option<&str>,
     conversation_key: Option<&str>,
-    changed: bool,
+    verdict: Option<bool>,
 ) {
-    if changed {
+    if verdict == Some(true) {
         tracing::warn!(
             event = "volatile_content_detected",
             request_id = %request_id,
@@ -313,6 +323,19 @@ fn emit_one(
             "volatile content in cached prefix will bust prompt-cache hits; \
              move per-request IDs/timestamps to message metadata or post-prefix \
              fields"
+        );
+    } else if verdict.is_none() {
+        tracing::info!(
+            event = "volatile_content_suspected",
+            request_id = %request_id,
+            session_key_hash = session_key_hash.unwrap_or(""),
+            conversation_key = conversation_key.unwrap_or(""),
+            kind = finding.kind.as_str(),
+            location = %finding.location,
+            sample = %finding.sample,
+            "volatile-shaped content in the cached prefix, not yet seen twice; \
+             it only busts the cache if it changes, which the next request on \
+             this conversation will settle"
         );
     } else {
         tracing::debug!(
@@ -967,6 +990,11 @@ mod change_suppression_tests {
         lines.iter().filter(|l| l.starts_with("WARN")).count()
     }
 
+    /// First sightings: reported, but not as a fault.
+    fn suspicions(lines: &[String]) -> usize {
+        lines.iter().filter(|l| l.starts_with("INFO")).count()
+    }
+
     /// The measured case: 4,004 of 4,004 live warnings came from values that
     /// never changed on their conversation. Re-sending one must go quiet after
     /// the first sighting.
@@ -980,8 +1008,13 @@ mod change_suppression_tests {
         });
         assert_eq!(
             warnings(&lines),
+            0,
+            "a value that never moved is not a cache bust: {lines:?}"
+        );
+        assert_eq!(
+            suspicions(&lines),
             1,
-            "the first sighting warns; the four identical repeats do not: {lines:?}"
+            "the first sighting is still reported once: {lines:?}"
         );
     }
 
@@ -1002,8 +1035,12 @@ mod change_suppression_tests {
                 Some("conv-churn"),
             );
         });
-        // One for the first sighting, one for the change itself.
-        assert_eq!(warnings(&lines), 2, "the change must warn: {lines:?}");
+        assert_eq!(
+            warnings(&lines),
+            1,
+            "the change itself must warn, and only it: {lines:?}"
+        );
+        assert_eq!(suspicions(&lines), 1, "the first sighting: {lines:?}");
     }
 
     /// One docstring holding several example timestamps arrives as several
@@ -1023,6 +1060,11 @@ mod change_suppression_tests {
         });
         assert_eq!(
             warnings(&lines),
+            0,
+            "three dates in one block are not three changes: {lines:?}"
+        );
+        assert_eq!(
+            suspicions(&lines),
             3,
             "three first sightings, then the identical re-send is silent: {lines:?}"
         );
@@ -1046,8 +1088,13 @@ mod change_suppression_tests {
         });
         assert_eq!(
             warnings(&lines),
-            3,
-            "a first sighting each, plus conv-b1's change; a shared verdict              would have silenced r2: {lines:?}"
+            1,
+            "only conv-b1's change warns: {lines:?}"
+        );
+        assert_eq!(
+            suspicions(&lines),
+            2,
+            "a first sighting each; a shared verdict would have silenced r2: {lines:?}"
         );
     }
 
@@ -1060,6 +1107,11 @@ mod change_suppression_tests {
             emit_volatile_warnings(&f, "r1", None, None);
             emit_volatile_warnings(&f, "r2", None, Some(""));
         });
-        assert_eq!(warnings(&lines), 2, "no key means no evidence: {lines:?}");
+        assert_eq!(
+            warnings(&lines),
+            0,
+            "no key means no evidence of a change: {lines:?}"
+        );
+        assert_eq!(suspicions(&lines), 2, "both are still reported: {lines:?}");
     }
 }

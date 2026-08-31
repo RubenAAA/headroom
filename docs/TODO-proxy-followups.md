@@ -14,6 +14,20 @@ constant-valued — and **every constant group fired exactly once**. Zero repeat
 warnings. What is left is one first-sighting per location, which is the
 documented floor: nothing has been observed yet, so nothing can be compared.
 
+**Amended 2026-09-01.** That floor was still too loud, and worse, it was
+saying something it could not know. Over the process that started 2026-08-30:
+589 warnings, 81 locations seen with more than one sample — and every one of
+those samples came from a *single request*, a block holding several dates.
+Grouped by `request_id`, not one location was ever observed changing between
+turns. So every warning in that window was an unconfirmed first sighting
+calling itself `volatile_content_detected`.
+
+First sightings now report at INFO as `volatile_content_suspected`, and WARN
+means the value was seen to move. The 2026-08-26 reason for keeping the first
+sighting holds — a one-request conversation must still hear something — but it
+is answered by the INFO line, not by a warning. The proxy runs at
+`--log-level info`, so nothing is lost.
+
 The residue is a `uuid_v4` inside `tool_result` content, and it reads as a new
 group each time only because the location carries the message index
 (`messages[9]`, `messages[15]`, `messages[21]`). Tightening that further means
