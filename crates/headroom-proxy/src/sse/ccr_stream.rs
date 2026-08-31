@@ -417,14 +417,16 @@ enum DropReason {
     UnresolvedProxyTool = 0,
     ContinuationThinking = 1,
     AlreadyStreamed = 2,
+    DeferredMemoryAnswer = 3,
 }
 
 impl DropReason {
     /// Indexed by the discriminant, so `ALL[r as usize] == r`.
-    const ALL: [DropReason; 3] = [
+    const ALL: [DropReason; 4] = [
         DropReason::UnresolvedProxyTool,
         DropReason::ContinuationThinking,
         DropReason::AlreadyStreamed,
+        DropReason::DeferredMemoryAnswer,
     ];
 
     fn label(self) -> &'static str {
@@ -432,14 +434,55 @@ impl DropReason {
             Self::UnresolvedProxyTool => "unresolved_proxy_tool",
             Self::ContinuationThinking => "continuation_thinking",
             Self::AlreadyStreamed => "already_streamed",
+            Self::DeferredMemoryAnswer => "deferred_memory_answer",
         }
     }
+}
+
+/// What to tell the user when the splice leaves a turn with nothing in it.
+///
+/// Naming the wrong cause is worse than naming none: someone reading "context
+/// retrieval" goes looking at the retrieval machinery, which in most of these
+/// turns did nothing wrong. So the message names the tool that was actually
+/// dropped, and says nothing about retrieval when no retrieval was dropped.
+fn empty_turn_text(unresolved_tool: Option<&str>) -> String {
+    match unresolved_tool {
+        Some(name) => format!(
+            "The proxy could not run `{name}` for this turn, so the turn came \
+             back empty. Nothing was lost; ask again."
+        ),
+        None => "The upstream ended this turn on a tool call that carried no \
+                 content. Nothing was lost; ask again."
+            .to_string(),
+    }
+}
+
+/// Whether this block's answer is already waiting for a later request.
+///
+/// A turn that calls a memory tool *and* a client tool cannot be continued, so
+/// the proxy runs the memory call and holds the answer for the request that
+/// carries the client's `tool_result` (see [`crate::memory::deferred`]).
+/// Suppressing the `tool_use` is that design working, not a tool call lost —
+/// and logging the two the same way left no way to tell a real stranding from
+/// a correct deferral.
+fn deferred_answer_held(block: &Value) -> bool {
+    let Some(id) = block.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    crate::memory::deferred::store()
+        .lock()
+        .map(|store| store.is_held(id))
+        .unwrap_or(false)
 }
 
 /// The splice's filter. `None` means the block is safe to send on.
 fn drop_reason(block: &Value, memory_enabled: bool, live: &[Value]) -> Option<DropReason> {
     if proxy_owned_tool(block, memory_enabled) {
-        Some(DropReason::UnresolvedProxyTool)
+        if deferred_answer_held(block) {
+            Some(DropReason::DeferredMemoryAnswer)
+        } else {
+            Some(DropReason::UnresolvedProxyTool)
+        }
     } else if continuation_thinking(block) {
         Some(DropReason::ContinuationThinking)
     } else if already_streamed(block, live) {
@@ -821,6 +864,7 @@ where
                     unresolved_proxy_tool = dropped[DropReason::UnresolvedProxyTool as usize],
                     continuation_thinking = dropped[DropReason::ContinuationThinking as usize],
                     already_streamed = dropped[DropReason::AlreadyStreamed as usize],
+                    deferred_memory_answer = dropped[DropReason::DeferredMemoryAnswer as usize],
                     "ccr: dropped a proxy tool call the client expected; the turn \
                      promises a tool_use block that will not arrive"
                 );
@@ -829,6 +873,7 @@ where
                     request_id = %ctx.request_id,
                     continuation_thinking = dropped[DropReason::ContinuationThinking as usize],
                     already_streamed = dropped[DropReason::AlreadyStreamed as usize],
+                    deferred_memory_answer = dropped[DropReason::DeferredMemoryAnswer as usize],
                     "ccr: dropping blocks the client must not receive from a streamed turn"
                 );
             }
@@ -1390,5 +1435,116 @@ mod tests {
         assert!(text.contains("end_turn"));
         assert!(text.contains("900"));
         assert!(text.contains("event: message_stop"));
+    }
+}
+
+#[cfg(test)]
+mod deferred_drop_reason_tests {
+    use super::*;
+    use crate::memory::deferred::{store, PendingMemoryResult};
+
+    /// The deferred store is a process-wide static, so these run one at a time.
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn clear() {
+        if let Ok(mut held) = store().lock() {
+            *held = crate::memory::deferred::DeferredMemory::new();
+        }
+    }
+
+    fn memory_call(id: &str) -> Value {
+        serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": "memory_search",
+            "input": {"query": "q"},
+        })
+    }
+
+    #[test]
+    fn a_held_answer_is_not_a_lost_tool_call() {
+        let _g = lock();
+        clear();
+        let block = memory_call("toolu_held");
+        store().lock().unwrap().hold(PendingMemoryResult::new(
+            block.clone(),
+            serde_json::json!({"type": "tool_result", "tool_use_id": "toolu_held"}),
+            vec!["toolu_client".to_string()],
+        ));
+
+        assert!(matches!(
+            drop_reason(&block, true, &[]),
+            Some(DropReason::DeferredMemoryAnswer)
+        ));
+        clear();
+    }
+
+    #[test]
+    fn a_memory_call_with_no_held_answer_is_still_a_fault() {
+        let _g = lock();
+        clear();
+        assert!(matches!(
+            drop_reason(&memory_call("toolu_stranded"), true, &[]),
+            Some(DropReason::UnresolvedProxyTool)
+        ));
+    }
+
+    #[test]
+    fn a_held_answer_for_another_call_does_not_excuse_this_one() {
+        let _g = lock();
+        clear();
+        store().lock().unwrap().hold(PendingMemoryResult::new(
+            memory_call("toolu_other"),
+            serde_json::json!({"type": "tool_result", "tool_use_id": "toolu_other"}),
+            vec!["toolu_client".to_string()],
+        ));
+
+        assert!(matches!(
+            drop_reason(&memory_call("toolu_stranded"), true, &[]),
+            Some(DropReason::UnresolvedProxyTool)
+        ));
+        clear();
+    }
+
+    /// The counters are indexed by discriminant, so a new variant that breaks
+    /// `ALL[r as usize] == r` would silently mislabel every count.
+    #[test]
+    fn every_reason_indexes_to_itself() {
+        for (i, reason) in DropReason::ALL.iter().enumerate() {
+            assert_eq!(i, *reason as usize, "{} is out of order", reason.label());
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_turn_text_tests {
+    use super::*;
+
+    /// A dropped call is named, so the reader knows which machinery to look
+    /// at. "context retrieval" was true of `headroom_retrieve` and wrong of
+    /// every memory tool, which the same branch also covers.
+    #[test]
+    fn a_dropped_tool_is_named() {
+        let text = empty_turn_text(Some(CCR_TOOL_NAME));
+        assert!(text.contains(CCR_TOOL_NAME), "tool not named: {text}");
+
+        let text = empty_turn_text(Some("memory_search"));
+        assert!(text.contains("memory_search"), "tool not named: {text}");
+        assert!(
+            !text.contains("retrieval"),
+            "a dropped memory call is not a retrieval failure: {text}"
+        );
+    }
+
+    /// The five-in-six case. Saying "context retrieval" here sent the reader
+    /// after machinery that had done nothing wrong.
+    #[test]
+    fn an_empty_tool_call_is_not_called_a_retrieval_failure() {
+        let text = empty_turn_text(None);
+        assert!(!text.contains("retrieval"), "wrong cause named: {text}");
+        assert!(text.contains("tool call"));
     }
 }

@@ -63,6 +63,17 @@ impl DeferredMemory {
         self.held.is_empty()
     }
 
+    /// Whether an answer for this `tool_use` id is waiting for a later request.
+    ///
+    /// The stream splice asks before calling a suppressed block a lost tool
+    /// call: a deferred answer is held on purpose, and the client is meant not
+    /// to see the `tool_use`.
+    pub fn is_held(&self, tool_use_id: &str) -> bool {
+        self.held.iter().any(|p| {
+            p.tool_use.get("id").and_then(Value::as_str) == Some(tool_use_id)
+        })
+    }
+
     pub fn hold(&mut self, pending: PendingMemoryResult) {
         self.expire();
         if self.held.len() >= MAX_HELD {
