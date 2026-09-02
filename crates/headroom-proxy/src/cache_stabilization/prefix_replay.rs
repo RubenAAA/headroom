@@ -290,6 +290,50 @@ fn align_over_withdrawn_scaffolding(
     Some(current_index)
 }
 
+/// Position of the first `role: "system"` message the Anthropic API would
+/// refuse, or `None` when the sequence is acceptable.
+///
+/// The rule upstream enforces: a `system` message must follow a `user` message
+/// or an `assistant` message ending in a server tool result, and the
+/// directive-only form (empty content) is allowed anywhere. Splicing two
+/// legal sequences together cannot break that on its own — the join reproduces
+/// an adjacency the client itself wrote — so this is a net under the splice
+/// rather than a working part of it, and it should never fire. It is here
+/// because the failure it catches costs a whole turn: the request 400s, and a
+/// re-cache of the entire conversation follows the retry.
+fn first_illegal_system_position(messages: &[Value]) -> Option<usize> {
+    messages.iter().enumerate().position(|(index, message)| {
+        if message.get("role").and_then(Value::as_str) != Some("system") {
+            return false;
+        }
+        // The directive-only form carries no content and is legal anywhere.
+        if has_empty_canonical_content(message) {
+            return false;
+        }
+        let Some(previous) = index.checked_sub(1).and_then(|i| messages.get(i)) else {
+            return true;
+        };
+        match previous.get("role").and_then(Value::as_str) {
+            Some("user") => false,
+            Some("assistant") => !ends_in_server_tool_result(previous),
+            _ => true,
+        }
+    })
+}
+
+/// Whether an assistant message's last content block is a server-side tool
+/// result (`web_search_tool_result` and its siblings), which the API accepts
+/// as a predecessor for a `system` message.
+fn ends_in_server_tool_result(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.last())
+        .and_then(|block| block.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.ends_with("_tool_result"))
+}
+
 /// Strip reminder spans from a text block, dropping the block when only
 /// scaffolding was there. Counterpart to [`split_ephemeral_spans`] for the
 /// comparison key; the forwarding side lifts the same spans in
@@ -916,9 +960,13 @@ pub enum ReplaySkip {
     /// Nothing stored for this session yet: its first turn, a TTL expiry, or an
     /// eviction. Benign on a first turn and expensive on the others.
     NoPreviousTurn,
-    /// The stored turn had a different number of forwarded and original
-    /// messages, so the prefix cannot be mapped one-to-one.
+    /// The stored turn forwarded fewer messages than it took in, so the two
+    /// slices no longer cover one span of the conversation.
     ForwardedCountMismatch,
+    /// The spliced output would put a `role: "system"` message where the API
+    /// refuses one. Forwarding this turn's own bytes costs a re-cache; the 400
+    /// it replaces costs the same re-cache plus the turn.
+    SystemAdjacencyBroken,
     /// This turn is **shorter** than the stored prefix. A conversation only
     /// grows, so this is the fingerprint of two interleaved streams sharing one
     /// session key — the store holds one prefix per session, so the longer
@@ -981,6 +1029,7 @@ impl ReplaySkip {
         match self {
             ReplaySkip::NoPreviousTurn => "no_previous_turn",
             ReplaySkip::ForwardedCountMismatch => "forwarded_count_mismatch",
+            ReplaySkip::SystemAdjacencyBroken => "system_adjacency_broken",
             ReplaySkip::ShorterThanStoredPrefix => "shorter_than_stored_prefix",
             ReplaySkip::OptimizedShorterThanPrefix => "optimized_shorter_than_prefix",
             ReplaySkip::OptimizedShorterThanOriginals => "optimized_shorter_than_originals",
@@ -1013,9 +1062,16 @@ pub fn overlay_cached_prefix_reported(
         _ => return (optimized_messages, Some(ReplaySkip::NoPreviousTurn)),
     };
     let n = prev_orig.len();
-    // One forwarded message per original, and the frozen prefix must fit within
-    // both the current originals and this turn's optimized output.
-    if prev_fwd.len() != n {
+    // The stored pair covers one span of the conversation, and the frozen
+    // prefix must fit within both the current originals and this turn's
+    // optimized output.
+    //
+    // A floor, not an equality. The two slices held equal counts only while the
+    // overlay never added a message; it replays scaffolding the client withdrew,
+    // so a forwarded slice legitimately runs LONGER than its originals by the
+    // number of messages stepped over. Fewer is still a desync — no pass in
+    // front of this one deletes a message — and declining is the safe answer.
+    if prev_fwd.len() < n {
         return (optimized_messages, Some(ReplaySkip::ForwardedCountMismatch));
     }
     // The index correspondence the splice rests on: `optimized[i]` is this
@@ -1127,6 +1183,9 @@ pub fn overlay_cached_prefix_reported(
         }
         let mut out = prev_fwd[..replay_upto].to_vec();
         out.extend_from_slice(&optimized_messages[replay_upto..]);
+        if first_illegal_system_position(&out).is_some() {
+            return (optimized_messages, Some(ReplaySkip::SystemAdjacencyBroken));
+        }
         return (out, Some(skip));
     };
     if optimized_messages.len() < consumed {
@@ -1160,6 +1219,9 @@ pub fn overlay_cached_prefix_reported(
     // withdrawn.
     let mut out = prev_fwd.to_vec();
     out.extend_from_slice(&optimized_messages[consumed..]);
+    if first_illegal_system_position(&out).is_some() {
+        return (optimized_messages, Some(ReplaySkip::SystemAdjacencyBroken));
+    }
     (out, None)
 }
 
@@ -2011,12 +2073,29 @@ impl PrefixReplayTracker {
         // Derive the boundary from the ORIGINAL slice. Relocation can attach a
         // reminder to a forwarded message whose original counterpart had none,
         // so inspecting the two tails independently can produce different
-        // lengths and trip `ForwardedCountMismatch`. Apply the one original
-        // index to both stored slices instead.
+        // lengths and trip `ForwardedCountMismatch`. Derive the one bound from
+        // the originals, then apply it to each slice from ITS OWN tail.
+        //
+        // Counting from the tail rather than reusing the index is what keeps
+        // the two spans equal. The overlay replays a withdrawn scaffolding
+        // message rather than dropping it, so a forwarded body can hold MORE
+        // messages than the originals it came from, and from the insertion
+        // point on the two no longer share an index. Truncating the forwarded
+        // slice AT an originals index then cut real messages off its tail, and
+        // next turn the splice read the short slice as covering the full stored
+        // span: `prev_fwd` ended early, `optimized[consumed..]` resumed past the
+        // gap, and the messages in between never reached the wire. Measured on
+        // the 195 persisted prefixes of 2026-09-02, 15 had lost content this
+        // way — 27 messages inserted, 27 client messages dropped, one for one.
+        // Two of those sessions had also drawn a 400 from the API, because the
+        // gap left a `role: "system"` reminder sitting behind an assistant
+        // message.
         let stored_prefix_len = replayable_stored_prefix_len(&incoming_original);
+        let trailing_dropped = incoming_original.len() - stored_prefix_len;
         incoming_original.truncate(stored_prefix_len);
         let mut incoming_forwarded = forwarded.to_vec();
-        incoming_forwarded.truncate(stored_prefix_len);
+        let forwarded_prefix_len = incoming_forwarded.len().saturating_sub(trailing_dropped);
+        incoming_forwarded.truncate(forwarded_prefix_len);
         // One projection of this turn's messages for all three branch tests
         // below — see [`matches_canonical_prefix`].
         let canonical_incoming = canonicalize_slice(&incoming_original);
