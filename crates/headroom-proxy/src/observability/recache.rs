@@ -111,6 +111,7 @@ fn reason_label(attribution_reason: Option<&str>) -> &'static str {
         Some("provider_between_entries") => "provider_between_entries",
         Some("aftershock_of_diverged_prefix") => "aftershock_of_diverged_prefix",
         Some("concurrent_turn_in_flight") => "concurrent_turn_in_flight",
+        Some("prefix_head_changed") => "prefix_head_changed",
         Some("prefix_content_diverged") => "prefix_content_diverged",
         Some("forwarded_count_mismatch") => "forwarded_count_mismatch",
         Some("shorter_than_stored_prefix") => "shorter_than_stored_prefix",

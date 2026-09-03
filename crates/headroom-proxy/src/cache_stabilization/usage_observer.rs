@@ -330,6 +330,20 @@ pub struct TurnRecord {
     /// continued one. Carried one turn so a miss can be placed against *two*
     /// earlier boundaries, not one — see [`CacheLanding`].
     pub previous_boundary: Option<u64>,
+    /// This turn's [`PrefixFingerprint::head`] — model, system and tools as the
+    /// client sent them — so the next turn of the same stream can tell whether
+    /// the cacheable head moved under it.
+    ///
+    /// Kept here because the drift detector cannot answer that question: it
+    /// compares consecutive *requests* of a session, so a request that never
+    /// completes still consumes the change, and the turn that is billed for it
+    /// reads empty dims. Comparing against the previous turn that completed
+    /// cannot be spent by a request that never arrives.
+    ///
+    /// The eight digest bytes as a `u64` rather than their hex, so the record
+    /// stays `Copy`. `None` when the request reached the observer without a
+    /// fingerprint, which compares as "not known", never as "unchanged".
+    pub head: Option<u64>,
 }
 
 /// Streams tracked per conversation key before the oldest is dropped.
@@ -740,6 +754,7 @@ struct RecacheAttribution<'a> {
 
 fn recache_attribution<'a>(
     drift_dims: Option<&'a str>,
+    head_changed: bool,
     outbound_drift_dims: Option<&'a str>,
     replay_skip: Option<ReplaySkipEvidence>,
     replay_applied: Option<ReplayAppliedEvidence>,
@@ -767,6 +782,69 @@ fn recache_attribution<'a>(
         };
     }
 
+    // The cacheable head — model, system, tools — is not the one the previous
+    // completed turn of this stream sent, so the provider keyed on something
+    // else and everything behind it had to be written again. Client origin and
+    // client scope: this is the same hot zone `drift_dims` names, read one
+    // turn apart instead of one request apart.
+    //
+    // `drift_dims` alone cannot see it. The drift detector is edge-triggered on
+    // a per-session LRU, so the first request carrying a change consumes the
+    // edge whether or not it ever completes. On 2026-09-03 a stream died
+    // mid-response, the client resent the turn with a system prompt 6 kB
+    // shorter (16,125 B → 10,145 B), and the abandoned retry took the edge at
+    // 15:56:36Z; the attempt that was billed nine seconds later saw empty dims,
+    // wrote 213,309 tokens against 15,621 read — the day's largest write — and
+    // fell through to `concurrent_turn_in_flight`, which was true and not the
+    // cause. `prefix_head` on this event and `prefix_composition` on the
+    // request say which of system or tools moved.
+    if head_changed {
+        return RecacheAttribution {
+            reason: Some("prefix_head_changed"),
+            origin: Some("client"),
+            scope: Some("hot_zone"),
+            counts_as_waste: true,
+        };
+    }
+
+    let reason = replay_skip.map(|evidence| evidence.reason.as_str());
+    let reason = match reason {
+        Some(
+            reason @ ("prefix_content_diverged"
+            | "forwarded_count_mismatch"
+            | "shorter_than_stored_prefix"
+            | "optimized_shorter_than_prefix"),
+        ) => Some(reason),
+        _ => None,
+    };
+    // Two of those four say the client's own history no longer continues the
+    // prefix we stored for it: it edited inside the prefix, or it is a second
+    // stream sharing one session key. That is client evidence, like a moved
+    // inbound hash, and it is ranked with it.
+    //
+    // Ranked above the outbound hash because declining a replay is itself what
+    // moves the forwarded hot zone: the overlay that had been restoring the
+    // stored early messages stops, and the forwarded prefix snaps back to the
+    // client's own bytes. Measured 2026-09-03: on 7 turns the client inserted a
+    // `role:"system"` message at index 1, replay declined at
+    // `first_diff_index=1`, and the outbound hash read `0:blocks 2->1` on the
+    // very message the overlay had been replaying. Those turns were filed
+    // `origin=proxy / forwarded_hot_zone` — the proxy charged for withdrawing
+    // its own overlay in response to an edit only the client could make.
+    //
+    // The other two — `forwarded_count_mismatch` and
+    // `optimized_shorter_than_prefix` — name our own pipeline dropping
+    // messages, so they stay below the outbound hash, which speaks for the
+    // proxy.
+    if let Some(reason @ ("prefix_content_diverged" | "shorter_than_stored_prefix")) = reason {
+        return RecacheAttribution {
+            reason: Some(reason),
+            origin: Some("client"),
+            scope: Some("stored_prefix"),
+            counts_as_waste: true,
+        };
+    }
+
     // The client's hot zone held still and ours did not, so the mutation was
     // ours. Checked after client drift, never before: when both moved, the
     // client's edit is the cause and the proxy only carried it forward.
@@ -784,16 +862,6 @@ fn recache_attribution<'a>(
         };
     }
 
-    let reason = replay_skip.map(|evidence| evidence.reason.as_str());
-    let reason = match reason {
-        Some(
-            reason @ ("prefix_content_diverged"
-            | "forwarded_count_mismatch"
-            | "shorter_than_stored_prefix"
-            | "optimized_shorter_than_prefix"),
-        ) => Some(reason),
-        _ => None,
-    };
     // Residual, not a finding. Everything above named a cause from evidence;
     // reaching here means a replay went out and the read still came back short,
     // with nothing to say why.
@@ -1447,6 +1515,12 @@ impl UsageObserver {
         // Classify against the stream this turn continues, not against
         // whatever turn happened to arrive last under the same key.
         let turn_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs);
+        // `head` is the hex of eight digest bytes (see `hex16`), so it reads
+        // back as the `u64` the record holds.
+        let turn_head = pending
+            .prefix
+            .as_ref()
+            .and_then(|p| u64::from_str_radix(&p.head, 16).ok());
         let (
             class,
             expected_cache_read,
@@ -1455,6 +1529,7 @@ impl UsageObserver {
             previous_turn_diverged,
             previous_cache_read,
             previous_previous_boundary,
+            head_changed,
             matched_stream_msgs,
             streams_tracked,
         ) = {
@@ -1526,6 +1601,7 @@ impl UsageObserver {
                     false,
                     0,
                     None,
+                    false,
                 ),
                 Some(i) => {
                     let prev = streams[i];
@@ -1547,6 +1623,11 @@ impl UsageObserver {
                         prev.diverged,
                         prev.cache_read_input_tokens,
                         prev.previous_boundary,
+                        // Both sides known and different. An unknown head on
+                        // either side is not comparable, and reporting a change
+                        // from it would blame the client for a missing
+                        // measurement.
+                        matches!((prev.head, turn_head), (Some(p), Some(c)) if p != c),
                     )
                 }
             };
@@ -1569,6 +1650,7 @@ impl UsageObserver {
                         .cache_read_input_tokens
                         .saturating_add(streams[i].cache_creation_input_tokens)
                 }),
+                head: turn_head,
             };
             match matched {
                 Some(i) => streams[i] = record,
@@ -1586,7 +1668,8 @@ impl UsageObserver {
                     streams.push(record);
                 }
             }
-            let (class, expected, gap, bytes, diverged, prev_read, prevprev_boundary) = outcome;
+            let (class, expected, gap, bytes, diverged, prev_read, prevprev_boundary, head_moved) =
+                outcome;
             (
                 class,
                 expected,
@@ -1595,6 +1678,7 @@ impl UsageObserver {
                 diverged,
                 prev_read,
                 prevprev_boundary,
+                head_moved,
                 matched_stream_msgs,
                 streams_tracked,
             )
@@ -1681,6 +1765,7 @@ impl UsageObserver {
                 inner.recache_events_total += 1;
                 let attribution = recache_attribution(
                     pending.drift_dims.as_deref(),
+                    head_changed,
                     pending.outbound_drift_dims.as_deref(),
                     pending.replay_skip,
                     pending.replay_applied,
@@ -2036,7 +2121,15 @@ mod tests {
 
     #[test]
     fn a_turn_after_a_divergence_names_the_previous_turn() {
-        let a = recache_attribution(None, None, None, Some(applied_evidence()), true, false);
+        let a = recache_attribution(
+            None,
+            false,
+            None,
+            None,
+            Some(applied_evidence()),
+            true,
+            false,
+        );
         assert_eq!(a.reason, Some("aftershock_of_diverged_prefix"));
         assert_eq!(a.origin, Some("previous_turn"));
         assert!(a.counts_as_waste, "the rewrite is still real waste");
@@ -2046,7 +2139,15 @@ mod tests {
     /// [`CacheLanding`] reason, keeping `origin` as it is.
     #[test]
     fn without_a_previous_divergence_the_residual_is_left_for_the_landing() {
-        let a = recache_attribution(None, None, None, Some(applied_evidence()), false, false);
+        let a = recache_attribution(
+            None,
+            false,
+            None,
+            None,
+            Some(applied_evidence()),
+            false,
+            false,
+        );
         assert_eq!(a.reason, Some("unexplained_after_replay"));
         assert_eq!(a.origin, Some("unknown"));
     }
@@ -2135,7 +2236,15 @@ mod tests {
     /// is where a cause goes to be forgotten.
     #[test]
     fn a_turn_racing_its_own_conversation_is_named_but_still_billed() {
-        let a = recache_attribution(None, None, None, Some(applied_evidence()), false, true);
+        let a = recache_attribution(
+            None,
+            false,
+            None,
+            None,
+            Some(applied_evidence()),
+            false,
+            true,
+        );
         assert_eq!(a.reason, Some("concurrent_turn_in_flight"));
         assert_eq!(a.origin, Some("client"));
         assert!(
@@ -2151,6 +2260,7 @@ mod tests {
     fn a_named_cause_outranks_concurrency() {
         let a = recache_attribution(
             Some("system"),
+            false,
             None,
             None,
             Some(applied_evidence()),
@@ -2160,6 +2270,66 @@ mod tests {
         assert_eq!(a.reason, Some("system"));
     }
 
+    /// A retry that never completed still consumed the drift detector's edge,
+    /// so the attempt that was billed saw empty dims and only the race left to
+    /// report. 2026-09-03 15:57:03Z: the client resent a turn with a system
+    /// prompt 6 kB shorter and the retry wrote 213,309 tokens against 15,621
+    /// read, filed `concurrent_turn_in_flight` — true, and not the cause.
+    #[test]
+    fn a_moved_cacheable_head_outranks_a_retry_still_in_flight() {
+        let a = recache_attribution(
+            None,
+            true,
+            None,
+            None,
+            Some(applied_evidence()),
+            false,
+            true,
+        );
+        assert_eq!(a.reason, Some("prefix_head_changed"));
+        assert_eq!(a.origin, Some("client"));
+        assert_eq!(a.scope, Some("hot_zone"));
+        assert!(a.counts_as_waste, "the prefix was genuinely re-written");
+    }
+
+    /// Declining a replay is what moves the forwarded hot zone: the overlay
+    /// stops restoring the stored early messages and the prefix snaps back to
+    /// the client's bytes. On 2026-09-03 that read as `origin=proxy` on 7
+    /// turns where the client had inserted a `role:"system"` message at index
+    /// 1 and the proxy had declined replay exactly as it should.
+    #[test]
+    fn a_declined_replay_is_charged_to_the_client_that_diverged() {
+        let prior = vec![
+            serde_json::json!({"role": "user", "content": "a"}),
+            serde_json::json!({"role": "assistant", "content": "b"}),
+        ];
+        let current = vec![
+            serde_json::json!({"role": "user", "content": "a"}),
+            serde_json::json!({"role": "system", "content": "reminder"}),
+            serde_json::json!({"role": "assistant", "content": "b"}),
+        ];
+        let skip = ReplaySkipEvidence::from_inbound_original_histories(
+            ReplaySkip::PrefixContentDiverged {
+                first_diff_index: 1,
+                replayed_prefix_msgs: 0,
+            },
+            Some(&prior),
+            &current,
+        );
+        let a = recache_attribution(
+            None,
+            false,
+            Some("early_messages"),
+            Some(skip),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(a.reason, Some("prefix_content_diverged"));
+        assert_eq!(a.origin, Some("client"));
+        assert_eq!(a.scope, Some("stored_prefix"));
+    }
+
     #[test]
     fn a_quiet_inbound_with_a_moved_outbound_is_charged_to_the_proxy() {
         // The hole this closes: the inbound hash is taken before any proxy
@@ -2167,6 +2337,7 @@ mod tests {
         // through every branch and land in the residual.
         let a = recache_attribution(
             None,
+            false,
             Some("tools,messages[0]"),
             None,
             Some(applied_evidence()),
@@ -2185,6 +2356,7 @@ mod tests {
         // would misattribute nearly every ordinary recache.
         let a = recache_attribution(
             Some("system"),
+            false,
             Some("system,tools"),
             None,
             Some(applied_evidence()),
@@ -2218,6 +2390,7 @@ mod tests {
         );
         let a = recache_attribution(
             None,
+            false,
             None,
             Some(skip),
             Some(applied_evidence()),
@@ -2247,6 +2420,7 @@ mod tests {
             msgs: None,
             diverged: false,
             previous_boundary: None,
+            head: None,
         }
     }
 
@@ -2621,6 +2795,7 @@ mod tests {
                     msgs: None,
                     diverged: false,
                     previous_boundary: None,
+                    head: None,
                 }],
             );
         }
@@ -2661,6 +2836,7 @@ mod tests {
                     msgs: None,
                     diverged: false,
                     previous_boundary: None,
+                    head: None,
                 }],
             );
         }
@@ -2701,6 +2877,7 @@ mod tests {
                     msgs: None,
                     diverged: false,
                     previous_boundary: None,
+                    head: None,
                 }],
             );
         }
@@ -3350,6 +3527,7 @@ mod stream_matching_tests {
             msgs,
             diverged: false,
             previous_boundary: None,
+            head: None,
         }
     }
 
