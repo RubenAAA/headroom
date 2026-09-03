@@ -237,16 +237,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
     let grace = config.graceful_shutdown_timeout;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+
+    // The shutdown future used to `sleep(grace)` before returning. Axum only
+    // begins draining once this future completes, so the timeout delayed the
+    // drain by its own length and then waited on in-flight connections with no
+    // limit at all. Three deploys on 2026-09-03 needed SIGKILL after the
+    // process outlived a 30s grace by more than ten seconds. Return as soon as
+    // the signal lands, and bound the drain below, which is what the flag says
+    // it does.
+    let signalled_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    let mark = signalled_at.clone();
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = mark.set(std::time::Instant::now());
+        tracing::info!(
+            event = "shutdown_started",
+            timeout_s = grace.as_secs(),
+            "signal received; refusing new connections and draining in-flight requests"
+        );
+        let _ = drain_started_tx.send(());
+    });
+    // `WithGracefulShutdown` is `IntoFuture`, not `Future`, so it cannot be
+    // polled in the `select!` below until it is converted.
+    let serve = std::future::IntoFuture::into_future(serve);
+    tokio::pin!(serve);
+
+    // Idle until the signal arrives, so the deadline bounds the drain and not
+    // the proxy's whole uptime.
+    let deadline = async move {
+        if drain_started_rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(grace).await;
+    };
+    tokio::pin!(deadline);
+
+    tokio::select! {
+        result = &mut serve => {
             tracing::info!(
-                timeout_s = grace.as_secs(),
-                "draining in-flight requests before exit"
+                event = "shutdown_drained",
+                drain_ms = signalled_at.get().map_or(0, |t| t.elapsed().as_millis() as u64),
+                "in-flight requests finished; exiting"
             );
-            tokio::time::sleep(grace).await;
-        })
-        .await?;
+            result?;
+        }
+        _ = &mut deadline => {
+            // Says which of the two it was. A drain that overruns because a
+            // client is still streaming is expected; one that overruns with
+            // nothing in flight is a task that never sees the shutdown.
+            tracing::warn!(
+                event = "shutdown_drain_timed_out",
+                timeout_s = grace.as_secs(),
+                drain_ms = signalled_at.get().map_or(0, |t| t.elapsed().as_millis() as u64),
+                "requests were still in flight when the grace period expired; exiting anyway"
+            );
+        }
+    }
 
     Ok(())
 }
