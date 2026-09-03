@@ -16,6 +16,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Before anything opens a database: SQLite refuses process-wide settings
+    // once its library has initialised.
+    headroom_core::sqlite_tuning::apply();
     let args = CliArgs::parse();
     let config = Config::from_cli(args);
 

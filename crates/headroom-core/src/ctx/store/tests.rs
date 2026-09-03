@@ -581,3 +581,77 @@ fn find_all_positions_finds_overlapping_matches() {
     assert!(find_all_positions("abc", "").is_empty());
     assert!(find_all_positions("abc", "z").is_empty());
 }
+
+// ── Lookup by content hash (cold tier for expired CCR blocks) ──
+
+#[test]
+fn content_by_hash_round_trips_a_single_chunk_source() {
+    let (_d, store) = open_tmp();
+    let body = "cargo test output line one\nline two\nline three";
+    store
+        .index_content(
+            "cargo test",
+            body,
+            &IndexOpts {
+                content_hash: Some("0123456789abcdef01234567".to_string()),
+                plain_text_lines: Some(50),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.content_by_hash("0123456789abcdef01234567").unwrap(),
+        Some(body.to_string()),
+        "a source small enough to stay in one chunk must come back byte-exact"
+    );
+}
+
+#[test]
+fn content_by_hash_misses_an_unknown_hash() {
+    let (_d, store) = open_tmp();
+    store
+        .index_content("notes", "some body text", &IndexOpts::default())
+        .unwrap();
+    assert!(store
+        .content_by_hash("ffffffffffffffffffffffff")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn content_by_hash_rejoins_every_chunk_of_a_split_source() {
+    let (_d, store) = open_tmp();
+    // Two lines per chunk forces a split, which is the lossy case the
+    // recovery note warns about: all the text returns, the joins may not
+    // reproduce the original separators.
+    let body = (0..20)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary = store
+        .index_content(
+            "long output",
+            &body,
+            &IndexOpts {
+                content_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                plain_text_lines: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        summary.total_chunks > 1,
+        "the fixture must actually split, got {} chunk(s)",
+        summary.total_chunks
+    );
+    let recovered = store
+        .content_by_hash("aaaaaaaaaaaaaaaaaaaaaaaa")
+        .unwrap()
+        .expect("a split source is still recoverable");
+    for i in 0..20 {
+        assert!(
+            recovered.contains(&format!("line {i}")),
+            "line {i} was lost rejoining the chunks"
+        );
+    }
+}

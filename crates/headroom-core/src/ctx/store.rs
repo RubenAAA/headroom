@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 // ─────────────────────────────────────────────────────────
@@ -184,6 +184,52 @@ struct Chunk {
 pub struct CtxStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Spare read-only connections, handed to `search` so reads do not queue
+    /// behind each other on `conn`.
+    ///
+    /// Every search used to take the one write connection for its whole run —
+    /// two FTS queries, the fuzzy fallback and the reranking. Measured on the
+    /// live memory index, twenty concurrent searches of the same query took
+    /// 21.6s against 1.08s for one: no parallelism at all, and the queue is
+    /// what a caller waits in. WAL already allows concurrent readers, so the
+    /// only thing in the way was the single connection.
+    readers: Mutex<Vec<Connection>>,
+    /// Whether the store was opened read-only, so pooled readers open the
+    /// same way. A read-only connection to a writable WAL database cannot
+    /// always see what is still in the WAL — it read an empty schema in the
+    /// tests — so a writable store hands out writable readers, which only
+    /// ever run SELECTs.
+    read_only: bool,
+}
+
+/// Idle read connections kept for reuse. Beyond this a returned connection is
+/// closed rather than pooled: the cap bounds file handles per store, and
+/// opening one costs well under a millisecond.
+const MAX_IDLE_READERS: usize = 8;
+
+/// Bytes of the database to map instead of reading through the pager.
+///
+/// Concurrent searches in one process spend their time in the pager, not in
+/// the query: twenty at once took 1.89s against 62ms for one, while the same
+/// twenty as separate processes took 184ms. Mapping the file cuts that to
+/// 0.67s. 256 MiB covers every store here with room to grow, and the mapping
+/// is virtual address space, not resident memory.
+const MMAP_BYTES: i64 = 268_435_456;
+
+/// Whether a path names an in-memory database rather than a file.
+fn is_in_memory(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text == ":memory:" || text.is_empty() || text.contains("mode=memory")
+}
+
+/// Apply the per-connection settings that make concurrent reads cheap.
+fn tune_connection(conn: &Connection) {
+    // `query_row` rather than `pragma_update`: mmap_size answers with the
+    // size it settled on, and a pragma that returns a row is an error to
+    // execute as a statement.
+    let _ = conn.query_row("PRAGMA mmap_size = ?1", [MMAP_BYTES], |row| {
+        row.get::<_, i64>(0)
+    });
 }
 
 impl CtxStore {
@@ -200,6 +246,43 @@ impl CtxStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// Take a read-only connection from the pool, opening one if the pool is
+    /// empty. `None` means the open failed and the caller should fall back to
+    /// the shared connection.
+    fn take_reader(&self) -> Option<Connection> {
+        // An in-memory database lives in its connection: a second connection
+        // to `:memory:` is a second, empty database, not another view of this
+        // one. Tests use those, so the pool has to stand aside for them.
+        if is_in_memory(&self.path) {
+            return None;
+        }
+        if let Ok(mut pool) = self.readers.lock() {
+            if let Some(conn) = pool.pop() {
+                return Some(conn);
+            }
+        }
+        let conn = if self.read_only {
+            Connection::open_with_flags(
+                &self.path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open(&self.path)
+        }
+        .ok()?;
+        tune_connection(&conn);
+        Some(conn)
+    }
+
+    /// Return a reader to the pool, or drop it once the pool is full.
+    fn give_reader(&self, conn: Connection) {
+        if let Ok(mut pool) = self.readers.lock() {
+            if pool.len() < MAX_IDLE_READERS {
+                pool.push(conn);
+            }
+        }
+    }
 }
 
 impl CtxStore {
@@ -207,6 +290,9 @@ impl CtxStore {
     /// Tolerates a DB created by the TypeScript `ContentStore` (identical
     /// schema), so existing per-project content DBs open cleanly.
     pub fn open(db_path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        // Best-effort, and a no-op after the first call: the settings this
+        // applies are process-wide and have to precede the first connection.
+        crate::sqlite_tuning::apply();
         let path = db_path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
 
@@ -214,12 +300,39 @@ impl CtxStore {
         // row costs at most one search miss (same rationale as ccr/sqlite.rs).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        tune_connection(&conn);
 
         Self::init_schema(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
             path,
+            readers: Mutex::new(Vec::new()),
+            read_only: false,
+        })
+    }
+
+    /// Open an existing DB read-only, without creating or migrating anything.
+    ///
+    /// The cold-tier sweep touches every project's file after a retrieval miss,
+    /// including projects this process has nothing to do with. Opening those
+    /// read-write would create a file for a path that has none and take a write
+    /// lock on stores another proxy may be writing. Read-only does neither.
+    /// It also means the sweep never adds `idx_sources_content_hash`; that
+    /// lands on the owning process's next write-open, which is where a
+    /// migration belongs.
+    pub fn open_read_only(db_path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        let path = db_path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        tune_connection(&conn);
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path,
+            readers: Mutex::new(Vec::new()),
+            read_only: true,
         })
     }
 
@@ -260,6 +373,47 @@ impl CtxStore {
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+
+    /// Reassemble an indexed source from its `content_hash`.
+    ///
+    /// The CCR store (`ccr.db`) holds originals for an idle TTL of a week and
+    /// then drops them; this index keeps the same blocks indefinitely, keyed by
+    /// the same blake3 hash. That makes it the only surviving copy of anything
+    /// offloaded longer ago than the TTL, which is where every measured
+    /// `ccr: content not found in store` miss comes from.
+    ///
+    /// **The result is a reconstruction, not the original bytes.** Indexing
+    /// splits content into chunks and stores no separator, so a source that
+    /// chunked into more than one piece cannot be rejoined exactly. Callers
+    /// must label what they hand back rather than pass it off as the original.
+    /// Sampled against blocks still live in both stores, single-chunk sources
+    /// round-trip byte-exact and multi-chunk ones drift by the join.
+    ///
+    /// `None` when no source carries the hash, or when it carries no chunks.
+    pub fn content_by_hash(&self, content_hash: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn();
+        let source_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM sources WHERE content_hash = ?1 ORDER BY id DESC LIMIT 1",
+                params![content_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(source_id) = source_id else {
+            return Ok(None);
+        };
+        // `rowid` is insertion order, so this rejoins the chunks as they were
+        // split. FTS5 has no other ordinal to sort on.
+        let mut stmt =
+            conn.prepare("SELECT content FROM chunks WHERE source_id = ?1 ORDER BY rowid")?;
+        let parts: Vec<String> = stmt
+            .query_map(params![source_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(parts.join("\n")))
     }
 
     /// Create the schema. Byte-identical to `ContentStore.#initSchema`
@@ -308,6 +462,14 @@ impl CtxStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
+            -- `content_by_hash` is the cold-tier lookup behind an expired
+            -- CCR retrieval, and it runs across every project's DB on a
+            -- miss. Without this it is a table scan per file. `IF NOT
+            -- EXISTS` makes it a migration: any DB gets the index the
+            -- next time it is opened for writing. An extra index does
+            -- not affect interchangeability with the TS store.
+            CREATE INDEX IF NOT EXISTS idx_sources_content_hash
+              ON sources(content_hash);
             ",
         )
     }
@@ -442,13 +604,24 @@ impl CtxStore {
         queries: &[String],
         opts: &SearchOpts,
     ) -> rusqlite::Result<Vec<SearchHit>> {
-        let conn = self.conn();
+        // Read-only work: take a pooled reader so concurrent searches run
+        // concurrently. The shared connection is the fallback for the case
+        // where opening one failed.
+        let reader = self.take_reader();
+        let fallback;
+        let conn: &Connection = match reader.as_ref() {
+            Some(conn) => conn,
+            None => {
+                fallback = self.conn();
+                &fallback
+            }
+        };
 
         let mut merged: HashMap<String, SearchHit> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
 
         for query in queries {
-            let hits = search_with_fallback(&conn, query, opts)?;
+            let hits = search_with_fallback(conn, query, opts)?;
             for hit in hits {
                 let key = format!("{}::{}", hit.source, hit.title);
                 match merged.get_mut(&key) {
@@ -492,6 +665,9 @@ impl CtxStore {
         }
 
         results.truncate(opts.limit);
+        if let Some(conn) = reader {
+            self.give_reader(conn);
+        }
         Ok(results)
     }
 }
@@ -518,7 +694,8 @@ fn search_with_fallback(
     let rrf = rrf_search(conn, query, limit, opts)?;
     if !rrf.is_empty() {
         let mut top: Vec<SearchHit> = rrf.into_iter().take(limit).collect();
-        apply_proximity_reranking(&mut top, query);
+        let depth = top.len().min(RERANK_DEPTH);
+        apply_proximity_reranking(&mut top[..depth], query);
         for h in &mut top {
             h.match_layer = "rrf";
         }
@@ -543,7 +720,8 @@ fn search_with_fallback(
         let fuzzy = rrf_search(conn, &corrected, limit, opts)?;
         if !fuzzy.is_empty() {
             let mut top: Vec<SearchHit> = fuzzy.into_iter().take(limit).collect();
-            apply_proximity_reranking(&mut top, &corrected);
+            let depth = top.len().min(RERANK_DEPTH);
+            apply_proximity_reranking(&mut top[..depth], &corrected);
             for h in &mut top {
                 h.match_layer = "rrf-fuzzy";
             }
@@ -803,6 +981,14 @@ fn apply_proximity_reranking(results: &mut [SearchHit], query: &str) {
     } else {
         filtered
     };
+    // Distinct terms only, and no more than the match expression itself uses.
+    // Every term costs a scan of every hit's content, so a 20k-word paste ran
+    // 20k scans per hit: 5.4s for one search against 0.48s for the same query
+    // at 800 words. Repeats were never worth their cost either — a term found
+    // once is found, and the second copy only diluted `title_boost`, whose
+    // denominator is the term count.
+    let mut terms = dedupe_tokens(terms);
+    terms.truncate(MAX_QUERY_TERMS);
 
     let mut scored: Vec<(f64, f64, SearchHit)> = results
         .iter()
@@ -949,6 +1135,27 @@ fn dedupe_tokens(tokens: Vec<String>) -> Vec<String> {
 
 const FTS_OPERATORS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
 
+/// Most distinct terms an FTS `MATCH` expression is built from.
+///
+/// A memory search takes the whole last user message as its query. Those run
+/// to 100k characters when the turn carries a paste, and the cost of the
+/// match is linear in distinct terms: measured against the live 522-memory
+/// index, 65 terms took 0.47s and ~1500 terms took 5.69s, each search holding
+/// the store lock for its whole run. The terms past the cap are also the ones
+/// carrying the least signal — they arrive after every rare word the message
+/// opened with, and BM25 ranks on rarity.
+const MAX_QUERY_TERMS: usize = 150;
+
+/// How far down the RRF list the proximity boost is allowed to reach.
+///
+/// A partition search asks the index for 2000 hits so that a small project's
+/// matches are not buried under a large one's, and reranking every one of
+/// them costs a lowercase copy of the content plus a substring scan per term.
+/// The boost only ever decides the order of what gets returned, and callers
+/// take ten; a hit ranked below 300 by RRF has no path to the answer through
+/// a boost. Below the cap the order is unchanged; above it, RRF order stands.
+const RERANK_DEPTH: usize = 300;
+
 /// Port of `sanitizeQuery`. `or_mode=true` joins with ` OR `, else with ` `.
 pub fn sanitize_query(query: &str, or_mode: bool) -> String {
     // Replace ['"(){}[]*:^~] with spaces, then split on whitespace.
@@ -974,11 +1181,12 @@ pub fn sanitize_query(query: &str, or_mode: bool) -> String {
         .filter(|w| !is_stopword(&w.to_lowercase()))
         .cloned()
         .collect();
-    let final_words = if meaningful.is_empty() {
+    let mut final_words = if meaningful.is_empty() {
         words
     } else {
         meaningful
     };
+    final_words.truncate(MAX_QUERY_TERMS);
     join_quoted(&final_words, or_mode)
 }
 
@@ -1014,11 +1222,12 @@ pub fn sanitize_trigram_query(query: &str, or_mode: bool) -> String {
         .filter(|w| !is_stopword(&w.to_lowercase()))
         .cloned()
         .collect();
-    let final_words = if meaningful.is_empty() {
+    let mut final_words = if meaningful.is_empty() {
         words
     } else {
         meaningful
     };
+    final_words.truncate(MAX_QUERY_TERMS);
     join_quoted(&final_words, or_mode)
 }
 
