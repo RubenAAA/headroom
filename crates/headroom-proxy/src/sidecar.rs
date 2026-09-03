@@ -511,6 +511,25 @@ async fn send_with_retry(
     }
 }
 
+/// Drop the 1M-context beta tokens from a client `anthropic-beta` value.
+///
+/// Returns `None` when nothing survives, so the caller sends no header at all
+/// rather than an empty one. Every other token rides along untouched: the
+/// sidecar only needs to shed what its own model cannot claim.
+fn strip_long_context_beta(value: &str) -> Option<String> {
+    let kept: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter(|t| !t.to_ascii_lowercase().starts_with("context-1m"))
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(","))
+    }
+}
+
 /// Send the shrunk request; `None` hands the turn back to the normal pipeline.
 ///
 /// Every failure falls back rather than surfacing. A transport error or any
@@ -529,6 +548,22 @@ async fn forward(
     let mut headers = HeaderMap::new();
     for (name, value) in client_headers.iter() {
         if crate::headers::is_request_drop(name) || crate::headers::is_internal_header(name) {
+            continue;
+        }
+        if name == axum::http::header::HeaderName::from_static("anthropic-beta") {
+            // The client asks for the 1M-context beta because its own model is
+            // entitled to it. The sidecar's haiku is not, and upstream answers
+            // "The long context beta is not yet available for this
+            // subscription" — a 400 that sent two thirds of sidecar turns back
+            // through the full-context fallback they were meant to avoid.
+            match strip_long_context_beta(value.to_str().unwrap_or_default()) {
+                Some(kept) => {
+                    if let Ok(v) = axum::http::HeaderValue::from_str(&kept) {
+                        headers.append(name.clone(), v);
+                    }
+                }
+                None => continue,
+            }
             continue;
         }
         headers.append(name.clone(), value.clone());
@@ -829,6 +864,21 @@ mod tests {
         // Streaming is the client's call and is passed through untouched.
         assert_eq!(out["stream"], true);
         assert_eq!(out["messages"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_long_context_beta_is_not_forwarded_to_the_sidecar_model() {
+        assert_eq!(
+            strip_long_context_beta("claude-code-20250219,context-1m-2025-08-07,effort-2025-11-24")
+                .as_deref(),
+            Some("claude-code-20250219,effort-2025-11-24")
+        );
+        assert_eq!(strip_long_context_beta("context-1m-2025-08-07"), None);
+        assert_eq!(strip_long_context_beta(""), None);
+        assert_eq!(
+            strip_long_context_beta("claude-code-20250219").as_deref(),
+            Some("claude-code-20250219")
+        );
     }
 
     #[test]
