@@ -68,36 +68,34 @@ impl Conversation {
     /// different routes — output down its stdout, tool calls in over HTTP —
     /// and either can be next.
     pub(crate) async fn next_step(&mut self) -> Step {
-        loop {
-            tokio::select! {
-                // Biased so a parked call is taken before more output when both
-                // are ready. Cursor writes its narration before it blocks on the
-                // call; taking the output first would be right too, but fixing
-                // the order keeps the frame sequence reproducible in tests.
-                biased;
+        tokio::select! {
+            // Biased so a parked call is taken before more output when both
+            // are ready. Cursor writes its narration before it blocks on the
+            // call; taking the output first would be right too, but fixing
+            // the order keeps the frame sequence reproducible in tests.
+            biased;
 
-                parked = self.inbox.recv() => {
-                    let Some(parked) = parked else {
-                        // The session was closed underneath us.
-                        return Step::End;
-                    };
-                    let mut frames = self.running.translator.emit_parked_tool_use(
-                        &parked.id,
-                        &parked.name,
-                        &parked.args,
-                    );
-                    frames.extend(self.running.translator.pause_for_tool());
-                    return Step::Pause(frames);
-                }
+            parked = self.inbox.recv() => {
+                let Some(parked) = parked else {
+                    // The session was closed underneath us.
+                    return Step::End;
+                };
+                let mut frames = self.running.translator.emit_parked_tool_use(
+                    &parked.id,
+                    &parked.name,
+                    &parked.args,
+                );
+                frames.extend(self.running.translator.pause_for_tool());
+                return Step::Pause(frames);
+            }
 
-                frames = self.running.next_frames() => {
-                    match frames {
-                        Some(frames) => {
-                            self.record_chat_id().await;
-                            return Step::Emit(frames);
-                        }
-                        None => return Step::End,
+            frames = self.running.next_frames() => {
+                match frames {
+                    Some(frames) => {
+                        self.record_chat_id().await;
+                        return Step::Emit(frames);
                     }
+                    None => return Step::End,
                 }
             }
         }

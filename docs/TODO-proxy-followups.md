@@ -1,8 +1,9 @@
 # Proxy follow-ups
 
-Four items, investigated 2026-08-23 against `~/headroom-proxy.log`
-(~3,200 streams, proxy restarted 16:47). Each entry records what the
-evidence says, not what it was assumed to say.
+Items 1 to 4 were investigated 2026-08-23 against `~/headroom-proxy.log`
+(~3,200 streams, proxy restarted 16:47). Items 5 and 6 come from the offload-gap
+round of 2026-08-18 to 08-21. Each entry records what the evidence says, not
+what it was assumed to say.
 
 ## 1. Volatile-content warning fires mostly on constants
 
@@ -201,3 +202,41 @@ against 211KB / 75k healthy — but stay inside the normal range
 Next: set `http2_keep_alive_interval` (~20s),
 `http2_keep_alive_while_idle(true)` and `tcp_keepalive`, then measure
 the drop rate over an hour of traffic.
+
+## 5. The outcome-context re-parse is still redundant
+
+**Status: open, last measured 2026-08-19 and not confirmed since.** Phase timers
+on a 743 KB body put the outcome-context stage at 7.5 ms. Its comment at
+`proxy.rs:3510` — "Re-parses `buffered` for model/num_messages (cheap, happens
+once)" — is wrong twice: it is not cheap at that size, and it is the fifth parse
+of the body. It can reuse an existing parse. Check the current source before
+costing the work; the line number is from August.
+
+Price the rest of the parse-once idea at 3.9 ms, not 54.
+`maybe_compact_tool_schemas` (`proxy.rs:1781`), `maybe_stabilize_tool_order` and
+the tail-breakpoint stage each parse the whole body, edit it and re-serialise,
+and those tool stages account for 3.9 ms between them. The 54 ms once attributed
+to them was the savings tracker, since fixed in
+`crates/headroom-core/src/savings_tracker.rs`. Memoising tool-schema compaction
+on a hash of the `tools` array, which used to be listed here as the second fix,
+already exists as `cache_key`/`cache_get`/`cache_put` in
+`tool_schema_compaction.rs:367`. The 0.6 ms left there is the cache *hit* path
+building the key and cloning the value out of the mutex, and it recomputes
+nothing.
+
+## 6. Two loose ends left by the memory retrieval bug
+
+**Status: open, both found 2026-08-21 while closing the RRF scoring bug in
+`3cee05d1`.**
+
+The live proxy had no `HEADROOM_MEMORY_*` in its environment, so it ran
+`auto_tail` rather than the configured `tool` mode. `claude-launcher` sources the
+flags file only in the branch that starts the proxy, so a run that reuses a live
+proxy exports nothing. Read the environment of the running process, not the
+flags file, before treating any memory-mode behaviour as configured.
+
+The memory backend's own tests never caught the scoring bug, which had stopped
+every injection for two days. They assert on presence and ordering and never on
+an absolute score against `min_similarity`, so a fused score capped at 0.032
+against a floor of 0.3 passed all of them. Any test guarding a threshold has to
+assert the number, not the ranking.

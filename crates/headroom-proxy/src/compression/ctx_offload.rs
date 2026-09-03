@@ -148,8 +148,10 @@ pub struct CtxOffloadConfig {
     pub stale_window: usize,
 }
 
-/// One offloaded block, handed to the background worker for storage. Never
-/// touched on the request path beyond construction.
+/// One offloaded block. Its CCR original is stored inline by
+/// [`crate::ctx::offload_store::OffloadStore::persist`], because a retrieval
+/// can land in the same turn as the offload; only the FTS indexing goes to the
+/// background worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffloadRecord {
     /// `blake3(original)[:24]` — the retrieval key embedded in the digest.
@@ -169,6 +171,16 @@ pub struct OffloadOutcome {
     /// PR-J4: qualifying frozen blocks left raw because the turn is not a
     /// rebuild boundary (they will convert at the next boundary).
     pub blocks_deferred: usize,
+    /// Serialized bytes of those blocks, as they will be re-sent verbatim on
+    /// every turn until a boundary opens.
+    ///
+    /// The count alone cannot price the deferral. Converting a deferred block
+    /// rewrites the cached prefix from that block forward, so whether the
+    /// conversion pays for itself is the ratio of what it frees to what it
+    /// forces rewritten — and the numerator was never recorded. Bytes rather
+    /// than tokens because the tokenizer pass a token count needs is exactly
+    /// the work the deferral skipped.
+    pub bytes_deferred: usize,
     /// PR-J5 thrash guard: conversions of frozen blocks not previously in the
     /// session's offload set. Non-zero on a non-boundary turn means the I4
     /// invariant was violated (a cache-thrash bug) — the caller warns loudly.
@@ -248,7 +260,16 @@ pub struct OffloadGate {
     /// Where the sets are kept so they survive a restart. `None` keeps them in
     /// memory only, which is the pre-2026-08-17 behaviour.
     persist_dir: Option<Arc<std::path::PathBuf>>,
+    /// Held from snapshot to rename, so two turns on one session cannot write
+    /// their snapshots out of order or into the same temporary file. Either
+    /// way the older, smaller set would win on disk, and after a restart the
+    /// hashes it lacked would revert their digests to raw — a cache bust.
+    persist_lock: Mutex<()>,
 }
+
+/// Distinguishes temporary files written by this process; combined with the
+/// pid it keeps a second proxy on the same directory from sharing one.
+static PERSIST_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One session's converted-hash set, as written to disk.
 ///
@@ -320,6 +341,7 @@ impl OffloadGate {
         Self {
             sessions: Mutex::new(LruCache::new(cap)),
             persist_dir: None,
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -404,6 +426,7 @@ impl OffloadGate {
     }
 
     fn record(&self, session: &str, hash: &str) {
+        let _serialised = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
         let snapshot = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             match sessions.get_mut(session) {
@@ -426,6 +449,63 @@ impl OffloadGate {
         }
     }
 
+    /// Copy the donor's conversions onto `session`, which has just adopted the
+    /// donor's forwarded prefix (see `SessionReplayStore`).
+    ///
+    /// The prefix carries the donor's digests, so the adopter's later turns
+    /// must re-apply them through the `prior` path. Without this the gate has
+    /// never seen those blocks under the adopter's key, the digest reverts to
+    /// the raw block, and the provider re-caches from there. The donor's own
+    /// set is left as it was.
+    pub fn adopt_from(
+        &self,
+        donor: &crate::cache_stabilization::prefix_replay::AdoptionDonor,
+        session: &str,
+    ) {
+        use crate::cache_stabilization::prefix_replay::AdoptionDonor;
+        let hashes: HashSet<String> = match donor {
+            AdoptionDonor::Session(key) => {
+                self.hydrate(key);
+                let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                sessions.peek(key.as_str()).cloned().unwrap_or_default()
+            }
+            // Same file naming as the replay store: the SHA-256 hex of the key.
+            AdoptionDonor::PersistedDigest(digest) => self
+                .persist_dir
+                .as_deref()
+                .and_then(|dir| std::fs::read(dir.join(format!("{digest}.json"))).ok())
+                .and_then(|bytes| serde_json::from_slice::<PersistedGate>(&bytes).ok())
+                .filter(|g| {
+                    gate_unix_now().saturating_sub(g.saved_at_unix)
+                        <= GATE_PERSIST_MAX_AGE.as_secs()
+                })
+                .map(|g| g.hashes.into_iter().collect())
+                .unwrap_or_default(),
+        };
+        if hashes.is_empty() {
+            return;
+        }
+        let adopted = hashes.len();
+        let snapshot = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            match sessions.get_mut(session) {
+                Some(set) => set.extend(hashes),
+                None => {
+                    sessions.put(session.to_string(), hashes);
+                }
+            }
+            sessions.get(session).cloned()
+        };
+        tracing::info!(
+            event = "offload_gate_adopted",
+            conversions = adopted,
+            "seeded a session's offload conversions from the session whose prefix it adopted"
+        );
+        if let (Some(dir), Some(set)) = (self.persist_dir.as_deref(), snapshot) {
+            self.persist(dir, session, set);
+        }
+    }
+
     /// Best-effort and quiet on failure: a lost set costs what the in-memory
     /// gate cost before it existed.
     fn persist(&self, dir: &std::path::Path, session: &str, set: HashSet<String>) {
@@ -443,7 +523,11 @@ impl OffloadGate {
         let path = gate_path(dir, session);
         // Write-then-rename, so a restart mid-write cannot leave a truncated file
         // that parses as a valid but short set.
-        let temporary = path.with_extension("tmp");
+        let temporary = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            PERSIST_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         if std::fs::write(&temporary, &bytes).is_ok() {
             let _ = std::fs::rename(&temporary, &path);
         }
@@ -477,6 +561,35 @@ const PREVIEW_FLOOR_BYTES: usize = 600;
 /// the same bytes yield the same digest on every turn and after a restart.
 fn preview_budget(len: usize) -> usize {
     (len / 4).clamp(PREVIEW_FLOOR_BYTES, PREVIEW_BYTES)
+}
+
+/// Ceiling on the preview of a block first converted after 2026-09-02. The
+/// legacy budget above yielded a 974-byte median preview; a digest exists to
+/// point at the store, and half a kilobyte orients the model as well.
+const PREVIEW_CAP_BYTES: usize = 512;
+
+/// Gate namespace for conversions made under [`PREVIEW_CAP_BYTES`]. A digest
+/// is a pure function of the block bytes AND the budget it was cut with, so a
+/// block converted under the legacy budget must keep regenerating under it:
+/// its digest is already in the provider's cache, and a shorter preview would
+/// be a new block. The un-namespaced entry therefore keeps meaning "legacy
+/// budget", and only never-converted blocks take the cap. Persisted gate files
+/// from before the cap carry only legacy entries and keep working unchanged.
+const PREVIEW_CAP_GATE_NS: &str = "p512:";
+
+/// Look `key` up under both gate entry shapes. Returns whether the block was
+/// converted before in this session, the entry to record it under, and the
+/// preview budget its digest must be cut with.
+fn gate_lookup(policy: Option<&OffloadPolicy>, key: &str, len: usize) -> (bool, String, usize) {
+    let capped_key = format!("{PREVIEW_CAP_GATE_NS}{key}");
+    let Some(p) = policy else {
+        return (false, capped_key, PREVIEW_CAP_BYTES);
+    };
+    if p.gate.contains(p.session_key, key) {
+        return (true, key.to_string(), preview_budget(len));
+    }
+    let prior = p.gate.contains(p.session_key, &capped_key);
+    (prior, capped_key, PREVIEW_CAP_BYTES)
 }
 
 /// Longest prefix of `text` whose UTF-8 encoding is at most `max_bytes`,
@@ -673,7 +786,10 @@ pub fn offload_anthropic_request(
                     outcome.tokens_saved += tokens_saved;
                     outcome.records.push(record);
                 }
-                BlockOutcome::Deferred => outcome.blocks_deferred += 1,
+                BlockOutcome::Deferred { bytes } => {
+                    outcome.blocks_deferred += 1;
+                    outcome.bytes_deferred += bytes;
+                }
                 BlockOutcome::Skipped => {}
             }
         }
@@ -693,7 +809,7 @@ enum BlockOutcome {
         tokens_saved: i64,
     },
     /// Block qualified but the PR-J4 gate deferred it to the next boundary.
-    Deferred,
+    Deferred { bytes: usize },
     /// Block did not qualify (too small / already a digest / no text).
     Skipped,
 }
@@ -731,14 +847,14 @@ fn offload_tool_result(
     // before anything positional so that "already a digest" outranks every
     // other test: monotonicity (I3) is what keeps the prefix stable, and a
     // block that reverts to raw costs the same as one that converts late.
-    let prior = policy.is_some_and(|p| p.gate.contains(p.session_key, &hash));
+    let (prior, gate_key, budget) = gate_lookup(policy, &hash, original.len());
 
     // PR-J4 boundary gate: a frozen block's *first* conversion only rides a
     // rebuild boundary; re-applications (hash already in the session set) and
     // live-tail blocks always pass. See [`OffloadGate`].
     if let Some(p) = policy {
         if !prior && !is_live && !near_tail && !p.rebuild_boundary {
-            return BlockOutcome::Deferred;
+            return BlockOutcome::Deferred { bytes: original.len() };
         }
     }
     // Structural compressor when one applies; otherwise a plain preview cut,
@@ -750,7 +866,7 @@ fn offload_tool_result(
     let body = if strategy.is_some() {
         compressed
     } else {
-        preview(&original, preview_budget(original.len()))
+        preview(&original, budget)
     };
     let digest = format!("{body}{}", footer(&hash, original.len()));
 
@@ -782,7 +898,7 @@ fn offload_tool_result(
     // PR-J4 (I3, monotonicity): once converted, the hash stays in the session
     // set so every later turn re-applies the offload without re-gating.
     if let Some(p) = policy {
-        p.gate.record(p.session_key, &hash);
+        p.gate.record(p.session_key, &gate_key);
     }
 
     BlockOutcome::Offloaded {
@@ -794,6 +910,127 @@ fn offload_tool_result(
         prior,
         tokens_saved,
     }
+}
+
+/// Gate-set namespace for `tool_use` conversions. A Write's `content` can be
+/// byte-identical to an earlier Read's result, and the two must not share a
+/// "converted before" verdict: the result's digest says nothing about whether
+/// this `tool_use` block was ever forwarded as one.
+const TOOL_USE_GATE_NS: &str = "tool_use:";
+
+/// Replace large string values in prior-turn `tool_use` inputs (a Write's
+/// `content`, an Edit's `new_string`) with the digest [`offload_tool_result`]
+/// writes: a preview plus [`footer`], keyed by the value's own hash, so
+/// `headroom_retrieve` hands the original back. Every key stays; only string
+/// values of at least `min_bytes` change.
+///
+/// Stricter than the tool_result pass, because a cached `tool_use` rewritten
+/// mid-history is a recache the user pays for. A FIRST conversion touches a
+/// block only where it provably sits outside every provider cache entry:
+///
+/// - the newest assistant message, at an index the replay store has never
+///   forwarded (`forwarded_before` is the store's count; `None` means unknown,
+///   which is treated as "already forwarded"); or
+/// - any message, on a rebuild boundary.
+///
+/// There is no near-tail window. Re-applications (`prior`) run everywhere but
+/// the last message, so a converted block never reverts. `put` stores the
+/// original before a first conversion is committed; when it fails the block
+/// stays raw, because a digest with no record behind it is a loss on its own
+/// and one that cannot be re-applied next turn is a recache.
+pub fn offload_tool_use_inputs(
+    parsed: &mut Value,
+    config: &CtxOffloadConfig,
+    policy: &OffloadPolicy,
+    forwarded_before: Option<usize>,
+    put: &dyn Fn(&OffloadRecord) -> bool,
+) -> OffloadOutcome {
+    let mut outcome = OffloadOutcome::default();
+    let Some(messages) = parsed.get_mut("messages").and_then(Value::as_array_mut) else {
+        return outcome;
+    };
+    let last_idx = messages.len().saturating_sub(1);
+    let newest_assistant = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"));
+    let tokenizer = get_tokenizer(DEFAULT_MODEL);
+
+    for (msg_idx, message) in messages.iter_mut().enumerate() {
+        // The last message is the client's live tail; left alone by contract.
+        if msg_idx == last_idx {
+            continue;
+        }
+        let first_allowed = policy.rebuild_boundary
+            || (Some(msg_idx) == newest_assistant
+                && forwarded_before.is_some_and(|sent| msg_idx >= sent));
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let tool_name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let Some(input) = block.get_mut("input").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            // `preserve_order` keeps this walk in the client's key order.
+            for (_, value) in input.iter_mut() {
+                let Value::String(original) = value else {
+                    continue;
+                };
+                if original.contains(MARKER_PREFIX) || original.len() < config.min_bytes {
+                    continue;
+                }
+                let hash = compute_key(original.as_bytes());
+                let (prior, gate_key, budget) = gate_lookup(
+                    Some(policy),
+                    &format!("{TOOL_USE_GATE_NS}{hash}"),
+                    original.len(),
+                );
+                if !prior && !first_allowed {
+                    outcome.blocks_deferred += 1;
+                    outcome.bytes_deferred += original.len();
+                    continue;
+                }
+                let digest = format!(
+                    "{}{}",
+                    preview(original, budget),
+                    footer(&hash, original.len())
+                );
+                let digest_tokens = tokenizer.count_text(&digest);
+                let original_tokens = tokenizer.count_text(original);
+                if digest_tokens >= original_tokens {
+                    continue;
+                }
+                let record = OffloadRecord {
+                    hash,
+                    original: original.clone(),
+                    title: tool_name.clone(),
+                };
+                if !prior && !put(&record) {
+                    tracing::warn!(
+                        event = "ctx_offload_tool_use_put_failed",
+                        tool = %tool_name,
+                        "offload store rejected the original; leaving the tool_use input raw"
+                    );
+                    continue;
+                }
+                *value = Value::String(digest);
+                if !prior {
+                    policy.gate.record(policy.session_key, &gate_key);
+                }
+                outcome.blocks_offloaded += 1;
+                outcome.tokens_saved += (original_tokens - digest_tokens) as i64;
+                outcome.records.push(record);
+            }
+        }
+    }
+    outcome
 }
 
 /// Concatenated text of a `tool_result` `content` field. `content` is either a
@@ -1080,6 +1317,10 @@ mod tests {
         let out = offload_anthropic_request(&mut parsed, &margin_cfg(4), Some(&policy));
         assert_eq!(out.blocks_offloaded, 0, "not on a steady-state turn");
         assert_eq!(out.blocks_deferred, 1, "deferred, not abandoned");
+        assert!(
+            out.bytes_deferred > 0,
+            "the deferral records what it is holding raw, not just that it held something"
+        );
         assert_eq!(
             first_tool_result_text(&parsed),
             body,
@@ -1119,6 +1360,139 @@ mod tests {
             first_tool_result_text(&shallow),
             digest,
             "the same bytes must yield the same digest at any depth"
+        );
+    }
+
+    /// `[user, assistant(Write), user(result), assistant, user]`: the Write
+    /// sits in an older assistant message.
+    fn session_with_old_write() -> Value {
+        json!({"messages": [
+            {"role":"user","content":[{"type":"text","text":"build it"}]},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"tu_w","name":"Write",
+                 "input":{"file_path":"/a.rs","content":big_body()}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tu_w","content":"ok"}
+            ]},
+            {"role":"assistant","content":"done"},
+            {"role":"user","content":[{"type":"text","text":"thanks"}]}
+        ]})
+    }
+
+    fn write_content(parsed: &Value) -> Value {
+        parsed["messages"][1]["content"][0]["input"]["content"].clone()
+    }
+
+    #[test]
+    fn an_older_assistant_message_is_never_converted_on_a_steady_turn() {
+        let gate = OffloadGate::new(16);
+        let put = |_: &OffloadRecord| true;
+
+        let mut steady = session_with_old_write();
+        let out = offload_tool_use_inputs(
+            &mut steady,
+            &cfg(200),
+            &gate_policy(&gate, false),
+            Some(5),
+            &put,
+        );
+        assert_eq!(
+            out.blocks_offloaded, 0,
+            "converted inside the cached prefix"
+        );
+        assert_eq!(out.blocks_deferred, 1);
+        assert_eq!(write_content(&steady), Value::String(big_body()));
+        assert_eq!(
+            steady["messages"][1]["content"][0]["input"]["file_path"], "/a.rs",
+            "other keys stay as sent"
+        );
+
+        let mut boundary = session_with_old_write();
+        let out = offload_tool_use_inputs(
+            &mut boundary,
+            &cfg(200),
+            &gate_policy(&gate, true),
+            Some(5),
+            &put,
+        );
+        assert_eq!(out.blocks_offloaded, 1);
+        let digest = write_content(&boundary);
+        assert!(digest.as_str().unwrap().contains(MARKER_PREFIX));
+        assert_eq!(out.records[0].original, big_body());
+        assert_eq!(out.records[0].title, "Write");
+
+        // Once converted, a steady turn re-applies the same bytes.
+        let mut again = session_with_old_write();
+        let out = offload_tool_use_inputs(
+            &mut again,
+            &cfg(200),
+            &gate_policy(&gate, false),
+            Some(5),
+            &put,
+        );
+        assert_eq!(out.blocks_offloaded, 1, "must not revert to raw");
+        assert_eq!(write_content(&again), digest);
+    }
+
+    #[test]
+    fn the_newest_assistant_message_converts_only_where_it_was_never_forwarded() {
+        let gate = OffloadGate::new(16);
+        let put = |_: &OffloadRecord| true;
+        // Three messages: the Write is the newest assistant message.
+        let mut body = session_with_old_write();
+        body["messages"].as_array_mut().unwrap().truncate(3);
+
+        let mut sent = body.clone();
+        let out = offload_tool_use_inputs(
+            &mut sent,
+            &cfg(200),
+            &gate_policy(&gate, false),
+            Some(2),
+            &put,
+        );
+        assert_eq!(out.blocks_offloaded, 0, "index 1 was already forwarded");
+
+        let mut unknown = body.clone();
+        let out = offload_tool_use_inputs(
+            &mut unknown,
+            &cfg(200),
+            &gate_policy(&gate, false),
+            None,
+            &put,
+        );
+        assert_eq!(out.blocks_offloaded, 0, "unsure means untouched");
+
+        let mut fresh = body.clone();
+        let out = offload_tool_use_inputs(
+            &mut fresh,
+            &cfg(200),
+            &gate_policy(&gate, false),
+            Some(1),
+            &put,
+        );
+        assert_eq!(out.blocks_offloaded, 1);
+    }
+
+    #[test]
+    fn a_failed_store_write_leaves_the_tool_use_raw() {
+        let gate = OffloadGate::new(16);
+        let mut body = session_with_old_write();
+        let out = offload_tool_use_inputs(
+            &mut body,
+            &cfg(200),
+            &gate_policy(&gate, true),
+            Some(5),
+            &|_| false,
+        );
+        assert_eq!(out.blocks_offloaded, 0);
+        assert_eq!(write_content(&body), Value::String(big_body()));
+        assert!(
+            !gate.contains(
+                "sess",
+                &format!("{TOOL_USE_GATE_NS}{}", compute_key(big_body().as_bytes()))
+            ),
+            "nothing to re-apply next turn"
         );
     }
 
@@ -1308,6 +1682,51 @@ mod tests {
         );
     }
 
+    /// Two turns of one session converting at the same moment used to race
+    /// the snapshot to disk through one shared temporary file. Whichever
+    /// finished last won, so a hash could be present in memory and absent on
+    /// disk; after a restart its digest reverted to raw and busted the cache.
+    /// Every hash recorded by any thread must be on disk once they all return.
+    #[test]
+    fn concurrent_records_all_reach_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(OffloadGate::with_persistence(16, dir.path().to_path_buf()));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        gate.record("sess", &format!("h{t}-{i}"));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let reopened = OffloadGate::with_persistence(16, dir.path().to_path_buf());
+        for t in 0..8 {
+            for i in 0..25 {
+                assert!(
+                    reopened.contains("sess", &format!("h{t}-{i}")),
+                    "h{t}-{i} was recorded but is not on disk"
+                );
+            }
+        }
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "temporary files must be renamed away");
+    }
+
     /// The PR-J5 guard exists to shout when frozen history converts on a quiet
     /// turn, which the window now does on purpose. Counted together, the guard
     /// fired twice in the first 15 turns after `stale_window` shipped — and a
@@ -1416,6 +1835,115 @@ mod tests {
 
     /// The preview has to scale, or `min_bytes` below ~3.2KB is a no-op: a fixed
     /// 3,072-byte cut cannot shrink a 4,000-byte block.
+    /// Prose no compressor claims, so the digest takes the preview fallback.
+    fn prose_body() -> String {
+        (0..120)
+            .map(|i| {
+                format!(
+                    "Paragraph {i}: the quick brown fox jumps over the lazy dog {}.\n",
+                    i * 7
+                )
+            })
+            .collect()
+    }
+
+    /// The preview text of the first tool_result's digest, without its footer.
+    fn preview_of(parsed: &Value) -> String {
+        let text = first_tool_result_text(parsed);
+        assert!(
+            text.contains("…[truncated"),
+            "digest took the preview fallback"
+        );
+        text[..text.find("\n…[truncated").unwrap()].to_string()
+    }
+
+    fn frozen_req(body: &str) -> Value {
+        req_with_tail(body, "Bash", 12)
+    }
+
+    #[test]
+    fn a_block_converted_under_the_legacy_entry_keeps_its_legacy_preview() {
+        let body = prose_body();
+        let hash = compute_key(body.as_bytes());
+        let gate = OffloadGate::new(4);
+        gate.record("s", &hash);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "s",
+            rebuild_boundary: false,
+        };
+        let mut parsed = frozen_req(&body);
+        let out = offload_anthropic_request(&mut parsed, &margin_cfg(4), Some(&policy));
+        assert_eq!(
+            out.blocks_offloaded, 1,
+            "a prior conversion re-applies off a boundary"
+        );
+        let preview = preview_of(&parsed);
+        assert_eq!(preview.len(), preview_budget(body.len()));
+        assert!(preview.len() > PREVIEW_CAP_BYTES);
+        assert!(!gate.contains("s", &format!("{PREVIEW_CAP_GATE_NS}{hash}")));
+    }
+
+    #[test]
+    fn a_new_block_takes_the_capped_preview_and_keeps_it() {
+        let body = prose_body();
+        let hash = compute_key(body.as_bytes());
+        let gate = OffloadGate::new(4);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "s",
+            rebuild_boundary: true,
+        };
+        let mut first = frozen_req(&body);
+        offload_anthropic_request(&mut first, &margin_cfg(4), Some(&policy));
+        assert_eq!(preview_of(&first).len(), PREVIEW_CAP_BYTES);
+        assert!(gate.contains("s", &format!("{PREVIEW_CAP_GATE_NS}{hash}")));
+        assert!(
+            !gate.contains("s", &hash),
+            "no legacy entry for a capped conversion"
+        );
+
+        let steady = OffloadPolicy {
+            gate: &gate,
+            session_key: "s",
+            rebuild_boundary: false,
+        };
+        let mut second = frozen_req(&body);
+        offload_anthropic_request(&mut second, &margin_cfg(4), Some(&steady));
+        assert_eq!(
+            first_tool_result_text(&first),
+            first_tool_result_text(&second)
+        );
+    }
+
+    #[test]
+    fn a_legacy_entry_read_from_disk_keeps_its_legacy_preview() {
+        let body = prose_body();
+        let hash = compute_key(body.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        // A gate file written before the cap existed: un-namespaced hashes only.
+        let file = PersistedGate {
+            saved_at_unix: gate_unix_now(),
+            hashes: vec![hash.clone()],
+        };
+        std::fs::write(
+            gate_path(dir.path(), "s"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+
+        let gate = OffloadGate::with_persistence(4, dir.path().to_path_buf());
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "s",
+            rebuild_boundary: false,
+        };
+        let mut parsed = frozen_req(&body);
+        let out = offload_anthropic_request(&mut parsed, &margin_cfg(4), Some(&policy));
+        assert_eq!(out.blocks_offloaded, 1);
+        assert_eq!(preview_of(&parsed).len(), preview_budget(body.len()));
+    }
+
     #[test]
     fn the_preview_budget_scales_with_the_block() {
         assert_eq!(preview_budget(100), PREVIEW_FLOOR_BYTES, "floor holds");

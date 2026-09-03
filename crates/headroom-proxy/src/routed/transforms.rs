@@ -209,7 +209,6 @@ pub(crate) async fn apply_ctx_request_transforms(
     // to write memories at all — `--memory` looked enabled and silently did
     // nothing.
     if let Some(handler) = state.memory_handler.as_ref() {
-        let handler = handler.lock().await;
         if handler.is_initialized() {
             // A request with no `tools` array still gets the memory tools; the
             // array is created on demand, matching the Claude path.
@@ -287,7 +286,6 @@ pub(crate) async fn apply_ctx_request_transforms(
 
     // Memory: search and append recalled context to the latest user message.
     if let Some(handler) = state.memory_handler.as_ref() {
-        let handler = handler.lock().await;
         if handler.is_initialized() {
             if let Some(messages) = parsed.get("messages").and_then(|v| v.as_array()).cloned() {
                 let user_id = headers

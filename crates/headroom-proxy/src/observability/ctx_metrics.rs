@@ -116,6 +116,32 @@ fn search_queries_counter(registry: &Registry) -> &'static IntCounter {
     })
 }
 
+fn events_deduped_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL,
+            METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL_HELP,
+        )
+        .expect("proxy_ctx_events_deduped_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("proxy_ctx_events_deduped_total registers exactly once");
+        c
+    })
+}
+
+/// Record one session event the store refused as a duplicate. Called from the
+/// CTX-2a capture observer.
+pub fn observe_event_deduped() {
+    events_deduped_counter(super::prometheus::registry()).inc();
+}
+
+/// Duplicate events refused so far. Used by tests and `/ctx/stats`.
+pub fn events_deduped_get(registry: &Registry) -> u64 {
+    events_deduped_counter(registry).get()
+}
+
 fn retrieval_hits_counter(registry: &Registry) -> &'static IntCounter {
     static COUNTER: OnceLock<IntCounter> = OnceLock::new();
     COUNTER.get_or_init(|| {

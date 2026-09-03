@@ -1,9 +1,10 @@
 //! CTX-4 — recall / resume injection engine.
 //!
-//! On the **first sight** of a conversation, prepends a text block into the
-//! first user message: a resume snapshot (when the request looks like a
-//! compaction/resume of a prior conversation under the same client) or a fresh
-//! recall block (top-k BM25 hits from the CTX-1 content store + a static
+//! On the **first sight** of a conversation, inserts a text block into the
+//! first user message, behind the client's opening `<system-reminder>` run and
+//! in front of what the user typed: a resume snapshot (when the request looks
+//! like a compaction/resume of a prior conversation under the same client) or a
+//! fresh recall block (top-k BM25 hits from the CTX-1 content store + a static
 //! directive). The decision is **persisted once** keyed by `conv_id` and
 //! replayed byte-for-byte on every subsequent turn — invariant I4
 //! (`docs/ctx-mode-in-headroom-plan.md`).
@@ -15,8 +16,8 @@
 //!   keeps the cached prefix byte-stable.
 //! - It is decided exactly once (`SessionsStore::put_injection` never
 //!   overwrites); later turns read the stored bytes and re-inject at the same
-//!   position (prepended into the first user message; `system`/`tools` are
-//!   never touched).
+//!   position (behind the opening scaffolding of the first user message;
+//!   `system`/`tools` are never touched).
 //! - **Row-miss fail-safe:** if we have seen a conversation before (its
 //!   prefix-chain exists) but its injection row is gone (purge/crash), we
 //!   inject **nothing** and log loudly. Worst case is a single re-cache, never
@@ -408,9 +409,33 @@ fn derive_queries(first_text: &str) -> Vec<String> {
     }
 }
 
-/// Prepend the injected text as a text block into the first user message.
-/// Idempotent: a message already carrying our sentinel is left untouched.
-/// Returns whether a block was inserted.
+/// How many blocks at the head of a user message are client scaffolding.
+///
+/// Claude Code opens every session of a project with the same
+/// `<system-reminder>` block — the CLAUDE.md digest, ~47 KB of it — followed by
+/// what the user actually typed. Those leading bytes are identical across
+/// sessions, so they can be one cached prefix shared by all of them, but only
+/// while nothing session-specific sits in front of them.
+fn leading_scaffolding_len(blocks: &[Value]) -> usize {
+    blocks
+        .iter()
+        .take_while(|b| crate::cache_stabilization::ephemeral_spans::is_ephemeral_client_block(b))
+        .count()
+}
+
+/// Insert the injected text as its own text block into the first user message,
+/// after the leading run of client scaffolding and before the first block the
+/// user wrote. Idempotent: a message already carrying our sentinel is left
+/// untouched. Returns whether a block was inserted.
+///
+/// The recall is session-specific. Put it at index 0 and it pushes the shared
+/// scaffolding behind bytes no other session has, which costs every fresh
+/// session a full write of the reminder — measured at ~11k tokens a session,
+/// ~10% of the day's cache writes. Behind the scaffolding it costs nothing that
+/// was not already session-specific.
+///
+/// `content` sent as a bare string has no block structure to sit behind, so it
+/// keeps the old prepend.
 fn apply(parsed: &mut Value, decision: &Decision) -> bool {
     let Some(text) = decision else {
         return false;
@@ -437,7 +462,8 @@ fn apply(parsed: &mut Value, decision: &Decision) -> bool {
                 Value::Array(vec![injected, json!({ "type": "text", "text": original })]);
         }
         Some(Value::Array(blocks)) => {
-            blocks.insert(0, injected);
+            let at = leading_scaffolding_len(blocks);
+            blocks.insert(at, injected);
         }
         _ => return false,
     }
@@ -758,5 +784,120 @@ mod tests {
             .unwrap();
         assert!(text.contains("<session_resume"));
         assert!(text.contains("implement the widget"));
+    }
+
+    /// Claude Code's opener: one or more `<system-reminder>` blocks carrying the
+    /// project's CLAUDE.md digest, then whatever the user typed.
+    fn scaffolded_req(reminders: &[&str], typed: &str) -> Value {
+        let mut blocks: Vec<Value> = reminders
+            .iter()
+            .map(|r| json!({"type":"text","text": format!("<system-reminder>\n{r}\n</system-reminder>")}))
+            .collect();
+        blocks.push(json!({"type":"text","text": typed}));
+        json!({
+            "system": "sys",
+            "messages": [{"role":"user","content": blocks}]
+        })
+    }
+
+    fn texts_of(req: &Value) -> Vec<String> {
+        req["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["text"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn recall_sits_behind_the_opening_scaffolding() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        let mut r = scaffolded_req(&["# claudeMd", "# gitStatus"], "build a parser");
+        assert!(eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
+
+        let texts = texts_of(&r);
+        assert_eq!(texts.len(), 4, "one block added, none replaced");
+        assert!(texts[0].starts_with("<system-reminder>"));
+        assert!(texts[1].starts_with("<system-reminder>"));
+        assert!(
+            texts[2].starts_with(INJECT_SENTINEL),
+            "recall goes after the reminders, before the typed text: {texts:?}"
+        );
+        assert_eq!(texts[3], "build a parser");
+    }
+
+    #[test]
+    fn recall_still_leads_when_there_is_no_scaffolding() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        let mut r = json!({
+            "system": "sys",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"build a parser"}
+            ]}]
+        });
+        assert!(eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
+
+        let texts = texts_of(&r);
+        assert!(texts[0].starts_with(INJECT_SENTINEL), "{texts:?}");
+        assert_eq!(texts[1], "build a parser");
+    }
+
+    /// A reminder that is not at the head does not start a run, so the recall
+    /// still leads. Only the opening run is shared across sessions.
+    #[test]
+    fn a_reminder_below_the_head_does_not_move_the_recall() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        let mut r = json!({
+            "system": "sys",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"build a parser"},
+                {"type":"text","text":"<system-reminder>late</system-reminder>"}
+            ]}]
+        });
+        assert!(eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
+        assert!(texts_of(&r)[0].starts_with(INJECT_SENTINEL));
+    }
+
+    #[test]
+    fn double_injection_is_guarded_behind_scaffolding() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        let mut r = scaffolded_req(&["# claudeMd"], "do a thing");
+        assert!(eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
+        let after_first = r.clone();
+        assert!(!eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
+        assert_eq!(r, after_first, "a second pass must change nothing");
+    }
+
+    /// Three consecutive turns of one session must forward the SAME bytes for
+    /// message 0. Anything else rewrites a prefix the provider already holds.
+    #[test]
+    fn message_zero_is_byte_stable_across_three_turns() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+
+        let turn = |extra: usize| {
+            let mut req = scaffolded_req(&["# claudeMd", "# gitStatus"], "build a parser");
+            let msgs = req["messages"].as_array_mut().unwrap();
+            for i in 0..extra {
+                msgs.push(json!({"role":"assistant","content":"ok"}));
+                msgs.push(json!({"role":"user","content": format!("next {i}")}));
+            }
+            req
+        };
+
+        let mut seen: Option<String> = None;
+        for extra in 0..3 {
+            let mut req = turn(extra);
+            assert!(eng.maybe_inject(&mut req, "sk", PROJECT, &big_budget()));
+            let bytes = serde_json::to_string(&req["messages"][0]).unwrap();
+            match &seen {
+                None => seen = Some(bytes),
+                Some(first) => assert_eq!(&bytes, first, "message 0 drifted on turn {}", extra + 1),
+            }
+        }
     }
 }

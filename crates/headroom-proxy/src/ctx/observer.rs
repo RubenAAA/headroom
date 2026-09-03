@@ -179,8 +179,21 @@ fn process(store: &SessionsStore, parsed: &Value, session_key: &str) {
     let events = extract::extract_new_messages(parsed, from_index);
 
     for ev in &events {
-        if let Err(e) = store.insert_event(&to_new_event(&conv_id, ev)) {
-            tracing::warn!(event = "ctx_insert_event_failed", conv = %conv_id, error = %e);
+        match store.insert_event(&to_new_event(&conv_id, ev)) {
+            Ok(ins) if ins.duplicate => {
+                crate::observability::ctx_metrics::observe_event_deduped();
+                tracing::debug!(
+                    event = "ctx_event_deduped",
+                    conv = %conv_id,
+                    kind = %ev.type_,
+                    existing_id = ins.id,
+                    "event already recorded for this conversation; not re-inserted"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(event = "ctx_insert_event_failed", conv = %conv_id, error = %e);
+            }
         }
     }
 
@@ -341,5 +354,105 @@ mod tests {
         // 1 (first) + 1 (second) — "first" is NOT re-extracted.
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].data, "second");
+    }
+
+    /// The real client stamps a cache breakpoint on the last message and moves
+    /// it forward every turn. That alone used to make every turn look like a
+    /// branch, so the extractor re-read the whole conversation and the store
+    /// grew one copy of every event per turn. Ten turns of a growing
+    /// conversation must leave ten rows, not fifty-five.
+    #[test]
+    fn a_moving_cache_breakpoint_does_not_re_extract_the_conversation() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionsStore::open(dir.path().join("s.db")).unwrap();
+
+        let mut messages: Vec<Value> = Vec::new();
+        let mut conv = String::new();
+        for turn in 0..10 {
+            // Last turn's breakpoint moves off as the new tail arrives.
+            for m in messages.iter_mut() {
+                if let Some(blocks) = m["content"].as_array_mut() {
+                    for b in blocks {
+                        b.as_object_mut().unwrap().remove("cache_control");
+                    }
+                }
+            }
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": format!("step {turn}"),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }));
+            let req = json!({"system": "sys", "messages": messages.clone()});
+            if turn == 0 {
+                conv = identity::conversation_key(&req, "sk");
+            }
+            process(&store, &req, "sk");
+            messages.push(json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}));
+        }
+
+        let events = store.get_events(&conv, 100).unwrap();
+        assert_eq!(
+            events.len(),
+            10,
+            "one intent per user message, not one per message per turn"
+        );
+        let texts: Vec<&str> = events.iter().map(|e| e.data.as_str()).collect();
+        assert_eq!(texts.first(), Some(&"step 0"));
+        assert_eq!(texts.last(), Some(&"step 9"));
+    }
+
+    /// The dedup backstop, seen from the capture path. A branch — the prefix
+    /// really did change under us — sends the extractor back to message 0 by
+    /// design, and everything it re-reads has already been recorded. The store
+    /// refuses those rows and the counter says how many.
+    #[test]
+    fn a_branch_re_reads_history_and_the_repeats_are_deduped() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionsStore::open(dir.path().join("s.db")).unwrap();
+
+        let t1 = json!({
+            "system":"sys",
+            "messages":[
+                {"role":"user","content":"do the thing"},
+                {"role":"assistant","content":"ok"},
+                {"role":"user","content":"and the other thing"}
+            ]
+        });
+        process(&store, &t1, "sk");
+        let conv = identity::conversation_key(&t1, "sk");
+        assert_eq!(store.get_events(&conv, 10).unwrap().len(), 2);
+
+        // The assistant turn is rewritten in place: a real edit inside the
+        // prefix, which is a branch and not a moved breakpoint.
+        let t2 = json!({
+            "system":"sys",
+            "messages":[
+                {"role":"user","content":"do the thing"},
+                {"role":"assistant","content":"actually, no"},
+                {"role":"user","content":"and the other thing"}
+            ]
+        });
+
+        let before = crate::observability::ctx_metrics::events_deduped_get(
+            crate::observability::prometheus::registry(),
+        );
+        assert_eq!(
+            identity::classify(store.last_prefix(&conv).unwrap().as_ref(), &t2),
+            identity::Classification::Branch
+        );
+        process(&store, &t2, "sk");
+        let after = crate::observability::ctx_metrics::events_deduped_get(
+            crate::observability::prometheus::registry(),
+        );
+
+        assert_eq!(
+            store.get_events(&conv, 10).unwrap().len(),
+            2,
+            "the two user intents are still one row each"
+        );
+        assert_eq!(after, before + 2, "both refused inserts are counted");
     }
 }

@@ -16,7 +16,9 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -447,7 +449,25 @@ pub struct SavingsTracker {
     display_session_inactivity_minutes: i64,
     stateless: bool,
     state: Mutex<State>,
+    /// When the state file was last written, and whether it has fallen behind
+    /// the state in memory.
+    ///
+    /// Nine `record_*` methods each ended with a `save`, and a save serialises
+    /// the whole file — 1.48 MB in production — then fsyncs it, all while
+    /// holding `state`. Several of those fire per request, so the proxy could
+    /// not clear more than about 45 saves a second in total and requests piled
+    /// up behind the lock, blocking their tokio worker threads rather than
+    /// yielding them. Writes are now coalesced: the state is still updated on
+    /// every record, but it reaches disk at most once per
+    /// [`MIN_SAVE_INTERVAL`], plus a final write when the tracker drops.
+    last_write: Mutex<Option<Instant>>,
+    dirty: AtomicBool,
 }
+
+/// Floor on how often the state file is rewritten. A crash can cost the
+/// statistics recorded since the last write; nothing else reads this file
+/// mid-run.
+const MIN_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Optional inputs to [`SavingsTracker::record_request`]. Neutral defaults
 /// mirror the Python keyword arguments.
@@ -538,6 +558,8 @@ impl SavingsTracker {
             display_session_inactivity_minutes: display_session_inactivity_minutes.max(1),
             stateless,
             state: Mutex::new(State::default()),
+            last_write: Mutex::new(None),
+            dirty: AtomicBool::new(false),
         };
         let loaded = tracker.load_state();
         *tracker.state.lock().unwrap() = loaded;
@@ -1426,7 +1448,49 @@ impl SavingsTracker {
         st
     }
 
+    /// Mark the state changed, and write it if the interval has elapsed.
     fn save(&self, st: &mut State) {
+        if self.stateless {
+            return;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        let due = {
+            let mut last = match self.last_write.lock() {
+                Ok(last) => last,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match *last {
+                Some(at) if at.elapsed() < MIN_SAVE_INTERVAL => false,
+                _ => {
+                    *last = Some(Instant::now());
+                    true
+                }
+            }
+        };
+        if due {
+            self.write_state(st);
+        }
+    }
+
+    /// Write the state file now, whatever the interval says.
+    ///
+    /// For shutdown and for callers that need the file current — a coalesced
+    /// write can otherwise sit unwritten for as long as the interval.
+    pub fn flush(&self) {
+        if self.stateless || !self.dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut st = match self.state.lock() {
+            Ok(st) => st,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.write_state(&mut st);
+        if let Ok(mut last) = self.last_write.lock() {
+            *last = Some(Instant::now());
+        }
+    }
+
+    fn write_state(&self, st: &mut State) {
         if self.stateless {
             return;
         }
@@ -1490,7 +1554,15 @@ impl SavingsTracker {
         if write_result.is_err() {
             let _ = std::fs::remove_file(&tmp);
             st.metrics.set_last_saved_at(previous_saved_at);
+        } else {
+            self.dirty.store(false, Ordering::Relaxed);
         }
+    }
+}
+
+impl Drop for SavingsTracker {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 

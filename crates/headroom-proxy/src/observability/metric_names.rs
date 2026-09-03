@@ -32,6 +32,17 @@ pub const METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP: &str =
      of read back. Labelled by reason (drift axis from PR-E6, or \
      'unknown' when the drift detector saw stable bytes).";
 
+// ---------- proxy_cache_first_turn_write_tokens_total ----------
+
+pub const METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL: &str =
+    "proxy_cache_first_turn_write_tokens_total";
+pub const METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL_HELP: &str =
+    "CTX-7: cache_creation_input_tokens billed on the first completed turn \
+     under each conversation key, which the recache classifier has no \
+     previous turn to score against. Labelled by attribution reason \
+     (compaction_restart, session_key_drift, identical_prompt_fanout, \
+     fresh_session, arrived_with_history).";
+
 // ---------- proxy_cache_recache_wasted_tokens_total ----------
 
 pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL: &str =
@@ -302,6 +313,15 @@ pub const METRIC_CTX_SEARCH_QUERIES_TOTAL: &str = "ctx_search_queries_total";
 pub const METRIC_CTX_SEARCH_QUERIES_TOTAL_HELP: &str =
     "CTX-5: count of search queries served via the /ctx/search endpoint.";
 
+// ---------- proxy_ctx_events_deduped_total ----------
+
+pub const METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL: &str = "proxy_ctx_events_deduped_total";
+pub const METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL_HELP: &str =
+    "CTX-2a: session events the capture path offered a second time and the \
+     store refused, because a row with the same (session_id, type, data_hash) \
+     was already there. A steady non-zero rate means the incremental capture \
+     high-water mark is not holding and the extractor is re-reading history.";
+
 // ---------- proxy_upstream_responses_total ----------
 
 pub const METRIC_PROXY_UPSTREAM_RESPONSES_TOTAL: &str = "proxy_upstream_responses_total";
@@ -318,6 +338,20 @@ pub const METRIC_PROXY_UPSTREAM_REJECTIONS_TOTAL_HELP: &str =
      rejected turn is work lost and a cached prefix rewritten, so this \
      is costlier than any cache miss. 429 is kept separate by its label \
      because rate limiting is the provider throttling a healthy proxy.";
+
+// ---------- proxy_sidecar_total ----------
+
+pub const METRIC_PROXY_SIDECAR_TOTAL: &str = "proxy_sidecar_total";
+pub const METRIC_PROXY_SIDECAR_TOTAL_HELP: &str =
+    "Client sidecar requests answered on a shrunk request instead of being \
+     forwarded whole, by kind. `describe_action` is Claude Code asking for \
+     its spinner line: it resends the entire conversation for four words of \
+     output, and forwarding it whole both billed a full prefix read and left \
+     a stored prefix that made the next real turn look like a re-cache. \
+     `fallback` counts the ones whose shrunk request failed and were sent \
+     whole after all; it should stay near zero, and a rising ratio against \
+     `describe_action` means the sidecar model is unreachable or refusing \
+     the rewritten body.";
 
 // ---------- proxy_ccr_splice_dropped_blocks_total ----------
 
@@ -340,6 +374,18 @@ pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP: &str =
      a real client tool call, so the content went in as text instead — that \
      turn used to lose the retrieval outright. `unresolved` means the model \
      asked and got nothing, and should stay at zero.";
+
+// ---------- proxy_ccr_cross_project_hits_total ----------
+
+pub const METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL: &str = "proxy_ccr_cross_project_hits_total";
+pub const METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP: &str =
+    "Retrievals the CCR store missed that the per-project content index still \
+     held. `ccr.db` drops a block after a week idle; the index keeps it, so \
+     this counts blocks recovered from the cold tier instead of being lost. \
+     Each one saved a continuation round and a re-read. Rising alongside \
+     `proxy_ccr_retrieval_outcomes_total{outcome=\"unresolved\"}` staying flat \
+     is the fallback working; both rising means the CCR TTL is too short for \
+     how far back the model reaches.";
 
 // ---------- proxy_ccr_continuation_retries_total ----------
 
@@ -382,6 +428,7 @@ pub const LABEL_WINDOW: &str = "window";
 pub const LABEL_REASON: &str = "reason";
 pub const LABEL_OUTCOME: &str = "outcome";
 pub const LABEL_TOOL: &str = "tool";
+pub const LABEL_KIND: &str = "kind";
 
 // ---------- bounded label vocabularies ----------
 

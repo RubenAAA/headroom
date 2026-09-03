@@ -115,14 +115,42 @@ impl OffloadStore {
         Arc::clone(&self.stores)
     }
 
-    /// Enqueue offloaded originals for persistence into `project_dir`'s index.
-    /// Non-blocking: hands the batch to the worker and returns. A send failure
-    /// means the worker is gone — logged, never fatal (the wire bytes are
-    /// already correct).
+    /// Store offloaded originals: CCR inline, FTS index on the worker.
+    ///
+    /// The CCR put has to happen before this returns. Both halves used to run
+    /// on the worker, and the worker also does the FTS indexing, which chunks
+    /// each block and writes two full-text tables plus vocabulary. On live
+    /// traffic that queue ran minutes deep: measured against each request's own
+    /// offload event, the model asked for a block a median of 2s later while
+    /// the CCR row landed a median of 589s later. Every retrieval of a block
+    /// offloaded in the same turn therefore missed a store that was about to
+    /// hold it — 28 of the 29 misses in a day of logs, and none of them an
+    /// expiry. The put is a keyed upsert benchmarked at ~2µs, so it is
+    /// affordable here; the indexing is what has to stay off the request path.
+    ///
+    /// A failed put is logged by the backend (`ccr_sqlite_put_failed`) and the
+    /// record is enqueued regardless, so the worker's own put retries it. The
+    /// request never fails for this: the wire bytes are already correct and a
+    /// lost original costs retrieval, not correctness.
     pub fn persist(&self, records: Vec<OffloadRecord>, project_dir: &str) {
         if records.is_empty() {
             return;
         }
+        let started = std::time::Instant::now();
+        let mut failed = 0usize;
+        for record in &records {
+            if !self.ccr.put(&record.hash, &record.original) {
+                failed += 1;
+            }
+        }
+        tracing::debug!(
+            event = "ctx_offload_put_inline",
+            records = records.len(),
+            failed = failed,
+            put_inline_us = started.elapsed().as_micros() as u64,
+            "CTX-3 CCR originals stored on the request path"
+        );
+
         let batch = Batch {
             records,
             project_dir: project_dir.to_string(),
@@ -230,5 +258,31 @@ mod tests {
         };
         let hits = content.search(&["disk full".to_string()], &opts).unwrap();
         assert!(!hits.is_empty(), "offloaded content should be searchable");
+    }
+
+    /// The race this closes: a retrieval that lands in the same turn as the
+    /// offload. Reads back on the calling thread with no sleep and no worker
+    /// drain, so it passes only if the put happened before `persist` returned.
+    #[test]
+    fn persist_stores_the_original_before_it_returns() {
+        let dir = TempDir::new().unwrap();
+        let stores = std::sync::Arc::new(crate::ctx::projects::ProjectStores::new(
+            dir.path().to_path_buf(),
+        ));
+        let store = OffloadStore::start(dir.path(), 3600, stores).unwrap();
+
+        let record = OffloadRecord {
+            hash: "0123456789abcdef01234567".to_string(),
+            original: "the original the model is about to ask for".to_string(),
+            title: "cargo test".to_string(),
+        };
+        store.persist(vec![record.clone()], "/home/dev/alpha");
+
+        assert_eq!(
+            store.ccr().get(&record.hash).as_deref(),
+            Some(record.original.as_str()),
+            "the original must be retrievable the instant persist returns, \
+             without waiting on the indexing worker"
+        );
     }
 }

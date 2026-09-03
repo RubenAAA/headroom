@@ -36,6 +36,42 @@ use lru::LruCache;
 /// the file descriptors.
 const MAX_OPEN_PER_KIND: usize = 16;
 
+/// Wall-clock ceiling for one cold-tier sweep.
+///
+/// The sweep runs only after the CCR store has already missed, and the
+/// alternative to spending this is a wasted continuation round plus the model
+/// re-reading the source, which costs far more. It still needs a ceiling: the
+/// number of project DBs grows without bound, and a retrieval must not stall a
+/// turn while every one of them is opened. Exhausting the budget is logged and
+/// degrades to the old behaviour, a plain miss.
+const COLD_TIER_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Outcome of one cold-tier sweep, including what it cost.
+///
+/// The cost travels with the result so the caller can put it in the same event
+/// as the hit or miss. A fallback nobody can see the latency of is one nobody
+/// can tell has gone slow.
+pub struct ColdTierLookup {
+    /// Project key and content, when a store held the hash.
+    pub found: Option<(String, String)>,
+    pub elapsed: std::time::Duration,
+    /// Project DBs actually opened and queried.
+    pub scanned: usize,
+    /// Whether the budget ran out before every project was swept.
+    pub gave_up: bool,
+}
+
+impl ColdTierLookup {
+    fn miss(started: std::time::Instant, scanned: usize, gave_up: bool) -> Self {
+        Self {
+            found: None,
+            elapsed: started.elapsed(),
+            scanned,
+            gave_up,
+        }
+    }
+}
+
 /// The bucket used when a request names no project.
 ///
 /// Empty string, which is what every call site passed unconditionally before
@@ -81,6 +117,101 @@ impl ProjectStores {
         self.get_or_open(&self.content, project_dir, &path, |p| {
             CtxStore::open(p).map(Arc::new).map_err(|e| e.to_string())
         })
+    }
+
+    /// Search every project's content DB for a block by its `content_hash`,
+    /// skipping `already_checked`.
+    ///
+    /// The CCR store is one global file and is not sharded by project, so this
+    /// is not a fix for cross-project isolation — it is the cold tier. `ccr.db`
+    /// drops a block after a week idle; the content index keeps it. A hash the
+    /// model quotes from an older stretch of its own transcript therefore
+    /// misses in `ccr.db` and is still on disk here, under whichever project
+    /// was current when the block was offloaded. That project is often not the
+    /// one making the request, because subagents, teammates and held working
+    /// directories all move the resolved project between turns.
+    ///
+    /// Returns the project key of the DB that answered, which is the
+    /// `hash_project_dir_canonical` stem of the file. The original path is not
+    /// recoverable from it — the hash is one-way — so it identifies the store
+    /// for correlation, not for display.
+    ///
+    /// Handles are opened one-shot and dropped rather than kept, so a sweep of
+    /// every project on disk cannot evict the working set from the LRU. The
+    /// sweep runs only after a miss, which is rare.
+    pub fn find_content_any_project(
+        &self,
+        content_hash: &str,
+        already_checked: &str,
+    ) -> ColdTierLookup {
+        let started = std::time::Instant::now();
+        let mut scanned = 0usize;
+        let skip = headroom_core::ctx::hash_project_dir_canonical(already_checked);
+        let Some(dir) = content_db_path(&self.base, already_checked)
+            .parent()
+            .map(Path::to_path_buf)
+        else {
+            return ColdTierLookup::miss(started, scanned, false);
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    event = "ctx_content_scan_failed",
+                    path = %dir.display(),
+                    error = %e,
+                );
+                return ColdTierLookup::miss(started, scanned, false);
+            }
+        };
+        for entry in entries.flatten() {
+            // Budget checked per file rather than per row: one file is the
+            // smallest unit of work here, and an indexed point lookup on a
+            // few hundred `sources` rows is far quicker than the check.
+            if started.elapsed() >= COLD_TIER_BUDGET {
+                tracing::warn!(
+                    event = "ctx_cold_tier_budget_exhausted",
+                    hash = %content_hash,
+                    scanned = scanned,
+                    budget_ms = COLD_TIER_BUDGET.as_millis() as u64,
+                    "cold-tier lookup gave up before sweeping every project"
+                );
+                return ColdTierLookup::miss(started, scanned, true);
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                continue;
+            }
+            let Some(key) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if key == skip {
+                continue;
+            }
+            // Read-only: the sweep must not create a DB for a project that has
+            // none, nor take a write lock on one another proxy is writing.
+            let Ok(store) = CtxStore::open_read_only(&path) else {
+                continue;
+            };
+            scanned += 1;
+            match store.content_by_hash(content_hash) {
+                Ok(Some(content)) => {
+                    return ColdTierLookup {
+                        found: Some((key.to_string(), content)),
+                        elapsed: started.elapsed(),
+                        scanned,
+                        gave_up: false,
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    event = "ctx_content_hash_lookup_failed",
+                    path = %path.display(),
+                    error = %e,
+                ),
+            }
+        }
+        ColdTierLookup::miss(started, scanned, false)
     }
 
     fn get_or_open<T>(
@@ -216,6 +347,127 @@ mod tests {
         assert!(
             b.last_prefix("conv-1").unwrap().is_none(),
             "a conversation must not surface in another project's sessions DB"
+        );
+    }
+
+    /// The bug this fixes: a block offloaded while one project was current,
+    /// asked for back while another is. The CCR store answers most of those on
+    /// its own, being global; this covers the case where it has expired the
+    /// block and only the per-project index still holds it.
+    #[test]
+    fn find_content_any_project_reaches_across_projects() {
+        let dir = TempDir::new().unwrap();
+        let stores = ProjectStores::new(dir.path().to_path_buf());
+        stores
+            .content("/home/dev/alpha")
+            .unwrap()
+            .index_content(
+                "cargo test output",
+                "alpha stored this block",
+                &IndexOpts {
+                    content_hash: Some("0123456789abcdef01234567".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Beta exists and does not hold the hash, so the sweep has to keep
+        // looking rather than stop at the first store it opens.
+        stores
+            .content("/home/dev/beta")
+            .unwrap()
+            .index_content(
+                "unrelated",
+                "beta stored something else",
+                &IndexOpts::default(),
+            )
+            .unwrap();
+
+        assert!(
+            stores
+                .content("/home/dev/beta")
+                .unwrap()
+                .content_by_hash("0123456789abcdef01234567")
+                .unwrap()
+                .is_none(),
+            "the requesting project's own store must miss, or the test proves nothing"
+        );
+
+        let hit = stores.find_content_any_project("0123456789abcdef01234567", "/home/dev/beta");
+        assert!(!hit.gave_up, "a two-project sweep must fit the budget");
+        assert_eq!(hit.scanned, 1, "beta is skipped, so only alpha is opened");
+        let (project, content) = hit.found.expect("the block is on disk under alpha");
+        assert_eq!(content, "alpha stored this block");
+        assert_eq!(
+            project,
+            headroom_core::ctx::hash_project_dir_canonical("/home/dev/alpha")
+        );
+    }
+
+    #[test]
+    fn find_content_any_project_skips_the_store_already_checked() {
+        let dir = TempDir::new().unwrap();
+        let stores = ProjectStores::new(dir.path().to_path_buf());
+        stores
+            .content("/home/dev/alpha")
+            .unwrap()
+            .index_content(
+                "only copy",
+                "alpha stored this block",
+                &IndexOpts {
+                    content_hash: Some("0123456789abcdef01234567".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            stores
+                .find_content_any_project("0123456789abcdef01234567", "/home/dev/alpha")
+                .found
+                .is_none(),
+            "alpha was already checked by the caller; sweeping it again would \
+             report a cross-project hit for a plain local one"
+        );
+    }
+
+    #[test]
+    fn find_content_any_project_misses_when_no_store_holds_the_hash() {
+        let dir = TempDir::new().unwrap();
+        let stores = ProjectStores::new(dir.path().to_path_buf());
+        stores
+            .content("/home/dev/alpha")
+            .unwrap()
+            .index_content("notes", "alpha stored this", &IndexOpts::default())
+            .unwrap();
+        assert!(stores
+            .find_content_any_project("ffffffffffffffffffffffff", "/home/dev/beta")
+            .found
+            .is_none());
+    }
+
+    /// The sweep is bounded and reports what it cost, so a fallback that goes
+    /// slow is visible in the same event as the hit.
+    #[test]
+    fn find_content_any_project_reports_its_cost_and_stays_in_budget() {
+        let dir = TempDir::new().unwrap();
+        let stores = ProjectStores::new(dir.path().to_path_buf());
+        for i in 0..20 {
+            stores
+                .content(&format!("/home/dev/p{i}"))
+                .unwrap()
+                .index_content("notes", "nothing to find here", &IndexOpts::default())
+                .unwrap();
+        }
+        let miss = stores.find_content_any_project("ffffffffffffffffffffffff", "/home/dev/p0");
+        assert!(miss.found.is_none());
+        assert_eq!(
+            miss.scanned, 19,
+            "every project but the one already checked"
+        );
+        assert!(
+            !miss.gave_up && miss.elapsed < COLD_TIER_BUDGET,
+            "20 small stores must fit the budget, took {:?}",
+            miss.elapsed
         );
     }
 }

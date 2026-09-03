@@ -37,10 +37,11 @@ pub mod context_editing;
 pub mod cross_turn;
 pub mod ctx_offload;
 pub mod live_zone_anthropic;
-pub(crate) mod manifest_totals;
 pub mod live_zone_openai;
 pub mod live_zone_responses;
+pub(crate) mod manifest_totals;
 pub mod model_limits;
+pub mod prior_thinking;
 
 // PR-A4 helper for cache-control floor derivation lives on the
 // passthrough-stub module so PR-B2's live-zone dispatcher can call

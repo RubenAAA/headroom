@@ -92,6 +92,24 @@ toward rate limits, and reads are over 90% of Claude Code's tokens. `Weights.
 documented` marks which profile is a guess; `fit_weights.py` recovers the real
 one by regression against `proxy_ratelimit_unified_utilization`.
 
+That question is now answered. `fit_weights.py fit --window 5h` over 17,152
+turns in five log files — 2,783 samples across 28.2 h, 1,569 intervals carrying
+turns, R² 0.328 — puts **cache read at 0.10**, with a bootstrap band of
+0.04–0.25 that excludes zero, and the 1h write at 1.45 with a band of
+1.00–2.00. The 5m write is pinned at 1.25 to free the other two, so it
+carries the API value by assumption, not by evidence. `cachesim.py` ships these
+numbers as `SUBSCRIPTION`.
+
+The fit resolves the 5h window and nothing else. Over 7d, utilization moves in
+46 intervals against 361 for 5h, and the read band widens to 0.00–0.30,
+which does include zero. Any 7d claim is unfitted. `fit` defaults to 7d, so pass
+`--window 5h`.
+
+Price every arm under both profiles. They disagree and the disagreement matters.
+The old `read=0.0` subscription profile overstated anything that trades writes
+for reads, by roughly 3x on the exclusion arm and 4x on the tail breakpoint. It
+never changed which arm won, only by how much.
+
 ## Findings so far
 
 - Relocation cost 1.74x plain Claude Code. Removed.
@@ -112,3 +130,124 @@ one by regression against `proxy_ratelimit_unified_utilization`.
   and not the next (Claude Code flips the shape), and marking every match in
   history blows the four-breakpoint budget, silently evicting the system
   breakpoints.
+
+- **Whether the proxy pays for itself depends on the corpus and on the
+  weights.** Measured 2026-08-19 and not re-run since.
+
+  | corpus | weights | Claude Code | proxy | delta |
+  | --- | --- | --- | --- | --- |
+  | blindguard | API | 237.0M | 241.2M | +1.8% |
+  | blindguard | subscription | 219.7M | 216.8M | −1.3% |
+  | windowgap | API | | | −15.9% |
+  | windowgap | subscription | | | −15.1% |
+
+  On blindguard the proxy is roughly a wash and which side it lands on depends
+  on what you are paying with. On windowgap it is ahead under both. The
+  windowgap subscription figure read −27.7% before the weights were fixed. The
+  two corpora are different builds, not different luck.
+
+## Corpora
+
+| corpus | turns | window | build |
+| --- | --- | --- | --- |
+| `~/headroom-capture-blindguard` | 7,839 | 2026-08-16T21:22Z – 08-18T01:11Z | old |
+| `~/headroom-capture-windowgap` | 1,150 | 2026-08-18T16:20Z onward | 2026-08-18T20:20 binary |
+| `~/headroom-capture-markercheck` | 446 scored | from 2026-08-19T14:54 local | same as windowgap |
+
+windowgap is a clean single-build corpus: every turn in it falls after the
+2026-08-18T20:20 binary was installed. markercheck was armed with
+`restart-headroom-capture.sh`, which restarts the **running** binary and changes
+only `HEADROOM_CAPTURE_DIR`, so the build is held fixed and only the arm under
+test varies. Disarm by restarting without it.
+
+Older corpora that carry two message markers, and so can test the marker
+family: `capture-beta` (1,869 turns), `toolblocks` (374), `msg0` (231). The
+`drift`, `replay-on` and `replay-off` corpora carry one message marker.
+`_marked_positions` needs exactly two and skips the request otherwise, so a
+marker arm run there skips every turn and scores identical to live.
+
+Inter-turn gaps have a median of 9 seconds. Only 1.0% of blindguard gaps and
+1.5% of windowgap gaps exceed the 5-minute TTL, and two of 8,681 exceed an hour.
+A lever aimed at idle-gap cache expiry has almost nothing to catch here.
+
+## Reproducing
+
+```
+cd bench
+python3 cachesim.py experiment ~/headroom-capture-blindguard \
+    --weights subscription --base forwarded \
+    --strategy offload-gated-2000 --strategy offload-gated-2000-no-tool-list
+python3 cachesim.py damage ~/headroom-capture-blindguard \
+    --base forwarded --strategy offload-gated-2000 --top 3
+python3 fit_weights.py fit --window 5h
+cargo run --release -p headroom-proxy --bin offload_replay -- \
+    ~/headroom-capture-blindguard
+```
+
+`--base forwarded` stacks each arm on what the proxy already did, so the number
+is incremental over the live build. `damage` takes one `--strategy` per run and
+diffs against what the client sent. Read it on anything that scores well,
+because `experiment` prices cache structure only and deleting the conversation
+scores beautifully there.
+
+`offload_replay` replays a corpus through the real `offload_anthropic_request`,
+with the real gate and the real drift detector, and reports counters the proxy
+otherwise only logs. `--out DIR` dumps the pre-gate body as `req-*.json` and the
+post-gate body as `out/<request_id>.json`, so `cachesim.py compare` prices both
+arms with one function. Prefer that over the `offload-gated-*` strategies when
+comparing against production: those model the gate alone and carry the same
+blind spot the gate does.
+
+Two harness notes. The gated arms are session-aware — they carry a monotonic
+per-session set across turns, so `strategies.reset()` runs between arms, and a
+stateful strategy takes `(body, turn)` while `apply` passes the turn when the
+signature asks for it. And `_is_rebuild_boundary` does **not** infer boundaries
+from the body: inferring them, by taking any change at a position both turns
+share, called 98.5% of turns boundaries, because Claude Code rewrites its own
+reminders on nearly every turn. The live counter says 0.16%.
+
+## Traps that cost hours
+
+**Cap the memory before running a whole-corpus mode against blindguard.** The
+old code loaded the corpus, its forwarded twin and one strategy's copy at once —
+7.8 GB on disk and far more parsed — and it took the whole machine down, not
+just the process. `compare` and `experiment` now stream the corpus a turn at a
+time and peak at about 60 MB, so blindguard runs in one pass in ~2.5 minutes.
+`score`, `defects`, `damage` and `validate` still materialise everything and are
+still unsafe there. Cap anything you are unsure of:
+
+```
+(ulimit -v 8000000; python3 cachesim.py ...)
+```
+
+The streaming rewrite is byte-identical to the old code on windowgap, for
+`compare` under both weightings and for `experiment`. Two things it cannot do:
+the cache scope is model plus credential and spans sessions on purpose, so the
+corpus cannot be chunked by session; and strategy state is module-global, so
+arms run one after another rather than in lockstep down one pass.
+
+**Count markers, do not assume them.** An arm was built on the claim that Claude
+Code places two message breakpoints, at 99.4% and 100% of history. It places
+one, at the tail, on 7,699 of 7,839 blindguard turns and 997 of 1,009 windowgap
+turns.
+
+**`json.dumps` escapes non-ASCII by default**, inflating byte counts 7–12%. Use
+`ensure_ascii=False` and `.encode()`. With that fixed, the capture's forwarded
+bytes matched the proxy's own figure exactly, at 103,013,808.
+
+**Strip `cache_control` before diffing bodies for prefix stability.** Markers
+move to the new tail each turn and register as content divergence. Leaving them
+in reported p50 100% invalidation; stripping them inverted the result, to 0.098%
+for the proxy against 0.526% for the client.
+
+**SQLite returns BLOB.** Comparing a Python `bytes` repr against text reported
+0.41% fidelity. Decoding first gave 100.00% across 10,415 round trips.
+
+**`nohup ... &` in a background shell returns immediately** and reports a
+completion that has not happened. Use an `until ! pgrep ...` loop.
+
+**`fit_weights.py` must read the log rotations.** `load_turns` once read only
+`~/headroom-proxy.log`, which had rotated, so samples and turns had zero time
+overlap and every predictor came back R² −inf. `log_paths()` now globs the
+rotations, and `fit()` bails with both time spans printed when no interval
+carries a turn.

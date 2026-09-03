@@ -50,7 +50,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
 use serde::Serialize;
@@ -92,10 +92,27 @@ pub const RECACHE_SLACK_TOKENS: u64 = 64;
 /// Bounded capacities. Same rationale as the drift detector's LRU:
 /// a flood of unique keys must not grow memory unboundedly.
 const PENDING_CAPACITY: usize = 512;
+
+/// How long a pending turn can count as "still in flight" for another turn of
+/// its conversation.
+///
+/// `complete` pops a pending entry only when the stream reached
+/// `message_stop`. A 429, a stream that dropped, or a client that hung up
+/// leaves the entry behind until the LRU evicts it, and every later turn of
+/// that conversation then looks concurrent with a turn that ended long ago.
+/// Over 2026-09-01/02, 133 of 218 `concurrent_turn_in_flight` events had no
+/// other request of the session in flight at all. A real turn cannot stream
+/// longer than this, so an older entry is a leftover, not a race.
+const IN_FLIGHT_HORIZON: Duration = Duration::from_secs(15 * 60);
 const CONVERSATION_CAPACITY: usize = 512;
 /// Rolling window for the fleet-wide hit-rate shown in the
 /// statusline (`/cache-health`).
 const RECENT_SAMPLE_CAPACITY: usize = 50;
+/// Message-0 hashes of recent first turns, keyed for the fan-out check in
+/// [`first_turn_reason`]. Parallel subagents launch within seconds of each
+/// other, so a small window and a small table are enough.
+const FIRST_TURN_OPENER_CAPACITY: usize = 256;
+const IDENTICAL_PROMPT_FANOUT_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// Watchdog conversation key — SHA-256 over the auth-derived session key
 /// plus the FIRST MESSAGE ONLY, deliberately excluding `system`.
@@ -309,6 +326,10 @@ pub struct TurnRecord {
     /// (A second divergence the same minute recovered immediately, so this is
     /// an aftershock that happens, not one that always happens.)
     pub diverged: bool,
+    /// `cache_read + cache_creation` of the turn this one continued, when it
+    /// continued one. Carried one turn so a miss can be placed against *two*
+    /// earlier boundaries, not one — see [`CacheLanding`].
+    pub previous_boundary: Option<u64>,
 }
 
 /// Streams tracked per conversation key before the oldest is dropped.
@@ -504,10 +525,91 @@ impl ReplaySkipEvidence {
     }
 }
 
+/// What the request side knows about a turn that may turn out to be the first
+/// completed one under its conversation key. Computed once in the handler,
+/// where the parsed body is, and parked here until the usage arrives — see
+/// [`UsageObserver::note_first_turn_context`].
+#[derive(Debug, Clone, Default)]
+pub struct FirstTurnContext {
+    /// Messages the client sent, before any compression.
+    pub msgs: usize,
+    /// Canonical hash of message 0, for the identical-prompt fan-out check.
+    pub message_zero_hash: Option<String>,
+    /// Message 0 carries Claude Code's compaction summary marker.
+    pub compaction_restart: bool,
+    pub model: Option<String>,
+}
+
+/// Outcome of the cross-session prefix adoption path: the replay store found a
+/// donor tracker under another session key whose originals prefix-match this
+/// request. Whether the donor's bytes reached the wire is read off the replay
+/// evidence when the event is emitted.
+#[derive(Debug, Clone)]
+pub struct PrefixAdoption {
+    pub donor_session_key_hash: String,
+}
+
+/// Compute [`FirstTurnContext`] from the client's parsed body, once, on the
+/// request path.
+pub fn first_turn_context(parsed: &serde_json::Value) -> FirstTurnContext {
+    use sha2::{Digest, Sha256};
+    let messages = parsed
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let message_zero_hash = messages.first().map(|m| {
+        let canonical = super::prefix_replay::canonicalize_for_prefix_compare(m);
+        hex16(Sha256::digest(canonical.to_string().as_bytes()).as_slice())
+    });
+    let compaction_restart = crate::ctx::identity::first_user_message_text(parsed)
+        .is_some_and(|t| crate::ctx::identity::has_compaction_marker(&t));
+    FirstTurnContext {
+        msgs: messages.len(),
+        message_zero_hash,
+        compaction_restart,
+        model: parsed
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    }
+}
+
+/// Why the first completed turn under a conversation key wrote cache. Bounded
+/// vocabulary; the metric label is built from it.
+///
+/// Precedence, when more than one applies: compaction restart, then session
+/// key drift, then identical-prompt fan-out, then a fresh session, and
+/// `arrived_with_history` when nothing else explains a turn that carried more
+/// than an opener.
+pub fn first_turn_reason(
+    ctx: &FirstTurnContext,
+    adoption: Option<&PrefixAdoption>,
+    opener_seen_elsewhere: bool,
+) -> &'static str {
+    if ctx.compaction_restart {
+        "compaction_restart"
+    } else if adoption.is_some() {
+        "session_key_drift"
+    } else if ctx.msgs <= 2 && opener_seen_elsewhere {
+        "identical_prompt_fanout"
+    } else if ctx.msgs <= 2 {
+        "fresh_session"
+    } else {
+        "arrived_with_history"
+    }
+}
+
 /// Request-side context parked until the response's usage arrives.
 #[derive(Debug, Clone)]
 struct PendingRequest {
     conversation_key: String,
+    /// See [`FirstTurnContext`]. `None` when the handler never filled it in.
+    first_turn: Option<FirstTurnContext>,
+    /// See [`PrefixAdoption`]. Set on the forward path, after `begin_request`.
+    adoption: Option<PrefixAdoption>,
+    /// Monotonic, so a wall clock that steps backwards cannot age an entry.
+    began: Instant,
     /// Another turn of this same conversation was still in flight when this
     /// one began.
     ///
@@ -557,6 +659,69 @@ struct PendingRequest {
     /// still real money, so the ledger must add it back or it reports less than
     /// the bill. `None` on the common single-round path.
     billed_totals: Option<(u64, u64, u64)>,
+}
+
+/// Where the provider's cache read landed against the two previous boundaries,
+/// for a miss the proxy cannot explain from its own side.
+///
+/// Every `unexplained_after_replay` event over 2026-09-01..02 (563 events,
+/// 547k tokens) had a byte-stable forwarded prefix; what differed was only
+/// where `cache_read` stopped relative to what the two previous turns read
+/// and wrote. Naming that position is what turns the residual bucket into
+/// five provider-side behaviours that can each be counted.
+///
+/// With `prev_read`/`prev_boundary` the previous turn's read and
+/// read+creation, and `prevprev_boundary` the boundary of the turn before it:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheLanding {
+    /// `actual == prev_read`: the write the previous turn made was not found.
+    /// Typical at gaps under 3s.
+    MissedNewestWrite,
+    /// `prev_read < actual < prev_boundary`: the read stops inside the
+    /// previous write. On Fable a fixed 69–114 tokens.
+    PartialOfPreviousWrite,
+    /// `actual == prevprev_boundary` while `prev_read > prevprev_boundary`:
+    /// the previous turn read past anything ever written, so the provider
+    /// served a segment it never persisted, then lost it.
+    FreeReadNotPersisted,
+    /// `actual < prevprev_boundary` (or `actual < prev_read` when no earlier
+    /// boundary is known): an older entry is gone, with the prefix stable.
+    DroppedOlderEntry,
+    /// Anything else below `prev_read`.
+    BetweenEntries,
+}
+
+impl CacheLanding {
+    fn classify(
+        actual: u64,
+        prev_read: u64,
+        prev_boundary: u64,
+        prevprev_boundary: Option<u64>,
+    ) -> Self {
+        if actual == prev_read {
+            return Self::MissedNewestWrite;
+        }
+        if actual > prev_read && actual < prev_boundary {
+            return Self::PartialOfPreviousWrite;
+        }
+        match prevprev_boundary {
+            Some(pp) if actual == pp && prev_read > pp => Self::FreeReadNotPersisted,
+            Some(pp) if actual < pp => Self::DroppedOlderEntry,
+            Some(_) => Self::BetweenEntries,
+            None if actual < prev_read => Self::DroppedOlderEntry,
+            None => Self::BetweenEntries,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissedNewestWrite => "provider_missed_newest_write",
+            Self::PartialOfPreviousWrite => "provider_partial_of_previous_write",
+            Self::FreeReadNotPersisted => "provider_free_read_not_persisted",
+            Self::DroppedOlderEntry => "provider_dropped_older_entry",
+            Self::BetweenEntries => "provider_between_entries",
+        }
+    }
 }
 
 /// Return a cause only when the request supplied direct evidence for it.
@@ -796,11 +961,28 @@ struct Inner {
     pending: LruCache<String, PendingRequest>,
     /// Several streams can share one key — see [`match_stream`].
     conversations: LruCache<String, Vec<TurnRecord>>,
+    /// Conversations `conversations` has evicted, so a turn that comes back
+    /// after eviction is not silently taken for a first turn.
+    ///
+    /// Without this the two are the same observation: `get` returns `None`
+    /// either way, an empty stream list goes in, `match_stream` finds nothing,
+    /// and the turn is booked `FirstTurn` — whose whole point is that its
+    /// cache write is not waste. A real recache then leaves the totals
+    /// untouched and no line in the log, because `cache_stream_unmatched`
+    /// only fires when the stream list is not empty. The classification stays
+    /// as it was, since the earlier turn really is gone and inventing waste
+    /// would be worse; what changes is that the undercount can be seen.
+    forgotten: LruCache<String, ()>,
+    /// Message-0 hash of each recent first turn → `(seen, conversation_key)`.
+    first_turn_openers: LruCache<String, (Instant, String)>,
     recent_hit_rates: VecDeque<f64>,
     recent_cost_samples: VecDeque<CostSample>,
     recache_events_total: u64,
     recache_wasted_tokens_total: u64,
     ttl_expiries_total: u64,
+    /// Turns booked `FirstTurn` only because their conversation had been
+    /// evicted. The floor under any waste figure this observer reports.
+    forgotten_conversations_total: u64,
     last_event: Option<RecacheEvent>,
 }
 
@@ -876,11 +1058,18 @@ impl UsageObserver {
                 conversations: LruCache::new(
                     NonZeroUsize::new(CONVERSATION_CAPACITY).expect("capacity is non-zero"),
                 ),
+                forgotten: LruCache::new(
+                    NonZeroUsize::new(CONVERSATION_CAPACITY).expect("capacity is non-zero"),
+                ),
+                first_turn_openers: LruCache::new(
+                    NonZeroUsize::new(FIRST_TURN_OPENER_CAPACITY).expect("capacity is non-zero"),
+                ),
                 recent_hit_rates: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
                 recent_cost_samples: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
                 recache_events_total: 0,
                 recache_wasted_tokens_total: 0,
                 ttl_expiries_total: 0,
+                forgotten_conversations_total: 0,
                 last_event: None,
             }),
             cache_ttl: ANTHROPIC_CACHE_TTL,
@@ -918,17 +1107,20 @@ impl UsageObserver {
         let mut inner = self.lock();
         // Anything else already running under this key means the provider may
         // not have committed that turn's cache write yet.
-        let concurrent_with_in_flight = inner
-            .pending
-            .iter()
-            .any(|(_, p)| p.conversation_key == conversation_key);
+        let now = Instant::now();
+        let concurrent_with_in_flight = inner.pending.iter().any(|(_, p)| {
+            p.conversation_key == conversation_key
+                && now.duration_since(p.began) < IN_FLIGHT_HORIZON
+        });
         inner.pending.put(
             request_id.to_string(),
             PendingRequest {
+                began: now,
                 concurrent_with_in_flight,
                 conversation_key,
-                session_key_hash: session_key
-                    .map(super::drift_detector::session_key_log_prefix),
+                first_turn: None,
+                adoption: None,
+                session_key_hash: session_key.map(super::drift_detector::session_key_log_prefix),
                 drift_dims,
                 outbound_drift_dims: None,
                 replay_skip: None,
@@ -950,6 +1142,24 @@ impl UsageObserver {
     /// client baseline `complete` is given; only the cost ledger uses these
     /// totals, so the ledger and the pricing counterfactual agree on one
     /// request's billed usage.
+    /// Test hook: whether `request_id` began while another turn of its
+    /// conversation was still in flight.
+    #[cfg(test)]
+    fn pending_is_concurrent(&self, request_id: &str) -> Option<bool> {
+        self.lock()
+            .pending
+            .peek(request_id)
+            .map(|p| p.concurrent_with_in_flight)
+    }
+
+    /// Test hook: pretend `request_id` began `by` earlier than it did.
+    #[cfg(test)]
+    fn age_pending(&self, request_id: &str, by: Duration) {
+        if let Some(p) = self.lock().pending.peek_mut(request_id) {
+            p.began -= by;
+        }
+    }
+
     pub fn note_billed_totals(
         &self,
         request_id: &str,
@@ -1024,6 +1234,24 @@ impl UsageObserver {
 
     /// Record a prefix replay only after the rewritten body serialized
     /// successfully, so this evidence describes bytes that reached upstream.
+    /// Park what the handler knows about this turn's opener, so a first turn
+    /// that writes cache can say why — see `first_turn_write_observed`.
+    pub fn note_first_turn_context(&self, request_id: &str, ctx: FirstTurnContext) {
+        let mut inner = self.lock();
+        if let Some(p) = inner.pending.get_mut(request_id) {
+            p.first_turn = Some(ctx);
+        }
+    }
+
+    /// Record that the cross-session adoption path found a donor for this
+    /// request, whether or not its prefix was used.
+    pub fn note_prefix_adoption(&self, request_id: &str, adoption: PrefixAdoption) {
+        let mut inner = self.lock();
+        if let Some(p) = inner.pending.get_mut(request_id) {
+            p.adoption = Some(adoption);
+        }
+    }
+
     pub fn note_replay_applied(&self, request_id: &str, evidence: ReplayAppliedEvidence) {
         let mut inner = self.lock();
         if let Some(pending) = inner.pending.get_mut(request_id) {
@@ -1036,8 +1264,9 @@ impl UsageObserver {
     /// `begin_request` carries the drift the *client* caused, measured before
     /// the proxy touches anything. That is the only drift the detector could
     /// ever see, so every recache the proxy inflicted on itself landed in the
-    /// residual bucket — `unexplained_after_replay`, 85% of events, with the
-    /// classifier structurally unable to say whether it was to blame.
+    /// residual bucket — then `unexplained_after_replay`, 85% of events, now
+    /// the `provider_*` reasons of [`CacheLanding`] — with the classifier
+    /// structurally unable to say whether it was to blame.
     ///
     /// Hashing the outbound body closes that: the same hot zone, the same
     /// comparison, one turn later in the pipeline. Inbound quiet plus outbound
@@ -1074,6 +1303,7 @@ impl UsageObserver {
         cache_write_ttl_split: Option<(u64, u64)>,
     ) -> Option<CompletionClass> {
         let now = SystemTime::now();
+        let now_instant = Instant::now();
         let cache_ttl = self.cache_ttl;
         let mut inner = self.lock();
 
@@ -1223,13 +1453,33 @@ impl UsageObserver {
             idle_gap,
             previous_forwarded_request_bytes,
             previous_turn_diverged,
+            previous_cache_read,
+            previous_previous_boundary,
             matched_stream_msgs,
             streams_tracked,
         ) = {
             if inner.conversations.get(&pending.conversation_key).is_none() {
-                inner
+                if inner.forgotten.pop(&pending.conversation_key).is_some() {
+                    inner.forgotten_conversations_total += 1;
+                    tracing::warn!(
+                        event = "cache_conversation_forgotten",
+                        conversation_key = %pending.conversation_key,
+                        capacity = CONVERSATION_CAPACITY,
+                        forgotten_total = inner.forgotten_conversations_total,
+                        "conversation evicted before its next turn; booked as a first turn, \
+                         so any cache write it just paid for goes uncounted"
+                    );
+                }
+                // `push` reports what fell off the end; `put` does not, and the
+                // eviction is the whole signal.
+                if let Some((evicted, _)) = inner
                     .conversations
-                    .put(pending.conversation_key.clone(), Vec::new());
+                    .push(pending.conversation_key.clone(), Vec::new())
+                {
+                    if evicted != pending.conversation_key {
+                        inner.forgotten.put(evicted, ());
+                    }
+                }
             }
             let streams = inner
                 .conversations
@@ -1268,7 +1518,15 @@ impl UsageObserver {
             let matched_stream_msgs = matched.and_then(|i| streams[i].msgs);
             let streams_tracked = streams.len();
             let outcome = match matched {
-                None => (TurnClass::FirstTurn, 0, Duration::ZERO, None, false),
+                None => (
+                    TurnClass::FirstTurn,
+                    0,
+                    Duration::ZERO,
+                    None,
+                    false,
+                    0,
+                    None,
+                ),
                 Some(i) => {
                     let prev = streams[i];
                     (
@@ -1287,6 +1545,8 @@ impl UsageObserver {
                         now.duration_since(prev.at).unwrap_or(Duration::ZERO),
                         prev.forwarded_request_bytes,
                         prev.diverged,
+                        prev.cache_read_input_tokens,
+                        prev.previous_boundary,
                     )
                 }
             };
@@ -1304,6 +1564,11 @@ impl UsageObserver {
                     .replay_skip
                     .as_ref()
                     .is_some_and(|e| e.reason.as_str() == "prefix_content_diverged"),
+                previous_boundary: matched.map(|i| {
+                    streams[i]
+                        .cache_read_input_tokens
+                        .saturating_add(streams[i].cache_creation_input_tokens)
+                }),
             };
             match matched {
                 Some(i) => streams[i] = record,
@@ -1321,17 +1586,66 @@ impl UsageObserver {
                     streams.push(record);
                 }
             }
-            let (class, expected, gap, bytes, diverged) = outcome;
+            let (class, expected, gap, bytes, diverged, prev_read, prevprev_boundary) = outcome;
             (
                 class,
                 expected,
                 gap,
                 bytes,
                 diverged,
+                prev_read,
+                prevprev_boundary,
                 matched_stream_msgs,
                 streams_tracked,
             )
         };
+
+        // First completed turn under this key. The recache classifier has
+        // nothing to score it against, so without this its cache write —
+        // 41% of all write tokens, live — went unattributed.
+        if streams_tracked == 0 {
+            let ctx = pending.first_turn.clone().unwrap_or_default();
+            let opener_seen_elsewhere = match ctx.message_zero_hash.as_deref() {
+                Some(hash) => {
+                    let seen = inner.first_turn_openers.get(hash).is_some_and(|(at, key)| {
+                        *key != pending.conversation_key
+                            && now_instant.duration_since(*at) < IDENTICAL_PROMPT_FANOUT_WINDOW
+                    });
+                    inner.first_turn_openers.put(
+                        hash.to_string(),
+                        (now_instant, pending.conversation_key.clone()),
+                    );
+                    seen
+                }
+                None => false,
+            };
+            if cache_creation_input_tokens > RECACHE_SLACK_TOKENS {
+                let reason =
+                    first_turn_reason(&ctx, pending.adoption.as_ref(), opener_seen_elsewhere);
+                tracing::info!(
+                    event = "first_turn_write_observed",
+                    request_id = %request_id,
+                    conversation_key = %pending.conversation_key,
+                    session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                    msgs = ctx.msgs,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    model = ctx.model.as_deref().unwrap_or(""),
+                    attribution_reason = reason,
+                    adopted = pending
+                        .adoption
+                        .as_ref()
+                        .map(|_| pending.replay_applied.is_some()),
+                    donor_session_key_hash = pending
+                        .adoption
+                        .as_ref()
+                        .map(|a| a.donor_session_key_hash.as_str())
+                        .unwrap_or(""),
+                    "first turn under its conversation key wrote cache"
+                );
+                crate::observability::observe_first_turn_write(reason, cache_creation_input_tokens);
+            }
+        }
 
         match class {
             TurnClass::FirstTurn | TurnClass::Healthy => None,
@@ -1373,6 +1687,24 @@ impl UsageObserver {
                     previous_turn_diverged,
                     pending.concurrent_with_in_flight,
                 );
+                // The residual is never left as "unexplained": the proxy's side
+                // was stable, so the only thing left to name is where the
+                // provider's read landed.
+                let landing = CacheLanding::classify(
+                    cache_read_input_tokens,
+                    previous_cache_read,
+                    expected_cache_read,
+                    previous_previous_boundary,
+                );
+                let unexplained = attribution.reason == Some("unexplained_after_replay");
+                let attribution = if unexplained {
+                    RecacheAttribution {
+                        reason: Some(landing.as_str()),
+                        ..attribution
+                    }
+                } else {
+                    attribution
+                };
                 let charged_wasted_tokens = if attribution.counts_as_waste {
                     wasted_tokens
                 } else {
@@ -1381,7 +1713,7 @@ impl UsageObserver {
                 inner.recache_wasted_tokens_total += charged_wasted_tokens;
                 let event_kind = if attribution.reason == Some("inbound_tail_replaced") {
                     RecacheEventKind::Branch
-                } else if attribution.reason == Some("unexplained_after_replay") {
+                } else if unexplained {
                     RecacheEventKind::Unexplained
                 } else if attribution.reason.is_some() {
                     RecacheEventKind::Drift
@@ -1511,7 +1843,8 @@ impl UsageObserver {
                         matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
                         turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
                         streams_tracked = streams_tracked,
-                        attribution_reason = "unexplained_after_replay",
+                        attribution_reason = landing.as_str(),
+                        landing = landing.as_str(),
                         origin = "unknown",
                         scope = "replayed_prefix",
                         event_kind = "unexplained",
@@ -1540,6 +1873,12 @@ impl UsageObserver {
                         wasted_tokens = charged_wasted_tokens,
                         expected_cache_read = expected_cache_read,
                         actual_cache_read = cache_read_input_tokens,
+                        // The three boundaries the landing was read against,
+                        // so the classification can be audited off the line.
+                        // `-1` = no turn before the previous one.
+                        previous_cache_read = previous_cache_read,
+                        previous_boundary = expected_cache_read,
+                        previous_previous_boundary = previous_previous_boundary.map_or(-1_i64, |b| b as i64),
                         cache_creation_input_tokens = cache_creation_input_tokens,
                         "provider did not reuse the expected cache footprint after a confirmed prefix replay"
                     ),
@@ -1654,6 +1993,42 @@ mod tests {
     use super::*;
     use crate::observability::proxy_counters::cache_miss_attribution_for_test;
 
+    /// Eviction and never-seen used to be the same observation, so a turn
+    /// that came back after its conversation fell out of the map was booked
+    /// a first turn and its cache write went uncounted, silently.
+    #[test]
+    fn a_conversation_evicted_before_its_next_turn_is_counted_as_forgotten() {
+        let obs = UsageObserver::new();
+        let fp = |msgs| PrefixFingerprint {
+            head: "h".into(),
+            body: "b".into(),
+            stable: "s".into(),
+            stable_msgs: msgs,
+        };
+        obs.begin_request("r0", "conv-evicted".into(), None, None, Some(fp(10)));
+        obs.complete("r0", 100, 60_000, 20_000, None);
+
+        // Push it off the end with a full capacity of other conversations.
+        for i in 0..CONVERSATION_CAPACITY {
+            let id = format!("r-filler-{i}");
+            obs.begin_request(&id, format!("conv-{i}"), None, None, Some(fp(10)));
+            obs.complete(&id, 100, 1_000, 1_000, None);
+        }
+        assert_eq!(
+            obs.lock().forgotten_conversations_total,
+            0,
+            "nothing is forgotten until an evicted conversation comes back"
+        );
+
+        obs.begin_request("r1", "conv-evicted".into(), None, None, Some(fp(12)));
+        obs.complete("r1", 100, 0, 80_000, None);
+        assert_eq!(
+            obs.lock().forgotten_conversations_total,
+            1,
+            "the turn is still booked a first turn, but the undercount is on record"
+        );
+    }
+
     // ── aftershock attribution ───────────────────────────────────────
     fn applied_evidence() -> ReplayAppliedEvidence {
         ReplayAppliedEvidence::new(1, 2, 0)
@@ -1667,11 +2042,87 @@ mod tests {
         assert!(a.counts_as_waste, "the rewrite is still real waste");
     }
 
+    /// The residual marker never reaches an event: `complete` swaps it for a
+    /// [`CacheLanding`] reason, keeping `origin` as it is.
     #[test]
-    fn without_a_previous_divergence_the_residual_stays_unexplained() {
+    fn without_a_previous_divergence_the_residual_is_left_for_the_landing() {
         let a = recache_attribution(None, None, None, Some(applied_evidence()), false, false);
         assert_eq!(a.reason, Some("unexplained_after_replay"));
         assert_eq!(a.origin, Some("unknown"));
+    }
+
+    // ── landing classification ───────────────────────────────────────
+    //
+    // prev read 100 and wrote 50, so prev_boundary = 150; the turn before it
+    // ended at 80.
+    fn landing(actual: u64, prevprev: Option<u64>) -> &'static str {
+        CacheLanding::classify(actual, 100, 150, prevprev).as_str()
+    }
+
+    #[test]
+    fn a_read_equal_to_the_previous_read_missed_the_newest_write() {
+        assert_eq!(landing(100, Some(80)), "provider_missed_newest_write");
+        assert_eq!(landing(100, None), "provider_missed_newest_write");
+    }
+
+    #[test]
+    fn a_read_inside_the_previous_write_is_partial() {
+        assert_eq!(landing(101, Some(80)), "provider_partial_of_previous_write");
+        assert_eq!(landing(149, None), "provider_partial_of_previous_write");
+    }
+
+    #[test]
+    fn a_read_back_at_the_older_boundary_was_a_free_read_never_persisted() {
+        assert_eq!(landing(80, Some(80)), "provider_free_read_not_persisted");
+    }
+
+    #[test]
+    fn a_read_below_the_older_boundary_dropped_an_older_entry() {
+        assert_eq!(landing(79, Some(80)), "provider_dropped_older_entry");
+        // With no older boundary known, anything short of the previous read.
+        assert_eq!(landing(99, None), "provider_dropped_older_entry");
+    }
+
+    #[test]
+    fn a_read_between_the_two_boundaries_is_between_entries() {
+        assert_eq!(landing(90, Some(80)), "provider_between_entries");
+    }
+
+    /// The older boundary rides on the `TurnRecord`, one turn behind, so the
+    /// third turn of a stream can be placed against the first's boundary.
+    #[test]
+    fn the_older_boundary_is_carried_across_turns() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        let fp = |msgs| PrefixFingerprint {
+            head: "h".into(),
+            body: "b".into(),
+            stable: "s".into(),
+            stable_msgs: msgs,
+        };
+        // Turn 1: boundary 80_000.
+        obs.begin_request("c1", "conv-carry".into(), None, None, Some(fp(10)));
+        obs.complete("c1", 100, 60_000, 20_000, None);
+        // Turn 2 read past that boundary without anyone writing there.
+        obs.begin_request("c2", "conv-carry".into(), None, None, Some(fp(12)));
+        obs.complete("c2", 100, 100_000, 5_000, None);
+        // Turn 3 lands exactly on turn 1's boundary.
+        obs.begin_request("c3", "conv-carry".into(), None, None, Some(fp(14)));
+        obs.note_replay_applied("c3", ReplayAppliedEvidence::new(3, 2, 0));
+        let class = obs.complete("c3", 100, 80_000, 25_000, None);
+        assert_eq!(
+            class,
+            Some(CompletionClass::UnexplainedAfterReplay {
+                wasted_tokens: 25_000
+            })
+        );
+        let event = obs.snapshot().last_event.expect("recache recorded");
+        assert_eq!(
+            event.attribution_reason.as_deref(),
+            Some("provider_free_read_not_persisted")
+        );
+        assert_eq!(event.origin.as_deref(), Some("unknown"));
+        assert_eq!(event.event_kind, RecacheEventKind::Unexplained);
     }
 
     /// A turn that began while another turn of the same conversation was still
@@ -1765,7 +2216,14 @@ mod tests {
             Some(&prior),
             &current,
         );
-        let a = recache_attribution(None, None, Some(skip), Some(applied_evidence()), true, false);
+        let a = recache_attribution(
+            None,
+            None,
+            Some(skip),
+            Some(applied_evidence()),
+            true,
+            false,
+        );
         assert_eq!(a.reason, Some("prefix_content_diverged"));
     }
 
@@ -1788,6 +2246,7 @@ mod tests {
             forwarded_request_bytes: None,
             msgs: None,
             diverged: false,
+            previous_boundary: None,
         }
     }
 
@@ -1973,6 +2432,26 @@ mod tests {
         assert_eq!(ev.event_kind, RecacheEventKind::Expected);
     }
 
+    /// A turn that never reached `message_stop` (a 429, a dropped stream, a
+    /// client that hung up) stays in the pending map. It must not make every
+    /// later turn of the conversation look like a race.
+    #[test]
+    fn a_turn_that_never_completed_stops_counting_as_in_flight() {
+        let obs = UsageObserver::new();
+        obs.begin_request("req-1", "conv".into(), None, None, None);
+        obs.begin_request("req-2", "conv".into(), None, None, None);
+        assert_eq!(obs.pending_is_concurrent("req-2"), Some(true));
+
+        obs.age_pending("req-1", IN_FLIGHT_HORIZON);
+        obs.age_pending("req-2", IN_FLIGHT_HORIZON);
+        obs.begin_request("req-3", "conv".into(), None, None, None);
+        assert_eq!(
+            obs.pending_is_concurrent("req-3"),
+            Some(false),
+            "a leftover older than the horizon is not a turn in flight"
+        );
+    }
+
     #[test]
     fn concurrent_conversations_do_not_cross_talk() {
         // Two conversations from the same client (main session +
@@ -2141,6 +2620,7 @@ mod tests {
                     forwarded_request_bytes: None,
                     msgs: None,
                     diverged: false,
+                    previous_boundary: None,
                 }],
             );
         }
@@ -2180,6 +2660,7 @@ mod tests {
                     forwarded_request_bytes: None,
                     msgs: None,
                     diverged: false,
+                    previous_boundary: None,
                 }],
             );
         }
@@ -2219,6 +2700,7 @@ mod tests {
                     forwarded_request_bytes: None,
                     msgs: None,
                     diverged: false,
+                    previous_boundary: None,
                 }],
             );
         }
@@ -2707,7 +3189,7 @@ mod prefix_on_recache_event_tests {
         let line = joined
             .lines()
             .filter(|l| l.contains("cache_recache_observed"))
-            .find(|l| l.contains("attribution_reason=unexplained_after_replay"))
+            .find(|l| l.contains("attribution_reason=provider_missed_newest_write"))
             .unwrap_or_else(|| panic!("no unexplained event; captured:\n{joined}"));
 
         assert!(line.contains("prefix_head=hhhhhhhhhhhhhhhh"), "{line}");
@@ -2750,7 +3232,7 @@ mod prefix_on_recache_event_tests {
         let line = joined
             .lines()
             .filter(|l| l.contains("cache_recache_observed"))
-            .find(|l| l.contains("attribution_reason=unexplained_after_replay"))
+            .find(|l| l.contains("attribution_reason=provider_missed_newest_write"))
             .unwrap_or_else(|| panic!("no unexplained event; captured:\n{joined}"));
         assert!(line.contains("replay_skipped=no_previous_turn"), "{line}");
     }
@@ -2867,6 +3349,7 @@ mod stream_matching_tests {
             forwarded_request_bytes: None,
             msgs,
             diverged: false,
+            previous_boundary: None,
         }
     }
 
@@ -3199,9 +3682,10 @@ mod stream_matching_tests {
         );
         let event = obs.snapshot().last_event.expect("provider miss recorded");
         assert_eq!(event.event_kind, RecacheEventKind::Unexplained);
+        // Read 46_985 both turns: the write p1 made was never found.
         assert_eq!(
             event.attribution_reason.as_deref(),
-            Some("unexplained_after_replay")
+            Some("provider_missed_newest_write")
         );
         assert_eq!(event.origin.as_deref(), Some("unknown"));
         assert_eq!(event.scope.as_deref(), Some("replayed_prefix"));
@@ -3246,5 +3730,242 @@ mod stream_matching_tests {
         let inner = obs.lock();
         let streams = inner.conversations.peek("conv-cap").expect("key tracked");
         assert_eq!(streams.len(), MAX_STREAMS_PER_CONVERSATION);
+    }
+}
+
+#[cfg(test)]
+mod first_turn_attribution_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    #[derive(Default)]
+    struct Captured {
+        lines: Vec<String>,
+    }
+
+    struct CaptureFields(Arc<StdMutex<Captured>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureFields {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            struct V(String);
+            impl tracing::field::Visit for V {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={:?} ", f.name(), v));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.push_str(&format!("{}={} ", f.name(), v));
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            self.0.lock().unwrap().lines.push(v.0);
+        }
+    }
+
+    fn ctx(msgs: usize, hash: &str, compaction: bool) -> FirstTurnContext {
+        FirstTurnContext {
+            msgs,
+            message_zero_hash: Some(hash.into()),
+            compaction_restart: compaction,
+            model: Some("claude-sonnet-5".into()),
+        }
+    }
+
+    /// Run `f` against a fresh observer and return every
+    /// `first_turn_write_observed` line it emitted.
+    fn first_turn_lines(f: impl FnOnce(&UsageObserver)) -> Vec<String> {
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+        tracing::subscriber::with_default(sub, || f(&UsageObserver::new()));
+        let lines = cap.lock().unwrap().lines.clone();
+        lines
+            .into_iter()
+            .filter(|l| l.contains("first_turn_write_observed"))
+            .collect()
+    }
+
+    fn one_turn(obs: &UsageObserver, rid: &str, conv: &str, c: FirstTurnContext, creation: u64) {
+        obs.begin_request(rid, conv.into(), Some(&format!("sess-{conv}")), None, None);
+        obs.note_first_turn_context(rid, c);
+        obs.complete(rid, 300, 0, creation, None);
+    }
+
+    #[test]
+    fn reason_precedence() {
+        let adoption = PrefixAdoption {
+            donor_session_key_hash: "donor".into(),
+        };
+        // Compaction beats everything, even a found donor and a fan-out hit.
+        assert_eq!(
+            first_turn_reason(&ctx(2, "h", true), Some(&adoption), true),
+            "compaction_restart"
+        );
+        assert_eq!(
+            first_turn_reason(&ctx(2, "h", false), Some(&adoption), true),
+            "session_key_drift"
+        );
+        assert_eq!(
+            first_turn_reason(&ctx(2, "h", false), None, true),
+            "identical_prompt_fanout"
+        );
+        assert_eq!(
+            first_turn_reason(&ctx(2, "h", false), None, false),
+            "fresh_session"
+        );
+        assert_eq!(
+            first_turn_reason(&ctx(9, "h", false), None, false),
+            "arrived_with_history"
+        );
+        // Fan-out only means something for an opener; a long history that
+        // happens to share message 0 is still new content.
+        assert_eq!(
+            first_turn_reason(&ctx(9, "h", false), None, true),
+            "arrived_with_history"
+        );
+    }
+
+    #[test]
+    fn fresh_session_write_is_attributed() {
+        let lines =
+            first_turn_lines(|obs| one_turn(obs, "r1", "conv-a", ctx(1, "h1", false), 9_000));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let l = &lines[0];
+        assert!(l.contains("attribution_reason=fresh_session"), "{l}");
+        assert!(l.contains("msgs=1 "), "{l}");
+        assert!(l.contains("cache_creation_input_tokens=9000"), "{l}");
+        assert!(l.contains("model=claude-sonnet-5"), "{l}");
+        assert!(l.contains("conversation_key=conv-a"), "{l}");
+        assert!(!l.contains("adopted="), "no adoption ran: {l}");
+    }
+
+    #[test]
+    fn compaction_restart_is_attributed() {
+        let lines =
+            first_turn_lines(|obs| one_turn(obs, "r1", "conv-a", ctx(1, "h1", true), 9_000));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("attribution_reason=compaction_restart"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn arrived_with_history_is_attributed() {
+        let lines =
+            first_turn_lines(|obs| one_turn(obs, "r1", "conv-a", ctx(17, "h1", false), 9_000));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("attribution_reason=arrived_with_history"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_found_donor_means_session_key_drift() {
+        let lines = first_turn_lines(|obs| {
+            obs.begin_request("r1", "conv-a".into(), Some("sess-a"), None, None);
+            obs.note_first_turn_context("r1", ctx(17, "h1", false));
+            obs.note_prefix_adoption(
+                "r1",
+                PrefixAdoption {
+                    donor_session_key_hash: "d0n0r".into(),
+                },
+            );
+            obs.complete("r1", 300, 0, 9_000, None);
+        });
+        assert_eq!(lines.len(), 1);
+        let l = &lines[0];
+        assert!(l.contains("attribution_reason=session_key_drift"), "{l}");
+        assert!(l.contains("adopted=false"), "{l}");
+        assert!(l.contains("donor_session_key_hash=d0n0r"), "{l}");
+    }
+
+    #[test]
+    fn the_same_opener_under_another_key_is_fanout() {
+        let lines = first_turn_lines(|obs| {
+            one_turn(obs, "r1", "conv-a", ctx(1, "same", false), 9_000);
+            one_turn(obs, "r2", "conv-b", ctx(1, "same", false), 9_000);
+            // A different opener is a fresh session in its own right.
+            one_turn(obs, "r3", "conv-c", ctx(1, "other", false), 9_000);
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains("attribution_reason=fresh_session"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("attribution_reason=identical_prompt_fanout"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("attribution_reason=fresh_session"),
+            "{}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn a_second_turn_under_the_key_emits_nothing() {
+        let lines = first_turn_lines(|obs| {
+            one_turn(obs, "r1", "conv-a", ctx(1, "h1", false), 9_000);
+            // Second turn re-writes the whole prefix: a recache, not a first
+            // turn, and it must not be booked here.
+            one_turn(obs, "r2", "conv-a", ctx(3, "h1", false), 12_000);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("request_id=r1"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn context_is_read_off_the_body() {
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "This session is being continued from a previous conversation. Summary:"}]},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "go"}
+            ]
+        });
+        let c = first_turn_context(&body);
+        assert_eq!(c.msgs, 3);
+        assert!(c.compaction_restart);
+        assert_eq!(c.model.as_deref(), Some("claude-opus-5"));
+        // The hash ignores cache_control, so two subagents whose openers
+        // differ only in breakpoints still fan out together.
+        let mut with_cc = body.clone();
+        with_cc["messages"][0]["content"][0]["cache_control"] =
+            serde_json::json!({"type": "ephemeral"});
+        assert_eq!(
+            c.message_zero_hash,
+            first_turn_context(&with_cc).message_zero_hash
+        );
+        let plain = first_turn_context(
+            &serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}),
+        );
+        assert!(!plain.compaction_restart);
+        assert_ne!(plain.message_zero_hash, c.message_zero_hash);
+        assert!(first_turn_context(&serde_json::json!({}))
+            .message_zero_hash
+            .is_none());
+    }
+
+    #[test]
+    fn a_first_turn_that_wrote_nothing_is_silent() {
+        let lines = first_turn_lines(|obs| {
+            one_turn(
+                obs,
+                "r1",
+                "conv-a",
+                ctx(1, "h1", false),
+                RECACHE_SLACK_TOKENS,
+            );
+        });
+        assert!(lines.is_empty(), "{lines:?}");
     }
 }

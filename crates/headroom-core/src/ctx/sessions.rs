@@ -22,10 +22,64 @@
 //! into a false success.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+
+/// How long a statement waits for the write lock before giving up.
+///
+/// Sized for the one writer that holds it for more than a moment: the
+/// background dedup-index build, measured at 73 seconds on a copy of the
+/// 9.7 GB DB. There was no timeout at all before, so an insert landing during
+/// that build would have failed outright with SQLITE_BUSY. Now it queues, which
+/// costs the capture worker a stall it can absorb — it is a background thread
+/// with an unbounded queue. Reads never wait: WAL serves them from the
+/// pre-build snapshot.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Row count above which the dedup index is built in the background instead of
+/// inline. A build at this size is well under a second.
+const DEDUP_INDEX_INLINE_ROW_LIMIT: i64 = 200_000;
+
+/// Whether `idx_session_events_dedup` exists.
+fn dedup_index_present(conn: &Connection) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_session_events_dedup'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Whether `session_events` holds at most `limit` rows. Bounded by `LIMIT`, so
+/// it costs the same on a 9.7 GB file as on an empty one — 14 ms, measured.
+fn row_count_at_most(conn: &Connection, limit: i64) -> rusqlite::Result<bool> {
+    let rows: i64 = conn.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM session_events LIMIT ?1)",
+        params![limit + 1],
+        |r| r.get(0),
+    )?;
+    Ok(rows <= limit)
+}
+
+/// Create the dedup index.
+///
+/// Deliberately **not unique**: the DBs that need it most already hold
+/// millions of duplicates, so a unique index would refuse to build and take
+/// the store down with it. The column set is still the dedup key.
+fn create_dedup_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_dedup
+           ON session_events(session_id, type, data_hash);",
+    )
+}
 
 /// A stored event row from `session_events`. Mirrors `StoredEvent`
 /// (session/db.ts:557) column-for-column.
@@ -95,6 +149,16 @@ impl NewEvent {
     }
 }
 
+/// What [`SessionsStore::insert_event`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventInsert {
+    /// The row id — newly written, or the existing row when `duplicate`.
+    pub id: i64,
+    /// True when a row with the same `(session_id, type, data_hash)` was
+    /// already there and nothing was written.
+    pub duplicate: bool,
+}
+
 /// A recorded prefix-chain turn (the newest known turn for a conversation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixTurn {
@@ -106,6 +170,13 @@ pub struct PrefixTurn {
 pub struct SessionsStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Whether `idx_session_events_dedup` exists yet.
+    ///
+    /// [`SessionsStore::insert_event`] only pays for its duplicate lookup when
+    /// this is set. Shared with the background index builder, which flips it
+    /// the moment the index lands, so a store that opened without one starts
+    /// deduplicating mid-life without being reopened.
+    has_dedup_index: Arc<AtomicBool>,
 }
 
 impl SessionsStore {
@@ -131,13 +202,129 @@ impl SessionsStore {
     pub fn open(db_path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = db_path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
+        // A background `CREATE INDEX` holds the write lock for as long as it
+        // takes to build. Without a timeout every concurrent insert would fail
+        // instantly with SQLITE_BUSY instead of waiting the build out. Reads
+        // are unaffected — WAL serves them from the pre-build snapshot.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::init_schema(&conn)?;
-        Ok(Self {
+        let has_dedup_index = Arc::new(AtomicBool::new(dedup_index_present(&conn)?));
+        let store = Self {
             conn: Mutex::new(conn),
             path,
-        })
+            has_dedup_index,
+        };
+        store.ensure_dedup_index();
+        Ok(store)
+    }
+
+    /// Make sure the dedup index exists, without making anyone wait for it.
+    ///
+    /// A small table is indexed on the spot: the build is microseconds, and
+    /// doing it here means the store deduplicates from its very first insert
+    /// rather than from whenever a thread happens to finish. A large one is
+    /// handed to a background thread on its own connection, because the build
+    /// on the 9.7 GB DB that prompted all this took 73 seconds and
+    /// `ProjectStores::sessions` is reachable from the request path.
+    ///
+    /// Until that thread finishes, `insert_event` skips its lookup entirely
+    /// (see there for why an unindexed probe is not worth its cost). The
+    /// high-water mark in the capture path is what keeps duplicates out
+    /// meanwhile; this index only backstops it.
+    fn ensure_dedup_index(&self) {
+        if self.has_dedup_index.load(Ordering::Acquire) {
+            return;
+        }
+        let small = {
+            let conn = self.conn();
+            row_count_at_most(&conn, DEDUP_INDEX_INLINE_ROW_LIMIT)
+        };
+        match small {
+            Ok(true) => {
+                let conn = self.conn();
+                match create_dedup_index(&conn) {
+                    Ok(()) => self.has_dedup_index.store(true, Ordering::Release),
+                    Err(e) => tracing::warn!(
+                        event = "ctx_dedup_index_failed",
+                        db = %self.path.display(),
+                        error = %e,
+                    ),
+                }
+            }
+            Ok(false) => self.spawn_dedup_index_build(),
+            Err(e) => tracing::warn!(
+                event = "ctx_dedup_index_failed",
+                db = %self.path.display(),
+                error = %e,
+            ),
+        }
+    }
+
+    /// Build the dedup index on a second connection, off any caller's thread.
+    ///
+    /// Logged once per store open, never per insert: the condition lasts for
+    /// one build and a line per refused lookup would bury it.
+    fn spawn_dedup_index_build(&self) {
+        tracing::info!(
+            event = "ctx_dedup_index_missing",
+            db = %self.path.display(),
+            rows_at_least = DEDUP_INDEX_INLINE_ROW_LIMIT,
+            "sessions DB has no dedup index; building it in the background, \
+             duplicate detection is off until it lands"
+        );
+        let path = self.path.clone();
+        let flag = Arc::clone(&self.has_dedup_index);
+        let spawned = thread::Builder::new()
+            .name("ctx-dedup-index".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                let build = Connection::open(&path).and_then(|conn| {
+                    conn.busy_timeout(BUSY_TIMEOUT)?;
+                    create_dedup_index(&conn)
+                });
+                match build {
+                    Ok(()) => {
+                        flag.store(true, Ordering::Release);
+                        tracing::info!(
+                            event = "ctx_dedup_index_built",
+                            db = %path.display(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "sessions dedup index built; duplicate detection is on"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        event = "ctx_dedup_index_failed",
+                        db = %path.display(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error = %e,
+                    ),
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                event = "ctx_dedup_index_failed",
+                db = %self.path.display(),
+                error = %e,
+                "could not spawn the dedup index builder"
+            );
+        }
+    }
+
+    /// Whether `insert_event` will look for a duplicate before writing.
+    pub fn dedup_active(&self) -> bool {
+        self.has_dedup_index.load(Ordering::Acquire)
+    }
+
+    /// Put the store back in the state it has while the background index build
+    /// is still running: index gone, lookup off.
+    #[cfg(test)]
+    fn drop_dedup_index_for_test(&self) {
+        self.conn()
+            .execute_batch("DROP INDEX IF EXISTS idx_session_events_dedup;")
+            .unwrap();
+        self.has_dedup_index.store(false, Ordering::Release);
     }
 
     /// Path the connection was opened against.
@@ -242,17 +429,51 @@ impl SessionsStore {
         )
     }
 
+    /// Rows above which the dedup index is left to offline maintenance.
     // ── Events ──
 
-    /// Insert one event. Mirrors `insertEvent` (session/db.ts:915). Returns the
-    /// new row id. An empty `data_hash` is auto-filled with `sha256(data)[..16]`.
-    pub fn insert_event(&self, ev: &NewEvent) -> rusqlite::Result<i64> {
+    /// Insert one event. Mirrors `insertEvent` (session/db.ts:915). An empty
+    /// `data_hash` is auto-filled with `sha256(data)[..16]`.
+    ///
+    /// Idempotent on `(session_id, type, data_hash)`: when a matching row
+    /// already exists nothing is written and the existing id comes back with
+    /// [`EventInsert::duplicate`] set. This is a backstop, not the fix — the
+    /// capture path is supposed to hand over only messages it has not captured
+    /// before, and `ctx::identity::prefix_hash` explains what broke that. It
+    /// stays because a resume, a compaction, or any branch legitimately makes
+    /// the extractor re-read history it has already seen.
+    pub fn insert_event(&self, ev: &NewEvent) -> rusqlite::Result<EventInsert> {
         let data_hash = if ev.data_hash.is_empty() {
             data_hash(&ev.data)
         } else {
             ev.data_hash.clone()
         };
         let conn = self.conn();
+        // Only probe when the index is there to make the probe cheap. Without
+        // it the lookup falls back to `idx_session_events_type`, which narrows
+        // to one (session, type) but then reads `data_hash` from the table row
+        // by row — so the cost grows with the session's own history, which on
+        // the conversations that matter is exactly where it must not. Measured
+        // against a copy of the 9.7 GB DB, on its worst (session, type) group
+        // of 27,224 rows: 23.4 ms per miss unindexed, 0.003 ms indexed.
+        let existing: Option<i64> = if self.has_dedup_index.load(Ordering::Acquire) {
+            conn.query_row(
+                "SELECT id FROM session_events
+                  WHERE session_id = ?1 AND type = ?2 AND data_hash = ?3
+                  LIMIT 1",
+                params![ev.session_id, ev.type_, data_hash],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        if let Some(id) = existing {
+            return Ok(EventInsert {
+                id,
+                duplicate: true,
+            });
+        }
         conn.execute(
             "INSERT INTO session_events (
                session_id, type, category, priority, data,
@@ -276,7 +497,10 @@ impl SessionsStore {
                 data_hash,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        Ok(EventInsert {
+            id: conn.last_insert_rowid(),
+            duplicate: false,
+        })
     }
 
     /// Search events, mirroring `searchEvents` (session/db.ts:1086): matches

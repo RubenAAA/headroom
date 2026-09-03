@@ -126,11 +126,28 @@ pub fn emit_stage_timings_log(
         })
         .collect();
 
+    let total_ms = stage_timer.elapsed_ms();
+
+    // The whole point of the facility: one line per request that already
+    // holds the per-stage split, so a latency question is a log query rather
+    // than a reconstruction from the gaps between unrelated events.
+    tracing::info!(
+        target: "headroom.proxy",
+        event = "stage_timings",
+        path = %path,
+        request_id = %request_id,
+        session_id = %session_id,
+        total_ms = total_ms,
+        stages = %serde_json::Value::Object(stages_map.clone()),
+        "per-stage request timings"
+    );
+
     let payload = serde_json::json!({
         "event": "stage_timings",
         "path": path,
         "request_id": request_id,
         "session_id": session_id,
+        "total_ms": total_ms,
         "stages": stages_map,
     });
 

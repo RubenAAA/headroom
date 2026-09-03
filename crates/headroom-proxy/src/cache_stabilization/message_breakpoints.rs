@@ -35,6 +35,24 @@ use serde_json::Value;
 /// of ours would not change that; two or more is a placement this was never
 /// measured against, and guessing at it risks the prefix for no known gain.
 pub fn push_marker_to_tail(body: &mut Value) -> bool {
+    push_to_tail(body, false)
+}
+
+/// Move the newest message breakpoint to the last content block, however many
+/// there are. Returns whether the body changed.
+///
+/// For continuation rounds the proxy builds itself. The request already went
+/// out once with its markers where the tail placement put them, so the
+/// caution in [`push_marker_to_tail`] about unmeasured client placements does
+/// not apply: with `--cache-tail-breakpoints 2` the body carries two, and
+/// leaving both behind the appended turn means every round re-pays the whole
+/// continuation uncached. Only the newest marker moves; the older one keeps
+/// naming the prefix the provider already holds.
+pub fn push_newest_marker_to_tail(body: &mut Value) -> bool {
+    push_to_tail(body, true)
+}
+
+fn push_to_tail(body: &mut Value, allow_many: bool) -> bool {
     // Message content that is still a bare string has no block to carry a
     // marker. Converting it would rewrite the message and cost the prefix at
     // the exact point of the edit, so those messages are passed over instead.
@@ -57,11 +75,14 @@ pub fn push_marker_to_tail(body: &mut Value) -> bool {
             positions.push((m, b));
         }
     }
-    if marked.len() != 1 || marked[0] + 1 == positions.len() {
+    let Some(&newest) = marked.last() else {
+        return false;
+    };
+    if (marked.len() != 1 && !allow_many) || newest + 1 == positions.len() {
         return false;
     }
 
-    let (fm, fb) = positions[marked[0]];
+    let (fm, fb) = positions[newest];
     let marker = body["messages"][fm]["content"][fb]
         .as_object_mut()
         .expect("marked position is an object")
@@ -123,10 +144,39 @@ mod tests {
                 {"type": "text", "text": format!("turn{round}")}]}));
             items.push(json!({"role": "user", "content": [
                 {"type": "text", "text": format!("result{round}")}]}));
-            assert!(push_marker_to_tail(&mut body), "round {round} had work to do");
+            assert!(
+                push_marker_to_tail(&mut body),
+                "round {round} had work to do"
+            );
             let last = body["messages"].as_array().unwrap().len() - 1;
             assert_eq!(marked_indices(&body), vec![last]);
         }
+    }
+
+    /// Two tail slots on a continuation: the newer marker follows the tail
+    /// round after round, the older one never moves.
+    #[test]
+    fn with_two_markers_only_the_newest_follows_the_continuation_tail() {
+        let mut body = body_marked_at(4, 3);
+        body["messages"][1]["content"][0]["cache_control"] = json!({"type": "ephemeral"});
+        assert!(
+            !push_marker_to_tail(&mut body),
+            "the client path leaves two alone"
+        );
+        for round in 0..3 {
+            let items = body["messages"].as_array_mut().unwrap();
+            items.push(json!({"role": "assistant", "content": [
+                {"type": "text", "text": format!("turn{round}")}]}));
+            items.push(json!({"role": "user", "content": [
+                {"type": "text", "text": format!("result{round}")}]}));
+            assert!(
+                push_newest_marker_to_tail(&mut body),
+                "round {round} had work to do"
+            );
+            let last = body["messages"].as_array().unwrap().len() - 1;
+            assert_eq!(marked_indices(&body), vec![1, last]);
+        }
+        assert!(!push_newest_marker_to_tail(&mut body));
     }
 
     /// The common case, and the reason this is cheap: 97% of captured requests

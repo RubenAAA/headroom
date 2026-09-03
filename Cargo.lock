@@ -2202,6 +2202,7 @@ dependencies = [
  "image",
  "lru",
  "md-5",
+ "memchr",
  "pin-project-lite",
  "prometheus",
  "proptest",

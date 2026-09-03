@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 /// - `cc_version`, the client's own version string (24 changed lines)
 /// - the live working directory, which moves on a `cd` (4 changed lines)
 /// - `cache_control` markers moving between blocks, which is not text at all
+///   (dropped from the first message too — see the note at the hash site)
 ///
 /// Hashing the text only and dropping those two lines takes the 30 changes to 1
 /// and the cost to 34,270 tokens, while leaving 121 distinct keys over 120
@@ -72,7 +73,19 @@ pub fn conversation_key(parsed: &Value, session_key: &str) -> String {
         _ => {}
     }
     if let Some(first) = parsed.get("messages").and_then(|m| m.get(0)) {
-        hasher.update(first.to_string().as_bytes());
+        // Third churning input, and the one the list above named but the code
+        // did not act on: the client's cache breakpoint sits on the last
+        // message, so on turn 1 it sits on `messages[0]` and on turn 2 it has
+        // moved off. Hashing the raw first message therefore split a third of
+        // all conversations in two at their second turn — 75 keys over the
+        // 2,648 requests of the `headroom-capture-netvalue` capture, against 48
+        // once the marker is dropped. Each split orphaned the events captured
+        // so far under a dead key and re-extracted the history under the new
+        // one, which the `(session_id, type, data_hash)` dedup cannot catch
+        // because the session id is exactly what changed.
+        let mut buf = String::new();
+        write_without_cache_control(first, &mut buf);
+        hasher.update(buf.as_bytes());
     }
     hex16(&hasher.finalize())
 }
@@ -111,16 +124,76 @@ pub fn message_count(parsed: &Value) -> u64 {
 /// should carry over unchanged between consecutive turns of one conversation.
 /// SHA-256 over each message's canonical JSON, length-prefixed so two adjacent
 /// messages can't be confused with one concatenated message.
+///
+/// # Why `cache_control` is stripped first
+///
+/// The client moves its cache breakpoint to the new tail on every turn, which
+/// means the message that carried `cache_control` at turn N no longer carries
+/// it at turn N+1 — inside the very prefix this hash is supposed to find
+/// unchanged. Hashing the raw JSON therefore made [`classify`] answer
+/// [`Classification::Branch`] on every single turn, `extract_from_index`
+/// return 0, and the extractor re-run over the whole conversation. Measured
+/// over the 134-turn conversation in the `headroom-capture-netvalue` capture:
+///
+/// | prefix hashed over | continuations | branches |
+/// |---|---:|---:|
+/// | raw message JSON | 0 | 133 |
+/// | `cache_control` stripped | 130 | 3 |
+///
+/// The cost landed in the sessions DB, where one project's file reached 9.7 GB
+/// holding 3,907,865 event rows of which 47,557 were distinct.
+///
+/// A breakpoint is a caching hint, never conversation content, so removing it
+/// cannot hide a real edit to the prefix.
 pub fn prefix_hash(parsed: &Value, prefix_len: u64) -> String {
     let mut hasher = Sha256::new();
     if let Some(msgs) = parsed.get("messages").and_then(Value::as_array) {
+        let mut buf = String::new();
         for msg in msgs.iter().take(prefix_len as usize) {
-            let s = msg.to_string();
-            hasher.update((s.len() as u64).to_le_bytes());
-            hasher.update(s.as_bytes());
+            buf.clear();
+            write_without_cache_control(msg, &mut buf);
+            hasher.update((buf.len() as u64).to_le_bytes());
+            hasher.update(buf.as_bytes());
         }
     }
     hex16(&hasher.finalize())
+}
+
+/// Append `v` to `out` as JSON, dropping every `cache_control` key at any
+/// depth. Writes straight into the buffer rather than cloning and mutating the
+/// message, which on a long conversation is the difference between one small
+/// string and a copy of the whole history per turn.
+fn write_without_cache_control(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(map) => {
+            out.push('{');
+            let mut first = true;
+            for (k, val) in map {
+                if k == "cache_control" {
+                    continue;
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                write_without_cache_control(val, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_without_cache_control(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 /// Text of the first `role == "user"` message. `content` may be a string or an
@@ -363,6 +436,102 @@ mod tests {
             extract_from_index(Classification::Continuation, Some(&prev)),
             2
         );
+    }
+
+    /// Turn 1 puts the cache breakpoint on `messages[0]`, because it is also
+    /// the last message. Turn 2 moves it off. If that counted, the conversation
+    /// would get a second identity at its second turn and lose everything
+    /// captured under the first.
+    #[test]
+    fn conversation_key_survives_the_breakpoint_leaving_the_first_message() {
+        let turn1 = req(
+            "sys",
+            json!([{"role":"user","content":[
+                {"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}
+            ]}]),
+        );
+        let turn2 = req(
+            "sys",
+            json!([
+                {"role":"user","content":[{"type":"text","text":"hello"}]},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}
+                ]}
+            ]),
+        );
+        assert_eq!(
+            conversation_key(&turn1, "sk"),
+            conversation_key(&turn2, "sk")
+        );
+    }
+
+    /// The client moves its cache breakpoint to the new tail every turn, so
+    /// the message that carried `cache_control` at turn N has lost it by turn
+    /// N+1. Before the hash learned to ignore it, this made every turn of every
+    /// conversation a branch, `extract_from_index` returned 0, and the whole
+    /// history was re-extracted and re-inserted once per request.
+    #[test]
+    fn moving_the_cache_breakpoint_is_still_a_continuation() {
+        let t1 = req(
+            "s",
+            json!([
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"yo","cache_control":{"type":"ephemeral"}}
+                ]}
+            ]),
+        );
+        let prev = PrefixTurn {
+            turn_n: 2,
+            prefix_hash: prefix_hash(&t1, 2),
+        };
+        // Turn 2: identical first two messages except the breakpoint has moved
+        // off the assistant turn and onto the new tail.
+        let t2 = req(
+            "s",
+            json!([
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":[{"type":"text","text":"yo"}]},
+                {"role":"user","content":[
+                    {"type":"text","text":"next","cache_control":{"type":"ephemeral"}}
+                ]}
+            ]),
+        );
+        assert_eq!(classify(Some(&prev), &t2), Classification::Continuation);
+        assert_eq!(
+            extract_from_index(Classification::Continuation, Some(&prev)),
+            2,
+            "capture resumes after the messages already recorded"
+        );
+    }
+
+    /// Ignoring `cache_control` must not extend to ignoring content. A real
+    /// edit inside the prefix still has to read as a branch.
+    #[test]
+    fn stripping_cache_control_does_not_hide_a_real_prefix_edit() {
+        let a = req(
+            "s",
+            json!([{"role":"user","content":[
+                {"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}
+            ]}]),
+        );
+        let b = req(
+            "s",
+            json!([{"role":"user","content":[{"type":"text","text":"hello"}]}]),
+        );
+        assert_ne!(prefix_hash(&a, 1), prefix_hash(&b, 1));
+    }
+
+    /// `cache_control` is dropped wherever it sits, not only on content
+    /// blocks — Claude Code also marks whole messages.
+    #[test]
+    fn cache_control_is_dropped_at_every_depth() {
+        let bare = req("s", json!([{"role":"user","content":"hi"}]));
+        let marked = req(
+            "s",
+            json!([{"role":"user","content":"hi","cache_control":{"type":"ephemeral"}}]),
+        );
+        assert_eq!(prefix_hash(&bare, 1), prefix_hash(&marked, 1));
     }
 
     #[test]

@@ -195,6 +195,102 @@ async fn client_stream(dir: &TempDir, rounds: Arc<AtomicUsize>) -> String {
     text
 }
 
+/// Same flow, but the CCR store never gets the block — only another project's
+/// content index does.
+///
+/// This is the production failure: `ccr.db` keeps a block for an idle week and
+/// then evicts it, while the content index keeps it forever under whichever
+/// project was current when it was offloaded. Joining every indexed
+/// `content_hash` against the live CCR rows on a real store found no block
+/// indexed inside the TTL window missing from `ccr.db`, and 12,807 of the older
+/// ones missing. Every miss was an expiry, and the cold copy was still there.
+async fn client_stream_cold_tier_only(dir: &TempDir, rounds: Arc<AtomicUsize>) -> String {
+    let (addr, _upstream) = ccr_upstream(rounds).await;
+    let store_dir = dir.path().to_path_buf();
+    let proxy = start_proxy_with_state(
+        &format!("http://{addr}"),
+        move |c| {
+            c.compression = true;
+            c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            c.ctx_offload = true;
+            c.ctx_store_dir = Some(store_dir);
+            c.ccr_handle_responses = true;
+        },
+        |s| {
+            // Deliberately no `ccr().put(...)`: the hot tier has expired this
+            // block. Index it under a project the request will not resolve to,
+            // so answering it has to cross projects.
+            s.ctx_offload
+                .as_ref()
+                .expect("ctx_offload runtime")
+                .store
+                .stores()
+                .content("/home/dev/somewhere-else")
+                .expect("content store opens")
+                .index_content(
+                    "the tool call that produced it",
+                    ORIGINAL,
+                    &headroom_core::ctx::IndexOpts {
+                        content_hash: Some(HASH.to_string()),
+                        plain_text_lines: Some(50),
+                        ..Default::default()
+                    },
+                )
+                .expect("index write");
+            s
+        },
+    )
+    .await;
+
+    let body = json!({
+        "model": "claude-3-haiku-20240307",
+        "stream": true,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "what did that say"}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .expect("proxy responds");
+    assert_eq!(resp.status(), 200);
+    let text = String::from_utf8_lossy(&resp.bytes().await.expect("stream body")).to_string();
+    proxy.shutdown().await;
+    text
+}
+
+#[tokio::test]
+async fn a_block_expired_from_the_ccr_store_is_recovered_from_the_content_index() {
+    let dir = TempDir::new().unwrap();
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let before = headroom_proxy::observability::ccr_retrieval::cross_project_hits_get();
+    let sse = client_stream_cold_tier_only(&dir, rounds.clone()).await;
+
+    assert_eq!(
+        rounds.load(Ordering::SeqCst),
+        1,
+        "the retrieval should have been answered by a continuation round, not \
+         abandoned:\n{sse}"
+    );
+    assert!(
+        sse.contains("ANSWER_AFTER_RETRIEVAL"),
+        "the model should have been given the recovered content:\n{sse}"
+    );
+    assert!(
+        !sse.contains("headroom_retrieve"),
+        "the client must never be handed a tool it cannot run:\n{sse}"
+    );
+    assert_eq!(
+        headroom_proxy::observability::ccr_retrieval::cross_project_hits_get(),
+        before + 1,
+        "the recovery should have been counted in \
+         proxy_ccr_cross_project_hits_total"
+    );
+}
+
 #[tokio::test]
 async fn retrieval_is_resolved_without_reaching_the_client() {
     let dir = TempDir::new().unwrap();

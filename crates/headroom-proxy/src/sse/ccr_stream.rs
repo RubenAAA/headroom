@@ -104,6 +104,9 @@ pub(crate) struct CcrStreamContext {
     /// rounds come back as plain JSON.
     pub forwarded_request: Bytes,
     pub ccr_store: Arc<dyn headroom_core::ccr::CcrStore>,
+    /// Per-project content stores, for the cold-tier lookup when `ccr_store`
+    /// has expired a block. `None` disables the fallback.
+    pub ccr_stores: Option<Arc<crate::ctx::projects::ProjectStores>>,
     pub config: Arc<crate::config::Config>,
     pub request_id: String,
     pub shape: CcrShape,
@@ -1028,6 +1031,7 @@ async fn resolve_retrieval(
             &ctx.upstream_url,
             &ctx.client,
             ctx.ccr_store.as_ref(),
+            ctx.ccr_stores.as_ref(),
             &ctx.config,
             &ctx.request_id,
             &ctx.outgoing_headers,

@@ -21,6 +21,7 @@ use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 
 use super::metric_names::{
     METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL, METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL_HELP,
+    METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL, METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP,
     METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL, METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP,
 };
 
@@ -66,6 +67,31 @@ fn retries(registry: &Registry) -> &'static IntCounter {
 
 /// Record `count` retrievals ending in `outcome`. `outcome` comes from the
 /// three constants above, never from request input.
+fn cross_project_hits(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL,
+            METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP,
+        )
+        .expect("proxy_ccr_cross_project_hits_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("proxy_ccr_cross_project_hits_total registers exactly once");
+        c
+    })
+}
+
+/// Record one block the CCR store missed and the content index recovered.
+pub fn observe_cross_project_hit() {
+    cross_project_hits(super::prometheus::registry()).inc();
+}
+
+/// Cross-project recoveries so far. Used by tests.
+pub fn cross_project_hits_get() -> u64 {
+    cross_project_hits(super::prometheus::registry()).get()
+}
+
 pub fn observe_outcome(outcome: &str, count: u64) {
     outcomes(super::prometheus::registry())
         .with_label_values(&[outcome])

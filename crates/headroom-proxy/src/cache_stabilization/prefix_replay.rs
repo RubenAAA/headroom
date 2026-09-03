@@ -80,12 +80,12 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lru::LruCache;
 use super::ephemeral_spans::{
     block_carries_ephemeral_span, is_client_scaffolding_message, is_ephemeral_client_block,
     is_ephemeral_client_text, split_ephemeral_spans, split_trailing_ephemeral_spans,
     take_trailing_ephemeral_spans, SYSTEM_REMINDER_OPEN_TAG,
 };
+use lru::LruCache;
 use serde_json::Value;
 
 /// Production session capacity — matches the drift detector's 1000.
@@ -1598,7 +1598,14 @@ pub fn relocate_ephemeral_blocks_reported(messages: Vec<Value>) -> (Vec<Value>, 
 /// proactive expansions stay byte-for-byte unchanged. Returns the input
 /// unchanged when there is nothing to normalize.
 pub fn normalize_message_cache_control(messages: Vec<Value>) -> Vec<Value> {
-    place_tail_cache_breakpoints(messages, 1).0
+    place_tail_cache_breakpoints(messages, 1, false).0
+}
+
+/// One `cache_control` position: which message, and which block within it.
+#[derive(Clone, Copy)]
+struct CacheTarget {
+    message_idx: usize,
+    block_idx: usize,
 }
 
 /// [`normalize_message_cache_control`] with the number of tail breakpoints
@@ -1619,17 +1626,29 @@ pub fn normalize_message_cache_control(messages: Vec<Value>) -> Vec<Value> {
 ///
 /// `tail_slots` is taken as given, `0` included — this function cannot see
 /// `system` or `tools`, so it cannot know how many of Anthropic's four marker
-/// slots are already spoken for. Ask [`tail_slots_within_budget`] first.
+/// slots are already spoken for. Ask [`message_slots_within_budget`] first.
+///
+/// `scaffold` adds one more marker on the opening scaffolding, on top of
+/// `tail_slots` rather than out of it — see [`opening_scaffolding_target`]. Ask
+/// [`message_slots_within_budget`] whether there is room for it.
+///
+/// # Why one tail slot is survivable
+///
+/// A single tail marker is the default, and the budget also falls back to it
+/// when `tools` has taken a slot. That is safe because Anthropic writes a cache
+/// entry only where a breakpoint says to, then looks back roughly 20 blocks from
+/// a miss to find one it already holds. A recent turn of this client adds at
+/// most 10 blocks, measured, so the lookback still reaches the entry the
+/// previous turn wrote and the read starts there rather than at nothing.
+///
+/// The second slot is a hedge against a longer jump, not a requirement. That is
+/// the margin the scaffolding marker is allowed to spend when the budget leaves
+/// no other way to pay for it.
 pub fn place_tail_cache_breakpoints(
     messages: Vec<Value>,
     tail_slots: usize,
+    scaffold: bool,
 ) -> (Vec<Value>, usize) {
-    #[derive(Clone, Copy)]
-    struct CacheTarget {
-        message_idx: usize,
-        block_idx: usize,
-    }
-
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     // The last cacheable target of each message, oldest first. Only the tail of
     // this list is used, but a message qualifies or not as it is walked.
@@ -1780,11 +1799,26 @@ pub fn place_tail_cache_breakpoints(
         }
     }
 
+    // One extra marker for the shared opening scaffolding. Claude Code's message
+    // 0 starts with the same `<system-reminder>` blocks in every session of a
+    // project, so a breakpoint on the last of them names a prefix — system,
+    // tools, scaffolding — that every session of that project reads instead of
+    // writes. Its slot comes out of `system`, not out of the tail; the caller
+    // settles that before saying `true` here.
+    let scaffold_target = if scaffold {
+        opening_scaffolding_target(&out)
+    } else {
+        None
+    };
+
     // Re-place the breakpoints on the latest ordinary blocks, newest first. A
     // proactive expansion is a one-time tail and must never become the cache
     // target: doing so converts its first appearance into a cache write.
     let mut placed = 0usize;
-    for target in cacheable_targets.iter().rev().take(tail_slots) {
+    for target in scaffold_target
+        .iter()
+        .chain(cacheable_targets.iter().rev().take(tail_slots))
+    {
         let CacheTarget {
             message_idx,
             block_idx,
@@ -1794,15 +1828,188 @@ pub fn place_tail_cache_breakpoints(
             .and_then(|c| c.as_array_mut())
         {
             if let Some(Value::Object(block)) = content.get_mut(block_idx) {
-                block.insert(
-                    "cache_control".to_string(),
-                    serde_json::json!({"type": "ephemeral"}),
-                );
-                placed += 1;
+                // A short message 0 can be both the scaffold target and the
+                // newest ordinary one. Counting the second write would report a
+                // marker that is not there and, upstream, licence a `system`
+                // strip on a budget that was never spent.
+                let already_marked = block
+                    .insert(
+                        "cache_control".to_string(),
+                        serde_json::json!({"type": "ephemeral"}),
+                    )
+                    .is_some();
+                if !already_marked {
+                    placed += 1;
+                }
             }
         }
     }
     (out, placed)
+}
+
+/// The last block of the opening run of client scaffolding in message 0, if
+/// message 0 opens with one.
+///
+/// Claude Code's first user message begins with `<system-reminder>` blocks that
+/// are a function of the project, not of the session: the same bytes arrive with
+/// every new session under the same working directory. A breakpoint here caches
+/// `system` + `tools` + those blocks as one prefix, which the next session reads
+/// rather than writes.
+///
+/// The run has to be at the very head. A session whose recall was injected in
+/// front of the scaffolding — every conversation the proxy stored before the
+/// injector learned to sit behind it — has no run at index 0 and gets nothing,
+/// which is what keeps its already-cached message 0 exactly as the provider
+/// holds it.
+fn opening_scaffolding_target(messages: &[Value]) -> Option<CacheTarget> {
+    let first = messages.first()?;
+    if first.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let blocks = first.get("content").and_then(Value::as_array)?;
+    let run = blocks
+        .iter()
+        .take_while(|block| is_ephemeral_client_block(block))
+        .count();
+    if run == 0 {
+        return None;
+    }
+    Some(CacheTarget {
+        message_idx: 0,
+        block_idx: run - 1,
+    })
+}
+
+/// Whether message 0 opens with client scaffolding, and so whether
+/// [`place_tail_cache_breakpoints`] has somewhere to put a scaffolding marker.
+///
+/// Answered from the first block alone, before normalization, because the marker
+/// budget has to be settled before placement runs. String content is wrapped
+/// into a single block by placement, so it is read the same way here.
+pub fn opens_with_scaffolding(messages: &[Value]) -> bool {
+    let Some(first) = messages.first() else {
+        return false;
+    };
+    if first.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match first.get("content") {
+        Some(Value::Array(blocks)) => blocks.first().is_some_and(is_ephemeral_client_block),
+        Some(Value::String(text)) => is_ephemeral_client_text(text),
+        _ => false,
+    }
+}
+
+/// The fewest `system` breakpoints worth keeping.
+///
+/// One names the whole `system` prefix. Claude Code's second only shortens the
+/// span the first already covers, and the scaffolding breakpoint sits
+/// immediately behind `system` and names that span itself, so the second buys
+/// nothing once the scaffolding marker is there. Going to zero is different: it
+/// leaves `system` and `tools` with no checkpoint of their own ahead of message
+/// 0, which is [`strip_system_cache_control`]'s business and gated on its flag.
+const SYSTEM_MARKERS_KEPT: usize = 1;
+
+/// How the provider's four `cache_control` slots are divided for one request.
+pub struct MessageSlots {
+    /// Tail breakpoints to place, counting back from the newest message.
+    pub tail: usize,
+    /// Whether one more may go on the opening scaffolding.
+    pub scaffold: bool,
+    /// Slots `system` and `tools` keep, once `system` has given up what it can.
+    pub reserved: usize,
+}
+
+/// Divide the four slots, letting `system` yield before the tail does.
+///
+/// The tail pair is the part that must not shrink. Anthropic writes a cache
+/// entry only where a breakpoint says to, and looks a short way back from a
+/// miss, so the older of the two tail markers is what lets a turn whose tail was
+/// edited still read from the message before it. A second `system` marker cannot
+/// do that job, and with the scaffolding marker sitting right behind `system` it
+/// is not doing any other job either — so it is the one that goes.
+///
+/// The scaffolding slot yields next, ahead of the tail, when even the shortened
+/// `system` plus `tools` leaves no room. And `system` is only asked to give up
+/// its marker when the scaffolding marker actually materialises — otherwise the
+/// freed slot goes unused and the request simply loses a checkpoint. Every other
+/// division is exactly what it was before the scaffolding marker existed.
+pub fn message_slots_within_budget(
+    body: &Value,
+    messages: &[Value],
+    requested_tail: usize,
+) -> MessageSlots {
+    let tools = count_field_markers(body, "tools");
+    let system = count_field_markers(body, "system");
+    // Only from two tail slots up. With one the breakpoint belongs at the tail,
+    // where it caches the whole conversation; a scaffolding marker on its own
+    // would trade the entire history for the opener.
+    let wanted = requested_tail >= 2 && opens_with_scaffolding(messages);
+    // One marker, and never the last one. The instruction is to give up Claude
+    // Code's second `system` breakpoint, not to take the field over.
+    let shortened = if system > SYSTEM_MARKERS_KEPT {
+        system - 1
+    } else {
+        system
+    };
+
+    let divide = |system_kept: usize| {
+        let reserved = system_kept + tools;
+        let free = ANTHROPIC_CACHE_CONTROL_LIMIT.saturating_sub(reserved);
+        let tail = requested_tail.min(free);
+        MessageSlots {
+            tail,
+            scaffold: wanted && tail >= 2 && free > tail,
+            reserved,
+        }
+    };
+
+    let paid_for = divide(shortened);
+    if paid_for.scaffold {
+        paid_for
+    } else {
+        divide(system)
+    }
+}
+
+/// Give up `system` breakpoints, last one first, until the request fits the
+/// provider's limit. Returns how many it removed.
+///
+/// This is the enforcing half of [`message_slots_within_budget`], run against
+/// the markers really placed rather than the ones planned, so a plan that did
+/// not come off cannot leave the request over the limit. Never goes below
+/// [`SYSTEM_MARKERS_KEPT`].
+///
+/// `on_messages` is [`place_tail_cache_breakpoints`]'s own count, which is exact:
+/// it strips every marker it finds on the content blocks before placing its own.
+/// Markers a client hung on a message *object* are not counted, the same
+/// omission the budget has always made.
+pub fn trim_system_breakpoints_to_budget(body: &mut Value, on_messages: usize) -> usize {
+    let tools = count_field_markers(body, "tools");
+    let Some(blocks) = body.get_mut("system").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut system = blocks
+        .iter()
+        .filter(|b| b.get("cache_control").is_some())
+        .count();
+    let mut removed = 0;
+    while system > SYSTEM_MARKERS_KEPT
+        && system + tools + on_messages > ANTHROPIC_CACHE_CONTROL_LIMIT
+    {
+        let Some(block) = blocks
+            .iter_mut()
+            .rev()
+            .find(|b| b.get("cache_control").is_some())
+            .and_then(Value::as_object_mut)
+        else {
+            break;
+        };
+        block.remove("cache_control");
+        system -= 1;
+        removed += 1;
+    }
+    removed
 }
 
 /// Remove every `cache_control` marker the client put on `system`.
@@ -1821,23 +2028,6 @@ pub fn place_tail_cache_breakpoints(
 /// Anthropic refuses a request carrying more than this many `cache_control`
 /// blocks, counted across `system`, `tools` and `messages` together.
 pub const ANTHROPIC_CACHE_CONTROL_LIMIT: usize = 4;
-
-/// How many tail breakpoints may be placed without breaking that limit, and how
-/// many slots `system` and `tools` have already taken.
-///
-/// The limit spans three fields and this proxy sets markers in only one of them,
-/// so the sum is nobody's business by default and the request is refused whole
-/// when it goes over. Claude Code sends 2 on `system`; PR-E3 adds one to
-/// `tools` on PAYG. Asking for 2 message slots on top of both is 5.
-///
-/// Message markers are not counted: [`place_tail_cache_breakpoints`] strips
-/// every one it finds before placing its own, so whatever the client put there
-/// is gone by the time these are added.
-pub fn tail_slots_within_budget(body: &Value, requested: usize) -> (usize, usize) {
-    let reserved = count_field_markers(body, "system") + count_field_markers(body, "tools");
-    let allowed = ANTHROPIC_CACHE_CONTROL_LIMIT.saturating_sub(reserved);
-    (requested.min(allowed), reserved)
-}
 
 /// `cache_control` markers on the objects of a top-level array field. `system`
 /// blocks and `tools` entries both carry theirs as a direct key, and a `system`
@@ -2291,6 +2481,106 @@ struct PersistedPrefix {
     saved_at_unix: u64,
     originals: Vec<Value>,
     forwarded: Vec<Value>,
+    /// [`adoption_head_hash`] of `originals`, so a cross-session scan can skip
+    /// this file without parsing its messages. Absent in files written before
+    /// the field existed; those are hashed once when first scanned.
+    #[serde(default)]
+    head_hash: Option<String>,
+}
+
+/// Fewest original messages a request must carry, and a donor prefix must
+/// cover, before another session's forwarded prefix is adopted.
+///
+/// Below this the rebuild is cheap and the opening messages are mostly shared
+/// scaffolding, so a match says little about the conversation. A fork
+/// subagent, a resumed transcript or a restarted client all arrive well above
+/// it: the pairs measured on 2026-09-02 shared 59 to 443 messages.
+pub const CROSS_SESSION_ADOPT_MIN_MESSAGES: usize = 10;
+
+/// Hash of the first two canonical messages. Two sessions whose prefixes
+/// share a head are the only ones worth comparing message by message.
+///
+/// Canonical means [`canonicalize_for_prefix_compare`], the same projection
+/// [`matches_canonical_prefix`] uses, so a `<system-reminder>` edited between
+/// turns (a CLAUDE.md change) or a moved `cache_control` still finds the
+/// donor. That matters because the session key itself hashes message 0 with a
+/// weaker normalisation: 16 of 22 key changes measured on 2026-09-02 were a
+/// reminder edit, the other 7 an OAuth token rotation, and each one is the
+/// same conversation continuing under a new key.
+fn adoption_head_hash(messages: &[Value]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if messages.is_empty() {
+        return None;
+    }
+    let head = canonicalize_slice(&messages[..messages.len().min(2)]);
+    let bytes = serde_json::to_vec(&head).ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// Which session a prefix was adopted from, for seeding whatever other
+/// per-session state has to travel with it (the offload gate).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdoptionDonor {
+    /// The donor's tracker was in memory, so its key is known.
+    Session(String),
+    /// The donor was found on disk, where only the SHA-256 hex of its key is
+    /// known — the file name. Sibling per-session stores name their files the
+    /// same way.
+    PersistedDigest(String),
+}
+
+/// Called once per adoption with the donor and the adopting session key.
+pub type AdoptionHook = Arc<dyn Fn(&AdoptionDonor, &str) + Send + Sync>;
+
+/// Head hash of each persisted prefix file, by path, with the modification
+/// time it was read at.
+type PersistedHeadCache =
+    std::collections::HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, Option<String>)>;
+
+/// A donor prefix chosen for adoption.
+struct AdoptedPrefix {
+    originals: Vec<Value>,
+    forwarded: Vec<Value>,
+    cached_token_count: u64,
+    cached_message_count: usize,
+    turn_number: u64,
+    donor: AdoptionDonor,
+    /// Time since the donor's last turn. Breaks ties between equally long
+    /// matches in favour of the donor that forwarded most recently.
+    age: Duration,
+}
+
+impl AdoptedPrefix {
+    /// Longest match wins; the most recent breaks a tie.
+    fn beats(&self, other: Option<&AdoptedPrefix>) -> bool {
+        match other {
+            None => true,
+            Some(o) => {
+                self.originals.len() > o.originals.len()
+                    || (self.originals.len() == o.originals.len() && self.age < o.age)
+            }
+        }
+    }
+}
+
+/// How many leading messages of a held prefix this turn can adopt, or `None`
+/// when too few to be worth it.
+///
+/// The donor usually went on past the fork: a subagent forks at turn 4 of a
+/// session now on turn 6, so the whole held prefix does not lead the turn but
+/// its first turns do. Originals and forwarded messages pair one to one (every
+/// one of 340 persisted prefixes checked on 2026-09-02 had equal counts), so
+/// the forwarded slice cuts at the same index.
+fn adoptable_len(
+    originals: &[Value],
+    forwarded: &[Value],
+    canonical_current: &[Value],
+) -> Option<usize> {
+    if forwarded.is_empty() || originals.len() != forwarded.len() {
+        return None;
+    }
+    let agreed = canonical_agreement_len(originals, canonical_current);
+    (agreed >= CROSS_SESSION_ADOPT_MIN_MESSAGES).then_some(agreed)
 }
 
 /// Where one session's prefix lives.
@@ -2306,7 +2596,11 @@ fn persisted_path(dir: &std::path::Path, session_key: &str) -> std::path::PathBu
 /// Read a session's persisted prefix, or `None` if there is none, it is
 /// unreadable, or its last turn is older than [`PERSIST_MAX_AGE`].
 fn read_persisted_prefix(dir: &std::path::Path, session_key: &str) -> Option<PersistedPrefix> {
-    let bytes = std::fs::read(persisted_path(dir, session_key)).ok()?;
+    read_persisted_prefix_at(&persisted_path(dir, session_key))
+}
+
+fn read_persisted_prefix_at(path: &std::path::Path) -> Option<PersistedPrefix> {
+    let bytes = std::fs::read(path).ok()?;
     let snapshot: PersistedPrefix = serde_json::from_slice(&bytes).ok()?;
     if snapshot.forwarded.is_empty() {
         return None;
@@ -2365,6 +2659,10 @@ const PERSIST_MAX_AGE: Duration = Duration::from_secs(3600);
 /// the tokens are. This only stops something pathological from filling the disk.
 const PERSIST_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Distinguishes concurrent temporary files within one process; see
+/// [`SessionReplayStore::persist`].
+static PERSIST_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How long a tracker survives with no turn on it. Past this a turn reports
 /// [`PrefixMiss::IdlePastTtl`] and rebuilds instead of replaying.
 ///
@@ -2404,6 +2702,22 @@ pub struct SessionReplayStore {
     session_ttl: Duration,
     /// Where prefixes are persisted, or `None` to keep everything in memory.
     persist_dir: Option<Arc<std::path::PathBuf>>,
+    /// [`adoption_head_hash`] of every in-memory prefix to the session keys
+    /// holding one, so a cross-session scan touches only candidates. Keys
+    /// whose tracker the LRU has since evicted are skipped when looked up.
+    head_index: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    /// Head hash of each persisted file, keyed by path and remembered with the
+    /// modification time it was read at, so a scan parses each file once.
+    persisted_heads: Arc<Mutex<PersistedHeadCache>>,
+    adoption_hook: Option<AdoptionHook>,
+    /// Held from snapshot to rename in [`Self::complete`], so two turns of one
+    /// session completing at once cannot write their files in the wrong order
+    /// and leave the older snapshot on disk.
+    persist_lock: Arc<Mutex<()>>,
+    /// Adopter session key → donor hash, for the turn that adopted. Read once
+    /// by [`SessionReplayStore::take_adoption`] so the usage observer can name
+    /// the donor on that turn's first-turn event.
+    recent_adoptions: Arc<Mutex<LruCache<String, String>>>,
 }
 
 impl std::fmt::Debug for SessionReplayStore {
@@ -2429,7 +2743,23 @@ impl SessionReplayStore {
             pending: Arc::new(Mutex::new(LruCache::new(pending_cap))),
             session_ttl: SESSION_TTL,
             persist_dir: None,
+            head_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            persisted_heads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            adoption_hook: None,
+            persist_lock: Arc::new(Mutex::new(())),
+            recent_adoptions: Arc::new(Mutex::new(LruCache::new(pending_cap))),
         }
+    }
+
+    /// The donor hash if `session_key` adopted another session's prefix and
+    /// nobody has read that outcome yet. Consumes it.
+    pub fn take_adoption(&self, session_key: &str) -> Option<String> {
+        self.recent_adoptions.lock().ok()?.pop(session_key)
+    }
+
+    /// Run `hook` whenever a session adopts another session's prefix.
+    pub fn set_adoption_hook(&mut self, hook: AdoptionHook) {
+        self.adoption_hook = Some(hook);
     }
 
     /// [`Self::new`], with prefixes persisted under `dir` so they survive a
@@ -2498,9 +2828,12 @@ impl SessionReplayStore {
             primary_chain_id: snapshot.chain_id,
             next_chain_id: snapshot.chain_id.saturating_add(1),
         };
+        let head = adoption_head_hash(&tracker.last_original_messages);
         if let Ok(mut guard) = self.trackers.lock() {
             if !guard.contains(session_key) {
-                guard.put(session_key.to_string(), tracker);
+                let evicted = guard.push(session_key.to_string(), tracker);
+                self.unindex_evicted(session_key, evicted);
+                self.index_head(session_key, head);
                 tracing::info!(
                     event = "prefix_replay_rehydrated",
                     session_key_hash =
@@ -2534,10 +2867,31 @@ impl SessionReplayStore {
         };
         let path = persisted_path(dir, session_key);
         // Write-then-rename, so a restart mid-write cannot leave a truncated
-        // file that reads as a valid but wrong prefix.
-        let temporary = path.with_extension("tmp");
-        if std::fs::write(&temporary, &bytes).is_ok() {
-            let _ = std::fs::rename(&temporary, &path);
+        // file that reads as a valid but wrong prefix. The temporary name is
+        // unique per process and write, so two writers of one session (two
+        // proxies on one store dir, or two in-flight turns) cannot rename
+        // each other's half-written file into place.
+        let temporary = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            PERSIST_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if std::fs::write(&temporary, &bytes).is_ok() && std::fs::rename(&temporary, &path).is_ok()
+        {
+            // Remember the head of what was just written. Without this the next
+            // adoption scan sees a file whose mtime moved, and reads and parses
+            // it back purely to learn a hash this side already had — and every
+            // session's turn rewrites its own file, so with many sessions open
+            // each scan re-parsed most of the store. Measured at 41 files and
+            // 16.4 MB: 77 ms of parsing per full pass, on the request path.
+            let head = snapshot
+                .head_hash
+                .clone()
+                .or_else(|| adoption_head_hash(&snapshot.originals));
+            let modified = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+            if let Ok(mut heads) = self.persisted_heads.lock() {
+                heads.insert(path.clone(), (modified, head));
+            }
         }
     }
 
@@ -2573,7 +2927,8 @@ impl SessionReplayStore {
         // A restart empties this store, and the miss that follows is expensive
         // rather than free — see [`PersistedPrefix`]. No-op unless persistence is
         // configured or the session is already in memory.
-        self.hydrate(session_key);
+        let canonical_current = canonicalize_slice(current_originals);
+        self.hydrate_or_adopt(session_key, current_originals, &canonical_current);
         let mut guard = match self.trackers.lock() {
             Ok(g) => g,
             Err(_) => return Err(PrefixMiss::LockPoisoned),
@@ -2582,15 +2937,14 @@ impl SessionReplayStore {
             return Err(PrefixMiss::NoTrackerForSession);
         };
         if tracker.last_activity.elapsed() > self.session_ttl {
-            guard.pop(session_key);
+            if let Some(idle) = guard.pop(session_key) {
+                self.unindex_head(session_key, &idle);
+            }
             return Err(PrefixMiss::IdlePastTtl);
         }
         if tracker.last_forwarded_messages.is_empty() && tracker.alternates.is_empty() {
             return Err(PrefixMiss::NothingForwardedYet);
         }
-        // One projection of this turn's messages, reused across every branch
-        // tested below — see [`matches_canonical_prefix`].
-        let canonical_current = canonicalize_slice(current_originals);
         let best = std::iter::once((
             tracker.primary_chain_id,
             &tracker.last_original_messages,
@@ -2721,7 +3075,9 @@ impl SessionReplayStore {
             return Err(PrefixMiss::NoTrackerForSession);
         };
         if tracker.last_activity.elapsed() > self.session_ttl {
-            guard.pop(session_key);
+            if let Some(idle) = guard.pop(session_key) {
+                self.unindex_head(session_key, &idle);
+            }
             return Err(PrefixMiss::IdlePastTtl);
         }
         if tracker.last_forwarded_messages.is_empty() {
@@ -2735,6 +3091,79 @@ impl SessionReplayStore {
 
     /// Shorten the session TTL so a test can reach the idle path without
     /// sleeping for the production ten minutes.
+    /// Whether this turn's history goes to the provider as a fresh write.
+    ///
+    /// True when nothing is stored for the session, the stored turn is older
+    /// than the session TTL, or the stored turn is not a prefix of what the
+    /// client sent now (a resume, a compaction, a rewound branch). In each of
+    /// those cases the provider has nothing to read back, so rewriting the
+    /// history with tool results offloaded costs no cache entry that a
+    /// verbatim copy would have kept. False when the stored prefix replays,
+    /// where the same rewrite would forfeit a warm read.
+    pub fn history_will_be_rewritten(
+        &self,
+        session_key: &str,
+        incoming_original: &[Value],
+    ) -> bool {
+        let canonical_incoming = canonicalize_slice(incoming_original);
+        self.hydrate_or_adopt(session_key, incoming_original, &canonical_incoming);
+        let Ok(guard) = self.trackers.lock() else {
+            return false;
+        };
+        let Some(tracker) = guard.peek(session_key) else {
+            return true;
+        };
+        if tracker.last_activity.elapsed() > self.session_ttl {
+            return true;
+        }
+        if tracker.last_forwarded_messages.is_empty() {
+            return false;
+        }
+        let replayable =
+            matches_canonical_prefix(&tracker.last_original_messages, &canonical_incoming)
+                || tracker.alternates.iter().any(|(_, original, _)| {
+                    matches_canonical_prefix(original, &canonical_incoming)
+                });
+        !replayable
+    }
+
+    /// How many of this session's messages the proxy has already sent upstream,
+    /// counting the primary prefix, every held alternate, and any turn still in
+    /// flight. `None` when the session is unknown or idle past its TTL.
+    ///
+    /// A message at or past this index has never left the proxy, so rewriting
+    /// it cannot break a cache entry. Everything below it may have been cached
+    /// verbatim; a caller unsure of that must leave it alone.
+    pub fn forwarded_message_count(&self, session_key: &str) -> Option<usize> {
+        self.hydrate(session_key);
+        let tracked = {
+            let guard = self.trackers.lock().ok()?;
+            let tracker = guard.peek(session_key)?;
+            if tracker.last_activity.elapsed() > self.session_ttl {
+                return None;
+            }
+            tracker
+                .alternates
+                .iter()
+                .map(|(_, original, _)| original.len())
+                .fold(tracker.last_original_messages.len(), usize::max)
+        };
+        let in_flight = self
+            .pending
+            .lock()
+            .ok()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|(_, turn)| turn.session_key == session_key)
+                    .map(|(_, turn)| turn.original_messages.len())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        Some(tracked.max(in_flight))
+    }
+
     #[cfg(test)]
     fn set_session_ttl_for_test(&mut self, ttl: Duration) {
         self.session_ttl = ttl;
@@ -2781,6 +3210,11 @@ impl SessionReplayStore {
         let Some(pending) = pending else {
             return;
         };
+        // Taken before the tracker lock and released after the rename, which
+        // orders whole snapshot-and-write sequences rather than just writes.
+        // Disk I/O under it stalls only other completions, not the request
+        // path, which never takes it.
+        let _serialised = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
         // Taken under the lock, written outside it. Serializing a few MB while
         // holding the trackers mutex would stall every other request's
         // `previous_turn_for` for the length of a disk write.
@@ -2789,7 +3223,9 @@ impl SessionReplayStore {
             let tracker = if let Some(t) = guard.get_mut(&pending.session_key) {
                 t
             } else {
-                guard.put(pending.session_key.clone(), PrefixReplayTracker::default());
+                let evicted =
+                    guard.push(pending.session_key.clone(), PrefixReplayTracker::default());
+                self.unindex_evicted(&pending.session_key, evicted);
                 guard.get_mut(&pending.session_key).unwrap()
             };
             tracker.update_from_response(
@@ -2798,6 +3234,7 @@ impl SessionReplayStore {
                 &pending.forwarded_messages,
                 Some(&pending.original_messages),
             );
+            let head_hash = adoption_head_hash(&tracker.last_original_messages);
             if self.persist_dir.is_some() && !tracker.last_forwarded_messages.is_empty() {
                 snapshot = Some(PersistedPrefix {
                     chain_id: tracker.primary_chain_id,
@@ -2807,12 +3244,329 @@ impl SessionReplayStore {
                     saved_at_unix: unix_now(),
                     originals: tracker.last_original_messages.clone(),
                     forwarded: tracker.last_forwarded_messages.clone(),
+                    head_hash: head_hash.clone(),
                 });
             }
+            self.index_head(&pending.session_key, head_hash);
         }
         if let Some(snapshot) = snapshot {
             self.persist(&pending.session_key, snapshot);
         }
+    }
+
+    fn index_head(&self, session_key: &str, head: Option<String>) {
+        let Some(head) = head else {
+            return;
+        };
+        if let Ok(mut index) = self.head_index.lock() {
+            let keys = index.entry(head).or_default();
+            if !keys.iter().any(|k| k == session_key) {
+                keys.push(session_key.to_string());
+            }
+        }
+    }
+
+    /// Forget a tracker's head, so the index holds only keys the LRU still
+    /// does. Called wherever a tracker leaves it: LRU eviction and TTL expiry.
+    fn unindex_head(&self, session_key: &str, tracker: &PrefixReplayTracker) {
+        let Some(head) = adoption_head_hash(&tracker.last_original_messages) else {
+            return;
+        };
+        if let Ok(mut index) = self.head_index.lock() {
+            if let Some(keys) = index.get_mut(&head) {
+                keys.retain(|k| k != session_key);
+                if keys.is_empty() {
+                    index.remove(&head);
+                }
+            }
+        }
+    }
+
+    /// What `LruCache::push` returned: the tracker it evicted to make room, or
+    /// the previous value under the same key, which is not an eviction.
+    fn unindex_evicted(&self, session_key: &str, evicted: Option<(String, PrefixReplayTracker)>) {
+        if let Some((key, tracker)) = evicted {
+            if key != session_key {
+                self.unindex_head(&key, &tracker);
+            }
+        }
+    }
+
+    /// Whether some prefix held for `session_key` leads `canonical_current`.
+    /// `false` when there is no tracker, it idled past the TTL, or nothing it
+    /// holds is a prefix of this turn.
+    fn leads_turn(&self, session_key: &str, canonical_current: &[Value]) -> bool {
+        let Ok(guard) = self.trackers.lock() else {
+            // Never adopt on a poisoned lock; the caller reports the miss.
+            return true;
+        };
+        let Some(tracker) = guard.peek(session_key) else {
+            return false;
+        };
+        if tracker.last_activity.elapsed() > self.session_ttl {
+            return false;
+        }
+        std::iter::once((
+            &tracker.last_original_messages,
+            &tracker.last_forwarded_messages,
+        ))
+        .chain(tracker.alternates.iter().map(|(_, o, f)| (o, f)))
+        .any(|(o, f)| !f.is_empty() && matches_canonical_prefix(o, canonical_current))
+    }
+
+    /// Restore this session's own prefix; failing that, on a turn that arrives
+    /// with real history, adopt another session's.
+    ///
+    /// A fork subagent, a resumed transcript and a restarted client all send
+    /// hundreds of messages the provider has already cached — under the
+    /// session key that forwarded them, not this one. Rebuilding forwards
+    /// different bytes (offload digests, markers and injections land
+    /// elsewhere), so the provider reads only the shared `system`/`tools` head
+    /// and writes the whole conversation again. Replaying the donor's bytes
+    /// instead makes this turn read what the donor wrote.
+    ///
+    /// The donor is not touched. The adopter gets a copy of the matched slice
+    /// as its own prefix and carries it forward from there.
+    fn hydrate_or_adopt(
+        &self,
+        session_key: &str,
+        current_originals: &[Value],
+        canonical_current: &[Value],
+    ) {
+        self.hydrate(session_key);
+        if current_originals.len() < CROSS_SESSION_ADOPT_MIN_MESSAGES
+            || self.leads_turn(session_key, canonical_current)
+        {
+            return;
+        }
+        let Some(head) = adoption_head_hash(current_originals) else {
+            return;
+        };
+        let adopted = self
+            .adoption_candidate_in_memory(session_key, &head, canonical_current)
+            .or_else(|| self.adoption_candidate_on_disk(session_key, &head, canonical_current));
+        let Some(adopted) = adopted else {
+            return;
+        };
+        let (donor_hash, source) = match &adopted.donor {
+            AdoptionDonor::Session(key) => {
+                (super::drift_detector::session_key_log_prefix(key), "memory")
+            }
+            AdoptionDonor::PersistedDigest(digest) => {
+                (digest.chars().take(16).collect::<String>(), "disk")
+            }
+        };
+        tracing::info!(
+            event = "prefix_adopted_from_session",
+            session_key_hash = %super::drift_detector::session_key_log_prefix(session_key),
+            donor_session_key_hash = %donor_hash,
+            source = source,
+            adopted_msgs = adopted.originals.len(),
+            incoming_msgs = current_originals.len(),
+            "a session arriving with history matched another session's prefix; \
+             forwarding the bytes that session forwarded"
+        );
+        let donor = adopted.donor.clone();
+        self.install_adopted(session_key, adopted);
+        if let Ok(mut recent) = self.recent_adoptions.lock() {
+            recent.put(session_key.to_string(), donor_hash);
+        }
+        if let Some(hook) = self.adoption_hook.as_ref() {
+            hook(&donor, session_key);
+        }
+    }
+
+    /// The longest prefix held in memory by another live session that leads
+    /// this turn.
+    fn adoption_candidate_in_memory(
+        &self,
+        session_key: &str,
+        head: &str,
+        canonical_current: &[Value],
+    ) -> Option<AdoptedPrefix> {
+        let keys: Vec<String> = self
+            .head_index
+            .lock()
+            .ok()?
+            .get(head)
+            .cloned()
+            .unwrap_or_default();
+        let guard = self.trackers.lock().ok()?;
+        let mut best: Option<AdoptedPrefix> = None;
+        for key in keys.iter().filter(|k| k.as_str() != session_key) {
+            let Some(tracker) = guard.peek(key) else {
+                continue;
+            };
+            if tracker.last_activity.elapsed() > self.session_ttl {
+                continue;
+            }
+            let found = std::iter::once((
+                &tracker.last_original_messages,
+                &tracker.last_forwarded_messages,
+            ))
+            .chain(tracker.alternates.iter().map(|(_, o, f)| (o, f)))
+            .filter_map(|(o, f)| adoptable_len(o, f, canonical_current).map(|n| (n, o, f)))
+            .max_by_key(|(n, ..)| *n);
+            let Some((n, o, f)) = found else {
+                tracing::debug!(
+                    event = "prefix_adoption_candidate_rejected",
+                    donor_session_key_hash = %super::drift_detector::session_key_log_prefix(key),
+                    source = "memory",
+                    donor_prefix_msgs = tracker.last_original_messages.len(),
+                    incoming_msgs = canonical_current.len(),
+                    "a session sharing this turn's opening messages holds no prefix of it"
+                );
+                continue;
+            };
+            let candidate = AdoptedPrefix {
+                originals: o[..n].to_vec(),
+                forwarded: f[..n].to_vec(),
+                cached_token_count: tracker.cached_token_count,
+                cached_message_count: tracker.cached_message_count,
+                turn_number: tracker.turn_number,
+                donor: AdoptionDonor::Session(key.clone()),
+                age: tracker.last_activity.elapsed(),
+            };
+            if candidate.beats(best.as_ref()) {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+
+    /// The longest persisted prefix of another session that leads this turn.
+    ///
+    /// Every file's head hash is read once per modification and remembered,
+    /// so after the first pass a scan costs a directory listing, a metadata
+    /// call per file, and a parse of only the files whose head matches.
+    fn adoption_candidate_on_disk(
+        &self,
+        session_key: &str,
+        head: &str,
+        canonical_current: &[Value],
+    ) -> Option<AdoptedPrefix> {
+        let dir = self.persist_dir.as_deref()?;
+        let own = persisted_path(dir, session_key);
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut best: Option<AdoptedPrefix> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == own || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+            let remembered = self
+                .persisted_heads
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&path).cloned());
+            let snapshot = match remembered {
+                Some((seen_at, file_head)) if seen_at == modified => {
+                    if file_head.as_deref() != Some(head) {
+                        continue;
+                    }
+                    read_persisted_prefix_at(&path)
+                }
+                _ => {
+                    let snapshot = read_persisted_prefix_at(&path);
+                    let file_head = snapshot.as_ref().and_then(|s| {
+                        s.head_hash
+                            .clone()
+                            .or_else(|| adoption_head_hash(&s.originals))
+                    });
+                    if let Ok(mut g) = self.persisted_heads.lock() {
+                        g.insert(path.clone(), (modified, file_head.clone()));
+                    }
+                    if file_head.as_deref() != Some(head) {
+                        continue;
+                    }
+                    snapshot
+                }
+            };
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+            let digest = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let Some(n) =
+                adoptable_len(&snapshot.originals, &snapshot.forwarded, canonical_current)
+            else {
+                tracing::debug!(
+                    event = "prefix_adoption_candidate_rejected",
+                    donor_session_key_hash = %digest.chars().take(16).collect::<String>(),
+                    source = "disk",
+                    donor_prefix_msgs = snapshot.originals.len(),
+                    incoming_msgs = canonical_current.len(),
+                    "a persisted prefix sharing this turn's opening messages does not lead it"
+                );
+                continue;
+            };
+            let mut originals = snapshot.originals;
+            let mut forwarded = snapshot.forwarded;
+            originals.truncate(n);
+            forwarded.truncate(n);
+            let candidate = AdoptedPrefix {
+                originals,
+                forwarded,
+                cached_token_count: snapshot.cached_token_count,
+                cached_message_count: snapshot.cached_message_count,
+                turn_number: snapshot.turn_number,
+                donor: AdoptionDonor::PersistedDigest(digest),
+                age: Duration::from_secs(unix_now().saturating_sub(snapshot.saved_at_unix)),
+            };
+            if candidate.beats(best.as_ref()) {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+
+    /// Seed `session_key` with the adopted slice: as its primary prefix when it
+    /// holds nothing live, otherwise as the newest alternate, which
+    /// [`Self::previous_turn_for`] and `update_from_response` both consult.
+    fn install_adopted(&self, session_key: &str, adopted: AdoptedPrefix) {
+        let head = adoption_head_hash(&adopted.originals);
+        let Ok(mut guard) = self.trackers.lock() else {
+            return;
+        };
+        let live = guard.peek(session_key).is_some_and(|t| {
+            t.last_activity.elapsed() <= self.session_ttl && !t.last_forwarded_messages.is_empty()
+        });
+        if live {
+            let tracker = guard.get_mut(session_key).expect("peeked above");
+            let id = tracker.next_chain_id;
+            tracker.next_chain_id += 1;
+            tracker
+                .alternates
+                .retain(|(_, o, _)| o != &adopted.originals);
+            tracker
+                .alternates
+                .insert(0, (id, adopted.originals, adopted.forwarded));
+            tracker.alternates.truncate(MAX_ALTERNATE_PREFIXES);
+            tracker.last_activity = Instant::now();
+        } else {
+            let cached_message_count = adopted.cached_message_count.min(adopted.forwarded.len());
+            let evicted = guard.push(
+                session_key.to_string(),
+                PrefixReplayTracker {
+                    cached_token_count: adopted.cached_token_count,
+                    cached_message_count,
+                    turn_number: adopted.turn_number.max(1),
+                    last_activity: Instant::now(),
+                    last_original_messages: adopted.originals,
+                    last_forwarded_messages: adopted.forwarded,
+                    alternates: Vec::new(),
+                    primary_chain_id: 1,
+                    next_chain_id: 2,
+                },
+            );
+            self.unindex_evicted(session_key, evicted);
+        }
+        drop(guard);
+        self.index_head(session_key, head);
     }
 
     #[cfg(test)]
@@ -3534,7 +4288,7 @@ mod tests {
             json!({"role": "user", "content": ""}),
             json!({"role": "assistant", "content": "  \n\t"}),
         ];
-        let (out, placed) = place_tail_cache_breakpoints(msgs.clone(), 2);
+        let (out, placed) = place_tail_cache_breakpoints(msgs.clone(), 2, false);
 
         assert_eq!(placed, 0);
         assert_eq!(out, msgs);
@@ -3547,7 +4301,7 @@ mod tests {
             "content": " \n<system-reminder>temporary</system-reminder>"
         });
         let msgs = vec![text_msg("assistant", "stable history"), reminder.clone()];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 2);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 2, false);
 
         assert_eq!(placed, 1);
         assert_eq!(marked_messages(&out), vec![0]);
@@ -3607,7 +4361,7 @@ mod tests {
             "content": "prefix <headroom_proactive_expansion>temporary</headroom_proactive_expansion>"
         });
         let msgs = vec![text_msg("assistant", "stable history"), expansion.clone()];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 2);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 2, false);
 
         assert_eq!(placed, 1);
         assert_eq!(marked_messages(&out), vec![0]);
@@ -3657,7 +4411,7 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "b"}]}),
             json!({"role": "user", "content": [{"type": "text", "text": "c"}]}),
         ];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 2);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 2, false);
         assert_eq!(placed, 2);
         assert_eq!(marked_messages(&out), vec![1, 2]);
     }
@@ -3675,7 +4429,7 @@ mod tests {
                 {"type": "text", "text": "<system-reminder>r</system-reminder>"}
             ]}),
         ];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 2);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 2, false);
         assert_eq!(placed, 2);
         assert_eq!(marked_messages(&out), vec![0, 1]);
     }
@@ -3686,9 +4440,257 @@ mod tests {
             json!({"role": "user", "content": "plain"}),
             json!({"role": "assistant", "content": [{"type": "text", "text": "b"}]}),
         ];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 3);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 3, false);
         assert_eq!(placed, 2);
         assert_eq!(marked_messages(&out), vec![0, 1]);
+    }
+
+    /// A first user message with no scaffolding at its head, so the budget
+    /// offers no scaffolding slot and every division is the pre-existing one.
+    fn plain_opener() -> Vec<Value> {
+        vec![json!({"role":"user","content":[{"type":"text","text":"hello"}]})]
+    }
+
+    /// Claude Code's opener: the CLAUDE.md reminder, a second reminder, then
+    /// what the user typed. Only the first two are shared across sessions.
+    fn scaffolded_opener() -> Value {
+        json!({"role":"user","content":[
+            {"type":"text","text":"<system-reminder>claudeMd</system-reminder>"},
+            {"type":"text","text":"<system-reminder>gitStatus</system-reminder>"},
+            {"type":"text","text":"build a parser"}
+        ]})
+    }
+
+    fn marked_positions(messages: &[Value]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            if let Some(blocks) = m.get("content").and_then(Value::as_array) {
+                for (j, b) in blocks.iter().enumerate() {
+                    if b.get("cache_control").is_some() {
+                        out.push((i, j));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The shared prefix gets its own breakpoint, on top of the tail pair rather
+    /// than out of it. The tail pair is what a tail-edited turn reads back from.
+    #[test]
+    fn the_opening_scaffolding_adds_a_breakpoint_of_its_own() {
+        let messages = vec![
+            scaffolded_opener(),
+            json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"go on"}]}),
+        ];
+        let (out, placed) = place_tail_cache_breakpoints(messages, 2, true);
+        assert_eq!(placed, 3);
+        assert_eq!(
+            marked_positions(&out),
+            vec![(0, 1), (1, 0), (2, 0)],
+            "the last reminder, and both tail markers still in place"
+        );
+    }
+
+    /// Claude Code's shape: two `system` markers, none on `tools`. The second
+    /// `system` marker is what pays for the scaffolding breakpoint.
+    #[test]
+    fn the_second_system_marker_pays_for_the_scaffolding_breakpoint() {
+        let body = json!({
+            "system": [
+                {"type": "text", "text": "s1", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"type": "text", "text": "s2", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+            "tools": [{"name": "t"}],
+        });
+        let messages = vec![
+            scaffolded_opener(),
+            json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"go on"}]}),
+        ];
+        let slots = message_slots_within_budget(&body, &messages, 2);
+        assert_eq!(slots.tail, 2, "the tail pair must survive intact");
+        assert!(slots.scaffold);
+        assert_eq!(slots.reserved, 1, "one system marker, none on tools");
+
+        // And the trim really takes it, leaving four markers exactly.
+        let mut body = body;
+        let (_out, placed) = place_tail_cache_breakpoints(messages, slots.tail, slots.scaffold);
+        assert_eq!(placed, 3);
+        assert_eq!(trim_system_breakpoints_to_budget(&mut body, placed), 1);
+        assert_eq!(count_field_markers(&body, "system"), 1);
+        assert_eq!(placed + count_field_markers(&body, "system"), 4);
+    }
+
+    /// A `tools` marker leaves no slot to buy. The scaffolding breakpoint is
+    /// what gives way then, never a tail one.
+    #[test]
+    fn the_scaffolding_yields_before_the_tail_does() {
+        let body = json!({
+            "system": [
+                {"type": "text", "text": "s1", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s2", "cache_control": {"type": "ephemeral"}}
+            ],
+            "tools": [{"name": "t", "cache_control": {"type": "ephemeral"}}],
+        });
+        let messages = vec![
+            scaffolded_opener(),
+            json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"go on"}]}),
+        ];
+        let slots = message_slots_within_budget(&body, &messages, 2);
+        assert!(!slots.scaffold);
+        assert_eq!(
+            (slots.tail, slots.reserved),
+            (1, 3),
+            "and `system` keeps both markers, since nothing was bought with one"
+        );
+    }
+
+    /// With a single tail slot the budget never offers a scaffolding one: a
+    /// breakpoint on message 0 alone would trade the whole conversation for its
+    /// opener.
+    #[test]
+    fn one_slot_still_goes_to_the_tail() {
+        let messages = vec![
+            scaffolded_opener(),
+            json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"go on"}]}),
+        ];
+        let body = json!({"system": [
+            {"type": "text", "text": "s1", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "s2", "cache_control": {"type": "ephemeral"}}
+        ]});
+        let slots = message_slots_within_budget(&body, &messages, 1);
+        assert!(!slots.scaffold);
+        assert_eq!(slots.tail, 1);
+
+        let (out, placed) = place_tail_cache_breakpoints(messages, slots.tail, slots.scaffold);
+        assert_eq!(placed, 1);
+        assert_eq!(marked_positions(&out), vec![(2, 0)]);
+    }
+
+    /// Three turns, the third of which rewrites the text of the newest message
+    /// the second one sent. That is the case the tail hedge exists for, and the
+    /// scaffolding marker must come through it untouched.
+    ///
+    /// The scaffolding block is the same bytes on every turn, so its entry stays
+    /// live no matter what the tail does. Exactly one tail marker lands on the
+    /// newest message — a message can only hold one — and the older tail marker
+    /// still names the turn before it.
+    #[test]
+    fn an_edited_tail_leaves_the_scaffolding_breakpoint_alone() {
+        let turn = |tail: &str, depth: usize| {
+            let mut messages = vec![scaffolded_opener()];
+            for i in 0..depth {
+                messages.push(json!({"role":"assistant","content":[
+                    {"type":"text","text": format!("reply {i}")}
+                ]}));
+                let text = if i + 1 == depth {
+                    tail.to_string()
+                } else {
+                    format!("follow up {i}")
+                };
+                messages.push(json!({"role":"user","content":[
+                    {"type":"text","text": text}
+                ]}));
+            }
+            messages
+        };
+
+        let tail_slots = 2;
+        let turns = [
+            turn("keep going", 1),
+            turn("and then this", 2),
+            // Turn 3 keeps turn 2's depth and rewrites its newest text block.
+            turn("actually, do it the other way", 2),
+        ];
+
+        let mut scaffold_seen: Option<Value> = None;
+        for (n, messages) in turns.into_iter().enumerate() {
+            let newest = messages.len() - 1;
+            let (out, placed) = place_tail_cache_breakpoints(messages, tail_slots, true);
+            let marks = marked_positions(&out);
+
+            // The scaffolding breakpoint survives, on the same block, carrying
+            // the same bytes as every other turn.
+            assert!(
+                marks.contains(&(0, 1)),
+                "turn {}: scaffolding breakpoint gone: {marks:?}",
+                n + 1
+            );
+            let scaffold = out[0]["content"][1]["cache_control"].clone();
+            match &scaffold_seen {
+                None => scaffold_seen = Some(scaffold),
+                Some(first) => assert_eq!(&scaffold, first, "turn {}", n + 1),
+            }
+
+            // Exactly one tail marker on the newest message.
+            let on_newest = marks.iter().filter(|(m, _)| *m == newest).count();
+            assert_eq!(
+                on_newest,
+                1,
+                "turn {}: {on_newest} markers on the newest message: {marks:?}",
+                n + 1
+            );
+
+            // And the tail never spends more than it was given. The scaffolding
+            // marker is the one extra, paid for out of `system` by the caller.
+            let tail_markers = marks.len() - 1;
+            assert!(
+                tail_markers <= tail_slots,
+                "turn {}: {tail_markers} tail markers for {tail_slots} slots",
+                n + 1
+            );
+            assert_eq!(placed, marks.len());
+        }
+    }
+
+    /// A session whose recall was injected in front of the reminders — every
+    /// conversation stored before the injector moved — has no run at the head,
+    /// so its message 0 is left exactly as the provider already cached it.
+    #[test]
+    fn a_recall_in_front_of_the_scaffolding_gets_no_breakpoint() {
+        let messages = vec![
+            json!({"role":"user","content":[
+                {"type":"text","text":"<!--ctx:injected--><session_recall/>"},
+                {"type":"text","text":"<system-reminder>claudeMd</system-reminder>"},
+                {"type":"text","text":"build a parser"}
+            ]}),
+            json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}),
+            json!({"role":"user","content":[{"type":"text","text":"go on"}]}),
+        ];
+        assert!(!opens_with_scaffolding(&messages));
+        let (out, placed) = place_tail_cache_breakpoints(messages, 2, true);
+        assert_eq!(placed, 2);
+        assert_eq!(
+            marked_positions(&out),
+            vec![(1, 0), (2, 0)],
+            "the tail keeps both, exactly as before this change"
+        );
+    }
+
+    /// Turn one: message 0 is both the shared opener and the newest message.
+    /// Two distinct blocks, so two markers, and neither is counted twice.
+    #[test]
+    fn turn_one_marks_the_scaffolding_and_the_tail_of_the_same_message() {
+        let (out, placed) = place_tail_cache_breakpoints(vec![scaffolded_opener()], 2, true);
+        assert_eq!(placed, 2);
+        assert_eq!(marked_positions(&out), vec![(0, 1), (0, 2)]);
+    }
+
+    /// An opener that is nothing but scaffolding collapses to one marker. The
+    /// count has to say one: upstream reads it as licence to drop the client's
+    /// `system` breakpoints.
+    #[test]
+    fn an_all_scaffolding_opener_is_counted_once() {
+        let messages = vec![json!({"role":"user","content":[
+            {"type":"text","text":"<system-reminder>claudeMd</system-reminder>"}
+        ]})];
+        let (out, placed) = place_tail_cache_breakpoints(messages, 2, true);
+        assert_eq!(placed, 1);
+        assert_eq!(marked_positions(&out), vec![(0, 0)]);
     }
 
     /// Claude Code's own shape: two markers on `system`, none on `tools`. Two
@@ -3702,7 +4704,9 @@ mod tests {
             ],
             "tools": [{"name": "t"}],
         });
-        assert_eq!(tail_slots_within_budget(&body, 2), (2, 2));
+        let slots = message_slots_within_budget(&body, &plain_opener(), 2);
+        assert_eq!((slots.tail, slots.reserved), (2, 2));
+        assert!(!slots.scaffold);
     }
 
     /// PR-E3 marks `tools[last]` on PAYG. That is the third slot, so the second
@@ -3716,7 +4720,8 @@ mod tests {
             ],
             "tools": [{"name": "t", "cache_control": {"type": "ephemeral"}}],
         });
-        assert_eq!(tail_slots_within_budget(&body, 2), (1, 3));
+        let slots = message_slots_within_budget(&body, &plain_opener(), 2);
+        assert_eq!((slots.tail, slots.reserved), (1, 3));
     }
 
     #[test]
@@ -3727,11 +4732,12 @@ mod tests {
                                 "cache_control": {"type": "ephemeral"}}))
                 .collect::<Vec<_>>(),
         });
-        assert_eq!(tail_slots_within_budget(&body, 2), (0, 4));
+        let slots = message_slots_within_budget(&body, &plain_opener(), 2);
+        assert_eq!((slots.tail, slots.reserved), (0, 4));
 
         // And zero slots really means none placed, not one.
         let msgs = vec![json!({"role": "user", "content": [{"type": "text", "text": "a"}]})];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 0);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 0, false);
         assert_eq!(placed, 0);
         assert!(marked_messages(&out).is_empty());
     }
@@ -3739,7 +4745,8 @@ mod tests {
     #[test]
     fn a_string_system_reserves_nothing() {
         let body = json!({"system": "one prompt", "messages": []});
-        assert_eq!(tail_slots_within_budget(&body, 2), (2, 0));
+        let slots = message_slots_within_budget(&body, &plain_opener(), 2);
+        assert_eq!((slots.tail, slots.reserved), (2, 0));
     }
 
     #[test]
@@ -3897,6 +4904,290 @@ mod tests {
         assert_eq!(t.frozen_message_count(), 0);
     }
 
+    // ---- cross-session prefix adoption ----
+
+    /// `n` alternating messages with distinct text, as the client sent them.
+    fn conversation(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                text_msg(role, &format!("message {i} {}", "x".repeat(600)))
+            })
+            .collect()
+    }
+
+    /// What the proxy forwarded for [`conversation`]: different bytes, so a
+    /// replay is told apart from a rebuild.
+    fn forwarded_for(originals: &[Value]) -> Vec<Value> {
+        originals
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                m["content"][0]["text"] = Value::String(format!(
+                    "{} [forwarded]",
+                    m["content"][0]["text"].as_str().unwrap()
+                ));
+                m
+            })
+            .collect()
+    }
+
+    fn record_turn(store: &SessionReplayStore, key: &str, request: &str, originals: &[Value]) {
+        store.begin_request(request, key, originals.to_vec(), forwarded_for(originals));
+        store.complete(request, 0, 5000);
+    }
+
+    fn adoption_log() -> (AdoptionHook, Arc<Mutex<Vec<(AdoptionDonor, String)>>>) {
+        let seen: Arc<Mutex<Vec<(AdoptionDonor, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let hook: AdoptionHook = Arc::new(move |donor: &AdoptionDonor, key: &str| {
+            sink.lock().unwrap().push((donor.clone(), key.to_string()));
+        });
+        (hook, seen)
+    }
+
+    #[test]
+    fn a_new_session_adopts_the_longest_leading_slice_of_another_sessions_prefix() {
+        let mut store = SessionReplayStore::new(8);
+        let (hook, seen) = adoption_log();
+        store.set_adoption_hook(hook);
+        // The donor went on past the fork point.
+        record_turn(&store, "donor", "req-a", &conversation(14));
+
+        let mut incoming = conversation(12);
+        incoming.push(text_msg("user", "the adopter's own new tail"));
+        let (originals, forwarded, chain_id) = store
+            .previous_turn_for("adopter", &incoming)
+            .expect("adopted");
+        assert_eq!(originals, conversation(12));
+        assert_eq!(forwarded, forwarded_for(&conversation(12)));
+        assert_ne!(
+            chain_id, 0,
+            "an adopted prefix is a stream this turn continues"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[(
+                AdoptionDonor::Session("donor".into()),
+                "adopter".to_string()
+            )]
+        );
+
+        // The donor is untouched.
+        let (donor_originals, ..) = store.previous_turn_for("donor", &conversation(14)).unwrap();
+        assert_eq!(donor_originals.len(), 14);
+    }
+
+    #[test]
+    fn an_adopted_prefix_is_carried_forward_as_the_adopters_own() {
+        let store = SessionReplayStore::new(8);
+        record_turn(&store, "donor", "req-a", &conversation(14));
+        let mut incoming = conversation(12);
+        incoming.push(text_msg("user", "the adopter's own new tail"));
+        store
+            .previous_turn_for("adopter", &incoming)
+            .expect("adopted");
+        record_turn(&store, "adopter", "req-b", &incoming);
+
+        incoming.push(text_msg("assistant", "reply"));
+        incoming.push(text_msg("user", "and again"));
+        let (originals, forwarded, _) = store
+            .previous_turn_for("adopter", &incoming)
+            .expect("the adopter replays its own previous turn");
+        assert_eq!(originals.len(), 13);
+        assert_eq!(forwarded, forwarded_for(&originals));
+    }
+
+    /// The session key hashes message 0 with `canonicalize_for_hash`, which
+    /// keeps `<system-reminder>` text, so a CLAUDE.md edit mid-conversation
+    /// mints a new key. The next turn then arrives as a stranger carrying the
+    /// whole history; it must find the old key's prefix.
+    #[test]
+    fn a_conversation_whose_opening_reminder_changed_adopts_its_own_old_prefix() {
+        let store = SessionReplayStore::new(8);
+        let mut donor_history = conversation(14);
+        donor_history[0] = json!({"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>CLAUDE.md v1</system-reminder>"},
+            {"type": "text", "text": "build a parser"}
+        ]});
+        record_turn(&store, "auth:token:conv-v1", "req-a", &donor_history);
+
+        let mut incoming = donor_history.clone();
+        incoming[0]["content"][0]["text"] =
+            Value::String("<system-reminder>CLAUDE.md v2, edited</system-reminder>".into());
+        incoming.push(text_msg("user", "next turn under the new key"));
+        let (originals, forwarded, _) = store
+            .previous_turn_for("auth:token:conv-v2", &incoming)
+            .expect("the reminder is not part of the canonical prefix");
+        assert_eq!(originals, donor_history);
+        assert_eq!(forwarded, forwarded_for(&donor_history));
+    }
+
+    #[test]
+    fn the_most_recent_donor_wins_an_equal_length_match() {
+        let store = SessionReplayStore::new(8);
+        record_turn(&store, "older", "req-a", &conversation(14));
+        std::thread::sleep(Duration::from_millis(5));
+        record_turn(&store, "newer", "req-b", &conversation(14));
+        let (hook, seen) = adoption_log();
+        let mut store = store;
+        store.set_adoption_hook(hook);
+
+        let mut incoming = conversation(14);
+        incoming.push(text_msg("user", "tail"));
+        store
+            .previous_turn_for("adopter", &incoming)
+            .expect("adopted");
+        assert_eq!(
+            seen.lock().unwrap()[0].0,
+            AdoptionDonor::Session("newer".into())
+        );
+    }
+
+    #[test]
+    fn an_evicted_or_expired_tracker_leaves_the_head_index() {
+        let mut store = SessionReplayStore::new(1);
+        store.set_session_ttl_for_test(Duration::from_millis(20));
+        record_turn(&store, "first", "req-a", &conversation(14));
+        record_turn(&store, "second", "req-b", &conversation(14));
+        let head = adoption_head_hash(&conversation(14)).unwrap();
+        assert_eq!(
+            store.head_index.lock().unwrap().get(&head).cloned(),
+            Some(vec!["second".to_string()]),
+            "the LRU evicted `first`, so the index must not name it"
+        );
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(matches!(
+            store.previous_turn_for("second", &conversation(14)),
+            Err(PrefixMiss::IdlePastTtl)
+        ));
+        assert!(
+            store.head_index.lock().unwrap().get(&head).is_none(),
+            "the last key under this head expired, so the bucket goes too"
+        );
+    }
+
+    #[test]
+    fn concurrent_completions_of_one_session_leave_one_whole_file_and_no_temporaries() {
+        let dir = TempDir::new("persist-race");
+        let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let originals = conversation(12 + i);
+                    let request = format!("req-{i}");
+                    store.begin_request(
+                        &request,
+                        "shared",
+                        originals.clone(),
+                        forwarded_for(&originals),
+                    );
+                    store.complete(&request, 0, 5000);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let snapshot = read_persisted_prefix(&dir.0, "shared").expect("a whole, parseable file");
+        assert!(!snapshot.forwarded.is_empty());
+        assert_eq!(snapshot.forwarded, forwarded_for(&snapshot.originals));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn no_adoption_below_the_message_floor() {
+        let store = SessionReplayStore::new(8);
+        record_turn(&store, "donor", "req-a", &conversation(14));
+
+        let short = conversation(CROSS_SESSION_ADOPT_MIN_MESSAGES - 1);
+        assert!(matches!(
+            store.previous_turn_for("adopter", &short),
+            Err(PrefixMiss::NoTrackerForSession)
+        ));
+        assert!(store.history_will_be_rewritten("adopter", &short));
+    }
+
+    #[test]
+    fn no_adoption_when_only_the_opening_messages_match() {
+        let store = SessionReplayStore::new(8);
+        record_turn(&store, "donor", "req-a", &conversation(14));
+
+        // Same head, so the donor is examined; diverges before the floor.
+        let mut incoming = conversation(14);
+        incoming[4] = text_msg("user", "a different fourth message");
+        assert!(matches!(
+            store.previous_turn_for("adopter", &incoming),
+            Err(PrefixMiss::NoTrackerForSession)
+        ));
+        assert!(store.history_will_be_rewritten("adopter", &incoming));
+    }
+
+    #[test]
+    fn a_persisted_prefix_of_another_session_is_adopted_after_a_restart() {
+        let dir = TempDir::new("adopt");
+        let before = SessionReplayStore::with_persistence(8, dir.0.clone());
+        record_turn(&before, "donor", "req-a", &conversation(14));
+        drop(before);
+
+        let mut after = SessionReplayStore::with_persistence(8, dir.0.clone());
+        let (hook, seen) = adoption_log();
+        after.set_adoption_hook(hook);
+        let mut incoming = conversation(12);
+        incoming.push(text_msg("user", "the adopter's own new tail"));
+        let (originals, forwarded, _) = after
+            .previous_turn_for("adopter", &incoming)
+            .expect("adopted from disk");
+        assert_eq!(originals, conversation(12));
+        assert_eq!(forwarded, forwarded_for(&conversation(12)));
+
+        let digest = persisted_path(&dir.0, "donor")
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[(
+                AdoptionDonor::PersistedDigest(digest),
+                "adopter".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_persisted_prefix_written_without_a_head_hash_is_still_found() {
+        let dir = TempDir::new("adopt-old-file");
+        let before = SessionReplayStore::with_persistence(8, dir.0.clone());
+        record_turn(&before, "donor", "req-a", &conversation(14));
+        drop(before);
+        let path = persisted_path(&dir.0, "donor");
+        let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(file.as_object_mut().unwrap().remove("head_hash").is_some());
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let after = SessionReplayStore::with_persistence(8, dir.0.clone());
+        let mut incoming = conversation(12);
+        incoming.push(text_msg("user", "tail"));
+        let (originals, ..) = after
+            .previous_turn_for("adopter", &incoming)
+            .expect("adopted from a file hashed on first scan");
+        assert_eq!(originals.len(), 12);
+    }
+
     /// A directory that cleans itself up, so these tests leave nothing behind.
     struct TempDir(std::path::PathBuf);
 
@@ -3925,6 +5216,35 @@ mod tests {
         store.begin_request("req-1", key, forwarded.clone(), forwarded.clone());
         store.complete("req-1", 0, 5000);
         forwarded
+    }
+
+    /// The offload gate asks this before touching frozen history: only a
+    /// history the provider cannot read back may be rewritten for free.
+    #[test]
+    fn history_is_rewritten_only_when_nothing_stored_replays_it() {
+        let dir = TempDir::new("rewritten");
+        let key = "auth:abc:03";
+        let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+        let history = vec![text_msg("user", "hello"), text_msg("assistant", "hi")];
+
+        assert!(
+            store.history_will_be_rewritten(key, &history),
+            "nothing stored, so the whole history is a fresh write"
+        );
+
+        let stored = persisted_turn(&store, key);
+        let mut extended = stored.clone();
+        extended.push(text_msg("assistant", "reply"));
+        extended.push(text_msg("user", "next"));
+        assert!(
+            !store.history_will_be_rewritten(key, &extended),
+            "the stored turn is a prefix of this one, so it replays"
+        );
+
+        assert!(
+            store.history_will_be_rewritten(key, &history),
+            "a history the stored turn is not a prefix of is written fresh"
+        );
     }
 
     #[test]
@@ -4201,7 +5521,7 @@ mod tests {
             // Production order is overlay first, placement second. On turn 0
             // this wraps the only bare string. On later turns overlay restores
             // that exact wrapped shape before the marker moves to the new tail.
-            let (forwarded, placed) = place_tail_cache_breakpoints(overlaid, 1);
+            let (forwarded, placed) = place_tail_cache_breakpoints(overlaid, 1, false);
             assert_eq!(placed, 1, "turn {turn}: one tail marker must be placed");
             let current_provider_key = provider_key(&forwarded);
 
@@ -5683,7 +7003,7 @@ mod block_shape_tests {
             previous.map(|(_, forwarded)| forwarded.as_slice()),
             true,
         );
-        (place_tail_cache_breakpoints(overlaid, 1).0, skip)
+        (place_tail_cache_breakpoints(overlaid, 1, false).0, skip)
     }
 
     /// What the store holds after a turn: the inbound messages and the bytes
@@ -5985,7 +7305,7 @@ mod block_shape_tests {
         let msgs = vec![json!({"role": "user", "content": [
                 reminder(),
                 {"type": "text", "text": "the actual question"}]})];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 1);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 1, false);
         assert_eq!(placed, 1, "turn one must still get a breakpoint");
         let blocks = out[0]["content"].as_array().unwrap();
         assert!(
@@ -6011,7 +7331,7 @@ mod block_shape_tests {
             json!({"role": "assistant", "content": [
                 {"type": "tool_use", "id": "tool-1", "name": "search", "input": {}}]}),
         ];
-        let (out, placed) = place_tail_cache_breakpoints(msgs, 2);
+        let (out, placed) = place_tail_cache_breakpoints(msgs, 2, false);
 
         assert_eq!(placed, 2, "the opener and the question are both cacheable");
         assert!(out[1]["content"][0].get("cache_control").is_some());

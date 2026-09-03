@@ -211,6 +211,45 @@ pub async fn handle_messages(
         }
     };
 
+    // Claude Code's spinner-text sidecar is answered here and goes no further:
+    // it must not reach route matching, the replay store, or the cache tracker,
+    // because the whole point is that it leaves no per-conversation state for
+    // the next real turn to be measured against. See `crate::sidecar`.
+    //
+    // This runs ahead of the route table on purpose. A sidecar is a throwaway
+    // four-word summary; whichever model the client named, it is answered on
+    // the sidecar model against the default upstream with the client's own
+    // credentials.
+    //
+    // A `None` means either that this was not a sidecar or that the shrunk
+    // request failed. Both want the same thing from here: fall through with
+    // `parsed` and `body` exactly as the client sent them. Neither the predicate
+    // nor the rewrite mutates either, so the normal path below cannot tell that
+    // this block ran.
+    if crate::sidecar::is_describe_action_sidecar(&parsed) {
+        let base = state.effective_upstream().await;
+        if let Ok(url) = crate::proxy::build_upstream_url(&base, &uri) {
+            let sidecar_model = state
+                .config
+                .sidecar_model
+                .clone()
+                .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
+            if let Some(resp) = crate::sidecar::try_handle(
+                &state.client,
+                &url,
+                &request_id,
+                &headers,
+                &parsed,
+                &sidecar_model,
+                crate::sidecar::SidecarRetry::from_config(&state.config),
+            )
+            .await
+            {
+                return resp;
+            }
+        }
+    }
+
     let body_model = parsed
         .get("model")
         .and_then(|v| v.as_str())
@@ -778,8 +817,10 @@ pub async fn handle_messages(
         &serde_json::to_vec(&parsed).map(Bytes::from).unwrap_or_default(),
     )
     .await;
+    let ccr_stores = state.ctx_offload.as_ref().map(|r| r.store.stores());
     let ccr = state.ccr_store().map(|store| RoutedCcr {
         store,
+        stores: ccr_stores,
         memory: routed_memory,
         client: state.client.clone(),
         upstream_url: upstream_url.clone(),
@@ -879,6 +920,7 @@ async fn resolve_routed_ccr(
         &url,
         &ccr.client,
         ccr.store.as_ref(),
+        ccr.stores.as_ref(),
         &ccr.config,
         &ccr.request_id,
         &ccr.headers,
@@ -974,6 +1016,9 @@ async fn resolve_routed_memory(
 /// headers are only in scope there.
 pub(crate) struct RoutedCcr {
     pub store: Arc<dyn headroom_core::ccr::CcrStore>,
+    /// Per-project content stores, for the cold-tier lookup when `store`
+    /// has expired a block. `None` disables the fallback.
+    pub stores: Option<Arc<crate::ctx::projects::ProjectStores>>,
     /// Memory tools are injected on this path too (see the injection site in
     /// `apply_ctx_request_transforms`), so this path has to run them. Without
     /// it the call streamed on to the client, which has never heard of
@@ -1211,6 +1256,7 @@ async fn handle_streaming_response(
         Some(ccr) => {
             let anthropic_request = original.clone();
             let ctx = crate::sse::ccr_stream::CcrStreamContext {
+                ccr_stores: ccr.stores.clone(),
                 client: ccr.client,
                 upstream_url: match url::Url::parse(&ccr.upstream_url) {
                     Ok(u) => u,
@@ -1991,7 +2037,7 @@ mod resolver_alternation_tests {
             crate::memory::local_backend::LocalMemoryBackend::new(),
         ));
         crate::proxy::MemoryToolContext {
-            handler: Arc::new(tokio::sync::Mutex::new(handler)),
+            handler: Arc::new(handler),
             provider: crate::memory::tool_adapter::Provider::Openai,
             user_id: "u1".to_string(),
         }
@@ -2047,6 +2093,7 @@ mod resolver_alternation_tests {
             .await;
 
         let ccr = RoutedCcr {
+            stores: None,
             store: Arc::new(store),
             memory: Some(memory_ctx()),
             client: reqwest::Client::new(),
@@ -2092,6 +2139,7 @@ mod resolver_alternation_tests {
     async fn a_turn_needing_neither_resolver_makes_no_upstream_call() {
         let server = MockServer::start().await;
         let ccr = RoutedCcr {
+            stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory_ctx()),
             client: reqwest::Client::new(),

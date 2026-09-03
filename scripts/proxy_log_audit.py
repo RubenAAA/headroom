@@ -169,8 +169,25 @@ def check_recache(log: Path, since: str) -> None:
                 int(f.get("wasted_tokens", 0) or 0),
                 int(f.get("expected_cache_read", 0) or 0),
                 int(f.get("actual_cache_read", 0) or 0),
+                str(f.get("attribution_reason", "") or "(none)"),
             )
         )
+
+    # Headline: every recache event burns cache-write tokens, whether or not
+    # the proxy managed to name a drift dimension for it. Reporting only the
+    # named ones hides most of the bill.
+    print(f"total wasted_tokens over all {len(rows)} recache events: "
+          f"{sum(r[3] for r in rows)}")
+
+    by_reason = defaultdict(list)
+    for r in rows:
+        by_reason[r[6]].append(r[3])
+    print("  by attribution_reason:")
+    print(f"    {'reason':<32} {'count':>6} {'tokens':>10} {'median':>8}")
+    for reason, vals in sorted(by_reason.items(), key=lambda x: -sum(x[1])):
+        vals.sort()
+        median = vals[len(vals) // 2]
+        print(f"    {reason:<32} {len(vals):>6} {sum(vals):>10} {median:>8}")
 
     expected = sum(r[3] for r in rows if not r[2])
     drift = [r for r in rows if r[2]]

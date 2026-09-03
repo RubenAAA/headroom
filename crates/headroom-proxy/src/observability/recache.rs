@@ -17,7 +17,8 @@ use std::sync::OnceLock;
 use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 
 use super::metric_names::{
-    LABEL_REASON, METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL,
+    LABEL_REASON, METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL,
+    METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL_HELP, METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL,
     METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP, METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL,
     METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP,
 };
@@ -55,6 +56,46 @@ fn wasted_tokens_counter(registry: &Registry) -> &'static IntCounter {
     })
 }
 
+fn first_turn_write_tokens_counter(registry: &Registry) -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL,
+                METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL_HELP,
+            ),
+            &[LABEL_REASON],
+        )
+        .expect("proxy_cache_first_turn_write_tokens_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("proxy_cache_first_turn_write_tokens_total registers exactly once");
+        counter
+    })
+}
+
+/// Bounded vocabulary for `first_turn_write_observed`; anything else is
+/// `unknown` so a future reason cannot widen the label set.
+fn first_turn_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "compaction_restart" => "compaction_restart",
+        "session_key_drift" => "session_key_drift",
+        "identical_prompt_fanout" => "identical_prompt_fanout",
+        "fresh_session" => "fresh_session",
+        "arrived_with_history" => "arrived_with_history",
+        _ => "unknown",
+    }
+}
+
+/// Record the cache write of a first turn under its conversation key.
+/// Called by the usage observer off the client byte path.
+pub fn observe_first_turn_write(reason: &str, cache_creation_input_tokens: u64) {
+    let registry = super::prometheus::registry();
+    first_turn_write_tokens_counter(registry)
+        .with_label_values(&[first_turn_reason_label(reason)])
+        .inc_by(cache_creation_input_tokens);
+}
+
 /// Map an evidence-only attribution reason to a bounded label vocabulary.
 fn reason_label(attribution_reason: Option<&str>) -> &'static str {
     match attribution_reason {
@@ -63,6 +104,11 @@ fn reason_label(attribution_reason: Option<&str>) -> &'static str {
         Some("early_messages") => "early_messages",
         Some("inbound_tail_replaced") => "inbound_tail_replaced",
         Some("unexplained_after_replay") => "unexplained_after_replay",
+        Some("provider_missed_newest_write") => "provider_missed_newest_write",
+        Some("provider_partial_of_previous_write") => "provider_partial_of_previous_write",
+        Some("provider_free_read_not_persisted") => "provider_free_read_not_persisted",
+        Some("provider_dropped_older_entry") => "provider_dropped_older_entry",
+        Some("provider_between_entries") => "provider_between_entries",
         Some("aftershock_of_diverged_prefix") => "aftershock_of_diverged_prefix",
         Some("concurrent_turn_in_flight") => "concurrent_turn_in_flight",
         Some("prefix_content_diverged") => "prefix_content_diverged",
@@ -139,6 +185,23 @@ mod tests {
         // counter concurrently, so assert a lower bound, not equality.
         assert!(wasted_tokens_counter(registry).get() >= before + 1234);
         assert!(events_counter(registry).with_label_values(&["tools"]).get() >= 1);
+    }
+
+    #[test]
+    fn first_turn_write_label_vocabulary_is_bounded() {
+        assert_eq!(first_turn_reason_label("fresh_session"), "fresh_session");
+        assert_eq!(first_turn_reason_label("something_new"), "unknown");
+        let registry = crate::observability::prometheus::registry();
+        let before = first_turn_write_tokens_counter(registry)
+            .with_label_values(&["compaction_restart"])
+            .get();
+        observe_first_turn_write("compaction_restart", 500);
+        assert!(
+            first_turn_write_tokens_counter(registry)
+                .with_label_values(&["compaction_restart"])
+                .get()
+                >= before + 500
+        );
     }
 
     #[test]

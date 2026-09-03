@@ -176,7 +176,7 @@ pub struct AppState {
     pub cursor_bridge: Arc<crate::cursor::bridge::Bridge>,
     /// Memory handler: orchestrates memory tool injection, context search,
     /// and tool call execution. `Some` only when `config.memory_enabled`.
-    pub memory_handler: Option<Arc<tokio::sync::Mutex<crate::memory::handler::MemoryHandler>>>,
+    pub memory_handler: Option<Arc<crate::memory::handler::MemoryHandler>>,
     /// Per-key token-bucket rate limiter. `Some` only when
     /// `config.rate_limit_enabled` is set.
     pub rate_limiter: Option<Arc<headroom_core::proxy::rate_limiter::TokenBucketRateLimiter>>,
@@ -593,7 +593,7 @@ impl AppState {
                     ));
                 }
             }
-            Some(Arc::new(tokio::sync::Mutex::new(handler)))
+            Some(Arc::new(handler))
         } else {
             None
         };
@@ -614,7 +614,7 @@ impl AppState {
             None
         };
 
-        let replay_store = if config.replay_store_dir.is_empty() {
+        let mut replay_store = if config.replay_store_dir.is_empty() {
             SessionReplayStore::new(REPLAY_STORE_CAPACITY)
         } else {
             SessionReplayStore::with_persistence(
@@ -622,6 +622,14 @@ impl AppState {
                 std::path::PathBuf::from(&config.replay_store_dir),
             )
         };
+        // A prefix adopted from another session carries that session's offload
+        // digests, so the gate must learn them under the adopter's key too.
+        if let Some(runtime) = ctx_offload.as_ref() {
+            let gate = runtime.gate.clone();
+            replay_store.set_adoption_hook(Arc::new(move |donor, session_key| {
+                gate.adopt_from(donor, session_key)
+            }));
+        }
 
         // Read before `config` moves into the Arc below.
         let observed_cache_ttl = if config.force_1h_cache_ttl || config.split_cache_ttl {
@@ -2355,6 +2363,7 @@ fn tool_inventory_of(value: &serde_json::Value) -> (Vec<(String, i64)>, Vec<(Str
 /// in seconds it does not register; on a passthrough request it never runs.
 fn record_request_footprint(
     tracker: &headroom_core::savings_tracker::SavingsTracker,
+    request_id: &str,
     original: &bytes::Bytes,
     on_the_wire: &bytes::Bytes,
 ) {
@@ -2364,9 +2373,84 @@ fn record_request_footprint(
     let Ok(after) = serde_json::from_slice::<serde_json::Value>(on_the_wire) else {
         return;
     };
+    audit_tool_pairing(request_id, &before, &after);
     tracker.record_proxy_overhead(prefix_head_bytes(&before), prefix_head_bytes(&after));
     let (definitions, calls) = tool_inventory_of(&after);
     tracker.record_tools(&definitions, &calls);
+}
+
+/// Every `tool_use` block Anthropic will find unanswered in `value`.
+///
+/// The rule the API enforces: a `tool_use` needs a `tool_result` carrying its
+/// id in the very next message. A turn that breaks it is refused whole, with
+/// a 400 that names one id and no indication of who dropped it.
+fn unanswered_tool_uses(value: &serde_json::Value) -> Vec<(usize, String)> {
+    let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let answered: std::collections::HashSet<&str> = messages
+            .get(index + 1)
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .map(|next| {
+                next.iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    .filter_map(|b| b.get("tool_use_id").and_then(|i| i.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let Some(id) = block.get("id").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            if !answered.contains(id) {
+                out.push((index, id.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Say, before the 400 arrives, whether the request left here unpaired — and
+/// whether it arrived that way.
+///
+/// Written after 2026-09-03, when a turn was refused for an unanswered
+/// `tool_use` and nothing in the logs could settle whether the client had
+/// sent it broken or the proxy had broken it. The two bodies are already
+/// parsed here, so the answer costs a walk of the messages array.
+fn audit_tool_pairing(
+    request_id: &str,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) {
+    let forwarded = unanswered_tool_uses(after);
+    if forwarded.is_empty() {
+        return;
+    }
+    let arrived = unanswered_tool_uses(before);
+    let origin = if arrived.is_empty() { "proxy" } else { "client" };
+    tracing::warn!(
+        target: "headroom.proxy",
+        event = "unanswered_tool_use_forwarded",
+        request_id = %request_id,
+        origin = origin,
+        unanswered_count = forwarded.len(),
+        unanswered = %forwarded
+            .iter()
+            .map(|(i, id)| format!("{i}:{id}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        arrived_unanswered_count = arrived.len(),
+        "a tool_use is going upstream without its tool_result; the request will be refused"
+    );
 }
 
 /// Whether an upstream `reqwest` send error is a transient transport
@@ -2820,6 +2904,7 @@ pub(crate) async fn forward_http(
                 )));
             }
         }
+        let body_read_start = Instant::now();
         let buffered = match to_bytes(req.into_body(), max).await {
             Ok(b) => b,
             Err(e) => {
@@ -2837,10 +2922,67 @@ pub(crate) async fn forward_http(
             }
         };
 
+        stage_timer.record("buffer", body_read_start.elapsed().as_secs_f64() * 1000.0);
+
         // Save the original buffer for semantic cache key computation.
         // CTX transforms and compression may modify `buffered`; the
         // cache key must reflect the original request.
         original_buffered = buffered.clone();
+
+        // Claude Code's spinner-text sidecar leaves here, before the endpoint
+        // dispatcher below and everything downstream of it — ctx injection,
+        // memory tools, the turn fingerprint, the replay store, the cache
+        // tracker, offload, compression, cache_control placement. It resends
+        // the whole conversation for a four-word status line, so forwarding it
+        // whole billed a full prefix read; worse, the prefix it stored made the
+        // next real turn read as an unexplained re-cache. See `crate::sidecar`.
+        //
+        // Nothing is deserialised yet at this point — the first parse is in the
+        // volatile/drift block below — so the gate is a substring search rather
+        // than a structural check. The phrase is one JSON string with nothing in
+        // it that needs escaping, so it survives serialisation verbatim.
+        //
+        // `memmem` and not `windows().any()`: measured on the largest body in a
+        // 2,648-request capture (1.6 MB), the naive scan costs 2,475 us, a full
+        // `serde_json` parse costs 1,213 us, and `memmem::find` costs 50 us. The
+        // naive scan is the one option slower than the parse it was meant to
+        // avoid. A non-sidecar request pays only that 50 us worst case, and the
+        // structural predicate that follows costs 0.094 us on a parsed body.
+        //
+        // A tail-only scan would be cheaper still and is wrong: Claude Code
+        // serialises `messages` second, ahead of `system` and 27-39 tool
+        // schemas, so the block sits nearer the middle of the body than the end.
+        //
+        // A `None` back means either that this was not a sidecar or that the
+        // shrunk request failed; both fall through to the dispatcher below with
+        // `buffered` untouched, which is what the proxy did before this existed.
+        const DESCRIBE: &[u8] = crate::sidecar::DESCRIBE_ACTION_PREFIX.as_bytes();
+        if compression::classify_compressible_path(uri.path())
+            == Some(compression::CompressibleEndpoint::AnthropicMessages)
+            && memchr::memmem::find(&buffered, DESCRIBE).is_some()
+        {
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
+                let sidecar_model = state
+                    .config
+                    .sidecar_model
+                    .clone()
+                    .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
+                let empty = http::HeaderMap::new();
+                if let Some(resp) = crate::sidecar::try_handle(
+                    &upstream_client,
+                    &upstream_url,
+                    &request_id,
+                    headers_snapshot.as_ref().unwrap_or(&empty),
+                    &parsed,
+                    &sidecar_model,
+                    crate::sidecar::SidecarRetry::from_config(&state.config),
+                )
+                .await
+                {
+                    return Ok(resp);
+                }
+            }
+        }
 
         // PR-C2: dispatch on the endpoint classification so each
         // provider hits its own live-zone walker. PR-B2/B3/B4 wired
@@ -3051,6 +3193,13 @@ pub(crate) async fn forward_http(
                     Some(cache_stabilization::usage_observer::prefix_fingerprint(
                         &parsed,
                     )),
+                );
+                // Read off the client's body here, once: the observer has no
+                // messages by the time usage comes back, and a first turn
+                // that writes cache needs them to say why.
+                state.usage_observer.note_first_turn_context(
+                    &request_id,
+                    cache_stabilization::usage_observer::first_turn_context(&parsed),
                 );
 
                 // PR-J0: env-gated request-body capture for the offload
@@ -3303,6 +3452,66 @@ pub(crate) async fn forward_http(
             }
         }
 
+        // History the provider cannot read back is written fresh this turn
+        // whatever the proxy sends, so offloading its tool results costs
+        // nothing that a verbatim copy would have kept. A session that arrives
+        // mid-conversation (resume, compaction, a new replay chain) otherwise
+        // carries every old tool result verbatim for the rest of its life: 12
+        // such sessions held 5% of all cache reads over 2026-09-01/02 with
+        // none of their history offloaded.
+        let history_rewritten = !rebuild_boundary
+            && replay_original_messages.as_deref().is_some_and(|messages| {
+                messages.len() > 1
+                    && state
+                        .replay_store
+                        .history_will_be_rewritten(&request_session_key, messages)
+            });
+        let offload_boundary = rebuild_boundary || history_rewritten;
+
+        // Same turns, same reason: the provider writes this prefix fresh, so
+        // stripping thinking the model will never read back costs nothing a
+        // verbatim copy would have kept. Off a boundary the pass must not run —
+        // the replay store carries the stripped bytes forward for every
+        // message it has seen. Its own block, not part of the ctx pipeline
+        // below: entering that one injects the retrieval tool.
+        let buffered = if state.config.ctx_drop_prior_thinking
+            && offload_boundary
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            )
+            && buffered
+                .windows(b"thinking".len())
+                .any(|w| w == b"thinking")
+        {
+            match serde_json::from_slice::<serde_json::Value>(&buffered) {
+                Ok(mut value) => {
+                    let dropped =
+                        crate::compression::prior_thinking::drop_prior_thinking(&mut value);
+                    if dropped.blocks_removed == 0 {
+                        buffered
+                    } else {
+                        tracing::info!(
+                            event = "prior_thinking_dropped",
+                            request_id = %request_id,
+                            blocks_removed = dropped.blocks_removed,
+                            bytes_removed = dropped.bytes_removed,
+                            rebuild_boundary,
+                            history_rewritten,
+                            "dropped thinking from assistant turns before the last"
+                        );
+                        match serde_json::to_vec(&value) {
+                            Ok(bytes) => axum::body::Bytes::from(bytes),
+                            Err(_) => buffered,
+                        }
+                    }
+                }
+                Err(_) => buffered,
+            }
+        } else {
+            buffered
+        };
+
         let buffered = if matches!(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
@@ -3369,17 +3578,61 @@ pub(crate) async fn forward_http(
                         let policy = crate::compression::ctx_offload::OffloadPolicy {
                             gate: &runtime.gate,
                             session_key: &session_key,
-                            rebuild_boundary,
+                            rebuild_boundary: offload_boundary,
                         };
                         let out = crate::compression::ctx_offload::offload_anthropic_request(
                             &mut value,
                             &runtime.config,
                             Some(&policy),
                         );
+                        // Large `tool_use` input strings (a Write's `content`)
+                        // go the same way, under a stricter gate: a first
+                        // conversion needs the block to be provably unsent, and
+                        // that is what the replay store's count says.
+                        let out = if state.config.ctx_offload_tool_use {
+                            let forwarded_before = state.config.prefix_replay.then(|| {
+                                state
+                                    .replay_store
+                                    .forwarded_message_count(&request_session_key)
+                            });
+                            let ccr = runtime.store.ccr();
+                            let put = |record: &crate::compression::ctx_offload::OffloadRecord| {
+                                ccr.put(&record.hash, &record.original)
+                            };
+                            let tool_use = crate::compression::ctx_offload::offload_tool_use_inputs(
+                                &mut value,
+                                &runtime.config,
+                                &policy,
+                                forwarded_before.flatten(),
+                                &put,
+                            );
+                            if tool_use.blocks_offloaded > 0 || tool_use.blocks_deferred > 0 {
+                                tracing::info!(
+                                    event = "ctx_offload_tool_use",
+                                    request_id = %request_id,
+                                    blocks_offloaded = tool_use.blocks_offloaded,
+                                    blocks_deferred = tool_use.blocks_deferred,
+                                    bytes_deferred = tool_use.bytes_deferred,
+                                    tokens_saved = tool_use.tokens_saved,
+                                    forwarded_before = ?forwarded_before.flatten(),
+                                    rebuild_boundary = offload_boundary,
+                                    "ctx_offload considered tool_use inputs"
+                                );
+                            }
+                            let mut out = out;
+                            out.blocks_offloaded += tool_use.blocks_offloaded;
+                            out.blocks_deferred += tool_use.blocks_deferred;
+                            out.bytes_deferred += tool_use.bytes_deferred;
+                            out.tokens_saved += tool_use.tokens_saved;
+                            out.records.extend(tool_use.records);
+                            out
+                        } else {
+                            out
+                        };
                         // PR-J5 thrash guard: an I4 violation (frozen-history
                         // conversion on a steady-state turn) is a cache-thrash
                         // bug — page-worthy, per the Phase J plan §13.
-                        if !rebuild_boundary && out.frozen_new_offloads > 0 {
+                        if !offload_boundary && out.frozen_new_offloads > 0 {
                             tracing::warn!(
                                 event = "ctx_offload_thrash_guard",
                                 request_id = %request_id,
@@ -3406,9 +3659,11 @@ pub(crate) async fn forward_http(
                                 request_id = %request_id,
                                 blocks_offloaded = out.blocks_offloaded,
                                 blocks_deferred = out.blocks_deferred,
+                                bytes_deferred = out.bytes_deferred,
                                 window_offloads = out.window_offloads,
                                 tokens_saved = out.tokens_saved,
                                 rebuild_boundary,
+                                history_rewritten,
                                 "ctx_offload considered tool_result blocks"
                             );
                         }
@@ -3426,7 +3681,6 @@ pub(crate) async fn forward_http(
                     // Memory: inject tool definitions into the request body.
                     // Runs after CTX transforms, before output shaping.
                     if let Some(handler) = state.memory_handler.as_ref() {
-                        let handler = handler.lock().await;
                         if handler.is_initialized() {
                             let provider = match endpoint {
                                 compression::CompressibleEndpoint::AnthropicMessages => {
@@ -3612,8 +3866,8 @@ pub(crate) async fn forward_http(
 
                     // Memory: search and inject context into user message tail.
                     // Runs after output shaping, before final serialization.
+                    let memory_start = Instant::now();
                     if let Some(handler) = state.memory_handler.as_ref() {
-                        let handler = handler.lock().await;
                         if handler.is_initialized() {
                             let provider = match endpoint {
                                 compression::CompressibleEndpoint::AnthropicMessages => {
@@ -3705,6 +3959,9 @@ pub(crate) async fn forward_http(
                             }
                         }
                     }
+
+                    stage_timer
+                        .record("memory", memory_start.elapsed().as_secs_f64() * 1000.0);
 
                     if changed {
                         match serde_json::to_vec(&value) {
@@ -4245,6 +4502,7 @@ pub(crate) async fn forward_http(
         // `headers_snapshot` is always `Some` on this buffered branch;
         // `replay_original_messages` is `Some` only when the flag is on
         // and the body carried a messages array.
+        let replay_start = Instant::now();
         let body_to_send = match (replay_original_messages, headers_snapshot.as_ref()) {
             // `_headers` is matched, not used: the key was derived once above
             // from the unmutated body. The arm still guards on `Some` because
@@ -4266,6 +4524,19 @@ pub(crate) async fn forward_http(
             }
             _ => body_to_send,
         };
+        stage_timer.record("replay", replay_start.elapsed().as_secs_f64() * 1000.0);
+        // The replay stage above may have adopted another session's prefix
+        // for this turn. Hand the donor to the observer so the first-turn
+        // event files it as session-key drift rather than new history.
+        if let Some(donor_session_key_hash) = state.replay_store.take_adoption(&request_session_key)
+        {
+            state.usage_observer.note_prefix_adoption(
+                &request_id,
+                cache_stabilization::usage_observer::PrefixAdoption {
+                    donor_session_key_hash,
+                },
+            );
+        }
 
         // Snapshot the prefix as the replay stage leaves it, to be checked
         // against what actually goes out. See [`message_digests`]. Gated the
@@ -4398,7 +4669,17 @@ pub(crate) async fn forward_http(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
         ) {
-            record_request_footprint(&state.savings_tracker, &original_buffered, &body_to_send);
+            let footprint_start = Instant::now();
+            record_request_footprint(
+                &state.savings_tracker,
+                &request_id,
+                &original_buffered,
+                &body_to_send,
+            );
+            stage_timer.record(
+                "footprint",
+                footprint_start.elapsed().as_secs_f64() * 1000.0,
+            );
         }
 
         cache_stabilization::capture::maybe_capture_outbound(&body_to_send, &request_id);
@@ -4424,7 +4705,6 @@ pub(crate) async fn forward_http(
             compression::CompressibleEndpoint::AnthropicMessages
         ) {
             if let Some(handler) = state.memory_handler.as_ref() {
-                let handler = handler.lock().await;
                 if handler.is_initialized() {
                     for (name, value) in handler.get_beta_headers() {
                         if name.eq_ignore_ascii_case("anthropic-beta") {
@@ -4508,7 +4788,7 @@ pub(crate) async fn forward_http(
             );
             // Same site, same bytes: this is what actually left the proxy, so
             // the fingerprints describe the prefix the provider keyed on.
-            log_prefix_composition(&request_id, &body_to_send);
+            log_prefix_composition(&request_id, &request_session_key, &body_to_send);
             // Feed the ground-truth ledger. Sizes come off the wire, and the
             // arm label makes a compression-on vs compression-off comparison a
             // query instead of an argument.
@@ -4648,6 +4928,11 @@ pub(crate) async fn forward_http(
                 );
             }
         }
+
+        // Everything headroom did before the bytes leave. This is the number
+        // that has to be reconstructed from log-line gaps when it is missing,
+        // and the one a latency complaint is about.
+        stage_timer.record("pre_forward", start.elapsed().as_secs_f64() * 1000.0);
 
         retry_body = Some(body_to_send.clone());
         forwarded_body = retry_body.clone();
@@ -4849,6 +5134,17 @@ pub(crate) async fn forward_http(
     // Bytes already read off the body while checking for a leading in-band
     // error. They lead the client's stream so nothing is lost.
     let (upstream_resp, sse_prefix) = upstream_resp;
+    // Response headers are in hand. Whatever is left after `pre_forward` is
+    // the provider's own time, including retries and backoff.
+    {
+        let pre_forward = stage_timer
+            .summary()
+            .get("pre_forward")
+            .copied()
+            .unwrap_or(0.0);
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        stage_timer.record("upstream", (elapsed - pre_forward).max(0.0));
+    }
 
     let upstream_status = upstream_resp.status();
     let mut status =
@@ -5057,6 +5353,7 @@ pub(crate) async fn forward_http(
                 .expect("ctx_offload checked above")
                 .store
                 .ccr(),
+            ccr_stores: state.ctx_offload.as_ref().map(|r| r.store.stores()),
             config: state.config.clone(),
             request_id: request_id.clone(),
             shape: crate::sse::ccr_stream::CcrShape::Anthropic,
@@ -5289,62 +5586,62 @@ pub(crate) async fn forward_http(
                 for _ in 0..MAX_RESOLVER_ALTERNATIONS {
                     let before = body_bytes.clone();
 
-                // CCR response handling: detect headroom_retrieve tool
-                // calls, fetch from CCR store, and continue conversation.
-                if state.config.ccr_handle_responses
-                    && !body_bytes.is_empty()
-                    && state.ctx_offload.is_some()
-                {
-                    // Derive the CCR provider shape from the request path so
-                    // interception fires for all three provider shapes:
-                    // Anthropic messages, OpenAI chat-completions, and OpenAI
-                    // Responses. Each has a distinct request/response layout.
-                    let ccr_provider = if path_for_log.contains("/v1/messages") {
-                        Some("anthropic")
-                    } else if path_for_log.contains("/v1/chat/completions") {
-                        Some("openai")
-                    } else if path_for_log.contains("/v1/responses") {
-                        Some("openai_responses")
-                    } else {
-                        None
-                    };
-                    if let Some(ccr_provider) = ccr_provider {
-                        let ccr_store = state.ctx_offload.as_ref().unwrap().store.ccr();
-                        let (resolved, extra) = handle_ccr_response(
+                    // CCR response handling: detect headroom_retrieve tool
+                    // calls, fetch from CCR store, and continue conversation.
+                    if state.config.ccr_handle_responses
+                        && !body_bytes.is_empty()
+                        && state.ctx_offload.is_some()
+                    {
+                        // Derive the CCR provider shape from the request path so
+                        // interception fires for all three provider shapes:
+                        // Anthropic messages, OpenAI chat-completions, and OpenAI
+                        // Responses. Each has a distinct request/response layout.
+                        let ccr_provider = if path_for_log.contains("/v1/messages") {
+                            Some("anthropic")
+                        } else if path_for_log.contains("/v1/chat/completions") {
+                            Some("openai")
+                        } else if path_for_log.contains("/v1/responses") {
+                            Some("openai_responses")
+                        } else {
+                            None
+                        };
+                        if let Some(ccr_provider) = ccr_provider {
+                            let ccr_store = state.ctx_offload.as_ref().unwrap().store.ccr();
+                            let ccr_stores = state.ctx_offload.as_ref().unwrap().store.stores();
+                            let (resolved, extra) = handle_ccr_response(
+                                &body_bytes,
+                                &continuation_base,
+                                &upstream_url,
+                                &upstream_client,
+                                ccr_store.as_ref(),
+                                Some(&ccr_stores),
+                                &state.config,
+                                &request_id,
+                                &outgoing_headers,
+                                ccr_provider,
+                            )
+                            .await;
+                            body_bytes = resolved;
+                            ccr_round_usage.absorb(extra);
+                        }
+                    }
+
+                    if let (Some(memory), Some(provider)) = (memory_ctx.as_ref(), memory_provider) {
+                        let (resolved, extra) = handle_memory_response(
                             &body_bytes,
                             &continuation_base,
                             &upstream_url,
                             &upstream_client,
-                            ccr_store.as_ref(),
+                            memory,
                             &state.config,
                             &request_id,
                             &outgoing_headers,
-                            ccr_provider,
+                            provider,
                         )
                         .await;
                         body_bytes = resolved;
                         ccr_round_usage.absorb(extra);
                     }
-                }
-
-                if let (Some(memory), Some(provider)) =
-                    (memory_ctx.as_ref(), memory_provider)
-                {
-                    let (resolved, extra) = handle_memory_response(
-                        &body_bytes,
-                        &continuation_base,
-                        &upstream_url,
-                        &upstream_client,
-                        memory,
-                        &state.config,
-                        &request_id,
-                        &outgoing_headers,
-                        provider,
-                    )
-                    .await;
-                    body_bytes = resolved;
-                    ccr_round_usage.absorb(extra);
-                }
 
                     if body_bytes == before {
                         break;
@@ -5720,7 +6017,15 @@ pub(crate) async fn forward_http(
         &request_id,
         "",
         &stage_timer,
-        &["buffer", "compression", "upstream"],
+        &[
+            "buffer",
+            "memory",
+            "compression",
+            "replay",
+            "footprint",
+            "pre_forward",
+            "upstream",
+        ],
     );
 
     Ok(response)
@@ -5846,6 +6151,32 @@ fn carries_thinking_block(message: &serde_json::Value) -> bool {
 }
 
 /// Every signed reasoning block in a message array, in order.
+/// Whether `after` still carries every signed reasoning block the provider
+/// will read back. Anthropic reads the LAST assistant message's blocks back
+/// (they must stay while a tool loop is open) and refuses any block that comes
+/// back altered. Blocks from earlier assistant turns may be dropped whole:
+/// `compression::prior_thinking` does so on a rebuild boundary, and the replay
+/// store repeats the stripped bytes on every steady turn after. So: the last
+/// assistant message's blocks match exactly, and the rest of `after` is a
+/// subsequence of `before` — nothing edited, nothing invented.
+fn signed_reasoning_preserved(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    fn last_assistant_blocks(messages: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .map(|m| signed_reasoning_blocks(std::slice::from_ref(m)))
+            .unwrap_or_default()
+    }
+    if last_assistant_blocks(before) != last_assistant_blocks(after) {
+        return false;
+    }
+    let mut remaining = signed_reasoning_blocks(before).into_iter();
+    signed_reasoning_blocks(after)
+        .into_iter()
+        .all(|block| remaining.any(|kept| kept == block))
+}
+
 fn signed_reasoning_blocks(messages: &[serde_json::Value]) -> Vec<&serde_json::Value> {
     messages
         .iter()
@@ -6002,6 +6333,16 @@ fn is_unsigned_reasoning(block: &serde_json::Value) -> bool {
 /// Restoring only `messages` keeps every change made outside it — model
 /// routing, tool pruning, the TTL pin — so a body that trips this costs one
 /// turn's compression rather than the turn.
+///
+/// It costs less than that now. Putting the whole array back also reverted
+/// messages nobody had complained about, including the opening ones — and
+/// those are in the cached prefix. Measured over 09-02, the four turns that
+/// took the wholesale restore are the four costliest proxy-caused re-caches
+/// of the day: 573,940 of 622,325 wasted tokens, one of them dropping a
+/// session's cache read from 267,681 to 17,238 in a single turn. So the
+/// repair now names the messages that broke the invariant and puts back only
+/// those, falling back to the whole array when it cannot map one array onto
+/// the other or when the narrow repair does not settle it.
 fn restore_client_reasoning_blocks(
     body_to_send: bytes::Bytes,
     original: &bytes::Bytes,
@@ -6033,16 +6374,23 @@ fn restore_client_reasoning_blocks(
         .get("messages")
         .and_then(|m| m.as_array())
         .unwrap_or(&empty);
-    if signed_reasoning_blocks(before_messages) == signed_reasoning_blocks(after_messages) {
+    if signed_reasoning_preserved(before_messages, after_messages) {
         return body_to_send;
     }
 
-    let restored = serde_json::Value::Array(before_messages.clone());
     let block_count = signed_reasoning_blocks(before_messages).len();
+    let message_count = before_messages.len();
+    let (restored, scope, restored_count) = match repair_signed_reasoning(
+        before_messages,
+        after_messages,
+    ) {
+        Some((messages, count)) => (messages, "offending_messages", count),
+        None => (before_messages.clone(), "all_messages", message_count),
+    };
     let Some(map) = after.as_object_mut() else {
         return body_to_send;
     };
-    map.insert("messages".to_string(), restored);
+    map.insert("messages".to_string(), serde_json::Value::Array(restored));
     match serde_json::to_vec(&after) {
         Ok(bytes) => {
             tracing::warn!(
@@ -6050,14 +6398,64 @@ fn restore_client_reasoning_blocks(
                 event = "signed_reasoning_blocks_restored",
                 request_id = %request_id,
                 signed_blocks = block_count,
-                messages_before = before_messages.len(),
+                messages_before = message_count,
+                messages_restored = restored_count,
+                restore_scope = scope,
                 "outbound body altered the client's signed reasoning blocks; \
-                 forwarding the client's message array instead"
+                 forwarding the client's copy of the messages that changed"
             );
             bytes::Bytes::from(bytes)
         }
         Err(_) => body_to_send,
     }
+}
+
+/// Put back only the messages whose signed reasoning the outbound chain broke.
+///
+/// Two things make a body unacceptable to Anthropic, and each names its own
+/// messages: the last assistant message's signed blocks must arrive
+/// unchanged, and no signed block may appear that the client did not send. A
+/// message that merely *lost* a signed block breaks neither — that is
+/// [`crate::compression::prior_thinking`] doing its job, and reverting it
+/// would undo the saving for nothing.
+///
+/// Returns `None` when the arrays cannot be lined up index for index, or when
+/// the narrow repair leaves the invariant still broken. The caller falls back
+/// to the whole array on either.
+fn repair_signed_reasoning(
+    before: &[serde_json::Value],
+    after: &[serde_json::Value],
+) -> Option<(Vec<serde_json::Value>, usize)> {
+    if before.len() != after.len() {
+        return None;
+    }
+    let last_assistant = before
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+    let sent = signed_reasoning_blocks(before);
+
+    let mut targets = Vec::new();
+    for index in 0..after.len() {
+        let ours = signed_reasoning_blocks(std::slice::from_ref(&after[index]));
+        let theirs = signed_reasoning_blocks(std::slice::from_ref(&before[index]));
+        let last_assistant_changed = Some(index) == last_assistant && ours != theirs;
+        let invented = ours.iter().any(|block| !sent.contains(block));
+        if last_assistant_changed || invented {
+            targets.push(index);
+        }
+    }
+    if targets.is_empty() {
+        return None;
+    }
+
+    let mut repaired = after.to_vec();
+    for index in &targets {
+        repaired[*index] = before[*index].clone();
+    }
+    if !signed_reasoning_preserved(before, &repaired) {
+        return None;
+    }
+    Some((repaired, targets.len()))
 }
 
 /// Make the outbound body satisfy Anthropic's `cache_control` TTL ordering.
@@ -6335,7 +6733,93 @@ fn short_hash(value: &str) -> String {
 /// versa. `tool_names_fingerprint` isolates the common case further: the same
 /// tools in a different ORDER hash differently there but identically by name
 /// set, which names ordering as the culprit without a capture.
-fn log_prefix_composition(request_id: &str, body: &[u8]) {
+/// Last tool roster forwarded on each session.
+///
+/// The composition line fingerprints the tool names, which says *that* the
+/// array moved but never *what* moved — and a tool arriving or leaving
+/// invalidates the whole cached prefix behind it, since tools sit at the
+/// front of the cache key. Measured over 09-02, five such turns cost 961k
+/// tokens between them, every one of them a tool the client dropped. Naming
+/// it is the difference between knowing a tool churns and being able to prune
+/// it.
+fn tool_rosters() -> &'static Mutex<std::collections::HashMap<String, Vec<String>>> {
+    static ROSTERS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<String>>>> =
+        std::sync::OnceLock::new();
+    ROSTERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Sessions tracked before the map starts forgetting. One entry is a session
+/// key and a list of tool names; a few hundred of those is nothing, and the
+/// cap only has to stop an unbounded process from growing one.
+const TOOL_ROSTER_CAPACITY: usize = 512;
+
+/// Log which tools joined or left this session's array since the last turn.
+///
+/// Silent on the first turn of a session: there is nothing to compare against,
+/// and "every tool appeared" is not news.
+fn note_tool_roster(session_key: &str, request_id: &str, names: &[&str]) {
+    if session_key.is_empty() {
+        return;
+    }
+    let current: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    let Ok(mut rosters) = tool_rosters().lock() else {
+        return;
+    };
+    let previous = rosters.insert(session_key.to_string(), current.clone());
+    if rosters.len() > TOOL_ROSTER_CAPACITY {
+        // Whichever the map hands over first. Losing a baseline costs one
+        // missed comparison, not a wrong one.
+        if let Some(victim) = rosters
+            .keys()
+            .find(|key| key.as_str() != session_key)
+            .cloned()
+        {
+            rosters.remove(&victim);
+        }
+    }
+    drop(rosters);
+
+    let Some(previous) = previous else {
+        return;
+    };
+    if previous == current {
+        return;
+    }
+    let added: Vec<&str> = current
+        .iter()
+        .filter(|name| !previous.contains(name))
+        .map(String::as_str)
+        .collect();
+    let removed: Vec<&str> = previous
+        .iter()
+        .filter(|name| !current.contains(name))
+        .map(String::as_str)
+        .collect();
+    if added.is_empty() && removed.is_empty() {
+        // Same set, different order. Worth its own reading: order is part of
+        // the cache key too, and `cache_stable_tool_order` exists to hold it.
+        tracing::info!(
+            target: "headroom.proxy",
+            event = "tool_roster_reordered",
+            request_id = %request_id,
+            tool_count = current.len(),
+            "the tools array kept its members and changed their order"
+        );
+        return;
+    }
+    tracing::warn!(
+        target: "headroom.proxy",
+        event = "tool_roster_changed",
+        request_id = %request_id,
+        added = %added.join(","),
+        removed = %removed.join(","),
+        count_before = previous.len(),
+        count_after = current.len(),
+        "the forwarded tools array changed; the cached prefix behind it is dead"
+    );
+}
+
+fn log_prefix_composition(request_id: &str, session_key: &str, body: &[u8]) {
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
         return;
     };
@@ -6381,6 +6865,7 @@ fn log_prefix_composition(request_id: &str, body: &[u8]) {
         tool_count = names.len(),
         "cacheable prefix composition"
     );
+    note_tool_roster(session_key, request_id, &names);
 }
 
 /// Anthropic's cache-write TTL split, as `(5m, 1h)`.
@@ -6524,8 +7009,9 @@ pub(crate) fn apply_prefix_replay(
     strip_system_breakpoints: bool,
 ) -> bytes::Bytes {
     use cache_stabilization::prefix_replay::{
-        early_message_fingerprints, overlay_cached_prefix_reported, place_tail_cache_breakpoints,
-        strip_system_cache_control, tail_slots_within_budget, ANTHROPIC_CACHE_CONTROL_LIMIT,
+        early_message_fingerprints, message_slots_within_budget, overlay_cached_prefix_reported,
+        place_tail_cache_breakpoints, strip_system_cache_control,
+        trim_system_breakpoints_to_budget, ANTHROPIC_CACHE_CONTROL_LIMIT,
     };
 
     let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
@@ -6743,25 +7229,37 @@ pub(crate) fn apply_prefix_replay(
         );
     }
     // Anthropic counts `cache_control` across `system`, `tools` and `messages`
-    // together and refuses the whole request past 4. The message slots are the
-    // only ones this proxy can give up, so they yield to whatever the client set
-    // on `system` and PR-E3 set on `tools`. Counted before any system stripping
-    // below, which errs low — a slot freed there goes unused rather than risking
-    // the sum.
-    let (allowed_slots, reserved_slots) = tail_slots_within_budget(&parsed, tail_breakpoints);
-    if allowed_slots < tail_breakpoints {
+    // together and refuses the whole request past 4. `system` yields its second
+    // marker before the message tail yields either of its two, and the
+    // scaffolding marker yields before the tail as well; `tools` is PR-E3's and
+    // is never touched.
+    let slots = message_slots_within_budget(&parsed, &overlaid, tail_breakpoints);
+    if slots.tail < tail_breakpoints {
         tracing::warn!(
             event = "cache_marker_budget_clamped",
             request_id = %request_id,
             requested = tail_breakpoints,
-            allowed = allowed_slots,
-            reserved_by_system_and_tools = reserved_slots,
+            allowed = slots.tail,
+            reserved_by_system_and_tools = slots.reserved,
             limit = ANTHROPIC_CACHE_CONTROL_LIMIT,
             "cache_control budget: placing fewer message breakpoints than asked \
              to keep the request under the provider's limit"
         );
     }
-    let (normalized, breakpoints_placed) = place_tail_cache_breakpoints(overlaid, allowed_slots);
+    let (normalized, breakpoints_placed) =
+        place_tail_cache_breakpoints(overlaid, slots.tail, slots.scaffold);
+    // Pay for the scaffolding marker out of `system`, and do it from what is
+    // really on the body rather than from what was planned, so a plan that did
+    // not come off cannot leave the request over the limit.
+    let system_markers_trimmed = trim_system_breakpoints_to_budget(&mut parsed, breakpoints_placed);
+    if system_markers_trimmed > 0 {
+        tracing::debug!(
+            event = "system_marker_yielded",
+            request_id = %request_id,
+            dropped = system_markers_trimmed,
+            "gave up a system breakpoint so the message tail keeps both of its own"
+        );
+    }
     // Anthropic refuses a turn whose signed `thinking` blocks changed, naming a
     // message index but not who changed it. Both the client and this proxy
     // rewrite history, so a rejection is unattributable without knowing which
@@ -6802,7 +7300,8 @@ pub(crate) fn apply_prefix_replay(
     } else {
         0
     };
-    let changed = normalized != optimized || system_markers_dropped > 0;
+    let changed =
+        normalized != optimized || system_markers_dropped > 0 || system_markers_trimmed > 0;
 
     let (final_body, forwarded_messages) = if changed {
         parsed["messages"] = serde_json::Value::Array(normalized.clone());
@@ -8267,10 +8766,11 @@ async fn apply_response_hooks(
 /// the marker drifts backwards through the request and everything after it is
 /// written fresh on the round that follows.
 ///
-/// `push_marker_to_tail` relocates the existing marker object rather than
-/// adding one, so calling it every round cannot breach Anthropic's cap of four
-/// and carries whatever TTL the pin gave it. It returns false when the marker
-/// is already at the tail, which is the common case on the first round.
+/// `push_newest_marker_to_tail` relocates the existing marker object rather
+/// than adding one, so calling it every round cannot breach Anthropic's cap of
+/// four and carries whatever TTL the pin gave it. With two tail slots only the
+/// newer marker moves; the older one stays on the prefix the provider already
+/// holds. It returns false when the marker is already at the tail.
 ///
 /// Anthropic only: no other shape here has `cache_control`.
 fn retail_continuation_breakpoint(
@@ -8283,7 +8783,7 @@ fn retail_continuation_breakpoint(
     if provider != "anthropic" || !config.cache_tail_breakpoint {
         return;
     }
-    if cache_stabilization::message_breakpoints::push_marker_to_tail(request) {
+    if cache_stabilization::message_breakpoints::push_newest_marker_to_tail(request) {
         tracing::debug!(
             request_id = %request_id,
             event = "continuation_tail_breakpoint",
@@ -8338,12 +8838,31 @@ fn extend_or_push(
 /// tool, every offloaded block and any routed model, so the continuation
 /// presents a prefix the provider never saw and every round after a
 /// transformed turn misses cache.
+/// Prefix for content rebuilt from the FTS index after the CCR store expired
+/// it. Indexing splits a block into chunks and keeps no separator, so a source
+/// that chunked into more than one piece rejoins approximately. Saying so is
+/// the difference between the model treating a near-copy as exact and it
+/// knowing to re-read when the exact bytes matter.
+const CCR_INDEX_RECOVERY_NOTE: &str = "[Recovered from the context index. \
+     The original expired from the retrieval store, so this was rebuilt from \
+     the indexed copy: the text is complete but whitespace between sections \
+     may differ from what you first read. Re-read the source if you need the \
+     exact bytes.]";
+
+/// Whether `hash` could be a CCR key: the 24-character lowercase hex the
+/// offload path emits. Models sometimes pass a summary or a truncated fragment
+/// instead, and those are worth telling apart from a genuine store miss.
+fn is_plausible_ccr_hash(hash: &str) -> bool {
+    hash.len() == 24 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub(crate) async fn handle_ccr_response(
     body_bytes: &bytes::Bytes,
     forwarded_request: &bytes::Bytes,
     upstream_url: &url::Url,
     client: &reqwest::Client,
     ccr_store: &dyn headroom_core::ccr::CcrStore,
+    stores: Option<&std::sync::Arc<crate::ctx::projects::ProjectStores>>,
     config: &Config,
     request_id: &str,
     outgoing_headers: &http::HeaderMap,
@@ -8476,20 +8995,108 @@ pub(crate) async fn handle_ccr_response(
                     );
                 }
                 None => {
-                    results.push(CcrToolResult {
-                        tool_call_id: call.tool_call_id.clone(),
-                        content: format!(
-                            "Error: CCR content not found for hash '{}'. The compressed data may have been evicted.",
-                            call.hash_key
-                        ),
-                        success: false,
-                        items_retrieved: 0,
-                    });
-                    tracing::warn!(
-                        request_id = %request_id,
-                        hash = %call.hash_key,
-                        "ccr: content not found in store"
-                    );
+                    // `ccr.db` keeps a block for an idle week and then drops
+                    // it. The per-project content index keeps the same block,
+                    // under the same blake3 key, with no expiry — so a miss
+                    // here is usually an eviction rather than a block that was
+                    // never stored, and the cold copy is still on disk. Joining
+                    // every indexed `content_hash` against the live CCR rows
+                    // measured this: of blocks indexed inside the TTL window,
+                    // none were missing from `ccr.db`; of the older ones,
+                    // 12,807 of 12,843 were. Every miss is an expiry.
+                    //
+                    // The sweep is cross-project because the project that
+                    // offloaded the block is often not the one asking for it
+                    // back: subagents, teammates and held working directories
+                    // all move the resolved project between turns. The CCR
+                    // store itself is one global file and never was sharded by
+                    // project, so this recovers reach, not isolation.
+                    let project_from =
+                        resolve_ctx_project(Some(outgoing_headers), &current_request);
+                    let recovered = match stores {
+                        Some(stores) if is_plausible_ccr_hash(&call.hash_key) => {
+                            // Opening dozens of sqlite files is blocking work.
+                            // Left inline it stalls the tokio worker driving
+                            // this turn and every other request on that thread,
+                            // so it goes to the blocking pool the way the
+                            // savings ledger already does. A panicked or
+                            // cancelled join degrades to a plain miss.
+                            let stores = std::sync::Arc::clone(stores);
+                            let hash = call.hash_key.clone();
+                            let project = project_from.clone();
+                            tokio::task::spawn_blocking(move || {
+                                stores.find_content_any_project(&hash, &project)
+                            })
+                            .await
+                            .map_err(|e| {
+                                tracing::warn!(
+                                    event = "ctx_cold_tier_join_failed",
+                                    hash = %call.hash_key,
+                                    error = %e,
+                                );
+                            })
+                            .ok()
+                        }
+                        // A hash the model invented cannot be on disk, and
+                        // scanning every project for it costs 85 file opens.
+                        // Both misses seen in production logs were of this
+                        // shape: one was five characters against the 24-hex
+                        // format, the other an English sentence.
+                        Some(_) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                hash = %call.hash_key,
+                                "ccr: retrieval asked for a malformed hash; not a store miss"
+                            );
+                            None
+                        }
+                        None => None,
+                    };
+                    let (recovered, cold_ms, cold_scanned, cold_gave_up) = match recovered {
+                        Some(l) => (l.found, l.elapsed.as_millis() as u64, l.scanned, l.gave_up),
+                        None => (None, 0, 0, false),
+                    };
+                    match recovered {
+                        Some((project_to, content)) => {
+                            tracing::info!(
+                                event = "ccr_cold_tier_hit",
+                                request_id = %request_id,
+                                hash = %call.hash_key,
+                                project_from = %project_from,
+                                project_to = %project_to,
+                                cold_tier_ms = cold_ms,
+                                projects_scanned = cold_scanned,
+                                "ccr: missing from the CCR store, recovered from the content index"
+                            );
+                            crate::observability::ccr_retrieval::observe_cross_project_hit();
+                            results.push(CcrToolResult {
+                                tool_call_id: call.tool_call_id.clone(),
+                                content: format!("{CCR_INDEX_RECOVERY_NOTE}\n\n{content}"),
+                                success: true,
+                                items_retrieved: 1,
+                            });
+                        }
+                        None => {
+                            results.push(CcrToolResult {
+                                tool_call_id: call.tool_call_id.clone(),
+                                content: format!(
+                                    "Error: CCR content not found for hash '{}'. The compressed data may have been evicted.",
+                                    call.hash_key
+                                ),
+                                success: false,
+                                items_retrieved: 0,
+                            });
+                            tracing::warn!(
+                                request_id = %request_id,
+                                hash = %call.hash_key,
+                                cross_project_checked = stores.is_some(),
+                                cold_tier_ms = cold_ms,
+                                projects_scanned = cold_scanned,
+                                cold_tier_gave_up = cold_gave_up,
+                                "ccr: content not found in store"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -8836,7 +9443,7 @@ pub(crate) async fn memory_tool_context(
     request_body: &bytes::Bytes,
 ) -> Option<MemoryToolContext> {
     let handler = state.memory_handler.as_ref()?;
-    if !handler.lock().await.is_initialized() {
+    if !handler.is_initialized() {
         return None;
     }
     let provider = match provider? {
@@ -8873,7 +9480,7 @@ pub(crate) async fn memory_tool_context(
 /// request in scope, the same way [`crate::handlers::local_model::RoutedCcr`]
 /// is.
 pub(crate) struct MemoryToolContext {
-    pub handler: Arc<tokio::sync::Mutex<crate::memory::handler::MemoryHandler>>,
+    pub handler: Arc<crate::memory::handler::MemoryHandler>,
     pub provider: crate::memory::tool_adapter::Provider,
     pub user_id: String,
 }
@@ -8913,7 +9520,7 @@ pub(crate) async fn handle_memory_response(
         return (body_bytes.clone(), round_usage);
     };
     {
-        let handler = memory.handler.lock().await;
+        let handler = memory.handler.as_ref();
         if !handler.is_initialized() || !handler.has_memory_tool_calls(&response, memory.provider) {
             return (body_bytes.clone(), round_usage);
         }
@@ -8944,7 +9551,7 @@ pub(crate) async fn handle_memory_response(
         let (ours, client_ids) = crate::memory::deferred::split_tool_calls(&response);
         if !ours.is_empty() && !client_ids.is_empty() {
             let results = {
-                let handler = memory.handler.lock().await;
+                let handler = memory.handler.as_ref();
                 handler
                     .handle_memory_tool_calls(&response, &memory.user_id, memory.provider, None)
                     .await
@@ -8981,7 +9588,7 @@ pub(crate) async fn handle_memory_response(
 
     while rounds < config.ccr_max_retrieval_rounds {
         let results: Vec<serde_json::Value> = {
-            let handler = memory.handler.lock().await;
+            let handler = memory.handler.as_ref();
             if !handler.has_memory_tool_calls(&current_response, memory.provider) {
                 break;
             }
@@ -9113,7 +9720,7 @@ pub(crate) async fn handle_memory_response(
     // the alternative is a turn quietly missing work the model asked for.
     if rounds >= config.ccr_max_retrieval_rounds {
         let still_pending = {
-            let handler = memory.handler.lock().await;
+            let handler = memory.handler.as_ref();
             handler.has_memory_tool_calls(&current_response, memory.provider)
         };
         if still_pending {
@@ -9566,6 +10173,7 @@ mod tests {
             &upstream_url,
             &client,
             &store as &dyn headroom_core::ccr::CcrStore,
+            None,
             &config,
             "req-test",
             &headers,
@@ -9615,6 +10223,7 @@ mod tests {
             &format!("{}/v1/responses", server.uri()).parse().unwrap(),
             &reqwest::Client::new(),
             &store as &dyn headroom_core::ccr::CcrStore,
+            None,
             &config,
             "req-test",
             &http::HeaderMap::new(),
@@ -11260,6 +11869,64 @@ mod timing_field_tests {
     use crate::observability::proxy_counters;
     use headroom_core::request_outcome::RequestOutcome;
 
+    fn turn_with(assistant: serde_json::Value, user: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": assistant},
+            {"role": "user", "content": user},
+        ]})
+    }
+
+    #[test]
+    fn a_paired_turn_reports_nothing_unanswered() {
+        let body = turn_with(
+            serde_json::json!([{"type": "tool_use", "id": "tu_1", "name": "Bash"}]),
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "tu_1"}]),
+        );
+        assert!(unanswered_tool_uses(&body).is_empty());
+    }
+
+    #[test]
+    fn an_unanswered_call_is_reported_with_its_message_index() {
+        let body = turn_with(
+            serde_json::json!([
+                {"type": "tool_use", "id": "tu_1", "name": "Bash"},
+                {"type": "tool_use", "id": "tu_2", "name": "Skill"},
+            ]),
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "tu_1"}]),
+        );
+        assert_eq!(unanswered_tool_uses(&body), vec![(1, "tu_2".to_string())]);
+    }
+
+    /// A result in a later message does not count: Anthropic wants it in the
+    /// message immediately after the call.
+    #[test]
+    fn a_result_two_messages_later_does_not_answer_the_call() {
+        let mut body = turn_with(
+            serde_json::json!([{"type": "tool_use", "id": "tu_1", "name": "Bash"}]),
+            serde_json::json!([{"type": "text", "text": "nothing here"}]),
+        );
+        body["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tu_1"}]
+            }));
+        assert_eq!(unanswered_tool_uses(&body), vec![(1, "tu_1".to_string())]);
+    }
+
+    /// The last assistant message has no next message at all. Upstream still
+    /// refuses it, so it is still worth naming.
+    #[test]
+    fn a_trailing_call_with_no_next_message_is_unanswered() {
+        let body = serde_json::json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tu_1", "name": "Bash"}]},
+        ]});
+        assert_eq!(unanswered_tool_uses(&body), vec![(1, "tu_1".to_string())]);
+    }
+
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -11377,6 +12044,93 @@ mod timing_field_tests {
 
     /// Dropping the message that held the block counts as altering it: the
     /// signed blocks on the wire no longer match what the client sent.
+    #[test]
+    fn a_prior_turn_reasoning_block_dropped_whole_is_forwarded_as_built() {
+        let mut body = client_body_with_thinking();
+        body["messages"].as_array_mut().unwrap().extend([
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "later reasoning", "signature": "sig456"},
+                {"type": "text", "text": "43"}
+            ]}),
+            serde_json::json!({"role": "user", "content": "and then"}),
+        ]);
+        let original = as_bytes(&body);
+        // The first assistant turn loses its block; the last keeps its own.
+        body["messages"][1]["content"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let sent = as_bytes(&body);
+        let out = restore_client_reasoning_blocks(sent.clone(), &original, "r1");
+        assert_eq!(out, sent);
+
+        // Dropping the LAST assistant turn's block still restores — but only
+        // that message. The earlier turn keeps the strip it was given, which
+        // is `prior_thinking` doing its job and no business of this guard.
+        body["messages"][3]["content"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let out = restore_client_reasoning_blocks(as_bytes(&body), &original, "r1");
+        let restored: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            restored["messages"][3],
+            client_body_with_thinking_extended()["messages"][3]
+        );
+        assert_eq!(restored["messages"][1]["content"][0]["type"], "text");
+    }
+
+    /// The point of repairing narrowly: a message the guard has no quarrel
+    /// with keeps whatever the pipeline did to it. Reverting those too is
+    /// what killed the cached prefix — the opening messages are in it.
+    #[test]
+    fn an_untouched_message_keeps_its_rewrite_when_another_is_restored() {
+        let original = as_bytes(&client_body_with_thinking_extended());
+        let mut body = client_body_with_thinking_extended();
+        // Stand-in for a ctx-offload placeholder in the cached prefix.
+        body["messages"][0]["content"] = serde_json::json!("[offloaded #abc123]");
+        // And the breakage the guard exists for, in the last assistant turn.
+        body["messages"][3]["content"][0]["thinking"] = serde_json::json!("edited");
+
+        let out = restore_client_reasoning_blocks(as_bytes(&body), &original, "r1");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["messages"][0]["content"], "[offloaded #abc123]");
+        assert_eq!(
+            parsed["messages"][3]["content"][0]["thinking"],
+            "later reasoning"
+        );
+    }
+
+    /// Arrays that cannot be lined up index for index fall back to the whole
+    /// client array, which is the only repair that is certainly correct.
+    #[test]
+    fn a_changed_message_count_falls_back_to_the_whole_array() {
+        let original = as_bytes(&client_body_with_thinking_extended());
+        let mut body = client_body_with_thinking_extended();
+        body["messages"][0]["content"] = serde_json::json!("[offloaded #abc123]");
+        body["messages"][3]["content"][0]["thinking"] = serde_json::json!("edited");
+        body["messages"].as_array_mut().unwrap().pop();
+
+        let out = restore_client_reasoning_blocks(as_bytes(&body), &original, "r1");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed["messages"],
+            client_body_with_thinking_extended()["messages"]
+        );
+    }
+
+    fn client_body_with_thinking_extended() -> serde_json::Value {
+        let mut body = client_body_with_thinking();
+        body["messages"].as_array_mut().unwrap().extend([
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "later reasoning", "signature": "sig456"},
+                {"type": "text", "text": "43"}
+            ]}),
+            serde_json::json!({"role": "user", "content": "and then"}),
+        ]);
+        body
+    }
+
     #[test]
     fn a_dropped_reasoning_block_restores_the_client_messages() {
         let original = as_bytes(&client_body_with_thinking());

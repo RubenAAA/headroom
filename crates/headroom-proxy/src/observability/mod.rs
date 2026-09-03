@@ -50,6 +50,7 @@ pub mod proxy_counters;
 pub mod proxy_metrics;
 pub mod recache;
 pub mod replay_alternates;
+pub mod sidecar;
 pub mod tail_breakpoint;
 pub mod upstream_health;
 
@@ -79,4 +80,4 @@ pub use proxy_metrics::{
     record_upstream_retry_exhausted, retry_reason, RateLimitSnapshot, UnifiedRateLimitSnapshot,
     UnifiedWindow,
 };
-pub use recache::observe_recache_event;
+pub use recache::{observe_first_turn_write, observe_recache_event};

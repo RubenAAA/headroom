@@ -260,6 +260,27 @@ has an explanation yet.
   repeats every turn. Fits the constant ~240-token figure. Also needs
   captured bodies.
 
+  Two data points from the offload-gap round of 2026-08-18 to 08-21, neither of
+  which settles H6.
+
+  The spare fourth breakpoint is not the answer. Swept at seven fractions from
+  2% to 50% back through history, on the blindguard and windowgap corpora and
+  under both weightings, every arm came out byte-identical to the untouched
+  proxy. Every turn writes a cache entry at its own tail, so the conversation
+  already carries a ladder of readable prefixes from its past turns and an extra
+  marker lands on a rung that exists. Counting the captures directly, the client
+  sends **one** message breakpoint and it is at the tail: 7,699 of 7,839
+  blindguard turns and 997 of 1,009 windowgap turns. The proxy adds its own, so
+  the two markers on the wire sit one block apart, which is the case
+  `_tail_breakpoints`' own comment calls worthless.
+
+  The arm that was supposed to test moving them apart never ran.
+  `_spread_shipped` in `bench/strategies.py` skips any request whose message
+  markers are not exactly one, which is true of the client and false of `--base
+  forwarded`. So `shipped-tail-back-05` skipped every request and scored
+  byte-identical to the live proxy. That read as "no effect"; it was "never ran".
+  Anything else guarded on the client's marker count has the same hole.
+
 `HEADROOM_CAPTURE_DIR` is unset on the running proxy, so no request bodies
 exist for this window. Testing H5 or H6 means enabling capture and waiting
 for a recurrence.
@@ -882,6 +903,20 @@ not a prefix we broke.
 Leave it. Re-open if the max reaches five figures, which would mean something
 real had started hiding behind the name.
 
+**Update 2026-09-02.** The name is gone. A second pass over 563 events (547K
+tokens, 09-01..09-02) found the forwarded prefix byte-stable in every one; the
+only thing that varied was where the provider's read stopped against the two
+previous turns' boundaries. The observer now names that position instead, and
+logs the four numbers it read (`actual_cache_read`, `previous_cache_read`,
+`previous_boundary`, `previous_previous_boundary`) so each call can be checked
+by hand. The reasons are `provider_missed_newest_write` (read equals the
+previous read, the newest write was not found), `provider_partial_of_previous_write`
+(read stops inside the previous write), `provider_free_read_not_persisted` (read
+falls back to the older boundary after the previous turn read past anything
+written), `provider_dropped_older_entry` (read is below the older boundary) and
+`provider_between_entries` (the rest). `event_kind` stays `unexplained` and
+`origin` stays `unknown`. All five are provider-side; none is ours.
+
 ## `concurrent_turn_in_flight` — the name is honest
 
 208 events, 150,652 tokens, median 241. Cheap enough to ignore, but it had been
@@ -973,3 +1008,117 @@ starting line. Version alone cannot separate two builds of `0.1.0`; size and
 mtime can. After the restart, "which binary produced this event" is answerable
 from the log instead of from memory — which is how the counts on this page went
 stale once already.
+
+## 2026-09-02 — live audit against the 09-01 binary
+
+The window is `~/headroom-proxy.log` from 07:55:30Z on 09-01 to 12:22Z on
+09-02, one binary, subscription auth, 9,481 booked turns. The log is live, so
+every count here is a total at a moment, not a fixed one: a pass four hours
+earlier in the same window read 8,706 turns and 503,030 tokens of recache
+waste, and that figure no longer reproduces from any prefix of the file. Quote
+the window with the number or the number means nothing.
+
+```
+booked turns                     9,481
+cache read               1,106,564,274
+cache write                 19,260,100
+hit ratio                            98.3%
+recache waste                  691,637   (3.6% of writes)
+```
+
+`scripts/proxy_log_audit.py recache` now prints that total first, then a table
+by `attribution_reason`. It used to headline only the events carrying
+`drift_dims` — 3 events and 192,549 tokens on this window — which is a
+seventieth of the events and under a third of the tokens. The reasons:
+
+```
+reason                          events      tokens   median
+unexplained_after_replay           339     308,083      615
+tools                                2     137,456   75,145
+early_messages                       2     136,208   74,830
+system                               1      55,093   55,093
+concurrent_turn_in_flight          101      43,659      240
+prefix_content_diverged             17       6,699      239
+aftershock_of_diverged_prefix        5       4,439      238
+inbound_tail_replaced                2           0        0
+```
+
+### The scaffolding fix holds
+
+Against the 08-26 baseline above, `prefix_content_diverged` goes from 20 events
+and 468,393 tokens in a day to 17 events and 6,699 — the events stay, the
+tokens fall 70x, so what is left is tail churn rather than a rebuilt prefix.
+`early_messages` goes from 3 events and 317,384 to 2 and 136,208. Both
+predictions the last section asked to be held to are met.
+
+### `unexplained_after_replay` is the spinner sidecar
+
+This bucket was closed once as "provider breakpoint granularity". That was
+wrong. It is now 339 events and 308,083 tokens, 45% of the remaining waste, and
+the cause is a request the proxy should never have stored.
+
+The tell is in the body size. On healthy consecutive turns the client body
+shrinks 0.4% of the time; on turns tagged `unexplained_after_replay` it shrinks
+76% of the time, by 523 bytes in 17 cases and 594–615 bytes in most of the
+rest. Claude Code sends a sidecar request to write its spinner text: it appends
+a text block beginning "Describe your most recent action in 3-5 words" to the
+last user message and sends the whole history to the same model. The next real
+turn drops the block. The proxy stores the sidecar's prefix, then flags the
+real turn for having lost it.
+
+The median waste in the bucket is 615 tokens, the same order as the appended
+block. Fix in progress: recognise the sidecar, trim it, route it to Haiku, and
+keep it out of the replay store. It will log `sidecar_detected`; that event
+does not exist in the tree yet, so its absence from a log means the fix is not
+in that binary rather than that no sidecar arrived.
+
+### First turns are the largest write, and they are avoidable
+
+215 new sessions opened in the window. Their first turns account for 7.5M
+tokens, 42% of all cache writes at the time of that pass. `system` and `tools`
+are shared and read back at ~17k; the write is the first user message — ~24k
+for a one- or two-message opener, ~95k for the 28 sessions first seen
+mid-conversation.
+
+The `<system-reminder>` block carrying `CLAUDE.md` in message 0 is ~47 KB and
+byte-identical across sessions of the same project, so it should be read, not
+written. Recall injection prepends session-specific bytes ahead of it and
+spoils that. Fix in progress: place recall after the scaffolding and put the
+breakpoint on the scaffolding block.
+
+### TTL, offload, and two things no longer worth watching
+
+- **TTL.** Zero recaches after a gap longer than 60 minutes; 77 turns recached
+  after gaps of 5 to 60 minutes. `--force-1h-cache-ttl` is doing its job.
+- **Offload against retrieval.** Offload books 154M `tokens_saved` a day, worth
+  15.4M read-equivalents at 0.10. Retrieval costs 441 CCR continuation requests
+  — 29.1M cache reads, 0.9M writes, 0.14M output, about 5.6M equivalents. Net
+  positive by roughly 3x. Lowering `--ctx-offload-min-bytes` would offload more
+  and retrieve more often, so it stays where it is.
+- **`<total_tokens>N tokens left</total_tokens>`.** This block drove 45% of
+  invalidated bytes in the August captures. It appears in 1 of the 100 newest
+  stored prefixes. Not a live problem.
+- **Utilization sampler.** `bench/fit_weights.py sample` last wrote
+  `~/hr-usage-samples.jsonl` on 2026-08-18. The fitted weights — read 0.10,
+  write_1h 1.45 with a 1.0–2.0 band, R² 0.33 — rest on that single 28-hour
+  window and have been quoted since as if they were settled. Sampler restarted
+  2026-09-02.
+
+## First-turn writes get a reason (2026-09-02)
+
+The classifier scores a turn only against a previous turn under the same
+conversation key, so the first completed turn of every key went unscored.
+Those first turns are 41% of all cache write tokens (11.1M over 09-01..09-02).
+The observer now emits one INFO event, `first_turn_write_observed`, when the
+first completed turn under a key writes more than `RECACHE_SLACK_TOKENS`, with
+`attribution_reason` from a fixed set, in precedence order:
+`compaction_restart` (message 0 carries Claude Code's compaction summary),
+`session_key_drift` (the replay store found a donor tracker under another
+session key; `adopted` and `donor_session_key_hash` ride along),
+`identical_prompt_fanout` (an opener of two or fewer messages whose message-0
+hash was seen under another key inside 10 minutes: parallel subagents),
+`fresh_session` (two or fewer messages, nothing else applies), and
+`arrived_with_history` (more than two messages: new content for the provider).
+The handler computes the message count, message-0 hash, and compaction marker
+once and parks them on the pending request. Tokens are summed per reason in
+`proxy_cache_first_turn_write_tokens_total{reason}`.

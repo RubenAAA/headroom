@@ -64,6 +64,16 @@ pub struct CtxMemoryBackend {
     records: Arc<MemoryRecordStore>,
     /// Search index: memory content, labelled by memory id.
     index: Arc<CtxStore>,
+    /// Serialises writes against each other, and nothing else.
+    ///
+    /// A save reads before it writes — it looks for an existing copy of the
+    /// content and returns that instead of minting a second id. Two saves of
+    /// the same text running at once would both find nothing and both store,
+    /// so the duplicate check has to hold across the write. Until now the
+    /// handler mutex serialised every memory call and gave this for free;
+    /// removing it left reads concurrent, which is the point, so writes keep
+    /// their own lock. Reads never take it.
+    writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CtxMemoryBackend {
@@ -78,6 +88,7 @@ impl CtxMemoryBackend {
         let backend = Self {
             records: Arc::new(MemoryRecordStore::open(base_dir.join("memories.db"))?),
             index: Arc::new(CtxStore::open(base_dir.join("memories_index.db"))?),
+            writes: Arc::new(tokio::sync::Mutex::new(())),
         };
         backend.backfill_entities()?;
         Ok(backend)
@@ -136,6 +147,7 @@ impl CtxMemoryBackend {
         Ok(Self {
             records: Arc::new(MemoryRecordStore::open(":memory:")?),
             index: Arc::new(CtxStore::open(":memory:")?),
+            writes: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 }
@@ -341,18 +353,43 @@ impl CtxMemoryBackend {
     }
 }
 
-#[async_trait]
-impl MemoryBackend for CtxMemoryBackend {
-    async fn save_memory(
+impl CtxMemoryBackend {
+    /// A second handle on the same two stores. Both fields are `Arc`, so this
+    /// is two refcount bumps — cheap enough to make per call.
+    fn handle(&self) -> Self {
+        Self {
+            records: Arc::clone(&self.records),
+            index: Arc::clone(&self.index),
+            writes: Arc::clone(&self.writes),
+        }
+    }
+
+    /// Run synchronous store work on the blocking pool.
+    ///
+    /// `CtxStore` is a synchronous rusqlite wrapper by contract (see its module
+    /// doc) and holds one connection behind one mutex. Calling it straight from
+    /// an `async fn` never yields, so the query occupies a tokio worker thread
+    /// for its whole duration instead of returning it to the pool. Under
+    /// concurrency that starved the runtime: requests queued behind disk I/O
+    /// with the CPU near idle.
+    async fn blocking<T, F>(&self, work: F) -> Result<T, BackendError>
+    where
+        F: FnOnce(&CtxMemoryBackend) -> Result<T, BackendError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let handle = self.handle();
+        match tokio::task::spawn_blocking(move || work(&handle)).await {
+            Ok(result) => result,
+            Err(error) => Err(format!("memory store task failed: {error}").into()),
+        }
+    }
+
+    fn save_memory_sync(
         &self,
         content: &str,
         user_id: &str,
         importance: f64,
-        _facts: Option<&[String]>,
-        entities: Option<&[String]>,
-        _extracted_entities: Option<&[serde_json::Value]>,
-        _relationships: Option<&[serde_json::Value]>,
-        _extracted_relationships: Option<&[serde_json::Value]>,
+        entities: Option<Vec<String>>,
     ) -> Result<Memory, BackendError> {
         let mut memory = Memory {
             content: content.to_string(),
@@ -361,7 +398,7 @@ impl MemoryBackend for CtxMemoryBackend {
             ..Memory::default()
         };
         if let Some(ents) = entities {
-            memory.entity_refs = ents.to_vec();
+            memory.entity_refs = ents;
         }
         // Saving text that is already stored used to mint a second id, and
         // nothing downstream could tell the copies apart: the index dedups by
@@ -392,7 +429,7 @@ impl MemoryBackend for CtxMemoryBackend {
         Ok(memory)
     }
 
-    async fn search_memories(
+    fn search_memories_sync(
         &self,
         query: &str,
         user_id: &str,
@@ -458,12 +495,10 @@ impl MemoryBackend for CtxMemoryBackend {
         Ok(out)
     }
 
-    async fn update_memory(
+    fn update_memory_sync(
         &self,
         memory_id: &str,
         new_content: &str,
-        _user_id: &str,
-        _reason: Option<&str>,
     ) -> Result<Memory, BackendError> {
         let Some(mut memory) = self.load(memory_id)? else {
             return Err(format!("Memory {memory_id} not found").into());
@@ -475,7 +510,7 @@ impl MemoryBackend for CtxMemoryBackend {
         Ok(memory)
     }
 
-    async fn delete_memory(&self, memory_id: &str) -> Result<bool, BackendError> {
+    fn delete_memory_sync(&self, memory_id: &str) -> Result<bool, BackendError> {
         let removed = self.records.delete(memory_id)?;
         if removed {
             // Empty content leaves a source with no chunks — the label stops
@@ -497,11 +532,7 @@ impl MemoryBackend for CtxMemoryBackend {
         Ok(removed)
     }
 
-    async fn get_memory(&self, memory_id: &str) -> Result<Option<Memory>, BackendError> {
-        self.load(memory_id)
-    }
-
-    async fn clear_user(&self, user_id: &str) -> Result<usize, BackendError> {
+    fn clear_user_sync(&self, user_id: &str) -> Result<usize, BackendError> {
         // Ids first: once the rows are gone there is nothing left to say which
         // index entries belonged to this user.
         for id in self.records.ids_for_user(user_id)? {
@@ -517,6 +548,78 @@ impl MemoryBackend for CtxMemoryBackend {
             }
         }
         Ok(self.records.delete_user(user_id)?)
+    }
+}
+
+#[async_trait]
+impl MemoryBackend for CtxMemoryBackend {
+    async fn save_memory(
+        &self,
+        content: &str,
+        user_id: &str,
+        importance: f64,
+        _facts: Option<&[String]>,
+        entities: Option<&[String]>,
+        _extracted_entities: Option<&[serde_json::Value]>,
+        _relationships: Option<&[serde_json::Value]>,
+        _extracted_relationships: Option<&[serde_json::Value]>,
+    ) -> Result<Memory, BackendError> {
+        let content = content.to_string();
+        let user_id = user_id.to_string();
+        let entities = entities.map(<[String]>::to_vec);
+        let _writing = self.writes.lock().await;
+        self.blocking(move |backend| {
+            backend.save_memory_sync(&content, &user_id, importance, entities)
+        })
+        .await
+    }
+
+    async fn search_memories(
+        &self,
+        query: &str,
+        user_id: &str,
+        top_k: usize,
+        include_related: bool,
+    ) -> Result<Vec<MemorySearchResult>, BackendError> {
+        let query = query.to_string();
+        let user_id = user_id.to_string();
+        self.blocking(move |backend| {
+            backend.search_memories_sync(&query, &user_id, top_k, include_related)
+        })
+        .await
+    }
+
+    async fn update_memory(
+        &self,
+        memory_id: &str,
+        new_content: &str,
+        _user_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<Memory, BackendError> {
+        let memory_id = memory_id.to_string();
+        let new_content = new_content.to_string();
+        let _writing = self.writes.lock().await;
+        self.blocking(move |backend| backend.update_memory_sync(&memory_id, &new_content))
+            .await
+    }
+
+    async fn delete_memory(&self, memory_id: &str) -> Result<bool, BackendError> {
+        let memory_id = memory_id.to_string();
+        let _writing = self.writes.lock().await;
+        self.blocking(move |backend| backend.delete_memory_sync(&memory_id))
+            .await
+    }
+
+    async fn get_memory(&self, memory_id: &str) -> Result<Option<Memory>, BackendError> {
+        let memory_id = memory_id.to_string();
+        self.blocking(move |backend| backend.load(&memory_id)).await
+    }
+
+    async fn clear_user(&self, user_id: &str) -> Result<usize, BackendError> {
+        let user_id = user_id.to_string();
+        let _writing = self.writes.lock().await;
+        self.blocking(move |backend| backend.clear_user_sync(&user_id))
+            .await
     }
 
     async fn close(&self) -> Result<(), BackendError> {

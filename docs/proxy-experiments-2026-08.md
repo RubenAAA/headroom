@@ -1340,6 +1340,18 @@ If neither fires, the hypothesis is wrong and the next suspect is the channel:
 early drop on the forwarding side would also end the task silently — with no
 panic to find.
 
+**Closed 2026-09-02.** The parser task now keeps its `JoinHandle` and a waiter
+awaits it, at `crates/headroom-proxy/src/proxy.rs:5102` — "do not drop its
+JoinHandle: a panic would otherwise erase the only completion record for this
+request." Re-measured on `~/headroom-proxy.log` over the 09-01 binary, from
+07:55:30Z on 09-01 to 12:22Z on 09-02: 154 of 9,625 forwarded requests reach no
+completion record, or 1.6%, against 11.9% above. The residue is spread evenly
+across hours rather than bunched, so it no longer looks like one failure mode
+and no longer hides a large part of the bill. An earlier pass the same morning
+read 43 of 8,763, or 0.5%; the two disagree by more than the extra traffic
+explains, and neither pass kept the request ids, so the true residual rate is
+somewhere between them and worth one clean re-run before anyone quotes it.
+
 ### 9b. The two unbooked categories are not the same failure
 
 A live `stream_incomplete` at 21:54:36Z was traced end to end. Its full
@@ -2615,3 +2627,280 @@ rate falls below the 11.6% baseline.
 
 Wrong: any non-429 `upstream_rejected`. Dropping a message is the riskiest thing
 the proxy now does to a request, and a 400 is how that would surface.
+
+## Offload-gap round, 2026-08-18 to 08-21 (folded from bench/HANDOFF-offload-gap.md)
+
+Priced on the `blindguard` and `windowgap` corpora described in `bench/README.md`,
+`--base forwarded` unless stated. Percentages are against the live proxy.
+
+Proved and shipped:
+
+- **The `--exclude-tools` list was costing about 4pp for nothing.** The
+  exclusion exists so the model never acts on a summary of a file it is about to
+  edit, which holds for the live-zone compressors but not for offload, where the
+  original bytes come back through `headroom_retrieve`. Lifting it took
+  `offload-gated-2000` from −10.1% to −13.9% subscription on blindguard and from
+  −29.4% to −32.7% API on windowgap. Checked first: 10,415 digest-to-content
+  round trips against the client's own re-sent bytes, all byte-identical, none
+  missing, no dangling digests across 691 bodies. Shipped in `4f223054`.
+  Lifting only the `--exclude-tools` half scored byte-identical to lifting both
+  lists on all four runs, so `is_verbatim_excluded` costs nothing and stays.
+  Consequence: `stale_margin`'s only remaining reader is the near-tail band
+  `distance < margin + window`, so it and `stale_window` now simply add.
+- **The CCR tracker cap was too small.** Over 870 requests in 22 sessions the
+  digests referenced inside one 300s age window peaked at 91 against a cap of
+  100. It evicted 3,953 times in a day, 460 hashes more than once. Cap raised
+  100 → 512; lifting the tool exclusions makes roughly 1.8x as many blocks
+  eligible.
+- **Claude Code's message breakpoint is sometimes short of the tail.** It spends
+  three of Anthropic's four markers, two on `system` and exactly one on the
+  messages, and that one already sits on the final content block on 97% of
+  requests. Moving it forward on the rest is worth −0.9% API and −0.9%
+  subscription on blindguard, and exactly zero on windowgap where the client had
+  already placed it at the tail on 384 of 389 requests. Shipped in `e796ee3c`
+  behind `--cache-tail-breakpoint`, default on, and a no-op when the marker is
+  already right.
+- **Roughly one buffered `headroom_retrieve` in five never reached the model.**
+  Three holes, all quiet, all fixed in `95df41d0`: a turn mixing the retrieval
+  with a real client tool call could not run a continuation, so the retrieval was
+  dropped and the client got a `tool_use` for a tool it never declared, and the
+  content is now spliced in as text instead; a refused continuation was a single
+  attempt, and now retries twice with backoff on transport errors, 5xx and 429,
+  leaving 4xx alone; and a hash the model mistyped fell out of `parse_tool_call`
+  as "not a CCR call", and is now probed raw, recognised, and answered with an
+  error.
+- **Overload outages run far longer than the retry budget.** Anthropic reports
+  overload inside a 200 body when the client asked for a stream. Over five days
+  of logs the loop gave up on 77 turns, clustered into 15 bursts running 27 to
+  245 seconds, worst case 20 lost turns over four minutes.
+
+  | attempts | waiting | turns cleared |
+  | --- | --- | --- |
+  | 3 (before) | ~3s | 16 / 77 (21%) |
+  | 5 | ~15s | 30 / 77 (39%) |
+  | **6 (now)** | **~31s** | **53 / 77 (69%)** |
+  | 7 | ~61s | 57 / 77 (74%) |
+  | 9 | ~121s | 68 / 77 (88%) |
+
+  Shipped in `8dc23eb9` as `--retry-overload-max-attempts`, default 6, separate
+  from `--retry-max-attempts` so nothing else waits longer. The branch can afford
+  the wait because the error is the first SSE event, so nothing has been
+  forwarded and a re-send cannot duplicate output.
+- **Mid-stream transport drops now retry, by holding the opening bytes back.**
+  Of 111 streams that ended without `message_stop` across the live log and its
+  four rotations, 32 died to `error decoding response body`. Of the 18 that
+  correlate to a `stream_incomplete` event, all 18 already had a content block
+  open, with 1 to 20 output tokens parsed, median 3. So any design testing "has a
+  delta gone out yet" would have declined to retry all 18, and a blind re-send
+  would have spliced two generations together. While the held buffer is under
+  `--retry-stream-hold-bytes` (default 2048) the response is uncommitted and a
+  drop discards it for a fresh request; past that the response is committed and a
+  drop propagates as before. This extends the safety condition at `proxy.rs:4124`
+  rather than working around it. The wrapper sits below both the CCR rewriter and
+  the telemetry tee, so a discarded attempt is invisible to billing. The cost is
+  time to first paint: 2 KiB arrives in one burst, which covers the preamble plus
+  about a dozen deltas. The drop arrives as reqwest's `Decode`, not `Body`, so
+  `is_retryable_transport_error` does not match it, which is why
+  `is_retryable_drop` exists. `sse/stream_retry.rs`, wired at `proxy.rs:4400`,
+  pinned by `tests/integration_stream_drop_retry.rs`.
+
+Disproved:
+
+- **The spare fourth breakpoint is worth nothing.** Swept at seven fractions from
+  2% to 50% back through history, on both corpora and under both weightings,
+  every arm came out byte-identical to the untouched proxy. Every turn writes a
+  cache entry at its own tail, so the conversation already carries a ladder of
+  readable prefixes and an extra marker lands on a rung that exists. Spending it
+  as a 1h anchor deep in history was worth 0.2pp at best, inside the noise
+  between fractions, because idle gaps past 5 minutes are 1.0–1.5% of turns.
+- **The third tail breakpoint does not survive the marker budget.**
+  `tail-breakpoints-3` scored −16.9% subscription on windowgap and looked like
+  the best untried idea in the file, but it asked for five markers on 1,133 of
+  1,159 requests and the simulator was quietly dropping the earliest to fit. Its
+  score was never "three tail markers". Named honestly as `rebalance-1sys-3tail`,
+  which asks for exactly four, it scores −16.7% on windowgap against the live
+  proxy's −15.1%, and −1.3% on blindguard against −1.3%. The control
+  `rebalance-1sys-2tail` shows the split: giving up a system marker costs 0.4pp
+  and the third tail marker buys 2.0pp. `cachesim.py` now counts requests over
+  `MAX_BREAKPOINTS` and prints `OVER BUDGET`; the comment there had claimed for a
+  while that such requests were flagged, and they were not.
+- **`pair-back-05` was measuring three levers at once.** It cleared every message
+  marker and re-placed two with `ttl: "1h"`. Separated, the tail move carries all
+  of it: `shipped-tail` alone scored −3.5% subscription on blindguard against
+  `pair-back-05`'s −3.3%.
+- **The marker-spreading levers do not replicate.** Backtested on the three older
+  two-marker corpora, `spread-wire-02` and `spread-wire-05` are flat to a shade
+  worse on capture-beta (1,869 turns) and toolblocks (374), with the 5pp gain
+  showing only on msg0 (231 turns). `rebalance-1sys-3tail` is bad everywhere
+  there, by 17 to 74 points, and its uncached share goes to 0.0%, which is the
+  tell: it rewrites the cache every turn and writes cost more than reads.
+- **markercheck settled both, on 446 turns of fresh traffic on windowgap's own
+  build.** Subscription weights, `--base forwarded`:
+
+  ```
+  claude code                 8,529,901    +0.0%   uncached 0.5%
+  live proxy                  7,410,026   -13.1%   uncached 0.4%
+  spread-wire-02              7,426,398   -12.9%
+  spread-wire-05              7,429,335   -12.9%
+  spread-wire-10              7,433,292   -12.9%
+  rebalance-1sys-3tail        7,422,759   -13.0%   uncached 0.0%
+  ```
+
+  Every arm is worse than the live proxy, on the one corpus captured
+  specifically to test them. Four corpora out of five say no gain; windowgap is
+  the outlier, not the signal. Both levers are closed. Do not re-open without a
+  reason that explains why windowgap differed. Two caveats on the baseline: the
+  `live proxy` row is the binary running since 2026-08-18 20:20, which predates
+  `e796ee3c`, so rebaseline before re-running these arms; and at 0.4% uncached
+  there is no marker slack left to win, which is the likely reason every arm
+  costs a little. Superseded in any case by the scaffold breakpoint now placed in
+  message 0 (`cache_stabilization/prefix_replay.rs`, `opening_scaffolding_target`),
+  which changes where the markers sit.
+
+Root causes found:
+
+- **The 6.6pp gap between the modelled policy and production was
+  `--force-1h-cache-ttl`, not the offload gate.** The real gate replayed over
+  blindguard bills −4.8%, matching the model exactly, so the whole gap lived in
+  the stages the replay skips. Confirmed by rewriting production's own forwarded
+  bodies from `1h` to `5m` and changing nothing else: +1.8% becomes −4.8%.
+  Production writes 15,446 message breakpoints against the replay's 7,699, and
+  15,400 of 15,400 system breakpoints at 1h where the client mix has 3,670 at 5m.
+
+  | | API | subscription |
+  | --- | --- | --- |
+  | production, 1h | +1.8% | −1.3% |
+  | same bodies, 5m | −4.8% | +2.7% |
+
+  1h wins by 4.0pp on subscription and loses by 6.6pp on API, which is what
+  `cache_ttl.rs:20-30` says it should do: rate-limit metering counts writes at
+  raw token count with no TTL distinction, while a 1h write costs 2x base input
+  against 1.25x for 5m. Keep it while paying by subscription, turn it off on API.
+  The swing is not just the multiplier: at 5m the entries expire sooner and
+  creates rise 30.8%, and 5m still wins on dollars even paying for those.
+  `--force-1h-cache-ttl true` is set at `~/.headroom-flags.sh:232`; the code
+  default is `false` (`config.rs:2425`).
+- **The memory layer was initialised and retrieving nothing, because the score
+  could never reach the floor.** Across 1,929 captured forwarded bodies there
+  were zero `## Relevant Memories` blocks, while 795 `<session_recall>` blocks
+  went out over the same plumbing. `CtxStore::search` fuses two ranked lists and
+  overwrites `SearchHit::rank` with the negated RRF score, and with `RRF_K = 60`
+  the best obtainable hit is `2/(RRF_K + 1)` = 0.033, which through
+  `|rank|/(1+|rank|)` caps the output at 0.032 against a `min_similarity` floor
+  of 0.3. No result could pass, for any query, at any threshold above 0.032. The
+  live log carried 7,265 consecutive `all_below_min_similarity` events, each
+  reporting ten results found and not one success. Fixed in `3cee05d1` by scaling
+  the fused score by `RRF_K + 1` before the squash: a single-list leader now
+  scores 0.5, a both-list leader 0.67, and roughly the first fifty fused
+  positions clear 0.3. The trap worth keeping: `SearchHit::rank` is named for
+  BM25 and carries a fused score, so testing the FTS index directly returns
+  ranks of −3.6 to −9.7 and tells you nothing about what the search path
+  produces. That is exactly what hid this for two days.
+- **A separate memory bug, fixed on the way.** The memory injection site computed
+  `frozen` as the length of the **system** array and passed it to
+  `append_to_latest_user_tail` as `frozen_message_count`, which indexes into
+  **messages**. Two system blocks skipped `messages[0..2]`, so a conversation one
+  or two messages long got no memory, silently. It now passes 0, which is honest:
+  the real frozen boundary comes from the prefix-replay tracker, which does not
+  run until `apply_prefix_replay`. Pinned by
+  `tail_anthropic_reaches_a_short_conversation`.
+- **Pricing was ruled out as a source of the gap.** `pricing.rs` had Opus 5 at
+  the retired Opus 4.1 rates, $15/$1.50 per MTok against the real $5/$0.50, a 3x
+  overstatement corrected in `85c32900`. It inflated the savings ledger but
+  cannot touch a cachesim comparison: both sides are weighted token counts
+  relative to fresh input = 1.0, and `bench/cachesim.py` contains no dollar
+  arithmetic at all.
+
+Ruled out by measurement, so nobody re-checks:
+
+- **The PR-J4 boundary gate withholds nothing.** With the boundary requirement
+  and without it, −6.6% either way, 0.01% apart.
+- **Stripping old thinking blocks** scores −3.2% and is unshippable.
+  `restore_client_reasoning_blocks` compares outbound signed `thinking` and
+  `redacted_thinking` blocks against the client's and restores the whole message
+  array on any mismatch, and a deletion is a mismatch, so the arm would be
+  reverted every turn. The guard exists because Anthropic rejects the turn
+  outright.
+- **Byte-based prompt composition.** Images bill by dimensions, not base64
+  length — 9.3 to 11.1 bytes per token against 3.1 for text — so the 2 MB image
+  bodies are the cheap ones. Price tokens before claiming what dominates a
+  prompt.
+- **Swapping the allocator.** A synthetic benchmark parsing a real 908 KB body
+  on 20 threads made jemalloc look like a 3.5x memory win that was also faster
+  (0.57s and +65 MB retained, against glibc's 0.90s and +230 MB). Measured on the
+  real proxy — 60 captured bodies through a dummy upstream with offload, inject,
+  memory, compression and prefix-replay all on — jemalloc peaked at 325 MB
+  against glibc's 290 MB, and `background_thread:true,dirty_decay_ms:2000` only
+  brought it to 312 MB. The change was reverted. The flat settle curve from 10s
+  to 60s is the real finding: nothing decays because nothing is waiting to be
+  freed, and the proxy's RSS is live data held on purpose by the replay store,
+  the offload store, the CCR tracker and the semantic cache. A microbenchmark
+  that models the wrong allocation lifetime will confidently recommend the wrong
+  fix. The levers that would work all trade cache coverage for bytes, which was
+  out of scope.
+- **Tokenization, fsync and quadratic scaling in message count** are not where
+  the proxy's own time goes: 0.9 ms to tokenize 710 KB, since Claude models
+  resolve to the estimator rather than BPE; 2.3 ms for fsync on this filesystem;
+  and cost per message *falls* from 4,168 us at 20 messages to 361 us at 586.
+
+Where the proxy's own latency goes:
+
+- **About 61 ms fixed plus 0.155 ms/KB, and 89% of it is proxy CPU.** Measured
+  with captured bodies replayed against an instant local upstream, so the number
+  is the proxy's own cost and not upstream inference: 156 ms at 198 KB and at
+  445 KB, 171 ms at 674 KB, 239 ms at 858 KB, and 184 ms of CPU against 207 ms of
+  wall over 20 requests. On the median 410 KB body that is roughly 125 ms, about
+  6% of a 2 s turn. Phase timers on a 743 KB body, no profiler being available
+  here: ident 1.8 ms, semantic cache 1.0 ms, compression decision 2.5 ms,
+  compression 39.8 ms, outcome-context 7.5 ms, replay 2.0 ms, and 108.6 ms total
+  to the send point. Compression is the proxy earning its keep.
+- **The 54.3 ms once attributed to the tool stages was the savings tracker.**
+  That timer window spanned `record_request_footprint`, which runs at the end of
+  it; split, the four tool stages account for 3.9 ms and the footprint call for
+  49.2 ms. `record_request_footprint` calls `record_proxy_overhead` and
+  `record_tools`, each of which calls `SavingsTracker::save`, and `save` rebuilt
+  every `history` entry into a `Value` before serialising — 1.14 MB of a 1.4 MB
+  payload, several times per request, since a typical request reaches four or
+  five recorders. Measured in release against the real savings file,
+  `record_proxy_overhead` went 12.40 ms to 1.16 ms, `record_tools` 11.96 ms to
+  1.33 ms, and `record_request` 16.13 ms to 2.22 ms. History was the whole of it:
+  emptied, the same pair of calls costs 0.62 ms instead of 24.36 ms. Fixed in
+  `crates/headroom-core/src/savings_tracker.rs`, where `State` now carries
+  `history_rendered` kept in step by `push_history` and `trim_history`, `save`
+  serialises from a borrowed struct, and `trim_history` retains and drains in
+  place instead of cloning every surviving entry on every push. The file written
+  is unchanged.
+
+Left unexplained, and worth knowing before quoting a replay counter:
+
+- **The replay sees a rebuild boundary on 3.1% of turns where production reported
+  0.16%.** 245 of 7,839 on blindguard, reproduced twice. It does not affect any
+  before/after comparison that holds the detector fixed across both runs, but do
+  not read the absolute deferral counts as production truth until it is chased
+  down. For scale, replaying blindguard across `4f223054` and its parent moved
+  `blocks_offloaded` from 72,349 to 73,181, `blocks_deferred` from 18,453 to
+  18,441, `window_offloads` from 1,681 to 1,673 and `tokens_saved` from
+  95,335,968 to 97,392,897 — about +1.1% blocks and +2.2% tokens saved, real but
+  not the step change that had been predicted. Deferrals do not move.
+- **The near-tail window is not inert**, which an earlier note had claimed at 1
+  window offload per 11 turns. Over the 08-17 to 08-19 log span, 8,287 turns
+  carrying a qualifying block, production fires 1,742 window offloads, 1 per 4.8
+  turns. The replay agrees independently at 1 per 4.7 on blindguard and 1 per 5.4
+  on windowgap. The old figure divided a count from one span by a turn count from
+  a wider one.
+
+Where the memory store actually lives, since two paths and a decoy made this
+expensive to establish:
+
+- `~/.claude-personal/context-mode` is a symlink to `~/.claude-work/context-mode`
+  and the proxy runs with `--ctx-store-dir` pointed at the former, so both paths
+  are one physical store at
+  `~/.claude-work/context-mode/memory/memories.db`. `~/.headroom/memories` is
+  `default_native_memory_dir()`, used only when `use_native_tool` is on, and it
+  is empty.
+- `user_id` is carried twice, in the column and inside the record JSON. Update
+  both or reads go inconsistent.
+- The `workspace` partition is empty as of 2026-08-19. `default` is the right
+  home for cross-repo reference, because `router::shared_partition` strips the
+  `::project` suffix, so a record stored under plain `default` is visible from
+  every project partition (`ctx_backend.rs` line 140).

@@ -949,6 +949,32 @@ pub struct CliArgs {
     )]
     pub ctx_offload_ttl_seconds: u64,
 
+    /// CTX-3: also offload large string values in prior-turn `tool_use` inputs
+    /// (a Write's `content`, an Edit's `new_string`). Only effective with
+    /// `--ctx-offload`. First conversions happen only where the block has never
+    /// been sent upstream, so a cached prefix is never rewritten.
+    #[arg(
+        long = "ctx-offload-tool-use",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_TOOL_USE",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    pub ctx_offload_tool_use: bool,
+
+    /// Drop `thinking` blocks from every assistant message but the last, on
+    /// rebuild boundaries and history arrivals only — the turns where the
+    /// prefix is written fresh anyway. The replay store keeps the stripped
+    /// bytes on every steady turn after, so no cached prefix is ever rewritten.
+    /// The last assistant message is never touched: its thinking must stay
+    /// while a tool loop is open.
+    #[arg(
+        long = "ctx-drop-prior-thinking",
+        env = "HEADROOM_PROXY_CTX_DROP_PRIOR_THINKING",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub ctx_drop_prior_thinking: bool,
+
     /// CTX-4: enable recall/resume injection. On the first request of a
     /// conversation, prepends a recall block (fresh) or resume snapshot
     /// (compaction/resume) into the first user message, then replays the same
@@ -1090,6 +1116,19 @@ pub struct CliArgs {
     /// default (None = disabled).
     #[arg(long = "local-model", env = "HEADROOM_PROXY_LOCAL_MODEL")]
     pub local_model: Option<String>,
+
+    /// Model that answers Claude Code's spinner-text sidecar.
+    ///
+    /// The client asks for the line beside its spinner ("Reading runAgent.ts")
+    /// by resending the whole conversation on the working model. The proxy
+    /// answers that request on its own: a few tail messages, no tools, 64
+    /// output tokens, and this model. Point it at a larger model only if the
+    /// summaries read badly; there is no reason to.
+    ///
+    /// Source priority: CLI flag -> `HEADROOM_PROXY_SIDECAR_MODEL` env var ->
+    /// default (`claude-haiku-4-5-20251001`).
+    #[arg(long = "sidecar-model", env = "HEADROOM_PROXY_SIDECAR_MODEL")]
+    pub sidecar_model: Option<String>,
 
     /// Upstream URL for the local model (e.g. http://localhost:8080).
     /// Required when `--local-model` is set; the proxy appends
@@ -2055,6 +2094,11 @@ pub struct Config {
     pub ctx_offload_stale_window: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
     pub ctx_offload_ttl_seconds: u64,
+    /// CTX-3: offload large `tool_use` input strings too. Needs `ctx_offload`.
+    pub ctx_offload_tool_use: bool,
+    /// Drop prior-turn `thinking` blocks on rebuild boundaries and history
+    /// arrivals. Never touches the last assistant message.
+    pub ctx_drop_prior_thinking: bool,
     /// CTX-4: recall/resume injection on/off. Requires `ctx_capture`.
     pub ctx_inject: bool,
     /// CCR Phase 4: multi-turn context tracker on/off.
@@ -2097,6 +2141,9 @@ pub struct Config {
     pub local_model: Option<String>,
     /// Local model upstream URL. Required when `local_model` is `Some`.
     pub local_upstream: Option<Url>,
+    /// Model the spinner-text sidecar is answered on. `None` means
+    /// [`crate::sidecar::DEFAULT_SIDECAR_MODEL`].
+    pub sidecar_model: Option<String>,
     /// Additional model routes from `--extra-model-route` flags.
     /// Evaluated after `local_model` (exact match takes priority).
     pub model_routes: Vec<ModelRoute>,
@@ -2333,6 +2380,8 @@ impl Config {
             ctx_offload_stale_messages: args.ctx_offload_stale_messages,
             ctx_offload_stale_window: args.ctx_offload_stale_window,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
+            ctx_offload_tool_use: args.ctx_offload_tool_use,
+            ctx_drop_prior_thinking: args.ctx_drop_prior_thinking,
             ctx_inject: args.ctx_inject,
             ccr_context_tracking: args.ccr_context_tracking,
             ccr_proactive_expansion: args.ccr_proactive_expansion,
@@ -2360,6 +2409,7 @@ impl Config {
             vertex_region: args.vertex_region,
             vertex_adc_scope: args.vertex_adc_scope,
             local_model: args.local_model,
+            sidecar_model: args.sidecar_model,
             local_upstream: args.local_upstream,
             model_routes: args
                 .extra_model_routes
@@ -2572,6 +2622,8 @@ impl Config {
             ctx_offload_stale_messages: 0,
             ctx_offload_stale_window: 0,
             ctx_offload_ttl_seconds: 604_800,
+            ctx_offload_tool_use: false,
+            ctx_drop_prior_thinking: true,
             ctx_inject: false,
             ccr_context_tracking: true,
             ccr_proactive_expansion: true,
@@ -2588,6 +2640,7 @@ impl Config {
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
             local_model: None,
+            sidecar_model: None,
             local_upstream: None,
             model_routes: Vec::new(),
             codex_auth_file: None,

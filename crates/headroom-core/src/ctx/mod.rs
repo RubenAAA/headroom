@@ -22,7 +22,9 @@ mod snapshot;
 mod store;
 
 pub use memory_records::MemoryRecordStore;
-pub use sessions::{data_hash, session_db_path, NewEvent, PrefixTurn, SessionsStore, StoredEvent};
+pub use sessions::{
+    data_hash, session_db_path, EventInsert, NewEvent, PrefixTurn, SessionsStore, StoredEvent,
+};
 pub use snapshot::{build_recall, build_resume_snapshot, INJECT_SENTINEL};
 pub use store::{
     content_db_path, default_base_dir, hash_project_dir_canonical, sanitize_query,
