@@ -113,10 +113,17 @@ pub struct CtxOffloadConfig {
     /// 253 of 10,485 eligible sightings (2.3MB of 101.5MB) ever sit where a
     /// conversion would survive.
     ///
-    /// Converting the rest means paying a rebuild, and it does not pay back:
-    /// re-creating a median 108,911 tokens to free 5,257 breaks even after 125
-    /// turns against a median conversation of 58. Four of 18 conversations with
-    /// a backlog would have repaid it.
+    /// Converting the rest means paying a rebuild, and on the median it does
+    /// not pay back: re-creating a median 108,911 tokens to free 5,257 breaks
+    /// even after 125 turns against a median conversation of 58. But four of
+    /// 18 conversations with a backlog would have repaid it, and a gate that
+    /// is off for all of them leaves that 22% on the table. The median is the
+    /// wrong statistic to gate on when the decision can be made per
+    /// conversation: `tokens_after`, what the backlog frees, and how many
+    /// turns the session has already run are all knowable at request time.
+    /// `ctx_offload_accounting` now carries all three
+    /// (`bytes_after_deepest_deferral`, `bytes_deferred`, `turns_seen`) so the
+    /// rule can be fitted to measurement instead of guessed at.
     ///
     /// `bench/cachesim.py` cannot price this — it applies a strategy uniformly
     /// to the client body and models no replay, so `stale_margin` 1 and 4 score
@@ -141,6 +148,12 @@ pub struct CtxOffloadConfig {
     /// 4-to-8-back window saves 2,280. That is a **10-turn** payback against a
     /// median conversation of 15 turns, and conversations of 51-150 turns hold
     /// 58.7% of all cache reads.
+    ///
+    /// Those rates are the 5-minute tier. Under `--force-1h-cache-ttl` a write
+    /// bills at 2.0 against a read at 0.1 (`headroom_core::pricing`), so the
+    /// multiplier is 19, not 16.1, and every payback above is a fifth longer
+    /// than it reads — the 10-turn window is 12 turns, still inside a median
+    /// conversation, and the 125-turn backlog is 148.
     ///
     /// So this window is a deliberate, bounded cache cost — the only one in this
     /// module. Widening it moves `tokens_after` up fast (the last 8 messages are
@@ -181,6 +194,23 @@ pub struct OffloadOutcome {
     /// than tokens because the tokenizer pass a token count needs is exactly
     /// the work the deferral skipped.
     pub bytes_deferred: usize,
+    /// Distance from the tail of the shallowest and deepest deferred block.
+    ///
+    /// [`CtxOffloadConfig::stale_window`] already converts inside a fixed band
+    /// because `tokens_after` is small there; past it every first conversion
+    /// waits. Whether the band is set right, and whether the backlog behind it
+    /// is shallow or deep, is a question about this distribution, and it was
+    /// never recorded — only the count of what was held back.
+    pub deferred_min_distance: Option<usize>,
+    pub deferred_max_distance: Option<usize>,
+    /// Serialized bytes of the messages after the deepest deferred block: what
+    /// converting the whole backlog at once would force rewritten.
+    ///
+    /// The denominator of the payback the module documents as
+    /// `tokens_after / tokens_saved`. Measured rather than assumed, because
+    /// the assumption — that a deferred block sits deep, so the rewrite is
+    /// nearly the whole body — is the one thing the decision turns on.
+    pub bytes_after_deepest_deferral: usize,
     /// PR-J5 thrash guard: conversions of frozen blocks not previously in the
     /// session's offload set. Non-zero on a non-boundary turn means the I4
     /// invariant was violated (a cache-thrash bug) — the caller warns loudly.
@@ -208,6 +238,18 @@ pub struct OffloadOutcome {
 }
 
 impl OffloadOutcome {
+    /// Widen the recorded deferral depth to include `distance`.
+    pub fn note_deferred_distance(&mut self, distance: usize) {
+        self.deferred_min_distance = Some(match self.deferred_min_distance {
+            Some(prev) => std::cmp::min(prev, distance),
+            None => distance,
+        });
+        self.deferred_max_distance = Some(match self.deferred_max_distance {
+            Some(prev) => std::cmp::max(prev, distance),
+            None => distance,
+        });
+    }
+
     /// Whether any block was rewritten (i.e. the body bytes changed).
     pub fn changed(&self) -> bool {
         self.blocks_offloaded > 0
@@ -710,6 +752,9 @@ pub fn offload_anthropic_request(
     };
 
     let last_idx = messages.len().saturating_sub(1);
+    // Lowest index, i.e. deepest in the history: converting the backlog costs
+    // one rewrite of everything after the earliest block in it.
+    let mut deepest_deferred_msg: Option<usize> = None;
     for (msg_idx, message) in messages.iter_mut().enumerate() {
         let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
@@ -789,10 +834,25 @@ pub fn offload_anthropic_request(
                 BlockOutcome::Deferred { bytes } => {
                     outcome.blocks_deferred += 1;
                     outcome.bytes_deferred += bytes;
+                    outcome.note_deferred_distance(distance);
+                    deepest_deferred_msg = Some(match deepest_deferred_msg {
+                        Some(prev) => std::cmp::min(prev, msg_idx),
+                        None => msg_idx,
+                    });
                 }
                 BlockOutcome::Skipped => {}
             }
         }
+    }
+
+    // Only walked when something was actually held back, so an ordinary turn
+    // pays nothing for the measurement.
+    if let Some(first) = deepest_deferred_msg {
+        outcome.bytes_after_deepest_deferral = messages
+            .iter()
+            .skip(first + 1)
+            .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+            .sum();
     }
 
     outcome
@@ -995,6 +1055,7 @@ pub fn offload_tool_use_inputs(
                 if !prior && !first_allowed {
                     outcome.blocks_deferred += 1;
                     outcome.bytes_deferred += original.len();
+                    outcome.note_deferred_distance(last_idx - msg_idx);
                     continue;
                 }
                 let digest = format!(
@@ -1320,6 +1381,14 @@ mod tests {
         assert!(
             out.bytes_deferred > 0,
             "the deferral records what it is holding raw, not just that it held something"
+        );
+        assert!(
+            out.deferred_min_distance.is_some(),
+            "and how far from the tail it sits, which is what prices the rewrite"
+        );
+        assert!(
+            out.bytes_after_deepest_deferral > 0,
+            "and what converting it would force rewritten"
         );
         assert_eq!(
             first_tool_result_text(&parsed),

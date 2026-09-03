@@ -3623,6 +3623,12 @@ pub(crate) async fn forward_http(
                             out.blocks_offloaded += tool_use.blocks_offloaded;
                             out.blocks_deferred += tool_use.blocks_deferred;
                             out.bytes_deferred += tool_use.bytes_deferred;
+                            if let Some(d) = tool_use.deferred_min_distance {
+                                out.note_deferred_distance(d);
+                            }
+                            if let Some(d) = tool_use.deferred_max_distance {
+                                out.note_deferred_distance(d);
+                            }
                             out.tokens_saved += tool_use.tokens_saved;
                             out.records.extend(tool_use.records);
                             out
@@ -3660,6 +3666,12 @@ pub(crate) async fn forward_http(
                                 blocks_offloaded = out.blocks_offloaded,
                                 blocks_deferred = out.blocks_deferred,
                                 bytes_deferred = out.bytes_deferred,
+                                deferred_min_distance = ?out.deferred_min_distance,
+                                deferred_max_distance = ?out.deferred_max_distance,
+                                // What converting the whole backlog would cost
+                                // in rewritten prefix, against what it frees.
+                                bytes_after_deepest_deferral = out.bytes_after_deepest_deferral,
+                                turns_seen = ?state.replay_store.turns_seen(&request_session_key),
                                 window_offloads = out.window_offloads,
                                 tokens_saved = out.tokens_saved,
                                 rebuild_boundary,

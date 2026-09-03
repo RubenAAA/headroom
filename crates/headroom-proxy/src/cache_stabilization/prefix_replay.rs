@@ -3134,6 +3134,24 @@ impl SessionReplayStore {
     /// A message at or past this index has never left the proxy, so rewriting
     /// it cannot break a cache entry. Everything below it may have been cached
     /// verbatim; a caller unsure of that must leave it alone.
+    /// Turns this proxy has seen of `session_key`, or `None` when the session
+    /// is unknown.
+    ///
+    /// Not `messages.len() / 2`: a session that arrives mid-conversation
+    /// carries a long history the proxy never forwarded, and the two numbers
+    /// are what tell those apart. Whether a deferred offload backlog would
+    /// ever pay for itself turns on how many more turns the conversation has
+    /// left, and turns already served is the only evidence available for that.
+    pub fn turns_seen(&self, session_key: &str) -> Option<u64> {
+        self.hydrate(session_key);
+        let guard = self.trackers.lock().ok()?;
+        let tracker = guard.peek(session_key)?;
+        if tracker.last_activity.elapsed() > self.session_ttl {
+            return None;
+        }
+        Some(tracker.turn_number())
+    }
+
     pub fn forwarded_message_count(&self, session_key: &str) -> Option<usize> {
         self.hydrate(session_key);
         let tracked = {
