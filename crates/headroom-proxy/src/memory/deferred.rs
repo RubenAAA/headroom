@@ -138,6 +138,21 @@ fn place(messages: &mut [Value], pending: &PendingMemoryResult) -> Placement {
         return Placement::TurnNotHere;
     }
 
+    // Every call already in the turn has to be answered by the message after
+    // it. `answers_tool_calls` only proves *a* result is there, not that the
+    // client's own calls were all answered — and a turn that arrives already
+    // broken is one this restore must not join, because the 400 it earns
+    // costs the whole request while a dropped answer costs one retrieval.
+    if let Some(unanswered) = first_unanswered(&messages[idx], &messages[idx + 1]) {
+        tracing::warn!(
+            event = "memory_answer_not_restored",
+            unanswered_tool_use_id = %unanswered,
+            reason = "turn_arrived_unpaired",
+            "memory: the turn is missing a tool_result of its own; holding the answer back"
+        );
+        return Placement::Unusable;
+    }
+
     let Some(content) = messages[idx]
         .get_mut("content")
         .and_then(|c| c.as_array_mut())
@@ -154,7 +169,60 @@ fn place(messages: &mut [Value], pending: &PendingMemoryResult) -> Placement {
     };
     // After the client's results, matching the order of the calls above.
     results.push(pending.tool_result.clone());
+
+    // The pair this function just wrote is the last thing that can break the
+    // turn, so prove it rather than trust it. Anything left unanswered here is
+    // our own doing; undo both pushes and let the answer go rather than send a
+    // body the API will refuse.
+    if let Some(unanswered) = first_unanswered(&messages[idx], &messages[idx + 1]) {
+        tracing::warn!(
+            event = "memory_answer_not_restored",
+            unanswered_tool_use_id = %unanswered,
+            reason = "restore_left_a_call_unpaired",
+            "memory: restoring the answer would have left a tool_use unanswered; undoing"
+        );
+        if let Some(content) = messages[idx]
+            .get_mut("content")
+            .and_then(|c| c.as_array_mut())
+        {
+            content.pop();
+        }
+        if let Some(results) = messages[idx + 1]
+            .get_mut("content")
+            .and_then(|c| c.as_array_mut())
+        {
+            results.pop();
+        }
+        return Placement::Unusable;
+    }
     Placement::Done
+}
+
+/// The id of the first `tool_use` in `calls` that `results` does not answer.
+///
+/// This is the pairing Anthropic enforces: every `tool_use` block needs a
+/// `tool_result` carrying its id in the very next message.
+fn first_unanswered(calls: &Value, results: &Value) -> Option<String> {
+    let answered: std::collections::HashSet<&str> = results
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    calls
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|b| b.get("id").and_then(Value::as_str))
+        .find(|id| !answered.contains(id))
+        .map(|id| id.to_string())
 }
 
 /// Index of the assistant message holding any of `ids`.
@@ -263,6 +331,31 @@ mod tests {
             tool_result_block("tu_mem", json!("two hits")),
             vec!["tu_bash".to_string()],
         )
+    }
+
+    /// The 400 seen on 2026-09-03: the client's turn came back with a
+    /// `tool_use` its next message never answered. Joining that turn adds a
+    /// second unanswered pair and loses the whole request; the answer is
+    /// worth less than the turn, so it goes.
+    #[test]
+    fn a_turn_that_arrives_unpaired_is_left_alone() {
+        let mut d = DeferredMemory::new();
+        d.hold(pending());
+        let mut msgs = client_turn();
+        // A second client call the results message does not answer.
+        msgs[1]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(tool_use("tu_skill", "Skill"));
+
+        assert_eq!(d.apply(&mut msgs), 0, "nothing is restored into a broken turn");
+        assert_eq!(
+            msgs[1]["content"].as_array().unwrap().len(),
+            2,
+            "and the turn is handed on exactly as it arrived"
+        );
+        assert_eq!(msgs[2]["content"].as_array().unwrap().len(), 1);
+        assert!(d.is_empty(), "the answer is dropped, not retried forever");
     }
 
     #[test]
