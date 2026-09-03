@@ -3127,13 +3127,75 @@ impl SessionReplayStore {
         !replayable
     }
 
-    /// How many of this session's messages the proxy has already sent upstream,
-    /// counting the primary prefix, every held alternate, and any turn still in
-    /// flight. `None` when the session is unknown or idle past its TTL.
+    /// How many leading messages this turn still shares with anything the
+    /// session has stored, counting the primary prefix and every alternate.
     ///
-    /// A message at or past this index has never left the proxy, so rewriting
-    /// it cannot break a cache entry. Everything below it may have been cached
-    /// verbatim; a caller unsure of that must leave it alone.
+    /// Only meaningful once `history_will_be_rewritten` has said yes: it tells
+    /// a caller about to rewrite the history how much of it the provider may
+    /// still be holding. `None` when there is no tracker to compare against,
+    /// which is the case that has nothing cached to lose.
+    ///
+    /// Careful with the answer. The run agrees on what the *client* sent, and
+    /// the provider cached what the proxy *forwarded*, which is not the same
+    /// bytes on any session where a rewriting pass has already run. Treat it as
+    /// an upper bound on what a rewrite could cost, not as a licence to skip it.
+    pub fn agreed_prefix_len(
+        &self,
+        session_key: &str,
+        incoming_original: &[Value],
+    ) -> Option<usize> {
+        let canonical_incoming = canonicalize_slice(incoming_original);
+        self.hydrate(session_key);
+        let guard = self.trackers.lock().ok()?;
+        let tracker = guard.peek(session_key)?;
+        if tracker.last_activity.elapsed() > self.session_ttl {
+            return None;
+        }
+        if tracker.last_forwarded_messages.is_empty() {
+            return None;
+        }
+        let best = std::iter::once(&tracker.last_original_messages)
+            .chain(tracker.alternates.iter().map(|(_, original, _)| original))
+            .map(|candidate| canonical_agreement_len(candidate, &canonical_incoming))
+            .max()
+            .unwrap_or(0);
+        Some(best)
+    }
+
+    /// How many leading messages this turn shares with what the proxy last
+    /// *forwarded*, as opposed to what the client last sent.
+    ///
+    /// This is the number that decides whether rewriting the head costs
+    /// anything. The provider cached the bytes we forwarded, and on any
+    /// session where a stripping pass has already run those are not the bytes
+    /// the client holds — so `agreed_prefix_len`, which compares originals,
+    /// can say the head is intact while the provider's copy of it is not.
+    /// Comparing against the forwarded copy answers the question directly.
+    ///
+    /// Still an upper bound: the passes that run after this one may rewrite
+    /// the head again before it goes out. `None` when there is nothing
+    /// forwarded to compare against, which is the case with nothing to lose.
+    pub fn forwarded_agreement_len(
+        &self,
+        session_key: &str,
+        incoming_original: &[Value],
+    ) -> Option<usize> {
+        let canonical_incoming = canonicalize_slice(incoming_original);
+        self.hydrate(session_key);
+        let guard = self.trackers.lock().ok()?;
+        let tracker = guard.peek(session_key)?;
+        if tracker.last_activity.elapsed() > self.session_ttl {
+            return None;
+        }
+        if tracker.last_forwarded_messages.is_empty() {
+            return None;
+        }
+        Some(canonical_agreement_len(
+            &tracker.last_forwarded_messages,
+            &canonical_incoming,
+        ))
+    }
+
     /// Turns this proxy has seen of `session_key`, or `None` when the session
     /// is unknown.
     ///
@@ -3152,6 +3214,13 @@ impl SessionReplayStore {
         Some(tracker.turn_number())
     }
 
+    /// How many of this session's messages the proxy has already sent upstream,
+    /// counting the primary prefix, every held alternate, and any turn still in
+    /// flight. `None` when the session is unknown or idle past its TTL.
+    ///
+    /// A message at or past this index has never left the proxy, so rewriting
+    /// it cannot break a cache entry. Everything below it may have been cached
+    /// verbatim; a caller unsure of that must leave it alone.
     pub fn forwarded_message_count(&self, session_key: &str) -> Option<usize> {
         self.hydrate(session_key);
         let tracked = {
@@ -5262,6 +5331,39 @@ mod tests {
         assert!(
             store.history_will_be_rewritten(key, &history),
             "a history the stored turn is not a prefix of is written fresh"
+        );
+    }
+
+    /// The companion number: when the history will be rewritten, how much of
+    /// it the provider may still be holding.
+    #[test]
+    fn the_agreed_prefix_is_the_leading_run_a_stored_turn_still_matches() {
+        let dir = TempDir::new("agreed");
+        let key = "auth:abc:04";
+        let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+
+        let unrelated = vec![text_msg("user", "hello")];
+        assert_eq!(
+            store.agreed_prefix_len(key, &unrelated),
+            None,
+            "no tracker means nothing cached to lose"
+        );
+
+        let stored = persisted_turn(&store, key);
+        let mut edited = stored.clone();
+        edited.push(text_msg("assistant", "reply"));
+        edited.push(text_msg("user", "next"));
+        assert_eq!(
+            store.agreed_prefix_len(key, &edited),
+            Some(stored.len()),
+            "the whole stored turn still agrees"
+        );
+
+        let diverged = vec![text_msg("user", "something else entirely")];
+        assert_eq!(
+            store.agreed_prefix_len(key, &diverged),
+            Some(0),
+            "nothing agrees, so a rewrite costs the provider nothing"
         );
     }
 

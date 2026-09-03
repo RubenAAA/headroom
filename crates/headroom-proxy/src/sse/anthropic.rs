@@ -96,6 +96,31 @@ pub struct BlockState {
     pub complete: bool,
 }
 
+/// Characters the model emitted, split by what it spent them on.
+///
+/// Chars, not tokens: the stream carries no per-block token count, and the
+/// only question this answers is which of the three buckets is worth acting
+/// on. Thinking and text share `text_buffer`; tool input is the accumulated
+/// `partial_json`, which is what the model actually generated for the call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputSplit {
+    pub thinking_chars: usize,
+    pub text_chars: usize,
+    pub tool_input_chars: usize,
+    pub thinking_blocks: usize,
+    pub text_blocks: usize,
+    pub tool_use_blocks: usize,
+    /// `thinking_delta` events seen on this stream.
+    ///
+    /// Separate from `thinking_chars` on purpose. Over 1,053 turns on
+    /// 2026-09-03 every thinking block measured zero characters while the
+    /// billed `output_tokens` ran 2.9x what the visible characters account
+    /// for, and the client stores these blocks as `thinking: ""` beside an
+    /// 808-byte signature. Either the deltas never arrive or they arrive
+    /// empty, and only a count of the events themselves tells those apart.
+    pub thinking_deltas: usize,
+}
+
 /// Per-stream state. Lives in a `tokio::spawn`ed task that consumes
 /// framed events from the SSE framer; the response byte-passthrough
 /// is independent (see `wire_state_machine` in `proxy.rs`).
@@ -106,6 +131,8 @@ pub struct AnthropicStreamState {
     /// Block index → block state. Keyed by index, not Vec position,
     /// because the spec allows out-of-order completion.
     pub blocks: HashMap<usize, BlockState>,
+    /// `thinking_delta` events seen. See `OutputSplit::thinking_deltas`.
+    pub thinking_deltas: usize,
     /// The most recent block index opened via `content_block_start`.
     /// Tracks "which block is the live zone right now" but does NOT
     /// gate which block a delta applies to — every delta carries its
@@ -404,6 +431,7 @@ impl AnthropicStreamState {
                 if let Some(t) = delta.get("thinking").and_then(|x| x.as_str()) {
                     block.text_buffer.push_str(t);
                 }
+                self.thinking_deltas += 1;
             }
             "input_json_delta" => {
                 if let Some(p) = delta.get("partial_json").and_then(|x| x.as_str()) {
@@ -496,6 +524,32 @@ impl AnthropicStreamState {
             self.cleared_input_tokens = self.cleared_input_tokens.max(cleared);
         }
         Ok(())
+    }
+
+    /// Where this turn's output characters went. See `OutputSplit`.
+    pub fn output_split(&self) -> OutputSplit {
+        let mut split = OutputSplit {
+            thinking_deltas: self.thinking_deltas,
+            ..OutputSplit::default()
+        };
+        for block in self.blocks.values() {
+            match block.block_type.as_str() {
+                "thinking" | "redacted_thinking" => {
+                    split.thinking_blocks += 1;
+                    split.thinking_chars += block.text_buffer.chars().count();
+                }
+                "text" => {
+                    split.text_blocks += 1;
+                    split.text_chars += block.text_buffer.chars().count();
+                }
+                "tool_use" | "server_tool_use" => {
+                    split.tool_use_blocks += 1;
+                    split.tool_input_chars += block.partial_json.chars().count();
+                }
+                _ => {}
+            }
+        }
+        split
     }
 
     /// A tool call this stream promised but did not deliver intact.
@@ -615,4 +669,41 @@ fn payload_preview(data: &bytes::Bytes) -> String {
         &data[..]
     };
     String::from_utf8_lossy(slice).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_output_split_counts_each_block_kind_against_its_own_bucket() {
+        let mut state = AnthropicStreamState::default();
+        for (i, (block_type, text, json)) in [
+            ("thinking", "let me work through this", ""),
+            ("redacted_thinking", "xxxx", ""),
+            ("text", "here you go", ""),
+            ("tool_use", "", "{\"command\":\"ls\"}"),
+            ("tool_result", "ignored", ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.blocks.insert(
+                i,
+                BlockState {
+                    block_type: block_type.to_string(),
+                    text_buffer: text.to_string(),
+                    partial_json: json.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+        let split = state.output_split();
+        assert_eq!(split.thinking_blocks, 2);
+        assert_eq!(split.thinking_chars, "let me work through this".len() + 4);
+        assert_eq!(split.text_blocks, 1);
+        assert_eq!(split.text_chars, "here you go".len());
+        assert_eq!(split.tool_use_blocks, 1);
+        assert_eq!(split.tool_input_chars, "{\"command\":\"ls\"}".len());
+    }
 }

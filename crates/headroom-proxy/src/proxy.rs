@@ -2379,6 +2379,19 @@ fn record_request_footprint(
     tracker.record_tools(&definitions, &calls);
 }
 
+/// `record_request_footprint` on the blocking pool, so the request does not
+/// wait for it. The handle is for tests; the proxy drops it.
+fn spawn_request_footprint(
+    tracker: Arc<headroom_core::savings_tracker::SavingsTracker>,
+    request_id: String,
+    original: bytes::Bytes,
+    on_the_wire: bytes::Bytes,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        record_request_footprint(&tracker, &request_id, &original, &on_the_wire)
+    })
+}
+
 /// Every `tool_use` block Anthropic will find unanswered in `value`.
 ///
 /// The rule the API enforces: a `tool_use` needs a `tool_result` carrying its
@@ -2585,6 +2598,36 @@ pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str
     joined
 }
 
+/// Requests inside `forward_http` right now, for the `inflight` field of
+/// `stage_timings`.
+///
+/// Memory p50 measured 1.7 s with two or fewer requests in flight and 5.6 s
+/// with six or seven (2026-09-03). Without the count on the line a slow query
+/// and a busy proxy read the same.
+static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Holds one slot in `INFLIGHT` from `forward_http` entry to any exit,
+/// including `?` returns.
+struct InflightGuard;
+
+impl InflightGuard {
+    fn enter() -> Self {
+        INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+
+    /// Requests in flight, this one included.
+    fn count(&self) -> usize {
+        INFLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Forward an HTTP request to the upstream and stream the response back.
 pub(crate) async fn forward_http(
     state: AppState,
@@ -2592,6 +2635,7 @@ pub(crate) async fn forward_http(
     mut req: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
     let start = Instant::now();
+    let inflight = InflightGuard::enter();
     let request_id = ensure_request_id(req.headers());
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -3498,6 +3542,39 @@ pub(crate) async fn forward_http(
                             bytes_removed = dropped.bytes_removed,
                             rebuild_boundary,
                             history_rewritten,
+                            // How much of the history the client still shares
+                            // with something this session stored. On a rebuild
+                            // boundary the provider rewrites from message 0
+                            // and this pass is free; on a history rewrite it
+                            // may not be, and nothing in the log said which.
+                            // Upper bound only — the agreement is on what the
+                            // client sent, and the provider cached what we
+                            // forwarded. `-1` where there is no tracker, which
+                            // is the case with nothing cached to lose.
+                            agreed_prefix_len = replay_original_messages
+                                .as_deref()
+                                .and_then(|m| {
+                                    state
+                                        .replay_store
+                                        .agreed_prefix_len(&request_session_key, m)
+                                })
+                                .map_or(-1_i64, |n| n as i64),
+                            // The head as the provider actually holds it. The
+                            // field above compares the client's originals; this
+                            // one compares what we last sent, which is what got
+                            // cached. Where the two disagree this is the one
+                            // that decides whether the drop costs anything.
+                            forwarded_agreement_len = replay_original_messages
+                                .as_deref()
+                                .and_then(|m| {
+                                    state
+                                        .replay_store
+                                        .forwarded_agreement_len(&request_session_key, m)
+                                })
+                                .map_or(-1_i64, |n| n as i64),
+                            incoming_msgs = replay_original_messages
+                                .as_deref()
+                                .map_or(-1_i64, |m| m.len() as i64),
                             "dropped thinking from assistant turns before the last"
                         );
                         match serde_json::to_vec(&value) {
@@ -3666,12 +3743,20 @@ pub(crate) async fn forward_http(
                                 blocks_offloaded = out.blocks_offloaded,
                                 blocks_deferred = out.blocks_deferred,
                                 bytes_deferred = out.bytes_deferred,
-                                deferred_min_distance = ?out.deferred_min_distance,
-                                deferred_max_distance = ?out.deferred_max_distance,
+                                // -1 where there is nothing to report, so the
+                                // field stays a number the audit scripts can
+                                // read; `?` would print "Some(4)" as a string.
+                                deferred_min_distance =
+                                    out.deferred_min_distance.map_or(-1, |d| d as i64),
+                                deferred_max_distance =
+                                    out.deferred_max_distance.map_or(-1, |d| d as i64),
                                 // What converting the whole backlog would cost
                                 // in rewritten prefix, against what it frees.
                                 bytes_after_deepest_deferral = out.bytes_after_deepest_deferral,
-                                turns_seen = ?state.replay_store.turns_seen(&request_session_key),
+                                turns_seen = state
+                                    .replay_store
+                                    .turns_seen(&request_session_key)
+                                    .map_or(-1, |t| t as i64),
                                 window_offloads = out.window_offloads,
                                 tokens_saved = out.tokens_saved,
                                 rebuild_boundary,
@@ -3718,6 +3803,19 @@ pub(crate) async fn forward_http(
                             // chose not to call them" both read as an empty
                             // log. Logged on both branches for that reason.
                             let added = new_tools.len().saturating_sub(existing.len());
+                            // Only the definitions we appended, not the whole
+                            // array: the tools block costs about $32/day in
+                            // cache reads and the memory tools' share of it was
+                            // a guess. `prefix_composition` already carries the
+                            // block's total size, so this is the other half of
+                            // the ratio. Serialising the tail is a handful of
+                            // small objects; serialising the array would not be.
+                            let added_bytes: usize = new_tools
+                                .iter()
+                                .skip(existing.len())
+                                .filter_map(|t| serde_json::to_string(t).ok())
+                                .map(|s| s.len())
+                                .sum();
                             if injected {
                                 if let Some(obj) = value.as_object_mut() {
                                     obj.insert(
@@ -3730,6 +3828,7 @@ pub(crate) async fn forward_http(
                                         event = "memory_tools_injected",
                                         tools_added = added,
                                         tools_total = existing.len() + added,
+                                        bytes_added = added_bytes,
                                     );
                                 }
                             } else {
@@ -3918,12 +4017,15 @@ pub(crate) async fn forward_http(
                                 // expansion and recall stages left. Clipping
                                 // here is cache-safe: this appends to the live
                                 // tail, which is re-sent every turn anyway.
-                                if let Some(context) = handler
-                                    .search_and_format_context(
-                                        &user_id, &msgs, None, // request_context
-                                        None, // ranker
-                                        None, // query
-                                        None, // budget
+                                if let Some(context) = crate::memory::ctx_backend::SEARCH_REQUEST_ID
+                                    .scope(
+                                        request_id.clone(),
+                                        handler.search_and_format_context(
+                                            &user_id, &msgs, None, // request_context
+                                            None, // ranker
+                                            None, // query
+                                            None, // budget
+                                        ),
                                     )
                                     .await
                                     .and_then(|context| {
@@ -4681,12 +4783,18 @@ pub(crate) async fn forward_http(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
         ) {
+            //
+            // Off the request path: two parses of a ~200 kB body and, once a
+            // second, a temp-file + fsync + rename in the tracker, for a number
+            // nothing downstream reads. Measured 14.4 ms p50, 92 ms p99 and a
+            // 63 s max on this stage (2026-09-03, n=2,014). The tracker's mutex
+            // orders the writes; the `Bytes` clones are refcount bumps.
             let footprint_start = Instant::now();
-            record_request_footprint(
-                &state.savings_tracker,
-                &request_id,
-                &original_buffered,
-                &body_to_send,
+            spawn_request_footprint(
+                state.savings_tracker.clone(),
+                request_id.clone(),
+                original_buffered.clone(),
+                body_to_send.clone(),
             );
             stage_timer.record(
                 "footprint",
@@ -6038,6 +6146,7 @@ pub(crate) async fn forward_http(
             "pre_forward",
             "upstream",
         ],
+        inflight.count(),
     );
 
     Ok(response)
@@ -7995,6 +8104,7 @@ async fn run_sse_state_machine(
                     store.complete(&request_id, cache_baseline_read, cache_baseline_write);
                 }
             }
+            let split = state.output_split();
             tracing::info!(
                 request_id = %request_id,
                 provider = "anthropic",
@@ -8005,6 +8115,17 @@ async fn run_sse_state_machine(
                 cleared_input_tokens = state.cleared_input_tokens,
                 stop_reason = state.stop_reason.as_deref().unwrap_or(""),
                 blocks = state.blocks.len(),
+                // Which of the three buckets the output went to. Nothing in
+                // the log said whether a turn's tokens were thinking, prose or
+                // tool arguments, so there was no way to size an output lever
+                // without guessing from transcripts.
+                thinking_chars = split.thinking_chars,
+                text_chars = split.text_chars,
+                tool_input_chars = split.tool_input_chars,
+                thinking_blocks = split.thinking_blocks,
+                text_blocks = split.text_blocks,
+                tool_use_blocks = split.tool_use_blocks,
+                thinking_deltas = split.thinking_deltas,
                 "sse stream closed"
             );
             // A turn the client will refuse whole: it was told a tool call
@@ -8054,6 +8175,11 @@ async fn run_sse_state_machine(
                     status = ?state.status,
                     partial_input_tokens = state.usage.input_tokens,
                     partial_output_tokens = state.usage.output_tokens,
+                    // Same split as a clean close, so a day's output census
+                    // does not silently drop the turns that broke.
+                    thinking_chars = split.thinking_chars,
+                    text_chars = split.text_chars,
+                    tool_input_chars = split.tool_input_chars,
                     "stream ended without message_stop; usage is partial, \
                      so this turn is not booked into cost or savings"
                 );
@@ -8087,6 +8213,11 @@ async fn run_sse_state_machine(
                     input_tokens = ccr_rounds.input_tokens,
                     output_tokens = ccr_rounds.output_tokens,
                     cache_write_tokens = ccr_rounds.cache_write_tokens,
+                    // Folded into RequestOutcome since CCR-1 but never logged,
+                    // so `turn_cost_ledger` (which sums the rounds in) could
+                    // not be reconciled against `sse stream closed` (which
+                    // does not) on any turn that retrieved.
+                    cache_read_tokens = ccr_rounds.cache_read_tokens,
                     client_cache_read_tokens = cache_baseline_read,
                     client_cache_write_tokens = cache_baseline_write,
                     "billed CCR continuation rounds the client never saw"
@@ -9209,6 +9340,12 @@ pub(crate) async fn handle_ccr_response(
         // leaves the model with an unanswered `headroom_retrieve`. Overload
         // and transport blips are exactly what the retry is for; a 4xx is the
         // request itself being wrong, so retrying it would only burn quota.
+        //
+        // Timed because the span from here to "retrieval handled" ran a median
+        // of 62 s at 16:00 on 2026-09-03 against 4-11 s on the days before,
+        // and the log had nothing between the two lines to say whether the
+        // wait was upstream, the retries, or reading the stream.
+        let continuation_started = std::time::Instant::now();
         let mut attempt = 0;
         let resp = loop {
             let body = continuation_body.clone();
@@ -9257,11 +9394,23 @@ pub(crate) async fn handle_ccr_response(
                     request_id = %request_id,
                     attempts = attempt + 1,
                     error = %e,
+                    upstream_ms = continuation_started.elapsed().as_millis() as u64,
                     "ccr: upstream request failed during continuation"
                 );
                 break;
             }
         };
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_continuation_upstream",
+            round = rounds + 1,
+            attempts = attempt + 1,
+            status = resp.status().as_u16(),
+            // Time to response headers. What is left of the span up to
+            // "retrieval handled" is reading and rewriting the stream.
+            upstream_ms = continuation_started.elapsed().as_millis() as u64,
+            "ccr: continuation response headers received"
+        );
 
         if !resp.status().is_success() {
             // The status alone does not say which part of the request the
@@ -10109,6 +10258,49 @@ fn extract_tool_name(body: &[u8], endpoint: compression::CompressibleEndpoint) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The footprint moved to the blocking pool; the tracker must not notice.
+    #[tokio::test]
+    async fn spawned_footprint_records_what_the_inline_call_did() {
+        let original = bytes::Bytes::from_static(
+            br#"{"system":"s","tools":[{"name":"read","description":"r"}],"messages":[{"role":"user","content":[{"type":"tool_use","id":"t1","name":"read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}"#,
+        );
+        let on_the_wire = bytes::Bytes::from_static(
+            br#"{"system":"s plus injected text","tools":[{"name":"read","description":"r"},{"name":"memory_search","description":"m"}],"messages":[{"role":"user","content":[{"type":"tool_use","id":"t1","name":"read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}"#,
+        );
+        // A `None` path loads the live state file, which the running proxy
+        // rewrites between two loads; each tracker gets its own empty file.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = |name: &str| {
+            headroom_core::savings_tracker::SavingsTracker::new(Some(dir.path().join(name)), false)
+        };
+        let inline = fresh("inline.json");
+        record_request_footprint(&inline, "req-inline", &original, &on_the_wire);
+
+        let spawned = Arc::new(fresh("spawned.json"));
+        spawn_request_footprint(
+            spawned.clone(),
+            "req-spawned".to_string(),
+            original.clone(),
+            on_the_wire.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inline.proxy_overhead_report(),
+            spawned.proxy_overhead_report()
+        );
+        assert_eq!(
+            inline.tool_inventory_report(),
+            spawned.tool_inventory_report()
+        );
+        assert_ne!(
+            inline.proxy_overhead_report(),
+            fresh("untouched.json").proxy_overhead_report(),
+            "the fixture must move a counter or the comparison proves nothing"
+        );
+    }
 
     /// End-to-end unit test for `handle_ccr_response` on the OpenAI Responses
     /// shape: a `function_call` for `headroom_retrieve` in the upstream
