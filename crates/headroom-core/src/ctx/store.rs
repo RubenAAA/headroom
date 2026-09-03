@@ -165,6 +165,38 @@ pub struct SearchHit {
     pub match_layer: &'static str,
 }
 
+/// Where one `search` call spent its time, in milliseconds.
+///
+/// The proxy's memory stage measured 1,539 ms p50 (2026-09-03, n=2,014) as
+/// one number. These split it so a change to one step (term cap, trigram as
+/// fallback, rerank depth) is judged on that step. The four buckets are
+/// disjoint: a fuzzy re-run's FTS time lands in `porter_ms` / `trigram_ms`,
+/// and `fuzzy_ms` is the vocabulary correction alone. `reader_ms` is the
+/// wait for a connection: a pooled one is a pop, but past `MAX_IDLE_READERS`
+/// concurrent searches each open and tune a fresh one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SearchTimings {
+    pub reader_ms: f64,
+    pub porter_ms: f64,
+    pub trigram_ms: f64,
+    pub rerank_ms: f64,
+    pub fuzzy_ms: f64,
+}
+
+impl SearchTimings {
+    pub fn add(&mut self, other: &SearchTimings) {
+        self.reader_ms += other.reader_ms;
+        self.porter_ms += other.porter_ms;
+        self.trigram_ms += other.trigram_ms;
+        self.rerank_ms += other.rerank_ms;
+        self.fuzzy_ms += other.fuzzy_ms;
+    }
+}
+
+fn elapsed_ms(since: std::time::Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
+
 // ─────────────────────────────────────────────────────────
 // Internal chunk type
 // ─────────────────────────────────────────────────────────
@@ -604,9 +636,20 @@ impl CtxStore {
         queries: &[String],
         opts: &SearchOpts,
     ) -> rusqlite::Result<Vec<SearchHit>> {
+        self.search_timed(queries, opts).map(|(hits, _)| hits)
+    }
+
+    /// `search`, plus where the time went. Same hits, same order.
+    pub fn search_timed(
+        &self,
+        queries: &[String],
+        opts: &SearchOpts,
+    ) -> rusqlite::Result<(Vec<SearchHit>, SearchTimings)> {
+        let mut timings = SearchTimings::default();
         // Read-only work: take a pooled reader so concurrent searches run
         // concurrently. The shared connection is the fallback for the case
         // where opening one failed.
+        let reader_start = std::time::Instant::now();
         let reader = self.take_reader();
         let fallback;
         let conn: &Connection = match reader.as_ref() {
@@ -616,12 +659,13 @@ impl CtxStore {
                 &fallback
             }
         };
+        timings.reader_ms += elapsed_ms(reader_start);
 
         let mut merged: HashMap<String, SearchHit> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
 
         for query in queries {
-            let hits = search_with_fallback(conn, query, opts)?;
+            let hits = search_with_fallback(conn, query, opts, &mut timings)?;
             for hit in hits {
                 let key = format!("{}::{}", hit.source, hit.title);
                 match merged.get_mut(&key) {
@@ -668,7 +712,7 @@ impl CtxStore {
         if let Some(conn) = reader {
             self.give_reader(conn);
         }
-        Ok(results)
+        Ok((results, timings))
     }
 }
 
@@ -687,15 +731,18 @@ fn search_with_fallback(
     conn: &Connection,
     query: &str,
     opts: &SearchOpts,
+    timings: &mut SearchTimings,
 ) -> rusqlite::Result<Vec<SearchHit>> {
     let limit = opts.limit.max(1);
 
     // Step 1: RRF fusion.
-    let rrf = rrf_search(conn, query, limit, opts)?;
+    let rrf = rrf_search(conn, query, limit, opts, timings)?;
     if !rrf.is_empty() {
         let mut top: Vec<SearchHit> = rrf.into_iter().take(limit).collect();
         let depth = top.len().min(RERANK_DEPTH);
+        let rerank_start = std::time::Instant::now();
         apply_proximity_reranking(&mut top[..depth], query);
+        timings.rerank_ms += elapsed_ms(rerank_start);
         for h in &mut top {
             h.match_layer = "rrf";
         }
@@ -710,18 +757,22 @@ fn search_with_fallback(
         .map(|w| w.to_string())
         .collect();
     let original = words.join(" ");
+    let fuzzy_start = std::time::Instant::now();
     let corrected_words: Vec<String> = words
         .iter()
         .map(|w| fuzzy_correct(conn, w).unwrap_or_else(|| w.clone()))
         .collect();
+    timings.fuzzy_ms += elapsed_ms(fuzzy_start);
     let corrected = corrected_words.join(" ");
 
     if corrected != original {
-        let fuzzy = rrf_search(conn, &corrected, limit, opts)?;
+        let fuzzy = rrf_search(conn, &corrected, limit, opts, timings)?;
         if !fuzzy.is_empty() {
             let mut top: Vec<SearchHit> = fuzzy.into_iter().take(limit).collect();
             let depth = top.len().min(RERANK_DEPTH);
+            let rerank_start = std::time::Instant::now();
             apply_proximity_reranking(&mut top[..depth], &corrected);
+            timings.rerank_ms += elapsed_ms(rerank_start);
             for h in &mut top {
                 h.match_layer = "rrf-fuzzy";
             }
@@ -739,10 +790,15 @@ fn rrf_search(
     query: &str,
     limit: usize,
     opts: &SearchOpts,
+    timings: &mut SearchTimings,
 ) -> rusqlite::Result<Vec<SearchHit>> {
     let fetch_limit = (limit * 2).max(10);
+    let porter_start = std::time::Instant::now();
     let porter = fts_search(conn, FtsTable::Porter, query, fetch_limit, opts)?;
+    timings.porter_ms += elapsed_ms(porter_start);
+    let trigram_start = std::time::Instant::now();
     let trigram = fts_search(conn, FtsTable::Trigram, query, fetch_limit, opts)?;
+    timings.trigram_ms += elapsed_ms(trigram_start);
 
     // key -> (hit, score). Preserve first-seen order for stable output before
     // the score sort (matches JS Map iteration order).

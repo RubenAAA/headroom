@@ -33,9 +33,12 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
-use headroom_core::ctx::{CtxStore, IndexOpts, MemoryRecordStore, SearchOpts};
+use headroom_core::ctx::{
+    sanitize_query, CtxStore, IndexOpts, MemoryRecordStore, SearchOpts, SearchTimings,
+};
 
 use super::backend::{MemoryBackend, MemorySearchResult};
 use super::models::Memory;
@@ -57,6 +60,55 @@ const WIDE_SEARCH_LIMIT: usize = 2000;
 /// never re-sorted, so a related memory cannot displace a real match even
 /// when BM25 scored that match below this value.
 const RELATED_SCORE: f64 = 0.35;
+
+tokio::task_local! {
+    /// The proxy request a memory search belongs to, for the
+    /// `memory_search_timings` event.
+    ///
+    /// The search sits three calls below `forward_http`, behind the
+    /// `MemoryBackend` trait and a `spawn_blocking`, and the JSON log drops
+    /// span fields (`with_current_span(false)`), so the id travels by task
+    /// local rather than by widening the trait for one log line.
+    pub static SEARCH_REQUEST_ID: String;
+}
+
+/// Where one memory search spent its time, in milliseconds.
+///
+/// The memory stage measured 1,539 ms p50 against 65 ms for the rest of the
+/// proxy (2026-09-03, n=2,014), and nothing said which of narrow pass, wide
+/// pass, record loads or the FTS tables was to blame. `narrow_ms` and
+/// `wide_ms` each cover one `ranked_for_user` call whole; `load_ms` and
+/// `index` are the parts of those two the store and the index account for.
+#[derive(Debug, Default)]
+struct SearchProfile {
+    passes: u32,
+    narrow_ms: f64,
+    wide_ms: f64,
+    related_ms: f64,
+    hits_narrow: usize,
+    hits_wide: usize,
+    loads: usize,
+    load_ms: f64,
+    index: SearchTimings,
+}
+
+impl SearchProfile {
+    /// The first pass is the narrow one; any later pass is the wide one.
+    fn note_pass(&mut self, hits: usize, ms: f64) {
+        if self.passes == 0 {
+            self.hits_narrow = hits;
+            self.narrow_ms = ms;
+        } else {
+            self.hits_wide = hits;
+            self.wide_ms = ms;
+        }
+        self.passes += 1;
+    }
+}
+
+fn elapsed_ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
 
 /// Memory backend backed by the ctx FTS5 store plus a record sidecar.
 pub struct CtxMemoryBackend {
@@ -189,7 +241,9 @@ impl CtxMemoryBackend {
         user_id: &str,
         top_k: usize,
         limit: usize,
+        profile: &mut SearchProfile,
     ) -> Result<Vec<MemorySearchResult>, BackendError> {
+        let pass_start = Instant::now();
         let opts = SearchOpts {
             limit,
             ..Default::default()
@@ -212,12 +266,19 @@ impl CtxMemoryBackend {
                     english = %english,
                     "searching the English rendering alongside the original"
                 );
-                let original = self.index.search(&[query.to_string()], &opts)?;
-                let rendered = self.index.search(&[english], &opts)?;
+                let (original, timed) = self.index.search_timed(&[query.to_string()], &opts)?;
+                profile.index.add(&timed);
+                let (rendered, timed) = self.index.search_timed(&[english], &opts)?;
+                profile.index.add(&timed);
                 interleave(original, rendered, limit)
             }
-            None => self.index.search(&[query.to_string()], &opts)?,
+            None => {
+                let (hits, timed) = self.index.search_timed(&[query.to_string()], &opts)?;
+                profile.index.add(&timed);
+                hits
+            }
         };
+        let hit_count = hits.len();
 
         let mut out = Vec::new();
         // A memory is indexed as several chunks, so one memory can match more
@@ -234,7 +295,11 @@ impl CtxMemoryBackend {
                 continue;
             }
             // The source label is the memory id.
-            let Some(memory) = self.load(&hit.source)? else {
+            let load_start = Instant::now();
+            let loaded = self.load(&hit.source)?;
+            profile.loads += 1;
+            profile.load_ms += elapsed_ms(load_start);
+            let Some(memory) = loaded else {
                 // Indexed but no record: a crash between the two writes, or a
                 // record deleted without its index entry. Skip rather than
                 // fail the search — a missing memory must not break recall.
@@ -264,6 +329,7 @@ impl CtxMemoryBackend {
                 break;
             }
         }
+        profile.note_pass(hit_count, elapsed_ms(pass_start));
         Ok(out)
     }
 
@@ -435,6 +501,8 @@ impl CtxMemoryBackend {
         user_id: &str,
         top_k: usize,
         include_related: bool,
+        request_id: &str,
+        queue_ms: f64,
     ) -> Result<Vec<MemorySearchResult>, BackendError> {
         // `memory_list` asks for everything by searching for nothing. BM25 has
         // no answer to that — an empty query matches no documents — so the
@@ -471,27 +539,72 @@ impl CtxMemoryBackend {
         // Over-fetch: hits are filtered by user and validity below, and the
         // index cannot express either, so asking for exactly `top_k` would
         // return fewer after filtering.
+        let search_start = Instant::now();
+        let mut profile = SearchProfile::default();
         let narrow = top_k.saturating_mul(4).max(top_k);
-        let out = self.ranked_for_user(query, user_id, top_k, narrow)?;
-        if out.len() >= top_k {
-            return Ok(out);
-        }
+        let narrow_out = self.ranked_for_user(query, user_id, top_k, narrow, &mut profile)?;
+        let out = if narrow_out.len() >= top_k {
+            narrow_out
+        } else {
+            // One index serves every project, but the partition filter runs
+            // after ranking — so a project holding 37 memories can be pushed
+            // off the first page entirely by one holding 155, and come back
+            // empty while a perfectly good match sits at rank 50. Widen when
+            // the narrow page did not fill, which costs a second query only on
+            // the searches that need one.
+            let wide =
+                self.ranked_for_user(query, user_id, top_k, WIDE_SEARCH_LIMIT, &mut profile)?;
+            let mut out = if wide.len() > narrow_out.len() {
+                wide
+            } else {
+                narrow_out
+            };
 
-        // One index serves every project, but the partition filter runs after
-        // ranking — so a project holding 37 memories can be pushed off the
-        // first page entirely by one holding 155, and come back empty while a
-        // perfectly good match sits at rank 50. Widen when the narrow page did
-        // not fill, which costs a second query only on the searches that need
-        // one.
-        let wide = self.ranked_for_user(query, user_id, top_k, WIDE_SEARCH_LIMIT)?;
-        let mut out = if wide.len() > out.len() { wide } else { out };
+            // Only once the text index has had both attempts and still left
+            // room. Expansion fills empty slots; it never competes for full
+            // ones.
+            if include_related && out.len() < top_k {
+                let want = top_k - out.len();
+                let related_start = Instant::now();
+                out.extend(self.related_to(&out, user_id, want)?);
+                profile.related_ms += elapsed_ms(related_start);
+            }
+            out
+        };
 
-        // Only once the text index has had both attempts and still left room.
-        // Expansion fills empty slots; it never competes for full ones.
-        if include_related && out.len() < top_k {
-            let want = top_k - out.len();
-            out.extend(self.related_to(&out, user_id, want)?);
-        }
+        // The terms the FTS tables were asked for: the sanitizer drops
+        // stopwords and caps at `MAX_QUERY_TERMS`, and trigram cost is linear
+        // in what survives. The count is what plan 1a's term cap is judged on.
+        let sanitized = sanitize_query(query, true);
+        let term_count = if sanitized == "\"\"" {
+            0
+        } else {
+            sanitized.split(" OR ").count()
+        };
+        tracing::info!(
+            target: "headroom.proxy",
+            event = "memory_search_timings",
+            request_id = %request_id,
+            term_count = term_count,
+            query_chars = query.chars().count(),
+            queue_ms = queue_ms,
+            total_ms = elapsed_ms(search_start),
+            narrow_ms = profile.narrow_ms,
+            wide_ms = profile.wide_ms,
+            wide_ran = profile.passes > 1,
+            related_ms = profile.related_ms,
+            hits_narrow = profile.hits_narrow,
+            hits_wide = profile.hits_wide,
+            loads = profile.loads,
+            load_ms = profile.load_ms,
+            reader_ms = profile.index.reader_ms,
+            porter_ms = profile.index.porter_ms,
+            trigram_ms = profile.index.trigram_ms,
+            rerank_ms = profile.index.rerank_ms,
+            fuzzy_ms = profile.index.fuzzy_ms,
+            results = out.len(),
+            "memory search sub-stage timings"
+        );
         Ok(out)
     }
 
@@ -583,8 +696,24 @@ impl MemoryBackend for CtxMemoryBackend {
     ) -> Result<Vec<MemorySearchResult>, BackendError> {
         let query = query.to_string();
         let user_id = user_id.to_string();
+        // Read here, on the task that set it: the blocking thread has no task
+        // locals.
+        let request_id = SEARCH_REQUEST_ID
+            .try_with(|id| id.clone())
+            .unwrap_or_default();
+        // The wait for a blocking thread sits inside the proxy's memory stage
+        // but outside the search, so it is timed on its own.
+        let queued_at = Instant::now();
         self.blocking(move |backend| {
-            backend.search_memories_sync(&query, &user_id, top_k, include_related)
+            let queue_ms = elapsed_ms(queued_at);
+            backend.search_memories_sync(
+                &query,
+                &user_id,
+                top_k,
+                include_related,
+                &request_id,
+                queue_ms,
+            )
         })
         .await
     }

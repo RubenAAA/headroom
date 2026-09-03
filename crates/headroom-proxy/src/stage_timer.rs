@@ -94,6 +94,7 @@ pub fn emit_stage_timings_log(
     session_id: &str,
     stage_timer: &StageTimer,
     expected_stages: &[&str],
+    inflight: usize,
 ) -> String {
     let summary = stage_timer.summary();
 
@@ -138,6 +139,7 @@ pub fn emit_stage_timings_log(
         request_id = %request_id,
         session_id = %session_id,
         total_ms = total_ms,
+        inflight = inflight,
         stages = %serde_json::Value::Object(stages_map.clone()),
         "per-stage request timings"
     );
@@ -148,6 +150,7 @@ pub fn emit_stage_timings_log(
         "request_id": request_id,
         "session_id": session_id,
         "total_ms": total_ms,
+        "inflight": inflight,
         "stages": stages_map,
     });
 
@@ -201,10 +204,12 @@ mod tests {
             "sess-1",
             &timer,
             &["parse", "compress", "forward"],
+            3,
         );
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(v["event"], "stage_timings");
         assert_eq!(v["path"], "/v1/messages");
+        assert_eq!(v["inflight"], 3);
         assert_eq!(v["stages"]["parse"], serde_json::Value::Null);
         assert_eq!(v["stages"]["compress"], 5.0);
         assert_eq!(v["stages"]["forward"], serde_json::Value::Null);
