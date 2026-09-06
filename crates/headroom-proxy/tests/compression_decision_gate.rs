@@ -221,3 +221,152 @@ async fn no_messages_forwards_byte_identical() {
     assert_eq!(tool_names(&upstream_body), vec!["zebra", "apple", "mango"]);
     proxy.shutdown().await;
 }
+
+// ── Auxiliary-pass gating (upstream fb79055b) ────────────────────────────
+//
+// The tool-schema compaction stage runs after the compression dispatcher, so
+// the dispatcher's own `should_compress` gate does not cover it. These tests
+// pin that the stage honors the same decision: a request the decision passes
+// through keeps its tools byte-identical. The discriminator is a tools array
+// that `compact_tools` strips (`$schema`/`title`/`examples` annotation keys)
+// but that the E1 tool-sort leaves alone (names already alphabetical), so any
+// mutation is attributable to the auxiliary stage only.
+
+/// Tools carrying JSON Schema annotation keys, names already sorted so the
+/// E1 tool-sort is a no-op and only the compaction stage can mutate them.
+fn compactable_tools_payload(messages: Value) -> Vec<u8> {
+    let schema = |title: &str| {
+        json!({
+            "type": "object",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": title,
+            "properties": {"q": {"type": "string"}},
+            "examples": [{"q": "x"}],
+        })
+    };
+    let payload = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 32,
+        "messages": messages,
+        "tools": [
+            {"name": "apple", "description": "a", "input_schema": schema("AppleArgs")},
+            {"name": "mango", "description": "m", "input_schema": schema("MangoArgs")},
+        ],
+    });
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn upstream_tools_keep_schema_keys(body: &[u8]) -> bool {
+    let v: Value = serde_json::from_slice(body).unwrap();
+    v["tools"].as_array().unwrap().iter().all(|t| {
+        t.get("input_schema")
+            .and_then(|s| s.get("$schema"))
+            .is_some()
+    })
+}
+
+/// Control: with the gate open the annotation keys ARE stripped — confirms
+/// the fixture discriminates (guards the bypass tests from silently passing
+/// because compaction never fires).
+#[tokio::test]
+async fn control_compactable_tools_are_stripped_when_gate_open() {
+    let upstream = MockServer::start().await;
+    let captured = mount_anthropic_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.compression_mode = CompressionMode::LiveZone;
+    })
+    .await;
+
+    let body = compactable_tools_payload(json!([{"role": "user", "content": "hi"}]));
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("x-api-key", "sk-ant-api03-abc")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let upstream_body = captured.lock().unwrap().clone().unwrap();
+    assert!(
+        !upstream_tools_keep_schema_keys(&upstream_body),
+        "gate open: auxiliary compaction must strip the annotation keys"
+    );
+    proxy.shutdown().await;
+}
+
+/// `no_messages` passthrough (decision false inside the buffered branch) →
+/// the auxiliary compaction stage is skipped: byte-identical, keys intact.
+#[tokio::test]
+async fn no_messages_skips_tool_schema_compaction() {
+    let upstream = MockServer::start().await;
+    let captured = mount_anthropic_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.compression_mode = CompressionMode::LiveZone;
+    })
+    .await;
+
+    let body = compactable_tools_payload(json!([]));
+    let sent_sha = sha256_hex(&body);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("x-api-key", "sk-ant-api03-abc")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let upstream_body = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        sha256_hex(&upstream_body),
+        sent_sha,
+        "no_messages must be byte-faithful (auxiliary compaction skipped)"
+    );
+    assert!(
+        upstream_tools_keep_schema_keys(&upstream_body),
+        "no_messages: tools must keep their annotation keys"
+    );
+    proxy.shutdown().await;
+}
+
+/// `compression_mode = Off` with the master switch on: the dispatcher passes
+/// through, and the auxiliary stage must too — byte-identical, keys intact.
+#[tokio::test]
+async fn compression_mode_off_skips_tool_schema_compaction() {
+    let upstream = MockServer::start().await;
+    let captured = mount_anthropic_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.compression_mode = CompressionMode::Off;
+    })
+    .await;
+
+    let body = compactable_tools_payload(json!([{"role": "user", "content": "hi"}]));
+    let sent_sha = sha256_hex(&body);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("x-api-key", "sk-ant-api03-abc")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let upstream_body = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        sha256_hex(&upstream_body),
+        sent_sha,
+        "mode Off must be byte-faithful (auxiliary compaction skipped)"
+    );
+    assert!(
+        upstream_tools_keep_schema_keys(&upstream_body),
+        "mode Off: tools must keep their annotation keys"
+    );
+    proxy.shutdown().await;
+}

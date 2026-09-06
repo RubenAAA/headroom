@@ -64,6 +64,41 @@ pub fn cache_economics(provider: &str) -> CacheEconomics {
     }
 }
 
+/// Split `tokens` into `(read, write, list)` shares by a request's cache mix.
+///
+/// Removed tokens would have ridden the same region of the request as the mix
+/// passed in, so the observed mix is the best available estimate of the rate
+/// they would have been billed at. Callers choose which mix to pass: message
+/// compression passes `cache_read_tokens = 0` (it rewrites the live zone
+/// only — the frozen prefix it never touches is where the reads are), while
+/// anything that sat in the cached prefix passes the full request mix. A
+/// request with no billed input breakdown falls back to list for the whole
+/// amount.
+pub fn bucket_by_cache_mix(
+    tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    uncached_tokens: i64,
+) -> (f64, f64, f64) {
+    if tokens <= 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let read = cache_read_tokens.max(0) as f64;
+    let write = cache_write_tokens.max(0) as f64;
+    let uncached = uncached_tokens.max(0) as f64;
+    let billed = read + write + uncached;
+    if billed <= 0.0 {
+        return (0.0, 0.0, tokens as f64);
+    }
+    let read_part = tokens as f64 * read / billed;
+    let write_part = tokens as f64 * write / billed;
+    (
+        read_part,
+        write_part,
+        tokens as f64 - read_part - write_part,
+    )
+}
+
 /// Strip enriched detail so each tag is safe in the comma-joined
 /// `x-headroom-transforms` header. `smart_crush:<n>:<names>` and
 /// `read_lifecycle:<state>:<path>` collapse to their legacy counter shape.
@@ -148,6 +183,10 @@ pub struct TokenRecord {
     pub cache_write_1h_tokens: i64,
     pub uncached_tokens: i64,
     pub output_tokens: i64,
+    /// The write counter was inferred, not billed (e.g. OpenAI). An inferred
+    /// write is not a billed write, so the removed tokens' counterfactual
+    /// prices them at list, not at the cache-write rate.
+    pub cache_inferred: bool,
 }
 
 #[derive(Default)]
@@ -160,6 +199,11 @@ struct PerModel {
     cache_write_5m: HashMap<String, i64>,
     cache_write_1h: HashMap<String, i64>,
     uncached: HashMap<String, i64>,
+    output_tokens: HashMap<String, i64>,
+    /// Live-zone shares of the removed tokens, for the cache-aware savings
+    /// counterfactual. Floats: per-request splits, not whole tokens.
+    saved_write: HashMap<String, f64>,
+    saved_list: HashMap<String, f64>,
 }
 
 struct Inner {
@@ -288,6 +332,25 @@ impl CostTracker {
         *m.cache_write_5m.entry(model.to_string()).or_default() += rec.cache_write_5m_tokens;
         *m.cache_write_1h.entry(model.to_string()).or_default() += rec.cache_write_1h_tokens;
         *m.uncached.entry(model.to_string()).or_default() += rec.uncached_tokens;
+        *m.output_tokens.entry(model.to_string()).or_default() += rec.output_tokens.max(0);
+
+        // Cache-aware counterfactual buckets for the removed tokens. Message
+        // compression rewrites the live zone only — the frozen, cache-read
+        // prefix is preserved byte-for-byte — so the removed tokens could
+        // never have been billed as cache reads. Split over the live-zone
+        // mix (write + uncached); pricing a warm turn's savings at ~0.1x
+        // list is what made the headline irreconcilable with tokens saved.
+        if tokens_saved > 0 {
+            let write_eff = if rec.cache_inferred {
+                0
+            } else {
+                rec.cache_write_tokens.max(0)
+            };
+            let (_, write_part, list_part) =
+                bucket_by_cache_mix(tokens_saved, 0, write_eff, rec.uncached_tokens.max(0));
+            *m.saved_write.entry(model.to_string()).or_default() += write_part;
+            *m.saved_list.entry(model.to_string()).or_default() += list_part;
+        }
 
         if let Some(cost) = cost {
             inner.costs.push_back((Local::now(), cost));
@@ -408,6 +471,10 @@ impl CostTracker {
         }
 
         // Compression savings: saved tokens at the model's list input price.
+        // This is simple, monotonic, and transparent — each saved token is valued
+        // at the published $/token rate for its model. Not affected by cache mix.
+        // Budget enforcement reads this figure, so it stays as-is; the
+        // cache-aware valuation below is reported alongside it.
         let mut savings_usd = 0.0f64;
         for (model, &saved) in &m.tokens_saved {
             if saved <= 0 {
@@ -415,6 +482,36 @@ impl CostTracker {
             }
             if let Some(price) = Self::list_price_per_token(model) {
                 savings_usd += saved as f64 * price;
+            }
+        }
+
+        // Completion spend. The input-only figure above is what a budget and
+        // the per-model table want; a card that says "spent" has to include
+        // the tokens the model emitted, or the spend it shows isn't the bill.
+        let mut output_cost_usd = 0.0f64;
+        for (model, &out_tokens) in &m.output_tokens {
+            if out_tokens <= 0 {
+                continue;
+            }
+            if let Some(p) = crate::pricing::lookup(model) {
+                output_cost_usd += out_tokens as f64 * p.output_cost_per_token;
+            }
+        }
+
+        // Compression savings priced at the rate the removed tokens would
+        // actually have been billed at: live-zone content, so the provider's
+        // cache-write rate for the share that would have been (re)cached on
+        // this turn and list for the rest. Flat list pricing (`savings_usd`)
+        // ignores the mix. Reported separately so budget enforcement keeps
+        // its monotonic list-priced basis; the session summary prefers this one.
+        let mut cache_aware_savings_usd = 0.0f64;
+        for (model, &write_part) in &m.saved_write {
+            let list_part = m.saved_list.get(model).copied().unwrap_or(0.0);
+            if write_part <= 0.0 && list_part <= 0.0 {
+                continue;
+            }
+            if let Some((_, cw_price, uncached_price)) = Self::cache_prices(model) {
+                cache_aware_savings_usd += write_part * cw_price + list_part * uncached_price;
             }
         }
 
@@ -428,8 +525,14 @@ impl CostTracker {
             "cache_write_5m_tokens": sum5m,
             "cache_write_1h_tokens": sum1h,
             "per_model": Value::Object(per_model),
+            // Input-only, unchanged: budgets, the per-model table and the
+            // persistent savings tracker all read it as input spend.
             "cost_with_headroom_usd": round_n(cost_with_headroom, 4),
+            "output_cost_usd": round_n(output_cost_usd, 4),
+            // What the session actually cost, input + output.
+            "total_cost_usd": round_n(cost_with_headroom + output_cost_usd, 4),
             "savings_usd": round_n(savings_usd, 4),
+            "cache_aware_savings_usd": round_n(cache_aware_savings_usd, 4),
             "budget_limit_usd": self.budget_limit_usd,
             "budget_period": self.budget_period,
         })
@@ -450,12 +553,20 @@ impl CostTracker {
 /// map of `model_name → input_price_per_token`. Returns the first model
 /// whose name matches the provider via simple prefix heuristics.
 pub fn find_model_input_price(provider: &str, model_prices: &HashMap<String, f64>) -> Option<f64> {
-    for (model, price) in model_prices {
-        if provider_model_matches(provider, model) {
-            return Some(*price);
-        }
-    }
-    None
+    find_provider_model(provider, model_prices).and_then(|m| model_prices.get(m).copied())
+}
+
+/// Name of the first model in `model_prices` matching `provider` via the
+/// same prefix heuristics. The prefix-cache builder prices the provider row
+/// off that model's list rate and — where the vendored table publishes cache
+/// rates for it — off its cache rates too.
+fn find_provider_model<'a>(
+    provider: &str,
+    model_prices: &'a HashMap<String, f64>,
+) -> Option<&'a String> {
+    model_prices
+        .keys()
+        .find(|model| provider_model_matches(provider, model))
 }
 
 /// Simple model→provider matching (mirrors Python's prefix heuristics in
@@ -567,6 +678,10 @@ pub struct ProviderCacheStats {
     pub write_premium_usd: f64,
     pub net_savings_usd: f64,
     pub label: String,
+    /// Where the row's read/write multipliers came from: `"vendored"` when
+    /// the model's per-model cache rates were used, `"provider_default"`
+    /// when the hardcoded provider table stood in.
+    pub cache_pricing_source: String,
     pub observed_ttl_buckets: CacheTtlBuckets,
 }
 
@@ -682,10 +797,25 @@ pub fn build_prefix_cache_stats(input: &PrefixCacheStatsInput) -> PrefixCacheSta
         }
 
         let econ = cache_economics(provider);
-        let read_mult = econ.read_multiplier;
-        let write_mult = econ.write_multiplier;
+        let mut read_mult = econ.read_multiplier;
+        let mut write_mult = econ.write_multiplier;
 
         let input_price = find_model_input_price(provider, input.model_prices);
+
+        // Per-model cache rates win over the hardcoded provider table, which
+        // cannot express a model's actual published cache rates. The table
+        // stays as the fallback for models with no vendored cache pricing.
+        let mut pricing_source = "provider_default";
+        if let Some(matched) = find_provider_model(provider, input.model_prices) {
+            if let Some(p) = crate::pricing::lookup(matched) {
+                let uncached = p.input_cost_per_token;
+                if uncached > 0.0 {
+                    read_mult = p.cache_read_cost_per_token.unwrap_or(uncached) / uncached;
+                    write_mult = p.cache_write_cost_per_token.unwrap_or(uncached) / uncached;
+                    pricing_source = "vendored";
+                }
+            }
+        }
 
         let mut savings_usd = 0.0;
         let mut write_premium_usd = 0.0;
@@ -758,6 +888,7 @@ pub fn build_prefix_cache_stats(input: &PrefixCacheStatsInput) -> PrefixCacheSta
                 write_premium_usd: round_n(write_premium_usd, 4),
                 net_savings_usd: round_n(savings_usd - write_premium_usd, 4),
                 label: econ.label.to_string(),
+                cache_pricing_source: pricing_source.to_string(),
                 observed_ttl_buckets: CacheTtlBuckets {
                     tokens_5m: pc.cache_write_5m_tokens,
                     requests_5m: pc.cache_write_5m_requests,
@@ -928,8 +1059,17 @@ pub struct CompressedRequestLog {
 /// Cost stats from [`CostTracker::stats()`] (the `cost_stats` dict).
 #[derive(Debug, Clone, Default)]
 pub struct CostSummary {
+    /// Input-only spend. Unchanged: budgets read it.
     pub cost_with_headroom_usd: f64,
+    /// List-priced compression savings. Unchanged: budgets read it.
     pub savings_usd: f64,
+    /// Completion spend (output tokens at the model's output rate).
+    pub output_cost_usd: f64,
+    /// Whole bill, input + output.
+    pub total_cost_usd: f64,
+    /// Compression savings at the rate the removed tokens would actually
+    /// have been billed at. The headline prefers this; budgets keep `savings_usd`.
+    pub cache_aware_savings_usd: f64,
 }
 
 /// MCP-side compression events (from `_aggregate_mcp_events`).
@@ -983,6 +1123,9 @@ pub struct CompressionSummary {
 pub struct CostBreakdown {
     pub cache_savings_usd: f64,
     pub compression_savings_usd: f64,
+    /// The same compression figure at list price, for comparison (and for
+    /// budget reasoning, which stays list-priced).
+    pub compression_savings_list_usd: f64,
 }
 
 /// Cost summary for the dashboard.
@@ -990,8 +1133,14 @@ pub struct CostBreakdown {
 pub struct CostSummaryOutput {
     pub without_headroom_usd: f64,
     pub with_headroom_usd: f64,
+    pub with_headroom_input_usd: f64,
+    pub with_headroom_output_usd: f64,
     pub total_saved_usd: f64,
     pub savings_pct: f64,
+    /// Provider-side, NOT part of `total_saved_usd`: the discount the
+    /// provider gives on cache reads, which Headroom helps land but does not
+    /// create. Already reflected in `with_headroom_usd`.
+    pub provider_cache_discount_usd: f64,
     pub breakdown: CostBreakdown,
 }
 
@@ -1095,12 +1244,45 @@ pub fn build_session_summary(input: &SessionSummaryInput) -> SessionSummary {
         })
         .unwrap_or((0.0, String::new()));
 
-    let cost_with = input
+    let cost_input = input
         .cost_stats
         .map(|c| c.cost_with_headroom_usd)
         .unwrap_or(0.0);
-    let compression_savings = input.cost_stats.map(|c| c.savings_usd).unwrap_or(0.0);
+    let cost_output = input.cost_stats.map(|c| c.output_cost_usd).unwrap_or(0.0);
+    let cost_with = input
+        .cost_stats
+        .map(|c| {
+            if c.total_cost_usd > 0.0 {
+                c.total_cost_usd
+            } else {
+                c.cost_with_headroom_usd + c.output_cost_usd
+            }
+        })
+        .unwrap_or(0.0);
+    // Cache-aware valuation of the compressed-away tokens: what they would
+    // actually have been billed at, given the cache mix of the requests they
+    // were removed from. The list-priced figure feeds budgets and is kept in
+    // the breakdown for comparison.
+    let compression_list = input.cost_stats.map(|c| c.savings_usd).unwrap_or(0.0);
+    let compression_cache_aware = input
+        .cost_stats
+        .map(|c| c.cache_aware_savings_usd)
+        .unwrap_or(0.0);
+    let compression_savings = if compression_cache_aware > 0.0 {
+        compression_cache_aware
+    } else {
+        compression_list
+    };
+    // The headline counts only what Headroom itself saved. The provider's
+    // prefix-cache discount is reported BESIDE it, never inside it: that
+    // discount is paid on cache reads whether or not Headroom is in the path,
+    // and it dwarfs compression on a long agent session, so folding it in
+    // produced a card that couldn't be reconciled with Tokens Saved.
+    let provider_discount = input.cache_net_savings_usd;
     let total_saved_usd = round_n(compression_savings, 2);
+    // Baseline = what this session would have cost without Headroom, on the
+    // same provider terms (cache discount included on both sides, since it
+    // applies either way).
     let cost_without = cost_with + compression_savings;
     let savings_pct_cost = if cost_without > 0.0 {
         round_n(total_saved_usd / cost_without * 100.0, 1)
@@ -1145,11 +1327,15 @@ pub fn build_session_summary(input: &SessionSummaryInput) -> SessionSummary {
         cost: CostSummaryOutput {
             without_headroom_usd: round_n(cost_without, 2),
             with_headroom_usd: round_n(cost_with, 2),
+            with_headroom_input_usd: round_n(cost_input, 2),
+            with_headroom_output_usd: round_n(cost_output, 2),
             total_saved_usd,
             savings_pct: savings_pct_cost,
+            provider_cache_discount_usd: round_n(provider_discount, 2),
             breakdown: CostBreakdown {
                 cache_savings_usd: round_n(input.cache_net_savings_usd, 2),
                 compression_savings_usd: round_n(compression_savings, 2),
+                compression_savings_list_usd: round_n(compression_list, 2),
             },
         },
         mcp: input.mcp_events.cloned(),
@@ -1357,6 +1543,8 @@ mod tests {
         let anthropic = &stats.by_provider["anthropic"];
         assert_eq!(anthropic.read_discount, "90%");
         assert_eq!(anthropic.write_premium, "25%");
+        // claude-sonnet-4's vendored rates match the table ratios exactly.
+        assert_eq!(anthropic.cache_pricing_source, "vendored");
     }
 
     #[test]
@@ -1533,6 +1721,7 @@ mod tests {
             cost_stats: Some(&CostSummary {
                 cost_with_headroom_usd: 1.5,
                 savings_usd: 0.5,
+                ..Default::default()
             }),
             mcp_events: None,
             codex_ws: None,
@@ -1547,6 +1736,10 @@ mod tests {
         assert_eq!(s.compression.cli_filtering_tokens_avoided, 100);
         assert_eq!(s.cost.with_headroom_usd, 1.5);
         assert_eq!(s.cost.total_saved_usd, 0.5);
+        // No cache-aware figure supplied → headline falls back to list.
+        assert_eq!(s.cost.breakdown.compression_savings_list_usd, 0.5);
+        // No provider discount folded into the headline.
+        assert_eq!(s.cost.provider_cache_discount_usd, 0.0);
         // cost_without = 1.5 + 0.5 = 2.0, savings_pct = 0.5/2.0*100 = 25.0
         assert!((s.cost.savings_pct - 25.0).abs() < 0.1);
         // uncompressed: 1 entry with tokens_saved=0 and no transforms → prefix_frozen
@@ -1554,6 +1747,178 @@ mod tests {
             *s.uncompressed_requests.get("prefix_frozen").unwrap_or(&0),
             1
         );
+    }
+
+    #[test]
+    fn bucket_by_cache_mix_splits_proportionally() {
+        let (r, w, l) = bucket_by_cache_mix(1000, 800, 100, 100);
+        assert!((r - 800.0).abs() < 1e-9);
+        assert!((w - 100.0).abs() < 1e-9);
+        assert!((l - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bucket_by_cache_mix_falls_back_to_list() {
+        // No billed breakdown → whole amount at list.
+        assert_eq!(bucket_by_cache_mix(500, 0, 0, 0), (0.0, 0.0, 500.0));
+        // Nothing removed → nothing bucketed.
+        assert_eq!(bucket_by_cache_mix(0, 800, 100, 100), (0.0, 0.0, 0.0));
+        // Live-zone mix (read = 0): warm-turn savings are not worth 0.1x.
+        let (r, w, l) = bucket_by_cache_mix(1000, 0, 3000, 2000);
+        assert_eq!(r, 0.0);
+        assert!((w - 600.0).abs() < 1e-9);
+        assert!((l - 400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_reports_output_and_cache_aware_savings() {
+        // Sonnet-4: input $3/M, output $15/M, read $0.30/M, write $3.75/M.
+        let t = CostTracker::new(None, "daily");
+        t.record_tokens(
+            "claude-sonnet-4",
+            &TokenRecord {
+                tokens_saved: 1000,
+                tokens_sent: 35000,
+                cache_read_tokens: 30000,
+                cache_write_tokens: 3000,
+                uncached_tokens: 2000,
+                output_tokens: 800,
+                ..Default::default()
+            },
+        );
+        let s = t.stats();
+        // List-priced figure unchanged (budgets read it): 1000 * 3e-6.
+        assert!((s["savings_usd"].as_f64().unwrap() - 0.003).abs() < 1e-9);
+        // Cache-aware: reads excluded (live zone), 600 @ write + 400 @ list.
+        // (stats() rounds to 4dp, hence the loose tolerance.)
+        let aware = s["cache_aware_savings_usd"].as_f64().unwrap();
+        assert!((aware - 0.00345).abs() < 1e-4);
+        // Completion spend: 800 * 15e-6 = 0.012; total adds input 0.02625.
+        assert!((s["output_cost_usd"].as_f64().unwrap() - 0.012).abs() < 1e-9);
+        assert!((s["total_cost_usd"].as_f64().unwrap() - 0.03825).abs() < 1e-4);
+        // Input-only spend untouched.
+        assert!((s["cost_with_headroom_usd"].as_f64().unwrap() - 0.02625).abs() < 1e-4);
+    }
+
+    #[test]
+    fn stats_inferred_writes_price_removed_tokens_at_list() {
+        // An inferred (unbilled) write counter must not pull the removed
+        // tokens onto the cache-write rate.
+        let t = CostTracker::new(None, "daily");
+        t.record_tokens(
+            "claude-sonnet-4",
+            &TokenRecord {
+                tokens_saved: 1000,
+                tokens_sent: 10000,
+                cache_write_tokens: 9000,
+                uncached_tokens: 1000,
+                cache_inferred: true,
+                ..Default::default()
+            },
+        );
+        let s = t.stats();
+        assert!((s["cache_aware_savings_usd"].as_f64().unwrap() - 0.003).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prefix_cache_stats_prefers_vendored_rates() {
+        // gemini-2.5-flash publishes a 0.25x read rate; the hardcoded gemini
+        // table says 0.1x. Per-model pricing must win.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gemini".into(),
+            ProviderCacheInput {
+                cache_read_tokens: 10000,
+                uncached_input_tokens: 2000,
+                requests: 10,
+                hit_requests: 8,
+                ..Default::default()
+            },
+        );
+        let mut model_prices = HashMap::new();
+        model_prices.insert("gemini-2.5-flash".into(), 0.30 / 1_000_000.0);
+
+        let input = PrefixCacheStatsInput {
+            providers: &providers,
+            model_prices: &model_prices,
+            miss_attribution: &HashMap::new(),
+            prefix_freeze: &PrefixFreezeInput::default(),
+            compression_vs_cache: &CompressionVsCacheInput::default(),
+            tokens_saved_by_compression: 0,
+        };
+        let stats = build_prefix_cache_stats(&input);
+        let g = &stats.by_provider["gemini"];
+        assert_eq!(g.cache_pricing_source, "vendored");
+        // 10000 * 0.3e-6 * (1 - 0.25) = 0.00225 (table would give 0.0027).
+        assert!((g.savings_usd - 0.00225).abs() < 0.0001);
+    }
+
+    #[test]
+    fn prefix_cache_stats_falls_back_to_provider_table() {
+        // No priced model for the provider: no vendored rates to prefer →
+        // provider_default, table mults, zero priced savings.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".into(),
+            ProviderCacheInput {
+                cache_read_tokens: 10000,
+                uncached_input_tokens: 2000,
+                requests: 10,
+                hit_requests: 8,
+                ..Default::default()
+            },
+        );
+
+        let input = PrefixCacheStatsInput {
+            providers: &providers,
+            model_prices: &HashMap::new(),
+            miss_attribution: &HashMap::new(),
+            prefix_freeze: &PrefixFreezeInput::default(),
+            compression_vs_cache: &CompressionVsCacheInput::default(),
+            tokens_saved_by_compression: 0,
+        };
+        let stats = build_prefix_cache_stats(&input);
+        let a = &stats.by_provider["anthropic"];
+        assert_eq!(a.cache_pricing_source, "provider_default");
+        assert_eq!(a.savings_usd, 0.0);
+    }
+
+    #[test]
+    fn session_summary_headline_excludes_provider_discount() {
+        // Cache-aware compression 1.05, list 4.20, provider discount 23.62,
+        // whole bill 11.47 (7.88 in + 3.60 out, approx).
+        let models = HashMap::new();
+        let input = SessionSummaryInput {
+            mode: "token",
+            compressed_requests: &[],
+            cache_net_savings_usd: 23.62,
+            cli_tokens_avoided: 0,
+            total_tokens_before: 0,
+            tokens_saved_total: 1_400_100,
+            requests_by_model: &models,
+            cost_stats: Some(&CostSummary {
+                cost_with_headroom_usd: 7.88,
+                savings_usd: 4.20,
+                output_cost_usd: 3.60,
+                total_cost_usd: 11.47,
+                cache_aware_savings_usd: 1.05,
+            }),
+            mcp_events: None,
+            codex_ws: None,
+        };
+        let s = build_session_summary(&input);
+        // Headline is Headroom's alone; the provider discount sits beside it.
+        assert!((s.cost.total_saved_usd - 1.05).abs() < 1e-9);
+        assert!((s.cost.provider_cache_discount_usd - 23.62).abs() < 1e-9);
+        // "Spent" is the whole bill, and the baseline keeps provider terms
+        // on both sides (discount NOT added back in).
+        assert!((s.cost.with_headroom_usd - 11.47).abs() < 1e-9);
+        assert!((s.cost.with_headroom_input_usd - 7.88).abs() < 1e-9);
+        assert!((s.cost.with_headroom_output_usd - 3.60).abs() < 1e-9);
+        assert!((s.cost.without_headroom_usd - 12.52).abs() < 1e-9);
+        // List figure kept for comparison.
+        assert!((s.cost.breakdown.compression_savings_list_usd - 4.20).abs() < 1e-9);
+        assert!((s.cost.breakdown.compression_savings_usd - 1.05).abs() < 1e-9);
     }
 
     #[test]

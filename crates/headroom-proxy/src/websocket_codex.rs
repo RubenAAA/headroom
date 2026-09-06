@@ -706,6 +706,7 @@ impl OutcomeSink for CodexWsOutcomeSink {
             cache_write_1h_tokens: outcome.cache_write_1h_tokens,
             uncached_tokens: outcome.uncached_input_tokens,
             output_tokens: outcome.output_tokens,
+            cache_inferred: outcome.cache_inferred,
         };
         self.cost_tracker.record_tokens(&outcome.model, &rec);
     }

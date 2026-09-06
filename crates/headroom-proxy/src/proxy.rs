@@ -911,6 +911,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             cache_write_1h_tokens: outcome.cache_write_1h_tokens,
             uncached_tokens: outcome.uncached_input_tokens,
             output_tokens: outcome.output_tokens,
+            cache_inferred: outcome.cache_inferred,
         };
         self.cost_tracker.record_tokens(&outcome.model, &rec);
     }
@@ -4777,7 +4778,24 @@ pub(crate) async fn forward_http(
         // endpoint (routing, sanitising, pruning and CCR injection are all
         // done), so what goes on the wire is what gets compacted. Byte-
         // identical passthrough when there is nothing to strip.
-        let body_to_send = maybe_compact_tool_schemas(body_to_send, &request_id);
+        //
+        // Auxiliary passes honor the same disable/bypass decision as message
+        // compression (upstream fb79055b): a request the decision passes
+        // through must keep its tools byte-identical and accrue no
+        // compaction savings, so this stage is skipped outright rather than
+        // merely finding nothing to strip. The mode switch rides along:
+        // `CompressionDecision` never sees it (see the ingestion gate), and
+        // `Off` promises byte-equal forwarding, so it disables this stage
+        // the same way it disables the dispatcher above.
+        let body_to_send = if decision.should_compress
+            && !matches!(
+                state.config.compression_mode,
+                crate::config::CompressionMode::Off
+            ) {
+            maybe_compact_tool_schemas(body_to_send, &request_id)
+        } else {
+            body_to_send
+        };
 
         // B2 tool-order stabilization. Must follow every other tool mutation
         // above, so the order we record is the order the provider caches.
