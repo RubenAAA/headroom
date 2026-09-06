@@ -5,7 +5,7 @@ SHELL := /bin/bash
 CARGO ?= cargo
 MATURIN ?= maturin
 PYTHON ?= python3
-FIXTURES ?= tests/parity/fixtures
+FIXTURES ?= upstream-python/tests/parity/fixtures
 
 .PHONY: help test test-parity bench build-proxy build-wheel fmt fmt-check lint clippy clean ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
 
@@ -27,9 +27,9 @@ help:
 	@echo "  make run-e2e-wrap       - build + run the wrap-e2e Docker container"
 	@echo ""
 	@echo "Pre-push verification (run BEFORE git push to catch CI failures locally):"
-	@echo "  make ci-precheck        - run all CI gates (rust + python + commitlint)"
+	@echo "  make ci-precheck        - run all CI gates (rust + commitlint)"
 	@echo "  make ci-precheck-rust   - cargo fmt --check + clippy + test"
-	@echo "  make ci-precheck-python - smart_crusher-affected python tests"
+	@echo "  make ci-precheck-python - smart_crusher-affected python tests (upstream mirror, not in ci-precheck)"
 	@echo "  make ci-precheck-commitlint - lint commits since origin/main"
 	@echo "  make install-git-hooks  - install pre-commit, commit-msg, and pre-push hooks"
 
@@ -67,7 +67,7 @@ verify-rust-core:
 		echo "error: activate a venv first (e.g. source .venv/bin/activate)"; \
 		exit 1; \
 	fi
-	bash scripts/build_rust_extension.sh
+	bash upstream-python/scripts/build_rust_extension.sh
 
 fmt:
 	$(CARGO) fmt --all
@@ -93,7 +93,10 @@ clean:
 # Run before EVERY `git push`. Install the git hook (one-time) with:
 #   make install-git-hooks
 
-ci-precheck: ci-precheck-rust ci-precheck-python ci-precheck-commitlint
+# `ci-precheck-python` is deliberately absent: the Python package now lives in
+# `upstream-python/` as a read-only mirror of upstream, and this fork neither
+# builds nor ships it. Run that target by hand when porting an upstream change.
+ci-precheck: ci-precheck-rust ci-precheck-commitlint
 	@echo ""
 	@echo "✅ ci-precheck PASSED — safe to push."
 
@@ -112,19 +115,19 @@ ci-precheck-python:
 		echo "error: activate a venv first (e.g. source .venv/bin/activate)"; \
 		exit 1; \
 	fi
-	bash scripts/build_rust_extension.sh
+	bash upstream-python/scripts/build_rust_extension.sh
 	$(PYTHON) -m pytest -q \
-		tests/test_transforms/test_smart_crusher_bugs.py \
-		tests/test_transforms/test_smart_crusher_rust_parity.py \
-		tests/test_transforms/test_diff_compressor.py \
-		tests/test_transforms/test_diff_compressor_rust_parity.py \
-		tests/test_relevance.py \
-		tests/test_relevance_extra.py \
-		tests/test_ccr.py \
-		tests/test_acceptance.py \
-		tests/test_critical_fixes.py \
-		tests/test_quality_retention.py \
-		tests/test_toin_integration.py
+		upstream-python/tests/test_transforms/test_smart_crusher_bugs.py \
+		upstream-python/tests/test_transforms/test_smart_crusher_rust_parity.py \
+		upstream-python/tests/test_transforms/test_diff_compressor.py \
+		upstream-python/tests/test_transforms/test_diff_compressor_rust_parity.py \
+		upstream-python/tests/test_relevance.py \
+		upstream-python/tests/test_relevance_extra.py \
+		upstream-python/tests/test_ccr.py \
+		upstream-python/tests/test_acceptance.py \
+		upstream-python/tests/test_critical_fixes.py \
+		upstream-python/tests/test_quality_retention.py \
+		upstream-python/tests/test_toin_integration.py
 
 # Lint commits since `origin/main`. Requires npx (Node 18+) on PATH.
 ci-precheck-commitlint:
@@ -141,7 +144,7 @@ ci-precheck-commitlint:
 		commitlint --from origin/main --to HEAD --config .commitlintrc.json
 
 install-git-hooks:
-	@scripts/install-git-hooks.sh
+	@upstream-python/scripts/install-git-hooks.sh
 
 # ─── E2e Docker targets ────────────────────────────────────────────────────
 #
@@ -150,8 +153,12 @@ install-git-hooks:
 # so the build works on Apple Silicon (requires QEMU emulation). On native
 # x86_64 hosts the flag is harmless and matches CI behaviour.
 
+# NOTE: this Dockerfile is upstream's and still COPYs `pyproject.toml`,
+# `headroom/`, `sdk/` and `plugins/` from the build context root, which the
+# move to `upstream-python/` broke. Left as-is on purpose — upstream owns the
+# file and the fork does not run the wrap e2e image.
 build-e2e-wrap:
-	docker build --platform linux/amd64 -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
+	docker build --platform linux/amd64 -f upstream-python/e2e/wrap/Dockerfile -t headroom-wrap-e2e .
 
 run-e2e-wrap: build-e2e-wrap
 	docker run --rm headroom-wrap-e2e

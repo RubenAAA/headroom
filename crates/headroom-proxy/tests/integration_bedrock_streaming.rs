@@ -6,7 +6,7 @@
 //! handler. The upstream is a wiremock server that serves
 //! `application/vnd.amazon.eventstream` bytes — no real AWS.
 //!
-//! Coverage matrix (per PR-D2 spec, REALIGNMENT/06-phase-D-bedrock-vertex.md):
+//! Coverage matrix (per PR-D2 spec, docs/notes/realignment/06-phase-D-bedrock-vertex.md):
 //!
 //! 1. `eventstream_parses_correctly` — feed known-good binary bytes
 //!    to the parser; assert message boundaries, CRCs, and headers.

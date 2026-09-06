@@ -24,6 +24,10 @@ permissions:
 
 jobs:
   install-native:
+    # Fork guard: this job builds or exercises the Python package, which
+    # now lives in `upstream-python/` as a read-only mirror. This fork
+    # ships the Rust proxy, so the job runs upstream only.
+    if: github.repository == 'headroomlabs-ai/headroom'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:

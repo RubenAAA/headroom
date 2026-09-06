@@ -19,7 +19,7 @@ struct Cli {
 enum Cmd {
     /// Run all built-in comparators against fixtures under --fixtures.
     Run {
-        #[arg(long, default_value = "tests/parity/fixtures")]
+        #[arg(long, default_value = "upstream-python/tests/parity/fixtures")]
         fixtures: PathBuf,
         /// Only run this comparator (by transform name).
         #[arg(long)]

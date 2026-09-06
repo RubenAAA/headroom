@@ -2,7 +2,7 @@
 //!
 //! Drops in front of the existing Python proxy. End-users hit the public
 //! port; this binary forwards every HTTP/SSE/WebSocket request verbatim to
-//! `--upstream`. See RUST_DEV.md for the operator runbook.
+//! `--upstream`. See docs/notes/rust-dev.md for the operator runbook.
 
 use std::net::SocketAddr;
 use std::time::UNIX_EPOCH;

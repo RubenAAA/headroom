@@ -13,7 +13,10 @@ on:
 jobs:
   # Fast smoke test on PRs touching compression code (~$0.05, ~2 min)
   smoke-test:
-    if: github.event_name == 'pull_request'
+    # Fork guard: this job builds or exercises the Python package, which
+    # now lives in `upstream-python/` as a read-only mirror. This fork
+    # ships the Rust proxy, so the job runs upstream only.
+    if: github.repository == 'headroomlabs-ai/headroom' && (github.event_name == 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -83,7 +86,10 @@ jobs:
 
   # Full Tier 1 suite, weekly or manual (~$3-5, ~30-45 min)
   weekly-suite:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Fork guard: this job builds or exercises the Python package, which
+    # now lives in `upstream-python/` as a read-only mirror. This fork
+    # ships the Rust proxy, so the job runs upstream only.
+    if: github.repository == 'headroomlabs-ai/headroom' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

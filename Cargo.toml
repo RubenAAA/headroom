@@ -23,7 +23,7 @@ default-members = [
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/chopratejas/headroom"
+repository = "https://github.com/RubenAAA/headroom"
 authors = ["Headroom Maintainers"]
 
 [workspace.dependencies]
@@ -38,8 +38,8 @@ serde = { version = "1", features = ["derive"] }
 # JSON intact: `Value::Number` becomes a wrapper around the original
 # digit string, so `1.0` does NOT collapse to `1`, and `12345678901234567`
 # does NOT lose precision through f64. Required by Realignment invariant
-# I1 (byte-faithful passthrough on unmutated bytes; see REALIGNMENT/02-
-# architecture.md §2.2) and PR-A4 (see REALIGNMENT/03-phase-A-lockdown.md).
+# I1 (byte-faithful passthrough on unmutated bytes; see docs/notes/realignment/02-
+# architecture.md §2.2) and PR-A4 (see docs/notes/realignment/03-phase-A-lockdown.md).
 #
 # `raw_value` exposes `serde_json::value::RawValue`, the unparsed JSON
 # fragment type. Phase B PR-B2 uses this to forward unmodified

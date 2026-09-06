@@ -180,9 +180,9 @@ impl MemoryRecordStore {
     /// from one that predates the table, and testing for rows would rescan
     /// every record on every open for as long as that stayed true.
     pub fn needs_entity_backfill(&self) -> rusqlite::Result<bool> {
-        let version: i64 =
-            self.conn()
-                .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let version: i64 = self
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         Ok(version < ENTITY_EDGES_VERSION)
     }
 
@@ -234,11 +234,7 @@ impl MemoryRecordStore {
     /// that put three copies of one memory into the top five for `proxy`.
     /// Matching on the JSON field rather than a stored hash keeps this free of
     /// a migration; the table is small and SQLite scans it in microseconds.
-    pub fn ids_with_content(
-        &self,
-        user_id: &str,
-        content: &str,
-    ) -> rusqlite::Result<Vec<String>> {
+    pub fn ids_with_content(&self, user_id: &str, content: &str) -> rusqlite::Result<Vec<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id FROM memories

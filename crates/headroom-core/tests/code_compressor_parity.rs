@@ -1,7 +1,7 @@
 //! Byte-parity integration test for the CodeCompressor Rust port.
 //!
 //! Runs the production [`CodeAwareCompressor`] against the fixtures recorded
-//! from the Python reference (`tests/parity/fixtures/code_aware_compressor/`)
+//! from the Python reference (`upstream-python/tests/parity/fixtures/code_aware_compressor/`)
 //! and asserts the serialized result matches field-for-field.
 //!
 //! Unlike the Kompress test, this needs no model/network: the per-language
@@ -83,7 +83,7 @@ fn config_from_fixture(config: &Value) -> CodeCompressorConfig {
 #[test]
 fn code_compressor_matches_python_fixtures_byte_for_byte() {
     let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/parity/fixtures/code_aware_compressor");
+        .join("../../upstream-python/tests/parity/fixtures/code_aware_compressor");
     assert!(
         fixtures_dir.exists(),
         "fixtures dir {} missing — run scripts/record_code_compressor_fixtures.py",

@@ -53,6 +53,10 @@ jobs:
   # `docker-manifest` job below combines the per-arch digests into the
   # final multi-arch tagged manifest, which is what users pull by tag.
   docker-build:
+    # Fork guard: this fork ships the Rust proxy, never the Python
+    # package or its images, and the build reads `pyproject.toml` from a
+    # repo root it no longer sits at. Skipped everywhere but upstream.
+    if: github.repository == 'headroomlabs-ai/headroom'
     runs-on: ${{ matrix.arch.runs_on }}
     timeout-minutes: 75
     strategy:
@@ -220,7 +224,10 @@ jobs:
   # tags, and that manifest is what users pull by `:tag`.
   docker-manifest:
     needs: docker-build
-    if: ${{ always() }}
+    # Fork guard: this fork ships the Rust proxy, never the Python
+    # package or its images, and the build reads `pyproject.toml` from a
+    # repo root it no longer sits at. Skipped everywhere but upstream.
+    if: ${{ always() && github.repository == 'headroomlabs-ai/headroom' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:

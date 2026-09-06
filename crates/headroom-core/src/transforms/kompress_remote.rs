@@ -1089,7 +1089,11 @@ mod tests {
             transport.clone(),
         );
         let (_, outcome) = c.compress_remote("one two three", None);
-        assert_eq!(transport.call_count(), 0, "3 words is still below the clamp");
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "3 words is still below the clamp"
+        );
         assert_eq!(outcome, RemoteOutcome::TooShort);
     }
 }

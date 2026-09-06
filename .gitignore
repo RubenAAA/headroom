@@ -8,40 +8,40 @@
 /onnx/
 
 # Private scripts (contain credentials). Allowlist checked-in helpers below.
-scripts/
-!scripts/
-scripts/*
-!scripts/install.sh
-!scripts/install.ps1
-!scripts/version-sync.py
-!scripts/sync-plugin-versions.py
-!scripts/changelog-gen.py
-!scripts/verify-versions.py
-!scripts/verify-ruff-version.py
-!scripts/pr-governance.py
-!scripts/bootstrap-windows-dev.ps1
-!scripts/build_npm_release_assets.mjs
-!scripts/build_python_release_smoke.py
-!scripts/release_smoke_all.py
-!scripts/verify_npm_release_assets.mjs
-!scripts/tests/
-!scripts/README.md
-!scripts/repro_codex_replay.py
-!scripts/eval_output_shaper.py
-!scripts/fixtures/
-!scripts/fixtures/*.json
-!scripts/record_fixtures.py
-!scripts/build_rust_extension.sh
-!scripts/install-git-hooks.sh
-!scripts/smoke_issue_327.py
-!scripts/refresh_model_limits.sh
-!scripts/audit_wheel_glibc_symbols.py
-!scripts/replay_codex_ws_load.py
-!scripts/export_kompress_v2_onnx.py
-!scripts/refresh_tool_hashes.py
-!scripts/record_kompress_fixtures.py
-!scripts/record_code_compressor_fixtures.py
-!scripts/proxy_log_audit.py
+upstream-python/scripts/
+!upstream-python/scripts/
+upstream-python/scripts/*
+!upstream-python/scripts/install.sh
+!upstream-python/scripts/install.ps1
+!upstream-python/scripts/version-sync.py
+!upstream-python/scripts/sync-plugin-versions.py
+!upstream-python/scripts/changelog-gen.py
+!upstream-python/scripts/verify-versions.py
+!upstream-python/scripts/verify-ruff-version.py
+!upstream-python/scripts/pr-governance.py
+!upstream-python/scripts/bootstrap-windows-dev.ps1
+!upstream-python/scripts/build_npm_release_assets.mjs
+!upstream-python/scripts/build_python_release_smoke.py
+!upstream-python/scripts/release_smoke_all.py
+!upstream-python/scripts/verify_npm_release_assets.mjs
+!upstream-python/scripts/tests/
+!upstream-python/scripts/README.md
+!upstream-python/scripts/repro_codex_replay.py
+!upstream-python/scripts/eval_output_shaper.py
+!upstream-python/scripts/fixtures/
+!upstream-python/scripts/fixtures/*.json
+!upstream-python/scripts/record_fixtures.py
+!upstream-python/scripts/build_rust_extension.sh
+!upstream-python/scripts/install-git-hooks.sh
+!upstream-python/scripts/smoke_issue_327.py
+!upstream-python/scripts/refresh_model_limits.sh
+!upstream-python/scripts/audit_wheel_glibc_symbols.py
+!upstream-python/scripts/replay_codex_ws_load.py
+!upstream-python/scripts/export_kompress_v2_onnx.py
+!upstream-python/scripts/refresh_tool_hashes.py
+!upstream-python/scripts/record_kompress_fixtures.py
+!upstream-python/scripts/record_code_compressor_fixtures.py
+!upstream-python/scripts/proxy_log_audit.py
 
 # Rust / Cargo build artifacts
 /target/
@@ -216,11 +216,11 @@ benchmark_results/
 headroom.db
 headroom_*.db
 *.jsonl
-!tests/fixtures/*.jsonl
+!upstream-python/tests/fixtures/*.jsonl
 # Recorded transcripts the tests replay. The rule above is anchored at the
 # repo root, so it misses fixtures under a crate.
 !**/tests/fixtures/**/*.jsonl
-docker/differential-network-capture/captures/
+upstream-python/docker/differential-network-capture/captures/
 
 # Documentation build
 docs/_build/
@@ -280,3 +280,11 @@ uv.lock
 context-mode/
 
 .codebase-memory/
+
+# Merge and editor leftovers
+*.orig
+
+# Local agent/tooling state, never shared
+.claude/
+.serena/
+.codegraph/

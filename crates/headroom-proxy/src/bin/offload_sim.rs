@@ -5,7 +5,7 @@
 //! a session under that offload policy — without touching the network or any
 //! production code path. The output ranks configs so the J1+ build commits to
 //! the winning combination on evidence (see
-//! `REALIGNMENT/13-phase-J-history-offload.md` §11 "Phase J0").
+//! `docs/notes/realignment/13-phase-J-history-offload.md` §11 "Phase J0").
 //!
 //! Usage:
 //!   cargo run -p headroom-proxy --bin offload_sim -- <capture_dir>

@@ -14,7 +14,7 @@ where to read the answer.
 
 | surface | scope | survives restart |
 |---|---|---|
-| statusline (`scripts/statusline-cache-health.sh`) | last bust, last 50 requests | no |
+| statusline (`upstream-python/scripts/statusline-cache-health.sh`) | last bust, last 50 requests | no |
 | `GET /cache-health` | in-process watchdog | no |
 | `headroom savings` | successful compression events; selected input only | yes |
 | `GET /stats` → `lifetime_metrics`, `savings_verdict` | durable totals | **yes** |

@@ -16,17 +16,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The seven topic terms are already the English side of each pair.
     let terms = [
-        "database", "proxy", "compression", "cache", "memory", "queries", "cohort",
+        "database",
+        "proxy",
+        "compression",
+        "cache",
+        "memory",
+        "queries",
+        "cohort",
     ];
     // Hand translations of the Russian sentences. These are the judgment call
     // in this comparison, so they are spelled out rather than computed.
     let sentences = [
-        ("где лежит база данных с памятью", "where is the memory database stored"),
+        (
+            "где лежит база данных с памятью",
+            "where is the memory database stored",
+        ),
         (
             "почему прокси падает с ошибкой соединения",
             "why does the proxy fail with a connection error",
         ),
-        ("как настроить сжатие контекста", "how to configure context compression"),
+        (
+            "как настроить сжатие контекста",
+            "how to configure context compression",
+        ),
     ];
 
     let opts = SearchOpts {
@@ -39,7 +51,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let hits = store.search(&[t.to_string()], &opts)?;
         println!("\n{t}  ({} hits shown)", hits.len());
         for h in hits.iter().take(5) {
-            println!("  {:>8.4} [{}] {}", h.rank, h.match_layer, trim(&h.content, 84));
+            println!(
+                "  {:>8.4} [{}] {}",
+                h.rank,
+                h.match_layer,
+                trim(&h.content, 84)
+            );
         }
     }
 
@@ -48,7 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let hits = store.search(&[en.to_string()], &opts)?;
         println!("\n{ru}\n  -> \"{en}\"  ({} hits)", hits.len());
         for h in hits.iter().take(5) {
-            println!("  {:>8.4} [{}] {}", h.rank, h.match_layer, trim(&h.content, 84));
+            println!(
+                "  {:>8.4} [{}] {}",
+                h.rank,
+                h.match_layer,
+                trim(&h.content, 84)
+            );
         }
     }
     Ok(())

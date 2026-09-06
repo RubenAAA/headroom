@@ -7,7 +7,7 @@
 //! This is the **test-default** backend. Production deployments use
 //! [`super::sqlite::SqliteCcrStore`] or [`super::redis::RedisCcrStore`]
 //! which are persistent across worker restarts and shareable across
-//! workers (see `RUST_DEV.md` "Multi-worker deployment").
+//! workers (see `docs/notes/rust-dev.md` "Multi-worker deployment").
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

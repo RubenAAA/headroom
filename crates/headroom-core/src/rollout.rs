@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn shared_python_rust_policy_vectors() {
         let vectors: Vec<PolicyVector> = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/rollout_policy_vectors.json"
+            "../../../upstream-python/tests/fixtures/rollout_policy_vectors.json"
         ))
         .unwrap();
         for vector in vectors {

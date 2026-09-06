@@ -305,7 +305,7 @@ pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL: &str = "ctx_retrieval_misses_total"
 pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL_HELP: &str =
     "PR-J5: count of /ctx/get retrievals for a hash absent from the CCR \
      store (expired, evicted, or never offloaded). A rising rate flags an \
-     information-loss risk — see REALIGNMENT/13 §8.";
+     information-loss risk — see docs/notes/realignment/13 §8.";
 
 // ---------- ctx_search_queries_total ----------
 

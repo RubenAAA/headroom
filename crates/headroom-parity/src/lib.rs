@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Recorded fixture schema. Matches `tests/parity/recorder.py`.
+/// Recorded fixture schema. Matches `upstream-python/tests/parity/recorder.py`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Fixture {
     pub transform: String,
@@ -688,7 +688,7 @@ impl TransformComparator for ContentDetectorComparator {
 
 /// Real comparator for the `text_crusher` transform. The fixture `input` is an
 /// object rather than a bare string, mirroring the recorder's three arguments
-/// (`tests/parity/record_text_crusher.py`), and `config` is always `null` — the
+/// (`upstream-python/tests/parity/record_text_crusher.py`), and `config` is always `null` — the
 /// recorder drove the Python default config, so the Rust side uses
 /// `TextCrusherConfig::default()` to match.
 pub struct TextCrusherComparator;

@@ -8,7 +8,7 @@ assignees: ''
 
 <!--
 Thanks for helping verify Copilot subscription mode across platforms!
-See TESTING-copilot-subscription.md for the step-by-step flows.
+See docs/notes/testing-copilot-subscription.md for the step-by-step flows.
 Redact your actual token everywhere.
 -->
 

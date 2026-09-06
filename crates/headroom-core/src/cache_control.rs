@@ -30,7 +30,7 @@
 //! - For markers in `system` (string OR block list) or `tools[*]`,
 //!   the function does NOT bump `frozen_count`. Those fields are
 //!   unconditionally part of the cache hot zone (see invariant I2 in
-//!   `REALIGNMENT/02-architecture.md` §2.2); they're never touched by
+//!   `docs/notes/realignment/02-architecture.md` §2.2); they're never touched by
 //!   the compressor regardless of marker placement, so they don't
 //!   affect the message-index floor.
 //! - Returns `0` when there are no markers anywhere in `messages[*]`.

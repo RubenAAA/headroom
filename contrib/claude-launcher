@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Multi-profile Claude Code launcher with optional headroom proxy + local Qwen.
+#
+# Install: symlink profile names onto this script —
+#   ln -s claude-launcher ~/.local/bin/claude-personal
+#   ln -s claude-launcher ~/.local/bin/claude-work
+#   ln -s claude-launcher ~/.local/bin/cclaude
+#
+# Usage:
+#   claude-personal [--context] [--qwen] [proxy flags...] [claude args...]
+#   claude-work     [--context] [--qwen] [proxy flags...] [claude args...]
+#   cclaude         [--context] [--qwen] [proxy flags...] [claude args...]   # default account
+#
+#   claude-personal and claude-work carry defaults (see the profile table).
+#   cclaude does not — it is the bare launcher.
+#
+#   --context  route through the headroom proxy (starts it if not running;
+#              reuses the running instance otherwise — it is multi-tenant)
+#   --qwen     start the local Qwen server if not running and expose it as a
+#              custom model option (requires --context for the proxy routing)
+#
+#   Proxy flags (passed to headroom-proxy, not claude):
+#     any long flag that `headroom-proxy --help` lists, e.g.
+#     --extra-model-route "MODEL=URL[:translate]", --codex-auth-file <path>,
+#     --compression-mode all_messages, --ctx-offload-min-bytes 15000
+#
+# All other args are passed to `claude` untouched.
+set -euo pipefail
+
+FLAGS_FILE="$HOME/.headroom-flags.sh"
+PROXY_URL="http://127.0.0.1:8787"
+# Same path restart-headroom.sh uses. They used to differ, so which log held the
+# current run depended on who started the proxy, and ~/headroom-savings.py reads
+# this one by name — a launcher-started proxy left it stale, which looks just
+# like the proxy having gone quiet.
+PROXY_LOG="$HOME/headroom-proxy.log"
+QWEN_URL="http://localhost:8080"
+QWEN_MODEL="qwen3.6-uncensored"
+
+# ── profile from invocation name ──────────────────────────────────────────
+# DEFAULT_FLAGS is prepended to the command line, so anything typed still wins
+# for flags named twice. cclaude keeps none of them — it is the bare launcher,
+# and the one to reach for when a profile's defaults are in the way.
+DEFAULT_FLAGS=()
+case "$(basename "$0")" in
+    claude-personal) CONFIG_DIR="$HOME/.claude-personal"
+                     DEFAULT_FLAGS=(--context --dangerously-skip-permissions) ;;
+    claude-work)     CONFIG_DIR="$HOME/.claude-work"
+                     DEFAULT_FLAGS=(--context --dangerously-skip-permissions) ;;
+    cclaude)         CONFIG_DIR="" ;;   # default ~/.claude account
+    *) echo "claude-launcher: invoke via a profile symlink (claude-personal|claude-work|cclaude)" >&2
+       exit 1 ;;
+esac
+
+# ── which long flags belong to the proxy (asked of the binary itself) ─────
+# 1 = takes a value, 0 = boolean. --help/--version are claude's, not ours.
+declare -A proxy_flag=()
+if command -v headroom-proxy >/dev/null 2>&1; then
+    while read -r name takes_value; do
+        [ -n "$name" ] && proxy_flag["$name"]="$takes_value"
+    done < <(headroom-proxy --help 2>/dev/null |
+             grep -oE '^[[:space:]]+(-[a-zA-Z], )?--[a-z0-9-]+( <[A-Z0-9_]+>)?' |
+             sed -E 's/^[[:space:]]+(-[a-zA-Z], )?//' |
+             awk '$1 != "--help" && $1 != "--version" { print $1, ($2 == "" ? 0 : 1) }')
+fi
+
+# ── flags ─────────────────────────────────────────────────────────────────
+use_context=0
+use_qwen=0
+passthrough=()
+proxy_flags=()
+args=("${DEFAULT_FLAGS[@]}" "$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
+    case "$arg" in
+        --context) use_context=1 ;;
+        --qwen)    use_qwen=1 ;;
+        --*=*)
+            if [ -n "${proxy_flag[${arg%%=*}]:-}" ]; then
+                proxy_flags+=("$arg")
+            else
+                passthrough+=("$arg")
+            fi
+            ;;
+        --*)
+            case "${proxy_flag[$arg]:-}" in
+                1) i=$((i + 1)); proxy_flags+=("$arg" "${args[$i]}") ;;
+                0) proxy_flags+=("$arg") ;;
+                *) passthrough+=("$arg") ;;
+            esac
+            ;;
+        *)
+            passthrough+=("$arg")
+            ;;
+    esac
+    i=$((i + 1))
+done
+
+if [ "$use_qwen" -eq 1 ] && [ "$use_context" -eq 0 ]; then
+    echo "claude-launcher: --qwen routes through the proxy; enabling --context too" >&2
+    use_context=1
+fi
+
+# ── qwen (start if requested and not up) ──────────────────────────────────
+if [ "$use_qwen" -eq 1 ]; then
+    if curl -fsS --max-time 1 "$QWEN_URL/v1/models" >/dev/null 2>&1; then
+        echo "qwen: already running at $QWEN_URL"
+    else
+        echo "qwen: starting via ~/start-qwen.sh ..."
+        nohup "$HOME/start-qwen.sh" >/dev/null 2>&1 &
+        disown
+    fi
+fi
+
+# ── headroom proxy (start if requested and not up; else reuse) ────────────
+if [ "$use_context" -eq 1 ]; then
+    if curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
+        echo "headroom: reusing running proxy at $PROXY_URL"
+        if [ "${#proxy_flags[@]}" -gt 0 ]; then
+            echo "headroom: the running proxy keeps the flags it was started with;" >&2
+            echo "          ${proxy_flags[*]} will NOT apply." >&2
+            echo "          To use them: pkill -f headroom-proxy, then rerun this command." >&2
+        fi
+    else
+        mkdir -p "$(dirname "$PROXY_LOG")"
+        # Roll the log so each proxy run starts with its own file. Without
+        # this the log accumulates across every restart, and a plain
+        # `grep -c` over it returns a months-long total that reads as if it
+        # were the current run — three separate "live defects" were diagnosed
+        # off that mistake on 2026-08-07 and none of them were real. Keep four
+        # generations; the proxy reopens the path itself on start.
+        if [ -s "$PROXY_LOG" ]; then
+            rm -f "$PROXY_LOG.4"
+            for i in 3 2 1; do
+                [ -f "$PROXY_LOG.$i" ] && mv -f "$PROXY_LOG.$i" "$PROXY_LOG.$((i + 1))"
+            done
+            mv -f "$PROXY_LOG" "$PROXY_LOG.1"
+        fi
+        # The measured settings, shared with restart-headroom.sh. This branch is
+        # what runs after a reboot, when nothing holds 8787 — so a proxy started
+        # here without them would quietly serve every session on defaults.
+        # Expanded before "$proxy_flags", so a flag on the command line still
+        # wins for anything named twice.
+        measured_flags=()
+        if [ -r "$FLAGS_FILE" ]; then
+            # shellcheck source=/dev/null
+            source "$FLAGS_FILE"
+            measured_flags=("${HEADROOM_FLAGS[@]}")
+        else
+            echo "headroom: $FLAGS_FILE missing — starting on defaults" >&2
+        fi
+        echo "headroom: starting proxy at $PROXY_URL (log: $PROXY_LOG)"
+        nohup headroom-proxy \
+            --listen 127.0.0.1:8787 \
+            --upstream https://api.anthropic.com \
+            --ctx-capture=true --ctx-offload=true --ctx-inject=true \
+            --local-model "$QWEN_MODEL" --local-upstream "$QWEN_URL" \
+            "${measured_flags[@]}" \
+            "${proxy_flags[@]}" \
+            >> "$PROXY_LOG" 2>&1 &
+        disown
+        # wait for the listener (up to ~5s)
+        for _ in $(seq 1 25); do
+            curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1 && break
+            sleep 0.2
+        done
+        if ! curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
+            echo "headroom: proxy failed to start — see $PROXY_LOG" >&2
+            exit 1
+        fi
+    fi
+fi
+
+# ── assemble env and exec claude ──────────────────────────────────────────
+env_vars=()
+[ -n "$CONFIG_DIR" ] && env_vars+=("CLAUDE_CONFIG_DIR=$CONFIG_DIR")
+[ "$use_context" -eq 1 ] && env_vars+=("ANTHROPIC_BASE_URL=$PROXY_URL")
+if [ "$use_qwen" -eq 1 ]; then
+    env_vars+=(
+        "ANTHROPIC_CUSTOM_MODEL_OPTION=$QWEN_MODEL"
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=Qwen3.6(local)"
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION=Local model via llama.cpp"
+    )
+fi
+
+# Make routed models selectable from /model.
+#
+# ANTHROPIC_CUSTOM_MODEL_OPTION holds ONE model. Setting it once per route only
+# leaves the last one — several routes were parsed by the proxy but just one was
+# ever offered, which looks like the routes not working. For more than one,
+# Claude Code has to read the list from the proxy: gateway discovery makes it
+# GET /v1/models, which advertises every exact-match claude-*/anthropic-* route.
+route_models=()
+i=0
+while [ "$i" -lt "${#proxy_flags[@]}" ]; do
+    case "${proxy_flags[$i]}" in
+        --extra-model-route)
+            i=$((i + 1))
+            route_val="${proxy_flags[$i]}" ;;
+        --extra-model-route=*)
+            route_val="${proxy_flags[$i]#--extra-model-route=}" ;;
+        *)
+            i=$((i + 1)); continue ;;
+    esac
+    # One flag may carry a comma-separated list; the proxy splits it the same way.
+    IFS=',' read -r -a route_specs <<<"$route_val"
+    for spec in "${route_specs[@]}"; do
+        [ -n "$spec" ] && route_models+=("${spec%%=*}")
+    done
+    i=$((i + 1))
+done
+
+if [ "${#route_models[@]}" -gt 0 ]; then
+    env_vars+=("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1")
+    # Discovery drops any id not starting with claude/anthropic, so a lone
+    # route named otherwise (the MiMo-V2.5 example above) still needs the
+    # single-model variable to show up at all.
+    if [ "${#route_models[@]}" -eq 1 ]; then
+        case "${route_models[0]}" in
+            claude*|anthropic*) ;;
+            *) env_vars+=("ANTHROPIC_CUSTOM_MODEL_OPTION=${route_models[0]}") ;;
+        esac
+    fi
+fi
+
+exec env "${env_vars[@]}" claude "${passthrough[@]}"

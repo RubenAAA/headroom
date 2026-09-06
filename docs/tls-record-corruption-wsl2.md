@@ -156,7 +156,7 @@ The offload settings did stick. `ethtool -k eth0` reads `gro`, `rx`, `tso` and
 `gso` all off, applied by the `[boot] command`. BadRecordMac carried on
 regardless: 34 events in a day, 16 of them past the hold.
 
-So the second branch is the live one, and `scripts/tls-corruption-repro.sh`
+So the second branch is the live one, and `upstream-python/scripts/tls-corruption-repro.sh`
 tests it. Concurrent 300KB uploads, eight of them multiplexed over one HTTP/2
 connection, aimed at `speed.cloudflare.com/__up`:
 

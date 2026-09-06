@@ -5,7 +5,7 @@
 //! Phase H ("retire the Python proxy") depends on this metric to
 //! confirm parity between the Rust proxy and the soon-to-retire
 //! Python proxy during canary. The acceptance gate in
-//! `REALIGNMENT/10-phase-H-python-retirement.md:11-12` reads
+//! `docs/notes/realignment/10-phase-H-python-retirement.md:11-12` reads
 //! `cache_hit_rate ≥ Python baseline; no 5xx regressions in 24h`.
 //! That assertion is meaningless without this histogram.
 //!

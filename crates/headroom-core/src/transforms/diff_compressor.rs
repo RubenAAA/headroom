@@ -15,7 +15,7 @@
 //! # Parity contract
 //! Output bytes (`compressed` field + all numeric counts) must be
 //! byte-identical to the Python implementation. The 20 fixtures in
-//! `tests/parity/fixtures/diff_compressor/` are the spec.
+//! `upstream-python/tests/parity/fixtures/diff_compressor/` are the spec.
 //!
 //! # Information preservation hardening (no parity impact)
 //! - Below `min_lines_for_ccr`, we return the input unchanged (matches

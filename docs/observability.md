@@ -316,5 +316,5 @@ cardinality unbounded.
 ## See also
 
 - `crates/headroom-proxy/src/observability/` — implementation.
-- `REALIGNMENT/09-phase-G-rtk-observability.md` — spec.
-- `REALIGNMENT/10-phase-H-python-retirement.md` — H1 acceptance gate.
+- `docs/notes/realignment/09-phase-G-rtk-observability.md` — spec.
+- `docs/notes/realignment/10-phase-H-python-retirement.md` — H1 acceptance gate.

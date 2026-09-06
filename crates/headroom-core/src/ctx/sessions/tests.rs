@@ -267,8 +267,14 @@ fn identical_event_is_inserted_once() {
     assert!(!first.duplicate);
 
     let second = store.insert_event(&ev).unwrap();
-    assert!(second.duplicate, "second offer of the same event is refused");
-    assert_eq!(second.id, first.id, "caller gets the row that already exists");
+    assert!(
+        second.duplicate,
+        "second offer of the same event is refused"
+    );
+    assert_eq!(
+        second.id, first.id,
+        "caller gets the row that already exists"
+    );
 
     assert_eq!(store.get_events("conv1", 10).unwrap().len(), 1);
 }

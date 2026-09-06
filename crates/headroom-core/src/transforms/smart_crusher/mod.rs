@@ -5,7 +5,7 @@
 //!
 //! This module is a literal Rust port of the Python `SmartCrusher`
 //! implementation. The goal of Stage 3c.1 is **byte-equal output parity** for
-//! every fixture in `tests/parity/fixtures/smart_crusher/`. Architectural
+//! every fixture in `upstream-python/tests/parity/fixtures/smart_crusher/`. Architectural
 //! improvements (lossless-first, unified saliency score, structured CCR
 //! markers, token budget) are deferred to Stage 3c.2 and tracked in
 //! `~/Desktop/SmartCrusher-Architecture-Improvements.md`.

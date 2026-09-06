@@ -19,7 +19,7 @@ overlap where it matters:
 
 Headroom's own realignment doc identifies its correct compression target as the **live zone**:
 "latest user message content + latest `tool_result` + latest `function_call_output` + latest
-`local_shell_call_output`" (`REALIGNMENT/00-overview.md`, Phase B).
+`local_shell_call_output`" (`docs/notes/realignment/00-overview.md`, Phase B).
 
 **That is precisely the payload context-mode intercepts one layer earlier.** Headroom Phase B is
 building a Rust engine to compress the latest tool result *after* it hits the wire. context-mode
@@ -30,7 +30,7 @@ token-validation fallback needed.
 Three strategic unlocks, in order of value:
 
 1. **Cache safety.** Headroom's #1 identified bug class is prompt-cache busting from request
-   mutation (5 top-tier cache-killer bugs, `REALIGNMENT/00-overview.md`). context-mode has
+   mutation (5 top-tier cache-killer bugs, `docs/notes/realignment/00-overview.md`). context-mode has
    *structurally zero* cache-bust risk because it never touches the request body.
 2. **Subscription safety.** The realignment flags "fingerprint-class subscription-revocation
    risks" from `X-Headroom-*` header leakage, `anthropic-beta` mutation and re-serialization on

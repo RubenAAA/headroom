@@ -7,7 +7,7 @@ name: Security
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**', 'feat/**', 'perf/**']
   pull_request:
     branches: [main]
   schedule:

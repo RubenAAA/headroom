@@ -19,7 +19,7 @@
 //!
 //! Regex patterns, dispatch order, confidence formulas, and line-count
 //! caps are byte-equal with the Python source. Recorded fixtures in
-//! `tests/parity/fixtures/content_detector/` lock the output across
+//! `upstream-python/tests/parity/fixtures/content_detector/` lock the output across
 //! the bridge.
 
 use std::collections::HashSet;

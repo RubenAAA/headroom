@@ -4,7 +4,7 @@
 //! the FTS cost is linear in query terms: trigram 39 ms at 20 terms, 79 at
 //! 50, 276 at 200 in one process, porter a fifth of that. The three sizes
 //! here are the ones the term-cap, trigram-fallback and wide-pass changes
-//! (plans 1a-1c in `docs/FABLE_IDEAS_SPEED.md`) are judged on. `limit=20` is
+//! (plans 1a-1c in `docs/notes/speed-ideas.md`) are judged on. `limit=20` is
 //! the narrow pass a `top_k=5` search issues; `limit=2000` is the wide one.
 //!
 //! Run with:

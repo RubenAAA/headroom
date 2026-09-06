@@ -82,7 +82,7 @@ flate2 = "1"
 # transitive `native-tls` → `openssl-sys` dependency that fastembed's
 # default features pull in (via `hf-hub-native-tls` + `ort-download-
 # binaries-native-tls`). Without this, every wheel-build surface
-# (release matrix, e2e/wrap, e2e/init, devcontainer, ci.yml) needs
+# (release matrix, upstream-python/e2e/{wrap,init}, devcontainer) needs
 # system OpenSSL + perl modules for openssl-src vendored compile. Using
 # rustls everywhere removes the entire OpenSSL build-deps surface.
 # `magika` is Google's ONNX-backed content classifier (Tier 1 of the

@@ -76,6 +76,10 @@ concurrency:
 
 jobs:
   detect-version:
+    # Fork guard: this fork ships the Rust proxy, never the Python
+    # package or its images, and the build reads `pyproject.toml` from a
+    # repo root it no longer sits at. Skipped everywhere but upstream.
+    if: github.repository == 'headroomlabs-ai/headroom'
     runs-on: ubuntu-latest
     permissions:
       contents: read

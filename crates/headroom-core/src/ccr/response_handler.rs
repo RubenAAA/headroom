@@ -6,7 +6,6 @@
 //!
 //! Mirrors Python's `headroom.ccr.response_handler`.
 
-
 use serde_json::{json, Value};
 
 use super::tool_injection::{parse_tool_call, raw_ccr_hash, CCR_TOOL_NAME};
@@ -258,8 +257,7 @@ impl CCRResponseHandler {
             // and report the turn as cleanly resolved. Keep it on the CCR side
             // with the hash as sent; the store lookup misses and the model gets
             // an error result it can act on.
-            let ccr_hash =
-                parse_tool_call(&tc, provider).or_else(|| raw_ccr_hash(&tc, provider));
+            let ccr_hash = parse_tool_call(&tc, provider).or_else(|| raw_ccr_hash(&tc, provider));
             if let Some(hash_key) = ccr_hash {
                 let tool_call_id = if provider == "google" {
                     tc.get("functionCall")
@@ -1525,7 +1523,10 @@ mod splice_tests {
         assert_eq!(spliced, 1);
         let blocks = response["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "text");
-        assert!(blocks[0]["text"].as_str().unwrap().contains("the original bytes"));
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("the original bytes"));
         // The client's own call has to survive untouched, or we have traded one
         // unanswerable tool_use for another.
         assert_eq!(blocks[1]["name"], "Bash");

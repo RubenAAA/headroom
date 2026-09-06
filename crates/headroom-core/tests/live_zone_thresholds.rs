@@ -2,7 +2,7 @@
 //!
 //! The dispatcher must skip compression entirely for blocks whose
 //! content is below the per-content-type byte threshold (1 KiB for
-//! JSON arrays). PR-B4 spec, `REALIGNMENT/04-phase-B-live-zone.md`.
+//! JSON arrays). PR-B4 spec, `docs/notes/realignment/04-phase-B-live-zone.md`.
 
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{

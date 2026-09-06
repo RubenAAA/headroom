@@ -45,7 +45,7 @@
 //! `input_ids`/`word_ids` reproduce `transformers` exactly, ONNX scores
 //! match to ~1e-6 (far below the 0.5 threshold), and the kept-word set +
 //! joined output match byte-for-byte. See
-//! `tests/parity/fixtures/kompress/` and `KompressComparator` in
+//! `upstream-python/tests/parity/fixtures/kompress/` and `KompressComparator` in
 //! `crates/headroom-parity`.
 //!
 //! # CCR

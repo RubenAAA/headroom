@@ -365,8 +365,7 @@ impl SavingsLedger {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
-        static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp.{}.{sequence}", std::process::id()));
         let result = (|| {

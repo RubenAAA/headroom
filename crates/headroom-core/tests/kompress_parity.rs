@@ -1,7 +1,7 @@
 //! Byte-parity integration test for the Kompress Rust port.
 //!
 //! Runs the production [`Kompress`] engine against the trace fixtures
-//! recorded from the Python reference (`tests/parity/fixtures/kompress/`)
+//! recorded from the Python reference (`upstream-python/tests/parity/fixtures/kompress/`)
 //! and asserts the compressed output matches byte-for-byte.
 //!
 //! Model-gated: if the ModernBERT tokenizer + kompress-v2-base ONNX
@@ -53,8 +53,8 @@ fn kompress_matches_python_fixtures_byte_for_byte() {
         }
     };
 
-    let fixtures_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/fixtures/kompress");
+    let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../upstream-python/tests/parity/fixtures/kompress");
     if !fixtures_dir.exists() {
         eprintln!("SKIP: fixtures dir {} missing", fixtures_dir.display());
         return;

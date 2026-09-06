@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 type Error = Box<dyn std::error::Error>;
 
-const REGISTRY_JSON: &str = include_str!("../../../../../headroom/tools.json");
+const REGISTRY_JSON: &str = include_str!("../../../../../upstream-python/headroom/tools.json");
 const HEADROOM_BINARIES_MIRROR: &str = "HEADROOM_BINARIES_MIRROR";
 const HEADROOM_BINARIES_CACHE: &str = "HEADROOM_BINARIES_CACHE";
 const HEADROOM_BINARIES_OFFLINE: &str = "HEADROOM_BINARIES_OFFLINE";

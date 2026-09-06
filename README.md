@@ -5,52 +5,18 @@ sent, and keeps the prompt cache intact while doing it. It also routes Codex
 models through the same Claude Code session, so one conversation, one memory,
 one set of tools.
 
-This is a fork of [chopratejas/headroom](https://github.com/chopratejas/headroom)
-focused on the Rust binaries. The upstream README, which covers the Python
-package, the MCP server and the hosted docs, is kept here as
-[`README.upstream.md`](README.upstream.md).
-
-## What you get
-
-- **A proxy** (`headroom-proxy`) on `127.0.0.1:8787`. Claude Code talks to it
-  instead of `api.anthropic.com`. No code changes, no plugin.
-- **Context compression** — tool output, logs, file reads and conversation
-  history are shrunk before they leave the machine. Originals stay retrievable.
-- **Cache stabilization** — the proxy owns the `cache_control` breakpoints and
-  replays the exact prefix it forwarded last turn, so rewriting history does not
-  cost you the cached prefix.
-- **Codex inside Claude Code** — `--extra-model-route` maps model names like
-  `claude-codex-5.6-luna` onto OpenAI models. Same session, same memory, same
-  tools. When the Claude window runs out, the conversation carries on.
-- **Cross-agent memory** — one store shared by Claude and Codex.
-- **A CLI** (`headroom`) for savings, health, context search and log analysis.
-
-## Quick start
-
-Build both binaries and put them on your PATH:
-
-```bash
-cargo build --release -p headroom-proxy
-install -m755 target/release/headroom-proxy target/release/headroom ~/.local/bin/
-```
-
-Then launch Claude Code through the wrapper instead of `claude`:
-
-```bash
-cclaude
-```
-
-`cclaude` starts the proxy if nothing holds port 8787, reuses it if something
-does, and passes Claude Code the environment it needs. To go back, run `claude`
-and stop the proxy with `pkill -f headroom-proxy`.
-
-There are no prebuilt binaries yet. Building needs a Rust toolchain and takes
-about two and a half minutes on a warm cache.
+This is a Rust rewrite of the proxy from
+[headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom), which
+the fork still tracks so upstream changes can be ported across. Upstream's
+README covers its Python package, MCP server and hosted docs. Upstream also
+publishes a container image, `ghcr.io/headroomlabs-ai/headroom`. It runs the
+Python package, not this proxy, and there is no image for this fork. Build from
+source.
 
 ## What it actually saves
 
 Measured on one developer's traffic, 2026-08-12. Run the same commands and you
-get your own figures — none of this is a projection.
+get your own figures. None of this is a projection.
 
 ```
 $ headroom savings
@@ -62,22 +28,13 @@ Last 30 days ████░░░░░░░░░░░░  24.5%  saved 102,
 ```
 
 **24.3% of the input selected on saving turns was removed before forwarding**
-over a week. This is transform efficiency, not a share of all provider input:
-the ledger records successful compression events and its denominator is those
-events' pre-compression input. Daily figures swing hard with what you are doing
-— a day of large tool output reads far higher than a day of conversation — so
-judge it over a week, not an afternoon. Use `/stats`'s `savings_verdict` for
-compression minus cache busts and `wire_verdict` for the provider-reconciled
-whole-request view.
+over a week. That is transform efficiency, not a share of all provider input:
+the ledger counts compression events, and its denominator is those events' own
+pre-compression input. Daily figures swing hard, so judge it over a week, and
+read the dollar column as an estimate rather than a provider bill.
 
-The dollar column is a counterfactual estimate, not a provider bill. Proxy
-events written after the 2026-08-12 cache-placement fix use the measured
-fresh-input or cache-read rate for that turn. Older ledger rows assumed every
-saved token was fresh input and are not retroactively repriced because they do
-not contain the placement needed to do that honestly.
-
-The proxy also causes some cache misses of its own, and it counts them against
-itself. From `/stats`:
+The proxy also causes cache misses of its own, and counts them against itself.
+From `/stats`:
 
 ```
 savings_verdict: saved 100,847,379 − lost to cache busts 31,923,043 (625 busts)
@@ -85,95 +42,179 @@ savings_verdict: saved 100,847,379 − lost to cache busts 31,923,043 (625 busts
 ```
 
 That is **1.20x the work per token spent**, after the tool pays for its own
-mistakes. It is the number to quote to anyone sceptical, because it is the one
-that could have come out negative.
+mistakes, and it could have come out negative. Overhead is small enough to
+ignore: across 25,708 requests the proxy added 566,855 bytes and removed
+199,499,200. How all of this is counted is written up in
+[`docs/measurement.md`](docs/measurement.md).
 
-Overhead is small enough to ignore: across 25,708 requests the proxy added
-566,855 bytes and removed 199,499,200 — a net 7.7 KB off every request.
+## Quick start
 
-## How it works
+Needs Rust via [rustup](https://rustup.rs) and git. On macOS the installer also
+pulls GNU tools through Homebrew, including a bash newer than the 3.2 it ships.
 
-Claude Code sends a request. The proxy:
+```bash
+git clone https://github.com/RubenAAA/headroom.git
+cd headroom
+./install.sh
+cclaude          # from now on, always this instead of `claude`
+```
 
-1. Compresses tool results, file reads and search output, keeping a retrievable
-   copy of anything it shrinks.
-2. Replays the prefix it forwarded on the previous turn, byte for byte, so the
-   provider's cached prefix still matches after compression rewrote history.
-3. Places its own `cache_control` breakpoints on the tail, bounded to stay under
-   the provider's limit of four.
-4. Forwards to `api.anthropic.com`, or to OpenAI for a routed model name.
+That builds both binaries, installs them to `~/.local/bin`, writes a flag file
+to your home directory, and wires the token statusline into
+`~/.claude/settings.json`.
 
-Steps 2 and 3 matter more than step 1 for a coding agent. Compression that busts
-the prompt cache costs more than it saves, which is why the proxy tracks its own
-busts and reports them.
+To edit the checkout, use `./install.sh --link`, which is how the maintainer
+runs it. That symlinks the scripts and the flag file into `contrib/` instead of
+copying, so editing the repo edits the live setup. Binaries are copied either
+way, so a Rust change still needs a rebuild and `restart-headroom.sh`.
+
+Then start Claude Code with `cclaude`, not `claude`. The wrapper starts the
+proxy if it is down, sets `ANTHROPIC_BASE_URL`, and execs `claude` with your
+arguments. Plain `claude` bypasses the proxy without any error. For another
+client, do it by hand:
+
+```bash
+headroom-proxy --upstream https://api.anthropic.com --listen 127.0.0.1:8787
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+```
+
+To check it is working:
+
+```bash
+curl -s localhost:8787/healthz
+curl -s localhost:8787/cache-health | head -20
+```
+
+`/cache-health` is the one that tells you something. A proxy that runs but does
+not help shows up there as a low hit rate.
+
+## What it does
+
+Claude Code sends a request. The proxy rewrites it, forwards it to
+`api.anthropic.com` or to OpenAI for a routed model name, and streams the
+response back.
+
+**Compression.** Tool results, file reads and search output get shrunk, and a
+retrievable copy of anything it touches is kept on disk.
+
+**Prefix replay.** Compression rewrites history, which would break the cached
+prefix. So the proxy replays the prefix it forwarded last turn, byte for byte,
+and puts its own `cache_control` breakpoints on the tail within the provider's
+limit of four. This matters more than compression does, because a compressor
+that busts the prompt cache costs more than it saves.
+
+**Cache stabilizers.** Small rewrites that stop the client from invalidating its
+own cached prefix. All are off unless a flag turns them on.
+
+| Flag | What it fixes |
+| --- | --- |
+| `--force-1h-cache-ttl` | Marks entries `1h` so the prefix survives an idle gap past the 5-minute default. Skipped on pay-as-you-go, where 1h input costs more. |
+| `--cache-stable-tool-order` | `tools` sits at the head of the cache key, so the first tool whose bytes move invalidates every tool after it plus the system prompt and all history. This replays last turn's order and appends new tools at the end. |
+| `--cache-pin-tool-roster` | Claude Code drops a tool from its roster for one turn and re-adds it next turn. The array is hashed as sent, so that flap alone accounts for about half the recache waste in the log. This puts the tool back where it was. |
+
+**Context capture.** Conversations go to a local store, searchable with
+`headroom ctx search`.
+
+**Model routing.** A Codex model name goes to OpenAI instead, inside the same
+Claude Code session.
+
+**Observability.** A JSON-lines log, four HTTP endpoints, and a savings ledger
+that survives restarts.
 
 ## Configuration
 
-The launcher sources `~/.headroom-flags.sh`, which holds the measured flag set:
+Flags come from the command line or the environment, never a config file. Every
+flag has a `HEADROOM_PROXY_*` variable, so `--cache-tail-breakpoints 2` and
+`HEADROOM_PROXY_CACHE_TAIL_BREAKPOINTS=2` do the same thing. Full list in
+[`docs/flags.md`](docs/flags.md), or run `headroom-proxy --help`.
+
+The launcher and the restart script source `~/.headroom-flags.sh`, a bash array
+`install.sh` writes from [`contrib/headroom-flags.sh`](contrib/headroom-flags.sh).
+That is the maintainer's measured set, about 85 flags, worth reading before you
+pick your own. An existing file is left alone, unless `--link` moves it aside to
+`.bak` and symlinks the checkout copy in its place.
+
+A running proxy is reused as it is, and flags on a later command line are
+ignored. Change a flag and you must restart, or you are measuring the old one.
+
+## Operating
 
 ```bash
---compression-mode all_messages     # compress the whole conversation, not just the tail
---prefix-replay true                # replay the previously forwarded prefix
---cache-tail-breakpoints 2          # two tail markers beat one by ~5% of the bill
---force-1h-cache-ttl true
---enable-cross-turn-dedup
---memory true
+restart-headroom.sh              # swap in a freshly built binary and restart
+tail -f ~/headroom-proxy.log     # JSON lines
 ```
 
-Two entries in that file still carry absolute paths (`--ctx-store-dir` and
-`--codex-auth-file`); change them for your machine. `--prune-drop-mcp` names the
-MCP servers whose tool definitions get dropped from the request — it is personal
-to your setup, and uninstalling the servers you do not use works as well.
+The restart script backs up the live binary first and rolls back if the new one
+fails to come up.
 
-A running proxy is reused as-is, and flags on a later command line are dropped
-when that happens. If you change flags, restart the proxy or you will be
-measuring the old ones.
+| Endpoint | What it gives you |
+| --- | --- |
+| `/healthz` | Liveness. |
+| `/cache-health` | Hit rates and recent cache busts. |
+| `/stats` | JSON counters, including the savings verdict above. |
+| `/metrics` | Prometheus. |
 
-## Commands
+Counters reset on restart. The savings ledger on disk does not, and the CLI
+reads it: `headroom savings` for savings over time, `headroom doctor` for
+liveness and ledger health, `headroom ctx search` for captured context.
 
-```bash
-headroom savings          # durable token and cost savings over time
-headroom doctor           # proxy liveness and local ledger health
-headroom ctx search "..." # search captured conversation context
-headroom perf             # analyze proxy performance from logs
-```
+## Repository layout
 
-The proxy also serves `/stats` (JSON, includes the savings verdict above) and
-`/metrics` (Prometheus). Both reset when the process restarts; the savings ledger
-on disk does not.
+| Path | What is in it |
+| --- | --- |
+| `crates/headroom-proxy` | The proxy, the `headroom` CLI, and the cache stabilizers. This is the product. |
+| `crates/headroom-core` | Compression, the context store, memory. |
+| `crates/headroom-parity` | Checks Rust output against the Python implementation. |
+| `crates/headroom-simulators` | Traffic simulators for benchmarks. |
+| `crates/headroom-py` | A PyO3 extension module, built with maturin rather than cargo. |
+| `contrib/` | The launcher, the restart script, the statuslines, the flag file. |
+| `docs/` | Reference docs, including [`flags.md`](docs/flags.md) and [`measurement.md`](docs/measurement.md). |
+| `docs/notes/` | Working notes and measurement logs. Not onboarding material, and parts go stale. |
+
+The Python tree (`headroom/`, `tests/`, `sdk/`, `plugins/`) is upstream's
+original: inert, not part of the Rust build, kept so upstream diffs stay
+readable when porting.
 
 ## Building and testing
 
+`rust-toolchain.toml` pins 1.95.0 so a clippy lint added in a newer stable
+cannot break CI without firing locally.
+
 ```bash
 cargo build --release -p headroom-proxy   # both binaries
-cargo test -p headroom-proxy              # unit tests
-cargo test -p headroom-proxy --tests      # integration tests
+make test                                 # cargo test --workspace
+make ci-precheck                          # fmt, clippy, tests, the whole gate
 ```
 
-The workspace holds five crates: `headroom-core` (compression, context store,
-memory), `headroom-proxy` (the proxy, the CLI and cache stabilization),
-`headroom-parity` (checks Rust output against the Python implementation),
-`headroom-simulators` and `headroom-py` (a PyO3 extension module, built with
-maturin rather than plain cargo).
+Run `make ci-precheck` before pushing. It runs what CI runs. `make help` lists
+the rest, of which `make fmt` and `make test-parity` are the useful ones.
 
-The Python implementation still lives in `headroom/`. It is not part of the Rust
-build and is not shipped with these binaries.
+## Status
+
+Daily-driven by one person on one machine. That is the whole test population.
+Linux and WSL2 are the primary targets, and `install.sh` supports macOS but sees
+less use there. No releases yet, so build from a checkout and expect flags to
+move.
+
+The default `ml` feature loads ONNX Runtime for file type detection and
+embeddings, and needs AVX2 on x86. `install.sh` looks for it at `ORT_DYLIB_PATH`
+and then as a python3 `onnxruntime` import, and prints a hint if neither works.
+Without it the proxy still starts and those transforms turn off with a warning.
 
 ## Credits
 
 Most of this code is not original work.
 
-- **[Headroom](https://github.com/chopratejas/headroom)** by chopratejas — the
-  project this forks. The compression pipeline, the proxy architecture, the MCP
-  server and the Python implementation the Rust port was written against are all
-  theirs. Apache 2.0.
-- **[context-mode](https://github.com/mksglu/context-mode)** by mksglu — the
-  context capture and retrieval work behind `headroom ctx` and the context store.
-  The `context-mode/` directory here comes from it.
-- **[rtk](https://github.com/rtk-ai/rtk)** by rtk-ai — a CLI proxy that filters
-  and summarizes command output before it reaches the model. It handles the
-  other half of the problem: trimming tool output at the source rather than in
-  the request.
+- **[Headroom](https://github.com/headroomlabs-ai/headroom)** by chopratejas,
+  the project this forks. The compression pipeline, the proxy architecture, the
+  MCP server, and the Python implementation the Rust port was written against
+  are all theirs. Apache 2.0.
+- **[context-mode](https://github.com/mksglu/context-mode)** by mksglu, the
+  context capture and retrieval work behind `headroom ctx` and the context
+  store. The `context-mode/` directory here comes from it.
+- **[rtk](https://github.com/rtk-ai/rtk)** by rtk-ai, a CLI proxy that filters
+  command output before it reaches the model. It handles the other half of the
+  problem, trimming at the source rather than in the request.
 
 If you use this, use theirs too.
 

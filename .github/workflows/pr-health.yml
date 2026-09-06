@@ -39,7 +39,7 @@ jobs:
 
       - name: Validate PR template
         id: validate
-        run: python3 scripts/pr-governance.py --event "$GITHUB_EVENT_PATH" --body-file .pr-body.md --report .pr-governance-report.json
+        run: python3 upstream-python/scripts/pr-governance.py --event "$GITHUB_EVENT_PATH" --body-file .pr-body.md --report .pr-governance-report.json
 
       - name: Append governance summary
         run: |

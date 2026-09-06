@@ -46,9 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
     let mut stmt = conn.prepare("SELECT title, content FROM chunks")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
 
     let mut titles: Vec<String> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
@@ -80,9 +78,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Runtime dylib; a bare `TextEmbedding::try_new` deadlocks instead of
     // erroring if that has not happened. Warm it, then drop it — the model
     // below wants the raw vectors, which the scorer does not expose.
-    drop(headroom_core::relevance::EmbeddingScorer::try_new_with_model(
-        EmbeddingModel::MultilingualE5Small,
-    )?);
+    drop(
+        headroom_core::relevance::EmbeddingScorer::try_new_with_model(
+            EmbeddingModel::MultilingualE5Small,
+        )?,
+    );
 
     let (mut model, doc_prefix, query_prefix) = match which.as_str() {
         "user2" => {
@@ -94,8 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 special_tokens_map_file: read("special_tokens_map.json")?,
                 tokenizer_config_file: read("tokenizer_config.json")?,
             };
-            let mut udm =
-                fastembed::UserDefinedEmbeddingModel::new(read("model.onnx")?, files);
+            let mut udm = fastembed::UserDefinedEmbeddingModel::new(read("model.onnx")?, files);
             // fastembed defaults to CLS. USER2 mean-pools; taking the CLS
             // vector from a mean-pooled model reads a position the training
             // objective never constrained, which measures nothing.
@@ -170,7 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .filter(|(d, _)| en_top.iter().any(|(e, _)| e == d))
             .count();
-        let ru_latin = ru_top.iter().filter(|(d, _)| script[*d] == Script::Latin).count();
+        let ru_latin = ru_top
+            .iter()
+            .filter(|(d, _)| script[*d] == Script::Latin)
+            .count();
         let ru_best = ru_top.first().map(|(_, s)| *s).unwrap_or(0.0);
         println!("{en:<14} {ru:<16} {overlap:>10} {ru_latin:>9} {ru_best:>9.3}");
 
@@ -214,7 +216,10 @@ enum Script {
 
 #[cfg(feature = "ml")]
 fn classify(t: &str) -> Script {
-    let cyr = t.chars().filter(|c| ('\u{0400}'..='\u{04FF}').contains(c)).count();
+    let cyr = t
+        .chars()
+        .filter(|c| ('\u{0400}'..='\u{04FF}').contains(c))
+        .count();
     let lat = t.chars().filter(|c| c.is_ascii_alphabetic()).count();
     if cyr == 0 {
         Script::Latin
@@ -242,7 +247,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 #[cfg(feature = "ml")]

@@ -264,7 +264,7 @@ impl OffloadOutcome {
 use headroom_core::transforms::live_zone::CTX_OFFLOAD_MARKER_PREFIX as MARKER_PREFIX;
 
 /// PR-J4 — boundary-gated offload policy (invariant I4 of
-/// `REALIGNMENT/13-phase-J-history-offload.md`).
+/// `docs/notes/realignment/13-phase-J-history-offload.md`).
 ///
 /// The digest itself is a pure function of the block bytes, so *re-applying*
 /// an offload is always cache-stable. The one remaining cache-bust risk is

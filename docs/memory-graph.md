@@ -117,7 +117,7 @@ over the content — see below.
 
 ### If Neo4j comes back
 
-Neo4j was never ported. `PORT_STATUS.md:184` lists the Qdrant/Neo4j bridge
+Neo4j was never ported. `docs/notes/port-status.md:184` lists the Qdrant/Neo4j bridge
 among the parts of the Python memory handler the Rust proxy does not have; no
 commit or doc records a decision to drop it. The comment at `backend.rs:1-7`
 about backends dispatching to Python describes a bridge that was never built —
