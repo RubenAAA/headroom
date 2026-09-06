@@ -166,42 +166,56 @@ fn write_ascii_json_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// Ceiling on decompressed request-body output (100 MB).
+///
+/// Port of Python `helpers.MAX_DECOMPRESSED_BODY_SIZE`, deliberately set to
+/// the same value as the uncompressed body ceiling: nobody gets more room by
+/// arriving compressed. Every codec below streams through a `Take` limited to
+/// this plus one byte, so a bomb is refused at the cap instead of being
+/// materialized (upstream 25a4e71b, closing #3284).
+pub const MAX_DECOMPRESSED_BODY_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Read and (if needed) decompress a request body, returning raw bytes.
 ///
 /// Port of Python `helpers._read_request_body_bytes`. Supports
 /// `gzip`/`deflate` (flate2), `zstd`/`zstandard`, and `br` (brotli).
 /// `None`, empty, or `identity` returns the bytes unchanged. Any other
 /// encoding or a decompression failure returns `Err`.
+///
+/// Decompressed output is capped at [`MAX_DECOMPRESSED_BODY_SIZE`]: bodies
+/// expanding past it fail with a message naming the cap rather than being
+/// allocated. Truncated streams still fail as decompression errors rather
+/// than yielding a short body.
 pub fn decode_body(bytes: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     let encoding = content_encoding.unwrap_or("").trim().to_ascii_lowercase();
+    // One byte past the cap: enough to detect an oversized expansion while
+    // bounding peak allocation to the cap plus one byte, never the bomb.
+    let limit = MAX_DECOMPRESSED_BODY_SIZE.saturating_add(1);
+    let capped = |decoder: Box<dyn Read>, label: &str| -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        decoder
+            .take(limit)
+            .read_to_end(&mut out)
+            .map_err(|e| format!("Failed to decompress {label} request body: {e}"))?;
+        if out.len() as u64 > MAX_DECOMPRESSED_BODY_SIZE {
+            return Err(format!(
+                "Decompressed {label} request body exceeds {}MB",
+                MAX_DECOMPRESSED_BODY_SIZE / (1024 * 1024)
+            ));
+        }
+        Ok(out)
+    };
     match encoding.as_str() {
         "" | "identity" => Ok(bytes.to_vec()),
-        "zstd" | "zstandard" => zstd::stream::decode_all(bytes)
-            .map_err(|e| format!("Failed to decompress zstd request body: {e}")),
-        "gzip" => {
-            use std::io::Read;
-            let mut d = flate2::read::GzDecoder::new(bytes);
-            let mut out = Vec::new();
-            d.read_to_end(&mut out)
-                .map(|_| out)
-                .map_err(|e| format!("Failed to decompress gzip request body: {e}"))
+        "zstd" | "zstandard" => {
+            let decoder = zstd::stream::Decoder::new(bytes)
+                .map_err(|e| format!("Failed to decompress zstd request body: {e}"))?;
+            capped(Box::new(decoder), "zstd")
         }
-        "deflate" => {
-            use std::io::Read;
-            let mut d = flate2::read::ZlibDecoder::new(bytes);
-            let mut out = Vec::new();
-            d.read_to_end(&mut out)
-                .map(|_| out)
-                .map_err(|e| format!("Failed to decompress deflate request body: {e}"))
-        }
-        "br" => {
-            use std::io::Read;
-            let mut d = brotli::Decompressor::new(bytes, 4096);
-            let mut out = Vec::new();
-            d.read_to_end(&mut out)
-                .map(|_| out)
-                .map_err(|e| format!("Failed to decompress brotli request body: {e}"))
-        }
+        "gzip" => capped(Box::new(flate2::read::GzDecoder::new(bytes)), "gzip"),
+        "deflate" => capped(Box::new(flate2::read::ZlibDecoder::new(bytes)), "deflate"),
+        "br" => capped(Box::new(brotli::Decompressor::new(bytes, 4096)), "brotli"),
         other => Err(format!("Unsupported Content-Encoding: {other}")),
     }
 }
@@ -431,6 +445,72 @@ mod tests {
     #[test]
     fn test_decode_unsupported_encoding_errors() {
         assert!(decode_body(b"x", Some("snappy")).is_err());
+    }
+
+    // ── decode_body decompression cap (zip-bomb guard) ───────────
+
+    /// Build a highly-compressible payload without holding the full
+    /// expansion in memory at once: stream 1 MiB zero chunks into the
+    /// compressor until `target_len` bytes are represented.
+    fn bomb_fixture(target_len: usize, encoding: &str) -> Vec<u8> {
+        use std::io::Write;
+        let chunk = vec![0u8; 1024 * 1024];
+        let rounds = target_len / chunk.len();
+        match encoding {
+            "gzip" => {
+                let mut enc =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                for _ in 0..rounds {
+                    enc.write_all(&chunk).unwrap();
+                }
+                enc.finish().unwrap()
+            }
+            "zstd" => {
+                let mut enc = zstd::stream::Encoder::new(Vec::new(), 0).unwrap();
+                for _ in 0..rounds {
+                    enc.write_all(&chunk).unwrap();
+                }
+                enc.finish().unwrap()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_decode_bomb_is_refused_at_cap() {
+        for encoding in ["gzip", "zstd"] {
+            let wire = bomb_fixture(
+                (MAX_DECOMPRESSED_BODY_SIZE as usize) + 1024 * 1024,
+                encoding,
+            );
+            // The bomb must actually exercise the cap: wire stays tiny
+            // while the expansion passes it.
+            assert!(
+                (wire.len() as u64) < MAX_DECOMPRESSED_BODY_SIZE,
+                "{encoding} bomb wire size {} should be far under the cap",
+                wire.len()
+            );
+            let err = decode_body(&wire, Some(encoding)).unwrap_err();
+            assert!(
+                err.contains("exceeds"),
+                "{encoding} bomb should be refused at the cap, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_truncated_gzip_still_errors() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"truncated payload").unwrap();
+        let comp = enc.finish().unwrap();
+        let cut = comp.len() / 2;
+        let err = decode_body(&comp[..cut], Some("gzip")).unwrap_err();
+        assert!(
+            err.contains("Failed to decompress"),
+            "truncated stream must error, not yield a short body, got: {err}"
+        );
     }
 
     // ── message splicing ─────────────────────────────────────────

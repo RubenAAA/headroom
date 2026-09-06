@@ -258,6 +258,11 @@ pub(crate) struct CallerClientKey {
 fn upstream_client_builder(config: &Config) -> reqwest::ClientBuilder {
     crate::ssl_context::client_builder()
         .connect_timeout(config.upstream_connect_timeout)
+        // Total bound, which also bounds the send: reqwest 0.12 exposes no
+        // per-phase write knob, so `config.upstream_write_timeout` cannot be
+        // set here. It is honored on paths with their own per-request bound
+        // (the Codex WS→HTTP fallback); everywhere else the send shares this
+        // total, matching pre-split behaviour.
         .timeout(config.upstream_timeout)
         // Upstream redirects are forwarded to the client. In particular, a
         // caller-selected public endpoint cannot redirect this process into a

@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         upstream = %config.upstream,
         upstream_timeout_s = config.upstream_timeout.as_secs(),
         upstream_connect_timeout_s = config.upstream_connect_timeout.as_secs(),
+        upstream_write_timeout_s = config.upstream_write_timeout.as_secs(),
         max_body_bytes = config.max_body_bytes,
         rewrite_host = config.rewrite_host,
         graceful_shutdown_timeout_s = config.graceful_shutdown_timeout.as_secs(),

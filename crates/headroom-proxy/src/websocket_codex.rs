@@ -521,6 +521,29 @@ fn first_frame_timeout() -> Duration {
     Duration::from_secs_f64(secs.max(0.001))
 }
 
+/// Read bound for the WS→HTTP fallback POST (port of Python
+/// `_WS_HTTP_FALLBACK_READ_TIMEOUT_SECONDS`, upstream 9128ebdc). The
+/// fallback streams SSE, so `read` is the gap *between* events, not a cap
+/// on the whole response — 120s of silence from a live Codex turn means the
+/// upstream is gone, not thinking. Deliberately tighter than the generic
+/// upstream timeout and not wired to it.
+pub(crate) const WS_HTTP_FALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Per-request timeout for the WS→HTTP fallback POST.
+///
+/// Port of Python `_ws_http_fallback_timeout`: connect/pool come from the
+/// shared client's `upstream_connect_timeout` and need no per-request
+/// setting, while the send honors `upstream_write_timeout`. reqwest
+/// per-request timeouts are total bounds (not per-phase like httpx), so the
+/// request carries the tighter of the write bound and the 120s read bound:
+/// a tightened write knob fails a dead pooled connection fast instead of
+/// stalling behind the flat 120s, and a raised one keeps the read bound.
+pub(crate) fn ws_http_fallback_timeout(config: &crate::config::Config) -> Duration {
+    config
+        .upstream_write_timeout
+        .min(WS_HTTP_FALLBACK_READ_TIMEOUT)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Session state
 // ─────────────────────────────────────────────────────────────────────────
@@ -699,7 +722,8 @@ impl OutcomeSink for CodexWsOutcomeSink {
         // to the blocking pool the way `record_savings_ledger` already does.
         let transforms = transforms.to_vec();
         tokio::task::spawn_blocking(move || {
-            headroom_core::output_savings::get_recorder().record_from_labels(&transforms, output_tokens);
+            headroom_core::output_savings::get_recorder()
+                .record_from_labels(&transforms, output_tokens);
         });
     }
 
@@ -1897,7 +1921,7 @@ async fn ws_http_fallback(
             .post(&http_url)
             .headers(headers.clone())
             .body(body_bytes.clone())
-            .timeout(Duration::from_secs(120))
+            .timeout(ws_http_fallback_timeout(&ctx.state.config))
             .send()
             .await
         {
@@ -1924,7 +1948,9 @@ async fn ws_http_fallback(
             "type": "error",
             "error": {"type": "server_error", "message": "Upstream unreachable"},
         });
-        let _ = client_sink.send(AxMsg::Text(error_event.to_string().into())).await;
+        let _ = client_sink
+            .send(AxMsg::Text(error_event.to_string().into()))
+            .await;
         return;
     };
 
@@ -1942,7 +1968,9 @@ async fn ws_http_fallback(
                 "message": format!("Upstream returned {status}"),
             },
         });
-        let _ = client_sink.send(AxMsg::Text(error_event.to_string().into())).await;
+        let _ = client_sink
+            .send(AxMsg::Text(error_event.to_string().into()))
+            .await;
         return;
     }
 
@@ -2010,6 +2038,36 @@ mod tests {
         assert!(!is_codex_responses_path("/v1/responses/xyz"));
         assert!(!is_codex_responses_path("/v1/chat/completions"));
         assert!(!is_codex_responses_path("/ws"));
+    }
+
+    // ── WS→HTTP fallback timeout ───────────────────────────────
+
+    fn config_with_write_timeout(secs: u64) -> crate::config::Config {
+        let mut cfg = crate::config::Config::for_test("http://127.0.0.1:9".parse().unwrap());
+        cfg.upstream_write_timeout = Duration::from_secs(secs);
+        cfg
+    }
+
+    #[test]
+    fn ws_fallback_keeps_120s_read_bound_by_default() {
+        // Default write is 150s (Python parity); the request still
+        // carries the 120s read bound, matching the old flat timeout.
+        let cfg = config_with_write_timeout(150);
+        assert_eq!(ws_http_fallback_timeout(&cfg), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn ws_fallback_honors_tightened_write_timeout() {
+        // Deliberately odd value so a wiring regression can't hide
+        // behind the defaults (cf. Python's connect=7/write=33 fixture).
+        let cfg = config_with_write_timeout(33);
+        assert_eq!(ws_http_fallback_timeout(&cfg), Duration::from_secs(33));
+    }
+
+    #[test]
+    fn ws_fallback_raised_write_keeps_read_bound() {
+        let cfg = config_with_write_timeout(300);
+        assert_eq!(ws_http_fallback_timeout(&cfg), Duration::from_secs(120));
     }
 
     // ── origin policy ────────────────────────────────────────────

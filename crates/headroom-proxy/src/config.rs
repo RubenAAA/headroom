@@ -303,6 +303,19 @@ pub struct CliArgs {
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub upstream_connect_timeout: Duration,
 
+    /// Bound on pushing request bytes upstream before the send is
+    /// abandoned and the request fails over to a fresh connection.
+    /// Port of Python `ProxyConfig.write_timeout_seconds` (upstream
+    /// a507249b): sending a request and waiting for a model to think
+    /// are different operations, and sharing one knob left the send
+    /// effectively unbounded — a pooled socket whose peer went away
+    /// stalls until the OS gives up retransmitting (~180s), under the
+    /// inherited budget, so no timeout ever fired. Default 150s:
+    /// carries a 15 MB body over a ~1 Mbps uplink while still firing
+    /// before the OS retransmit ceiling.
+    #[arg(long, default_value = "150s", value_parser = parse_duration)]
+    pub upstream_write_timeout: Duration,
+
     /// Optional HTTP proxy for upstream provider calls only (e.g.
     /// http://127.0.0.1:3128). Scoped to the proxy's provider HTTP
     /// client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY`
@@ -1986,6 +1999,12 @@ pub struct Config {
     pub upstream: Url,
     pub upstream_timeout: Duration,
     pub upstream_connect_timeout: Duration,
+    /// Bound on the upstream write phase. See the CLI flag of the same
+    /// name. reqwest exposes no per-phase write knob, so the shared
+    /// client's total timeout still bounds the send; this value is
+    /// honored on paths that set their own per-request bound (the
+    /// Codex WS→HTTP fallback).
+    pub upstream_write_timeout: Duration,
     /// Provider-only HTTP proxy for upstream calls. See the CLI arg of
     /// the same name; scoped to the provider HTTP client, never exported
     /// to the process environment.
@@ -2345,6 +2364,7 @@ impl Config {
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
             upstream_connect_timeout: args.upstream_connect_timeout,
+            upstream_write_timeout: args.upstream_write_timeout,
             http_proxy: args.http_proxy,
             max_body_bytes: args.max_body_bytes,
             log_level: args.log_level,
@@ -2571,6 +2591,7 @@ impl Config {
             upstream,
             upstream_timeout: Duration::from_secs(60),
             upstream_connect_timeout: Duration::from_secs(5),
+            upstream_write_timeout: Duration::from_secs(150),
             http_proxy: None,
             max_body_bytes: 100 * 1024 * 1024,
             log_level: "warn".into(),
@@ -2779,6 +2800,39 @@ mod prune_policy_tests {
     fn drop_tools_alone_is_not_noop_but_absent_is() {
         assert!(!parse_prune_policy(None, None, Some("WebSearch")).is_noop());
         assert!(parse_prune_policy(None, None, Some(" , ")).is_noop());
+    }
+}
+
+#[cfg(test)]
+mod upstream_write_timeout_tests {
+    use super::{CliArgs, Config};
+    use clap::Parser;
+    use std::time::Duration;
+
+    fn parse(rest: &[&str]) -> CliArgs {
+        let mut argv = vec!["headroom-proxy", "--upstream", "http://127.0.0.1:9"];
+        argv.extend_from_slice(rest);
+        CliArgs::try_parse_from(argv).expect("CLI args should parse")
+    }
+
+    #[test]
+    fn write_timeout_defaults_to_150s() {
+        let args = parse(&[]);
+        assert_eq!(args.upstream_write_timeout, Duration::from_secs(150));
+        let config = Config::from_cli(args);
+        assert_eq!(config.upstream_write_timeout, Duration::from_secs(150));
+    }
+
+    #[test]
+    fn write_timeout_flag_overrides_default() {
+        let config = Config::from_cli(parse(&["--upstream-write-timeout", "30s"]));
+        assert_eq!(config.upstream_write_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn for_test_carries_the_python_default() {
+        let config = Config::for_test("http://127.0.0.1:9".parse().unwrap());
+        assert_eq!(config.upstream_write_timeout, Duration::from_secs(150));
     }
 }
 
