@@ -665,6 +665,14 @@ pub fn extract_cache_stable_delta(
 /// return `optimized_messages` unchanged (accept a possible bust over forwarding
 /// wrong content).
 ///
+/// Takes no confirmed floor, so the non-inflation bound does not apply: the
+/// pre-floor posture. Production calls [`overlay_cached_prefix_reported`] with
+/// the tracker's provider-confirmed count; this shim stays for callers with no
+/// count in scope. (Upstream defaults the floor to `None` for a fully
+/// size-bounded overlay, but this overlay never had the bound — `None` here
+/// keeps the historical unbounded behavior instead of inventing declines on
+/// paths that never asked for one.)
+///
 /// Assumes the stored prefix belongs to this conversation. Callers that got it
 /// from the fallback — which hands back the session's most recent prefix even
 /// when nothing continues it — must use [`overlay_cached_prefix_reported`] and
@@ -681,6 +689,7 @@ pub fn overlay_cached_prefix(
         previous_original_messages,
         previous_forwarded_messages,
         true,
+        None,
     )
     .0
 }
@@ -963,6 +972,15 @@ pub enum ReplaySkip {
     /// The stored turn forwarded fewer messages than it took in, so the two
     /// slices no longer cover one span of the conversation.
     ForwardedCountMismatch,
+    /// The replayed prefix is byte-larger than this turn's own output and
+    /// nothing in it is provider-confirmed, so the fresh (usually
+    /// recompressed-smaller) bytes go out instead. This is the designed
+    /// cold-cache re-baseline, not a defect: when the provider count collapses
+    /// the floor collapses with it and every accumulated improvement lands at
+    /// once, which is what bounds long-session growth. Partial floors never
+    /// report this — they split at the floor instead (see
+    /// [`split_inflated_replay_at_floor`]).
+    InflatedWithoutConfirmedFloor,
     /// The spliced output would put a `role: "system"` message where the API
     /// refuses one. Forwarding this turn's own bytes costs a re-cache; the 400
     /// it replaces costs the same re-cache plus the turn.
@@ -1029,6 +1047,7 @@ impl ReplaySkip {
         match self {
             ReplaySkip::NoPreviousTurn => "no_previous_turn",
             ReplaySkip::ForwardedCountMismatch => "forwarded_count_mismatch",
+            ReplaySkip::InflatedWithoutConfirmedFloor => "inflated_without_confirmed_floor",
             ReplaySkip::SystemAdjacencyBroken => "system_adjacency_broken",
             ReplaySkip::ShorterThanStoredPrefix => "shorter_than_stored_prefix",
             ReplaySkip::OptimizedShorterThanPrefix => "optimized_shorter_than_prefix",
@@ -1036,6 +1055,119 @@ impl ReplaySkip {
             ReplaySkip::PrefixContentDiverged { .. } => "prefix_content_diverged",
         }
     }
+}
+
+/// Compact-JSON byte length, the unit the non-inflation bound compares in.
+///
+/// Port of Python `_compact_json_bytes`: `serde_json::to_vec` already emits
+/// compact separators with unescaped UTF-8, matching `separators=(",", ":")`
+/// plus `ensure_ascii=False`. `None` when sizing cannot be proved; the bound
+/// treats that as tripped, the same fail direction as upstream.
+fn compact_json_len(messages: &[Value]) -> Option<usize> {
+    serde_json::to_vec(messages).ok().map(|bytes| bytes.len())
+}
+
+/// What to forward after the non-inflation bound trips on a splice.
+enum InflatedReplay {
+    /// Forward the splice whole: the bound passed, the floor covers it, or
+    /// the span is withdrawal-shifted under a non-zero floor (see
+    /// [`split_inflated_replay_at_floor`] for why that span is atomic).
+    Whole(Vec<Value>),
+    /// Forward the confirmed head replayed and the rest fresh.
+    Split(Vec<Value>),
+    /// Nothing confirmed: forward this turn's own bytes.
+    Fresh,
+}
+
+/// Split an inflated splice at the provider-confirmed floor.
+///
+/// `head_len` counts the splice's leading messages that come from the stored
+/// forwarded prefix (`prev_fwd.len()` on the aligned path, `replay_upto` on
+/// the diverged path); the rest is this turn's own tail. `floor` is already
+/// clamped to `head_len`. `shifted` says the stored pair no longer shares one
+/// index space — the overlay replayed a scaffolding message the client
+/// withdrew, so `prev_fwd` runs longer than `prev_orig` and the two disagree
+/// past the insertion point.
+///
+/// The bound itself is the port of upstream #3052 this overlay never had: the
+/// replayed bytes must not exceed this turn's own output, so a fresh
+/// compression improvement beyond the floor reaches the wire instead of being
+/// pinned behind stale forwarded bytes. The floor is the port of upstream
+/// `aebe9895`: inside the provider-confirmed prefix the replay source is
+/// exactly what the provider hashed, so changing those bytes can only bust
+/// the cache — replay there is unconditional, and a collapsed floor (cold
+/// cache, TTL lapse) lets every accumulated improvement land at once, which
+/// bounds long-session growth.
+///
+/// Which wins when the two mechanisms meet a withdrawal — the floor or the
+/// alignment span: the span. Resuming `optimized` mid-span at a forwarded
+/// index would read a current-space position that no longer names the same
+/// message past the insertion point, dropping or duplicating client content
+/// to save a cache entry. So a shifted span is atomic: with anything confirmed
+/// it replays whole (the withdrawn bytes are provider-cached history —
+/// forwarded last turn — small standalone scaffolding by construction, and a
+/// non-zero floor says the cache is warm), and only a zero floor sends the
+/// turn out fresh. Correctness outranks economy; the improvement lands on the
+/// next cold turn.
+fn split_inflated_replay_at_floor(
+    spliced: Vec<Value>,
+    prev_fwd: &[Value],
+    optimized_messages: &[Value],
+    head_len: usize,
+    floor: usize,
+    shifted: bool,
+) -> InflatedReplay {
+    if floor >= head_len {
+        // The floor covers the whole replayed head: unconditional, and the
+        // bound is moot — this is also the fast path, skipping two whole-body
+        // serialisations on every warm-cache turn.
+        return InflatedReplay::Whole(spliced);
+    }
+    if spliced.is_empty() || optimized_messages.is_empty() {
+        // Degenerate body either way; declining can only drop what the splice
+        // kept, so keep the splice.
+        return InflatedReplay::Whole(spliced);
+    }
+    let within_bound = match (
+        compact_json_len(&spliced),
+        compact_json_len(optimized_messages),
+    ) {
+        (Some(replayed), Some(optimized)) => replayed <= optimized,
+        // Sizing unprovable: same fail direction as upstream — treat as tripped.
+        (None, _) | (_, None) => false,
+    };
+    if within_bound {
+        return InflatedReplay::Whole(spliced);
+    }
+    if floor == 0 {
+        tracing::debug!(
+            event = "prefix_replay_inflated_without_floor",
+            replayed_head_msgs = head_len,
+            "replay inflated this turn's output with nothing provider-confirmed; forwarding fresh"
+        );
+        return InflatedReplay::Fresh;
+    }
+    if shifted {
+        // Atomic span (see doc comment): a mid-span split would resume the
+        // tail at a shifted index. The floor is non-zero, so replay whole.
+        tracing::debug!(
+            event = "prefix_replay_floor_keeps_shifted_span",
+            replayed_head_msgs = head_len,
+            confirmed_floor_msgs = floor,
+            "replay inflated but the span carries a replayed withdrawal; splitting would resume at a shifted index, so the confirmed floor keeps the whole span"
+        );
+        return InflatedReplay::Whole(spliced);
+    }
+    let floor = floor.min(optimized_messages.len());
+    let mut out = prev_fwd[..floor].to_vec();
+    out.extend_from_slice(&optimized_messages[floor..]);
+    tracing::debug!(
+        event = "prefix_replay_split_at_confirmed_floor",
+        replayed_head_msgs = head_len,
+        confirmed_floor_msgs = floor,
+        "replay inflated beyond the confirmed floor; replaying the confirmed head, forwarding the rest fresh"
+    );
+    InflatedReplay::Split(out)
 }
 
 /// [`overlay_cached_prefix`], but reporting why it declined.
@@ -1050,12 +1182,25 @@ impl ReplaySkip {
 /// nothing continues it, reporting `chain_id = 0`; splicing another stream's
 /// bytes in on the strength of a shared opener would forward compressed content
 /// whose referents live in a conversation this one never had.
+///
+/// `confirmed_frozen_count` is the provider-confirmed floor (port of upstream
+/// `aebe9895`): how many leading messages the provider has confirmed cached.
+/// Inside the floor the replay is unconditional and the non-inflation bound
+/// (compact-JSON bytes of the splice must not exceed this turn's own output)
+/// arbitrates only beyond it — a shrinking replay still repairs drift, an
+/// inflating one lets the fresh improvement through. `None` disables the
+/// bound (the historical posture); production passes
+/// `Some(store.confirmed_frozen_count(session_key))`, which is `Some(0)` on a
+/// cold cache so improvements land at once instead of pinning forever. The
+/// alignment guards and the span atomicity above are never relaxed by the
+/// floor — see [`split_inflated_replay_at_floor`] for which wins where they meet.
 pub fn overlay_cached_prefix_reported(
     optimized_messages: Vec<Value>,
     current_original_messages: &[Value],
     previous_original_messages: Option<&[Value]>,
     previous_forwarded_messages: Option<&[Value]>,
     continues_chain: bool,
+    confirmed_frozen_count: Option<usize>,
 ) -> (Vec<Value>, Option<ReplaySkip>) {
     let (prev_orig, prev_fwd) = match (previous_original_messages, previous_forwarded_messages) {
         (Some(o), Some(f)) if !o.is_empty() && !f.is_empty() => (o, f),
@@ -1183,9 +1328,41 @@ pub fn overlay_cached_prefix_reported(
         }
         let mut out = prev_fwd[..replay_upto].to_vec();
         out.extend_from_slice(&optimized_messages[replay_upto..]);
+        // The floor arbitrates the bound, never the guards: a divergence still
+        // declines when nothing agrees, and a split only moves where the fresh
+        // tail resumes — which can only forward more of this turn's own bytes.
+        // The reported count follows the split down when one happens.
+        let mut replayed_prefix_msgs = replay_upto;
+        out = match confirmed_frozen_count {
+            None => out,
+            Some(confirmed) => match split_inflated_replay_at_floor(
+                out,
+                prev_fwd,
+                &optimized_messages,
+                replay_upto,
+                confirmed.min(replay_upto),
+                prev_fwd.len() > n,
+            ) {
+                InflatedReplay::Whole(out) => out,
+                InflatedReplay::Split(out) => {
+                    replayed_prefix_msgs = confirmed.min(replay_upto).min(optimized_messages.len());
+                    out
+                }
+                InflatedReplay::Fresh => {
+                    return (
+                        optimized_messages,
+                        Some(ReplaySkip::InflatedWithoutConfirmedFloor),
+                    );
+                }
+            },
+        };
         if first_illegal_system_position(&out).is_some() {
             return (optimized_messages, Some(ReplaySkip::SystemAdjacencyBroken));
         }
+        let skip = ReplaySkip::PrefixContentDiverged {
+            first_diff_index,
+            replayed_prefix_msgs,
+        };
         return (out, Some(skip));
     };
     if optimized_messages.len() < consumed {
@@ -1219,6 +1396,33 @@ pub fn overlay_cached_prefix_reported(
     // withdrawn.
     let mut out = prev_fwd.to_vec();
     out.extend_from_slice(&optimized_messages[consumed..]);
+    // The confirmed floor (port of upstream `aebe9895`): positions the
+    // provider confirmed cached replay unconditionally — the replay source is
+    // exactly what the provider hashed — while the non-inflation bound keeps
+    // arbitrating beyond the floor, so a fresh compression improvement still
+    // reaches the wire. `None` keeps this overlay's historical posture (no
+    // bound); production always passes the tracker's count. The alignment span
+    // from the withdrawal work stays atomic under a partial floor — see
+    // [`split_inflated_replay_at_floor`].
+    out = match confirmed_frozen_count {
+        None => out,
+        Some(confirmed) => match split_inflated_replay_at_floor(
+            out,
+            prev_fwd,
+            &optimized_messages,
+            prev_fwd.len(),
+            confirmed.min(prev_fwd.len()),
+            prev_fwd.len() > n,
+        ) {
+            InflatedReplay::Whole(out) | InflatedReplay::Split(out) => out,
+            InflatedReplay::Fresh => {
+                return (
+                    optimized_messages,
+                    Some(ReplaySkip::InflatedWithoutConfirmedFloor),
+                );
+            }
+        },
+    };
     if first_illegal_system_position(&out).is_some() {
         return (optimized_messages, Some(ReplaySkip::SystemAdjacencyBroken));
     }
@@ -2888,7 +3092,9 @@ impl SessionReplayStore {
                 .head_hash
                 .clone()
                 .or_else(|| adoption_head_hash(&snapshot.originals));
-            let modified = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+            let modified = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok());
             if let Ok(mut heads) = self.persisted_heads.lock() {
                 heads.insert(path.clone(), (modified, head));
             }
@@ -3249,6 +3455,38 @@ impl SessionReplayStore {
             })
             .unwrap_or(0);
         Some(tracked.max(in_flight))
+    }
+
+    /// How many leading messages the provider has confirmed cached for this
+    /// session, or 0 when unknown (no tracker, idle past its TTL, cold cache).
+    ///
+    /// The overlay's unconditional-replay floor (port of upstream `aebe9895`):
+    /// inside this prefix the replay source is exactly what the provider
+    /// hashed, so replaying it can only help; beyond it the non-inflation
+    /// bound decides. Read from the live tracker — which the response side
+    /// feeds via [`Self::complete`] — rather than threaded through
+    /// [`Self::previous_turn_for`], so the overlay call site needs no new
+    /// plumbing; same pattern as [`Self::turns_seen`].
+    ///
+    /// Approximate on alternate-chain turns: the count belongs to the
+    /// session's primary tracker while the replayed bytes may come from a
+    /// held alternate. Either direction is safe — the floor only bypasses the
+    /// size bound, never an alignment guard, so the worst case is the
+    /// historical unbounded replay on one side and a conservative decline on
+    /// the other.
+    pub fn confirmed_frozen_count(&self, session_key: &str) -> usize {
+        self.hydrate(session_key);
+        let guard = match self.trackers.lock() {
+            Ok(guard) => guard,
+            Err(_) => return 0,
+        };
+        let Some(tracker) = guard.peek(session_key) else {
+            return 0;
+        };
+        if tracker.last_activity.elapsed() > self.session_ttl {
+            return 0;
+        }
+        tracker.frozen_message_count()
     }
 
     #[cfg(test)]
@@ -3951,6 +4189,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert!(skip.is_none(), "withdrawal must not decline: {skip:?}");
         assert_eq!(out[..4], prev_fwd[..], "cached bytes replayed verbatim");
@@ -3995,6 +4234,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert!(
             skip.is_none(),
@@ -4023,6 +4263,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert!(
             skip.is_some(),
@@ -4058,6 +4299,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert!(
             matches!(skip, Some(ReplaySkip::PrefixContentDiverged { .. })),
@@ -4086,6 +4328,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert!(
             skip.is_some(),
@@ -4116,6 +4359,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert_eq!(
             skip,
@@ -4192,6 +4436,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert!(
             matches!(skip, Some(ReplaySkip::PrefixContentDiverged { .. })),
@@ -4234,6 +4479,7 @@ mod tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert_eq!(
             skip,
@@ -4918,6 +5164,7 @@ mod tests {
             Some(&stored_originals),
             Some(&stored_forwarded),
             true,
+            None,
         );
         assert_eq!(skip, None);
         assert_eq!(out[0], stable_forwarded);
@@ -5694,7 +5941,7 @@ mod skip_reason_tests {
         prev_orig: Option<&[Value]>,
         prev_fwd: Option<&[Value]>,
     ) -> Option<ReplaySkip> {
-        overlay_cached_prefix_reported(optimized, current, prev_orig, prev_fwd, true).1
+        overlay_cached_prefix_reported(optimized, current, prev_orig, prev_fwd, true, None).1
     }
 
     #[test]
@@ -5708,6 +5955,7 @@ mod skip_reason_tests {
             Some(&prev_orig),
             Some(&prev_fwd),
             true,
+            None,
         );
         assert_eq!(reason, None, "an append-only turn must replay");
         assert_eq!(out[0], prev_fwd[0], "the cached bytes must be forwarded");
@@ -5949,7 +6197,7 @@ mod interleaved_stream_tests {
 
         // And the overlay accepts it, which is the whole point.
         let (_, skip) =
-            overlay_cached_prefix_reported(a2.clone(), &a2, Some(&orig), Some(&fwd), true);
+            overlay_cached_prefix_reported(a2.clone(), &a2, Some(&orig), Some(&fwd), true, None);
         assert_eq!(skip, None, "A's turn must replay rather than decline");
     }
 
@@ -6024,6 +6272,7 @@ mod interleaved_stream_tests {
                 Some(&orig),
                 Some(&fwd),
                 chain_id != 0,
+                None,
             );
             assert!(skip.is_some(), "an unrelated stream must not replay");
             assert_eq!(out, c, "the turn's own bytes must be forwarded untouched");
@@ -6061,6 +6310,7 @@ mod interleaved_stream_tests {
             Some(&orig),
             Some(&fwd),
             chain_id != 0,
+            None,
         );
         assert_eq!(
             skip,
@@ -6246,8 +6496,14 @@ mod interleaved_stream_tests {
             let (orig, fwd, _) = store
                 .previous_turn_for("S", &next)
                 .unwrap_or_else(|e| panic!("agent{i} lost its prefix: {e:?}"));
-            let (_, skip) =
-                overlay_cached_prefix_reported(next.clone(), &next, Some(&orig), Some(&fwd), true);
+            let (_, skip) = overlay_cached_prefix_reported(
+                next.clone(),
+                &next,
+                Some(&orig),
+                Some(&fwd),
+                true,
+                None,
+            );
             assert_eq!(skip, None, "agent{i} was forced to decline and would bust");
         }
     }
@@ -6302,6 +6558,7 @@ mod divergence_index_tests {
             Some(prev),
             Some(&prev.to_vec()),
             true,
+            None,
         )
         .1
         {
@@ -6456,6 +6713,7 @@ mod originals_are_the_clients_tests {
             Some(&ours_prev),
             Some(&ours_prev),
             true,
+            None,
         );
         assert!(
             matches!(skip, Some(ReplaySkip::PrefixContentDiverged { .. })),
@@ -6477,6 +6735,7 @@ mod originals_are_the_clients_tests {
             Some(&client_prev),
             Some(&forwarded_prev),
             true,
+            None,
         );
         assert_eq!(skip, None, "an append-only client turn must replay");
         assert_eq!(
@@ -6498,6 +6757,7 @@ mod originals_are_the_clients_tests {
             Some(&client_prev),
             Some(&forwarded_prev),
             true,
+            None,
         );
         assert!(skip.is_some(), "a genuine edit must still decline");
         assert_eq!(out, client_now, "and forward the client's own bytes");
@@ -7122,6 +7382,7 @@ mod block_shape_tests {
             previous.map(|(original, _)| original.as_slice()),
             previous.map(|(_, forwarded)| forwarded.as_slice()),
             true,
+            None,
         );
         (place_tail_cache_breakpoints(overlaid, 1, false).0, skip)
     }

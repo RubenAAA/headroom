@@ -7240,6 +7240,13 @@ pub(crate) fn apply_prefix_replay(
         // stored chain. A zero id means the store fell back to the session's
         // most recent prefix, which belongs to some other stream.
         chain_id != 0,
+        // Provider-confirmed floor (port of upstream `aebe9895`): the leading
+        // messages the provider confirmed cached replay unconditionally, so a
+        // background recompression landing a smaller form of already-forwarded
+        // history cannot bust the warm cache; beyond the floor the
+        // non-inflation bound still lets improvements through, and a cold
+        // cache (count 0) lets every accumulated improvement land at once.
+        Some(store.confirmed_frozen_count(session_key)),
     );
     let replayed_prefix = overlaid != optimized;
     // A turn that does not replay is where the money goes: measured over the
