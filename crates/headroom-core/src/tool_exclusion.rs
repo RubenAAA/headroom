@@ -25,10 +25,21 @@ pub const DEFAULT_EXCLUDE_TOOLS: &[&str] = &[
     "WebFetch",
     "view",
     "headroom_retrieve",
+    // Cursor's file-read tool, the same category as `Read` and `view`:
+    // without this its raw source takes the LOSSY path, which is strictly
+    // worse than the fold `DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS` protects it
+    // from below.
+    "read_file",
+    // Skill bodies (Claude Code's `Skill` tool) are INSTRUCTIONS, not tool
+    // output: lossy compression on a directive does not degrade it, it
+    // inverts it. Named below as well, because protecting a tool needs
+    // both halves.
+    "Skill",
     // Lowercase variants for case-insensitive matching.
     "read",
     "glob",
     "grep",
+    "skill",
     "write",
     "edit",
     "web_search",
@@ -47,7 +58,7 @@ pub const DEFAULT_EXCLUDE_TOOLS: &[&str] = &[
 /// of the model acting on a summary of a file rather than the file. Pass
 /// `--exclude-tools ""` to compress them anyway.
 pub const DEFAULT_EXCLUDE_TOOLS_CSV: &str =
-    "Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,headroom_retrieve";
+    "Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve";
 
 /// Excluded tools whose results must stay *byte-faithful* — not merely
 /// uncompressed. Even the excluded-tool lossless fold rewrites formatted JSON,
@@ -64,6 +75,20 @@ pub const DEFAULT_VERBATIM_EXCLUDE_TOOLS: &[&str] = &[
     "view",
     "headroom_retrieve",
 ];
+
+/// File-READ tools whose output the excluded-tool lossless fold must never
+/// REWRITE. A strictly weaker protection than
+/// [`DEFAULT_VERBATIM_EXCLUDE_TOOLS`]: this gates only the fold, so these
+/// tools keep cross-turn dedup and the age-based lossy fall-through.
+///
+/// Mirrors Python `DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS`. A read result hands
+/// the fold raw file bytes; the fold inverts on our side, but the model
+/// types `Edit(old_string=…)` from the bytes it was SHOWN, so a rewrite
+/// breaks the anchor and the retry turn costs more than the fold saved.
+/// Protecting a read tool takes both halves: excluded above so it never
+/// compresses lossily, and named here so it is never folded either.
+pub const DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS: &[&str] =
+    &["Read", "read", "read_file", "Skill", "skill"];
 
 /// Equivalent spellings of a tool name, for exclusion matching.
 /// Mirrors Python `_tool_name_aliases`.
@@ -193,6 +218,12 @@ pub fn is_verbatim_excluded(name: &str) -> bool {
     is_tool_excluded(name, DEFAULT_VERBATIM_EXCLUDE_TOOLS.iter().copied())
 }
 
+/// True if `name` is a file-read tool whose output must pass through the
+/// excluded-tool lossless fold byte-exact.
+pub fn is_byte_exact_excluded(name: &str) -> bool {
+    is_tool_excluded(name, DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS.iter().copied())
+}
+
 /// The CCR retrieval tool's canonical name. Results carrying this name are the
 /// bytes the model just asked to have restored; compressing them again reopens
 /// the loop the retrieval closed.
@@ -290,5 +321,39 @@ mod tests {
         assert!(is_verbatim_excluded("WebFetch"));
         // Read is excluded from compression but is not verbatim-protected.
         assert!(!is_verbatim_excluded("Read"));
+    }
+
+    #[test]
+    fn lossy_exclusion_covers_read_file_and_skill() {
+        for name in ["read_file", "READ_FILE", "Skill", "skill", "SKILL"] {
+            assert!(
+                is_tool_excluded(name, DEFAULT_EXCLUDE_TOOLS.iter().copied()),
+                "{name} must be excluded from lossy compression"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_exact_set_covers_file_reads_and_skills_only() {
+        for name in [
+            "Read",
+            "read",
+            "READ",
+            "read_file",
+            "Skill",
+            "skill",
+            "SKILL",
+        ] {
+            assert!(
+                is_byte_exact_excluded(name),
+                "{name} must pass through the lossless fold byte-exact"
+            );
+        }
+        for name in ["Bash", "Grep", "WebFetch", "view", "headroom_retrieve"] {
+            assert!(
+                !is_byte_exact_excluded(name),
+                "{name} must keep reaching the lossless fold"
+            );
+        }
     }
 }

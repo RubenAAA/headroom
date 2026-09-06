@@ -3021,19 +3021,23 @@ mod ctx_implies_interception_tests {
             "Edit",
             "WebSearch",
             "WebFetch",
+            "read_file",
+            "Skill",
         ] {
             assert!(
                 c.exclude_tools.iter().any(|t| t == tool),
                 "{tool} must be excluded from compression by default"
             );
         }
-        assert!(
-            headroom_core::tool_exclusion::is_tool_excluded(
-                "Read",
-                c.exclude_tools.iter().map(String::as_str)
-            ),
-            "the parsed default must actually match through is_tool_excluded"
-        );
+        for tool in ["Read", "read_file", "Skill", "skill"] {
+            assert!(
+                headroom_core::tool_exclusion::is_tool_excluded(
+                    tool,
+                    c.exclude_tools.iter().map(String::as_str)
+                ),
+                "{tool} must match the parsed default through is_tool_excluded"
+            );
+        }
     }
 
     /// An operator who wants the old behaviour can still ask for it.

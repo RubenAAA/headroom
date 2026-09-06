@@ -119,7 +119,9 @@ use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
 use crate::tokenizer::get_tokenizer;
-use crate::tool_exclusion::{is_ccr_retrieve_tool, is_tool_excluded, is_verbatim_excluded};
+use crate::tool_exclusion::{
+    is_byte_exact_excluded, is_ccr_retrieve_tool, is_tool_excluded, is_verbatim_excluded,
+};
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────
 
@@ -1480,6 +1482,13 @@ enum ToolGuard {
     /// Excluded tool whose output breaks if rewritten at all, even
     /// reversibly (see `DEFAULT_VERBATIM_EXCLUDE_TOOLS`).
     Verbatim,
+    /// Excluded file-read tool whose output must skip the reversible
+    /// fold (see `DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS`): the model copies
+    /// `Edit(old_string=…)` anchors from the bytes it is shown, so even
+    /// a reversible rewrite breaks the next edit. Weaker than
+    /// [`ToolGuard::Verbatim`] on purpose — dedup and the age-based
+    /// fall-through still apply.
+    ByteExact,
     /// Excluded tool: no lossy compressor, but a self-verified
     /// reversible fold may still shrink it.
     LosslessOnly,
@@ -1534,6 +1543,12 @@ fn collect_tool_guards(messages: &[Value], exclude_tools: &[String]) -> HashMap<
                 ToolGuard::CcrRetrieve
             } else if excluded && is_verbatim_excluded(name) {
                 ToolGuard::Verbatim
+            } else if excluded && is_byte_exact_excluded(name) {
+                // Ahead of `LosslessOnly`: exclusion routes the block INTO
+                // the reversible fold, and the fold rewrites the file bytes
+                // the model patches from. Byte-exactness is the invariant;
+                // the fold is the leak.
+                ToolGuard::ByteExact
             } else if protect_reads
                 && block
                     .get("input")
@@ -1691,7 +1706,7 @@ fn plan_block_replacements(
                 });
                 continue;
             }
-            Some(ToolGuard::Verbatim) => {
+            Some(ToolGuard::Verbatim) | Some(ToolGuard::ByteExact) => {
                 slots.push(PlanSlot {
                     block_index: block_idx,
                     kind: SlotKind::Excluded {
@@ -3078,6 +3093,68 @@ mod tests {
         );
     }
 
+    /// File-read tools skip the excluded-tool fold as a whole: the model
+    /// copies `Edit(old_string=…)` anchors from the bytes it is shown, so
+    /// even a reversible rewrite breaks the next edit.
+    #[test]
+    fn byte_exact_file_read_skips_the_lossless_fold() {
+        let payload = repeated_log_payload();
+        for tool in ["Read", "read", "read_file"] {
+            let b = tool_result_body(tool, &payload);
+            let out = run_excluding(&b, &[tool]);
+            assert!(
+                matches!(out, LiveZoneOutcome::NoChange { .. }),
+                "{tool}: file-read output must pass through byte-exact"
+            );
+            assert!(
+                matches!(
+                    outcome_block_actions(&out).as_slice(),
+                    [BlockAction::Excluded {
+                        reason: ExclusionReason::ExcludedTool
+                    }]
+                ),
+                "{tool}: got {:?}",
+                outcome_block_actions(&out)
+            );
+        }
+        // Control: the same payload under a non-read tool folds.
+        let b = tool_result_body("Grep", &payload);
+        let out = run_excluding(&b, &["Grep"]);
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Compressed {
+                    strategy: STRATEGY_EXCLUDED_TOOL_LOSSLESS,
+                    ..
+                }]
+            ),
+            "control: got {:?}",
+            outcome_block_actions(&out)
+        );
+    }
+
+    /// Skill bodies are directives, not data: the fold that collapses
+    /// repeats can merge two distinct instructions into one.
+    #[test]
+    fn byte_exact_skill_skips_the_lossless_fold() {
+        let b = tool_result_body("Skill", &repeated_log_payload());
+        let out = run_excluding(&b, &["Skill"]);
+        assert!(
+            matches!(out, LiveZoneOutcome::NoChange { .. }),
+            "Skill output must pass through byte-exact"
+        );
+        assert!(
+            matches!(
+                outcome_block_actions(&out).as_slice(),
+                [BlockAction::Excluded {
+                    reason: ExclusionReason::ExcludedTool
+                }]
+            ),
+            "got {:?}",
+            outcome_block_actions(&out)
+        );
+    }
+
     /// The CCR guard is about unredeemable markers, not fidelity, so it
     /// outranks the operator's list: a retrieve result stays fully
     /// excluded even when a pattern would have routed it to the fold.
@@ -3350,7 +3427,45 @@ pub fn compress_openai_chat_live_zone(
     let mut block_outcomes: Vec<BlockOutcome> = Vec::with_capacity(all_slots.len());
     let mut replacements: Vec<Replacement> = Vec::new();
 
+    // Map assistant `tool_calls[].id` → `function.name` so a `role == "tool"`
+    // message can be attributed to the tool that produced it. A byte-exact
+    // file read (Read/read/read_file/Skill/skill) must reach the model as
+    // the bytes the file holds — the Anthropic planner's `ByteExact` guard
+    // on the same names. This path never consulted `--exclude-tools`, so
+    // the builtin set (not the operator list) is the gate here.
+    let tool_name_by_call_id: HashMap<&str, &str> = messages
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|tc| {
+            let id = tc.get("id").and_then(Value::as_str)?;
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)?;
+            Some((id, name))
+        })
+        .collect();
+
     for (msg_idx, slot) in all_slots {
+        let byte_exact_tool_output = slot.block_type == "tool_content"
+            && messages
+                .get(msg_idx)
+                .and_then(|m| m.get("tool_call_id"))
+                .and_then(Value::as_str)
+                .and_then(|id| tool_name_by_call_id.get(id))
+                .is_some_and(|name| is_byte_exact_excluded(name));
+        if byte_exact_tool_output {
+            block_outcomes.push(BlockOutcome {
+                message_index: msg_idx,
+                block_index: slot.block_index,
+                block_type: slot.block_type,
+                action: BlockAction::Excluded {
+                    reason: ExclusionReason::ExcludedTool,
+                },
+            });
+            continue;
+        }
         let detected = detect_content_type(&slot.content_text);
         let outcome = compress_one_block(
             &slot.content_text,
@@ -3673,6 +3788,82 @@ mod openai_chat_tests {
             .expect("user block recorded");
         assert_eq!(user_block.message_index, 2);
     }
+
+    /// Log-shaped filler big enough to compress on this path.
+    fn bulky_log_payload() -> String {
+        format!(
+            "2024-01-01 12:00:00 INFO  worker: starting up\n{}",
+            "2024-01-01 12:00:01 WARN  worker: retrying connection\n".repeat(200)
+        )
+    }
+
+    /// A byte-exact file read must reach the model as the bytes the file
+    /// holds: the tool name resolves through the assistant `tool_calls`,
+    /// and the `role == "tool"` message passes through untouched.
+    #[test]
+    fn byte_exact_tool_message_passes_through() {
+        let payload = bulky_log_payload();
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "reading",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": payload},
+            ]
+        }));
+        let out = compress_openai_chat_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        match &out {
+            LiveZoneOutcome::NoChange { manifest } => {
+                let tool_block = manifest
+                    .block_outcomes
+                    .iter()
+                    .find(|b| b.block_type == "tool_content")
+                    .expect("tool block recorded");
+                assert!(
+                    matches!(
+                        tool_block.action,
+                        BlockAction::Excluded {
+                            reason: ExclusionReason::ExcludedTool
+                        }
+                    ),
+                    "got {:?}",
+                    tool_block.action
+                );
+            }
+            LiveZoneOutcome::Modified { .. } => {
+                panic!("byte-exact tool message must not rewrite the body")
+            }
+        }
+        // Control: the same payload with no tool_calls attribution still
+        // compresses — the gate is name-based, not a blanket tool skip.
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "tool_call_id": "t9", "content": payload},
+            ]
+        }));
+        let out = compress_openai_chat_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        match &out {
+            LiveZoneOutcome::Modified { manifest, .. } => {
+                assert!(
+                    manifest
+                        .block_outcomes
+                        .iter()
+                        .any(|b| matches!(b.action, BlockAction::Compressed { .. })),
+                    "control: got {:?}",
+                    manifest
+                        .block_outcomes
+                        .iter()
+                        .map(|b| &b.action)
+                        .collect::<Vec<_>>()
+                );
+            }
+            LiveZoneOutcome::NoChange { .. } => {
+                panic!("control: unattributed tool payload must still compress")
+            }
+        }
+    }
 }
 
 // ─── OpenAI Responses live-zone dispatcher (Phase C PR-C3) ────────────
@@ -3776,6 +3967,11 @@ pub fn compress_openai_responses_live_zone(
     let protect_reads = read_protection_enabled();
     let mut read_command_call_ids: HashSet<&str> = HashSet::new();
     let mut verbatim_tool_call_ids: HashSet<&str> = HashSet::new();
+    // File reads whose output the model patches from (the Codex wire shape
+    // of the Anthropic planner's `ByteExact` guard): no lossy compressor
+    // and no fold may rewrite them. This path has no fold step, so one
+    // passthrough covers both.
+    let mut byte_exact_tool_call_ids: HashSet<&str> = HashSet::new();
     for item in items {
         let type_tag = item.get("type").and_then(Value::as_str).unwrap_or("");
         if type_tag == "function_call" {
@@ -3786,6 +3982,9 @@ pub fn compress_openai_responses_live_zone(
                 }
                 if is_verbatim_excluded(name) {
                     verbatim_tool_call_ids.insert(call_id);
+                }
+                if is_byte_exact_excluded(name) {
+                    byte_exact_tool_call_ids.insert(call_id);
                 }
             }
         }
@@ -3913,6 +4112,25 @@ pub fn compress_openai_responses_live_zone(
             .and_then(Value::as_str)
             .is_some_and(|id| verbatim_tool_call_ids.contains(id));
         if is_verbatim_tool {
+            block_outcomes.push(BlockOutcome {
+                message_index: msg_idx,
+                block_index: slot.block_index,
+                block_type: slot.block_type.clone(),
+                action: BlockAction::Excluded {
+                    reason: ExclusionReason::ExcludedTool,
+                },
+            });
+            continue;
+        }
+        // A file read skips compression entirely: this is the Codex wire,
+        // where `read` returns raw file bytes, so any rewrite here breaks
+        // the next `Edit(old_string=…)`.
+        let is_byte_exact_tool = items
+            .get(msg_idx)
+            .and_then(|item| item.get("call_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| byte_exact_tool_call_ids.contains(id));
+        if is_byte_exact_tool {
             block_outcomes.push(BlockOutcome {
                 message_index: msg_idx,
                 block_index: slot.block_index,
@@ -4270,6 +4488,58 @@ mod openai_responses_tests {
             })
             .count();
         assert_eq!(compressed_outputs, 2, "{manifest:?}");
+    }
+
+    /// A byte-exact file read must reach the model as the bytes the file
+    /// holds: on this wire the output names its call via `call_id`, and
+    /// the matching `function_call` names the tool.
+    #[test]
+    fn byte_exact_function_call_output_passes_through() {
+        let mut payload = String::new();
+        for i in 0..400 {
+            payload.push_str(&format!(
+                "./src/foo_{i}.rs:12: error[E0308]: mismatched types in module foo_{i}\n"
+            ));
+        }
+        let b = body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": payload},
+            ]
+        }));
+        let out = compress_openai_responses_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        match &out {
+            LiveZoneOutcome::NoChange { manifest } => {
+                assert_eq!(manifest.block_outcomes.len(), 1);
+                assert!(
+                    matches!(
+                        manifest.block_outcomes[0].action,
+                        BlockAction::Excluded {
+                            reason: ExclusionReason::ExcludedTool
+                        }
+                    ),
+                    "got {:?}",
+                    manifest.block_outcomes[0].action
+                );
+            }
+            LiveZoneOutcome::Modified { .. } => {
+                panic!("byte-exact function_call_output must not rewrite the body")
+            }
+        }
+        // Control: the same payload under a non-read tool still compresses.
+        let b = body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "exec", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": payload},
+            ]
+        }));
+        let out = compress_openai_responses_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        assert!(
+            matches!(out, LiveZoneOutcome::Modified { .. }),
+            "control: non-read output must still compress"
+        );
     }
 
     #[test]
