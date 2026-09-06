@@ -62,8 +62,8 @@ pub use cache_aligner::{
     VolatileFinding,
 };
 pub use code_compressor::{
-    detect_language, CodeAwareCompressor, CodeCompressionResult, CodeCompressorConfig,
-    CodeLanguage, DocstringMode,
+    detect_language, syntax_breaker_status, CodeAwareCompressor, CodeCompressionResult,
+    CodeCompressorConfig, CodeLanguage, DocstringMode, SyntaxBreakerLanguageStatus,
 };
 pub use content_detector::{
     detect_content_type, is_json_array_of_dicts, ContentType, DetectionResult,

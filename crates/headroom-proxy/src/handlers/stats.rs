@@ -43,6 +43,9 @@ pub async fn handle_stats(State(state): State<AppState>) -> Json<serde_json::Val
         "proxy_overhead": state.savings_tracker.proxy_overhead_report(),
         "recent_requests": recent,
         "total_logged": state.request_logger.len(),
+        // Per-language AST-compression pauses. Empty on a healthy install;
+        // non-empty is the explanation for a savings drop in one language.
+        "code_syntax_breaker": headroom_core::transforms::code_compressor::syntax_breaker_status(),
         "codex_rate_limits": state
             .codex_rate_limits
             .snapshot()

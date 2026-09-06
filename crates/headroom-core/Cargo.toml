@@ -228,6 +228,12 @@ tree-sitter-c-sharp = "=0.23.5"
 # (mixed HTML + `<?php` islands) and `LANGUAGE_PHP_ONLY` (no surrounding HTML).
 # The language pack's `php` parser is the mixed one, so that is what we use.
 tree-sitter-php = "=0.24.2"
+# Bash, like Perl and PHP, has no PyPI wheel pin — Python loads it from
+# `tree-sitter-language-pack`. The grammar is only used to VALIDATE (and to
+# compete in language detection); recognized shell is always returned
+# byte-for-byte, never AST-rewritten, so node-type parity is not load-bearing
+# here the way it is for the rewritten languages.
+tree-sitter-bash = "=0.25.1"
 
 [features]
 # `ml` is ON by default, so a stock build is byte-for-byte what it was before:

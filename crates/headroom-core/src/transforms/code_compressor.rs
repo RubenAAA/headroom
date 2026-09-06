@@ -38,7 +38,9 @@
 //! convention via the dispatcher. Parity fixtures are recorded with
 //! `enable_ccr=False` so the output is deterministic and store-independent.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tree_sitter::{Language, Node, Parser, Tree};
 
@@ -59,6 +61,7 @@ pub enum CodeLanguage {
     Perl,
     CSharp,
     Php,
+    Bash,
     Unknown,
 }
 
@@ -76,6 +79,7 @@ impl CodeLanguage {
             CodeLanguage::Perl => "perl",
             CodeLanguage::CSharp => "csharp",
             CodeLanguage::Php => "php",
+            CodeLanguage::Bash => "bash",
             CodeLanguage::Unknown => "unknown",
         }
     }
@@ -96,6 +100,7 @@ impl CodeLanguage {
             "perl" => CodeLanguage::Perl,
             "csharp" => CodeLanguage::CSharp,
             "php" => CodeLanguage::Php,
+            "bash" => CodeLanguage::Bash,
             "unknown" => CodeLanguage::Unknown,
             _ => return None,
         })
@@ -126,6 +131,7 @@ impl CodeLanguage {
             "c++" | "cxx" | "cc" | "hpp" => CodeLanguage::Cpp,
             "pl" => CodeLanguage::Perl,
             "phtml" | "php5" | "php7" | "php8" => CodeLanguage::Php,
+            "shell" | "sh" | "zsh" | "shellscript" => CodeLanguage::Bash,
             _ => CodeLanguage::Unknown,
         }
     }
@@ -146,6 +152,10 @@ impl CodeLanguage {
             // The mixed HTML + `<?php` grammar, matching what Python's
             // `tree-sitter-language-pack` returns for `php`.
             CodeLanguage::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            // The Bash grammar is only used to validate (and to compete in
+            // detection). Recognized shell is returned byte-for-byte, never
+            // AST-rewritten — see the early return in `compress_with`.
+            CodeLanguage::Bash => tree_sitter_bash::LANGUAGE.into(),
             CodeLanguage::Unknown => return None,
         })
     }
@@ -405,6 +415,37 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             package_node: Some("namespace_definition"),
             container_node_types: &[],
             opaque_node_types: &[],
+        },
+        CodeLanguage::Bash => LangConfig {
+            // Shell control-flow nodes are opaque: their `then`/`fi`,
+            // `do`/`done`, and `case` delimiters are anonymous grammar
+            // tokens. The generic extractor must not descend into them and
+            // re-emit only their commands, which would silently corrupt
+            // otherwise valid shell code. (The `compress_with` early return
+            // currently keeps Bash byte-for-byte, so this config is the
+            // backstop for any future AST path, as in the reference.)
+            import_nodes: &[],
+            function_nodes: &[],
+            class_nodes: &[],
+            type_nodes: &[],
+            body_node_types: &[],
+            class_body_node_types: None,
+            decorator_node: None,
+            comment_prefix: "#",
+            uses_colon_after_signature: false,
+            package_node: None,
+            container_node_types: &[],
+            opaque_node_types: &[
+                "if_statement",
+                "for_statement",
+                "while_statement",
+                "until_statement",
+                "case_statement",
+                "select_statement",
+                "function_definition",
+                "subshell",
+                "compound_statement",
+            ],
         },
         CodeLanguage::Unknown => return None,
     })
@@ -871,6 +912,15 @@ mod prefilter {
                         c(r"(?m)\$this->|->\w+\s*\("),
                     ],
                 ),
+                (
+                    CodeLanguage::Bash,
+                    vec![
+                        c(r"(?m)^\s*#!.*\b(?:bash|sh|zsh)\b"),
+                        c(r"(?m)^\s*(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|select)\b"),
+                        c(r"(?m)^\s*(?:export|source|shopt|declare|local|alias|set|readonly|typeset)\b"),
+                        c(r"(?m)\[\[.*\]\]|\$\{[^}]+\}|\$\([^)]+\)"),
+                    ],
+                ),
             ]
         })
     }
@@ -977,6 +1027,145 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
     }
     let confidence = (0.3 + best.1 as f64 * 0.1).min(1.0);
     (best.0, confidence)
+}
+
+// ─── Per-language syntax breaker ──────────────────────────────────────
+//
+// The AST pass validates its own output and discards anything that no longer
+// parses ("never serve broken code"), so a misbehaving grammar costs the full
+// compression latency and then throws the work away. When a language keeps
+// failing its own validation, stop attempting it for a cooldown instead of
+// burning the latency on every request.
+//
+// Process-global, deliberately: a failing grammar is a property of the
+// process's tree-sitter build, not of the caller. Opt out per-deployment
+// with `HEADROOM_CODE_SYNTAX_BREAKER=0` (also `false`/`off`), read live on
+// every call like the other kill-switches in this crate.
+const SYNTAX_BREAKER_WINDOW: usize = 20;
+const SYNTAX_BREAKER_MIN_FAILURES: usize = 10;
+const SYNTAX_BREAKER_COOLDOWN_SECS: u64 = 1800;
+const SYNTAX_BREAKER_ENV: &str = "HEADROOM_CODE_SYNTAX_BREAKER";
+
+#[derive(Debug, Default)]
+struct SyntaxBreakerState {
+    outcomes: HashMap<String, VecDeque<bool>>,
+    open_until: HashMap<String, Instant>,
+    trips: HashMap<String, u64>,
+}
+
+fn syntax_breaker_state() -> &'static Mutex<SyntaxBreakerState> {
+    static STATE: OnceLock<Mutex<SyntaxBreakerState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(SyntaxBreakerState::default()))
+}
+
+/// False when the breaker is opted out via
+/// `HEADROOM_CODE_SYNTAX_BREAKER=0|false|off` (case-insensitive, trimmed).
+fn syntax_breaker_enabled() -> bool {
+    match std::env::var(SYNTAX_BREAKER_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// True while AST compression for `language` (a [`CodeLanguage::value`]) is
+/// paused after repeat validation failures.
+fn syntax_breaker_open(language: &str) -> bool {
+    if !syntax_breaker_enabled() {
+        return false;
+    }
+    let state = syntax_breaker_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    state
+        .open_until
+        .get(language)
+        .is_some_and(|until| *until > Instant::now())
+}
+
+/// Track a validation outcome; trip the breaker on a failing window. The
+/// window clears on trip so a fresh run of failures must re-earn the next
+/// pause. Other languages are isolated.
+fn record_syntax_outcome(language: &str, valid: bool) {
+    if !syntax_breaker_enabled() {
+        return;
+    }
+    let mut tripped_failures = 0usize;
+    {
+        let mut state = syntax_breaker_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let failures = {
+            let window = state.outcomes.entry(language.to_string()).or_default();
+            if window.len() >= SYNTAX_BREAKER_WINDOW {
+                window.pop_front();
+            }
+            window.push_back(valid);
+            window.iter().filter(|&&ok| !ok).count()
+        };
+        if failures >= SYNTAX_BREAKER_MIN_FAILURES {
+            state.open_until.insert(
+                language.to_string(),
+                Instant::now() + Duration::from_secs(SYNTAX_BREAKER_COOLDOWN_SECS),
+            );
+            *state.trips.entry(language.to_string()).or_insert(0) += 1;
+            // A fresh window after the cooldown must re-earn the trip.
+            if let Some(window) = state.outcomes.get_mut(language) {
+                window.clear();
+            }
+            tripped_failures = failures;
+        }
+    }
+    if tripped_failures > 0 {
+        tracing::warn!(
+            "Code compression for {language} paused for {} min: {tripped_failures} of the last {SYNTAX_BREAKER_WINDOW} attempts produced invalid syntax and were discarded (HEADROOM_CODE_SYNTAX_BREAKER=0 disables this breaker)",
+            SYNTAX_BREAKER_COOLDOWN_SECS / 60,
+        );
+    }
+}
+
+/// Per-language breaker state for one language, surfaced on `/stats`.
+///
+/// While the breaker is open that language compresses at ratio 1.0, so
+/// savings drop with nothing in the payload explaining why. The map is empty
+/// until something trips, so a healthy install carries no extra keys.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SyntaxBreakerLanguageStatus {
+    pub open: bool,
+    pub trips: u64,
+    pub reopens_in_seconds: f64,
+}
+
+/// Per-language breaker state keyed by language value, sorted. Empty until
+/// something trips.
+pub fn syntax_breaker_status() -> BTreeMap<String, SyntaxBreakerLanguageStatus> {
+    let now = Instant::now();
+    let state = syntax_breaker_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut out = BTreeMap::new();
+    let mut languages: Vec<&String> = state.trips.keys().chain(state.open_until.keys()).collect();
+    languages.sort();
+    languages.dedup();
+    for language in languages {
+        let until = state.open_until.get(language);
+        let open = until.is_some_and(|t| *t > now);
+        let remaining = until
+            .and_then(|t| t.checked_duration_since(now))
+            .map(|d| (d.as_secs_f64() * 10.0).round() / 10.0)
+            .unwrap_or(0.0);
+        out.insert(
+            language.clone(),
+            SyntaxBreakerLanguageStatus {
+                open,
+                trips: state.trips.get(language).copied().unwrap_or(0),
+                reopens_in_seconds: remaining,
+            },
+        );
+    }
+    out
 }
 
 // ─── Compressor ─────────────────────────────────────────────────────────
@@ -1091,6 +1280,45 @@ impl CodeAwareCompressor {
             };
         }
 
+        // Bash control-flow is recognized and parsed for validation, but is
+        // not rewritten: shell `then`/`fi`, `do`/`done`, `esac` delimiters
+        // are anonymous grammar tokens the generic AST reassembler cannot
+        // preserve. Returning the validated source keeps shell scripts
+        // byte-for-byte intact instead of risking lossy fallback.
+        if detected_lang == CodeLanguage::Bash {
+            // Validate only when a parser exists. Without one there is
+            // nothing to validate against, and the source is returned
+            // unchanged either way — report it as valid rather than as
+            // broken.
+            let syntax_valid = match parse_code(code, detected_lang) {
+                Some(tree) => !has_syntax_issues(tree.root_node()),
+                None => true,
+            };
+            return CodeCompressionResult {
+                compressed: code.to_string(),
+                original: code.to_string(),
+                original_tokens,
+                compressed_tokens: original_tokens,
+                compression_ratio: 1.0,
+                language: detected_lang,
+                language_confidence: confidence,
+                preserved_imports: 0,
+                preserved_signatures: 0,
+                compressed_bodies: 0,
+                syntax_valid,
+                cache_key: None,
+                symbol_scores: Vec::new(),
+            };
+        }
+
+        // A language that keeps failing its own output validation gets its
+        // attempts paused (see `record_syntax_outcome`) — return the original
+        // without paying the parse/compress latency for work that would be
+        // discarded anyway.
+        if syntax_breaker_open(detected_lang.value()) {
+            return passthrough_result(code, original_tokens, detected_lang, confidence);
+        }
+
         // Parse + compress (tree-sitter always available here).
         let Some((compressed, structure, symbol_scores)) =
             self.compress_with_ast(code, detected_lang, context, false)
@@ -1125,6 +1353,11 @@ impl CodeAwareCompressor {
                 syntax_valid = self.verify_syntax(&compressed, detected_lang);
             }
         }
+
+        // The recovery retry above feeds the final verdict: a grammar that
+        // keeps mangling real code pauses AST attempts for a cooldown
+        // instead of burning the latency on every request.
+        record_syntax_outcome(detected_lang.value(), syntax_valid);
 
         // Still broken → never serve invalid code.
         if !syntax_valid {
@@ -2731,5 +2964,279 @@ mod tests {
         };
         let r = CodeAwareCompressor::new(cfg).compress(&code);
         assert_eq!(r.compressed.trim_end(), code.trim_end());
+    }
+
+    // ─── Bash passthrough (upstream ee902074 / ee6f9db2) ────────────────
+    //
+    // Shell control-flow words (`then`/`fi`, `do`/`done`, `esac`) are
+    // anonymous grammar tokens the generic AST reassembler cannot preserve,
+    // so recognized Bash is returned byte-for-byte. No tree-sitter Bash
+    // grammar is bundled: detection is regex-only and the passthrough
+    // reports valid, which is also the no-parser ordering the reference
+    // requires.
+
+    /// The control-flow sample from the upstream issue: two `then`/`fi`
+    /// pairs plus nested expansions.
+    fn bash_issue_sample() -> &'static str {
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         \n\
+         if [ -x \"$(command -v /opt/bin/forgejo)\" ]\n\
+         then\n\
+         \texport GITEA_WORK_DIR=/git/forgejo\n\
+         \texport FORGEJO_CUSTOM=/etc/forgejo\n\
+         \talias forge=\"sudo -Eu git GITEA_CUSTOM=${FORGEJO_CUSTOM} GITEA_WORK_DIR=${GITEA_WORK_DIR} /opt/bin/forgejo\"\n\
+         fi\n\
+         \n\
+         if [[ \"$( git config --global alias.pushall 2>/dev/null )\" != '!git remote | xargs -L1 git push --all' ]]\n\
+         then\n\
+         \tgit config --global --unset-all alias.pushall\n\
+         git config --global --add alias.pushall '!git remote | xargs -L1 git push --all'\n\
+         fi\n"
+    }
+
+    fn bash_compressor() -> CodeAwareCompressor {
+        CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn bash_aliases_are_canonicalized() {
+        assert_eq!(CodeLanguage::coerce("bash"), CodeLanguage::Bash);
+        assert_eq!(CodeLanguage::coerce("shell"), CodeLanguage::Bash);
+        assert_eq!(CodeLanguage::coerce("sh"), CodeLanguage::Bash);
+        assert_eq!(CodeLanguage::coerce("zsh"), CodeLanguage::Bash);
+        assert_eq!(CodeLanguage::coerce("shellscript"), CodeLanguage::Bash);
+        assert_eq!(CodeLanguage::from_name("bash"), Some(CodeLanguage::Bash));
+        assert_eq!(CodeLanguage::Bash.value(), "bash");
+    }
+
+    #[test]
+    fn bash_is_detected_from_control_flow() {
+        let code = bash_issue_sample()
+            .strip_prefix("#!/usr/bin/env bash\n")
+            .unwrap();
+        let (detected, confidence) = detect_language(code);
+        assert_eq!(detected, CodeLanguage::Bash);
+        assert!(confidence > 0.0);
+    }
+
+    #[test]
+    fn bash_is_detected_from_shebang() {
+        let (detected, confidence) = detect_language("#!/bin/sh\necho hello\n");
+        assert_eq!(detected, CodeLanguage::Bash);
+        assert!(confidence > 0.0);
+    }
+
+    #[test]
+    fn bash_compression_is_lossless() {
+        let code = bash_issue_sample();
+        let r = bash_compressor().compress(code);
+        assert_eq!(r.language, CodeLanguage::Bash);
+        assert!(r.syntax_valid);
+        assert_eq!(r.compressed, code);
+        assert_eq!(r.compressed_tokens, r.original_tokens);
+        assert_eq!(r.compression_ratio, 1.0);
+    }
+
+    #[test]
+    fn shell_hint_is_lossless() {
+        let code = bash_issue_sample();
+        let r = bash_compressor().compress_with(code, Some("shell"), "");
+        assert_eq!(r.language, CodeLanguage::Bash);
+        assert_eq!(r.compressed, code);
+        assert!(r.syntax_valid);
+    }
+
+    #[test]
+    fn bash_control_flow_nodes_pass_through_byte_exact() {
+        // One sample per opaque node class in the reference config:
+        // if/for/while/case/subshell. Each must survive compression
+        // byte-for-byte, delimiters included.
+        let samples = [
+            "if [ -f /etc/os-release ]; then\n\techo present\nfi\n",
+            "for f in *.log; do\n\tgzip \"$f\"\ndone\n",
+            "while read -r line; do\n\techo \"$line\"\ndone < input.txt\n",
+            "case \"$1\" in\n\tstart) exec foo;;\n\tstop) exit 0;;\nesac\n",
+            "#!/bin/bash\n(cd /tmp && tar czf out.tgz src)\n",
+        ];
+        for code in samples {
+            let r = bash_compressor().compress_with(code, Some("bash"), "");
+            assert_eq!(r.language, CodeLanguage::Bash, "for {code:?}");
+            assert_eq!(r.compressed, code, "byte-exact for {code:?}");
+            assert!(r.syntax_valid);
+            assert_eq!(r.compression_ratio, 1.0);
+        }
+    }
+
+    // ─── Syntax breaker (upstream dde83c91) ─────────────────────────────
+
+    /// Serialize breaker tests: the state is process-global and the runner
+    /// is multi-threaded.
+    fn breaker_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reset_syntax_breaker() {
+        let mut state = syntax_breaker_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.outcomes.clear();
+        state.open_until.clear();
+        state.trips.clear();
+    }
+
+    #[test]
+    fn breaker_trips_after_min_failures_in_window() {
+        let _guard = breaker_test_lock();
+        reset_syntax_breaker();
+        for _ in 0..SYNTAX_BREAKER_MIN_FAILURES - 1 {
+            record_syntax_outcome("typescript", false);
+        }
+        assert!(!syntax_breaker_open("typescript"));
+        record_syntax_outcome("typescript", false);
+        assert!(syntax_breaker_open("typescript"));
+        // Per-language isolation: python keeps compressing.
+        assert!(!syntax_breaker_open("python"));
+        reset_syntax_breaker();
+    }
+
+    #[test]
+    fn breaker_successes_keep_it_closed() {
+        let _guard = breaker_test_lock();
+        reset_syntax_breaker();
+        for _ in 0..SYNTAX_BREAKER_WINDOW * 2 {
+            record_syntax_outcome("typescript", true);
+        }
+        for _ in 0..SYNTAX_BREAKER_MIN_FAILURES - 1 {
+            record_syntax_outcome("typescript", false);
+        }
+        assert!(!syntax_breaker_open("typescript"));
+        reset_syntax_breaker();
+    }
+
+    #[test]
+    fn breaker_reopens_after_cooldown() {
+        let _guard = breaker_test_lock();
+        reset_syntax_breaker();
+        for _ in 0..SYNTAX_BREAKER_MIN_FAILURES {
+            record_syntax_outcome("typescript", false);
+        }
+        assert!(syntax_breaker_open("typescript"));
+        // Expire the cooldown directly (the clock itself is not patchable).
+        {
+            let mut state = syntax_breaker_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let past = Instant::now() - Duration::from_secs(1);
+            state.open_until.insert("typescript".to_string(), past);
+        }
+        assert!(!syntax_breaker_open("typescript"));
+        // The cleared window means one more failure does not instantly re-trip.
+        record_syntax_outcome("typescript", false);
+        assert!(!syntax_breaker_open("typescript"));
+        reset_syntax_breaker();
+    }
+
+    #[test]
+    fn breaker_env_kill_switch() {
+        let _guard = breaker_test_lock();
+        reset_syntax_breaker();
+        for raw in ["0", "false", "off", "  Off "] {
+            std::env::set_var(SYNTAX_BREAKER_ENV, raw);
+            for _ in 0..SYNTAX_BREAKER_WINDOW {
+                record_syntax_outcome("typescript", false);
+            }
+            assert!(
+                !syntax_breaker_open("typescript"),
+                "breaker must stay closed with {raw:?}"
+            );
+            reset_syntax_breaker();
+        }
+        std::env::remove_var(SYNTAX_BREAKER_ENV);
+        // Sanity: without the opt-out the same run trips.
+        for _ in 0..SYNTAX_BREAKER_MIN_FAILURES {
+            record_syntax_outcome("typescript", false);
+        }
+        assert!(syntax_breaker_open("typescript"));
+        reset_syntax_breaker();
+        std::env::remove_var(SYNTAX_BREAKER_ENV);
+    }
+
+    #[test]
+    fn breaker_compress_short_circuits_while_open() {
+        let _guard = breaker_test_lock();
+        reset_syntax_breaker();
+        // Long-bodied TypeScript functions: the AST pass would truncate the
+        // bodies, so byte-identical output proves it never ran.
+        let body: String = (0..20)
+            .map(|i| format!("    const step{i} = compute(value{i}, {i});\n"))
+            .collect();
+        let code = format!("function alpha(x: number): number {{\n{body}    return step0;\n}}\n")
+            .repeat(6);
+        assert!(estimate_tokens(&code) >= 100);
+        {
+            let mut state = syntax_breaker_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.open_until.insert(
+                "typescript".to_string(),
+                Instant::now() + Duration::from_secs(60),
+            );
+        }
+        let cfg = CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            enable_ccr: false,
+            fallback_to_kompress: false,
+            language_hint: Some("typescript".to_string()),
+            ..Default::default()
+        };
+        let r = CodeAwareCompressor::new(cfg).compress(&code);
+        assert_eq!(r.language, CodeLanguage::Typescript);
+        assert_eq!(r.compressed, code);
+        assert_eq!(r.compression_ratio, 1.0);
+        assert!(r.syntax_valid);
+        reset_syntax_breaker();
+    }
+
+    #[test]
+    fn breaker_status_reports_open_languages_for_stats() {
+        let _guard = breaker_test_lock();
+        reset_syntax_breaker();
+        assert!(syntax_breaker_status().is_empty());
+
+        for _ in 0..SYNTAX_BREAKER_MIN_FAILURES {
+            record_syntax_outcome("typescript", false);
+        }
+        let status = syntax_breaker_status();
+        let ts = &status["typescript"];
+        assert!(ts.open);
+        assert_eq!(ts.trips, 1);
+        assert!(
+            (ts.reopens_in_seconds - SYNTAX_BREAKER_COOLDOWN_SECS as f64).abs() < 5.0,
+            "got {}",
+            ts.reopens_in_seconds
+        );
+
+        {
+            let mut state = syntax_breaker_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let past = Instant::now() - Duration::from_secs(1);
+            state.open_until.insert("typescript".to_string(), past);
+        }
+        let reopened = &syntax_breaker_status()["typescript"];
+        assert!(!reopened.open);
+        // The trip count survives the cooldown: a language that keeps
+        // tripping is the field diagnosis, and it would be invisible if this
+        // reset.
+        assert_eq!(reopened.trips, 1);
+        assert_eq!(reopened.reopens_in_seconds, 0.0);
+        reset_syntax_breaker();
     }
 }
