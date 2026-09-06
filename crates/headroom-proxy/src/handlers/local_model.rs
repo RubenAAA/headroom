@@ -5,6 +5,8 @@
 //! to OpenAI Chat Completions format, forwards to the local upstream,
 //! and translates the response back.
 
+use crate::openai::response::{openai_to_anthropic_response, responses_stream_to_turn};
+use crate::openai::stream::translate_openai_stream_to_anthropic;
 use crate::routed::outcome::{
     book_routed_outcome, book_routed_outcome_with_ccr, build_routed_outcome_context,
     RoutedOutcomeContext,
@@ -13,8 +15,6 @@ use crate::routed::transforms::{
     apply_bytes_stage, apply_compression_and_replay, apply_ctx_request_transforms,
     apply_tool_schema_compaction, merge_routed_compression_report,
 };
-use crate::openai::response::{openai_to_anthropic_response, responses_stream_to_turn};
-use crate::openai::stream::translate_openai_stream_to_anthropic;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
@@ -31,16 +31,6 @@ use crate::openai::request::{anthropic_to_openai_request, anthropic_to_openai_re
 use crate::codex::{
     derive_session_uuid, refresh_codex_token, resolve_codex_routing_headers, turn_state_map,
 };
-
-
-
-
-
-
-
-
-
-
 
 /// Pick the upstream credential for a matched route, returning the headers and
 /// whether they carry ChatGPT auth.
@@ -452,6 +442,17 @@ pub async fn handle_messages(
         ctx_report.tokens_saved += compaction_saved;
     }
 
+    if state.config.cache_pin_tool_roster {
+        apply_bytes_stage(&mut parsed, |body| {
+            crate::proxy::maybe_pin_tool_roster(
+                body,
+                &state.roster_pin_state,
+                &session_key,
+                &request_id,
+            )
+        });
+    }
+
     if state.config.cache_stable_tool_order {
         apply_bytes_stage(&mut parsed, |body| {
             crate::proxy::maybe_stabilize_tool_order(
@@ -814,7 +815,9 @@ pub async fn handle_messages(
         &state,
         &Some(headers.clone()),
         Some("openai"),
-        &serde_json::to_vec(&parsed).map(Bytes::from).unwrap_or_default(),
+        &serde_json::to_vec(&parsed)
+            .map(Bytes::from)
+            .unwrap_or_default(),
     )
     .await;
     let ccr_stores = state.ctx_offload.as_ref().map(|r| r.store.stores());
@@ -1098,11 +1101,11 @@ async fn handle_buffered_response(
     outcome: Option<RoutedOutcomeContext>,
     ccr: Option<RoutedCcr>,
 ) -> Response {
-    let openai_text =
-        match read_routed_body(upstream_resp, upstream_status, outcome.as_ref()).await {
-            Ok(text) => text,
-            Err(response) => return response,
-        };
+    let openai_text = match read_routed_body(upstream_resp, upstream_status, outcome.as_ref()).await
+    {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
     let openai_body: Value = match serde_json::from_str(&openai_text) {
         Ok(v) => v,
         Err(e) => {
@@ -1213,9 +1216,6 @@ async fn handle_buffered_responses_response(
         .expect("static response")
 }
 
-
-
-
 // ---------------------------------------------------------------------------
 // Streaming response translation: OpenAI SSE → Anthropic SSE
 // ---------------------------------------------------------------------------
@@ -1323,13 +1323,6 @@ fn streaming_body_response(body: axum::body::Body) -> Response {
         .expect("static response")
 }
 
-
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1337,15 +1330,13 @@ fn streaming_body_response(body: axum::body::Body) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::test_state;
-    use crate::routed::transforms::{CompressionReport, CtxTransformReport};
-    use base64::Engine as _;
     use crate::codex::{codex_user_agent, generate_traceparent};
+    use crate::routed::transforms::{CompressionReport, CtxTransformReport};
+    use crate::test_support::test_state;
     use axum::http::HeaderValue;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use serde_json::json;
-
-
 
     fn conversation(tail: &str) -> Value {
         json!({
@@ -1933,9 +1924,12 @@ mod tests {
         let auth_path = dir.path().join("auth.json");
         std::env::set_var("HEADROOM_TEST_ROUTE_KEY", "xai-route-token");
 
-        let (h, is_chatgpt) =
-            upstream_auth_headers(Some("HEADROOM_TEST_ROUTE_KEY"), &HeaderMap::new(), auth_path.to_str())
-                .expect("the variable is set");
+        let (h, is_chatgpt) = upstream_auth_headers(
+            Some("HEADROOM_TEST_ROUTE_KEY"),
+            &HeaderMap::new(),
+            auth_path.to_str(),
+        )
+        .expect("the variable is set");
 
         assert!(!is_chatgpt, "a route credential is not ChatGPT auth");
         assert_eq!(
@@ -1964,7 +1958,10 @@ mod tests {
             header(&h, "authorization"),
             Some(format!("Bearer {codex_token}"))
         );
-        assert_eq!(header(&h, "ChatGPT-Account-ID").as_deref(), Some("acct-do-not-leak"));
+        assert_eq!(
+            header(&h, "ChatGPT-Account-ID").as_deref(),
+            Some("acct-do-not-leak")
+        );
         assert!(header(&h, "originator").is_some());
     }
 
@@ -1999,9 +1996,13 @@ mod tests {
     fn a_trailing_newline_is_trimmed_off_the_token() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HEADROOM_TEST_NEWLINE_KEY", "xai-token\n");
-        let (h, _) = upstream_auth_headers(Some("HEADROOM_TEST_NEWLINE_KEY"), &HeaderMap::new(), None)
-            .expect("trimmed");
-        assert_eq!(header(&h, "authorization").as_deref(), Some("Bearer xai-token"));
+        let (h, _) =
+            upstream_auth_headers(Some("HEADROOM_TEST_NEWLINE_KEY"), &HeaderMap::new(), None)
+                .expect("trimmed");
+        assert_eq!(
+            header(&h, "authorization").as_deref(),
+            Some("Bearer xai-token")
+        );
         std::env::remove_var("HEADROOM_TEST_NEWLINE_KEY");
     }
 }
@@ -2122,9 +2123,9 @@ mod resolver_alternation_tests {
             "the second continuation never ran: {resolved}"
         );
         assert!(
-            message.get("tool_calls").is_none_or(|c| c
-                .as_array()
-                .is_none_or(std::vec::Vec::is_empty)),
+            message
+                .get("tool_calls")
+                .is_none_or(|c| c.as_array().is_none_or(std::vec::Vec::is_empty)),
             "a proxy tool call survived to the client: {resolved}"
         );
         assert_eq!(
@@ -2164,7 +2165,11 @@ mod resolver_alternation_tests {
         assert_eq!(resolved, plain);
         assert_eq!(rounds.rounds, 0);
         assert!(
-            server.received_requests().await.unwrap_or_default().is_empty(),
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
             "an idle pass must not call upstream"
         );
     }

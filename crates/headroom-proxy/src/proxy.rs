@@ -60,8 +60,7 @@ pub struct AppState {
     /// contains the hostname and the complete approved address set, so a DNS
     /// change receives a new client and cannot reuse a connection pinned to a
     /// different resolution.
-    pub(crate) caller_clients:
-        Arc<Mutex<lru::LruCache<CallerClientKey, reqwest::Client>>>,
+    pub(crate) caller_clients: Arc<Mutex<lru::LruCache<CallerClientKey, reqwest::Client>>>,
     /// PR-D1: AWS credentials resolved at startup via the
     /// `aws-config` default chain. `None` when the proxy boots
     /// without AWS creds available (operator running locally
@@ -89,6 +88,7 @@ pub struct AppState {
     /// bounded to 1000 sessions. Read and written once per Anthropic
     /// request, after tools are final.
     pub tool_order_state: cache_stabilization::tool_order::ToolOrderStore,
+    pub roster_pin_state: cache_stabilization::tool_roster_pin::RosterPinStore,
     /// Session-sticky beta-header tracker (parity port of the Python
     /// `SessionBetaTracker`, PR-A6): per-`(provider, session)` LRU of
     /// `anthropic-beta` / `openai-beta` tokens, unioned across turns
@@ -648,6 +648,7 @@ impl AppState {
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             outbound_drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             tool_order_state: cache_stabilization::tool_order::ToolOrderStore::default(),
+            roster_pin_state: cache_stabilization::tool_roster_pin::RosterPinStore::default(),
             replay_store,
             working_dir_pins: cache_stabilization::working_dir::WorkingDirPins::new(
                 REPLAY_STORE_CAPACITY,
@@ -921,7 +922,8 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // to the blocking pool the way `record_savings_ledger` already does.
         let transforms = transforms.to_vec();
         tokio::task::spawn_blocking(move || {
-            headroom_core::output_savings::get_recorder().record_from_labels(&transforms, output_tokens);
+            headroom_core::output_savings::get_recorder()
+                .record_from_labels(&transforms, output_tokens);
         });
     }
 
@@ -1988,6 +1990,53 @@ fn maybe_compact_tool_schemas(body: bytes::Bytes, request_id: &str) -> bytes::By
     }
 }
 
+/// B3: put back tools the client dropped from this session's roster, so the
+/// `tools` prefix stays byte-stable through a one-tool flap. Runs before B2
+/// so the order replay sees a complete roster. Same passthrough rules as
+/// [`maybe_stabilize_tool_order`]: no `tools`, empty `session_key`, or any
+/// parse/serialize failure forwards the original bytes.
+pub(crate) fn maybe_pin_tool_roster(
+    body: bytes::Bytes,
+    store: &cache_stabilization::tool_roster_pin::RosterPinStore,
+    session_key: &str,
+    request_id: &str,
+) -> bytes::Bytes {
+    if session_key.is_empty() {
+        return body;
+    }
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let model = value
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(tools) = value
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return body;
+    };
+    let outcome = store.pin(session_key, &model, tools);
+    if !outcome.changed() {
+        return body;
+    }
+    tracing::info!(
+        event = "tool_roster_pinned",
+        request_id = %request_id,
+        model = %model,
+        reinserted = %outcome.reinserted.join(","),
+        appended = %outcome.appended.join(","),
+        "tool roster pinned to the session's remembered set"
+    );
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes::Bytes::from(bytes),
+        Err(_) => body,
+    }
+}
+
 /// B2: reorder `tools[]` to lead with the order forwarded on this session's
 /// previous turn, appending genuinely-new tools at the end.
 ///
@@ -2439,17 +2488,17 @@ fn unanswered_tool_uses(value: &serde_json::Value) -> Vec<(usize, String)> {
 /// `tool_use` and nothing in the logs could settle whether the client had
 /// sent it broken or the proxy had broken it. The two bodies are already
 /// parsed here, so the answer costs a walk of the messages array.
-fn audit_tool_pairing(
-    request_id: &str,
-    before: &serde_json::Value,
-    after: &serde_json::Value,
-) {
+fn audit_tool_pairing(request_id: &str, before: &serde_json::Value, after: &serde_json::Value) {
     let forwarded = unanswered_tool_uses(after);
     if forwarded.is_empty() {
         return;
     }
     let arrived = unanswered_tool_uses(before);
-    let origin = if arrived.is_empty() { "proxy" } else { "client" };
+    let origin = if arrived.is_empty() {
+        "proxy"
+    } else {
+        "client"
+    };
     tracing::warn!(
         target: "headroom.proxy",
         event = "unanswered_tool_use_forwarded",
@@ -2812,7 +2861,7 @@ pub(crate) async fn forward_http(
 
     // ─── COMPRESSION GATE ──────────────────────────────────────────────
     //
-    // PR-A1 lockdown (per `REALIGNMENT/03-phase-A-lockdown.md`): the
+    // PR-A1 lockdown (per `docs/notes/realignment/03-phase-A-lockdown.md`): the
     // `/v1/messages` path no longer mutates the body. The gate below
     // still routes JSON bodies on the LLM endpoint into a "buffered"
     // arm, because:
@@ -3369,14 +3418,12 @@ pub(crate) async fn forward_http(
         // seen the client's own shape, but before every mutating tool consumer
         // (memory injection, normalization, shaping, compaction, accounting).
         // The restore plan stays live until the last pre-wire stage.
-        let (buffered, additional_tools_restore_plan) = if matches!(
-            endpoint,
-            compression::CompressibleEndpoint::OpenAiResponses
-        ) {
-            crate::handlers::responses::lift_codex_additional_tools_body(buffered, &request_id)
-        } else {
-            (buffered, None)
-        };
+        let (buffered, additional_tools_restore_plan) =
+            if matches!(endpoint, compression::CompressibleEndpoint::OpenAiResponses) {
+                crate::handlers::responses::lift_codex_additional_tools_body(buffered, &request_id)
+            } else {
+                (buffered, None)
+            };
 
         // Mirror the enforcement-flag override already applied to
         // CompressionPolicy at request entry (line ~416): when
@@ -4074,8 +4121,7 @@ pub(crate) async fn forward_http(
                         }
                     }
 
-                    stage_timer
-                        .record("memory", memory_start.elapsed().as_secs_f64() * 1000.0);
+                    stage_timer.record("memory", memory_start.elapsed().as_secs_f64() * 1000.0);
 
                     if changed {
                         match serde_json::to_vec(&value) {
@@ -4730,6 +4776,21 @@ pub(crate) async fn forward_http(
 
         // B2 tool-order stabilization. Must follow every other tool mutation
         // above, so the order we record is the order the provider caches.
+        let body_to_send = if state.config.cache_pin_tool_roster
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            ) {
+            maybe_pin_tool_roster(
+                body_to_send,
+                &state.roster_pin_state,
+                &request_session_key,
+                &request_id,
+            )
+        } else {
+            body_to_send
+        };
+
         let body_to_send = if state.config.cache_stable_tool_order
             && matches!(
                 endpoint,
@@ -4879,12 +4940,11 @@ pub(crate) async fn forward_http(
         // The lift is an internal normalization, never a wire-format change.
         // Restore after every tool consumer and request hook, but before wire
         // accounting, retries, continuations, and the actual upstream send.
-        let body_to_send =
-            crate::handlers::responses::restore_codex_additional_tools_body(
-                body_to_send,
-                additional_tools_restore_plan.as_ref(),
-                &request_id,
-            );
+        let body_to_send = crate::handlers::responses::restore_codex_additional_tools_body(
+            body_to_send,
+            additional_tools_restore_plan.as_ref(),
+            &request_id,
+        );
 
         // Wire footprint. The last measurement before the body leaves, so it
         // covers every stage — compression, routing, prune, replay, TTL, hooks
@@ -5456,7 +5516,9 @@ pub(crate) async fn forward_http(
     // What every continuation round below appends to: the bytes the provider
     // saw and cached, falling back to the client's own body on the passthrough
     // branch, which forwards nothing of its own.
-    let continuation_base = forwarded_body.clone().unwrap_or_else(|| original_buffered.clone());
+    let continuation_base = forwarded_body
+        .clone()
+        .unwrap_or_else(|| original_buffered.clone());
 
     let (upstream_body, ccr_round_usage): (
         std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
@@ -6501,13 +6563,11 @@ fn restore_client_reasoning_blocks(
 
     let block_count = signed_reasoning_blocks(before_messages).len();
     let message_count = before_messages.len();
-    let (restored, scope, restored_count) = match repair_signed_reasoning(
-        before_messages,
-        after_messages,
-    ) {
-        Some((messages, count)) => (messages, "offending_messages", count),
-        None => (before_messages.clone(), "all_messages", message_count),
-    };
+    let (restored, scope, restored_count) =
+        match repair_signed_reasoning(before_messages, after_messages) {
+            Some((messages, count)) => (messages, "offending_messages", count),
+            None => (before_messages.clone(), "all_messages", message_count),
+        };
     let Some(map) = after.as_object_mut() else {
         return body_to_send;
     };
@@ -8157,8 +8217,7 @@ async fn run_sse_state_machine(
             // the proxy synthesises stop reasons of its own elsewhere
             // (`stream_finisher`, `ccr_stream`), so it is the weaker of the two
             // signals. `message_stop` off the wire is the gate, same as above.
-            let stream_completed =
-                state.status == crate::sse::anthropic::StreamStatus::MessageStop;
+            let stream_completed = state.status == crate::sse::anthropic::StreamStatus::MessageStop;
             if !stream_completed {
                 crate::observability::record_stream_incomplete("anthropic");
                 // Also booked into the persisted savings state, so the lifetime
@@ -10097,7 +10156,8 @@ mod memory_trace_tests {
 
     #[test]
     fn search_reports_the_query_and_the_count() {
-        let response = json!({"content": [call("t1", "memory_search", json!({"query": "raw_payloads"}))]});
+        let response =
+            json!({"content": [call("t1", "memory_search", json!({"query": "raw_payloads"}))]});
         let results = vec![result("t1", json!({"status": "found", "count": 19}))];
         assert_eq!(
             memory_trace_lines(&response, &results, Provider::Anthropic),
@@ -10108,7 +10168,10 @@ mod memory_trace_tests {
     #[test]
     fn save_reports_the_id_so_a_later_turn_can_quote_it() {
         let response = json!({"content": [call("t1", "memory_save", json!({"content": "the proxy runs on 8787"}))]});
-        let results = vec![result("t1", json!({"status": "saved", "memory_id": "m-42"}))];
+        let results = vec![result(
+            "t1",
+            json!({"status": "saved", "memory_id": "m-42"}),
+        )];
         assert_eq!(
             memory_trace_lines(&response, &results, Provider::Anthropic),
             vec!["memory_save(\"the proxy runs on 8787\") → saved m-42"]
@@ -10128,7 +10191,10 @@ mod memory_trace_tests {
     #[test]
     fn an_error_says_so_rather_than_reading_as_a_hit() {
         let response = json!({"content": [call("t1", "memory_search", json!({"query": "q"}))]});
-        let results = vec![result("t1", json!({"status": "error", "error": "backend not initialized"}))];
+        let results = vec![result(
+            "t1",
+            json!({"status": "error", "error": "backend not initialized"}),
+        )];
         assert_eq!(
             memory_trace_lines(&response, &results, Provider::Anthropic),
             vec!["memory_search(\"q\") → error: backend not initialized"]
@@ -10244,7 +10310,6 @@ fn endpoint_str(endpoint: &compression::CompressibleEndpoint) -> &'static str {
 }
 
 fn extract_tool_name(body: &[u8], endpoint: compression::CompressibleEndpoint) -> Option<String> {
-    
     match endpoint {
         compression::CompressibleEndpoint::AnthropicMessages => {
             let v: serde_json::Value = serde_json::from_slice(body).ok()?;

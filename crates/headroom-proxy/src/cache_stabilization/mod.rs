@@ -1,6 +1,6 @@
 //! Phase E cache-stabilization surface.
 //!
-//! The realignment plan (`REALIGNMENT/07-phase-E-cache-stabilization.md`)
+//! The realignment plan (`docs/notes/realignment/07-phase-E-cache-stabilization.md`)
 //! groups every cache-stabilization mechanism behind one module so
 //! operators searching for "what does Headroom do to keep prompt
 //! caches warm" land in one place. Phase E PRs in this module either:
@@ -62,6 +62,12 @@
 //!   (lossless — same definitions, byte for byte); declines whenever a
 //!   tool carries a `cache_control` marker, which is what keeps it out
 //!   of PR-E1/PR-E3's way on PAYG.
+//! - [`tool_roster_pin`] — B3: puts back a tool the client dropped
+//!   from a session's roster for one turn, at its old position with
+//!   its last-seen definition, and appends new tools at the tail.
+//!   **Mutates the body's `tools` array** (not lossless — the model is
+//!   offered a tool the client did not send this turn); default off.
+//!   Declines on any tool `cache_control` marker, like B2.
 //! - [`cache_ttl`] — B1: rewrites every `cache_control` marker to
 //!   `ttl: "1h"` so the cached prefix survives idle gaps past the
 //!   5-minute default. **Mutates the body**; default off and skipped
@@ -96,6 +102,7 @@ pub mod prefix_replay;
 pub mod tool_def_normalize;
 pub mod tool_order;
 pub mod tool_prune;
+pub mod tool_roster_pin;
 pub mod ttl_order;
 pub mod usage_observer;
 pub mod volatile_detector;

@@ -795,6 +795,21 @@ pub struct CliArgs {
     )]
     pub cache_stable_tool_order: bool,
 
+    /// Pin each session's tool roster to every tool it has offered so far
+    /// (B3). A tool the client drops for a turn is put back at its old
+    /// position with the definition last seen for it; a new tool is appended.
+    /// Keeps the cached prefix alive through Claude Code's `SendUserFile` /
+    /// `WaitForMcpServers` flaps, which cost a full recache each. Off by
+    /// default: if the client really removed a tool, the model may still
+    /// call it. Declines whenever a tool carries a `cache_control` marker.
+    #[arg(
+        long = "cache-pin-tool-roster",
+        env = "HEADROOM_PROXY_CACHE_PIN_TOOL_ROSTER",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub cache_pin_tool_roster: bool,
+
     /// B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached
     /// prefix survives idle gaps past the 5-minute default. Anthropic only,
     /// and skipped on PAYG — a 1h write is priced at 2× base input against
@@ -1880,7 +1895,9 @@ fn split_auth_env(rest: &str) -> Result<(&str, Option<String>), String> {
     };
     let name = rest[idx + AUTH_MARKER.len()..].trim();
     if name.is_empty() {
-        return Err(format!("expected an env-var name after {AUTH_MARKER} in {rest}"));
+        return Err(format!(
+            "expected an env-var name after {AUTH_MARKER} in {rest}"
+        ));
     }
     let shaped = name
         .chars()
@@ -2070,6 +2087,9 @@ pub struct Config {
     /// B2: replay last turn's tool order, appending new tools at the end.
     /// Default `true`.
     pub cache_stable_tool_order: bool,
+    /// B3: put back a tool the client dropped from a session's roster, at its
+    /// old position. Default `false`.
+    pub cache_pin_tool_roster: bool,
     /// B1: pin `cache_control.ttl` to `1h`. Non-PAYG only. Default `false`.
     pub force_1h_cache_ttl: bool,
     /// 1h on the tools and system prefix, 5m on the message tail. Takes
@@ -2371,6 +2391,7 @@ impl Config {
             cache_tail_breakpoints: args.cache_tail_breakpoints,
             strip_system_cache_breakpoints: args.strip_system_cache_breakpoints,
             cache_stable_tool_order: args.cache_stable_tool_order,
+            cache_pin_tool_roster: args.cache_pin_tool_roster,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
             cache_tail_breakpoint: args.cache_tail_breakpoint,
@@ -2613,6 +2634,7 @@ impl Config {
             // B2 off in the test default so existing request-path tests keep
             // asserting byte-identical tool arrays; production defaults to on.
             cache_stable_tool_order: false,
+            cache_pin_tool_roster: false,
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
             cache_tail_breakpoint: false,
@@ -3295,10 +3317,22 @@ mod live_flags_file_tests {
     #[test]
     fn the_grok_cursor_routes_parse() {
         for (spec, cursor_id) in [
-            ("claude-grok-4.6=cursor:cursor-grok-4.6-{effort}", "cursor-grok-4.6-{effort}"),
-            ("claude-grok-4.6-xhigh=cursor:cursor-grok-4.6-xhigh", "cursor-grok-4.6-xhigh"),
-            ("claude-grok-4.6-high=cursor:cursor-grok-4.6-high", "cursor-grok-4.6-high"),
-            ("claude-grok-4.6-low=cursor:cursor-grok-4.6-low", "cursor-grok-4.6-low"),
+            (
+                "claude-grok-4.6=cursor:cursor-grok-4.6-{effort}",
+                "cursor-grok-4.6-{effort}",
+            ),
+            (
+                "claude-grok-4.6-xhigh=cursor:cursor-grok-4.6-xhigh",
+                "cursor-grok-4.6-xhigh",
+            ),
+            (
+                "claude-grok-4.6-high=cursor:cursor-grok-4.6-high",
+                "cursor-grok-4.6-high",
+            ),
+            (
+                "claude-grok-4.6-low=cursor:cursor-grok-4.6-low",
+                "cursor-grok-4.6-low",
+            ),
         ] {
             let r = parse_model_route(spec).expect("spec parses");
             assert_eq!(r.cursor_agent.as_deref(), Some(cursor_id), "for {spec}");
@@ -3314,7 +3348,11 @@ mod live_flags_file_tests {
     #[test]
     fn the_effort_alias_does_not_shadow_the_pinned_ones() {
         let open = parse_model_route("claude-grok-4.6=cursor:cursor-grok-4.6-{effort}").unwrap();
-        for pinned in ["claude-grok-4.6-xhigh", "claude-grok-4.6-high", "claude-grok-4.6-low"] {
+        for pinned in [
+            "claude-grok-4.6-xhigh",
+            "claude-grok-4.6-high",
+            "claude-grok-4.6-low",
+        ] {
             assert!(!open.matches(pinned), "{pinned} was swallowed");
         }
         assert!(open.matches("claude-grok-4.6"));
