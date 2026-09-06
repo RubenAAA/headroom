@@ -53,6 +53,28 @@ fn grep_row_re() -> &'static Regex {
     })
 }
 
+/// A timestamped log row, which must never fold as a grep `path:line:content`
+/// row. Shape `2026-09-02 14:30:00 [FATAL] ...` splits as path=`2026-09-02 14`,
+/// line=`30`, content=`00 [FATAL] ...`: folding hoists the date+hour into a
+/// heading and strips it from every row, leaving the model a clock to
+/// reconstruct. The fold round-trips exactly, so the inverse check in
+/// [`compact_lossless`] cannot catch it — exclude it at the row matcher.
+fn timestamp_row_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?x)
+            ^\s*\[?(?:
+              \d{4}-\d{2}-\d{2}[T\ ]\d{1,2}:\d{2}   # 2026-09-02 14:30 / ISO 8601
+            | \d{2}/\d{2}/\d{2,4}[T\ ]\d{1,2}:\d{2}  # 09/02/2026 14:30
+            | [A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2} # syslog: Aug 16 11:02
+            | \d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|$) # bare 15:03:53
+            )",
+        )
+        .expect("TIMESTAMP_ROW_RE is a valid regex")
+    })
+}
+
 fn heading_row_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -233,7 +255,11 @@ pub fn search_dir_heading(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut current_dir: Option<String> = None;
     for line in &lines {
-        let caps = grep_row_re().captures(line);
+        let caps = if timestamp_row_re().is_match(line) {
+            None
+        } else {
+            grep_row_re().captures(line)
+        };
         let matched = caps.as_ref().filter(|c| c["path"].contains('/'));
         match matched {
             Some(c) => {
@@ -461,7 +487,12 @@ pub fn search_heading(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut current_path: Option<&str> = None;
     for line in &lines {
-        if let Some(caps) = grep_row_re().captures(line) {
+        let caps = if timestamp_row_re().is_match(line) {
+            None
+        } else {
+            grep_row_re().captures(line)
+        };
+        if let Some(caps) = caps {
             let path = caps.name("path").unwrap().as_str();
             let line_num = caps.name("line").unwrap().as_str();
             let content = caps.name("content").unwrap().as_str();
@@ -719,6 +750,20 @@ mod tests {
         let text = "just some prose\nnot a grep row at all\n";
         assert_eq!(search_heading(text), text);
         assert_eq!(search_unheading(text), text);
+    }
+
+    #[test]
+    fn search_heading_never_folds_timestamped_logs() {
+        // `2026-09-02 14:30:00 [FATAL] ...` parses as path:line:content, but
+        // folding it hoists the date+hour into a heading and the model loses
+        // the clock. The fold round-trips, so the inverse check can't catch
+        // it — the rows must pass through untouched, in both functors.
+        let logs = "2026-09-02 14:30:00 [FATAL] disk full\n\
+                    2026-09-02 14:30:01 [FATAL] write failed\n\
+                    Aug 16 11:02:03 web-1 request timed out\n\
+                    [15:03:53] heartbeat lost\n";
+        assert_eq!(search_heading(logs), logs);
+        assert_eq!(search_dir_heading(logs), logs);
     }
 
     #[test]

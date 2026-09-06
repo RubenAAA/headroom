@@ -98,9 +98,10 @@ pub const MAX_SEQ_LEN: usize = 512;
 //
 // Tokens matching this pattern are always kept regardless of model score.
 // Numbers, ALLCAPS identifiers, dotted paths, unix paths, file extensions,
-// CLI flags, and CamelCase names carry semantic meaning that agents cannot
-// reconstruct from context — dropping them degrades reasoning correctness.
-// Disable with HEADROOM_KOMPRESS_MUST_KEEP=0.
+// CLI flags, CamelCase names, and negation/modal directive words (not, never,
+// must, always, only, ...) carry meaning the model cannot reconstruct — or,
+// for directives, meaning whose loss inverts the sentence. Disable with
+// HEADROOM_KOMPRESS_MUST_KEEP=0.
 //
 // NOTE: Python's regex uses look-around (`(?<![\w.])` / `(?![\w.])`) for
 // standalone numbers, but Rust's `regex` crate doesn't support look-around.
@@ -119,6 +120,9 @@ fn must_keep_re() -> &'static Regex {
             | \.[a-z]{2,4}\b                            # extensions: .py .so .json
             | --?[a-z][\w-]*                            # flags: --verbose, -n
             | \b[A-Z][a-z]+[A-Z]\w*                    # CamelCase: EXC_BAD_INSTRUCTION, IndexError
+            | (?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't
+            | mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless
+            | except|without|must|should|shall|required|always|only|mandatory)\b)
             ",
         )
         .expect("MUST_KEEP_RE is a valid regex")

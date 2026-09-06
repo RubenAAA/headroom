@@ -51,13 +51,17 @@ pub const KNOWN_MISS_REASONS: [&str; 3] = ["ttl_expiry", "prefix_change", "unkno
 
 /// Waste signals that keep their own bucket; anything else is `other`.
 ///
+/// Names must match `WasteSignals.to_dict()` — the parser emits `json_bloat`;
+/// an allowlist that says `json_noise` silently shovels the largest waste
+/// category into the catch-all bucket.
+///
 /// `other` is itself in the list because it is the recording fallback, and a
 /// bucket the recorder can produce but the loader does not recognise gets
 /// folded into `unknown` on the way back in. Leaving it out migrated the whole
 /// `other` bucket into `unknown` on every restart, so `unknown` grew without
 /// any request ever having been classified that way.
 pub const KNOWN_WASTE_SIGNALS: [&str; 9] = [
-    "json_noise",
+    "json_bloat",
     "html_noise",
     "base64",
     "whitespace",
@@ -1484,17 +1488,22 @@ fn normalize_count_map(raw: Option<&Value>, limit: usize) -> CountMap {
 }
 
 /// Sum a raw map into a count map keyed only by `allowed` labels; anything
-/// else lands in `unknown`.
-fn normalize_enum_map(raw: Option<&Value>, allowed: &[&str]) -> CountMap {
+/// else lands in `fallback`.
+///
+/// Waste signals load with `fallback = "other"`, matching record time —
+/// loading them into `unknown` relabelled the whole `other` bucket on every
+/// restart while new traffic started a fresh `other`. Miss reasons keep the
+/// `unknown` fallback.
+fn normalize_enum_map(raw: Option<&Value>, allowed: &[&str], fallback: &str) -> CountMap {
     let mut result = CountMap::default();
     let Some(raw) = dict_or_empty(raw) else {
         return result;
     };
     for (key, value) in raw {
-        let bucket = if allowed.contains(&key.as_str()) {
+        let bucket = if allowed.contains(&key.as_str()) || key.as_str() == fallback {
             key.as_str()
         } else {
-            "unknown"
+            fallback
         };
         result.add(bucket, coerce_int(Some(value)));
     }
@@ -1548,6 +1557,7 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
         misses_by_reason: normalize_enum_map(
             get(raw_cache, "misses_by_reason"),
             &KNOWN_MISS_REASONS,
+            "unknown",
         ),
         by_provider: normalize_count_map(get(raw_cache, "by_provider"), MAX_PROVIDER_VALUES),
     };
@@ -1559,7 +1569,8 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
         cache_savings_usd: round6(coerce_signed_float(get(raw_cost, "cache_savings_usd"))),
     };
 
-    result.waste_signals = normalize_enum_map(get(source, "waste_signals"), &KNOWN_WASTE_SIGNALS);
+    result.waste_signals =
+        normalize_enum_map(get(source, "waste_signals"), &KNOWN_WASTE_SIGNALS, "other");
 
     let raw_overhead = dict_or_empty(get(source, "proxy_overhead"));
     result.proxy_overhead = ProxyOverheadState {
@@ -1774,7 +1785,7 @@ mod tests {
             compression_savings_usd: 0.5,
             cache_savings_usd: 0.25,
             waste_signals: Some(
-                json!({"json_noise": 12, "made_up": 3})
+                json!({"json_bloat": 12, "made_up": 3})
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -1783,7 +1794,7 @@ mod tests {
         });
         assert_eq!(
             compact(&state.to_dict()),
-            r#"{"started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"openai":1},"by_stack":{"codex":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":40,"cache_write_tokens":10,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":60,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"openai":1}},"cost":{"input_usd":0.001235,"compression_savings_usd":0.5,"cache_savings_usd":0.25},"waste_signals":{"json_noise":12,"other":3},"models":{"tracked":{"gpt-5":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"}},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
+            r#"{"started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"openai":1},"by_stack":{"codex":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":40,"cache_write_tokens":10,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":60,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"openai":1}},"cost":{"input_usd":0.001235,"compression_savings_usd":0.5,"cache_savings_usd":0.25},"waste_signals":{"json_bloat":12,"other":3},"models":{"tracked":{"gpt-5":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"}},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
         );
     }
 
@@ -1882,6 +1893,40 @@ mod tests {
         assert_eq!(
             compact(&state.to_dict()["models"]),
             r#"{"tracked":{"gpt-4":{"requests":1,"input_tokens":9,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"other":{"requests":5,"input_tokens":5,"output_tokens":4,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":"2026-02-01T00:00:00Z"}}"#
+        );
+    }
+
+    #[test]
+    fn waste_signal_other_bucket_survives_reload() {
+        // Python: record-time files unrecognised names under `other`, so
+        // load-time must do the same — otherwise every restart relabels the
+        // whole `other` bucket as `unknown`.
+        let raw = json!({
+            "waste_signals": {"json_bloat": 5, "other": 7, "made_up": 3}
+        });
+        let state = PersistentMetricsState::new(Some(&raw));
+        assert_eq!(state.state().waste_signals.get("json_bloat"), 5);
+        assert_eq!(state.state().waste_signals.get("other"), 10);
+        assert_eq!(state.state().waste_signals.get("unknown"), 0);
+    }
+
+    #[test]
+    fn miss_reasons_still_fall_back_to_unknown_on_reload() {
+        let raw = json!({
+            "prefix_cache": {"misses_by_reason": {"ttl_expiry": 2, "bogus": 4}}
+        });
+        let state = PersistentMetricsState::new(Some(&raw));
+        assert_eq!(
+            state
+                .state()
+                .prefix_cache
+                .misses_by_reason
+                .get("ttl_expiry"),
+            2
+        );
+        assert_eq!(
+            state.state().prefix_cache.misses_by_reason.get("unknown"),
+            4
         );
     }
 

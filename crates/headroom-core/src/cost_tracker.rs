@@ -1062,10 +1062,18 @@ pub fn build_session_summary(input: &SessionSummaryInput) -> SessionSummary {
         .collect();
 
     let avg_compression = if !compressed.is_empty() {
-        round_n(
-            compressed.iter().map(|r| r.savings_percent).sum::<f64>() / compressed.len() as f64,
-            1,
-        )
+        // Size-WEIGHTED, not a mean of per-request percentages. An unweighted
+        // mean lets one tiny, highly-compressible request dominate the
+        // headline while the large requests it is averaged with barely moved.
+        // Weighting by original size makes the number mean what an operator
+        // reads it as: the share of total tokens actually removed.
+        let orig_total: i64 = compressed.iter().map(|r| r.input_tokens_original).sum();
+        let saved_total: i64 = compressed.iter().map(|r| r.tokens_saved).sum();
+        if orig_total > 0 {
+            round_n(100.0 * saved_total as f64 / orig_total as f64, 1)
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
