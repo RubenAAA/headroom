@@ -54,6 +54,59 @@ fn upstream_auth_headers(
     }
 }
 
+/// Inject the headers OpenCode Zen requires for its free tier.
+///
+/// Direct `curl https://opencode.ai/zen/v1/responses` with only
+/// `Authorization: Bearer $OPENCODE_API_KEY` now returns
+/// `MissingSessionID: OpenCode's free tier can only be used in OpenCode`
+/// (2026-09-07). The OpenCode CLI always sends `x-opencode-session` (and
+/// friends) — see `LLMRequestPrep.prepare` in the bundled
+/// `chunk-*.js` (`x-opencode-session`, `x-opencode-request`,
+/// `x-opencode-client`, `User-Agent: opencode/…`). Without the session
+/// header the free models are gated, even with a valid key.
+fn inject_opencode_headers(headers: &mut HeaderMap, request_id: &str, session_key: Option<&str>) {
+    // `ses_` + 64 hex, like OpenCode's `ses_[0-9a-f]{64}`. Derive from the
+    // request_id UUID so retries within the same logical request share the
+    // same session, but different requests don't collide.
+    let raw = request_id.replace('-', "");
+    let mut hex = String::with_capacity(64);
+    while hex.len() < 64 {
+        hex.push_str(&raw);
+    }
+    hex.truncate(64);
+    let session = format!("ses_{hex}");
+    if let Ok(v) = http::HeaderValue::from_str(&session) {
+        headers.insert(
+            http::HeaderName::from_static("x-opencode-session"),
+            v,
+        );
+    }
+    if let Ok(v) = http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
+        headers.insert(
+            http::HeaderName::from_static("x-opencode-request"),
+            v,
+        );
+    }
+    headers.insert(
+        http::HeaderName::from_static("x-opencode-client"),
+        http::HeaderValue::from_static("opencode"),
+    );
+    headers.insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_static("opencode/1.18.29"),
+    );
+    if let Some(sk) = session_key {
+        // Best-effort project correlation; not required for the gate, but
+        // mirrors what OpenCode sends (`x-opencode-project`).
+        if let Ok(v) = http::HeaderValue::from_str(sk) {
+            headers.insert(
+                http::HeaderName::from_static("x-opencode-project"),
+                v,
+            );
+        }
+    }
+}
+
 /// Build upstream headers for a route that carries its own credential.
 ///
 /// `var` is the name of an environment variable, not a token — see
@@ -291,12 +344,17 @@ async fn try_routed_sidecar(
     shape_sidecar_request(&mut openai_body);
     let openai_bytes = serde_json::to_vec(&openai_body).ok()?;
 
-    let (upstream_headers, _) = upstream_auth_headers(
+    let (mut upstream_headers, _) = upstream_auth_headers(
         route.auth_env.as_deref(),
         headers,
         state.config.codex_auth_file.as_deref(),
     )
     .ok()?;
+    if upstream.host_str() == Some("opencode.ai") {
+        // `session_key` is not material here — the sidecar is a stateless
+        // one-shot, so the request_id-derived session is sufficient.
+        inject_opencode_headers(&mut upstream_headers, request_id, None);
+    }
 
     let base = upstream.as_str().trim_end_matches('/');
     let upstream_url = format!("{}/v1/responses", base.trim_end_matches("/v1"));
@@ -600,7 +658,7 @@ pub async fn handle_messages(
         }
     };
 
-    let (upstream_headers, is_chatgpt_auth) = match upstream_auth_headers(
+    let (mut upstream_headers, is_chatgpt_auth) = match upstream_auth_headers(
         auth_env.as_deref(),
         &headers,
         state.config.codex_auth_file.as_deref(),
@@ -608,6 +666,9 @@ pub async fn handle_messages(
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    if upstream.host_str() == Some("opencode.ai") {
+        inject_opencode_headers(&mut upstream_headers, &request_id, None);
+    }
 
     if !translate {
         // No translation needed — forward Anthropic format directly to the upstream.

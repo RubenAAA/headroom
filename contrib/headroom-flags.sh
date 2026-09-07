@@ -451,12 +451,16 @@ HEADROOM_FLAGS=(
   # Muse (Responses-only model). Tradeoffs of the free tier: dynamic
   # unpublished quota (429s with multi-hour retry windows — keep a paid
   # fallback) and Meta may train on prompts/completions.
-  --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none
+  # Free tier now requires a Zen API key (2026-09-07: anonymous MissingSessionID).
+  # Get one at https://opencode.ai/zen -> Create API key, then:
+  #   export OPENCODE_API_KEY="your-key"   (or add to ~/.bashrc)
+  # or: opencode auth login  (if you prefer the auth file, export the env var from it)
+  --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=OPENCODE_API_KEY
 
   # Weaker, faster sibling for the spinner sidecar: 1.2 reasons ~250 tokens
   # to 1.3's ~500-1000 on the same summary and answers in ~5s against ~12s,
-  # measured 2026-09-06. Same anonymous free tier, same :auth=none.
-  --extra-model-route claude-muse-spark-1.2=https://opencode.ai/zen/v1:openai:muse-spark-1.2-contributor-free:auth=none
+  # measured 2026-09-06. Same free tier via OPENCODE_API_KEY.
+  --extra-model-route claude-muse-spark-1.2=https://opencode.ai/zen/v1:openai:muse-spark-1.2-contributor-free:auth=OPENCODE_API_KEY
 
   # Spinner sidecar offload: answer Claude Code's 4-word status summaries on
   # the free tier instead of Haiku. The sidecar tries the route above first
