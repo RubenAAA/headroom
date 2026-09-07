@@ -92,6 +92,17 @@ pub fn encode_reasoning_signature(replay: &ReasoningReplay) -> Option<String> {
     Some(format!("{PREFIX}{encoded_id}:{}", replay.encrypted_content))
 }
 
+/// Did this proxy write this signature?
+///
+/// A different question from [`decode_reasoning_signature`], which asks
+/// whether the envelope can be replayed. A truncated or corrupt envelope of
+/// ours decodes to `None` yet still has to be recognised here, because what
+/// the answer decides is whether Anthropic would refuse the block — and it
+/// refuses any signature it did not issue, well-formed or not.
+pub fn is_headroom_reasoning_signature(signature: &str) -> bool {
+    signature.starts_with(PREFIX)
+}
+
 /// Unpack a signature written by [`encode_reasoning_signature`].
 ///
 /// Returns `None` for anything else — a real Anthropic thinking signature, an

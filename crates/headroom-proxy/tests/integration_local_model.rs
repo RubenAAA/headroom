@@ -599,8 +599,7 @@ async fn cost_aware_rule_routes_a_small_tool_less_turn() {
 
     let received = zen.received_requests().await.unwrap();
     assert_eq!(received.len(), 1);
-    let upstream_body: serde_json::Value =
-        serde_json::from_slice(&received[0].body).unwrap();
+    let upstream_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
     assert_eq!(upstream_body["model"], "muse-spark-1.3");
 
     proxy.shutdown().await;
@@ -653,6 +652,417 @@ async fn cost_aware_rule_skips_a_tool_using_turn() {
     assert!(
         zen.received_requests().await.unwrap().is_empty(),
         "a tool-using turn must not reach the routed upstream"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// Claude Code appends `?beta=true` to ordinary `/v1/messages` turns, and a
+/// streamed routed turn has to survive it whole.
+///
+/// Both halves of this matter. The router once sat behind an
+/// `if uri.query().is_none()` guard, which read as a narrow exclusion and
+/// was in fact a kill switch: every real turn carries the query, so nothing
+/// was ever routed, while the tests above kept passing because they omit it.
+/// The stream then has to arrive complete — a truncated one is what the
+/// guard was added to chase, so asserting `message_stop` here is what tells
+/// the two failures apart next time.
+#[tokio::test]
+async fn a_beta_query_does_not_disable_cost_aware_routing() {
+    let default = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_default", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "from default"}],
+            "model": "claude-opus-5", "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })))
+        .mount(&default)
+        .await;
+
+    let zen = codex_responses_sse_upstream().await;
+    let (_uri, route, router) = spark_router_config(&zen);
+    let proxy = start_proxy_with(&default.uri(), |cfg| {
+        cfg.model_routes = vec![route];
+        cfg.model_router = router;
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages?beta=true", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [{"role": "user", "content": "What is 2+2?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let sse = resp.text().await.unwrap();
+    assert!(
+        sse.contains("event: message_start"),
+        "routed stream never opened: {sse}"
+    );
+    assert!(
+        sse.contains("hello from responses"),
+        "routed stream carried no text: {sse}"
+    );
+    assert!(
+        sse.contains("event: message_stop"),
+        "routed stream ended before message_stop: {sse}"
+    );
+
+    let received = zen.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "the query string kept the turn off the routed upstream"
+    );
+    let upstream_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(upstream_body["model"], "muse-spark-1.3");
+    assert!(
+        received[0].url.query().is_none(),
+        "the routed upstream URL must not carry the client's query"
+    );
+
+    proxy.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Fallback and cooldown: a routed upstream that will not serve the turn must
+// not cost the client the turn.
+// ---------------------------------------------------------------------------
+
+/// A Zen-shaped upstream that refuses every request with a 503.
+async fn failing_zen_upstream() -> MockServer {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+        .mount(&mock)
+        .await;
+    mock
+}
+
+/// A default upstream answering `/v1/messages` with one Anthropic turn.
+async fn anthropic_default_upstream(text: &'static str) -> MockServer {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_default", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": "claude-opus-5", "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })))
+        .mount(&mock)
+        .await;
+    mock
+}
+
+/// Keep the retry budget's backoff out of the test's wall time. The count
+/// stays at the default 3 so the assertion below is about the real budget.
+fn fast_retries(cfg: &mut headroom_proxy::Config) {
+    cfg.retry_base_delay_ms = 1;
+    cfg.retry_max_delay_ms = 5;
+    // Buffered rather than relayed blind, which is what puts a served turn in
+    // front of the outcome funnel the accounting assertions read. `Off` keeps
+    // the bytes untouched, so this changes what is measured, not what is sent.
+    cfg.compression = true;
+    cfg.compression_mode = headroom_proxy::config::CompressionMode::Off;
+    // The response cache would serve the second turn of a test from the first
+    // turn's answer, which would make "the router did not fire" pass without
+    // the router having been consulted at all.
+    cfg.cache_enabled = false;
+}
+
+fn tool_less_turn(prompt: &str) -> serde_json::Value {
+    json!({
+        "model": "claude-opus-5",
+        "max_tokens": 100,
+        "stream": false,
+        "messages": [{"role": "user", "content": prompt}]
+    })
+}
+
+/// The whole point of the fallback: the router's choice failing is headroom's
+/// problem, not the client's. The client asked for `claude-opus-5` and gets a
+/// complete answer from it, and the failed attempt's bytes never appear.
+#[tokio::test]
+async fn a_failing_routed_upstream_falls_back_to_the_clients_model() {
+    let default = anthropic_default_upstream("from default").await;
+    let zen = failing_zen_upstream().await;
+    let (_uri, route, router) = spark_router_config(&zen);
+
+    let mut cooldowns: Option<headroom_proxy::model_router::ModelCooldowns> = None;
+    let proxy = start_proxy_with_state(
+        &default.uri(),
+        |cfg| {
+            fast_retries(cfg);
+            cfg.model_routes = vec![route];
+            cfg.model_router = router;
+        },
+        |state| {
+            cooldowns = Some(state.model_route_cooldowns.clone());
+            state
+        },
+    )
+    .await;
+    let cooldowns = cooldowns.expect("state captured");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&tool_less_turn("What is 2+2?"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "the client must not see the 503");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "from default");
+    assert_eq!(
+        body["type"], "message",
+        "the reply must be Anthropic-shaped"
+    );
+
+    assert_eq!(
+        zen.received_requests().await.unwrap().len(),
+        3,
+        "the routed upstream should have had the full retry budget first"
+    );
+    assert!(
+        cooldowns.remaining("claude-muse-spark-1.3").is_some(),
+        "the failed target must be parked in cooldown"
+    );
+
+    // The next tool-less turn is not offered to the same target again.
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&tool_less_turn("And what is 3+3?"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "from default");
+    assert_eq!(
+        zen.received_requests().await.unwrap().len(),
+        3,
+        "a turn inside the cooldown window must not reach the routed upstream"
+    );
+
+    // Accounting: each turn is booked once, against the model that answered.
+    // Booking the alias would price Zen tokens off a row nobody was served
+    // from, and would credit the reroute's savings to a reroute that did not
+    // happen.
+    let stats: serde_json::Value = client
+        .get(format!("{}/stats", proxy.url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models: Vec<&str> = stats["recent_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(models, vec!["claude-opus-5", "claude-opus-5"], "{stats:#}");
+    assert_eq!(stats["total_logged"], 2, "the failed attempt must not book");
+
+    proxy.shutdown().await;
+}
+
+/// The cooldown is a pause, not a kill switch: once the window passes, the
+/// target is tried again without a restart.
+#[tokio::test]
+async fn the_routed_target_is_tried_again_after_the_cooldown_window() {
+    let default = anthropic_default_upstream("from default").await;
+    let zen = failing_zen_upstream().await;
+    let (_uri, route, mut router) = spark_router_config(&zen);
+    router.cooldown = Some(std::time::Duration::from_millis(250));
+
+    let proxy = start_proxy_with(&default.uri(), |cfg| {
+        fast_retries(cfg);
+        cfg.model_routes = vec![route];
+        cfg.model_router = router;
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let send = |prompt: &'static str| {
+        let client = client.clone();
+        let url = format!("{}/v1/messages", proxy.url());
+        async move {
+            client
+                .post(url)
+                .header("content-type", "application/json")
+                .header("x-api-key", "test-key")
+                .header("anthropic-version", "2023-06-01")
+                .json(&tool_less_turn(prompt))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(send("first").await.status(), 200);
+    let after_first = zen.received_requests().await.unwrap().len();
+    assert_eq!(after_first, 3);
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    assert_eq!(send("second").await.status(), 200);
+    assert_eq!(
+        zen.received_requests().await.unwrap().len(),
+        6,
+        "once the window expires the router must offer the target again"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// A client that names the routed alias itself gets that route's answer,
+/// error included. Silently serving a different model would be the surprise.
+#[tokio::test]
+async fn an_explicit_pick_of_the_routed_model_still_returns_the_error() {
+    let default = anthropic_default_upstream("from default").await;
+    let zen = failing_zen_upstream().await;
+    let (_uri, route, router) = spark_router_config(&zen);
+
+    let mut cooldowns: Option<headroom_proxy::model_router::ModelCooldowns> = None;
+    let proxy = start_proxy_with_state(
+        &default.uri(),
+        |cfg| {
+            fast_retries(cfg);
+            cfg.model_routes = vec![route];
+            cfg.model_router = router;
+        },
+        |state| {
+            cooldowns = Some(state.model_route_cooldowns.clone());
+            state
+        },
+    )
+    .await;
+    let cooldowns = cooldowns.expect("state captured");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-muse-spark-1.3",
+            "max_tokens": 100,
+            "stream": false,
+            "messages": [{"role": "user", "content": "What is 2+2?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 503, "an explicit pick keeps its own error");
+    assert!(
+        default.received_requests().await.unwrap().is_empty(),
+        "the client's own choice must not be second-guessed"
+    );
+    assert!(
+        cooldowns.remaining("claude-muse-spark-1.3").is_none(),
+        "no fallback happened, so nothing goes into cooldown"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// A streamed turn has to fall back whole: the client asked for SSE and must
+/// get one complete Anthropic stream, with nothing of the failed attempt in
+/// front of it.
+#[tokio::test]
+async fn a_streamed_turn_falls_back_to_a_complete_anthropic_stream() {
+    let default = MockServer::start().await;
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"from default\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&default)
+        .await;
+
+    let zen = failing_zen_upstream().await;
+    let (_uri, route, router) = spark_router_config(&zen);
+    let proxy = start_proxy_with(&default.uri(), |cfg| {
+        fast_retries(cfg);
+        cfg.model_routes = vec![route];
+        cfg.model_router = router;
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages?beta=true", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [{"role": "user", "content": "What is 2+2?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.starts_with("event: message_start"),
+        "the stream must open cleanly, with no trace of the failed attempt: {body}"
+    );
+    assert!(body.contains("from default"), "{body}");
+    assert!(
+        body.contains("event: message_stop"),
+        "the fallback stream must end whole: {body}"
+    );
+    assert!(
+        !body.contains("upstream unavailable"),
+        "the failed attempt's body must never reach the client: {body}"
     );
 
     proxy.shutdown().await;

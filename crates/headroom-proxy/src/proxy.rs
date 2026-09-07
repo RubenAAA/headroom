@@ -199,6 +199,11 @@ pub struct AppState {
     /// original (pre-compression) request messages/tools/model so batch
     /// results can be CCR-post-processed. Constructed unconditionally.
     pub batch_context_store: Arc<headroom_core::ccr::BatchContextStore>,
+    /// Cost-aware routing targets that recently failed a turn, with the time
+    /// each becomes eligible again. Written when a routed turn falls back to
+    /// the client's own model, read by the router on every request it sees, so
+    /// one outage costs one failed turn rather than one per tool-less turn.
+    pub model_route_cooldowns: crate::model_router::ModelCooldowns,
 }
 
 /// TTL for a stored CCR batch context (24h). Mirrors Python's
@@ -256,13 +261,10 @@ pub(crate) struct CallerClientKey {
 /// below, but retain the same TLS roots, timeouts, keepalives, redirect policy,
 /// and response behavior as the normal upstream client.
 fn upstream_client_builder(config: &Config) -> reqwest::ClientBuilder {
-    crate::ssl_context::client_builder()
+    let builder = crate::ssl_context::client_builder()
         .connect_timeout(config.upstream_connect_timeout)
-        // Total bound, which also bounds the send: reqwest 0.12 exposes no
-        // per-phase write knob, so `config.upstream_write_timeout` cannot be
-        // set here. It is honored on paths with their own per-request bound
-        // (the Codex WS→HTTP fallback); everywhere else the send shares this
-        // total, matching pre-split behaviour.
+        // End-to-end bound on a single upstream request, streamed body
+        // included. The send is bounded separately, below.
         .timeout(config.upstream_timeout)
         // Upstream redirects are forwarded to the client. In particular, a
         // caller-selected public endpoint cannot redirect this process into a
@@ -272,7 +274,37 @@ fn upstream_client_builder(config: &Config) -> reqwest::ClientBuilder {
         .http2_keep_alive_interval(std::time::Duration::from_secs(20))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)
-        .tcp_keepalive(std::time::Duration::from_secs(20))
+        .tcp_keepalive(std::time::Duration::from_secs(20));
+    apply_upstream_write_timeout(builder, config)
+}
+
+/// Apply `config.upstream_write_timeout` (port of Python
+/// `ProxyConfig.write_timeout_seconds`, upstream a507249b).
+///
+/// httpx bounds the send phase on its own; reqwest 0.12 has no per-phase
+/// write knob, and both knobs it does have are the wrong phase — `timeout`
+/// and `read_timeout` cover the wait for the answer, so setting either to
+/// the write bound would kill a model that thinks longer than it. Linux's
+/// `TCP_USER_TIMEOUT` bounds exactly what httpx's `write` bounds: outbound
+/// bytes the peer never acknowledges, including a zero-window stall. Think
+/// time is unaffected, because a thinking peer has already acked the
+/// request. This replaces reqwest's own 30s default with the operator knob.
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+fn apply_upstream_write_timeout(
+    builder: reqwest::ClientBuilder,
+    config: &Config,
+) -> reqwest::ClientBuilder {
+    builder.tcp_user_timeout(config.upstream_write_timeout)
+}
+
+/// No `TCP_USER_TIMEOUT` off Linux: the send stays under the total
+/// `upstream_timeout`, as it did before the knob existed.
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+fn apply_upstream_write_timeout(
+    builder: reqwest::ClientBuilder,
+    _config: &Config,
+) -> reqwest::ClientBuilder {
+    builder
 }
 
 /// Build the request-scoped transport for a caller-selected upstream.
@@ -689,6 +721,7 @@ impl AppState {
             request_logger: Arc::new(crate::request_logger::RequestLogger::new(None)),
             dynamic_upstream: crate::cc_switch_reconciler::new_dynamic_upstream(),
             cursor_bridge: Arc::new(crate::cursor::bridge::Bridge::new()),
+            model_route_cooldowns: crate::model_router::ModelCooldowns::default(),
             ws_sessions: Arc::new(Mutex::new(
                 crate::ws_session_registry::WebSocketSessionRegistry::new(),
             )),
@@ -2683,7 +2716,17 @@ impl Drop for InflightGuard {
     }
 }
 
-/// Forward an HTTP request to the upstream and stream the response back.
+/// Marks a request that the cost-aware router must leave alone, carrying the
+/// id of the routed attempt it replaces.
+///
+/// Set on the re-dispatch of a turn whose routed upstream failed: the request
+/// is on this path precisely because the router's choice did not work, and
+/// re-applying the same rules would send it straight back. Reusing the id
+/// keeps the two attempts on one thread in the logs, and lets the second
+/// attempt close out the replay and usage entries the first one parked.
+#[derive(Clone)]
+pub(crate) struct SkipModelRouting(pub(crate) String);
+pub(crate) struct SkipCtx;
 pub(crate) async fn forward_http(
     state: AppState,
     client_addr: SocketAddr,
@@ -2691,7 +2734,14 @@ pub(crate) async fn forward_http(
 ) -> Result<Response<Body>, ProxyError> {
     let start = Instant::now();
     let inflight = InflightGuard::enter();
-    let request_id = ensure_request_id(req.headers());
+    // Read before the body is taken, since the extension travels on the
+    // request rather than on the wire — a header would leak to the upstream.
+    let routing_skipped = req.extensions().get::<SkipModelRouting>().cloned();
+    let skip_model_routing = routing_skipped.is_some();
+    let request_id = match routing_skipped {
+        Some(SkipModelRouting(id)) => id,
+        None => ensure_request_id(req.headers()),
+    };
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path_for_log = uri.path().to_string();
@@ -2926,15 +2976,19 @@ pub(crate) async fn forward_http(
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
 
-    // Intercepted requests tee the response into the SSE state machine
-    // (usage observer, hit-rate metrics, re-cache watchdog). Those parsers
-    // read the raw byte stream, so a gzip/br-encoded upstream response is
-    // opaque to them — Claude Code sends `accept-encoding: gzip, deflate,
-    // br, zstd` and Anthropic gzips SSE, which silently blinds all
-    // response-side telemetry. Force identity upstream for intercepted
-    // requests; the client receives the same uncompressed bytes (we never
+    // Every POST to a compressible path tees the response into the SSE
+    // state machine (usage observer, hit-rate metrics, re-cache watchdog),
+    // and the CCR stream rewriter re-frames the body on the passthrough
+    // branch too. Those parsers read the raw byte stream, so a gzip/br-encoded
+    // upstream response is opaque to them — Claude Code sends
+    // `accept-encoding: gzip, deflate, br, zstd` and Anthropic gzips SSE.
+    // With `--compression` off that used to blind telemetry and, worse, the
+    // rewriter forwarded an empty body under a `content-encoding: gzip`
+    // header (client-side ZlibError, "stream ended before any data"). Force
+    // identity upstream whenever a parser may attach, not only when
+    // intercepting; the client receives uncompressed bytes (we never
     // re-encode), which HTTP permits regardless of what it advertised.
-    if should_intercept {
+    if method == axum::http::Method::POST && compression::is_compressible_path(uri.path()) {
         outgoing_headers.insert(
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("identity"),
@@ -3986,11 +4040,14 @@ pub(crate) async fn forward_http(
                     // enabled in config. The shaping is idempotent (steering
                     // text includes a sentinel prefix) so repeated
                     // applications are safe.
+                    // Disabled in cache mode: steering writes into the
+                    // provider prefix-cache key that mode exists to freeze.
                     if state.config.output_shaper_enabled {
-                        let shape_result = crate::output_shaper::shape_request(
+                        let shape_result = crate::output_shaper::shape_request_for_mode(
                             &mut value,
                             true,
                             state.config.verbosity_level,
+                            &state.config.mode,
                         );
                         if shape_result.changed {
                             changed = true;
@@ -4658,7 +4715,13 @@ pub(crate) async fn forward_http(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
         ) {
-            drop_unsigned_reasoning_blocks(body_to_send, &request_id)
+            // Both stages remove a thinking block Anthropic would refuse, for
+            // two unrelated reasons — a stream that died before the signature
+            // arrived, and a signature this proxy wrote on a routed turn — so
+            // they count and log separately. Same placement argument as above
+            // applies to both.
+            let body_to_send = drop_unsigned_reasoning_blocks(body_to_send, &request_id);
+            drop_headroom_signed_reasoning_blocks(body_to_send, &request_id)
         } else {
             body_to_send
         };
@@ -4744,11 +4807,22 @@ pub(crate) async fn forward_http(
                 // a routed id is cleaned too, and before the upstream is chosen
                 // so `config.model_routes` sees the model actually being sent.
                 // No-op unless the operator configured routes.
-                let body_to_send = crate::model_router::apply_to_anthropic_body(
-                    body_to_send,
-                    &crate::model_router::ModelRouter::new(Some(state.config.model_router.clone())),
-                    &request_id,
-                );
+                //
+                // Skipped entirely for a turn re-dispatched after its routed
+                // upstream failed, and rules whose target is in cooldown are
+                // passed over — see [`SkipModelRouting`].
+                let body_to_send = if skip_model_routing {
+                    body_to_send
+                } else {
+                    crate::model_router::apply_to_anthropic_body_with_cooldowns(
+                        body_to_send,
+                        &crate::model_router::ModelRouter::new(Some(
+                            state.config.model_router.clone(),
+                        )),
+                        &request_id,
+                        Some(&state.model_route_cooldowns),
+                    )
+                };
                 // Strip terminal styling artifacts (e.g. a dangling
                 // `[1m]` suffix) from `body["model"]` before forwarding;
                 // Anthropic-compatible upstreams reject the decorated id.
@@ -6391,14 +6465,14 @@ fn signed_reasoning_blocks(messages: &[serde_json::Value]) -> Vec<&serde_json::V
                 b.get("type").and_then(|t| t.as_str()),
                 Some("thinking") | Some("redacted_thinking")
             );
-            // Genuinely signed, as the name says. What this guards is
-            // Anthropic's refusal of a *signed* block that came back altered,
-            // and a block with no signature has nothing to violate. Counting
-            // those too would make `drop_unsigned_reasoning_blocks` — the one
-            // stage that is meant to remove them — look like tampering, and
-            // the restore below would put back the block that upstream is
-            // about to refuse.
-            is_reasoning && !is_unsigned_reasoning(b)
+            // Genuinely signed *by the provider*, as the name says. What this
+            // guards is Anthropic's refusal of a signed block that came back
+            // altered, and neither an unsigned block nor one carrying our own
+            // envelope has anything to violate. Counting those would make the
+            // two drop stages meant to remove them look like tampering, and
+            // the restore below would put back the block upstream is about to
+            // refuse.
+            is_reasoning && !is_unsigned_reasoning(b) && !is_headroom_signed_reasoning(b)
         })
         .collect()
 }
@@ -6431,12 +6505,79 @@ fn drop_unsigned_reasoning_blocks(body_to_send: bytes::Bytes, request_id: &str) 
     if !body_to_send.windows(MARKER.len()).any(|w| w == MARKER) {
         return body_to_send;
     }
-    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body_to_send) else {
+    let Some((out, dropped, markers_moved)) =
+        drop_reasoning_blocks_where(&body_to_send, is_unsigned_reasoning)
+    else {
         return body_to_send;
     };
-    let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+    tracing::info!(
+        request_id = %request_id,
+        event = "unsigned_reasoning_blocks_dropped",
+        dropped,
+        markers_moved,
+        "removed thinking blocks with no signature; they are the tail of a \
+         stream that died mid-block and upstream would refuse them"
+    );
+    out
+}
+
+/// Drop `thinking` blocks this proxy signed itself.
+///
+/// A routed turn answered by an OpenAI-shaped upstream comes back with its
+/// reasoning item packed into a signature only this proxy can read — see
+/// [`crate::handlers::reasoning_signature`]. That works while the
+/// conversation stays on the routed model, which is what the `:translate`
+/// routes were built for. The cost-aware router (#1706) broke that
+/// assumption: it sends one tool-less turn to a cheap model and leaves the
+/// next one, which usually declares tools, on Anthropic. The client stores
+/// the block and hands it back, and Anthropic refuses a signature it never
+/// issued — one cheap turn poisoning every turn after it.
+///
+/// So our own envelopes come off on the way to Anthropic. Nothing is lost
+/// that Anthropic could have used: it cannot read the envelope, and the model
+/// that wrote the reasoning is not the one being asked to continue it. The
+/// `:translate` paths do not call this, so replay to the routed upstream is
+/// untouched.
+///
+/// The gate is the prefix itself rather than `"thinking"`, so a body that
+/// never met a routed turn skips this on a substring scan.
+pub(crate) fn drop_headroom_signed_reasoning_blocks(
+    body_to_send: bytes::Bytes,
+    request_id: &str,
+) -> bytes::Bytes {
+    const MARKER: &[u8] = b"headroom:codex:v1:";
+    if !body_to_send.windows(MARKER.len()).any(|w| w == MARKER) {
+        return body_to_send;
+    }
+    let Some((out, dropped, markers_moved)) =
+        drop_reasoning_blocks_where(&body_to_send, is_headroom_signed_reasoning)
+    else {
         return body_to_send;
     };
+    tracing::info!(
+        request_id = %request_id,
+        event = "headroom_signed_reasoning_blocks_dropped",
+        dropped,
+        markers_moved,
+        "removed thinking blocks carrying this proxy's own reasoning envelope; \
+         a routed turn wrote them and Anthropic would refuse a signature it \
+         did not issue"
+    );
+    out
+}
+
+/// The message-array surgery both drop stages share.
+///
+/// Returns `None` when there is nothing to do — unparseable body, no
+/// `messages`, or no block the predicate claims — so the caller can hand back
+/// its original `Bytes` untouched rather than pay a re-serialize that would
+/// change nothing.
+fn drop_reasoning_blocks_where(
+    body_to_send: &bytes::Bytes,
+    doomed: fn(&serde_json::Value) -> bool,
+) -> Option<(bytes::Bytes, usize, usize)> {
+    let mut v = serde_json::from_slice::<serde_json::Value>(body_to_send).ok()?;
+    let messages = v.get_mut("messages").and_then(|m| m.as_array_mut())?;
     let mut dropped = 0usize;
     let mut markers_moved = 0usize;
     for message in messages.iter_mut() {
@@ -6444,11 +6585,11 @@ fn drop_unsigned_reasoning_blocks(body_to_send: bytes::Bytes, request_id: &str) 
             continue;
         };
         // Removing every block would leave a message with empty content, which
-        // upstream refuses just as firmly as the unsigned block does. Nothing
+        // upstream refuses just as firmly as the doomed block does. Nothing
         // this proxy writes looks like that — `stream_finisher` always leaves a
         // text block behind — but history the proxy did not write reaches here
         // too, and trading one bad turn for a different bad turn is no trade.
-        if content.iter().all(is_unsigned_reasoning) {
+        if content.iter().all(|b| doomed(b)) {
             continue;
         }
         // A `cache_control` marker on a doomed block is a cache breakpoint, and
@@ -6459,7 +6600,7 @@ fn drop_unsigned_reasoning_blocks(body_to_send: bytes::Bytes, request_id: &str) 
         let mut carried: Option<serde_json::Value> = None;
         let mut kept: Vec<serde_json::Value> = Vec::with_capacity(content.len());
         for mut block in content.drain(..) {
-            if is_unsigned_reasoning(&block) {
+            if doomed(&block) {
                 dropped += 1;
                 if let Some(cc) = block.get("cache_control") {
                     carried = Some(cc.clone());
@@ -6489,20 +6630,27 @@ fn drop_unsigned_reasoning_blocks(body_to_send: bytes::Bytes, request_id: &str) 
         *content = kept;
     }
     if dropped == 0 {
-        return body_to_send;
+        return None;
     }
-    let Ok(out) = serde_json::to_vec(&v) else {
-        return body_to_send;
-    };
-    tracing::info!(
-        request_id = %request_id,
-        event = "unsigned_reasoning_blocks_dropped",
-        dropped,
-        markers_moved,
-        "removed thinking blocks with no signature; they are the tail of a \
-         stream that died mid-block and upstream would refuse them"
+    let out = serde_json::to_vec(&v).ok()?;
+    Some((bytes::Bytes::from(out), dropped, markers_moved))
+}
+
+/// A `thinking` block this proxy signed on a routed turn.
+///
+/// `redacted_thinking` is included for the same reason it is everywhere else
+/// here: the two types travel together and a caller that handled one and not
+/// the other would leave half the problem on the wire.
+fn is_headroom_signed_reasoning(block: &serde_json::Value) -> bool {
+    let is_reasoning = matches!(
+        block.get("type").and_then(|t| t.as_str()),
+        Some("thinking") | Some("redacted_thinking")
     );
-    bytes::Bytes::from(out)
+    let ours = block
+        .get("signature")
+        .and_then(|s| s.as_str())
+        .is_some_and(crate::handlers::reasoning_signature::is_headroom_reasoning_signature);
+    is_reasoning && ours
 }
 
 /// A `thinking` block the model never got to sign.
@@ -11814,6 +11962,122 @@ mod tests {
         assert_eq!(content.as_array().unwrap().len(), 2);
         assert_eq!(content[0]["signature"], "sig");
         assert_eq!(content[0]["thinking"], "real");
+    }
+
+    // ── drop_headroom_signed_reasoning_blocks ────────────────────
+    //
+    // The cost-aware router can send one turn to a routed model and the next
+    // back to Anthropic. The routed reply carries a signature only this proxy
+    // can read, and Anthropic refuses any signature it did not issue, so the
+    // envelope has to come off before the turn goes back.
+
+    /// A signature in the shape the routed stream actually writes, so the
+    /// test moves if the envelope format does.
+    fn our_signature() -> String {
+        crate::handlers::reasoning_signature::encode_reasoning_signature(
+            &crate::handlers::reasoning_signature::ReasoningReplay {
+                id: "rs_1".to_string(),
+                encrypted_content: "blob".to_string(),
+            },
+        )
+        .expect("a well-formed replay encodes")
+    }
+
+    #[test]
+    fn only_our_own_envelope_comes_off_the_anthropic_bound_turn() {
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "native", "signature": "ErUBCkYIBRgCKkDzS1nT"},
+                {"type": "thinking", "thinking": "routed", "signature": our_signature()},
+                {"type": "text", "text": "answer"},
+            ],
+        }]));
+        let out = drop_headroom_signed_reasoning_blocks(body, "r");
+        let content = messages_of(&out)[0]["content"].clone();
+        let blocks = content.as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "exactly one block should have gone");
+        assert_eq!(blocks[0]["thinking"], "native");
+        assert_eq!(blocks[0]["signature"], "ErUBCkYIBRgCKkDzS1nT");
+        assert_eq!(blocks[1]["text"], "answer");
+    }
+
+    #[test]
+    fn a_turn_that_never_met_a_routed_model_is_byte_identical() {
+        // The prefix gate: no envelope, no parse, no re-serialize. A body
+        // that came back changed would move the cached prefix for every
+        // conversation on the proxy, which is most of them.
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "native", "signature": "ErUBCkYIBRgCKkDzS1nT"},
+                {"type": "text", "text": "answer"},
+            ],
+        }]));
+        assert_eq!(
+            drop_headroom_signed_reasoning_blocks(body.clone(), "r"),
+            body
+        );
+    }
+
+    #[test]
+    fn our_envelope_is_left_alone_when_dropping_would_empty_the_message() {
+        // Same trade the unsigned stage refuses: an empty content array is
+        // rejected just as firmly as the foreign signature.
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "routed", "signature": our_signature()}],
+        }]));
+        assert_eq!(
+            drop_headroom_signed_reasoning_blocks(body.clone(), "r"),
+            body
+        );
+    }
+
+    #[test]
+    fn dropping_our_envelope_carries_its_cache_breakpoint_forward() {
+        let body = body_with(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "routed", "signature": our_signature(),
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "answer"},
+            ],
+        }]));
+        let out = drop_headroom_signed_reasoning_blocks(body, "r");
+        let content = messages_of(&out)[0]["content"].clone();
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        assert_eq!(
+            content[0]["cache_control"]["type"], "ephemeral",
+            "the breakpoint must ride to the surviving block, not vanish"
+        );
+    }
+
+    #[test]
+    fn the_tampering_guard_does_not_see_our_envelope_as_a_rewrite() {
+        // `restore_client_reasoning_blocks` reverts the whole message array
+        // when the outbound signed set stops matching the client's. Counting
+        // our own envelope there would put the refused block straight back.
+        let client: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "native", "signature": "ErUBCkYIBRgCKkDzS1nT"},
+                {"type": "thinking", "thinking": "routed", "signature": our_signature()},
+                {"type": "text", "text": "tail"},
+            ],
+        }]))
+        .unwrap();
+        let dropped = drop_headroom_signed_reasoning_blocks(
+            body_with(serde_json::Value::Array(client.clone())),
+            "r",
+        );
+        let forwarded: Vec<serde_json::Value> =
+            serde_json::from_value(messages_of(&dropped)).unwrap();
+        assert_eq!(
+            signed_reasoning_blocks(&client),
+            signed_reasoning_blocks(&forwarded),
+            "dropping our own envelope must leave the provider-signed set identical"
+        );
     }
 
     #[test]

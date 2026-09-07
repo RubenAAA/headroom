@@ -220,9 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // container image has by default. Say so at boot, where an operator will
     // see it, rather than leaving it to be discovered.
     if config.proxy_token.is_none()
-        && !headroom_proxy::loopback_guard::is_loopback_host(Some(
-            &config.listen.ip().to_string(),
-        ))
+        && !headroom_proxy::loopback_guard::is_loopback_host(Some(&config.listen.ip().to_string()))
     {
         tracing::warn!(
             event = "proxy_open_bind",

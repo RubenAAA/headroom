@@ -200,7 +200,8 @@ mod tests {
         let first = ranker.rank(&candidates);
         std::thread::sleep(std::time::Duration::from_millis(20));
         let second = ranker.rank(&candidates);
-        let scores = |r: &[MemoryCandidate]| r.iter().map(|c| c.score.to_bits()).collect::<Vec<_>>();
+        let scores =
+            |r: &[MemoryCandidate]| r.iter().map(|c| c.score.to_bits()).collect::<Vec<_>>();
         assert_eq!(scores(&first), scores(&second));
     }
 

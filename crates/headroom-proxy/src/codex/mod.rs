@@ -9,9 +9,9 @@
 //! rather than invented. The backend buckets by originator and user-agent, so a
 //! header that drifts from the CLI's is one that gets treated differently.
 
+use axum::http::HeaderMap;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use axum::http::HeaderMap;
 use serde_json::{json, Value};
 
 /// Values mirrored from the Codex CLI source (codex-rs/login/src/auth):
@@ -22,7 +22,10 @@ const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 /// Resolve a file that lives alongside auth.json in the codex home dir.
-pub(crate) fn codex_home_sibling(auth_file: Option<&str>, name: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn codex_home_sibling(
+    auth_file: Option<&str>,
+    name: &str,
+) -> Option<std::path::PathBuf> {
     Some(std::path::Path::new(auth_file?).parent()?.join(name))
 }
 
@@ -73,7 +76,8 @@ static CODEX_TURN_STATE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, String>>,
 > = std::sync::OnceLock::new();
 
-pub(crate) fn turn_state_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+pub(crate) fn turn_state_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     CODEX_TURN_STATE.get_or_init(Default::default)
 }
 
@@ -110,7 +114,10 @@ pub(crate) fn derive_session_uuid(user_id: &str) -> String {
 /// Refresh the Codex OAuth token using the refresh_token in the auth file,
 /// mirroring codex-rs/login/src/auth/manager.rs. Persists the new tokens back
 /// to the auth file and returns the fresh access token.
-pub(crate) async fn refresh_codex_token(client: &reqwest::Client, auth_file: &str) -> Option<String> {
+pub(crate) async fn refresh_codex_token(
+    client: &reqwest::Client,
+    auth_file: &str,
+) -> Option<String> {
     let data = std::fs::read_to_string(auth_file).ok()?;
     let mut parsed: Value = serde_json::from_str(&data).ok()?;
     let refresh_token = parsed

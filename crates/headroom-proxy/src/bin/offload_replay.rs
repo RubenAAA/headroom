@@ -206,8 +206,7 @@ fn main() {
     let mut totals = Totals::default();
 
     if let Some(out) = &out_dir {
-        std::fs::create_dir_all(Path::new(out).join("out"))
-            .expect("create --out directory");
+        std::fs::create_dir_all(Path::new(out).join("out")).expect("create --out directory");
     }
 
     for (session_key, turns) in &sessions {

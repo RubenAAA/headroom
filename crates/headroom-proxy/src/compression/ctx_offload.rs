@@ -914,7 +914,9 @@ fn offload_tool_result(
     // live-tail blocks always pass. See [`OffloadGate`].
     if let Some(p) = policy {
         if !prior && !is_live && !near_tail && !p.rebuild_boundary {
-            return BlockOutcome::Deferred { bytes: original.len() };
+            return BlockOutcome::Deferred {
+                bytes: original.len(),
+            };
         }
     }
     // Structural compressor when one applies; otherwise a plain preview cut,

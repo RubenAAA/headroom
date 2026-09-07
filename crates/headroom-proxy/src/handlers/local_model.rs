@@ -76,16 +76,10 @@ fn inject_opencode_headers(headers: &mut HeaderMap, request_id: &str, session_ke
     hex.truncate(64);
     let session = format!("ses_{hex}");
     if let Ok(v) = http::HeaderValue::from_str(&session) {
-        headers.insert(
-            http::HeaderName::from_static("x-opencode-session"),
-            v,
-        );
+        headers.insert(http::HeaderName::from_static("x-opencode-session"), v);
     }
     if let Ok(v) = http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
-        headers.insert(
-            http::HeaderName::from_static("x-opencode-request"),
-            v,
-        );
+        headers.insert(http::HeaderName::from_static("x-opencode-request"), v);
     }
     headers.insert(
         http::HeaderName::from_static("x-opencode-client"),
@@ -99,10 +93,7 @@ fn inject_opencode_headers(headers: &mut HeaderMap, request_id: &str, session_ke
         // Best-effort project correlation; not required for the gate, but
         // mirrors what OpenCode sends (`x-opencode-project`).
         if let Ok(v) = http::HeaderValue::from_str(sk) {
-            headers.insert(
-                http::HeaderName::from_static("x-opencode-project"),
-                v,
-            );
+            headers.insert(http::HeaderName::from_static("x-opencode-project"), v);
         }
     }
 }
@@ -746,6 +737,13 @@ pub async fn handle_messages(
         ctx_transform_tokens_saved = ctx_tokens_saved,
         "routed-model savings split by transform scope"
     );
+    // A rerouted turn that falls back must not re-run the CTX stages: the
+    // first run already parked the replay prefix and captured the session.
+    // Overwrite the saved original with the already-transformed body so the
+    // fallback's `forward_http` sees the work as done.
+    if let Some(fb) = route_fallback.as_mut() {
+        fb.original_body = Bytes::from(serde_json::to_vec(&parsed).unwrap_or_default());
+    }
 
     // Tool pruning, schema compaction, then order stabilization — the Claude
     // path's closing sequence, and order matters within it: compaction runs

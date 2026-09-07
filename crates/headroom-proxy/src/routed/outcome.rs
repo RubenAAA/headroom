@@ -80,6 +80,8 @@ pub(crate) fn build_routed_outcome_context(
         overhead_ms,
         forwarded_tokens_estimate,
         upstream_attempts: 1,
+        // Filled in by the handler, which is where the routing decision is.
+        reroute: None,
     })
 }
 
@@ -137,6 +139,19 @@ pub(crate) struct RoutedOutcomeContext {
     /// CTX-7 observer, to close out the entry parked at request time.
     pub(crate) usage_observer:
         Option<std::sync::Arc<crate::cache_stabilization::usage_observer::UsageObserver>>,
+    /// Set when the cost-aware router chose this turn's model rather than the
+    /// client. Drives the `model_route_served` line that closes out the
+    /// `model_route_rerouted` line opened at request time.
+    pub(crate) reroute: Option<RerouteOrigin>,
+}
+
+/// The two model ids a rerouted turn ran under.
+#[derive(Clone)]
+pub(crate) struct RerouteOrigin {
+    /// What the client asked for.
+    pub(crate) from_model: String,
+    /// Where the router sent it.
+    pub(crate) to_model: String,
 }
 
 /// Book a finished routed turn through the shared outcome funnel.
@@ -201,6 +216,25 @@ pub(crate) fn book_routed_outcome_with_ccr(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
+    // What the reroute actually bought, once per rerouted turn. Pair it with
+    // the `model_route_rerouted` line on the same request id to see which
+    // turns left the client's model and what they cost. Token counts are the
+    // provider's own when it reported usage, and the request-side estimate
+    // when it did not — the same numbers this turn is booked at. No pricing:
+    // that stays out of the proxy.
+    if let Some(reroute) = ctx.reroute.as_ref() {
+        tracing::info!(
+            event = "model_route_served",
+            request_id = %ctx.request_id,
+            from_model = %reroute.from_model,
+            to_model = %reroute.to_model,
+            input_tokens,
+            output_tokens,
+            fell_back = false,
+            "cost-aware reroute completed on the routed upstream"
+        );
+    }
+
     let outcome = headroom_core::request_outcome::RequestOutcome {
         request_id: ctx.request_id.clone(),
         provider: ctx.provider.clone(),
@@ -231,4 +265,96 @@ pub(crate) fn book_routed_outcome_with_ccr(
         ..Default::default()
     };
     headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::EventCapture;
+    use serde_json::json;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn context(reroute: Option<RerouteOrigin>) -> RoutedOutcomeContext {
+        RoutedOutcomeContext {
+            sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink {
+                cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                    None, "monthly",
+                )),
+                savings_tracker: std::sync::Arc::new(
+                    headroom_core::savings_tracker::SavingsTracker::new(None, false),
+                ),
+                request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(
+                    None,
+                )),
+            }),
+            request_id: "req-test".to_string(),
+            model: "muse-spark-1.3".to_string(),
+            provider: "openai_responses".to_string(),
+            client: None,
+            project: None,
+            tokens_saved: 0,
+            transforms_applied: Vec::new(),
+            num_messages: 1,
+            started_at: std::time::Instant::now(),
+            overhead_ms: 0.0,
+            forwarded_tokens_estimate: 7,
+            upstream_attempts: 1,
+            replay_store: None,
+            session_key: "sess-test".to_string(),
+            usage_observer: None,
+            reroute,
+        }
+    }
+
+    fn lines_from(book: impl FnOnce()) -> String {
+        let capture = EventCapture::default();
+        let lines = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, book);
+        let joined = lines.lock().unwrap().join("\n");
+        joined
+    }
+
+    /// What the reroute bought, on the turn it bought it. Without this the only
+    /// record of a rerouted turn is the decision line, which is written before
+    /// the upstream has said anything at all.
+    #[test]
+    fn a_rerouted_turn_reports_what_it_served() {
+        let ctx = context(Some(RerouteOrigin {
+            from_model: "claude-opus-5".to_string(),
+            to_model: "claude-muse-spark-1.3".to_string(),
+        }));
+        let usage = json!({"input_tokens": 120, "output_tokens": 34});
+        let joined = lines_from(|| book_routed_outcome(&ctx, Some(&usage), 0, 0.0, 200));
+
+        let served: Vec<&str> = joined
+            .lines()
+            .filter(|l| l.contains("model_route_served"))
+            .collect();
+        assert_eq!(served.len(), 1, "{joined}");
+        for field in [
+            "request_id=req-test",
+            "from_model=claude-opus-5",
+            "to_model=claude-muse-spark-1.3",
+            "input_tokens=120",
+            "output_tokens=34",
+            "fell_back=false",
+        ] {
+            assert!(
+                served[0].contains(field),
+                "missing {field} in {}",
+                served[0]
+            );
+        }
+    }
+
+    /// A client that picked the model itself was not rerouted, so there is
+    /// nothing to report and the log stays quiet.
+    #[test]
+    fn a_turn_the_client_routed_itself_reports_nothing() {
+        let ctx = context(None);
+        let usage = json!({"input_tokens": 120, "output_tokens": 34});
+        let joined = lines_from(|| book_routed_outcome(&ctx, Some(&usage), 0, 0.0, 200));
+        assert!(!joined.contains("model_route_served"), "{joined}");
+    }
 }

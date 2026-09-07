@@ -936,8 +936,7 @@ impl MemoryHandler {
         }
         let effective_user_id = match (requested_project, scope) {
             (Some(path), _) => {
-                let base =
-                    crate::memory::router::shared_partition(&effective_user_id).to_string();
+                let base = crate::memory::router::shared_partition(&effective_user_id).to_string();
                 let root = expand_home(path);
                 // The resolver hashes whatever it is handed; it never asks the
                 // filesystem. A mistyped path therefore resolves cleanly to a

@@ -321,10 +321,7 @@ mod tests {
             let mut msgs = vec![json!({"role": "user", "content": content})];
             let before = msgs.clone();
             for provider in ["anthropic", "openai"] {
-                assert_eq!(
-                    append_to_latest_user_tail(&mut msgs, block, provider, 0),
-                    0
-                );
+                assert_eq!(append_to_latest_user_tail(&mut msgs, block, provider, 0), 0);
             }
             assert_eq!(msgs, before, "a refused injection must not touch the body");
         }
@@ -339,7 +336,12 @@ mod tests {
             json!({"role": "assistant", "content": "ok"}),
             json!({"role": "user", "content": "new"}),
         ];
-        let n = append_to_latest_user_tail(&mut msgs, "## Relevant Memories (scope: global)", "anthropic", 0);
+        let n = append_to_latest_user_tail(
+            &mut msgs,
+            "## Relevant Memories (scope: global)",
+            "anthropic",
+            0,
+        );
         assert!(n > 0);
     }
 

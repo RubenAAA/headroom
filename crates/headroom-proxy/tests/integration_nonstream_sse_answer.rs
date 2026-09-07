@@ -47,9 +47,7 @@ async fn complete_event_stream_is_rebuilt_as_json() {
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
         .mount(&upstream)
         .await;
 
@@ -105,9 +103,7 @@ async fn truncated_event_stream_becomes_502() {
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
         .mount(&upstream)
         .await;
 
@@ -149,9 +145,7 @@ async fn streaming_client_still_gets_the_event_stream() {
     );
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
         .mount(&upstream)
         .await;
 

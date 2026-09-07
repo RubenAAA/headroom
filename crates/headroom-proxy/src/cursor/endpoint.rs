@@ -117,8 +117,10 @@ mod tests {
         let state = test_state();
         let (a, _ia) = state.cursor_bridge.open("conv-a").await;
         let (b, _ib) = state.cursor_bridge.open("conv-b").await;
-        a.set_tools(vec![json!({"name": "OnlyA", "input_schema": {}})]).await;
-        b.set_tools(vec![json!({"name": "OnlyB", "input_schema": {}})]).await;
+        a.set_tools(vec![json!({"name": "OnlyA", "input_schema": {}})])
+            .await;
+        b.set_tools(vec![json!({"name": "OnlyB", "input_schema": {}})])
+            .await;
 
         let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let (_, from_a) = post(router(state.clone()), "/mcp/conv-a", list.clone()).await;
@@ -138,7 +140,11 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "not a 404: the agent must be able to read it");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "not a 404: the agent must be able to read it"
+        );
         assert_eq!(body["error"]["code"], -32000);
         assert_eq!(body["id"], 4);
     }
@@ -163,7 +169,9 @@ mod tests {
     async fn a_tool_call_holds_the_http_request_open_until_it_is_answered() {
         let state = test_state();
         let (session, mut inbox) = state.cursor_bridge.open("conv-a").await;
-        session.set_tools(vec![json!({"name": "Read", "input_schema": {}})]).await;
+        session
+            .set_tools(vec![json!({"name": "Read", "input_schema": {}})])
+            .await;
 
         let request = tokio::spawn(post(
             router(state),
@@ -175,7 +183,9 @@ mod tests {
         let parked = inbox.recv().await.expect("the call reaches the turn loop");
         assert!(!request.is_finished(), "the request must still be open");
 
-        session.answer(&parked.id, ToolOutcome::Ok("contents".into())).await;
+        session
+            .answer(&parked.id, ToolOutcome::Ok("contents".into()))
+            .await;
         let (status, body) = request.await.expect("join");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["content"][0]["text"], "contents");

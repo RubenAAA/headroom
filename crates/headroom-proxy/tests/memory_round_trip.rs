@@ -78,7 +78,12 @@ async fn a_saved_memory_comes_back_on_a_search() {
     )
     .await;
 
-    let found = call(&handler, "memory_search", json!({"query": "split cache TTL"})).await;
+    let found = call(
+        &handler,
+        "memory_search",
+        json!({"query": "split cache TTL"}),
+    )
+    .await;
 
     assert!(
         found.contains("511%"),
@@ -173,10 +178,23 @@ async fn a_near_duplicate_merges_into_the_original() {
     let dir = tempfile::tempdir().unwrap();
     let handler = handler(dir.path());
 
-    let first = call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes"})).await;
-    let second = call(&handler, "memory_save", json!({"content": "images are billed by pixel dimensions, not bytes."})).await;
+    let first = call(
+        &handler,
+        "memory_save",
+        json!({"content": "images are billed by pixel dimensions, not bytes"}),
+    )
+    .await;
+    let second = call(
+        &handler,
+        "memory_save",
+        json!({"content": "images are billed by pixel dimensions, not bytes."}),
+    )
+    .await;
 
-    assert!(second.contains("merged"), "a restatement must merge: {second}");
+    assert!(
+        second.contains("merged"),
+        "a restatement must merge: {second}"
+    );
     assert!(
         second.contains("memory_update"),
         "and must say how to change it further: {second}"
@@ -188,7 +206,10 @@ async fn a_near_duplicate_merges_into_the_original() {
         1,
         "one fact, one memory; got {listed}"
     );
-    assert!(!first.contains("merged"), "the first save had nothing to merge into");
+    assert!(
+        !first.contains("merged"),
+        "the first save had nothing to merge into"
+    );
 }
 
 /// Two facts that merely share vocabulary must stay two facts.
@@ -197,10 +218,20 @@ async fn related_but_distinct_memories_are_both_kept() {
     let dir = tempfile::tempdir().unwrap();
     let handler = handler(dir.path());
 
-    call(&handler, "memory_save", json!({"content":
-        "the split cache TTL cost 511 percent more creation on live traffic and was reverted"})).await;
-    call(&handler, "memory_save", json!({"content":
-        "the reminder guard cut depth-standardised cache creation by 55 percent on live traffic"})).await;
+    call(
+        &handler,
+        "memory_save",
+        json!({"content":
+        "the split cache TTL cost 511 percent more creation on live traffic and was reverted"}),
+    )
+    .await;
+    call(
+        &handler,
+        "memory_save",
+        json!({"content":
+        "the reminder guard cut depth-standardised cache creation by 55 percent on live traffic"}),
+    )
+    .await;
 
     let listed = call(&handler, "memory_list", json!({"limit": 100})).await;
     assert!(listed.contains("511 percent"), "first fact lost: {listed}");
@@ -298,7 +329,6 @@ async fn a_listed_memory_is_the_one_that_was_saved() {
     );
 }
 
-
 /// A restatement at a DIFFERENT scope must not be merged into.
 ///
 /// Project search also reads the shared partition, so a `scope: "project"` save
@@ -323,7 +353,10 @@ async fn a_restatement_at_another_scope_is_not_merged_into() {
         json!({"content": content, "scope": "global"}),
     )
     .await;
-    assert!(!global.contains("merged"), "nothing to merge into: {global}");
+    assert!(
+        !global.contains("merged"),
+        "nothing to merge into: {global}"
+    );
 
     let project = call_as(
         &handler,
@@ -389,7 +422,13 @@ async fn an_explicit_project_files_the_memory_under_that_repository() {
         "the sibling must find its own fact: {from_sibling}"
     );
 
-    let from_here = call_as(&handler, here, "memory_search", json!({"query": "yarn.lock npm ci"})).await;
+    let from_here = call_as(
+        &handler,
+        here,
+        "memory_search",
+        json!({"query": "yarn.lock npm ci"}),
+    )
+    .await;
     assert!(
         !from_here.contains("yarn.lock"),
         "and the writing session must not keep it: {from_here}"
@@ -408,7 +447,10 @@ async fn a_project_and_a_global_scope_together_are_refused() {
         json!({"content": "anything at all", "project": "/tmp", "scope": "global"}),
     )
     .await;
-    assert!(out.contains("error"), "the contradiction must be refused: {out}");
+    assert!(
+        out.contains("error"),
+        "the contradiction must be refused: {out}"
+    );
     assert!(out.contains("contradict"), "and must say why: {out}");
 }
 

@@ -31,9 +31,7 @@
 use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
-use headroom_core::transforms::{
-    compress_openai_chat_live_zone, LiveZoneError, LiveZoneOutcome,
-};
+use headroom_core::transforms::{compress_openai_chat_live_zone, LiveZoneError, LiveZoneOutcome};
 use serde_json::Value;
 
 use crate::cache_stabilization::tool_def_normalize::{

@@ -69,9 +69,9 @@ impl DeferredMemory {
     /// call: a deferred answer is held on purpose, and the client is meant not
     /// to see the `tool_use`.
     pub fn is_held(&self, tool_use_id: &str) -> bool {
-        self.held.iter().any(|p| {
-            p.tool_use.get("id").and_then(Value::as_str) == Some(tool_use_id)
-        })
+        self.held
+            .iter()
+            .any(|p| p.tool_use.get("id").and_then(Value::as_str) == Some(tool_use_id))
     }
 
     pub fn hold(&mut self, pending: PendingMemoryResult) {
@@ -348,7 +348,11 @@ mod tests {
             .unwrap()
             .push(tool_use("tu_skill", "Skill"));
 
-        assert_eq!(d.apply(&mut msgs), 0, "nothing is restored into a broken turn");
+        assert_eq!(
+            d.apply(&mut msgs),
+            0,
+            "nothing is restored into a broken turn"
+        );
         assert_eq!(
             msgs[1]["content"].as_array().unwrap().len(),
             2,

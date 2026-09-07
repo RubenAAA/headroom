@@ -216,6 +216,40 @@ pub struct ShapeResult {
     pub labels: Vec<String>,
 }
 
+/// False when the proxy runs in prefix-freezing cache mode.
+///
+/// `mode="cache"` freezes prior turns specifically to keep the provider's
+/// prefix-cache key byte-stable. Verbosity steering is the one lever that
+/// writes into that key: it appends to the system-prompt tail, and on a body
+/// with no `system` field it creates one. Running it there trades a large,
+/// certain cache cost for a small, uncertain output saving. Ports Python
+/// `output_shaper.steering_allowed_for`.
+pub fn steering_allowed_for(mode: &str) -> bool {
+    !crate::modes::is_cache_mode(Some(mode))
+}
+
+/// Apply verbosity steering to an Anthropic request body in place, honoring
+/// the proxy run mode.
+///
+/// In cache mode the level is forced to 0 — the documented "no steering"
+/// value — which disables the only cache-key-mutating lever. This
+/// deliberately outranks a configured level: a level set on the command line
+/// must not reintroduce a prefix mutation the mode exists to prevent. Ports
+/// the `steering_enabled` branch of Python `resolve_verbosity_level`.
+pub fn shape_request_for_mode(
+    body: &mut Value,
+    enabled: bool,
+    verbosity_level: i32,
+    mode: &str,
+) -> ShapeResult {
+    let level = if steering_allowed_for(mode) {
+        verbosity_level
+    } else {
+        0
+    };
+    shape_request(body, enabled, level)
+}
+
 /// Apply verbosity steering to an Anthropic request body in place.
 pub fn shape_request(body: &mut Value, enabled: bool, verbosity_level: i32) -> ShapeResult {
     let mut result = ShapeResult::default();
@@ -399,6 +433,73 @@ mod tests {
         assert!(result.changed);
         assert_eq!(result.labels, vec!["output_shaper:verbosity:L2",]);
         assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    /// Cache mode freezes the provider prefix-cache key, so the one lever
+    /// that writes into it must not run. The body has to come out of the
+    /// shaper stage byte-identical.
+    #[test]
+    fn cache_mode_leaves_body_byte_identical() {
+        let mut body = json!({
+            "system": "Sys.",
+            "messages": mechanical_messages(),
+            "output_config": {"effort": "xhigh"}
+        });
+        let before = serde_json::to_vec(&body).unwrap();
+
+        let result = shape_request_for_mode(&mut body, true, 3, crate::modes::PROXY_MODE_CACHE);
+
+        assert!(!result.changed);
+        assert!(result.labels.is_empty());
+        assert_eq!(serde_json::to_vec(&body).unwrap(), before);
+    }
+
+    /// A body carrying no `system` field is the sharper case: steering would
+    /// create one, which is a bigger prefix break than an append.
+    #[test]
+    fn cache_mode_does_not_create_a_system_field() {
+        let mut body = json!({"messages": mechanical_messages()});
+        let before = serde_json::to_vec(&body).unwrap();
+
+        shape_request_for_mode(&mut body, true, 3, crate::modes::PROXY_MODE_CACHE);
+
+        assert!(body.get("system").is_none());
+        assert_eq!(serde_json::to_vec(&body).unwrap(), before);
+    }
+
+    /// The gate outranks a configured level, and cache-mode aliases resolve
+    /// the same way the mode flag does.
+    #[test]
+    fn cache_mode_aliases_also_disable_steering() {
+        for mode in ["cache", "cache_mode", "cost_savings"] {
+            let mut body = json!({"system": "Sys.", "messages": mechanical_messages()});
+            let before = serde_json::to_vec(&body).unwrap();
+
+            shape_request_for_mode(&mut body, true, 4, mode);
+
+            assert_eq!(serde_json::to_vec(&body).unwrap(), before, "mode={mode}");
+            assert!(!steering_allowed_for(mode), "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn token_mode_still_shapes() {
+        let mut body = json!({
+            "system": "Sys.",
+            "messages": mechanical_messages(),
+            "output_config": {"effort": "xhigh"}
+        });
+
+        let result = shape_request_for_mode(&mut body, true, 2, crate::modes::PROXY_MODE_TOKEN);
+
+        assert!(result.changed);
+        assert_eq!(result.labels, vec!["output_shaper:verbosity:L2"]);
+        let tail = body["system"].as_array().unwrap().last().unwrap();
+        assert!(tail["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(STEERING_SENTINEL));
+        assert!(steering_allowed_for(crate::modes::PROXY_MODE_TOKEN));
     }
 
     /// Effort routing was removed upstream (per-turn routing measured ~15x

@@ -489,7 +489,9 @@ fn the_stale_window_confines_its_rewrite_to_the_tail() {
     for messages in snapshots.iter().skip(1) {
         let converted = run(messages);
         assert!(
-            serde_json::to_string(&converted).unwrap().contains("<<ctx:"),
+            serde_json::to_string(&converted)
+                .unwrap()
+                .contains("<<ctx:"),
             "the window converted nothing; it would be inert"
         );
         let next = message_bytes(&converted);

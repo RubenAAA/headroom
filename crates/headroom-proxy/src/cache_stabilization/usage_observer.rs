@@ -205,10 +205,23 @@ pub struct PrefixFingerprint {
 /// only if every fragment shares both — not a case worth engineering against
 /// for a field whose job is to tell two live streams apart.
 pub fn prefix_fingerprint(parsed: &serde_json::Value) -> PrefixFingerprint {
+    prefix_fingerprint_with_model(parsed, None)
+}
+
+/// As [`prefix_fingerprint`], but with `identity_model` standing in for the
+/// body's own `model`.
+///
+/// Same reason as `derive_session_key_with_model`: a turn the cost-aware
+/// router sent to another upstream is the same conversation, and the
+/// fingerprint has to match the one the previous turn left behind.
+pub fn prefix_fingerprint_with_model(
+    parsed: &serde_json::Value,
+    identity_model: Option<&str>,
+) -> PrefixFingerprint {
     use sha2::{Digest, Sha256};
 
     let mut head = Sha256::new();
-    if let Some(model) = parsed.get("model").and_then(|v| v.as_str()) {
+    if let Some(model) = identity_model.or_else(|| parsed.get("model").and_then(|v| v.as_str())) {
         head.update(model.as_bytes());
     }
     for key in ["system", "tools"] {

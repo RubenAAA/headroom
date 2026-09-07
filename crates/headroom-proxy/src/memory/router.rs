@@ -571,7 +571,10 @@ mod tests {
             base_user_id: "default".to_string(),
             project_root_override: None,
         };
-        assert_eq!(scoped_user_id("default", &ctx("shopkit")), "default::shopkit");
+        assert_eq!(
+            scoped_user_id("default", &ctx("shopkit")),
+            "default::shopkit"
+        );
         assert_ne!(
             scoped_user_id("default", &ctx("shopkit")),
             scoped_user_id("default", &ctx("headroom"))

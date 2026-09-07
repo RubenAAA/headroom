@@ -930,7 +930,11 @@ fn shape_delta(prev: &MessageShape, curr: &MessageShape) -> String {
                 // sits past the window we fingerprint.
                 format!("block[>{}]", EARLY_BLOCKS_WINDOW - 1)
             } else {
-                format!("block[{}]{}", changed.join(","), block_deltas(prev, curr, &changed))
+                format!(
+                    "block[{}]{}",
+                    changed.join(","),
+                    block_deltas(prev, curr, &changed)
+                )
             }
         }
         // One side had blocks and the other a bare string, or both are
@@ -948,22 +952,24 @@ fn block_deltas(prev: &MessageShape, curr: &MessageShape, changed: &[String]) ->
     let parts: Vec<String> = changed
         .iter()
         .filter_map(|i| i.parse::<usize>().ok())
-        .filter_map(|i| match (prev.block_tags.get(i)?, curr.block_tags.get(i)?) {
-            (Some(p), Some(c)) if p.kind == c.kind && p.bytes == c.bytes => {
-                Some(format!("{} {}B", p.kind.name(), p.bytes))
-            }
-            (Some(p), Some(c)) if p.kind == c.kind => {
-                Some(format!("{} {}B->{}B", p.kind.name(), p.bytes, c.bytes))
-            }
-            (Some(p), Some(c)) => Some(format!(
-                "{} {}B->{} {}B",
-                p.kind.name(),
-                p.bytes,
-                c.kind.name(),
-                c.bytes
-            )),
-            _ => None,
-        })
+        .filter_map(
+            |i| match (prev.block_tags.get(i)?, curr.block_tags.get(i)?) {
+                (Some(p), Some(c)) if p.kind == c.kind && p.bytes == c.bytes => {
+                    Some(format!("{} {}B", p.kind.name(), p.bytes))
+                }
+                (Some(p), Some(c)) if p.kind == c.kind => {
+                    Some(format!("{} {}B->{}B", p.kind.name(), p.bytes, c.bytes))
+                }
+                (Some(p), Some(c)) => Some(format!(
+                    "{} {}B->{} {}B",
+                    p.kind.name(),
+                    p.bytes,
+                    c.kind.name(),
+                    c.bytes
+                )),
+                _ => None,
+            },
+        )
         .collect();
     if parts.is_empty() {
         String::new()
@@ -1003,6 +1009,26 @@ pub fn derive_session_key(
     body: &serde_json::Value,
     kind: ApiKind,
 ) -> String {
+    derive_session_key_with_model(headers, client_addr, body, kind, None)
+}
+
+/// As [`derive_session_key`], but with the conversation identity taken from
+/// `identity_model` instead of the body's own `model` field.
+///
+/// The cost-aware router rewrites `model` before this runs, and the
+/// discriminator folds the model in on purpose — a genuine model switch does
+/// start a new provider cache lineage. A reroute is not that switch: it is the
+/// proxy's own choice, and letting it rotate the key made every rerouted turn
+/// report `cache_drift_first_request` and threw away the conversation's
+/// confirmed-frozen prefix. Passing the model the *client* asked for keeps one
+/// conversation on one key whichever upstream served it.
+pub fn derive_session_key_with_model(
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+    body: &serde_json::Value,
+    kind: ApiKind,
+    identity_model: Option<&str>,
+) -> String {
     if let Some(sid) = headers
         .get("x-headroom-session-id")
         .and_then(|v| v.to_str().ok())
@@ -1010,7 +1036,7 @@ pub fn derive_session_key(
     {
         return format!("session:{}", hash_secret(sid));
     }
-    let conv = conversation_discriminator(body, kind);
+    let conv = conversation_discriminator(body, kind, identity_model);
     if let Some(token) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1064,8 +1090,14 @@ pub fn derive_session_key(
 /// explicit `x-headroom-session-id` pins the identity and reports
 /// those rewrites as drift. Conversations sharing one credential AND
 /// a byte-identical opener on the same model still conflate.
-fn conversation_discriminator(body: &serde_json::Value, kind: ApiKind) -> String {
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
+fn conversation_discriminator(
+    body: &serde_json::Value,
+    kind: ApiKind,
+    identity_model: Option<&str>,
+) -> String {
+    let model = identity_model
+        .or_else(|| body.get("model").and_then(|m| m.as_str()))
+        .unwrap_or("");
     match conversation_messages(body, kind).first() {
         Some(first) => {
             let canonical = canonicalize_for_hash(first, false);
@@ -1218,10 +1250,7 @@ mod tests {
     fn a_block_that_changed_type_says_so() {
         let before = blocks_body(json!([{"type": "thinking", "thinking": "", "signature": "sig"}]));
         let after = blocks_body(json!([{"type": "text", "text": "hello"}]));
-        assert_eq!(
-            detail(&before, &after),
-            "0:block[0] thinking 51B->text 30B"
-        );
+        assert_eq!(detail(&before, &after), "0:block[0] thinking 51B->text 30B");
     }
 
     #[test]
@@ -1910,7 +1939,7 @@ mod tests {
         );
         let malformed = json!({"model": "m", "system": "s", "messages": "oops"});
         assert!(conversation_messages(&malformed, ApiKind::Anthropic).is_empty());
-        assert!(conversation_discriminator(&malformed, ApiKind::Anthropic) == "-");
+        assert!(conversation_discriminator(&malformed, ApiKind::Anthropic, None) == "-");
     }
 
     #[test]

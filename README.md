@@ -60,8 +60,14 @@ cclaude          # from now on, always this instead of `claude`
 ```
 
 That builds both binaries, installs them to `~/.local/bin`, writes a flag file
-to your home directory, and wires the token statusline into
-`~/.claude/settings.json`.
+to your home directory, wires the token statusline into
+`~/.claude/settings.json`, adds one Claude Code subagent per routed model to
+`~/.claude/agents/` (`codex-sol`, `grok-high`, `spark`, and so on), and splices
+the memory-tool instructions from
+[`contrib/claude/CLAUDE.headroom.md`](contrib/claude/CLAUDE.headroom.md) into
+`~/.claude/CLAUDE.md` between marker comments. Existing agent files are left
+alone. The statusline helpers live in `contrib/`, so keep the checkout where it
+is.
 
 To edit the checkout, use `./install.sh --link`, which is how the maintainer
 runs it. That symlinks the scripts and the flag file into `contrib/` instead of
@@ -167,7 +173,7 @@ liveness and ledger health, `headroom ctx search` for captured context.
 | `crates/headroom-parity` | Checks Rust output against the Python implementation. |
 | `crates/headroom-simulators` | Traffic simulators for benchmarks. |
 | `crates/headroom-py` | A PyO3 extension module, built with maturin rather than cargo. |
-| `contrib/` | The launcher, the restart script, the statuslines, the flag file. |
+| `contrib/` | The launcher, the restart script, the statuslines, the flag file. `contrib/claude/` holds the subagent definitions and the CLAUDE.md excerpt. |
 | `docs/` | Reference docs, including [`flags.md`](docs/flags.md) and [`measurement.md`](docs/measurement.md). |
 | `docs/notes/` | Working notes and measurement logs. Not onboarding material, and parts go stale. |
 

@@ -132,7 +132,11 @@ fn the_next_splice_drops_no_message_and_leaves_no_system_message_stranded() {
         "role": "system",
         "content": "<system-reminder>\nSubagentStart hook additional context\n</system-reminder>"
     }));
-    assert_eq!(first_illegal_system(&third), None, "the client's own body is legal");
+    assert_eq!(
+        first_illegal_system(&third),
+        None,
+        "the client's own body is legal"
+    );
 
     let out = overlay_cached_prefix(
         third.clone(),

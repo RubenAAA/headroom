@@ -47,7 +47,9 @@ async fn upstream(
                     let seen = Arc::clone(&seen);
                     async move {
                         let body = req.into_body().collect().await.unwrap().to_bytes();
-                        seen.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+                        seen.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&body).into_owned());
                         let round = rounds.fetch_add(1, Ordering::SeqCst);
 
                         // The continuation asks for `stream: false`, so it has
@@ -64,17 +66,37 @@ async fn upstream(
                                 .to_string()],
                             )
                         } else {
-                            ("text/event-stream", vec![
-                                sse("message_start", json!({"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":0}}})),
-                                sse("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"memory_search","input":{}}})),
-                                sse("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"split cache TTL\"}"}})),
-                                sse("content_block_stop", json!({"type":"content_block_stop","index":0})),
-                                sse("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}})),
-                                sse("message_stop", json!({"type":"message_stop"})),
-                            ])
+                            (
+                                "text/event-stream",
+                                vec![
+                                    sse(
+                                        "message_start",
+                                        json!({"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":0}}}),
+                                    ),
+                                    sse(
+                                        "content_block_start",
+                                        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"memory_search","input":{}}}),
+                                    ),
+                                    sse(
+                                        "content_block_delta",
+                                        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"split cache TTL\"}"}}),
+                                    ),
+                                    sse(
+                                        "content_block_stop",
+                                        json!({"type":"content_block_stop","index":0}),
+                                    ),
+                                    sse(
+                                        "message_delta",
+                                        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}),
+                                    ),
+                                    sse("message_stop", json!({"type":"message_stop"})),
+                                ],
+                            )
                         };
                         let stream = futures_util::stream::iter(
-                            events.into_iter().map(|e| Ok::<_, Infallible>(Frame::data(Bytes::from(e)))),
+                            events
+                                .into_iter()
+                                .map(|e| Ok::<_, Infallible>(Frame::data(Bytes::from(e)))),
                         );
                         Ok::<_, Infallible>(
                             Response::builder()
@@ -156,9 +178,15 @@ async fn the_memory_tools_reach_the_request_body() {
         "memory_delete",
         "memory_list",
     ] {
-        assert!(first.contains(tool), "{tool} must be injected into the tools array");
+        assert!(
+            first.contains(tool),
+            "{tool} must be injected into the tools array"
+        );
     }
-    assert!(first.contains("\"Read\""), "the client's own tools must survive");
+    assert!(
+        first.contains("\"Read\""),
+        "the client's own tools must survive"
+    );
 }
 
 #[tokio::test]
@@ -196,11 +224,14 @@ async fn the_continuation_carries_the_tool_result_upstream() {
     let dir = TempDir::new().unwrap();
     let (_client_saw, upstream_saw, _) = run_turn(&dir).await;
 
-    assert_eq!(upstream_saw.len(), 2, "expected an original and a continuation");
+    assert_eq!(
+        upstream_saw.len(),
+        2,
+        "expected an original and a continuation"
+    );
     assert!(
         upstream_saw[1].contains("tool_result"),
         "the continuation must carry the memory answer: {}",
         upstream_saw[1]
     );
 }
-

@@ -2404,6 +2404,11 @@ impl Config {
                     .ok()
                     .as_deref(),
                 std::env::var("HEADROOM_MODEL_ROUTES").ok().as_deref(),
+            )
+            .with_cooldown_from_env(
+                std::env::var("HEADROOM_MODEL_ROUTER_COOLDOWN_SECS")
+                    .ok()
+                    .as_deref(),
             ),
             cache_control_auto_frozen: args.cache_control_auto_frozen,
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,

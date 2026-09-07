@@ -144,7 +144,11 @@ fn is_loopback(interface: &str) -> bool {
 
 /// The risky offloads on one interface, or `None` when it cannot be read.
 fn offloads_on(interface: &str) -> Option<Vec<&'static str>> {
-    let output = Command::new("ethtool").arg("-k").arg(interface).output().ok()?;
+    let output = Command::new("ethtool")
+        .arg("-k")
+        .arg(interface)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

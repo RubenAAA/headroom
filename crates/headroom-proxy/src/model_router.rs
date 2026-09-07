@@ -21,6 +21,9 @@
 
 use bytes::Bytes;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// One ordered routing rule.
 ///
@@ -69,11 +72,22 @@ impl ModelRoute {
     }
 }
 
+/// How long a target model is skipped after a routed turn had to fall back.
+///
+/// Long enough that a provider outage or a spent rate-limit window is not
+/// re-probed on every tool-less turn, short enough that a recovered upstream
+/// is picked up again without a restart.
+pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
+
 /// Configuration for [`ModelRouter`]. Disabled by default.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ModelRouterConfig {
     pub enabled: bool,
     pub routes: Vec<ModelRoute>,
+    /// How long to skip a target model after a fallback. `None` means
+    /// [`DEFAULT_COOLDOWN_SECS`]; `Some(ZERO)` turns cooldowns off, so every
+    /// turn re-probes the routed upstream as it did before this existed.
+    pub cooldown: Option<Duration>,
 }
 
 impl ModelRouterConfig {
@@ -96,12 +110,122 @@ impl ModelRouterConfig {
             return Self {
                 enabled: false,
                 routes: Vec::new(),
+                cooldown: None,
             };
         }
         Self {
             enabled: enabled && !routes.is_empty(),
             routes,
+            cooldown: None,
         }
+    }
+
+    /// Set the post-fallback cooldown window from
+    /// `HEADROOM_MODEL_ROUTER_COOLDOWN_SECS`.
+    ///
+    /// Unset or unparseable keeps the default. `0` disables cooldowns.
+    /// Chained rather than taken as a third argument to `from_env` so the
+    /// config call site reads as one expression.
+    #[must_use]
+    pub fn with_cooldown_from_env(mut self, raw: Option<&str>) -> Self {
+        self.cooldown = match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None => None,
+            Some(s) => match s.parse::<u64>() {
+                Ok(secs) => Some(Duration::from_secs(secs)),
+                Err(_) => {
+                    tracing::warn!(
+                        "invalid HEADROOM_MODEL_ROUTER_COOLDOWN_SECS {s:?}; using the default"
+                    );
+                    None
+                }
+            },
+        };
+        self
+    }
+
+    /// The cooldown window this config asks for.
+    pub fn cooldown(&self) -> Duration {
+        self.cooldown
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_COOLDOWN_SECS))
+    }
+}
+
+/// Target models a routed turn recently had to fall back from, and when each
+/// becomes eligible again.
+///
+/// One entry per `to_model`, not per rule: the reason a rule is skipped is
+/// that its destination is down, and two rules pointing at the same model
+/// share that fact. Cloneable handle over shared state, like the other
+/// per-process stores on `AppState`.
+#[derive(Clone, Debug, Default)]
+pub struct ModelCooldowns {
+    inner: Arc<Mutex<HashMap<String, Cooling>>>,
+}
+
+#[derive(Debug)]
+struct Cooling {
+    until: Instant,
+    /// When the last skip was logged, so an active cooldown does not write a
+    /// line per turn for as long as it lasts.
+    last_logged: Option<Instant>,
+}
+
+/// One skipped rule, and whether this skip is the one to log.
+pub struct SkipNotice {
+    pub remaining: Duration,
+    pub log: bool,
+}
+
+/// Minimum gap between two `model_route_cooldown_skip` lines for one model.
+const SKIP_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+impl ModelCooldowns {
+    /// Put `model` in cooldown for `window`. Returns false when cooldowns are
+    /// off (`window` is zero), so the caller can log the fallback plainly.
+    pub fn start(&self, model: &str, window: Duration) -> bool {
+        if window.is_zero() {
+            return false;
+        }
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.insert(
+                model.to_string(),
+                Cooling {
+                    until: Instant::now() + window,
+                    last_logged: None,
+                },
+            );
+        }
+        true
+    }
+
+    /// Time left on `model`'s cooldown, or `None` when it is eligible again.
+    /// Read-only: does not count as a skip.
+    pub fn remaining(&self, model: &str) -> Option<Duration> {
+        let guard = self.inner.lock().ok()?;
+        let entry = guard.get(model)?;
+        entry.until.checked_duration_since(Instant::now())
+    }
+
+    /// Record that a rule targeting `model` was skipped this turn.
+    ///
+    /// `None` means the model is eligible and the rule should be taken. An
+    /// expired entry is dropped here, so a recovered upstream costs one map
+    /// removal rather than staying in the table until the process restarts.
+    pub fn note_skip(&self, model: &str) -> Option<SkipNotice> {
+        let now = Instant::now();
+        let mut guard = self.inner.lock().ok()?;
+        let entry = guard.get_mut(model)?;
+        let Some(remaining) = entry.until.checked_duration_since(now) else {
+            guard.remove(model);
+            return None;
+        };
+        let log = entry
+            .last_logged
+            .is_none_or(|at| now.duration_since(at) >= SKIP_LOG_INTERVAL);
+        if log {
+            entry.last_logged = Some(now);
+        }
+        Some(SkipNotice { remaining, log })
     }
 }
 
@@ -155,6 +279,23 @@ impl ModelRouter {
     /// Never fails: on a disabled router or no matching rule, returns a
     /// non-matching decision that leaves the original model in place.
     pub fn select(&self, model: &str, input_tokens: u64, has_tools: bool) -> ModelDecision {
+        self.select_skipping(model, input_tokens, has_tools, &mut |_| false)
+    }
+
+    /// As [`Self::select`], but `skip` can veto a rule by its target model.
+    ///
+    /// This is how a cooldown reaches the router without the router learning
+    /// about clocks or shared state: the caller decides which destinations are
+    /// currently unusable and the first-match-wins walk simply carries on past
+    /// them. A vetoed rule does not short-circuit the rules after it — the
+    /// point is to find another route, or none.
+    pub fn select_skipping(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        has_tools: bool,
+        skip: &mut dyn FnMut(&str) -> bool,
+    ) -> ModelDecision {
         if !self.enabled() {
             return ModelDecision::passthrough(model, "router disabled");
         }
@@ -164,6 +305,11 @@ impl ModelRouter {
 
         for route in &self.config.routes {
             if route.matches(model, input_tokens, has_tools) {
+                // A rule routing a model to itself changes nothing, so there is
+                // nothing to skip: the request goes where it was already going.
+                if route.to_model != model && skip(&route.to_model) {
+                    continue;
+                }
                 // Python formats `{route.name or route.to_model!r}`: the `!r`
                 // conversion applies to the whole expression, so the label is
                 // always quoted — including when `name` is set.
@@ -589,6 +735,7 @@ mod tests {
     fn first_match_wins_and_builds_reason() {
         let cfg = ModelRouterConfig {
             enabled: true,
+            cooldown: None,
             routes: vec![
                 ModelRoute {
                     to_model: "mini".into(),
@@ -614,6 +761,7 @@ mod tests {
     fn unnamed_rule_reason_uses_target_model() {
         let cfg = ModelRouterConfig {
             enabled: true,
+            cooldown: None,
             routes: vec![route("mini")],
         };
         let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 7, true);
@@ -627,6 +775,7 @@ mod tests {
     fn no_rule_matched() {
         let cfg = ModelRouterConfig {
             enabled: true,
+            cooldown: None,
             routes: vec![ModelRoute {
                 to_model: "mini".into(),
                 max_input_tokens: Some(10),
@@ -642,6 +791,7 @@ mod tests {
     fn empty_model_short_circuits() {
         let cfg = ModelRouterConfig {
             enabled: true,
+            cooldown: None,
             routes: vec![route("mini")],
         };
         let d = ModelRouter::new(Some(cfg)).select("", 1, false);
@@ -653,6 +803,7 @@ mod tests {
     fn self_route_matches_but_is_not_a_change() {
         let cfg = ModelRouterConfig {
             enabled: true,
+            cooldown: None,
             routes: vec![route("gpt-5.4"), route("mini")],
         };
         let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 1, false);
@@ -889,6 +1040,20 @@ mod tests {
 /// The caller is responsible for skipping this under bypass/passthrough, so a
 /// byte-faithful request is never model-rewritten.
 pub fn apply_to_anthropic_body(body: Bytes, router: &ModelRouter, request_id: &str) -> Bytes {
+    apply_to_anthropic_body_with_cooldowns(body, router, request_id, None)
+}
+
+/// As [`apply_to_anthropic_body`], skipping rules whose target model is in
+/// cooldown after a recent fallback.
+///
+/// Passing `None` for `cooldowns` is the pre-cooldown behaviour: every rule is
+/// eligible on every turn.
+pub fn apply_to_anthropic_body_with_cooldowns(
+    body: Bytes,
+    router: &ModelRouter,
+    request_id: &str,
+    cooldowns: Option<&ModelCooldowns>,
+) -> Bytes {
     if !router.enabled() {
         return body;
     }
@@ -914,7 +1079,24 @@ pub fn apply_to_anthropic_body(body: Bytes, router: &ModelRouter, request_id: &s
         })
         .unwrap_or(false);
 
-    let decision = router.select(model, input_tokens, has_tools);
+    let decision = router.select_skipping(model, input_tokens, has_tools, &mut |to_model| {
+        let Some(cooldowns) = cooldowns else {
+            return false;
+        };
+        let Some(notice) = cooldowns.note_skip(to_model) else {
+            return false;
+        };
+        if notice.log {
+            tracing::info!(
+                event = "model_route_cooldown_skip",
+                request_id = %request_id,
+                to_model = %to_model,
+                remaining_secs = notice.remaining.as_secs(),
+                "skipping a route whose target is in cooldown after a fallback"
+            );
+        }
+        true
+    });
     tracing::info!(
         request_id = %request_id,
         reason = %decision.reason,
@@ -1020,6 +1202,37 @@ mod body_routing_tests {
         }
     }
 
+    /// The size bound an operator sets to keep big-context turns off a cheap
+    /// or free tier. The estimate counts `messages`, `tools` and `system` at
+    /// roughly four characters per token, so a long system prompt alone can
+    /// put a turn over the line.
+    #[test]
+    fn a_turn_over_the_size_bound_stays_on_the_clients_model() {
+        let r = router(r#"[{"name":"small","max_input_tokens":100,"to_model":"gpt-5.6-luna"}]"#);
+
+        let small = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            model_of(&apply_to_anthropic_body(small, &r, "req")),
+            "gpt-5.6-luna"
+        );
+
+        let big = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "x".repeat(4_000)}],
+            }))
+            .unwrap(),
+        );
+        let out = apply_to_anthropic_body(big.clone(), &r, "req");
+        assert_eq!(out, big, "an over-budget turn must forward untouched");
+    }
+
     /// A rule routing a model to itself is not a change, so the body should be
     /// returned byte-identical rather than re-serialised.
     #[test]
@@ -1028,5 +1241,138 @@ mod body_routing_tests {
         let original = body_with("claude-opus-5", Value::Null);
         let out = apply_to_anthropic_body(original.clone(), &r, "req");
         assert_eq!(out, original);
+    }
+}
+
+#[cfg(test)]
+mod cooldown_tests {
+    use super::*;
+
+    fn router(routes_json: &str) -> ModelRouter {
+        ModelRouter::new(Some(ModelRouterConfig::from_env(
+            Some("1"),
+            Some(routes_json),
+        )))
+    }
+
+    fn body_with(model: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn model_of(body: &Bytes) -> String {
+        let v: Value = serde_json::from_slice(body).expect("valid json");
+        v["model"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn a_vetoed_rule_is_passed_over_for_the_next_one() {
+        let r = router(r#"[{"to_model":"down"},{"to_model":"up"}]"#);
+        let d = r.select_skipping("claude-opus-5", 10, false, &mut |to| to == "down");
+        assert_eq!(d.routed_model, "up");
+        assert!(d.changed());
+    }
+
+    /// Vetoing every rule is not a match, so the client's model stands. The
+    /// veto must not fabricate a route.
+    #[test]
+    fn vetoing_every_rule_leaves_the_original_model() {
+        let r = router(r#"[{"to_model":"down"}]"#);
+        let d = r.select_skipping("claude-opus-5", 10, false, &mut |_| true);
+        assert!(!d.matched);
+        assert_eq!(d.routed_model, "claude-opus-5");
+    }
+
+    /// A rule routing a model to itself sends the request where it was already
+    /// going, so there is nothing to skip and no reason to consult the veto.
+    #[test]
+    fn a_self_route_is_never_vetoed() {
+        let r = router(r#"[{"to_model":"claude-opus-5"}]"#);
+        let mut asked = Vec::new();
+        let d = r.select_skipping("claude-opus-5", 10, false, &mut |to| {
+            asked.push(to.to_string());
+            true
+        });
+        assert!(d.matched);
+        assert!(asked.is_empty(), "asked about {asked:?}");
+    }
+
+    #[test]
+    fn a_cooling_model_is_skipped_until_the_window_expires() {
+        let cooldowns = ModelCooldowns::default();
+        assert!(
+            cooldowns.note_skip("spark").is_none(),
+            "nothing recorded yet"
+        );
+
+        assert!(cooldowns.start("spark", Duration::from_millis(50)));
+        assert!(cooldowns.remaining("spark").is_some());
+        let notice = cooldowns.note_skip("spark").expect("still cooling");
+        assert!(
+            notice.log,
+            "the first skip of a window is the one worth logging"
+        );
+        assert!(
+            !cooldowns.note_skip("spark").expect("still cooling").log,
+            "a second skip inside the interval must not log again"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cooldowns.remaining("spark").is_none());
+        assert!(cooldowns.note_skip("spark").is_none(), "eligible again");
+    }
+
+    /// `0` is how an operator turns the mechanism off: nothing is recorded, so
+    /// every turn re-probes the routed upstream as it did before cooldowns.
+    #[test]
+    fn a_zero_window_records_nothing() {
+        let cooldowns = ModelCooldowns::default();
+        assert!(!cooldowns.start("spark", Duration::ZERO));
+        assert!(cooldowns.remaining("spark").is_none());
+    }
+
+    #[test]
+    fn a_cooling_target_leaves_the_body_on_the_clients_model() {
+        let r = router(r#"[{"name":"small","to_model":"claude-muse-spark-1.3"}]"#);
+        let cooldowns = ModelCooldowns::default();
+        let original = body_with("claude-opus-5");
+
+        let out =
+            apply_to_anthropic_body_with_cooldowns(original.clone(), &r, "req", Some(&cooldowns));
+        assert_eq!(model_of(&out), "claude-muse-spark-1.3");
+
+        cooldowns.start("claude-muse-spark-1.3", Duration::from_secs(300));
+        let out =
+            apply_to_anthropic_body_with_cooldowns(original.clone(), &r, "req", Some(&cooldowns));
+        assert_eq!(
+            out, original,
+            "a cooling target must leave the bytes byte-identical"
+        );
+    }
+
+    #[test]
+    fn the_cooldown_window_comes_from_the_env_with_a_default() {
+        let cfg = ModelRouterConfig::default();
+        assert_eq!(cfg.cooldown(), Duration::from_secs(DEFAULT_COOLDOWN_SECS));
+        assert_eq!(
+            cfg.clone().with_cooldown_from_env(Some("30")).cooldown(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            cfg.clone().with_cooldown_from_env(Some("0")).cooldown(),
+            Duration::ZERO
+        );
+        for raw in [None, Some(""), Some("  "), Some("later")] {
+            assert_eq!(
+                cfg.clone().with_cooldown_from_env(raw).cooldown(),
+                Duration::from_secs(DEFAULT_COOLDOWN_SECS),
+                "{raw:?}"
+            );
+        }
     }
 }

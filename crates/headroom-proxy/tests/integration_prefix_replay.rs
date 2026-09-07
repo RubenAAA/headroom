@@ -305,7 +305,10 @@ async fn a_rebuild_boundary_drops_the_stored_prefix() {
             break;
         }
     }
-    assert!(replayed, "precondition: turn 2 must replay the stored prefix");
+    assert!(
+        replayed,
+        "precondition: turn 2 must replay the stored prefix"
+    );
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // ── turn 3: same history, different system prompt → hot-zone drift ──

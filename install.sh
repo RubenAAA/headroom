@@ -172,9 +172,17 @@ if [ "$LINK" = 1 ]; then
 else
     install -m 755 "$CONTRIB/statusline-usage-dump.sh" "$CLAUDE_DIR/statusline-usage-dump.sh"
 fi
-sed "s|\${HEADROOM_REPO:-\$HOME/headroom}|$REPO_DIR|g" \
-    "$CONTRIB/statusline-with-cache.sh" > "$CLAUDE_DIR/statusline-with-cache.sh"
-chmod 755 "$CLAUDE_DIR/statusline-with-cache.sh"
+# The wrapper finds its helper scripts (cache health, codex limits, cache
+# perf) next to itself in contrib/, so the checkout has to stay where it is.
+if [ "$LINK" = 1 ]; then
+    [ -e "$CLAUDE_DIR/statusline-with-cache.sh" ] && [ ! -L "$CLAUDE_DIR/statusline-with-cache.sh" ] \
+        && mv "$CLAUDE_DIR/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh.bak"
+    ln -sfn "$CONTRIB/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh"
+else
+    sed "s|\${HEADROOM_REPO:-\$HOME/headroom}|$REPO_DIR|g" \
+        "$CONTRIB/statusline-with-cache.sh" > "$CLAUDE_DIR/statusline-with-cache.sh"
+    chmod 755 "$CLAUDE_DIR/statusline-with-cache.sh"
+fi
 
 if command -v node >/dev/null 2>&1; then
     [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.bak"
@@ -190,6 +198,45 @@ fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n");
 else
     say "node not found — set statusLine.command in $SETTINGS by hand:"
     say "  $CLAUDE_DIR/statusline-with-cache.sh"
+fi
+
+# ── Claude Code agents ────────────────────────────────────────────────────
+# One subagent definition per routed model (codex-*, grok-*, spark*), so
+# `Agent(subagent_type: "codex-sol")` works out of the box. A file the user
+# already has under the same name is left alone.
+step "Agents"
+mkdir -p "$CLAUDE_DIR/agents"
+for src in "$CONTRIB"/claude/agents/*.md; do
+    dst="$CLAUDE_DIR/agents/$(basename "$src")"
+    if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+        continue
+    elif [ -e "$dst" ]; then
+        say "$dst exists — left alone"
+    elif [ "$LINK" = 1 ]; then
+        ln -sfn "$src" "$dst"
+    else
+        install -m 644 "$src" "$dst"
+    fi
+done
+say "agents in $CLAUDE_DIR/agents: $(ls "$CONTRIB"/claude/agents/*.md | xargs -n1 basename | sed 's/\.md$//' | tr '\n' ' ')"
+
+# ── CLAUDE.md ─────────────────────────────────────────────────────────────
+# The proxy injects memory tools and headroom_retrieve; this excerpt tells
+# the model how to use them. Spliced between markers so a re-run replaces it.
+step "CLAUDE.md"
+CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
+BEGIN_MARK="<!-- headroom:begin -->"
+END_MARK="<!-- headroom:end -->"
+touch "$CLAUDE_MD"
+if grep -qF "$BEGIN_MARK" "$CLAUDE_MD"; then
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" -v f="$CONTRIB/claude/CLAUDE.headroom.md" '
+        index($0,b)==1 { print; while ((getline l < f) > 0) print l; skip=1; next }
+        index($0,e)==1 { skip=0 }
+        !skip' "$CLAUDE_MD" > "$CLAUDE_MD.tmp" && mv "$CLAUDE_MD.tmp" "$CLAUDE_MD"
+    say "refreshed the headroom section in $CLAUDE_MD"
+else
+    { printf '\n%s\n' "$BEGIN_MARK"; cat "$CONTRIB/claude/CLAUDE.headroom.md"; printf '%s\n' "$END_MARK"; } >> "$CLAUDE_MD"
+    say "appended the headroom section to $CLAUDE_MD"
 fi
 
 # ── done ──────────────────────────────────────────────────────────────────

@@ -171,7 +171,10 @@ mod tests {
             keys.sort();
             (kind, keys)
         };
-        assert_eq!(field_of(text_delta(0, "a")), ("text_delta".into(), vec!["text".to_string()]));
+        assert_eq!(
+            field_of(text_delta(0, "a")),
+            ("text_delta".into(), vec!["text".to_string()])
+        );
         assert_eq!(
             field_of(thinking_delta(0, "a")),
             ("thinking_delta".into(), vec!["thinking".to_string()])

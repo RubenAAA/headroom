@@ -14,8 +14,26 @@
 //! upstream provider pricing pages. A refresh mechanism is a documented
 //! follow-up (see the port plan). Costs are per **token** (per-1M / 1e6).
 
+/// Context size at which the major catalogs publish a second, higher price
+/// tier (LiteLLM spells it `*_above_200k_tokens`). A request's billed prompt is
+/// compared against this to pick which rate applies. Port of
+/// `cost.py::_LONG_CONTEXT_THRESHOLD_TOKENS`.
+pub const LONG_CONTEXT_THRESHOLD_TOKENS: i64 = 200_000;
+
+/// True when a billed prompt of `billed_prompt_tokens` falls in the
+/// above-200k tier. Strictly greater, matching Python.
+pub fn is_long_context(billed_prompt_tokens: i64) -> bool {
+    billed_prompt_tokens > LONG_CONTEXT_THRESHOLD_TOKENS
+}
+
 /// Per-token pricing for one model. `None` cache fields mean the family has no
 /// published cache pricing (or we do not vendor it).
+///
+/// The `*_above_200k` fields are the catalog's long-context tier: on the models
+/// that publish one, a prompt past [`LONG_CONTEXT_THRESHOLD_TOKENS`] re-prices
+/// the *whole* request — input, output and cache alike — not just the tokens
+/// past the threshold. `None` means the family is flat-rated across its window,
+/// and the accessors below fall back per rate to the base one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPricing {
     pub input_cost_per_token: f64,
@@ -26,6 +44,54 @@ pub struct ModelPricing {
     /// Cache write billed at the 1-hour TTL (Anthropic: 2.0x input). `None`
     /// where the family publishes no 1h rate; callers fall back to the 5m rate.
     pub cache_write_1h_cost_per_token: Option<f64>,
+    pub input_cost_per_token_above_200k: Option<f64>,
+    pub output_cost_per_token_above_200k: Option<f64>,
+    pub cache_read_cost_per_token_above_200k: Option<f64>,
+    pub cache_write_cost_per_token_above_200k: Option<f64>,
+}
+
+impl ModelPricing {
+    /// Input rate for the given context tier, falling back to the base rate for
+    /// a model with no published tier (Python's `info.get(above) or base`).
+    pub fn input_rate(&self, long_context: bool) -> f64 {
+        if long_context {
+            self.input_cost_per_token_above_200k
+                .unwrap_or(self.input_cost_per_token)
+        } else {
+            self.input_cost_per_token
+        }
+    }
+
+    /// Completion rate for the given context tier.
+    pub fn output_rate(&self, long_context: bool) -> f64 {
+        if long_context {
+            self.output_cost_per_token_above_200k
+                .unwrap_or(self.output_cost_per_token)
+        } else {
+            self.output_cost_per_token
+        }
+    }
+
+    /// Cache-read rate for the given context tier, or `None` when the family
+    /// publishes no cache-read price at all.
+    pub fn cache_read_rate(&self, long_context: bool) -> Option<f64> {
+        if long_context {
+            self.cache_read_cost_per_token_above_200k
+                .or(self.cache_read_cost_per_token)
+        } else {
+            self.cache_read_cost_per_token
+        }
+    }
+
+    /// Cache-write (5m TTL) rate for the given context tier.
+    pub fn cache_write_rate(&self, long_context: bool) -> Option<f64> {
+        if long_context {
+            self.cache_write_cost_per_token_above_200k
+                .or(self.cache_write_cost_per_token)
+        } else {
+            self.cache_write_cost_per_token
+        }
+    }
 }
 
 /// Build a `ModelPricing` from USD-per-1M figures (the unit the provider
@@ -49,6 +115,10 @@ const fn per_1m(
             None => None,
         },
         cache_write_1h_cost_per_token: None,
+        input_cost_per_token_above_200k: None,
+        output_cost_per_token_above_200k: None,
+        cache_read_cost_per_token_above_200k: None,
+        cache_write_cost_per_token_above_200k: None,
     }
 }
 
@@ -71,6 +141,42 @@ const fn per_1m_ttl(
         cache_read_cost_per_token: Some(cache_read / M),
         cache_write_cost_per_token: Some(cache_write_5m / M),
         cache_write_1h_cost_per_token: Some(cache_write_1h / M),
+        input_cost_per_token_above_200k: None,
+        output_cost_per_token_above_200k: None,
+        cache_read_cost_per_token_above_200k: None,
+        cache_write_cost_per_token_above_200k: None,
+    }
+}
+
+/// Build a `ModelPricing` for a family that also publishes an above-200k tier.
+///
+/// Only the Sonnet 4 / 4.5 family is tiered: Opus, and Sonnet 4.6 onward, are
+/// flat-rated across their whole window. Numbers come from LiteLLM's
+/// `*_above_200k_tokens` fields ($3 -> $6 in, $15 -> $22.50 out, $0.30 -> $0.60
+/// cache read, and a 5m write at 1.25x the tier's input rate).
+#[allow(clippy::too_many_arguments)]
+const fn per_1m_ttl_long(
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write_5m: f64,
+    cache_write_1h: f64,
+    input_long: f64,
+    output_long: f64,
+    cache_read_long: f64,
+    cache_write_5m_long: f64,
+) -> ModelPricing {
+    const M: f64 = 1_000_000.0;
+    ModelPricing {
+        input_cost_per_token: input / M,
+        output_cost_per_token: output / M,
+        cache_read_cost_per_token: Some(cache_read / M),
+        cache_write_cost_per_token: Some(cache_write_5m / M),
+        cache_write_1h_cost_per_token: Some(cache_write_1h / M),
+        input_cost_per_token_above_200k: Some(input_long / M),
+        output_cost_per_token_above_200k: Some(output_long / M),
+        cache_read_cost_per_token_above_200k: Some(cache_read_long / M),
+        cache_write_cost_per_token_above_200k: Some(cache_write_5m_long / M),
     }
 }
 
@@ -97,7 +203,20 @@ static TABLE: &[(&str, ModelPricing)] = &[
     // Same rates the `claude-` fallback already resolved to, made explicit so a
     // Sonnet-5 turn is priced by a table entry rather than by a default.
     ("claude-sonnet-5", per_1m_ttl(2.0, 10.0, 0.2, 2.5, 4.0)),
-    ("claude-sonnet-4", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    // Sonnet 4.6 is flat-rated across its whole window, so it needs its own
+    // entry: without one the `claude-sonnet-4` prefix below would hand it the
+    // Sonnet-4.5 long-context tier.
+    ("claude-sonnet-4-6", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    // Sonnet 4 / 4.5 are the only tiered family: past 200k the whole request
+    // re-prices at 2x input, 1.5x output, 2x cache read.
+    (
+        "claude-sonnet-4",
+        per_1m_ttl_long(3.0, 15.0, 0.3, 3.75, 6.0, 6.0, 22.5, 0.6, 7.5),
+    ),
+    (
+        "claude-4-sonnet",
+        per_1m_ttl_long(3.0, 15.0, 0.3, 3.75, 6.0, 6.0, 22.5, 0.6, 7.5),
+    ),
     ("claude-3-7-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
     ("claude-3-5-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
     ("claude-3-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
@@ -195,14 +314,17 @@ pub fn estimate_cost_usd(
     let cr = cache_read_tokens.max(0) as f64;
     let cw = cache_write_tokens.max(0) as f64;
 
+    // The billed prompt (uncached + cache read + cache write) picks the price
+    // tier, as it does in `CostTracker::record_tokens`.
+    let long =
+        is_long_context(input_tokens.max(0) + cache_read_tokens.max(0) + cache_write_tokens.max(0));
+
     match lookup(model) {
         Some(p) => {
-            let cache_read_rate = p.cache_read_cost_per_token.unwrap_or(fallback_rate);
-            let cache_write_rate = p
-                .cache_write_cost_per_token
-                .unwrap_or(p.input_cost_per_token);
-            inp * p.input_cost_per_token
-                + out * p.output_cost_per_token
+            let cache_read_rate = p.cache_read_rate(long).unwrap_or(fallback_rate);
+            let cache_write_rate = p.cache_write_rate(long).unwrap_or(p.input_rate(long));
+            inp * p.input_rate(long)
+                + out * p.output_rate(long)
                 + cr * cache_read_rate
                 + cw * cache_write_rate
         }
@@ -304,19 +426,93 @@ mod tests {
 
     #[test]
     fn estimate_uses_vendored_pricing() {
-        // 1M input + 1M output on sonnet-class → $3 + $15.
+        // 1M input + 1M output on sonnet-class. A 1M prompt is past the 200k
+        // threshold, so the whole request bills at the tier: $6 + $22.50.
         let cost = estimate_cost_usd("claude-sonnet-4", 1_000_000, 1_000_000, 0, 0, 1e-6);
-        assert!((cost - 18.0).abs() < 1e-9);
+        assert!((cost - 28.5).abs() < 1e-9);
+        // Under the threshold the same call bills at $3 + $15.
+        let cost = estimate_cost_usd("claude-sonnet-4", 100_000, 100_000, 0, 0, 1e-6);
+        assert!((cost - 1.8).abs() < 1e-9);
     }
 
     #[test]
     fn estimate_cache_tokens() {
-        // 1M cache-read tokens at sonnet cache-read rate ($0.30/M).
+        // 100k cache-read tokens at the sonnet cache-read rate ($0.30/M).
+        let cost = estimate_cost_usd("claude-sonnet-4", 0, 0, 100_000, 0, 1e-6);
+        assert!((cost - 0.03).abs() < 1e-9);
+        // 100k cache-write tokens at the sonnet cache-write rate ($3.75/M).
+        let cost = estimate_cost_usd("claude-sonnet-4", 0, 0, 0, 100_000, 1e-6);
+        assert!((cost - 0.375).abs() < 1e-9);
+        // Past 200k both rates double to their above-200k tier.
         let cost = estimate_cost_usd("claude-sonnet-4", 0, 0, 1_000_000, 0, 1e-6);
-        assert!((cost - 0.30).abs() < 1e-9);
-        // 1M cache-write tokens at sonnet cache-write rate ($3.75/M).
+        assert!((cost - 0.60).abs() < 1e-9);
         let cost = estimate_cost_usd("claude-sonnet-4", 0, 0, 0, 1_000_000, 1e-6);
-        assert!((cost - 3.75).abs() < 1e-9);
+        assert!((cost - 7.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sonnet_4_family_publishes_the_above_200k_tier() {
+        for id in [
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-20250514",
+            "claude-4-sonnet-20250514",
+        ] {
+            let p = lookup(id).unwrap();
+            assert!((p.input_rate(true) - 6.0 / 1e6).abs() < 1e-18, "{id} input");
+            assert!(
+                (p.output_rate(true) - 22.5 / 1e6).abs() < 1e-18,
+                "{id} output"
+            );
+            assert!((p.cache_read_rate(true).unwrap() - 0.6 / 1e6).abs() < 1e-18);
+            assert!((p.cache_write_rate(true).unwrap() - 7.5 / 1e6).abs() < 1e-18);
+            // Base tier untouched.
+            assert!((p.input_rate(false) - 3.0 / 1e6).abs() < 1e-18);
+            assert!((p.output_rate(false) - 15.0 / 1e6).abs() < 1e-18);
+        }
+    }
+
+    /// Only Sonnet 4 / 4.5 are tiered. Sonnet 4.6 onward and every Opus are
+    /// flat-rated, so their long-context rates must equal their base ones.
+    #[test]
+    fn flat_rated_models_have_no_tier() {
+        for id in [
+            "claude-sonnet-4-6-20260210",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5",
+            "gpt-5",
+            "gemini-2.5-pro",
+        ] {
+            let p = lookup(id).unwrap();
+            assert!(p.input_cost_per_token_above_200k.is_none(), "{id}");
+            assert_eq!(p.input_rate(true), p.input_cost_per_token, "{id}");
+            assert_eq!(p.output_rate(true), p.output_cost_per_token, "{id}");
+            assert_eq!(p.cache_read_rate(true), p.cache_read_cost_per_token, "{id}");
+        }
+        // Sonnet 4.6 keeps the Sonnet base rates, it is not a different price.
+        let p = lookup("claude-sonnet-4-6").unwrap();
+        assert!((p.input_cost_per_token - 3.0 / 1e6).abs() < 1e-18);
+        assert!((p.output_cost_per_token - 15.0 / 1e6).abs() < 1e-18);
+    }
+
+    #[test]
+    fn threshold_is_strictly_above_200k() {
+        assert!(!is_long_context(200_000));
+        assert!(is_long_context(200_001));
+        assert!(!is_long_context(0));
+    }
+
+    #[test]
+    fn estimate_prices_a_long_prompt_at_the_tier() {
+        // 300k uncached input on a tiered model: $6/M, not $3/M.
+        let cost = estimate_cost_usd("claude-sonnet-4-5", 300_000, 0, 0, 0, 1e-6);
+        assert!((cost - 300_000.0 * 6.0 / 1e6).abs() < 1e-12);
+        // The same prompt on a flat-rated model is unchanged.
+        let flat = estimate_cost_usd("claude-opus-5", 300_000, 0, 0, 0, 1e-6);
+        assert!((flat - 300_000.0 * 5.0 / 1e6).abs() < 1e-12);
+        // Under the threshold the tiered model keeps its base rate.
+        let base = estimate_cost_usd("claude-sonnet-4-5", 100_000, 0, 0, 0, 1e-6);
+        assert!((base - 100_000.0 * 3.0 / 1e6).abs() < 1e-12);
     }
 
     #[test]

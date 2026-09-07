@@ -526,22 +526,48 @@ fn first_frame_timeout() -> Duration {
 /// fallback streams SSE, so `read` is the gap *between* events, not a cap
 /// on the whole response — 120s of silence from a live Codex turn means the
 /// upstream is gone, not thinking. Deliberately tighter than the generic
-/// upstream timeout and not wired to it.
+/// upstream timeout and not wired to it. Enforced by `with_idle_gap` on the
+/// response body and as a bound on everything before it (connect, send,
+/// response headers); the body's only wall-clock cap is the shared client's
+/// `upstream_timeout`, as on every other streaming path.
 pub(crate) const WS_HTTP_FALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Per-request timeout for the WS→HTTP fallback POST.
+/// Failure of a stream bounded by a per-chunk idle gap.
+#[derive(Debug)]
+pub(crate) enum GapError<E> {
+    /// Nothing arrived within the gap.
+    Idle,
+    /// The underlying stream failed.
+    Inner(E),
+}
+
+/// Bound the silence *between* items of `stream` by `gap`.
 ///
-/// Port of Python `_ws_http_fallback_timeout`: connect/pool come from the
-/// shared client's `upstream_connect_timeout` and need no per-request
-/// setting, while the send honors `upstream_write_timeout`. reqwest
-/// per-request timeouts are total bounds (not per-phase like httpx), so the
-/// request carries the tighter of the write bound and the 120s read bound:
-/// a tightened write knob fails a dead pooled connection fast instead of
-/// stalling behind the flat 120s, and a raised one keeps the read bound.
-pub(crate) fn ws_http_fallback_timeout(config: &crate::config::Config) -> Duration {
-    config
-        .upstream_write_timeout
-        .min(WS_HTTP_FALLBACK_READ_TIMEOUT)
+/// This is the piece httpx gives for free: its `read` timeout is armed per
+/// read and reset by every byte, so a turn that keeps producing runs as long
+/// as it likes. reqwest's per-request `timeout` is a total deadline covering
+/// the response body, so handing it the 120s read bound killed any Codex turn
+/// that streamed steadily past two minutes. The gap is enforced here instead,
+/// once per `next()`.
+///
+/// The stream ends on the first idle gap or inner error; the item carrying it
+/// is yielded first so the caller can log which one happened.
+pub(crate) fn with_idle_gap<S, T, E>(
+    stream: S,
+    gap: Duration,
+) -> impl futures_util::Stream<Item = Result<T, GapError<E>>>
+where
+    S: futures_util::Stream<Item = Result<T, E>> + Unpin,
+{
+    futures_util::stream::unfold(Some(stream), move |state| async move {
+        let mut inner = state?;
+        match tokio::time::timeout(gap, inner.next()).await {
+            Ok(Some(Ok(item))) => Some((Ok(item), Some(inner))),
+            Ok(Some(Err(err))) => Some((Err(GapError::Inner(err)), None)),
+            Ok(None) => None,
+            Err(_) => Some((Err(GapError::Idle), None)),
+        }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1916,26 +1942,42 @@ async fn ws_http_fallback(
     let attempts = ctx.state.config.retry_max_attempts.max(1);
     let mut response = None;
     for attempt in 0..attempts {
-        match ctx
-            .state
-            .client
-            .post(&http_url)
-            .headers(headers.clone())
-            .body(body_bytes.clone())
-            .timeout(ws_http_fallback_timeout(&ctx.state.config))
-            .send()
-            .await
-        {
-            Ok(resp) => {
+        // Bounds connect + send + response headers, the phases httpx covers
+        // with connect/write/read. The response body is deliberately outside
+        // it: a per-request reqwest timeout would cap the whole turn.
+        let attempt_result = tokio::time::timeout(
+            WS_HTTP_FALLBACK_READ_TIMEOUT,
+            ctx.state
+                .client
+                .post(&http_url)
+                .headers(headers.clone())
+                .body(body_bytes.clone())
+                .send(),
+        )
+        .await;
+        match attempt_result {
+            Ok(Ok(resp)) => {
                 response = Some(resp);
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     request_id = %ctx.request_id,
                     attempt = attempt + 1,
                     error = %e,
                     "ws http fallback request failed"
+                );
+                if attempt + 1 < attempts {
+                    let delay = crate::proxy::backoff_ms(&ctx.state, attempt);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    attempt = attempt + 1,
+                    timeout_s = WS_HTTP_FALLBACK_READ_TIMEOUT.as_secs(),
+                    "ws http fallback request timed out before response headers"
                 );
                 if attempt + 1 < attempts {
                     let delay = crate::proxy::backoff_ms(&ctx.state, attempt);
@@ -1975,11 +2017,25 @@ async fn ws_http_fallback(
         return;
     }
 
-    // Relay SSE `data:` lines as WS text frames.
-    let mut stream = response.bytes_stream();
+    // Relay SSE `data:` lines as WS text frames. The 120s bound is a gap
+    // between chunks, not a cap on the turn.
+    let mut stream = Box::pin(with_idle_gap(
+        Box::pin(response.bytes_stream()),
+        WS_HTTP_FALLBACK_READ_TIMEOUT,
+    ));
     let mut buffer = String::new();
     while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else { break };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    error = ?e,
+                    "ws http fallback stream ended early"
+                );
+                break;
+            }
+        };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(idx) = buffer.find('\n') {
             let line: String = buffer.drain(..=idx).collect();
@@ -2041,34 +2097,65 @@ mod tests {
         assert!(!is_codex_responses_path("/ws"));
     }
 
-    // ── WS→HTTP fallback timeout ───────────────────────────────
+    // ── WS→HTTP fallback read bound ─────────────────────────────
 
-    fn config_with_write_timeout(secs: u64) -> crate::config::Config {
-        let mut cfg = crate::config::Config::for_test("http://127.0.0.1:9".parse().unwrap());
-        cfg.upstream_write_timeout = Duration::from_secs(secs);
-        cfg
+    /// `count` items, each arriving `gap` after the previous one.
+    fn spaced_items(
+        count: usize,
+        gap: Duration,
+    ) -> impl futures_util::Stream<Item = Result<usize, &'static str>> {
+        futures_util::stream::unfold(0usize, move |i| async move {
+            if i >= count {
+                return None;
+            }
+            tokio::time::sleep(gap).await;
+            Some((Ok(i), i + 1))
+        })
     }
 
-    #[test]
-    fn ws_fallback_keeps_120s_read_bound_by_default() {
-        // Default write is 150s (Python parity); the request still
-        // carries the 120s read bound, matching the old flat timeout.
-        let cfg = config_with_write_timeout(150);
-        assert_eq!(ws_http_fallback_timeout(&cfg), Duration::from_secs(120));
+    #[tokio::test(start_paused = true)]
+    async fn idle_gap_lets_a_steady_stream_outlive_the_bound() {
+        // 30 chunks, 10s apart: five minutes of wall clock, no gap
+        // anywhere near the 120s bound. This is the Codex turn the
+        // old total timeout cut off at two minutes.
+        let started = tokio::time::Instant::now();
+        let stream = Box::pin(with_idle_gap(
+            Box::pin(spaced_items(30, Duration::from_secs(10))),
+            WS_HTTP_FALLBACK_READ_TIMEOUT,
+        ));
+        let items: Vec<_> = stream.collect().await;
+
+        assert_eq!(items.len(), 30);
+        assert!(items.iter().all(|item| item.is_ok()), "{items:?}");
+        assert!(started.elapsed() >= Duration::from_secs(300));
     }
 
-    #[test]
-    fn ws_fallback_honors_tightened_write_timeout() {
-        // Deliberately odd value so a wiring regression can't hide
-        // behind the defaults (cf. Python's connect=7/write=33 fixture).
-        let cfg = config_with_write_timeout(33);
-        assert_eq!(ws_http_fallback_timeout(&cfg), Duration::from_secs(33));
+    #[tokio::test(start_paused = true)]
+    async fn idle_gap_errors_on_a_single_long_silence() {
+        let stream = Box::pin(with_idle_gap(
+            Box::pin(spaced_items(1, Duration::from_secs(200))),
+            WS_HTTP_FALLBACK_READ_TIMEOUT,
+        ));
+        let items: Vec<_> = stream.collect().await;
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Err(GapError::Idle)), "{items:?}");
     }
 
-    #[test]
-    fn ws_fallback_raised_write_keeps_read_bound() {
-        let cfg = config_with_write_timeout(300);
-        assert_eq!(ws_http_fallback_timeout(&cfg), Duration::from_secs(120));
+    #[tokio::test(start_paused = true)]
+    async fn idle_gap_surfaces_an_inner_error() {
+        let inner = futures_util::stream::iter(vec![Ok(1usize), Err("boom")]);
+        let stream = Box::pin(with_idle_gap(
+            Box::pin(inner),
+            WS_HTTP_FALLBACK_READ_TIMEOUT,
+        ));
+        let items: Vec<_> = stream.collect().await;
+
+        assert_eq!(items.len(), 2);
+        assert!(
+            matches!(items[1], Err(GapError::Inner("boom"))),
+            "{items:?}"
+        );
     }
 
     // ── origin policy ────────────────────────────────────────────

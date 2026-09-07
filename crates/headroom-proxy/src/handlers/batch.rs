@@ -841,5 +841,4 @@ mod tests {
         assert!(lines.is_empty());
         assert_eq!(stats, BatchJsonlStats::default());
     }
-
 }

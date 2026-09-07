@@ -341,8 +341,7 @@ async fn live_store_recall() {
         return;
     };
     let handler = handler(&dir, 5);
-    let headroom =
-        partition_for_slug(&home_slug("headroom")).expect("headroom project resolves");
+    let headroom = partition_for_slug(&home_slug("headroom")).expect("headroom project resolves");
 
     let mut hits = 0;
     let mut misses = Vec::new();

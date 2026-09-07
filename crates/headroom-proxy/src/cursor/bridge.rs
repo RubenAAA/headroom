@@ -240,7 +240,10 @@ impl Bridge {
     /// Returns the inbox as well, and only here: a session with no reader would
     /// park calls that nothing can answer, so the caller that takes the inbox
     /// is by construction the one that must drive the turn.
-    pub(crate) async fn open(&self, key: &str) -> (Arc<Session>, mpsc::UnboundedReceiver<ParkedCall>) {
+    pub(crate) async fn open(
+        &self,
+        key: &str,
+    ) -> (Arc<Session>, mpsc::UnboundedReceiver<ParkedCall>) {
         let (session, inbox) = Session::new();
         self.sessions
             .lock()
@@ -452,9 +455,12 @@ mod tests {
     #[tokio::test]
     async fn initialize_echoes_the_clients_protocol_version() {
         let (session, _inbox) = Bridge::new().open("c1").await;
-        let reply = handle_rpc(&session, &rpc("initialize", json!({"protocolVersion": "2025-06-18"})))
-            .await
-            .expect("initialize is answered");
+        let reply = handle_rpc(
+            &session,
+            &rpc("initialize", json!({"protocolVersion": "2025-06-18"})),
+        )
+        .await
+        .expect("initialize is answered");
         assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
         assert!(reply["result"]["capabilities"]["tools"].is_object());
     }
@@ -464,7 +470,11 @@ mod tests {
     #[tokio::test]
     async fn a_notification_is_not_answered() {
         let (session, _inbox) = Bridge::new().open("c1").await;
-        let out = handle_rpc(&session, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+        let out = handle_rpc(
+            &session,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
         assert!(out.is_none());
     }
 
@@ -473,14 +483,21 @@ mod tests {
     #[tokio::test]
     async fn anthropic_tools_are_republished_under_the_mcp_schema_key() {
         let (session, _inbox) = Bridge::new().open("c1").await;
-        session.set_tools(vec![anthropic_tool("Read"), anthropic_tool("Bash")]).await;
+        session
+            .set_tools(vec![anthropic_tool("Read"), anthropic_tool("Bash")])
+            .await;
 
-        let reply = handle_rpc(&session, &rpc("tools/list", json!({}))).await.unwrap();
+        let reply = handle_rpc(&session, &rpc("tools/list", json!({})))
+            .await
+            .unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "Read");
         assert_eq!(tools[0]["inputSchema"]["required"][0], "file_path");
-        assert!(tools[0].get("input_schema").is_none(), "the Anthropic key must not leak");
+        assert!(
+            tools[0].get("input_schema").is_none(),
+            "the Anthropic key must not leak"
+        );
     }
 
     /// Claude Code varies its tool set between turns. A list from last turn
@@ -488,10 +505,14 @@ mod tests {
     #[tokio::test]
     async fn the_tool_list_is_replaced_each_turn_not_appended_to() {
         let (session, _inbox) = Bridge::new().open("c1").await;
-        session.set_tools(vec![anthropic_tool("Read"), anthropic_tool("Bash")]).await;
+        session
+            .set_tools(vec![anthropic_tool("Read"), anthropic_tool("Bash")])
+            .await;
         session.set_tools(vec![anthropic_tool("Read")]).await;
 
-        let reply = handle_rpc(&session, &rpc("tools/list", json!({}))).await.unwrap();
+        let reply = handle_rpc(&session, &rpc("tools/list", json!({})))
+            .await
+            .unwrap();
         assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 1);
     }
 
@@ -505,23 +526,40 @@ mod tests {
         let calling = {
             let session = session.clone();
             tokio::spawn(async move {
-                handle_rpc(&session, &rpc("tools/call", json!({"name": "Read", "arguments": {"file_path": "/tmp/x"}}))).await
+                handle_rpc(
+                    &session,
+                    &rpc(
+                        "tools/call",
+                        json!({"name": "Read", "arguments": {"file_path": "/tmp/x"}}),
+                    ),
+                )
+                .await
             })
         };
 
         let parked = inbox.recv().await.expect("the call reaches the turn loop");
         assert_eq!(parked.name, "Read");
         assert_eq!(parked.args["file_path"], "/tmp/x");
-        assert!(parked.id.starts_with("toolu_"), "the id must be usable as a tool_use id");
+        assert!(
+            parked.id.starts_with("toolu_"),
+            "the id must be usable as a tool_use id"
+        );
 
         assert!(!calling.is_finished(), "the call must still be waiting");
         assert!(session.has_parked_calls().await);
 
-        assert!(session.answer(&parked.id, ToolOutcome::Ok("file contents".into())).await);
+        assert!(
+            session
+                .answer(&parked.id, ToolOutcome::Ok("file contents".into()))
+                .await
+        );
         let reply = calling.await.expect("join").expect("answered");
         assert_eq!(reply["result"]["content"][0]["text"], "file contents");
         assert!(reply["result"].get("isError").is_none());
-        assert!(!session.has_parked_calls().await, "answering clears the park");
+        assert!(
+            !session.has_parked_calls().await,
+            "answering clears the park"
+        );
     }
 
     /// A declined or failed tool has to come back as an MCP error, or the model
@@ -532,11 +570,17 @@ mod tests {
         let calling = {
             let session = session.clone();
             tokio::spawn(async move {
-                handle_rpc(&session, &rpc("tools/call", json!({"name": "Bash", "arguments": {}}))).await
+                handle_rpc(
+                    &session,
+                    &rpc("tools/call", json!({"name": "Bash", "arguments": {}})),
+                )
+                .await
             })
         };
         let parked = inbox.recv().await.unwrap();
-        session.answer(&parked.id, ToolOutcome::Failed("the user declined".into())).await;
+        session
+            .answer(&parked.id, ToolOutcome::Failed("the user declined".into()))
+            .await;
 
         let reply = calling.await.unwrap().unwrap();
         assert_eq!(reply["result"]["isError"], true);
@@ -551,7 +595,11 @@ mod tests {
         let spawn_call = |name: &'static str| {
             let session = session.clone();
             tokio::spawn(async move {
-                handle_rpc(&session, &rpc("tools/call", json!({"name": name, "arguments": {}}))).await
+                handle_rpc(
+                    &session,
+                    &rpc("tools/call", json!({"name": name, "arguments": {}})),
+                )
+                .await
             })
         };
         let first = spawn_call("Read");
@@ -562,11 +610,18 @@ mod tests {
         assert_ne!(a.id, b.id, "ids must be distinct or answers cross");
 
         // Answer the second one first.
-        session.answer(&b.id, ToolOutcome::Ok(format!("answer for {}", b.name))).await;
-        session.answer(&a.id, ToolOutcome::Ok(format!("answer for {}", a.name))).await;
+        session
+            .answer(&b.id, ToolOutcome::Ok(format!("answer for {}", b.name)))
+            .await;
+        session
+            .answer(&a.id, ToolOutcome::Ok(format!("answer for {}", a.name)))
+            .await;
 
         let by_name = |r: Value, name: &str| {
-            assert_eq!(r["result"]["content"][0]["text"], format!("answer for {name}"));
+            assert_eq!(
+                r["result"]["content"][0]["text"],
+                format!("answer for {name}")
+            );
         };
         by_name(first.await.unwrap().unwrap(), "Read");
         by_name(second.await.unwrap().unwrap(), "Bash");
@@ -577,7 +632,11 @@ mod tests {
     #[tokio::test]
     async fn answering_an_unknown_id_is_reported_not_fatal() {
         let (session, _inbox) = Bridge::new().open("c1").await;
-        assert!(!session.answer("toolu_cursor_00000099", ToolOutcome::Ok("x".into())).await);
+        assert!(
+            !session
+                .answer("toolu_cursor_00000099", ToolOutcome::Ok("x".into()))
+                .await
+        );
     }
 
     /// With no turn in flight nothing can ever answer, so the call has to fail
@@ -586,16 +645,21 @@ mod tests {
     async fn a_call_with_no_turn_listening_fails_instead_of_hanging() {
         let (session, inbox) = Bridge::new().open("c1").await;
         drop(inbox);
-        let reply = handle_rpc(&session, &rpc("tools/call", json!({"name": "Read", "arguments": {}})))
-            .await
-            .unwrap();
+        let reply = handle_rpc(
+            &session,
+            &rpc("tools/call", json!({"name": "Read", "arguments": {}})),
+        )
+        .await
+        .unwrap();
         assert_eq!(reply["result"]["isError"], true);
     }
 
     #[tokio::test]
     async fn an_unknown_method_is_a_jsonrpc_error_not_a_panic() {
         let (session, _inbox) = Bridge::new().open("c1").await;
-        let reply = handle_rpc(&session, &rpc("resources/list", json!({}))).await.unwrap();
+        let reply = handle_rpc(&session, &rpc("resources/list", json!({})))
+            .await
+            .unwrap();
         assert_eq!(reply["error"]["code"], -32601);
     }
 
@@ -686,7 +750,10 @@ mod tests {
         assert_eq!(bridge.parked_drivers().await, 1);
 
         // Nothing is due yet.
-        assert_eq!(bridge.reap_idle(std::time::Duration::from_secs(3600)).await, 0);
+        assert_eq!(
+            bridge.reap_idle(std::time::Duration::from_secs(3600)).await,
+            0
+        );
         assert_eq!(bridge.parked_drivers().await, 1);
 
         // Everything is due.
@@ -719,7 +786,10 @@ mod tests {
             "the oldest is the one that goes"
         );
         assert!(
-            bridge.take_driver(&format!("conv-{MAX_PARKED}")).await.is_some(),
+            bridge
+                .take_driver(&format!("conv-{MAX_PARKED}"))
+                .await
+                .is_some(),
             "the newest is the one someone is waiting on"
         );
     }

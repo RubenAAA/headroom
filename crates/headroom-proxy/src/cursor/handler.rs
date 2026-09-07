@@ -430,7 +430,10 @@ fn transcript(parsed: &Value, latest_only: bool) -> String {
         return String::new();
     };
     let slice: &[Value] = if latest_only {
-        messages.last().map(std::slice::from_ref).unwrap_or_default()
+        messages
+            .last()
+            .map(std::slice::from_ref)
+            .unwrap_or_default()
     } else {
         messages
     };
@@ -533,7 +536,10 @@ mod tests {
         });
         let prompt = prompt_for(&body, Some("chat-1")).await;
         assert!(prompt.contains("second question"));
-        assert!(!prompt.contains("first question"), "history is Cursor's job");
+        assert!(
+            !prompt.contains("first question"),
+            "history is Cursor's job"
+        );
         assert!(
             !prompt.contains("HOST INSTRUCTIONS"),
             "the system prompt went with turn one"
@@ -606,23 +612,47 @@ mod non_streaming_tests {
     #[test]
     fn text_and_thinking_deltas_are_concatenated() {
         let frames = vec![
-            frame("message_start", json!({"type": "message_start", "message": {
+            frame(
+                "message_start",
+                json!({"type": "message_start", "message": {
                 "id": "msg_1", "type": "message", "role": "assistant",
-                "model": "cursor-grok-4.6-high", "content": [], "stop_reason": null}})),
-            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""}})),
-            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": "let me "}})),
-            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": "count"}})),
-            frame("content_block_start", json!({"type": "content_block_start", "index": 1,
-                "content_block": {"type": "text", "text": ""}})),
-            frame("content_block_delta", json!({"type": "content_block_delta", "index": 1,
-                "delta": {"type": "text_delta", "text": "39"}})),
-            frame("content_block_delta", json!({"type": "content_block_delta", "index": 1,
-                "delta": {"type": "text_delta", "text": "1"}})),
-            frame("message_delta", json!({"type": "message_delta",
-                "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}})),
+                "model": "cursor-grok-4.6-high", "content": [], "stop_reason": null}}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "let me "}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "count"}}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "39"}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "1"}}),
+            ),
+            frame(
+                "message_delta",
+                json!({"type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}}),
+            ),
             frame("message_stop", json!({"type": "message_stop"})),
         ];
 
@@ -639,16 +669,31 @@ mod non_streaming_tests {
     #[test]
     fn tool_input_is_parsed_from_the_whole_json_not_the_fragments() {
         let frames = vec![
-            frame("message_start", json!({"type": "message_start",
-                "message": {"id": "msg_2", "content": []}})),
-            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
-                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}})),
-            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-                "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}})),
-            frame("content_block_delta", json!({"type": "content_block_delta", "index": 0,
-                "delta": {"type": "input_json_delta", "partial_json": "\"Yerevan\"}"}})),
-            frame("message_delta", json!({"type": "message_delta",
-                "delta": {"stop_reason": "tool_use"}})),
+            frame(
+                "message_start",
+                json!({"type": "message_start",
+                "message": {"id": "msg_2", "content": []}}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "\"Yerevan\"}"}}),
+            ),
+            frame(
+                "message_delta",
+                json!({"type": "message_delta",
+                "delta": {"stop_reason": "tool_use"}}),
+            ),
         ];
 
         let msg = message_from_frames(&frames).expect("a message");
@@ -662,9 +707,15 @@ mod non_streaming_tests {
     #[test]
     fn a_tool_call_with_no_arguments_keeps_its_empty_input() {
         let frames = vec![
-            frame("message_start", json!({"type": "message_start", "message": {"content": []}})),
-            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
-                "content_block": {"type": "tool_use", "id": "t", "name": "now", "input": {}}})),
+            frame(
+                "message_start",
+                json!({"type": "message_start", "message": {"content": []}}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "t", "name": "now", "input": {}}}),
+            ),
         ];
         let msg = message_from_frames(&frames).expect("a message");
         assert_eq!(msg["content"][0]["input"], json!({}));
@@ -683,10 +734,19 @@ mod non_streaming_tests {
     #[test]
     fn an_unknown_event_is_skipped_rather_than_fatal() {
         let frames = vec![
-            frame("message_start", json!({"type": "message_start", "message": {"content": []}})),
-            frame("something_new", json!({"type": "something_new", "index": 0, "wat": true})),
-            frame("content_block_start", json!({"type": "content_block_start", "index": 0,
-                "content_block": {"type": "text", "text": "ok"}})),
+            frame(
+                "message_start",
+                json!({"type": "message_start", "message": {"content": []}}),
+            ),
+            frame(
+                "something_new",
+                json!({"type": "something_new", "index": 0, "wat": true}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": "ok"}}),
+            ),
         ];
         let msg = message_from_frames(&frames).expect("a message");
         assert_eq!(msg["content"][0]["text"], "ok");

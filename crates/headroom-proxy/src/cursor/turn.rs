@@ -123,7 +123,9 @@ impl Conversation {
 /// entire history every turn, and answering an id from ten turns ago would push
 /// a stale result into a call parked now. Only the newest message can hold the
 /// answer to the call this conversation is actually blocked on.
-pub(crate) fn tool_results_in_latest_message(body: &Value) -> Vec<(String, super::bridge::ToolOutcome)> {
+pub(crate) fn tool_results_in_latest_message(
+    body: &Value,
+) -> Vec<(String, super::bridge::ToolOutcome)> {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -179,7 +181,10 @@ mod tests {
         let got = tool_results_in_latest_message(&body);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, "toolu_1");
-        assert_eq!(got[0].1, super::super::bridge::ToolOutcome::Ok("file body".into()));
+        assert_eq!(
+            got[0].1,
+            super::super::bridge::ToolOutcome::Ok("file body".into())
+        );
     }
 
     #[test]
@@ -189,7 +194,10 @@ mod tests {
               "content": [{"type": "text", "text": "line one"}, {"type": "text", "text": "line two"}]}]}
         ]});
         let got = tool_results_in_latest_message(&body);
-        assert_eq!(got[0].1, super::super::bridge::ToolOutcome::Ok("line one\nline two".into()));
+        assert_eq!(
+            got[0].1,
+            super::super::bridge::ToolOutcome::Ok("line one\nline two".into())
+        );
     }
 
     #[test]
@@ -306,7 +314,12 @@ mod tests {
         .await
         .expect("spawn stub");
 
-        let mut convo = Conversation::new(session.clone(), inbox, running, Workspace::create(None).expect("workspace"));
+        let mut convo = Conversation::new(
+            session.clone(),
+            inbox,
+            running,
+            Workspace::create(None).expect("workspace"),
+        );
 
         // The agent talks before it reaches for anything.
         let mut before = String::new();
@@ -354,10 +367,16 @@ mod tests {
         };
         assert!(paused.contains(r#""type":"tool_use""#));
         assert!(paused.contains(r#""name":"Read""#));
-        assert!(paused.contains(r#"/tmp/marker.txt"#), "the arguments came through");
+        assert!(
+            paused.contains(r#"/tmp/marker.txt"#),
+            "the arguments came through"
+        );
         assert!(paused.contains(r#""stop_reason":"tool_use""#));
         assert!(paused.trim_end().ends_with(r#""type":"message_stop"}"#));
-        assert!(session.has_parked_calls().await, "the agent is still waiting");
+        assert!(
+            session.has_parked_calls().await,
+            "the agent is still waiting"
+        );
 
         // Claude Code runs the tool and comes back with the answer.
         let parked_id = paused
@@ -367,12 +386,17 @@ mod tests {
             .map(|n| format!("toolu_{n}"))
             .expect("a tool_use id");
         assert!(
-            session.answer(&parked_id, ToolOutcome::Ok("DISK: CRIMSON-42".into())).await,
+            session
+                .answer(&parked_id, ToolOutcome::Ok("DISK: CRIMSON-42".into()))
+                .await,
             "the id in the tool_use block is the id the bridge parked under"
         );
 
         let mcp_reply = calling.await.expect("join").expect("answered");
-        assert_eq!(mcp_reply["result"]["content"][0]["text"], "DISK: CRIMSON-42");
+        assert_eq!(
+            mcp_reply["result"]["content"][0]["text"],
+            "DISK: CRIMSON-42"
+        );
 
         // The same process picks up where it left off.
         let mut after = String::new();
@@ -385,7 +409,10 @@ mod tests {
         }
         assert!(after.contains("CRIMSON-42"), "got: {after}");
         assert!(after.contains(r#""stop_reason":"end_turn""#));
-        assert!(after.contains(r#""input_tokens":11"#), "usage survived the pause");
+        assert!(
+            after.contains(r#""input_tokens":11"#),
+            "usage survived the pause"
+        );
         assert!(!session.has_parked_calls().await);
 
         convo.shutdown().await;
@@ -414,7 +441,12 @@ mod tests {
         )
         .await
         .expect("spawn");
-        let mut convo = Conversation::new(session, inbox, running, Workspace::create(None).expect("workspace"));
+        let mut convo = Conversation::new(
+            session,
+            inbox,
+            running,
+            Workspace::create(None).expect("workspace"),
+        );
         // Drain the two lines the stub writes before it blocks.
         assert!(matches!(convo.next_step().await, Step::Emit(_)));
         assert!(matches!(convo.next_step().await, Step::Emit(_)));

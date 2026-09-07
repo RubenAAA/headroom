@@ -841,7 +841,10 @@ mod tests {
             .search_memories("TLS corruption", "alice", 5, false)
             .await
             .unwrap();
-        assert!(found(&without, "TLS records"), "the direct match is missing");
+        assert!(
+            found(&without, "TLS records"),
+            "the direct match is missing"
+        );
         assert!(
             !found(&without, "loopback"),
             "expansion must not happen when it was not asked for"

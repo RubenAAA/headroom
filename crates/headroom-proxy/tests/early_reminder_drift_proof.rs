@@ -281,7 +281,10 @@ fn price_the_fix_against_persisted_conversations() {
     println!("  invalidated by a withdrawal, AFTER  : {after}");
     if before > 0 {
         let pct = 100.0 * (before - after) as f64 / before as f64;
-        println!("  removed by the fix                  : {} ({pct:.0}%)\n", before - after);
+        println!(
+            "  removed by the fix                  : {} ({pct:.0}%)\n",
+            before - after
+        );
     }
     assert!(after <= before, "the fix must not create new invalidations");
 }

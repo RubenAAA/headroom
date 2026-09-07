@@ -760,10 +760,22 @@ pub(crate) fn translate_openai_stream_to_anthropic(
                     Some(Ok(bytes::Bytes::from(output)))
                 }
             }
-            Err(e) => Some(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))),
+            Err(e) => {
+                // The client already holds part of this turn, so there is no
+                // fallback to be had: re-dispatching now would splice a second
+                // upstream's events onto a half-finished message. End as the
+                // transport ended, and leave a line saying which turn died
+                // mid-body rather than at the status line.
+                tracing::warn!(
+                    event = "routed_stream_aborted",
+                    error = %e,
+                    "routed upstream stream failed after the client had events"
+                );
+                Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))
+            }
         };
         async { translated }
     })
@@ -799,6 +811,7 @@ mod tests {
             request_id: "req-test".to_string(),
             replay_store: None,
             usage_observer: None,
+            reroute: None,
             session_key: "sess-test".to_string(),
             model: model.to_string(),
             provider: "openai_responses".to_string(),

@@ -139,10 +139,7 @@ pub(crate) struct RunningTurn {
 /// replays a recorded transcript, and so an operator can pin a path when the
 /// CLI is not on the proxy's `PATH` — it runs as a service and will not have
 /// the login shell's.
-pub(crate) async fn spawn(
-    binary: &str,
-    turn: &AgentTurn,
-) -> Result<RunningTurn, std::io::Error> {
+pub(crate) async fn spawn(binary: &str, turn: &AgentTurn) -> Result<RunningTurn, std::io::Error> {
     let mut cmd = Command::new(binary);
     cmd.args(turn.args())
         .current_dir(&turn.workspace)
@@ -202,25 +199,29 @@ impl RunningTurn {
         loop {
             let mut line = String::new();
             let read = match self.deadline {
-                Some(at) => match tokio::time::timeout_at(at, self.reader.read_line(&mut line))
-                    .await
-                {
-                    Ok(read) => read,
-                    Err(_) => {
-                        // The cap the caller asked for. Kill the child rather
-                        // than leaving it to `kill_on_drop`, so the process is
-                        // gone before the salvaged frames reach the client and
-                        // the turn cannot keep writing after it has ended.
-                        tracing::warn!(
-                            event = "cursor_agent_turn_timeout",
-                            "cursor-agent exceeded its turn cap; killing the child"
-                        );
-                        let _ = self.child.start_kill();
-                        self.done = true;
-                        let frames = self.translator.finish_unterminated();
-                        return if frames.is_empty() { None } else { Some(frames) };
+                Some(at) => {
+                    match tokio::time::timeout_at(at, self.reader.read_line(&mut line)).await {
+                        Ok(read) => read,
+                        Err(_) => {
+                            // The cap the caller asked for. Kill the child rather
+                            // than leaving it to `kill_on_drop`, so the process is
+                            // gone before the salvaged frames reach the client and
+                            // the turn cannot keep writing after it has ended.
+                            tracing::warn!(
+                                event = "cursor_agent_turn_timeout",
+                                "cursor-agent exceeded its turn cap; killing the child"
+                            );
+                            let _ = self.child.start_kill();
+                            self.done = true;
+                            let frames = self.translator.finish_unterminated();
+                            return if frames.is_empty() {
+                                None
+                            } else {
+                                Some(frames)
+                            };
+                        }
                     }
-                },
+                }
                 None => self.reader.read_line(&mut line).await,
             };
             match read {
@@ -229,7 +230,11 @@ impl RunningTurn {
                     // caller is not left waiting for `message_stop`.
                     self.done = true;
                     let frames = self.translator.finish_unterminated();
-                    return if frames.is_empty() { None } else { Some(frames) };
+                    return if frames.is_empty() {
+                        None
+                    } else {
+                        Some(frames)
+                    };
                 }
                 Ok(_) => {
                     let frames = self.translator.push_line(&line);
@@ -248,7 +253,11 @@ impl RunningTurn {
                     );
                     self.done = true;
                     let frames = self.translator.finish_unterminated();
-                    return if frames.is_empty() { None } else { Some(frames) };
+                    return if frames.is_empty() {
+                        None
+                    } else {
+                        Some(frames)
+                    };
                 }
             }
         }
@@ -359,7 +368,9 @@ mod tests {
         turn.timeout = Some(Duration::from_millis(150));
 
         let started = std::time::Instant::now();
-        let mut running = spawn(stub.to_str().unwrap(), &turn).await.expect("spawn stub");
+        let mut running = spawn(stub.to_str().unwrap(), &turn)
+            .await
+            .expect("spawn stub");
 
         // The cap salvages rather than truncating: a client that has been
         // handed a `message_start` is owed a `message_stop`, and hanging up
@@ -470,12 +481,18 @@ mod tests {
         assert!(all.starts_with("event: message_start\n"));
         assert!(all.contains("ORANGE-13"), "the model did not answer");
         assert!(all.trim_end().ends_with(r#""type":"message_stop"}"#));
-        assert_eq!(running.translator.outcome, Some(super::super::translate::Outcome::EndTurn));
+        assert_eq!(
+            running.translator.outcome,
+            Some(super::super::translate::Outcome::EndTurn)
+        );
         assert!(
             running.translator.usage.input_tokens > 0,
             "usage did not survive: {:?}",
             running.translator.usage
         );
-        assert!(running.translator.session_id.is_some(), "no session id to resume from");
+        assert!(
+            running.translator.session_id.is_some(),
+            "no session id to resume from"
+        );
     }
 }

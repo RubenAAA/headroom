@@ -47,8 +47,41 @@ export HEADROOM_MEMORY_MODE=tool
 # dropping `require_no_tools` for small turns or adding a haiku rule.
 # The target MUST be a route alias below; an unknown id would ride the
 # default upstream and 404. Disable by unsetting the first line.
-export HEADROOM_MODEL_ROUTER_ENABLED=0
+#
+# Turned off for a few hours on 2026-09-07 as the suspect in a streaming
+# failure it had nothing to do with. The real cause was the proxy forwarding
+# the client's `accept-encoding` upstream on the passthrough path, so
+# Anthropic's brotli-encoded SSE reached a parser that reads raw bytes; that
+# is fixed in proxy.rs. Routed turns never had the problem — they build fresh
+# upstream headers and ask for no encoding. Back on after an end-to-end check
+# on a scratch proxy: a tool-less streamed turn on /v1/messages?beta=true
+# returns a complete Anthropic SSE, and a turn with tools stays on Anthropic.
+# Grep `model_route_rerouted` to see which turns left, and
+# `model_route_served` for what each one then cost: it carries both model
+# ids, the upstream's token counts, and whether the turn fell back.
+#
+# Rule keys, all optional except `to_model`, all ANDed, first match wins:
+#   to_model          where a matching turn goes. Must be a route alias below.
+#   require_no_tools  skip turns that declare tools.
+#   max_input_tokens  skip turns bigger than this, to keep long-context work
+#                     off the free tier. The estimate is characters over four
+#                     across `messages`, `tools` and `system`, so a large
+#                     system prompt counts even on a one-line question.
+#   min_input_tokens  the same bound from below, for a route that only pays
+#                     off on big turns.
+#   from_models       restrict the rule to these client model ids.
+#   name              the label the decision log prints.
+export HEADROOM_MODEL_ROUTER_ENABLED=1
 export HEADROOM_MODEL_ROUTES='[{"name": "no-tools->spark", "require_no_tools": true, "to_model": "claude-muse-spark-1.3"}]'
+
+# How long a routed target is skipped after a turn had to fall back to the
+# client's own model, in seconds. Default 300, `0` disables the skip so every
+# turn re-probes the routed upstream. A rerouted turn whose upstream answers
+# 429, 5xx, or nothing at all is re-sent to the model the client asked for,
+# and the target is parked for this window rather than failing the next
+# tool-less turn the same way. Grep `model_route_fallback` for the turns that
+# fell back and `model_route_cooldown_start` for the window opening.
+# export HEADROOM_MODEL_ROUTER_COOLDOWN_SECS=300
 
 HEADROOM_FLAGS=(
   # Master switch for the proxy's memory subsystem, default false. It lived on

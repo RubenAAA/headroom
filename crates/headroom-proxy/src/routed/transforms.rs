@@ -34,16 +34,23 @@ pub(crate) struct CtxTransformReport {
 ///
 /// Note: offload rewrites frozen history only on rebuild boundaries (the gate
 /// prevents cache thrash), exactly as the Claude path does.
+///
+/// `identity_model` is the model the *client* asked for, passed only when the
+/// cost-aware router rewrote it. Everything keyed on conversation identity —
+/// the session key, and through it prefix replay, the roster pin and the tool
+/// order store, plus the usage observer's prefix fingerprint — is derived from
+/// it, so a rerouted turn stays on the key its conversation already has.
 pub(crate) async fn apply_ctx_request_transforms(
     state: &AppState,
     parsed: &mut Value,
     headers: &HeaderMap,
     client_addr: &SocketAddr,
     request_id: &str,
+    identity_model: Option<&str>,
 ) -> CtxTransformReport {
     let mut report = CtxTransformReport::default();
     use crate::cache_stabilization::drift_detector::{
-        compute_structural_hash, derive_session_key, observe_drift, ApiKind,
+        compute_structural_hash, derive_session_key_with_model, observe_drift, ApiKind,
     };
 
     // PR-E5: volatile-content detector. Pure observer — one WARN per finding
@@ -64,7 +71,13 @@ pub(crate) async fn apply_ctx_request_transforms(
     // mutates `parsed`, which matters because `derive_session_key`
     // fingerprints the conversation's first message when no
     // `x-headroom-session-id` header is present.
-    let session_key = derive_session_key(headers, client_addr, parsed, ApiKind::Anthropic);
+    let session_key = derive_session_key_with_model(
+        headers,
+        client_addr,
+        parsed,
+        ApiKind::Anthropic,
+        identity_model,
+    );
     report.session_key = session_key.clone();
 
     // Observe cache-prefix drift on the incoming body (before any transform),
@@ -86,7 +99,12 @@ pub(crate) async fn apply_ctx_request_transforms(
         crate::cache_stabilization::usage_observer::conversation_key(parsed, &session_key),
         Some(session_key.as_str()),
         drift_dims,
-        Some(crate::cache_stabilization::usage_observer::prefix_fingerprint(parsed)),
+        Some(
+            crate::cache_stabilization::usage_observer::prefix_fingerprint_with_model(
+                parsed,
+                identity_model,
+            ),
+        ),
     );
 
     // CTX-2: passive session capture. Read-only — clones the body onto a
@@ -266,9 +284,16 @@ pub(crate) async fn apply_ctx_request_transforms(
     // Output shaping: verbosity steering. Idempotent — the
     // steering text carries a sentinel prefix — so replaying a prefix that
     // already contains it does not stack.
+    // Disabled in cache mode, as on the Claude path: this body is
+    // Anthropic-shaped, so steering appends to the same system-prompt tail
+    // that carries the provider prefix-cache key.
     if state.config.output_shaper_enabled {
-        let shaped =
-            crate::output_shaper::shape_request(parsed, true, state.config.verbosity_level);
+        let shaped = crate::output_shaper::shape_request_for_mode(
+            parsed,
+            true,
+            state.config.verbosity_level,
+            &state.config.mode,
+        );
         if shaped.changed {
             report.transforms_applied.extend(shaped.labels.clone());
             tracing::debug!(

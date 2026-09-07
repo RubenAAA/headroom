@@ -199,11 +199,14 @@ struct PerModel {
     cache_write_5m: HashMap<String, i64>,
     cache_write_1h: HashMap<String, i64>,
     uncached: HashMap<String, i64>,
-    output_tokens: HashMap<String, i64>,
+    /// Keyed by `(model, long_context)` so a >200k-context turn's completion
+    /// tokens are priced at the tier the provider billed them in.
+    output_tokens: HashMap<(String, bool), i64>,
     /// Live-zone shares of the removed tokens, for the cache-aware savings
-    /// counterfactual. Floats: per-request splits, not whole tokens.
-    saved_write: HashMap<String, f64>,
-    saved_list: HashMap<String, f64>,
+    /// counterfactual. Floats: per-request splits, not whole tokens. Keyed by
+    /// `(model, long_context)` for the same reason as `output_tokens`.
+    saved_write: HashMap<(String, bool), f64>,
+    saved_list: HashMap<(String, bool), f64>,
 }
 
 struct Inner {
@@ -250,16 +253,15 @@ impl CostTracker {
         let out = output_tokens.max(0) as f64;
         let cr = cache_read_tokens.max(0) as f64;
         let cw = cache_write_tokens.max(0) as f64;
-        let cr_rate = p
-            .cache_read_cost_per_token
-            .unwrap_or(p.input_cost_per_token);
-        let cw_rate = p
-            .cache_write_cost_per_token
-            .unwrap_or(p.input_cost_per_token);
-        let total = inp * p.input_cost_per_token
-            + out * p.output_cost_per_token
-            + cr * cr_rate
-            + cw * cw_rate;
+        // Billed prompt picks the price tier: past 200k the tiered families
+        // re-price the whole request, output included.
+        let long = crate::pricing::is_long_context(
+            input_tokens.max(0) + cache_read_tokens.max(0) + cache_write_tokens.max(0),
+        );
+        let cr_rate = p.cache_read_rate(long).unwrap_or(p.input_rate(long));
+        let cw_rate = p.cache_write_rate(long).unwrap_or(p.input_rate(long));
+        let total =
+            inp * p.input_rate(long) + out * p.output_rate(long) + cr * cr_rate + cw * cw_rate;
         if total > 0.0 {
             Some(total)
         } else {
@@ -275,15 +277,22 @@ impl CostTracker {
     /// `(cache_read, cache_write, uncached)` per-token prices, or `None` when
     /// the model has no input price. Missing cache prices fall back to the
     /// uncached rate (matching Python's `.get(..., uncached)`).
-    fn cache_prices(model: &str) -> Option<(f64, f64, f64)> {
+    ///
+    /// `long_context` picks the above-200k tier for each of the three rates,
+    /// falling back per rate to the base one on a model that publishes no
+    /// long-context price.
+    fn cache_prices(model: &str, long_context: bool) -> Option<(f64, f64, f64)> {
         let p = crate::pricing::lookup(model)?;
-        let uncached = p.input_cost_per_token;
-        if uncached <= 0.0 {
+        // A model priced at zero has no pricing entry to speak of; that check
+        // uses the base rate so a long-context turn is not admitted by a tier
+        // rate the flat one would have rejected.
+        if p.input_cost_per_token <= 0.0 {
             return None;
         }
+        let uncached = p.input_rate(long_context);
         Some((
-            p.cache_read_cost_per_token.unwrap_or(uncached),
-            p.cache_write_cost_per_token.unwrap_or(uncached),
+            p.cache_read_rate(long_context).unwrap_or(uncached),
+            p.cache_write_rate(long_context).unwrap_or(uncached),
             uncached,
         ))
     }
@@ -332,7 +341,21 @@ impl CostTracker {
         *m.cache_write_5m.entry(model.to_string()).or_default() += rec.cache_write_5m_tokens;
         *m.cache_write_1h.entry(model.to_string()).or_default() += rec.cache_write_1h_tokens;
         *m.uncached.entry(model.to_string()).or_default() += rec.uncached_tokens;
-        *m.output_tokens.entry(model.to_string()).or_default() += rec.output_tokens.max(0);
+
+        // Which price tier the provider billed this turn in. A request the
+        // provider reported no cache data for (or whose write counter was
+        // inferred, not billed) contributes no write tokens to the prompt.
+        let write_eff = if rec.cache_inferred {
+            0
+        } else {
+            rec.cache_write_tokens.max(0)
+        };
+        let billed_prompt = rec.cache_read_tokens.max(0) + write_eff + rec.uncached_tokens.max(0);
+        let long_context = crate::pricing::is_long_context(billed_prompt.max(rec.tokens_sent));
+
+        *m.output_tokens
+            .entry((model.to_string(), long_context))
+            .or_default() += rec.output_tokens.max(0);
 
         // Cache-aware counterfactual buckets for the removed tokens. Message
         // compression rewrites the live zone only — the frozen, cache-read
@@ -341,15 +364,11 @@ impl CostTracker {
         // mix (write + uncached); pricing a warm turn's savings at ~0.1x
         // list is what made the headline irreconcilable with tokens saved.
         if tokens_saved > 0 {
-            let write_eff = if rec.cache_inferred {
-                0
-            } else {
-                rec.cache_write_tokens.max(0)
-            };
             let (_, write_part, list_part) =
                 bucket_by_cache_mix(tokens_saved, 0, write_eff, rec.uncached_tokens.max(0));
-            *m.saved_write.entry(model.to_string()).or_default() += write_part;
-            *m.saved_list.entry(model.to_string()).or_default() += list_part;
+            let key = (model.to_string(), long_context);
+            *m.saved_write.entry(key.clone()).or_default() += write_part;
+            *m.saved_list.entry(key).or_default() += list_part;
         }
 
         if let Some(cost) = cost {
@@ -460,7 +479,7 @@ impl CostTracker {
             let cw = *m.cache_write.get(model).unwrap_or(&0);
             let uncached = *m.uncached.get(model).unwrap_or(&0);
             total_input_tokens += sent;
-            if let Some((cr_p, cw_p, unc_p)) = Self::cache_prices(model) {
+            if let Some((cr_p, cw_p, unc_p)) = Self::cache_prices(model, false) {
                 if cr + cw + uncached > 0 {
                     cost_with_headroom +=
                         cr as f64 * cr_p + cw as f64 * cw_p + uncached as f64 * unc_p;
@@ -489,12 +508,12 @@ impl CostTracker {
         // the per-model table want; a card that says "spent" has to include
         // the tokens the model emitted, or the spend it shows isn't the bill.
         let mut output_cost_usd = 0.0f64;
-        for (model, &out_tokens) in &m.output_tokens {
+        for ((model, long_context), &out_tokens) in &m.output_tokens {
             if out_tokens <= 0 {
                 continue;
             }
             if let Some(p) = crate::pricing::lookup(model) {
-                output_cost_usd += out_tokens as f64 * p.output_cost_per_token;
+                output_cost_usd += out_tokens as f64 * p.output_rate(*long_context);
             }
         }
 
@@ -505,12 +524,13 @@ impl CostTracker {
         // ignores the mix. Reported separately so budget enforcement keeps
         // its monotonic list-priced basis; the session summary prefers this one.
         let mut cache_aware_savings_usd = 0.0f64;
-        for (model, &write_part) in &m.saved_write {
-            let list_part = m.saved_list.get(model).copied().unwrap_or(0.0);
+        for (key, &write_part) in &m.saved_write {
+            let (model, long_context) = key;
+            let list_part = m.saved_list.get(key).copied().unwrap_or(0.0);
             if write_part <= 0.0 && list_part <= 0.0 {
                 continue;
             }
-            if let Some((_, cw_price, uncached_price)) = Self::cache_prices(model) {
+            if let Some((_, cw_price, uncached_price)) = Self::cache_prices(model, *long_context) {
                 cache_aware_savings_usd += write_part * cw_price + list_part * uncached_price;
             }
         }
@@ -1444,6 +1464,116 @@ mod tests {
         );
         // savings_usd = 1000 * (3/1e6) = 0.003
         assert_eq!(s["savings_usd"], json!(0.003));
+    }
+
+    /// Past 200k the catalog charges a second, higher tier for input, output
+    /// and cache alike, and it re-prices the whole request rather than only the
+    /// tokens past the threshold. Port of Python's
+    /// `test_long_context_turn_is_priced_at_the_above_200k_rates`.
+    #[test]
+    fn long_context_turn_is_priced_at_the_above_200k_rates() {
+        let long_input = 6.0 / 1e6;
+        let long_output = 22.5 / 1e6;
+        let t = CostTracker::new(None, "daily");
+        t.record_tokens(
+            "claude-sonnet-4-5",
+            &TokenRecord {
+                tokens_saved: 10_000,
+                tokens_sent: 300_000,
+                uncached_tokens: 300_000,
+                output_tokens: 5_000,
+                ..Default::default()
+            },
+        );
+        let s = t.stats();
+        let out = s["output_cost_usd"].as_f64().unwrap();
+        assert!(
+            (out - round_n(5_000.0 * long_output, 4)).abs() < 1e-6,
+            "output priced at the flat rate: {out}"
+        );
+        // No cache writes, so every removed token falls in the list bucket.
+        let saved = s["cache_aware_savings_usd"].as_f64().unwrap();
+        assert!(
+            (saved - round_n(10_000.0 * long_input, 4)).abs() < 1e-6,
+            "cache-aware savings priced at the flat rate: {saved}"
+        );
+    }
+
+    /// The tier is a threshold on the billed prompt, not on the model: the same
+    /// model under 200k keeps the base rates exactly.
+    #[test]
+    fn below_the_threshold_keeps_the_base_rates() {
+        let t = CostTracker::new(None, "daily");
+        t.record_tokens(
+            "claude-sonnet-4-5",
+            &TokenRecord {
+                tokens_saved: 10_000,
+                tokens_sent: 200_000,
+                uncached_tokens: 200_000,
+                output_tokens: 5_000,
+                ..Default::default()
+            },
+        );
+        let s = t.stats();
+        // Exactly at the threshold is still the base tier (strictly greater).
+        assert_eq!(
+            s["output_cost_usd"],
+            json!(round_n(5_000.0 * 15.0 / 1e6, 4))
+        );
+        assert_eq!(
+            s["cache_aware_savings_usd"],
+            json!(round_n(10_000.0 * 3.0 / 1e6, 4))
+        );
+    }
+
+    /// A flat-rated model must be untouched by the tier at any context size.
+    #[test]
+    fn untiered_model_is_unaffected_by_a_long_context() {
+        let t = CostTracker::new(None, "daily");
+        t.record_tokens(
+            "claude-opus-5",
+            &TokenRecord {
+                tokens_saved: 10_000,
+                tokens_sent: 300_000,
+                uncached_tokens: 300_000,
+                output_tokens: 5_000,
+                ..Default::default()
+            },
+        );
+        let s = t.stats();
+        assert_eq!(
+            s["output_cost_usd"],
+            json!(round_n(5_000.0 * 25.0 / 1e6, 4))
+        );
+        assert_eq!(
+            s["cache_aware_savings_usd"],
+            json!(round_n(10_000.0 * 5.0 / 1e6, 4))
+        );
+    }
+
+    /// An inferred cache-write counter is the same tokens as `uncached_tokens`,
+    /// so it must not be double-counted into the billed prompt and tip a
+    /// sub-threshold request into the higher tier.
+    #[test]
+    fn inferred_cache_writes_do_not_inflate_the_tier_decision() {
+        let t = CostTracker::new(None, "daily");
+        t.record_tokens(
+            "claude-sonnet-4-5",
+            &TokenRecord {
+                tokens_saved: 1_000,
+                tokens_sent: 150_000,
+                cache_write_tokens: 150_000,
+                uncached_tokens: 150_000,
+                output_tokens: 1_000,
+                cache_inferred: true,
+                ..Default::default()
+            },
+        );
+        let s = t.stats();
+        assert_eq!(
+            s["output_cost_usd"],
+            json!(round_n(1_000.0 * 15.0 / 1e6, 4))
+        );
     }
 
     #[test]

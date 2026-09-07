@@ -6,7 +6,6 @@
 //!
 //! Mirrors the public API of Python's `LocalBackend`.
 
-
 use serde::{Deserialize, Serialize};
 
 use super::models::Memory;
