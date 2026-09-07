@@ -842,6 +842,16 @@ mod tests {
         // Note: "HTTPServer" contains "HTTP" which matches ALLCAPS pattern -
         // this is correct behavior as the ALLCAPS substring is semantically
         // significant and should be preserved.
+        // Directive words (upstream 4bca514a): losing "not" inverts the sentence
+        assert!(re.is_match("not"));
+        assert!(re.is_match("never"));
+        assert!(re.is_match("must"));
+        assert!(re.is_match("always"));
+        assert!(re.is_match("only"));
+        assert!(re.is_match("can't"));
+        assert!(re.is_match("without"));
+        assert!(re.is_match("NOT")); // scoped case-insensitive, like Python (?i:...)
+        assert!(!re.is_match("notebook")); // substring, not a word
     }
 
     #[test]

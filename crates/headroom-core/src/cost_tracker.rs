@@ -1750,6 +1750,44 @@ mod tests {
     }
 
     #[test]
+    fn avg_compression_is_weighted_by_original_size() {
+        // Upstream 73a6edbe: a mean of per-request percentages lets one tiny
+        // highly-compressible request dominate the headline. Mean of 98% and
+        // 10% is 54%; size-weighted it is 1098/10100 = 10.9%.
+        let requests = vec![
+            CompressedRequestLog {
+                savings_percent: 98.0,
+                tokens_saved: 98,
+                input_tokens_original: 100,
+                input_tokens_optimized: 2,
+                ..Default::default()
+            },
+            CompressedRequestLog {
+                savings_percent: 10.0,
+                tokens_saved: 1000,
+                input_tokens_original: 10000,
+                input_tokens_optimized: 9000,
+                ..Default::default()
+            },
+        ];
+        let input = SessionSummaryInput {
+            mode: "token",
+            compressed_requests: &requests,
+            cache_net_savings_usd: 0.0,
+            cli_tokens_avoided: 0,
+            total_tokens_before: 10100,
+            tokens_saved_total: 1098,
+            requests_by_model: &HashMap::new(),
+            cost_stats: None,
+            mcp_events: None,
+            codex_ws: None,
+        };
+        let s = build_session_summary(&input);
+        assert_eq!(s.compression.requests_compressed, 2);
+        assert!((s.compression.avg_compression_pct - 10.9).abs() < 0.05);
+    }
+
+    #[test]
     fn bucket_by_cache_mix_splits_proportionally() {
         let (r, w, l) = bucket_by_cache_mix(1000, 800, 100, 100);
         assert!((r - 800.0).abs() < 1e-9);
