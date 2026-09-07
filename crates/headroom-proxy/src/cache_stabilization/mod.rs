@@ -99,6 +99,7 @@ pub mod ephemeral_spans;
 pub mod message_breakpoints;
 pub mod openai_cache_key;
 pub mod prefix_replay;
+pub mod role_sentence;
 pub mod tool_def_normalize;
 pub mod tool_order;
 pub mod tool_prune;

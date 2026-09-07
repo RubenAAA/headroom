@@ -74,6 +74,11 @@ Options:
           
           [default: 10s]
 
+      --upstream-write-timeout <UPSTREAM_WRITE_TIMEOUT>
+          Bound on pushing request bytes upstream before the send is abandoned and the request fails over to a fresh connection. Port of Python `ProxyConfig.write_timeout_seconds` (upstream a507249b): sending a request and waiting for a model to think are different operations, and sharing one knob left the send effectively unbounded — a pooled socket whose peer went away stalls until the OS gives up retransmitting (~180s), under the inherited budget, so no timeout ever fired. Default 150s: carries a 15 MB body over a ~1 Mbps uplink while still firing before the OS retransmit ceiling
+          
+          [default: 150s]
+
       --http-proxy <HTTP_PROXY>
           Optional HTTP proxy for upstream provider calls only (e.g. http://127.0.0.1:3128). Scoped to the proxy's provider HTTP client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY` env vars, which would leak into tool executions inheriting the environment. HTTP/2 is disabled for provider clients when this is set so HTTPS provider APIs can tunnel through a CONNECT proxy
           
@@ -421,6 +426,17 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --hold-role-sentence <HOLD_ROLE_SENTENCE>
+          Hold the opening role sentence of the `system` preamble to the form each conversation opened with.
+          
+          Claude Code swaps between "helps users with software engineering tasks" and "helps users according to your \"Output Style\"" mid-session, on no operator action: four sessions flipped within 70 seconds of each other on 2026-09-07 and back nine minutes later. The sentence heads a 14,000-character block with no marker of its own, so each flip re-caches the conversation from the system block down: 788,210 tokens that day. See [`crate::cache_stabilization::role_sentence`].
+          
+          Default `false`. Rewrites text the client sent, so it stays opt-in.
+          
+          [env: HEADROOM_PROXY_HOLD_ROLE_SENTENCE=]
+          [default: false]
+          [possible values: true, false]
+
       --ctx-offload-min-bytes <CTX_OFFLOAD_MIN_BYTES>
           CTX-3: minimum serialized byte length a `tool_result` block must exceed to be offloaded. Static per invariant I3 (never changes mid-session). Default `50_000` (mirrors context-mode's Read threshold)
           
@@ -597,7 +613,7 @@ Options:
           [default: token]
 
       --output-shaper
-          Master switch for output-token shaping. When enabled, the proxy appends verbosity steering to system prompts and routes effort on mechanical tool-result continuations
+          Master switch for output-token shaping. When enabled, the proxy appends verbosity steering to system prompts
           
           [env: HEADROOM_OUTPUT_SHAPER=]
 
@@ -606,12 +622,6 @@ Options:
           
           [env: HEADROOM_VERBOSITY_LEVEL=]
           [default: 2]
-
-      --mechanical-effort <MECHANICAL_EFFORT>
-          Effort value for mechanical tool-result continuations. Only effective when output-shaper is enabled
-          
-          [env: HEADROOM_MECHANICAL_EFFORT=]
-          [default: low]
 
       --cache <CACHE_ENABLED>
           Enable semantic response caching. When `true`, identical non-streaming requests are served from an in-memory LRU cache instead of hitting upstream. Cache keys hash `{model, messages, system, tools, ...}` with `cache_control` annotations stripped so moved breakpoints don't fragment keys.
@@ -857,7 +867,7 @@ Options:
           Defaults to Python's `DEFAULT_EXCLUDE_TOOLS`: file and search results are what the model is most likely to need verbatim, and the `all_messages` path compresses without storing an original to retrieve, so a summarized file read cannot be undone. Pass `--exclude-tools ""` to compress them anyway.
           
           [env: HEADROOM_EXCLUDE_TOOLS=]
-          [default: Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,headroom_retrieve]
+          [default: Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve]
 
       --protect-tool-results <PROTECT_TOOL_RESULTS>
           Comma-separated tool names whose results must not be lossy-compressed

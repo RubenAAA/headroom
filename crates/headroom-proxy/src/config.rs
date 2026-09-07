@@ -913,6 +913,26 @@ pub struct CliArgs {
     )]
     pub hold_working_directory: bool,
 
+    /// Hold the opening role sentence of the `system` preamble to the form each
+    /// conversation opened with.
+    ///
+    /// Claude Code swaps between "helps users with software engineering tasks"
+    /// and "helps users according to your \"Output Style\"" mid-session, on no
+    /// operator action: four sessions flipped within 70 seconds of each other
+    /// on 2026-09-07 and back nine minutes later. The sentence heads a
+    /// 14,000-character block with no marker of its own, so each flip re-caches
+    /// the conversation from the system block down: 788,210 tokens that day.
+    /// See [`crate::cache_stabilization::role_sentence`].
+    ///
+    /// Default `false`. Rewrites text the client sent, so it stays opt-in.
+    #[arg(
+        long = "hold-role-sentence",
+        env = "HEADROOM_PROXY_HOLD_ROLE_SENTENCE",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub hold_role_sentence: bool,
+
     /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
     /// to be offloaded. Static per invariant I3 (never changes mid-session).
     /// Default `50_000` (mirrors context-mode's Read threshold).
@@ -2133,6 +2153,8 @@ pub struct Config {
     /// state the live one at the message tail. See
     /// [`crate::cache_stabilization::working_dir`].
     pub hold_working_directory: bool,
+    /// See [`crate::cache_stabilization::role_sentence`].
+    pub hold_role_sentence: bool,
     /// Where forwarded prefixes are persisted so they survive a restart. Empty
     /// keeps them in memory only.
     pub replay_store_dir: String,
@@ -2435,6 +2457,7 @@ impl Config {
             split_cache_ttl: args.split_cache_ttl,
             cache_tail_breakpoint: args.cache_tail_breakpoint,
             hold_working_directory: args.hold_working_directory,
+            hold_role_sentence: args.hold_role_sentence,
             replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_stale_messages: args.ctx_offload_stale_messages,
@@ -2679,6 +2702,7 @@ impl Config {
             split_cache_ttl: false,
             cache_tail_breakpoint: false,
             hold_working_directory: false,
+            hold_role_sentence: false,
             replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,
             ctx_offload_stale_messages: 0,

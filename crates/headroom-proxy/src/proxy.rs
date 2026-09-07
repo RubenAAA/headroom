@@ -114,6 +114,9 @@ pub struct AppState {
     /// [`cache_stabilization::working_dir`] for why the pin outlives the replay
     /// store's session TTL.
     pub working_dir_pins: cache_stabilization::working_dir::WorkingDirPins,
+    /// Per-conversation opening-sentence pins. Same lifetime rules as
+    /// `working_dir_pins`; see [`cache_stabilization::role_sentence`].
+    pub role_sentence_pins: cache_stabilization::role_sentence::RoleSentencePins,
     /// When this process started. The replay store is in-memory, so every
     /// restart empties it and the first turn of every live conversation then
     /// finds no prefix. Without this, that expected gap is indistinguishable
@@ -688,6 +691,9 @@ impl AppState {
             roster_pin_state: cache_stabilization::tool_roster_pin::RosterPinStore::default(),
             replay_store,
             working_dir_pins: cache_stabilization::working_dir::WorkingDirPins::new(
+                REPLAY_STORE_CAPACITY,
+            ),
+            role_sentence_pins: cache_stabilization::role_sentence::RoleSentencePins::new(
                 REPLAY_STORE_CAPACITY,
             ),
             started_at: std::time::Instant::now(),
@@ -2283,6 +2289,38 @@ fn hold_working_directory(
     }
 }
 
+/// Hold this conversation's opening role sentence still.
+///
+/// Byte-equal passthrough on the same terms as [`hold_working_directory`]:
+/// not JSON, no such sentence, first sight, or already matching the pin. See
+/// [`cache_stabilization::role_sentence`].
+fn hold_role_sentence(
+    body: bytes::Bytes,
+    pins: &cache_stabilization::role_sentence::RoleSentencePins,
+    session_key: &str,
+    request_id: &str,
+) -> bytes::Bytes {
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let Some(live) = pins.hold(&mut value, session_key) else {
+        return body;
+    };
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::info!(
+                event = "role_sentence_held",
+                request_id = %request_id,
+                live_sentence_len = live.len(),
+                "held the opening role sentence to the conversation's opening form"
+            );
+            bytes::Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
 /// How many times retrieval and memory may hand work back to each other.
 ///
 /// Each resolver only runs the calls standing when it starts, and either one's
@@ -3311,7 +3349,23 @@ pub(crate) async fn forward_http(
                 } else {
                     None
                 };
+                // Same again for the opening sentence: hash the held form so a
+                // client-side flip does not read as a hot-zone change.
+                let sentence_previewed = if state.config.hold_role_sentence
+                    && state.config.prefix_replay
+                    && matches!(kind, ApiKind::Anthropic)
+                {
+                    state.role_sentence_pins.preview(&mut parsed, &session_key)
+                } else {
+                    None
+                };
                 let hash = compute_structural_hash(&parsed, kind);
+                // Restore in reverse order: the sentence preview saw the
+                // directory-held view, so its copy goes back first.
+                if let (Some(original), Some(slot)) = (sentence_previewed, parsed.get_mut("system"))
+                {
+                    *slot = original;
+                }
                 if let (Some(original), Some(slot)) = (previewed, parsed.get_mut("system")) {
                     *slot = original;
                 }
@@ -4696,6 +4750,23 @@ pub(crate) async fn forward_http(
             hold_working_directory(
                 body_to_send,
                 &state.working_dir_pins,
+                &request_session_key,
+                &request_id,
+            )
+        } else {
+            body_to_send
+        };
+        let body_to_send = if state.config.hold_role_sentence
+            && state.config.prefix_replay
+            && matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            )
+            && !request_session_key.is_empty()
+        {
+            hold_role_sentence(
+                body_to_send,
+                &state.role_sentence_pins,
                 &request_session_key,
                 &request_id,
             )

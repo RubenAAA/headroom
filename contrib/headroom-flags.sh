@@ -295,6 +295,22 @@ HEADROOM_FLAGS=(
   # which the code enforces.
   --hold-working-directory true
 
+  # ON 2026-09-08. Holds the opening role sentence of the system preamble to
+  # the form each conversation opened with. Claude Code swaps between "helps
+  # users with software engineering tasks" and "helps users according to your
+  # Output Style" mid-session, on no operator action: four sessions flipped
+  # within 70 seconds of each other on 2026-09-07 and back nine minutes later.
+  # The sentence heads the same 14,000-character block as the directory line,
+  # so each flip re-caches the conversation from the system block down:
+  # 788,210 tokens in 8 flips that day, the largest source of waste left once
+  # the two defects of that date were fixed.
+  #
+  # Look for `role_sentence_held` in the log to confirm it fired. It rewrites
+  # one sentence the client sent to another the same client sent earlier in
+  # the same conversation; the `# Output Style` section that carries the style
+  # itself is untouched.
+  --hold-role-sentence true
+
   # `serena` was added here on 2026-08-17 and taken straight back out. All 29 of
   # its tools were sent in 13% of turns across a 4,361-body capture and none was
   # ever called, which looked like 1,073 tok/turn of dead weight.
