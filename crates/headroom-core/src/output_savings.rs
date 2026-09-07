@@ -217,6 +217,69 @@ impl BaselineModel {
     }
 }
 
+/// Benchmark-derived reduction factors, consulted ONLY when a deployment has
+/// neither a holdout nor a learned baseline.
+///
+/// THIS TABLE SHIPS EMPTY, AND THAT IS THE INTENDED BEHAVIOUR. Headroom can
+/// apply verbosity steering out of the box; what it cannot do out of the box
+/// is say HOW MUCH it saved without measuring your own traffic, because a
+/// credible factor is not a constant: it depends on the model family, the
+/// shape of the turn, and the exact steering text. An empty table means
+/// [`SavingsLedger::estimate_from_model`] returns `None` for every level, so
+/// an unmeasured level shows nothing rather than a guess. A dash is the
+/// correct rendering of "not measured"; an invented constant is not.
+///
+/// Two ways to populate it, in order of strength:
+///
+/// 1. Run a holdout. [`SavingsLedger::estimate_from_holdout`] measures YOUR
+///    traffic and outranks anything here. This is the honest answer and it
+///    needs no factor table at all.
+/// 2. Register factors from a benchmark via [`register_modelled_factors`].
+///    An extension that has done the measurement can install them at startup.
+static MODELLED_REDUCTION: OnceLock<Mutex<HashMap<i32, (f64, f64)>>> = OnceLock::new();
+
+fn modelled_table() -> &'static Mutex<HashMap<i32, (f64, f64)>> {
+    MODELLED_REDUCTION.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Install benchmark-derived reduction factors for one verbosity level.
+///
+/// Extension seam. `conservative` and `optimistic` are fractions in `(0, 1)`
+/// — the low and high ends of the measured reduction, where the low end
+/// becomes the headline so the number under-reports rather than flatters.
+///
+/// Registering a level twice replaces it. Values outside `(0, 1)` are
+/// rejected: the estimator inverts them as `r/(1-r)`, which is nonsense at 0
+/// and divides by zero at 1.
+pub fn register_modelled_factors(
+    level: i32,
+    conservative: f64,
+    optimistic: f64,
+) -> Result<(), String> {
+    if !(0.0 < conservative && conservative < 1.0 && 0.0 < optimistic && optimistic < 1.0) {
+        return Err(format!(
+            "reduction factors must lie in (0, 1); got ({conservative}, {optimistic})"
+        ));
+    }
+    if conservative > optimistic {
+        return Err(format!(
+            "conservative factor {conservative} exceeds optimistic {optimistic}"
+        ));
+    }
+    modelled_table()
+        .lock()
+        .unwrap()
+        .insert(level, (conservative, optimistic));
+    Ok(())
+}
+
+/// Clear all registered modelled factors. Test-only: the table is
+/// process-global and the test runner is multi-threaded.
+#[cfg(test)]
+fn clear_modelled_factors() {
+    modelled_table().lock().unwrap().clear();
+}
+
 /// Result of an estimation pass.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavingsEstimate {
@@ -226,7 +289,8 @@ pub struct SavingsEstimate {
     pub ci_low_pct: f64,
     pub ci_high_pct: f64,
     pub n_requests: i64,
-    /// "estimated" (synthetic control) or "measured" (A/B holdout).
+    /// "measured" (A/B holdout) > "estimated" (synthetic control) >
+    /// "modelled" (benchmark factor — not this deployment's traffic).
     pub kind: String,
 }
 
@@ -346,9 +410,75 @@ impl SavingsLedger {
     }
 
     /// Prefer the measured A/B number; fall back to the baseline estimate.
+    /// Existing callers stay on this: without a level there is no modelled
+    /// fallback, which keeps every existing caller honest.
     pub fn best_estimate(&self) -> SavingsEstimate {
-        self.estimate_from_holdout()
-            .unwrap_or_else(|| self.estimate_from_baseline())
+        self.best_estimate_with_level(None)
+    }
+
+    /// Weakest tier: apply a benchmark factor to observed treatment output.
+    ///
+    /// Used only when this deployment has produced no counterfactual of its
+    /// own. Returns `None` for a level that was never benchmarked, so an
+    /// unmeasured level shows nothing rather than a guess.
+    ///
+    /// The arithmetic is the part worth getting right. Observed output is
+    /// already POST-shaping, so the saving is not `observed x r`. If the
+    /// unshaped response would have been `U` and we observed `O = U(1-r)`,
+    /// then `saved = U - O = O * r/(1-r)`. At r=0.20 that is 0.25 of
+    /// observed, not 0.20 — the naive form understates, and by more as r
+    /// grows.
+    pub fn estimate_from_model(&self, level: i32) -> Option<SavingsEstimate> {
+        let (lo_r, hi_r) = modelled_table().lock().unwrap().get(&level).copied()?;
+        let mut observed = 0.0;
+        let mut n_requests = 0i64;
+        for acc in self.treatment.values() {
+            if acc.n == 0 {
+                continue;
+            }
+            observed += acc.n as f64 * acc.mean();
+            n_requests += acc.n;
+        }
+        if n_requests == 0 || observed <= 0.0 {
+            return None;
+        }
+        let saved_for = |r: f64| observed * r / (1.0 - r);
+        let saved = saved_for(lo_r);
+        let baseline = observed + saved;
+        // The band is the spread between the two benchmarked models, NOT a
+        // sampling CI — there is no sample here. Callers must not label it
+        // "95% CI".
+        let lo_pct = lo_r * 100.0;
+        let hi_pct = hi_r * 100.0;
+        Some(SavingsEstimate {
+            tokens_saved: saved,
+            baseline_tokens: baseline,
+            pct: lo_pct,
+            ci_low_pct: lo_pct,
+            ci_high_pct: hi_pct,
+            n_requests,
+            kind: "modelled".to_string(),
+        })
+    }
+
+    /// Strongest available tier: measured > estimated > modelled.
+    ///
+    /// `level` enables the modelled fallback; without it the behaviour is
+    /// unchanged from before, which keeps every existing caller honest.
+    pub fn best_estimate_with_level(&self, level: Option<i32>) -> SavingsEstimate {
+        if let Some(measured) = self.estimate_from_holdout() {
+            return measured;
+        }
+        let estimated = self.estimate_from_baseline();
+        if estimated.n_requests > 0 {
+            return estimated;
+        }
+        if let Some(level) = level {
+            if let Some(modelled) = self.estimate_from_model(level) {
+                return modelled;
+            }
+        }
+        estimated
     }
 
     /// Write the ledger, leaving either the old file or the new one behind.
@@ -493,11 +623,22 @@ impl SavingsRecorder {
     /// Per-request output tokens saved, for the savings rollup.
     ///
     /// For a treatment request, the synthetic-control estimate
-    /// `max(0, baseline_mean(stratum) - output_tokens)`; 0 for control, unknown
+    /// `baseline_mean(stratum) - output_tokens`; 0 for control, unknown
     /// strata, or when no shaping label is present.
     ///
     /// Read-only: unlike [`Self::record_from_labels`] it does not mutate the
     /// ledger, so the two compose without double-counting.
+    ///
+    /// The delta is **clamped at zero here**, which is deliberate and is not
+    /// in tension with the tier-1 rule in
+    /// [`SavingsLedger::estimate_from_baseline`], which sums *signed* deltas
+    /// precisely so that chattier-than-baseline turns pull the headline down.
+    /// This method feeds something else: the per-request savings rollup,
+    /// which flows to the savings tracker — an accumulate-only surface that
+    /// floors again at its own boundary (`savings_tracker` records
+    /// `output_tokens_saved` through `.max(0)`). Keeping the floor here makes
+    /// that boundary explicit rather than relying on every downstream caller
+    /// to reapply it.
     pub fn estimate_request_savings(&self, labels: &[String], output_tokens: i64) -> i64 {
         for label in labels {
             let Some((arm, key)) = parse_stratum_label(label) else {
@@ -552,9 +693,13 @@ impl SavingsRecorder {
     }
 
     pub fn estimate(&self) -> SavingsEstimate {
+        self.estimate_with_level(None)
+    }
+
+    pub fn estimate_with_level(&self, level: Option<i32>) -> SavingsEstimate {
         let mut st = self.state.lock().unwrap();
         self.reload_baseline_locked(&mut st);
-        st.ledger.best_estimate()
+        st.ledger.best_estimate_with_level(level)
     }
 }
 
@@ -889,6 +1034,7 @@ mod tests {
     /// reads unparseable JSON as an empty ledger — so a torn write silently
     /// resets the savings history. The rename makes that unrepresentable.
     #[test]
+    #[allow(clippy::len_zero)]
     fn save_leaves_no_temporary_and_reloads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("ledger.json");
@@ -909,5 +1055,96 @@ mod tests {
         ledger.save(&path).expect("second save");
         let text = std::fs::read_to_string(&path).unwrap();
         serde_json::from_str::<SavingsLedger>(&text).expect("reloads as valid JSON");
+    }
+
+    // ─── modelled tier (upstream honesty fix) ──────────────────────────
+    //
+    // The modelled table ships empty: without a benchmark an unmeasured level
+    // must show nothing rather than a guess. These tests pin that, plus the
+    // post-shaping inversion (saved = observed * r/(1-r), not observed * r).
+    //
+    // The table is process-global; each test clears it first and serialises
+    // via a dedicated mutex so parallel tests cannot observe each other's
+    // registrations.
+
+    fn modelled_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn modelled_table_ships_empty_so_unmeasured_levels_show_nothing() {
+        let _guard = modelled_test_lock();
+        clear_modelled_factors();
+        let mut l = SavingsLedger::default();
+        for _ in 0..10 {
+            l.record("treatment", "k", 70);
+        }
+        assert!(l.estimate_from_model(3).is_none());
+        // And the level-less default never invents a modelled number either.
+        assert_eq!(l.best_estimate().kind, "estimated");
+    }
+
+    #[test]
+    fn modelled_math_inverts_post_shaping_observation() {
+        let _guard = modelled_test_lock();
+        clear_modelled_factors();
+        register_modelled_factors(3, 0.20, 0.40).unwrap();
+        let mut l = SavingsLedger::default();
+        // Observed 800 post-shaping tokens at r=0.20: unshaped would have been
+        // 1000, so saved = 200 (not the naive 800*0.20 = 160).
+        for _ in 0..8 {
+            l.record("treatment", "k", 100);
+        }
+        let est = l.estimate_from_model(3).unwrap();
+        assert_eq!(est.kind, "modelled");
+        assert!((est.tokens_saved - 200.0).abs() < 1e-6);
+        assert!((est.baseline_tokens - 1000.0).abs() < 1e-6);
+        // Headline is the conservative end; the band is the benchmark spread,
+        // not a sampling CI.
+        assert!((est.pct - 20.0).abs() < 1e-9);
+        assert!((est.ci_low_pct - 20.0).abs() < 1e-9);
+        assert!((est.ci_high_pct - 40.0).abs() < 1e-9);
+        assert_eq!(est.n_requests, 8);
+        clear_modelled_factors();
+    }
+
+    #[test]
+    fn modelled_yields_to_measured_and_estimated() {
+        let _guard = modelled_test_lock();
+        clear_modelled_factors();
+        register_modelled_factors(3, 0.20, 0.40).unwrap();
+        // Holdout data outranks the factor table.
+        let mut l = SavingsLedger::default();
+        for _ in 0..10 {
+            l.record("control", "k", 100);
+            l.record("treatment", "k", 70);
+        }
+        assert_eq!(l.best_estimate_with_level(Some(3)).kind, "measured");
+        // So does a learned baseline.
+        let mut l = SavingsLedger::default();
+        l.baseline.observe("k", 100);
+        l.baseline.observe("k", 100);
+        l.record("treatment", "k", 70);
+        assert_eq!(l.best_estimate_with_level(Some(3)).kind, "estimated");
+        // With neither, the level unlocks the modelled fallback.
+        let mut l = SavingsLedger::default();
+        l.record("treatment", "k", 70);
+        assert_eq!(l.best_estimate_with_level(Some(3)).kind, "modelled");
+        assert_eq!(l.best_estimate_with_level(None).kind, "estimated");
+        clear_modelled_factors();
+    }
+
+    #[test]
+    fn register_modelled_factors_rejects_nonsense() {
+        let _guard = modelled_test_lock();
+        clear_modelled_factors();
+        assert!(register_modelled_factors(3, 0.0, 0.5).is_err());
+        assert!(register_modelled_factors(3, 0.2, 1.0).is_err());
+        assert!(register_modelled_factors(3, 0.5, 0.2).is_err());
+        assert!(register_modelled_factors(3, 0.2, 0.5).is_ok());
+        // Re-registering a level replaces it.
+        assert!(register_modelled_factors(3, 0.3, 0.6).is_ok());
+        clear_modelled_factors();
     }
 }

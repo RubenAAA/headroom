@@ -7,19 +7,22 @@
 //! 1. Verbosity steering — a deterministic instruction block appended to the
 //!    TAIL of the system prompt (after any `cache_control` breakpoint).
 //!
-//! 2. Effort routing — on turns classified as mechanical we lower an
-//!    explicitly-present effort; on errors or new user asks we leave it alone.
+//! Effort routing (lowering `output_config.effort` / clamping
+//! `thinking.budget_tokens` on mechanical turns) was removed, mirroring
+//! upstream: live measurement showed per-turn effort routing ~15x underwater
+//! on mechanical turns. The shaper now only steers verbosity.
 //!
 //! Turn classification is purely structural (block types, roles, `is_error`
-//! flags) — no content regexes or keyword patterns.
+//! flags) — no content regexes or keyword patterns. It is retained for
+//! stratum labelling; the shaper itself no longer branches on it.
 
 use serde_json::Value;
 
-/// Documented Anthropic API minimum for thinking.budget_tokens on models
-/// that still accept the legacy enabled/budget_tokens form.
-pub const LEGACY_THINKING_FLOOR: i64 = 1024;
-
 /// Ordering for output_config.effort values.
+///
+/// Kept as a read-only helper: [`requested_effort`] reports the effort the
+/// client asked for (used by the OpenAI request translator and the cursor
+/// agent resolver). Nothing lowers it anymore.
 fn effort_rank(s: &str) -> Option<i32> {
     match s {
         "low" => Some(0),
@@ -39,11 +42,7 @@ fn effort_rank(s: &str) -> Option<i32> {
 /// carries no budget, so a reader looking only at `thinking.budget_tokens`
 /// sees nothing and the setting is silently lost.
 pub fn requested_effort(body: &Value) -> Option<&str> {
-    let effort = body
-        .get("output_config")?
-        .get("effort")?
-        .as_str()?
-        .trim();
+    let effort = body.get("output_config")?.get("effort")?.as_str()?.trim();
     effort_rank(effort).map(|_| effort)
 }
 
@@ -66,15 +65,25 @@ fn verbosity_text(level: i32) -> Option<&'static str> {
         ),
         3 => Some(
             "Skip preamble and postamble. Never restate code, file contents, \
-             diffs, or tool output already in this conversation — reference by \
-             path and line. Give conclusions only; omit rationale unless the user \
-             asks why. Prefer the smallest edit over rewriting whole files. Keep \
-             prose to the minimum needed to be unambiguous.",
+             diffs, or tool output already in this conversation — cite the exact \
+             file path and line or symbol instead, always; a reference that omits \
+             the location is not a reference. Give conclusions only; omit \
+             rationale unless the user asks why. Prefer the smallest edit over \
+             rewriting whole files. Keep prose to the minimum needed to be \
+             unambiguous. Never drop anything the turn or task needs to be \
+             correct, including negations (not, never, no, only, except) — shorten \
+             how you say it, not what you say. Use full prose for destructive or \
+             irreversible actions, security warnings, and any multi-step sequence \
+             where brevity would create ambiguity.",
         ),
         4 => Some(
             "Minimum tokens. Fragments fine. No preamble, no postamble, no \
              restating context, no rationale. Answer, smallest-possible edits, \
-             nothing else.",
+             nothing else. Never drop anything the turn or task needs to be \
+             correct, including negations (not, never, no, only, except). Use \
+             full prose for destructive or irreversible actions, security \
+             warnings, and any multi-step sequence where brevity would create \
+             ambiguity.",
         ),
         _ => None,
     }
@@ -200,48 +209,6 @@ pub fn apply_verbosity_steering(body: &mut Value, level: i32) -> bool {
     false
 }
 
-/// Lower thinking/effort spend on mechanical continuations.
-///
-/// Returns labels for each mutation made (empty list = untouched).
-pub fn route_effort(body: &mut Value, kind: TurnKind, mechanical_effort: &str) -> Vec<String> {
-    if kind != TurnKind::MechanicalContinuation {
-        return vec![];
-    }
-
-    let mut labels = Vec::new();
-
-    // Modern lever: output_config.effort
-    if let Some(output_config) = body.get_mut("output_config").and_then(Value::as_object_mut) {
-        if let Some(effort_val) = output_config.get("effort").and_then(Value::as_str) {
-            if let (Some(current_rank), Some(target_rank)) =
-                (effort_rank(effort_val), effort_rank(mechanical_effort))
-            {
-                if current_rank > target_rank {
-                    let old = effort_val.to_string();
-                    output_config["effort"] = Value::String(mechanical_effort.to_string());
-                    labels.push(format!("output_shaper:effort:{old}->{mechanical_effort}"));
-                }
-            }
-        }
-    }
-
-    // Legacy lever: clamp thinking.budget_tokens
-    if let Some(thinking) = body.get_mut("thinking").and_then(Value::as_object_mut) {
-        if thinking.get("type").and_then(Value::as_str) == Some("enabled") {
-            if let Some(budget) = thinking.get("budget_tokens").and_then(Value::as_i64) {
-                if budget > LEGACY_THINKING_FLOOR {
-                    thinking["budget_tokens"] = Value::Number(LEGACY_THINKING_FLOOR.into());
-                    labels.push(format!(
-                        "output_shaper:thinking_budget:{budget}->{LEGACY_THINKING_FLOOR}"
-                    ));
-                }
-            }
-        }
-    }
-
-    labels
-}
-
 /// Result of output shaping.
 #[derive(Debug, Default)]
 pub struct ShapeResult {
@@ -249,14 +216,8 @@ pub struct ShapeResult {
     pub labels: Vec<String>,
 }
 
-/// Apply all output-shaping levers to an Anthropic request body in place.
-pub fn shape_request(
-    body: &mut Value,
-    enabled: bool,
-    verbosity_level: i32,
-    effort_router_enabled: bool,
-    mechanical_effort: &str,
-) -> ShapeResult {
+/// Apply verbosity steering to an Anthropic request body in place.
+pub fn shape_request(body: &mut Value, enabled: bool, verbosity_level: i32) -> ShapeResult {
     let mut result = ShapeResult::default();
     if !enabled {
         return result;
@@ -267,20 +228,6 @@ pub fn shape_request(
         result
             .labels
             .push(format!("output_shaper:verbosity:L{verbosity_level}"));
-    }
-
-    if effort_router_enabled {
-        let messages: Vec<Value> = body
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let kind = classify_turn(&messages);
-        let labels = route_effort(body, kind, mechanical_effort);
-        if !labels.is_empty() {
-            result.changed = true;
-            result.labels.extend(labels);
-        }
     }
 
     result
@@ -425,72 +372,6 @@ mod tests {
         }
     }
 
-    // ── route_effort ──────────────────────────────────────────────
-
-    #[test]
-    fn lowers_explicit_effort_on_mechanical_turn() {
-        let mut body = json!({"output_config": {"effort": "xhigh"}});
-        let labels = route_effort(&mut body, TurnKind::MechanicalContinuation, "low");
-        assert_eq!(body["output_config"]["effort"], "low");
-        assert_eq!(labels, vec!["output_shaper:effort:xhigh->low"]);
-    }
-
-    #[test]
-    fn never_injects_effort_when_absent() {
-        let mut body = json!({"messages": []});
-        let labels = route_effort(&mut body, TurnKind::MechanicalContinuation, "low");
-        assert!(body.get("output_config").is_none());
-        assert!(labels.is_empty());
-    }
-
-    #[test]
-    fn effort_untouched_on_new_ask() {
-        let mut body = json!({"output_config": {"effort": "xhigh"}});
-        assert!(route_effort(&mut body, TurnKind::NewUserAsk, "low").is_empty());
-        assert_eq!(body["output_config"]["effort"], "xhigh");
-    }
-
-    #[test]
-    fn effort_already_at_target_untouched() {
-        let mut body = json!({"output_config": {"effort": "low"}});
-        assert!(route_effort(&mut body, TurnKind::MechanicalContinuation, "low").is_empty());
-    }
-
-    #[test]
-    fn unknown_effort_value_untouched() {
-        let mut body = json!({"output_config": {"effort": "turbo"}});
-        assert!(route_effort(&mut body, TurnKind::MechanicalContinuation, "low").is_empty());
-        assert_eq!(body["output_config"]["effort"], "turbo");
-    }
-
-    #[test]
-    fn legacy_thinking_budget_clamped() {
-        let mut body = json!({"thinking": {"type": "enabled", "budget_tokens": 32000}});
-        let labels = route_effort(&mut body, TurnKind::MechanicalContinuation, "low");
-        assert_eq!(body["thinking"]["budget_tokens"], LEGACY_THINKING_FLOOR);
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(
-            labels,
-            vec![format!(
-                "output_shaper:thinking_budget:32000->{LEGACY_THINKING_FLOOR}"
-            )]
-        );
-    }
-
-    #[test]
-    fn legacy_budget_at_floor_untouched() {
-        let mut body =
-            json!({"thinking": {"type": "enabled", "budget_tokens": LEGACY_THINKING_FLOOR}});
-        assert!(route_effort(&mut body, TurnKind::MechanicalContinuation, "low").is_empty());
-    }
-
-    #[test]
-    fn adaptive_thinking_untouched() {
-        let mut body = json!({"thinking": {"type": "adaptive"}});
-        assert!(route_effort(&mut body, TurnKind::MechanicalContinuation, "low").is_empty());
-        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
-    }
-
     // ── shape_request (end to end) ────────────────────────────────
 
     #[test]
@@ -501,29 +382,40 @@ mod tests {
             "output_config": {"effort": "xhigh"}
         });
         let snapshot = body.clone();
-        let result = shape_request(&mut body, false, 2, true, "low");
+        let result = shape_request(&mut body, false, 2);
         assert!(!result.changed);
         assert_eq!(body, snapshot);
     }
 
     #[test]
-    fn enabled_applies_steering_and_effort_routing() {
+    fn enabled_applies_steering_only() {
         let mut body = json!({
             "system": "Sys.",
             "messages": mechanical_messages(),
             "output_config": {"effort": "xhigh"},
             "thinking": {"type": "adaptive"}
         });
-        let result = shape_request(&mut body, true, 2, true, "low");
+        let result = shape_request(&mut body, true, 2);
         assert!(result.changed);
-        assert_eq!(
-            result.labels,
-            vec![
-                "output_shaper:verbosity:L2",
-                "output_shaper:effort:xhigh->low",
-            ]
-        );
-        assert_eq!(body["output_config"]["effort"], "low");
+        assert_eq!(result.labels, vec!["output_shaper:verbosity:L2",]);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    /// Effort routing was removed upstream (per-turn routing measured ~15x
+    /// underwater on mechanical turns): even a mechanical continuation keeps
+    /// the effort the client sent.
+    #[test]
+    fn mechanical_turn_keeps_explicit_effort() {
+        let mut body = json!({
+            "system": "Sys.",
+            "messages": mechanical_messages(),
+            "output_config": {"effort": "xhigh"},
+            "thinking": {"type": "enabled", "budget_tokens": 32000}
+        });
+        let result = shape_request(&mut body, true, 2);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["thinking"]["budget_tokens"], 32000);
+        assert_eq!(result.labels, vec!["output_shaper:verbosity:L2"]);
     }
 
     #[test]
@@ -533,7 +425,7 @@ mod tests {
             "messages": [{"role": "user", "content": "design a cache layer"}],
             "output_config": {"effort": "xhigh"}
         });
-        let result = shape_request(&mut body, true, 2, true, "low");
+        let result = shape_request(&mut body, true, 2);
         assert_eq!(result.labels, vec!["output_shaper:verbosity:L2"]);
         assert_eq!(body["output_config"]["effort"], "xhigh");
     }
@@ -541,11 +433,26 @@ mod tests {
     #[test]
     fn second_pass_is_stable() {
         let mut body = json!({"system": "Sys.", "messages": mechanical_messages()});
-        shape_request(&mut body, true, 2, true, "low");
+        shape_request(&mut body, true, 2);
         let snapshot = body.clone();
-        let result = shape_request(&mut body, true, 2, true, "low");
+        let result = shape_request(&mut body, true, 2);
         assert!(!result.changed);
         assert_eq!(body, snapshot);
+    }
+
+    #[test]
+    fn l3_cites_exact_location_and_carries_completeness_floor() {
+        let text = steering_text(3).unwrap();
+        assert!(text.contains("cite the exact file path and line or symbol instead, always"));
+        assert!(text.contains("Never drop anything the turn or task needs to be correct"));
+        assert!(text.contains("negations"));
+    }
+
+    #[test]
+    fn l4_carries_completeness_floor_and_clarity_exception() {
+        let text = steering_text(4).unwrap();
+        assert!(text.contains("Never drop anything the turn or task needs to be correct"));
+        assert!(text.contains("destructive or irreversible actions"));
     }
 }
 

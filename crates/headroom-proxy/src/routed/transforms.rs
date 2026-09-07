@@ -6,8 +6,8 @@
 //! stages.
 
 use crate::proxy::AppState;
-use axum::http::HeaderMap;
 use crate::routed::outcome::count_tools_tokens;
+use axum::http::HeaderMap;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
@@ -263,17 +263,12 @@ pub(crate) async fn apply_ctx_request_transforms(
         }
     }
 
-    // Output shaping: verbosity steering and effort routing. Idempotent — the
+    // Output shaping: verbosity steering. Idempotent — the
     // steering text carries a sentinel prefix — so replaying a prefix that
     // already contains it does not stack.
     if state.config.output_shaper_enabled {
-        let shaped = crate::output_shaper::shape_request(
-            parsed,
-            true,
-            state.config.verbosity_level,
-            true,
-            &state.config.mechanical_effort,
-        );
+        let shaped =
+            crate::output_shaper::shape_request(parsed, true, state.config.verbosity_level);
         if shaped.changed {
             report.transforms_applied.extend(shaped.labels.clone());
             tracing::debug!(
@@ -335,7 +330,10 @@ pub(crate) async fn apply_ctx_request_transforms(
 /// Any serialize/parse failure leaves `parsed` untouched. Every one of these
 /// stages already returns its input unchanged when it cannot parse, so
 /// preserving that is the same contract.
-pub(crate) fn apply_bytes_stage(parsed: &mut Value, stage: impl FnOnce(bytes::Bytes) -> bytes::Bytes) {
+pub(crate) fn apply_bytes_stage(
+    parsed: &mut Value,
+    stage: impl FnOnce(bytes::Bytes) -> bytes::Bytes,
+) {
     let Ok(body) = serde_json::to_vec(parsed) else {
         return;
     };

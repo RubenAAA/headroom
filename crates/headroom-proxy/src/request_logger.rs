@@ -575,6 +575,13 @@ mod tests {
             uncached_input_tokens: 1000,
             cache_inferred: false,
             from_response_cache: false,
+            // Unknown split: this fixture never saw a response body, so no
+            // thinking count could be reported or inferred — and unknown is
+            // not zero.
+            thinking_tokens: None,
+            thinking_inferred: false,
+            stop_reason: None,
+            turn_index: 0,
             total_latency_ms: 150.5,
             overhead_ms: 12.3,
             ttfb_ms: 45.0,

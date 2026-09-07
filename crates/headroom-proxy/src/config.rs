@@ -1215,8 +1215,7 @@ pub struct CliArgs {
     pub mode: String,
 
     /// Master switch for output-token shaping. When enabled, the proxy
-    /// appends verbosity steering to system prompts and routes effort
-    /// on mechanical tool-result continuations.
+    /// appends verbosity steering to system prompts.
     #[arg(
         long = "output-shaper",
         env = "HEADROOM_OUTPUT_SHAPER",
@@ -1232,15 +1231,6 @@ pub struct CliArgs {
         default_value_t = 2
     )]
     pub verbosity_level: i32,
-
-    /// Effort value for mechanical tool-result continuations.
-    /// Only effective when output-shaper is enabled.
-    #[arg(
-        long = "mechanical-effort",
-        env = "HEADROOM_MECHANICAL_EFFORT",
-        default_value = "low"
-    )]
-    pub mechanical_effort: String,
 
     /// Enable semantic response caching. When `true`, identical
     /// non-streaming requests are served from an in-memory LRU cache
@@ -2194,13 +2184,11 @@ pub struct Config {
     /// (prioritize provider prefix cache stability). Normalized via
     /// `modes::normalize_proxy_mode`.
     pub mode: String,
-    /// Master switch for output-token shaping (verbosity steering,
-    /// effort routing). Env-driven via HEADROOM_OUTPUT_SHAPER.
+    /// Master switch for output-token shaping (verbosity steering).
+    /// Env-driven via HEADROOM_OUTPUT_SHAPER.
     pub output_shaper_enabled: bool,
     /// Verbosity steering level 0-4 (0 = off, 4 = minimum tokens).
     pub verbosity_level: i32,
-    /// Effort value used on mechanical tool-result continuations.
-    pub mechanical_effort: String,
     /// Shared ceiling on bytes one request may gain across all injection
     /// stages. See `injection_budget.rs`.
     pub max_injection_bytes: usize,
@@ -2486,7 +2474,6 @@ impl Config {
             ),
             output_shaper_enabled: args.output_shaper_enabled,
             verbosity_level: args.verbosity_level.max(0).min(4),
-            mechanical_effort: args.mechanical_effort,
             max_injection_bytes: args.max_injection_bytes,
             memory_enabled: args.memory_enabled,
             cursor_agent_binary: args.cursor_agent_binary.clone(),
@@ -2690,7 +2677,6 @@ impl Config {
             mode: crate::modes::PROXY_MODE_TOKEN.to_string(),
             output_shaper_enabled: false,
             verbosity_level: 2,
-            mechanical_effort: "low".to_string(),
             max_injection_bytes: crate::injection_budget::DEFAULT_MAX_INJECTION_BYTES,
             memory_enabled: false,
             cursor_agent_binary: "agent".to_string(),

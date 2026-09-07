@@ -329,6 +329,11 @@ mod tests {
         assert_eq!(get("HEADROOM_SMART_CRUSHER_COMPACTION"), "0");
         assert_eq!(get("HEADROOM_FORCE_KOMPRESS"), "1");
         assert_eq!(get("HEADROOM_ACCURACY_GUARD"), "strict");
+        // Upstream deleted effort routing (per-turn routing measured ~15x
+        // underwater): no profile may emit its knobs anymore.
+        assert!(!env
+            .iter()
+            .any(|(k, _)| *k == "HEADROOM_EFFORT_ROUTER" || *k == "HEADROOM_MECHANICAL_EFFORT"));
     }
 
     #[test]

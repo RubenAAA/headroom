@@ -3981,18 +3981,16 @@ pub(crate) async fn forward_http(
                         }
                     }
 
-                    // Output shaping: apply verbosity steering and effort
-                    // routing to Anthropic-shaped request bodies. Only runs
-                    // when the output shaper is enabled in config. The shaping
-                    // is idempotent (steering text includes a sentinel prefix)
-                    // so repeated applications are safe.
+                    // Output shaping: verbosity steering on Anthropic-shaped
+                    // request bodies. Only runs when the output shaper is
+                    // enabled in config. The shaping is idempotent (steering
+                    // text includes a sentinel prefix) so repeated
+                    // applications are safe.
                     if state.config.output_shaper_enabled {
                         let shape_result = crate::output_shaper::shape_request(
                             &mut value,
                             true,
                             state.config.verbosity_level,
-                            true,
-                            &state.config.mechanical_effort,
                         );
                         if shape_result.changed {
                             changed = true;

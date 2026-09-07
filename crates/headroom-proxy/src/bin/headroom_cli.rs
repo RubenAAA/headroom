@@ -569,7 +569,39 @@ fn cmd_output_savings() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn format_output_savings(ledger: &headroom_core::output_savings::SavingsLedger) -> String {
-    let est = ledger.best_estimate();
+    format_output_savings_with_level(ledger, active_verbosity_level())
+}
+
+/// Resolve the active steering level for the modelled fallback, mirroring
+/// upstream `server.py`: the level enables the weakest estimate tier, and
+/// only when the shaper is actually on — i.e. every fresh install, since
+/// `learn --verbosity` needs history that predates the shaper. Without an
+/// explicit opt-in there is no modelled fallback, which keeps the report
+/// honest: an unmeasured level shows nothing rather than a guess.
+fn active_verbosity_level() -> Option<i32> {
+    let enabled = std::env::var("HEADROOM_OUTPUT_SHAPER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let level = std::env::var("HEADROOM_VERBOSITY_LEVEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(2)
+        .clamp(0, 4);
+    if level == 0 {
+        None
+    } else {
+        Some(level)
+    }
+}
+
+fn format_output_savings_with_level(
+    ledger: &headroom_core::output_savings::SavingsLedger,
+    level: Option<i32>,
+) -> String {
+    let est = ledger.best_estimate_with_level(level);
     let mut out = String::new();
     out.push_str(&format!("\n{}\n", "=".repeat(56)));
     out.push_str("Output-token reduction\n");
@@ -586,6 +618,8 @@ fn format_output_savings(ledger: &headroom_core::output_savings::SavingsLedger) 
 
     let label = if est.kind == "measured" {
         "MEASURED (A/B holdout)"
+    } else if est.kind == "modelled" {
+        "MODELLED (benchmark factor)"
     } else {
         "ESTIMATED (synthetic control)"
     };
@@ -602,15 +636,30 @@ fn format_output_savings(ledger: &headroom_core::output_savings::SavingsLedger) 
         "  Saved:     {} output tokens\n",
         commafy(est.tokens_saved.round_ties_even() as i64)
     ));
-    out.push_str(&format!(
-        "  Reduction: {:.1}%   (95% CI {:.1}% … {:.1}%)\n",
-        est.pct, est.ci_low_pct, est.ci_high_pct
-    ));
+    if est.kind == "modelled" {
+        // The band is the spread between the two benchmarked models, NOT a
+        // sampling CI — there is no sample here. Calling it one would be a lie.
+        out.push_str(&format!(
+            "  Reduction: {:.1}%   (range {:.1}% … {:.1}%)\n",
+            est.pct, est.ci_low_pct, est.ci_high_pct
+        ));
+    } else {
+        out.push_str(&format!(
+            "  Reduction: {:.1}%   (95% CI {:.1}% … {:.1}%)\n",
+            est.pct, est.ci_low_pct, est.ci_high_pct
+        ));
+    }
     if est.kind == "estimated" {
         out.push_str(
             "\n  Note: estimated vs the learned baseline. For a measured number,\
              \n  set HEADROOM_OUTPUT_HOLDOUT=0.1 to leave 10% of conversations\
              \n  unshaped as a control arm.\n",
+        );
+    } else if est.kind == "modelled" {
+        out.push_str(
+            "\n  Note: approximate — a benchmark factor, not your traffic.\
+             \n  Set HEADROOM_OUTPUT_HOLDOUT=0.1 to leave 10% of conversations\
+             \n  unshaped as a control arm and measure it for real.\n",
         );
     }
     out
@@ -1254,6 +1303,39 @@ mod tests {
         assert!(out.contains("Method:    MEASURED (A/B holdout)"));
         assert!(out.contains("Reduction: 30.0%"));
         assert!(!out.contains("HEADROOM_OUTPUT_HOLDOUT"));
+    }
+
+    #[test]
+    fn output_savings_modelled_report_is_labelled_range_not_ci() {
+        use headroom_core::output_savings::{register_modelled_factors, SavingsLedger};
+        // The modelled table is process-global; level 3 is registered nowhere
+        // else in this binary, so no clearing or locking is needed.
+        register_modelled_factors(3, 0.20, 0.40).unwrap();
+        let mut ledger = SavingsLedger::default();
+        for _ in 0..8 {
+            ledger.record("treatment", "k", 100);
+        }
+        let out = format_output_savings_with_level(&ledger, Some(3));
+        assert!(out.contains("Method:    MODELLED (benchmark factor)"));
+        assert!(out.contains("(range 20.0% … 40.0%)"));
+        assert!(!out.contains("95% CI"));
+        assert!(out.contains("not your traffic"));
+        assert!(out.contains("HEADROOM_OUTPUT_HOLDOUT=0.1"));
+    }
+
+    #[test]
+    fn output_savings_unmeasured_level_shows_nothing_not_a_guess() {
+        use headroom_core::output_savings::SavingsLedger;
+        // No factors registered for level 2 anywhere in this binary: the
+        // level unlocks nothing and the report falls back to the empty
+        // estimated tier — the honest rendering of "not measured".
+        let mut ledger = SavingsLedger::default();
+        for _ in 0..8 {
+            ledger.record("treatment", "k", 100);
+        }
+        let out = format_output_savings_with_level(&ledger, Some(2));
+        assert!(out.contains("No shaped requests recorded yet."));
+        assert!(!out.contains("MODELLED"));
     }
 
     #[test]

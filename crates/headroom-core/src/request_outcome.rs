@@ -64,6 +64,30 @@ pub struct RequestOutcome {
     /// upstream prompt-cache `cache_read_tokens`).
     pub from_response_cache: bool,
 
+    // ── Output composition ──
+    // `output_tokens` pools two quantities that different levers move in
+    // opposite directions: reasoning-effort routing cuts thinking, verbosity
+    // steering cuts visible text. Summed, neither can be attributed.
+    //
+    // `None` means "we could not tell", which is NOT zero: Anthropic reports
+    // no thinking count at all, so claiming 0 there would assert that no
+    // thinking occurred and corrupt any average over mixed-provider traffic.
+    // `thinking_inferred` marks a count Headroom derived by tokenizing the
+    // response's thinking blocks rather than one the provider reported — the
+    // same distinction `cache_inferred` draws on the input side.
+    pub thinking_tokens: Option<i64>,
+    pub thinking_inferred: bool,
+    // Why the model stopped. `"max_tokens"` (Anthropic) / `"length"` (OpenAI)
+    // mean a token ceiling cut the response off — the one unambiguous,
+    // provider-supplied feedback signal an adaptive ceiling can run a control
+    // loop on.
+    pub stop_reason: Option<String>,
+    // 0-based position of this turn in its conversation. An output token is
+    // billed once at the output rate and again as input on every later turn,
+    // so what a wasted token actually costs depends on how much conversation
+    // is left — which cannot be computed without knowing where we are in it.
+    pub turn_index: i64,
+
     // ── Timing ──
     pub total_latency_ms: f64,
     pub overhead_ms: f64,
@@ -87,6 +111,22 @@ impl RequestOutcome {
     /// Headroom's own response cache.
     pub fn cache_hit(&self) -> bool {
         self.cache_read_tokens > 0 || self.from_response_cache
+    }
+
+    /// Output tokens excluding thinking, or `None` when the split is unknown.
+    ///
+    /// The quantity verbosity steering actually targets. Callers must handle
+    /// `None` rather than defaulting it to `output_tokens`: on a provider
+    /// that reports no thinking count, treating the whole output as visible
+    /// would credit steering with reductions that reasoning-effort routing
+    /// produced.
+    ///
+    /// Clamped at zero because an inferred count comes from Headroom's
+    /// tokenizer while `output_tokens` is on the provider's scale; the two
+    /// can disagree by a token or two on a short response.
+    pub fn visible_output_tokens(&self) -> Option<i64> {
+        self.thinking_tokens
+            .map(|t| (self.output_tokens - t).max(0))
     }
 
     /// Cache-read share of (read + write), rounded to int percent; `0` when no
@@ -189,6 +229,10 @@ pub struct StreamParams<'a> {
     pub cache_write_1h_tokens: i64,
     pub uncached_input_tokens: i64,
     pub cache_inferred: bool,
+    pub thinking_tokens: Option<i64>,
+    pub thinking_inferred: bool,
+    pub stop_reason: Option<String>,
+    pub turn_index: i64,
     pub ttfb_ms: f64,
     pub pipeline_timing: Option<Vec<(String, f64)>>,
     pub waste_signals: Option<Vec<(String, i64)>>,
@@ -295,6 +339,10 @@ impl RequestOutcome {
             uncached_input_tokens: p.uncached_input_tokens,
             cache_inferred: p.cache_inferred,
             from_response_cache: false,
+            thinking_tokens: p.thinking_tokens,
+            thinking_inferred: p.thinking_inferred,
+            stop_reason: p.stop_reason,
+            turn_index: p.turn_index,
             total_latency_ms: p.total_latency_ms,
             overhead_ms: p.overhead_ms,
             ttfb_ms: p.ttfb_ms,

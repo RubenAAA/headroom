@@ -30,16 +30,6 @@ pub fn runtime_env_knobs() -> Vec<Knob> {
             summary: "Verbosity steering level 0-4.".into(),
         },
         Knob {
-            env: "HEADROOM_EFFORT_ROUTER".into(),
-            kind: "bool".into(),
-            summary: "Lower effort on mechanical tool-result continuations.".into(),
-        },
-        Knob {
-            env: "HEADROOM_MECHANICAL_EFFORT".into(),
-            kind: "str".into(),
-            summary: "Effort value used on mechanical continuations.".into(),
-        },
-        Knob {
             env: "HEADROOM_VERBOSITY_AUTOTUNE".into(),
             kind: "bool".into(),
             summary: "Use the AIMD verbosity controller state.".into(),

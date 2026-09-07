@@ -26,6 +26,7 @@ pub mod session_sticky;
 pub mod signals;
 pub mod sqlite_tuning;
 pub mod subscription;
+pub mod thinking_tokens;
 pub mod tokenizer;
 pub mod tool_exclusion;
 pub mod transforms;
