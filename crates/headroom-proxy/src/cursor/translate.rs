@@ -16,9 +16,13 @@
 //! And `tool_call` events are *reports*, not requests. Cursor's agent has
 //! already run the tool by the time the event is written; `completed` carries
 //! the result. Forwarding one as an Anthropic `tool_use` would ask the caller
-//! to run something that has already run. They are surfaced as thinking text so
-//! the work is visible, and the only blocks that become real `tool_use` are the
-//! ones the bridge parks (see `super::park`).
+//! to run something that has already run. `started` is surfaced as thinking
+//! text so the work is visible, and a `completed` built-in call has its result
+//! surfaced as plain text so the caller can read what the agent already saw —
+//! without that the caller re-asks and the agent re-runs the same call. MCP
+//! calls are skipped here because their results already flow back through the
+//! bridge as real `tool_use`/`tool_result` pairs. The only blocks that become
+//! real `tool_use` are the ones the bridge parks (see `super::park`).
 
 use serde_json::{json, Value};
 
@@ -171,6 +175,20 @@ impl Translator {
                     out.extend(self.ensure_started());
                     out.extend(self.open_block(OpenBlock::Thinking));
                     out.push(self.delta_frame("thinking_delta", "thinking", &note));
+                }
+            }
+            ("tool_call", Some("completed")) => {
+                // The agent already ran this and the result is in hand. Drop
+                // it on the floor and a caller that never saw the data
+                // re-asks, so the agent runs the same call again. Surface it
+                // as plain text instead — text needs no `tool_use` pairing,
+                // so this cannot desync the transcript.
+                if let Some(text) = completed_tool_text(event) {
+                    out.extend(self.ensure_started());
+                    out.extend(self.close_block());
+                    out.extend(self.open_block(OpenBlock::Text));
+                    out.push(self.delta_frame("text_delta", "text", &text));
+                    out.extend(self.close_block());
                 }
             }
             ("result", _) => {
@@ -341,6 +359,87 @@ fn describe_tool_call(event: &Value) -> Option<String> {
         name.to_string()
     };
     Some(format!("[cursor ran {name}]\n"))
+}
+
+/// Cap for a surfaced built-in result. Same order as the sidecar's
+/// `SIDECAR_MAX_BLOCK_CHARS`: past this the bytes cost more cached prefix
+/// than the information is worth, and the caller can ask for more.
+const COMPLETED_RESULT_MAX_CHARS: usize = 2000;
+
+/// The text for a `tool_call/completed` event, if it carries something the
+/// caller should see.
+///
+/// MCP calls return `None`: their results already travel through the bridge
+/// as real `tool_use`/`tool_result` pairs, and surfacing them here too would
+/// paste every proxied tool result into the transcript twice. A failed call
+/// (no `result.success`) also returns `None` — the `started` note already
+/// narrated the attempt, and there is nothing to read.
+fn completed_tool_text(event: &Value) -> Option<String> {
+    let obj = event.get("tool_call")?.as_object()?;
+    let (key, payload) = obj.iter().find(|(k, _)| k.ends_with("ToolCall"))?;
+    let name = key.trim_end_matches("ToolCall");
+    if name == "mcp" {
+        return None;
+    }
+    let content = payload.pointer("/result/success/content")?;
+    let body = flatten_result_content(content)?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[cursor {label} result]\n{body}",
+        label = tool_label(name, payload),
+        body = truncate_chars(&body)
+    ))
+}
+
+/// A short label naming what the built-in call acted on: `read
+/// /tmp/x`, `shell ls -la`, falling back to the bare tool name when the
+/// args carry nothing recognizable.
+fn tool_label(name: &str, payload: &Value) -> String {
+    let detail = payload.get("args").and_then(|args| {
+        args.get("path")
+            .or_else(|| args.get("command"))
+            .or_else(|| args.get("pattern"))
+            .and_then(Value::as_str)
+    });
+    match detail {
+        Some(d) if !d.trim().is_empty() => format!("{name} {d}"),
+        _ => name.to_string(),
+    }
+}
+
+/// The `result.success.content` of a built-in call as plain text: a string
+/// as-is, an array of text parts joined, anything else as compact JSON.
+fn flatten_result_content(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let texts: Vec<&str> = parts
+                .iter()
+                .filter_map(|p| {
+                    p.pointer("/text/text")
+                        .and_then(Value::as_str)
+                        .or_else(|| p.get("text").and_then(Value::as_str))
+                })
+                .collect();
+            if texts.is_empty() {
+                Some(content.to_string())
+            } else {
+                Some(texts.join("\n"))
+            }
+        }
+        _ => Some(content.to_string()),
+    }
+}
+
+fn truncate_chars(s: &str) -> String {
+    if s.chars().count() <= COMPLETED_RESULT_MAX_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(COMPLETED_RESULT_MAX_CHARS).collect();
+    out.push_str("\n[truncated]");
+    out
 }
 
 fn rand_u64() -> u64 {
@@ -529,6 +628,107 @@ mod tests {
         ]);
         let note = events.iter().find(|(e, _)| e == "content_block_delta").unwrap();
         assert!(note.1["delta"]["thinking"].as_str().unwrap().contains("headroom-Read"));
+    }
+
+    /// A built-in call the agent ran itself has its result surfaced as text.
+    /// Dropping it is what starved the caller: it re-asked, the agent
+    /// re-ran the same call, and the conversation circled.
+    #[test]
+    fn a_completed_builtin_call_surfaces_its_result_as_text() {
+        let events = run(&[
+            r#"{"type":"tool_call","subtype":"started","tool_call":{"readToolCall":{"args":{"path":"/tmp/x"}}}}"#,
+            r#"{"type":"tool_call","subtype":"completed","tool_call":{"readToolCall":{"args":{"path":"/tmp/x"},"result":{"success":{"content":"file bytes here"}}}}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false}"#,
+        ]);
+        assert!(
+            !events
+                .iter()
+                .any(|(_, d)| d["content_block"]["type"] == "tool_use"),
+            "a report must not become a request"
+        );
+        let texts: String = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_delta")
+            .filter_map(|(_, d)| d["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            texts.contains("file bytes here"),
+            "the result must reach the caller, got: {texts}"
+        );
+        assert!(
+            texts.contains("/tmp/x"),
+            "the label names what was read, got: {texts}"
+        );
+    }
+
+    /// MCP results already travel through the bridge as real
+    /// `tool_use`/`tool_result` pairs. Surfacing them here too would paste
+    /// every proxied tool result into the transcript twice.
+    #[test]
+    fn a_completed_mcp_call_is_not_surfaced_again() {
+        let events = run(&[
+            r#"{"type":"tool_call","subtype":"completed","tool_call":{"mcpToolCall":{"args":{"name":"headroom-Read"},"result":{"success":{"content":"ALREADY-DELIVERED-VIA-BRIDGE"}}}}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false}"#,
+        ]);
+        let texts: String = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_delta")
+            .filter_map(|(_, d)| d["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            !texts.contains("ALREADY-DELIVERED-VIA-BRIDGE"),
+            "got: {texts}"
+        );
+    }
+
+    /// An unbounded shell output must not bloat every cached prefix from
+    /// this turn on. Cap it and mark the cut.
+    #[test]
+    fn an_oversized_builtin_result_is_truncated() {
+        let big = "y".repeat(COMPLETED_RESULT_MAX_CHARS + 100);
+        let line = serde_json::json!({
+            "type": "tool_call", "subtype": "completed",
+            "tool_call": {"shellToolCall": {"args": {"command": "yes"},
+                "result": {"success": {"content": big}}}}
+        })
+        .to_string();
+        let events = run(&[
+            &line,
+            r#"{"type":"result","subtype":"success","is_error":false}"#,
+        ]);
+        let texts: String = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_delta")
+            .filter_map(|(_, d)| d["delta"]["text"].as_str())
+            .collect();
+        assert!(texts.contains("[truncated]"), "the cut must be marked");
+        assert!(
+            texts.chars().count() < COMPLETED_RESULT_MAX_CHARS + 500,
+            "the cap must hold"
+        );
+    }
+
+    /// Replay of the recorded turn where the agent read from disk itself:
+    /// the marker the tool returned must survive into the caller-visible
+    /// text, or the caller re-asks and the turn circles.
+    #[test]
+    fn a_recorded_builtin_turn_replays_with_its_result() {
+        let raw = include_str!("../../tests/fixtures/cursor/builtin-tool-turn.jsonl");
+        let mut t = Translator::new("cursor-grok-4.6-high").with_fixed_id("msg_test");
+        let mut frames = Vec::new();
+        for line in raw.lines() {
+            frames.extend(t.push_line(line));
+        }
+        let events = parse(&frames);
+        let texts: String = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_delta")
+            .filter_map(|(_, d)| d["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            texts.contains("AZURE-99"),
+            "the disk content must reach the caller, got: {texts}"
+        );
     }
 
     /// Cursor adds event kinds between releases. An unknown one is not a reason
