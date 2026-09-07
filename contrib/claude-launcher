@@ -130,12 +130,30 @@ if [ "$use_context" -eq 1 ]; then
         # were the current run — three separate "live defects" were diagnosed
         # off that mistake on 2026-08-07 and none of them were real. Keep four
         # generations; the proxy reopens the path itself on start.
-        if [ -s "$PROXY_LOG" ]; then
+        #
+        # Two guards, both learned on 2026-09-07 when a full day of log
+        # vanished. A proxy that is up but not answering the health probe
+        # (draining, or briefly wedged) still holds the file open; rolling it
+        # then leaves the live process writing into an unlinked inode and
+        # starts the next run on an empty file. And a binary that dies on a
+        # stale flag writes a few lines of usage text and exits — each retry
+        # rolled that noise up the chain and pushed the real logs off the end.
+        # So: roll only when no proxy process exists, and only when the file
+        # holds a real run rather than a failed start.
+        # `pgrep -x` on the image name, not `-f` on the argv: a shell whose own
+        # command line quotes the pattern would match itself.
+        if pgrep -x headroom-proxy >/dev/null 2>&1; then
+            echo "headroom: a proxy process is still up on 8787 but not answering; not rolling its log" >&2
+        elif [ -s "$PROXY_LOG" ] && head -c 4096 "$PROXY_LOG" | grep -q '"level":'; then
             rm -f "$PROXY_LOG.4"
             for i in 3 2 1; do
                 [ -f "$PROXY_LOG.$i" ] && mv -f "$PROXY_LOG.$i" "$PROXY_LOG.$((i + 1))"
             done
             mv -f "$PROXY_LOG" "$PROXY_LOG.1"
+        elif [ -s "$PROXY_LOG" ]; then
+            # A failed start left only usage or crash text; drop it rather
+            # than spend a generation on it.
+            : > "$PROXY_LOG"
         fi
         # The measured settings, shared with restart-headroom.sh. This branch is
         # what runs after a reboot, when nothing holds 8787 — so a proxy started
