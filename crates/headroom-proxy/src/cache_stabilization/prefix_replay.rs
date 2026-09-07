@@ -268,6 +268,18 @@ fn trim_text_block(block: Value) -> Option<Value> {
 /// the provider's cached bytes exactly as they were. Stepping over a message on
 /// the CURRENT side would mean not forwarding something the client sent, which
 /// is how reminders get lost; the caller declines to those instead.
+///
+/// One exception: a scaffolding message the client SHRANK rather than removed.
+/// Claude Code ends a turn with a `system` message carrying two reminders as two
+/// blocks, then re-renders it next turn with only the first, as one string. The
+/// two forms compare unequal, and skipping only the stored copy leaves the
+/// shrunken one to be spliced in right behind it — two `system` messages back
+/// to back, which the adjacency net declines. Measured on 2026-09-07: one
+/// session declined 82 turns running, 1.47M cached tokens rebuilt. When the
+/// current message at the same slot is itself scaffolding, it is that
+/// replacement: the stored copy goes out from cache and the shrunken one is
+/// consumed with it. Nothing the client wrote is lost — the stored copy is a
+/// superset of what it sent this turn.
 fn align_over_withdrawn_scaffolding(
     previous_originals: &[Value],
     current_originals: &[Value],
@@ -283,6 +295,12 @@ fn align_over_withdrawn_scaffolding(
             continue;
         }
         if is_client_scaffolding_message(stored_index, stored) {
+            if current_originals
+                .get(current_index)
+                .is_some_and(|current| is_client_scaffolding_message(current_index, current))
+            {
+                current_index += 1;
+            }
             continue;
         }
         return None;
@@ -4198,6 +4216,117 @@ mod tests {
         assert!(
             out.contains(&scaffold),
             "the withdrawn reminder still goes out: it is in the cached prefix"
+        );
+    }
+
+    /// The tail `system` message of the stored turn carried two reminders as
+    /// two blocks; this turn the client re-renders it with only the first, as
+    /// one string. Seen on 2026-09-07: skipping only the stored copy left the
+    /// shrunken one to be spliced in right behind it, `system` after `system`,
+    /// and the adjacency net declined 82 turns running, 1.47M cached tokens
+    /// rebuilt. The shrunken copy is a replacement, so it is consumed with the
+    /// stored one and the cached two-block form goes out.
+    #[test]
+    fn overlay_replays_across_a_shrunken_scaffolding_message() {
+        let u0 = text_msg("user", "first");
+        let a1 = json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]});
+        let u2 = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]});
+        let two_blocks = json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Only you see that command's output."},
+                {"type": "text", "text": "First privately list what you need next."},
+            ],
+        });
+        let one_string = json!({
+            "role": "system",
+            "content": "Only you see that command's output.",
+        });
+        let prev_orig = vec![u0.clone(), a1.clone(), u2.clone(), two_blocks.clone()];
+        let prev_fwd = vec![
+            text_msg("user", "first-c"),
+            a1.clone(),
+            u2.clone(),
+            two_blocks.clone(),
+        ];
+
+        let a4 = text_msg("assistant", "newest");
+        let u5 = text_msg("user", "again");
+        let current_orig = vec![u0, a1, u2, one_string.clone(), a4.clone(), u5.clone()];
+        let optimized = current_orig.clone();
+
+        let (out, skip) = overlay_cached_prefix_reported(
+            optimized,
+            &current_orig,
+            Some(&prev_orig),
+            Some(&prev_fwd),
+            true,
+            None,
+        );
+        assert!(
+            skip.is_none(),
+            "a shrunken reminder must not decline: {skip:?}"
+        );
+        assert_eq!(out[..4], prev_fwd[..], "cached bytes replayed verbatim");
+        assert_eq!(out[4], a4, "this turn's own tail follows the cached prefix");
+        assert_eq!(out[5], u5);
+        assert_eq!(
+            out.len(),
+            6,
+            "the shrunken copy is consumed, not spliced in twice"
+        );
+        assert!(
+            !out.contains(&one_string),
+            "the shrunken form is not forwarded: the cached two-block form covers it"
+        );
+        assert_eq!(
+            first_illegal_system_position(&out),
+            None,
+            "no system message may land behind another system message"
+        );
+    }
+
+    /// The alignment itself, without the overlay: a scaffolding slot whose
+    /// current occupant is also scaffolding consumes one current message; a
+    /// slot the client emptied consumes none. Both step over the stored copy.
+    #[test]
+    fn align_consumes_a_replaced_scaffolding_message_but_not_a_withdrawn_one() {
+        let u0 = text_msg("user", "first");
+        let a1 = text_msg("assistant", "reply");
+        let two_blocks = json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "reminder A"},
+                {"type": "text", "text": "reminder B"},
+            ],
+        });
+        let one_string = json!({"role": "system", "content": "reminder A"});
+        let prev_orig = vec![u0.clone(), a1.clone(), two_blocks];
+
+        let replaced = vec![
+            u0.clone(),
+            a1.clone(),
+            one_string,
+            text_msg("assistant", "next"),
+        ];
+        assert_eq!(
+            align_over_withdrawn_scaffolding(&prev_orig, &replaced),
+            Some(3),
+            "the shrunken reminder occupies the stored slot and is consumed"
+        );
+
+        let withdrawn = vec![u0.clone(), a1.clone(), text_msg("assistant", "next")];
+        assert_eq!(
+            align_over_withdrawn_scaffolding(&prev_orig, &withdrawn),
+            Some(2),
+            "a withdrawn reminder consumes nothing on the current side"
+        );
+
+        let edited = vec![u0, a1, text_msg("user", "a real edit")];
+        assert_eq!(
+            align_over_withdrawn_scaffolding(&prev_orig, &edited),
+            Some(2),
+            "a non-scaffolding message at the slot is not consumed by the skip"
         );
     }
 
