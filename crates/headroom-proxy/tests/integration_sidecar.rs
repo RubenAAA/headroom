@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::start_proxy_with;
+use headroom_proxy::config::ModelRoute;
 use serde_json::{json, Value};
+use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -733,6 +735,153 @@ async fn retries_disabled_means_a_single_sidecar_attempt() {
         1,
         "the sidecar model should have been called exactly once"
     );
+
+    proxy.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Routed sidecar: free-tier offload with Haiku fallback.
+// ---------------------------------------------------------------------------
+
+/// Responses SSE in the shape Zen serves: created, one text delta, completed.
+fn zen_responses_sse() -> String {
+    [
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_zen\",\"model\":\"muse-spark-1.2-contributor-free\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"Reading zen.rs\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_zen\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
+    ]
+    .join("")
+}
+
+/// Mount a Zen-shaped upstream on `/v1/responses`, capturing request bodies.
+async fn mount_zen(upstream: &MockServer) -> Arc<Mutex<Vec<Vec<u8>>>> {
+    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(req.body.clone());
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(zen_responses_sse())
+        })
+        .mount(upstream)
+        .await;
+    captured
+}
+
+fn zen_route(zen: &MockServer) -> ModelRoute {
+    ModelRoute {
+        model_prefix: "claude-muse-spark-1.2".to_string(),
+        prefix_match: false,
+        upstream: Some(Url::parse(&zen.uri()).unwrap()),
+        translate: true,
+        cursor_agent: None,
+        target_model: Some("muse-spark-1.2-contributor-free".to_string()),
+        auth_env: Some("none".to_string()),
+    }
+}
+
+/// A sidecar that wants a buffered (non-SSE) reply, for JSON assertions.
+fn buffered_sidecar_body() -> Value {
+    let mut body = sidecar_body();
+    body["stream"] = json!(false);
+    body
+}
+
+async fn post_json(client: &reqwest::Client, proxy_url: &str, body: &Value) -> Value {
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-sidecar-test")
+        .body(serde_json::to_vec(body).unwrap())
+        .send()
+        .await
+        .expect("proxy reachable");
+    assert_eq!(resp.status(), 200);
+    resp.json().await.expect("downstream JSON")
+}
+
+/// When the sidecar model names a Responses route, the sidecar is translated
+/// and served from there — and the default upstream never sees it.
+#[tokio::test]
+async fn a_routed_sidecar_is_served_from_the_responses_upstream() {
+    let default = MockServer::start().await;
+    let default_captured = mount_capture(&default).await;
+    let zen = MockServer::start().await;
+    let zen_captured = mount_zen(&zen).await;
+
+    let proxy = start_proxy_with(&default.uri(), |c| {
+        c.compression = true;
+        c.sidecar_model = Some("claude-muse-spark-1.2".to_string());
+        c.model_routes = vec![zen_route(&zen)];
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let body = post_json(&client, &proxy.url(), &buffered_sidecar_body()).await;
+    assert_eq!(body["content"][0]["text"], "Reading zen.rs");
+
+    assert!(
+        default_captured.lock().unwrap().is_empty(),
+        "the default upstream must not see a routed sidecar"
+    );
+    let zen_bodies = zen_captured.lock().unwrap().clone();
+    assert_eq!(zen_bodies.len(), 1, "exactly one routed attempt, no retry");
+    let fwd: Value = serde_json::from_slice(&zen_bodies[0]).expect("upstream body is JSON");
+    assert_eq!(fwd["model"], "muse-spark-1.2-contributor-free");
+    assert_eq!(fwd["reasoning"]["effort"], "minimal");
+    assert_eq!(fwd["max_output_tokens"], 512);
+    assert_eq!(fwd["store"], false);
+    assert_eq!(fwd["stream"], true);
+    assert!(
+        fwd.get("messages").is_none(),
+        "Responses shape carries input, not messages"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// A 429 from the routed upstream is attempted exactly once — even with
+/// retries enabled — and then answered on the direct path.
+#[tokio::test]
+async fn a_failed_routed_sidecar_falls_back_to_the_direct_path() {
+    let default = MockServer::start().await;
+    let default_captured = mount_capture(&default).await;
+    let zen = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("free quota exhausted"))
+        .mount(&zen)
+        .await;
+
+    let proxy = start_proxy_with(&default.uri(), |c| {
+        c.compression = true;
+        c.retry_enabled = true;
+        c.retry_max_attempts = 3;
+        c.retry_base_delay_ms = 1;
+        c.retry_max_delay_ms = 5;
+        c.sidecar_model = Some("claude-muse-spark-1.2".to_string());
+        c.model_routes = vec![zen_route(&zen)];
+    })
+    .await;
+
+    post(&reqwest::Client::new(), &proxy.url(), &sidecar_body()).await;
+
+    assert_eq!(
+        zen.received_requests().await.unwrap().len(),
+        1,
+        "the shuttle never retries; the budget belongs to the fallback"
+    );
+    let bodies = default_captured.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "exactly one direct-path call followed");
+    let fwd: Value = serde_json::from_slice(&bodies[0]).expect("upstream body is JSON");
+    assert_eq!(fwd["model"], "claude-muse-spark-1.2");
+    assert!(fwd["messages"].as_array().unwrap().len() <= 4);
+    assert!(fwd.get("tools").is_none());
 
     proxy.shutdown().await;
 }

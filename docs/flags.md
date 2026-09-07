@@ -559,6 +559,12 @@ Options:
           
           [env: HEADROOM_PROXY_SIDECAR_MODEL=]
 
+      --sidecar-route-timeout <SIDECAR_ROUTE_TIMEOUT>
+          Bound on one spinner-sidecar attempt against a routed Responses upstream. The routed sidecar never retries: on timeout (or any other failure) it falls back to the direct sidecar path, so this is the longest a free-tier detour may hold a status line before Haiku answers it instead
+          
+          [env: HEADROOM_PROXY_SIDECAR_ROUTE_TIMEOUT=]
+          [default: 15s]
+
       --local-upstream <LOCAL_UPSTREAM>
           Upstream URL for the local model (e.g. http://localhost:8080). Required when `--local-model` is set; the proxy appends `/v1/chat/completions` to this base. Ignored when `--local-model` is unset.
           
@@ -571,9 +577,9 @@ Options:
           
           `TARGET_MODEL_ID` does two things. It overrides the model id sent upstream, so `MODEL_NAME` can be a discoverable `claude-*` id (Claude Code's gateway discovery only lists ids starting with `claude` or `anthropic`) while the real upstream id differs. It ALSO selects the endpoint: with a target the request goes to the agentic Responses API (`/v1/responses`, or the ChatGPT Codex backend under Codex auth); without one it goes to `/v1/chat/completions`. Codex needs the former.
           
-          `:auth=ENV_VAR` names the environment variable holding this route's bearer token — the name, so nothing written here is a secret. It also declares the route is not Codex-bound: without it, a route inherits whatever `--codex-auth-file` set up, which would send a live ChatGPT token and a `codex_cli_rs` originator to whatever host the URL names.
+          `:auth=ENV_VAR` names the environment variable holding this route's bearer token — the name, so nothing written here is a secret. It also declares the route is not Codex-bound: without it, a route inherits whatever `--codex-auth-file` set up, which would send a live ChatGPT token and a `codex_cli_rs` originator to whatever host the URL names. The reserved name `:auth=none` (exact lowercase) declares a public anonymous upstream instead: no Authorization header is sent at all, and neither the Codex headers nor the caller's credentials are forwarded.
           
-          Examples: --extra-model-route "claude-grok-4.6=cursor:cursor-grok-4.6-high" --extra-model-route "codex-*=https://api.openai.com/v1:openai" --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra" --extra-model-route "claude-grok-4.6=https://api.x.ai/v1:openai:grok-4.6:auth=XAI_API_KEY"
+          Examples: --extra-model-route "claude-grok-4.6=cursor:cursor-grok-4.6-high" --extra-model-route "codex-*=https://api.openai.com/v1:openai" --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra" --extra-model-route "claude-grok-4.6=https://api.x.ai/v1:openai:grok-4.6:auth=XAI_API_KEY" --extra-model-route "claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none"
           
           [env: HEADROOM_PROXY_EXTRA_MODEL_ROUTES=]
 

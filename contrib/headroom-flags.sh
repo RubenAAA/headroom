@@ -36,6 +36,20 @@ export HEADROOM_MEMORY_INJECT_TOOLS=1
 # whether it was wanted or not; a tool costs zero tokens until it is called.
 export HEADROOM_MEMORY_MODE=tool
 
+# Cost-aware auto-routing: tool-less turns go to the free tier instead of
+# Claude. Deliberately no `max_input_tokens` bound to start: the router's
+# size estimate counts system+tools (tens of thousands of tokens on real
+# Claude Code traffic), so any bound needs a day of logs to calibrate.
+# Watch `model routing decision` — the reason names the rule, input_tokens
+# and has_tools per request — then add e.g. `"max_input_tokens": 30000.
+# Expect a low initial fire rate (the client sends tools on most turns);
+# that is the rule being conservative, not broken. Broaden later by
+# dropping `require_no_tools` for small turns or adding a haiku rule.
+# The target MUST be a route alias below; an unknown id would ride the
+# default upstream and 404. Disable by unsetting the first line.
+export HEADROOM_MODEL_ROUTER_ENABLED=1
+export HEADROOM_MODEL_ROUTES='[{"name": "no-tools->spark", "require_no_tools": true, "to_model": "claude-muse-spark-1.3"}]'
+
 HEADROOM_FLAGS=(
   # Master switch for the proxy's memory subsystem, default false. It lived on
   # the `cclaude` command line for weeks and never once took effect: a running
@@ -426,6 +440,33 @@ HEADROOM_FLAGS=(
   --extra-model-route claude-grok-4.6-high=cursor:cursor-grok-4.6-high
   --extra-model-route claude-grok-4.6-low=cursor:cursor-grok-4.6-low
 
+  # Muse Spark 1.3 free via OpenCode Zen, with no key anywhere — not Meta's,
+  # not Zen's. Zen serves the contributor-free tier anonymously (verified
+  # 2026-09-06: no Authorization header at all, cost 0). `:auth=none`
+  # declares the route carries no credential, so it gets neither the Codex
+  # ChatGPT token above nor the caller's key.
+  #
+  # The `:openai:TARGET` form matters: it selects the /v1/responses endpoint.
+  # The bare `:openai` form would hit chat-completions, which Zen 500s for
+  # Muse (Responses-only model). Tradeoffs of the free tier: dynamic
+  # unpublished quota (429s with multi-hour retry windows — keep a paid
+  # fallback) and Meta may train on prompts/completions.
+  --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none
+
+  # Weaker, faster sibling for the spinner sidecar: 1.2 reasons ~250 tokens
+  # to 1.3's ~500-1000 on the same summary and answers in ~5s against ~12s,
+  # measured 2026-09-06. Same anonymous free tier, same :auth=none.
+  --extra-model-route claude-muse-spark-1.2=https://opencode.ai/zen/v1:openai:muse-spark-1.2-contributor-free:auth=none
+
+  # Spinner sidecar offload: answer Claude Code's 4-word status summaries on
+  # the free tier instead of Haiku. The sidecar tries the route above first
+  # with one bounded attempt (see --sidecar-route-timeout below) and falls
+  # back to the direct Haiku path on any failure, so the worst case is
+  # today's behavior plus one short wasted call. Offload rate is visible as
+  # `routed: true` on the sidecar_detected log lines. Revert by deleting
+  # this line: the default is Haiku.
+  --sidecar-model claude-muse-spark-1.2
+
   # ─── Defaults, written out ──────────────────────────────────────────
   #
   # Everything below carries the binary's own default value, spelled out so
@@ -536,6 +577,10 @@ HEADROOM_FLAGS=(
   --retry-max-delay-ms 30000
   --upstream-timeout 600s
   --upstream-connect-timeout 10s
+  # Single-attempt bound for a routed spinner sidecar (see --sidecar-model
+  # above). No retry by design: on timeout the sidecar falls back to Haiku.
+  # 15s is 3x the measured ~5s Zen answer for a minimal-effort summary.
+  --sidecar-route-timeout 15s
   --graceful-shutdown-timeout 30s
   --max-body-bytes 100MB
   --anthropic-pre-upstream-concurrency 1000

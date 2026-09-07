@@ -1158,6 +1158,19 @@ pub struct CliArgs {
     #[arg(long = "sidecar-model", env = "HEADROOM_PROXY_SIDECAR_MODEL")]
     pub sidecar_model: Option<String>,
 
+    /// Bound on one spinner-sidecar attempt against a routed Responses
+    /// upstream. The routed sidecar never retries: on timeout (or any other
+    /// failure) it falls back to the direct sidecar path, so this is the
+    /// longest a free-tier detour may hold a status line before Haiku
+    /// answers it instead.
+    #[arg(
+        long = "sidecar-route-timeout",
+        env = "HEADROOM_PROXY_SIDECAR_ROUTE_TIMEOUT",
+        default_value = "15s",
+        value_parser = parse_duration
+    )]
+    pub sidecar_route_timeout: Duration,
+
     /// Upstream URL for the local model (e.g. http://localhost:8080).
     /// Required when `--local-model` is set; the proxy appends
     /// `/v1/chat/completions` to this base. Ignored when `--local-model`
@@ -1188,12 +1201,17 @@ pub struct CliArgs {
     /// declares the route is not Codex-bound: without it, a route inherits
     /// whatever `--codex-auth-file` set up, which would send a live ChatGPT
     /// token and a `codex_cli_rs` originator to whatever host the URL names.
+    /// The reserved name `:auth=none` (exact lowercase) declares a public
+    /// anonymous upstream instead: no Authorization header is sent at all,
+    /// and neither the Codex headers nor the caller's credentials are
+    /// forwarded.
     ///
     /// Examples:
     ///   --extra-model-route "claude-grok-4.6=cursor:cursor-grok-4.6-high"
     ///   --extra-model-route "codex-*=https://api.openai.com/v1:openai"
     ///   --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra"
     ///   --extra-model-route "claude-grok-4.6=https://api.x.ai/v1:openai:grok-4.6:auth=XAI_API_KEY"
+    ///   --extra-model-route "claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none"
     #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
     pub extra_model_routes: Vec<String>,
 
@@ -1706,6 +1724,11 @@ pub struct ModelRoute {
     /// no secrets today. The value is read once per request, at the moment the
     /// upstream headers are built.
     ///
+    /// The reserved name `none` declares the route carries no credential at
+    /// all: the upstream gets no Authorization header (and none of the Codex
+    /// identity headers either). For a public anonymous upstream such as
+    /// OpenCode Zen's free tier.
+    ///
     /// Setting this also declares the route is not Codex-bound, so it never
     /// gets the ChatGPT bearer token, the `codex_cli_rs` originator or the
     /// Codex session headers. Without it the route keeps the old behavior:
@@ -2173,6 +2196,9 @@ pub struct Config {
     /// Model the spinner-text sidecar is answered on. `None` means
     /// [`crate::sidecar::DEFAULT_SIDECAR_MODEL`].
     pub sidecar_model: Option<String>,
+    /// Bound on one spinner-sidecar attempt against a routed Responses
+    /// upstream before it falls back to the direct sidecar path.
+    pub sidecar_route_timeout: Duration,
     /// Additional model routes from `--extra-model-route` flags.
     /// Evaluated after `local_model` (exact match takes priority).
     pub model_routes: Vec<ModelRoute>,
@@ -2439,6 +2465,7 @@ impl Config {
             vertex_adc_scope: args.vertex_adc_scope,
             local_model: args.local_model,
             sidecar_model: args.sidecar_model,
+            sidecar_route_timeout: args.sidecar_route_timeout,
             local_upstream: args.local_upstream,
             model_routes: args
                 .extra_model_routes
@@ -2671,6 +2698,7 @@ impl Config {
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
             local_model: None,
             sidecar_model: None,
+            sidecar_route_timeout: Duration::from_secs(15),
             local_upstream: None,
             model_routes: Vec::new(),
             codex_auth_file: None,
@@ -2899,6 +2927,31 @@ mod model_route_tests {
         assert!(r.translate);
         assert_eq!(r.target_model.as_deref(), Some("gpt-5.5"));
         assert!(r.matches("claude-codex-5.5"));
+    }
+
+    /// The anonymous Zen route: Responses translation with a target model id
+    /// and no credential. The `:openai:TARGET` form is what selects the
+    /// `/v1/responses` endpoint; the bare `:openai` form would land on
+    /// chat-completions, which Zen 500s for Muse.
+    #[test]
+    fn parse_anonymous_zen_route() {
+        let r = parse_model_route(
+            "claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none",
+        )
+        .unwrap();
+        assert_eq!(r.model_prefix, "claude-muse-spark-1.3");
+        assert!(!r.prefix_match);
+        assert!(r.translate);
+        assert_eq!(
+            r.target_model.as_deref(),
+            Some("muse-spark-1.3-contributor-free")
+        );
+        assert_eq!(r.auth_env.as_deref(), Some("none"));
+        assert_eq!(
+            r.upstream.as_ref().unwrap().as_str(),
+            "https://opencode.ai/zen/v1"
+        );
+        assert!(r.matches("claude-muse-spark-1.3"));
     }
 
     #[test]

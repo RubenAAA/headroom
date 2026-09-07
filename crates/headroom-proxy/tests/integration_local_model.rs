@@ -8,6 +8,7 @@ mod common;
 
 use common::{start_proxy_with, start_proxy_with_state};
 use headroom_proxy::config::ModelRoute;
+use headroom_proxy::model_router::ModelRouterConfig;
 use serde_json::json;
 use std::sync::Arc;
 use url::Url;
@@ -510,6 +511,149 @@ async fn exhausted_5xx_retries_land_only_in_failed_work() {
     );
     assert_eq!(failed["provider_usage_observed_requests"], 0);
     assert_eq!(failed["by_status"]["529"], 1);
+
+    proxy.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing into the route table: a rule rewriting a request's model
+// to a route alias must be served from that route's upstream.
+// ---------------------------------------------------------------------------
+
+/// Proxy with a Zen-shaped Responses mock as the route upstream and a
+/// cost-aware rule sending small tool-less turns at the route's alias. The
+/// default upstream answering means the rule did not fire.
+fn spark_router_config(zen: &MockServer) -> (String, ModelRoute, ModelRouterConfig) {
+    let route = ModelRoute {
+        model_prefix: "claude-muse-spark-1.3".to_string(),
+        prefix_match: false,
+        upstream: Some(Url::parse(&zen.uri()).unwrap()),
+        translate: true,
+        cursor_agent: None,
+        target_model: Some("muse-spark-1.3".to_string()),
+        auth_env: Some("none".to_string()),
+    };
+    let router = ModelRouterConfig::from_env(
+        Some("1"),
+        Some(
+            r#"[{"name": "small-no-tools->spark", "require_no_tools": true,
+                  "max_input_tokens": 4000, "to_model": "claude-muse-spark-1.3"}]"#,
+        ),
+    );
+    (zen.uri(), route, router)
+}
+
+/// A small tool-less turn on a Claude model is rewritten to the spark alias
+/// and served from the route's upstream — never touching the default one.
+#[tokio::test]
+async fn cost_aware_rule_routes_a_small_tool_less_turn() {
+    let default = MockServer::start().await;
+    let default_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = default_hits.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |_: &wiremock::Request| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_default", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "from default"}],
+                "model": "claude-opus-5", "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }))
+        })
+        .mount(&default)
+        .await;
+
+    let zen = codex_responses_sse_upstream().await;
+    let (_uri, route, router) = spark_router_config(&zen);
+    let proxy = start_proxy_with(&default.uri(), |cfg| {
+        cfg.model_routes = vec![route];
+        cfg.model_router = router;
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "stream": false,
+            "messages": [{"role": "user", "content": "What is 2+2?"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "hello from responses");
+    assert_eq!(
+        default_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a routed turn must not touch the default upstream"
+    );
+
+    let received = zen.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let upstream_body: serde_json::Value =
+        serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(upstream_body["model"], "muse-spark-1.3");
+
+    proxy.shutdown().await;
+}
+
+/// A turn declaring tools does not match the rule and keeps the direct path.
+#[tokio::test]
+async fn cost_aware_rule_skips_a_tool_using_turn() {
+    let default = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_default", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "from default"}],
+            "model": "claude-opus-5", "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })))
+        .mount(&default)
+        .await;
+
+    let zen = codex_responses_sse_upstream().await;
+    let (_uri, route, router) = spark_router_config(&zen);
+    let proxy = start_proxy_with(&default.uri(), |cfg| {
+        cfg.model_routes = vec![route];
+        cfg.model_router = router;
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "stream": false,
+            "messages": [{"role": "user", "content": "Read the file."}],
+            "tools": [{"name": "Read", "description": "read",
+                       "input_schema": {"type": "object"}}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "from default");
+    assert!(
+        zen.received_requests().await.unwrap().is_empty(),
+        "a tool-using turn must not reach the routed upstream"
+    );
 
     proxy.shutdown().await;
 }

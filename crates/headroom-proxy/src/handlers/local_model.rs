@@ -65,6 +65,21 @@ fn upstream_auth_headers(
 /// silent version sends an unauthenticated request and gets back an upstream
 /// 401, which reads like a bad token rather than a missing one.
 fn route_auth_headers(var: &str) -> Result<HeaderMap, Response> {
+    // `none` is not a variable: it declares the route carries no credential
+    // at all. The upstream gets only Content-Type — no Authorization, and
+    // none of the Codex identity headers the default path would add. For a
+    // public anonymous upstream (e.g. OpenCode Zen's free tier, verified
+    // 2026-09-06 to serve with no Authorization header at cost 0). Do not
+    // name a real environment variable `none`; it would never be read.
+    if var == "none" {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/json".parse().expect("valid header"),
+        );
+        return Ok(upstream_headers);
+    }
+
     let deny = |detail: String| -> Response {
         tracing::error!(
             event = "model_route_auth_env_unusable",
@@ -164,6 +179,216 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({ "data": data }))
 }
 
+/// A model route the spinner sidecar may take off-Claude.
+///
+/// Only Responses-shaped routes qualify: `translate` plus a target model id
+/// select the `/v1/responses` endpoint the translator speaks. A passthrough
+/// route (Anthropic in, Anthropic out, no model rewrite) or a `cursor:`
+/// subprocess route cannot serve a translated sidecar; the sidecar keeps its
+/// direct path for those, exactly as before.
+fn sidecar_responses_route<'a>(
+    routes: &'a [crate::config::ModelRoute],
+    sidecar_model: &str,
+) -> Option<&'a crate::config::ModelRoute> {
+    routes.iter().find(|r| {
+        r.matches(sidecar_model)
+            && r.translate
+            && r.target_model.is_some()
+            && r.cursor_agent.is_none()
+            && r.upstream.is_some()
+    })
+}
+
+/// Output budget for a routed sidecar, overriding the client's 64-token cap.
+///
+/// A reasoning model spends its budget on thinking first: measured 2026-09-06
+/// at 240-1000 reasoning tokens for a four-word summary (effort- and
+/// model-dependent), so forwarding the 64 cap starves the text every time.
+/// 512 leaves room for ~300 reasoning tokens plus the summary at ~100 tok/s,
+/// about 5s on Zen's free pool. Billed cost is zero on the free tier, so the
+/// cap is purely a latency bound; anything unused is simply not generated.
+const SIDECAR_ROUTED_MAX_TOKENS: u64 = 512;
+
+/// Force the reasoning effort and output budget a routed sidecar is served at.
+///
+/// The shrunk sidecar carries no thinking or effort fields, so the translator
+/// leaves `reasoning` unset and the backend falls back to its default
+/// (`high` on Zen: 1001 reasoning tokens measured for four words). `minimal`
+/// is the floor — killing reasoning entirely is a 400 on every surface, per
+/// Meta's docs — and `muse-spark-1.2` at `minimal` completes inside the
+/// budget above in ~5s, verified live.
+fn shape_sidecar_request(openai_body: &mut Value) {
+    if let Some(obj) = openai_body.as_object_mut() {
+        obj.insert("reasoning".to_string(), json!({"effort": "minimal"}));
+        obj.insert(
+            "max_output_tokens".to_string(),
+            json!(SIDECAR_ROUTED_MAX_TOKENS),
+        );
+    }
+}
+
+/// True when a translated sidecar reply carries usable text.
+///
+/// A 200 whose output budget went to reasoning is a dead spinner; treating it
+/// as a failure sends the sidecar down the direct path, which answers it.
+fn sidecar_text_present(anthropic: &Value) -> bool {
+    anthropic
+        .get("content")
+        .and_then(|c| c.as_array())
+        .is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                b.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && b.get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| !t.trim().is_empty())
+            })
+        })
+}
+
+/// Try the spinner sidecar on a routed Responses upstream, failing fast.
+///
+/// `Some` means the route answered with usable text. `None` means carry on:
+/// either the sidecar model names no Responses route (the direct path,
+/// today's behavior) or the routed attempt failed — a non-OK status, a
+/// transport error or timeout, an unparseable body, or empty text — and the
+/// direct path should answer instead.
+///
+/// One attempt, bounded by `sidecar_route_timeout`, no retry: spending a
+/// retry budget here would hold the status line through exactly the window
+/// the Haiku fallback needs. Deliberately lean — no CTX transforms, no
+/// compression, no replay parking, no outcome booking — so a routed sidecar
+/// leaves no per-conversation state, the invariant the direct path upholds.
+/// The only trace is the `sidecar_detected` line with `routed: true`.
+async fn try_routed_sidecar(
+    state: &AppState,
+    headers: &HeaderMap,
+    parsed: &Value,
+    request_id: &str,
+) -> Option<Response> {
+    let sidecar_model = state
+        .config
+        .sidecar_model
+        .clone()
+        .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
+    let route = sidecar_responses_route(&state.config.model_routes, &sidecar_model)?;
+    let target = route.target_model.clone()?;
+    let upstream = route.upstream.clone()?;
+
+    // The same shrink the direct path sends: tail messages, no tools,
+    // one-line system, 64 output tokens.
+    let shrunk = crate::sidecar::rewrite_sidecar(parsed, &sidecar_model);
+    let downstream_stream = shrunk
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // `false`: the client's 64-token cap is not forwarded — a reasoning
+    // model spends the budget on thinking first (see
+    // [`SIDECAR_ROUTED_MAX_TOKENS`]). The routed budget is set explicitly
+    // below.
+    let mut openai_body = anthropic_to_openai_responses_request(&shrunk, false).ok()?;
+    openai_body = apply_target_model_override(openai_body, Some(&target), true, true);
+    shape_sidecar_request(&mut openai_body);
+    let openai_bytes = serde_json::to_vec(&openai_body).ok()?;
+
+    let (upstream_headers, _) = upstream_auth_headers(
+        route.auth_env.as_deref(),
+        headers,
+        state.config.codex_auth_file.as_deref(),
+    )
+    .ok()?;
+
+    let base = upstream.as_str().trim_end_matches('/');
+    let upstream_url = format!("{}/v1/responses", base.trim_end_matches("/v1"));
+
+    tracing::info!(
+        event = "sidecar_routed_attempt",
+        request_id = %request_id,
+        model = %sidecar_model,
+        target = %target,
+        upstream = %upstream_url,
+        "trying the spinner sidecar on a routed Responses upstream"
+    );
+
+    let upstream_resp = state
+        .client
+        .post(&upstream_url)
+        .headers(upstream_headers)
+        .body(openai_bytes)
+        .timeout(state.config.sidecar_route_timeout)
+        .send()
+        .await
+        .ok()?;
+    if upstream_resp.status() != StatusCode::OK {
+        tracing::warn!(
+            event = "sidecar_routed_fallback",
+            request_id = %request_id,
+            status = upstream_resp.status().as_u16(),
+            "routed sidecar failed; falling back to the direct path"
+        );
+        return None;
+    }
+
+    let shape = crate::sidecar::SidecarShape {
+        original_messages: parsed
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map_or(0, |m| m.len()),
+        forwarded_messages: shrunk
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map_or(0, |m| m.len()),
+        model_from: parsed
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        model_to: sidecar_model.clone(),
+        routed: true,
+    };
+
+    if downstream_stream {
+        let stream = upstream_resp.bytes_stream();
+        // A fresh quota store, not the shared one: Zen's rate-limit headers
+        // must never pollute Codex quota tracking.
+        let translated = translate_openai_stream_to_anthropic(
+            stream,
+            sidecar_model,
+            crate::codex_rate_limits::CodexRateLimitStore::new(),
+            false,
+            None,
+        );
+        crate::sidecar::record_sidecar(request_id, &shape);
+        return Some(streaming_body_response(axum::body::Body::from_stream(
+            translated,
+        )));
+    }
+
+    let text = upstream_resp.text().await.ok()?;
+    let (turn, _) = responses_stream_to_turn(&text);
+    let anthropic_response =
+        crate::sse::ccr_stream::responses_output_as_anthropic_turn(&turn, &shrunk);
+    if !sidecar_text_present(&anthropic_response) {
+        tracing::warn!(
+            event = "sidecar_routed_fallback",
+            request_id = %request_id,
+            reason = "empty_text",
+            "routed sidecar returned no text; falling back to the direct path"
+        );
+        return None;
+    }
+    crate::sidecar::record_sidecar(request_id, &shape);
+
+    let body_bytes = serde_json::to_vec(&anthropic_response).ok()?;
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(body_bytes))
+            .expect("static response"),
+    )
+}
+
 /// Handle POST `/v1/messages` with local model routing.
 ///
 /// 1. Buffer the body
@@ -176,7 +401,7 @@ pub async fn handle_messages(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    mut body: Bytes,
 ) -> Response {
     // Clock for the request outcome, started before any work so the recorded
     // latency covers what the client actually waited for.
@@ -209,7 +434,9 @@ pub async fn handle_messages(
     // This runs ahead of the route table on purpose. A sidecar is a throwaway
     // four-word summary; whichever model the client named, it is answered on
     // the sidecar model against the default upstream with the client's own
-    // credentials.
+    // credentials — unless the sidecar model names a Responses route, in
+    // which case one bounded attempt goes there first (free-tier offload)
+    // and any failure lands back here.
     //
     // A `None` means either that this was not a sidecar or that the shrunk
     // request failed. Both want the same thing from here: fall through with
@@ -217,6 +444,9 @@ pub async fn handle_messages(
     // nor the rewrite mutates either, so the normal path below cannot tell that
     // this block ran.
     if crate::sidecar::is_describe_action_sidecar(&parsed) {
+        if let Some(resp) = try_routed_sidecar(&state, &headers, &parsed, &request_id).await {
+            return resp;
+        }
         let base = state.effective_upstream().await;
         if let Ok(url) = crate::proxy::build_upstream_url(&base, &uri) {
             let sidecar_model = state
@@ -236,6 +466,46 @@ pub async fn handle_messages(
             .await
             {
                 return resp;
+            }
+        }
+    }
+
+    // Cost-aware model routing (#1706): the same helper the passthrough path
+    // uses, applied here so a rewritten id still meets the route table below.
+    // A rule sending small tool-less turns at a `claude-*` alias routes them
+    // to that alias's upstream. Disabled by default; when no rule matches the
+    // bytes come back untouched.
+    //
+    // Runs after the sidecar block on purpose: a sidecar is answered and gone
+    // before this line, so routing can never claim one. On a rewrite both
+    // `parsed` and `body` move together, so the passthrough and no-match
+    // paths below see the model actually being sent — and a second
+    // application downstream is a no-op (the id already equals the target).
+    // Any serialization failure skips routing: it is an optimization, never
+    // a breakage.
+    {
+        let router = crate::model_router::ModelRouter::new(Some(state.config.model_router.clone()));
+        if router.enabled() {
+            if let Ok(buf) = serde_json::to_vec(&parsed) {
+                let routed = crate::model_router::apply_to_anthropic_body(
+                    Bytes::from(buf),
+                    &router,
+                    &request_id,
+                );
+                if let Ok(next) = serde_json::from_slice::<Value>(&routed) {
+                    let before = parsed
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let after = next
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if !after.is_empty() && after != before {
+                        parsed = next;
+                        body = routed;
+                    }
+                }
             }
         }
     }
@@ -2004,6 +2274,143 @@ mod tests {
             Some("Bearer xai-token")
         );
         std::env::remove_var("HEADROOM_TEST_NEWLINE_KEY");
+    }
+
+    /// `:auth=none` declares a public anonymous upstream: no Authorization
+    /// even when a Codex auth file is configured, and none of the Codex
+    /// identity headers either. This is what the OpenCode Zen free tier
+    /// route uses.
+    #[test]
+    fn none_sends_no_credential_despite_a_codex_auth_file() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, _codex_token) = codex_auth();
+        let auth_path = dir.path().join("auth.json");
+
+        // Seed the caller headers a broken impl could leak: the anonymous
+        // arm must drop them, not merge them.
+        let mut caller = HeaderMap::new();
+        caller.insert(
+            http::header::AUTHORIZATION,
+            "Bearer caller-key".parse().expect("valid header"),
+        );
+        caller.insert(
+            "ChatGPT-Account-ID",
+            "acct-caller".parse().expect("valid header"),
+        );
+
+        let (h, is_chatgpt) = upstream_auth_headers(Some("none"), &caller, auth_path.to_str())
+            .expect("none is always usable");
+
+        assert!(!is_chatgpt, "no credential is not ChatGPT auth");
+        assert_eq!(header(&h, "authorization"), None);
+        assert_eq!(header(&h, "ChatGPT-Account-ID"), None);
+        assert_eq!(header(&h, "originator"), None);
+        assert_eq!(header(&h, "user-agent"), None);
+        assert_eq!(
+            header(&h, "content-type").as_deref(),
+            Some("application/json")
+        );
+    }
+
+    /// Only Responses-shaped routes can serve a translated sidecar: the
+    /// shuttle speaks `/v1/responses` and rewrites the model id, so it needs
+    /// `translate`, a target, and an HTTP upstream.
+    #[test]
+    fn sidecar_route_qualifies_only_responses_routes() {
+        fn route(
+            prefix: &str,
+            translate: bool,
+            target: Option<&str>,
+            cursor: Option<&str>,
+            upstream: Option<&str>,
+        ) -> crate::config::ModelRoute {
+            crate::config::ModelRoute {
+                model_prefix: prefix.to_string(),
+                prefix_match: false,
+                upstream: upstream.map(|u| url::Url::parse(u).expect("valid url")),
+                translate,
+                cursor_agent: cursor.map(str::to_string),
+                target_model: target.map(str::to_string),
+                auth_env: None,
+            }
+        }
+        let zen = route(
+            "claude-muse-spark-1.3",
+            true,
+            Some("muse-spark-1.3-contributor-free"),
+            None,
+            Some("https://opencode.ai/zen/v1"),
+        );
+        assert!(
+            sidecar_responses_route(std::slice::from_ref(&zen), "claude-muse-spark-1.3").is_some()
+        );
+
+        // Passthrough: Anthropic in, Anthropic out, no model rewrite.
+        let passthrough = route(
+            "claude-passthrough",
+            false,
+            None,
+            None,
+            Some("https://api.meta.ai"),
+        );
+        assert!(
+            sidecar_responses_route(std::slice::from_ref(&passthrough), "claude-passthrough")
+                .is_none()
+        );
+
+        // A `cursor:` route is a subprocess transport with no HTTP upstream.
+        let cursor = route(
+            "claude-grok-4.6",
+            false,
+            None,
+            Some("cursor-grok-4.6-high"),
+            None,
+        );
+        assert!(
+            sidecar_responses_route(std::slice::from_ref(&cursor), "claude-grok-4.6").is_none()
+        );
+
+        // Translate without a target selects chat-completions, not Responses.
+        let chat = route(
+            "codex-5.5",
+            true,
+            None,
+            None,
+            Some("https://api.openai.com/v1"),
+        );
+        assert!(sidecar_responses_route(std::slice::from_ref(&chat), "codex-5.5").is_none());
+
+        // A name that matches nothing.
+        assert!(sidecar_responses_route(std::slice::from_ref(&zen), "claude-opus-5").is_none());
+    }
+
+    /// The forced effort and budget land on the translated body without
+    /// touching the rest.
+    #[test]
+    fn sidecar_request_shaping() {
+        let mut body = json!({"model": "m", "input": [], "max_output_tokens": 64});
+        shape_sidecar_request(&mut body);
+        assert_eq!(body["reasoning"], json!({"effort": "minimal"}));
+        assert_eq!(body["max_output_tokens"], 512);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["input"], json!([]));
+    }
+
+    /// Empty, whitespace-only, thinking-only and missing content all read as
+    /// "no text" and send the sidecar down the direct path.
+    #[test]
+    fn sidecar_empty_text_detection() {
+        assert!(sidecar_text_present(
+            &json!({"content": [{"type": "text", "text": "Reading foo.rs"}]})
+        ));
+        assert!(!sidecar_text_present(
+            &json!({"content": [{"type": "text", "text": "   "}]})
+        ));
+        assert!(!sidecar_text_present(
+            &json!({"content": [{"type": "thinking", "thinking": "hmm"}]})
+        ));
+        assert!(!sidecar_text_present(&json!({"content": []})));
+        assert!(!sidecar_text_present(&json!({})));
     }
 }
 

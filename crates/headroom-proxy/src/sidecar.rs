@@ -361,6 +361,9 @@ pub struct SidecarShape {
     pub forwarded_messages: usize,
     pub model_from: String,
     pub model_to: String,
+    /// True when a routed Responses upstream answered instead of the direct
+    /// path. The offload rate is `routed: true` lines over all of them.
+    pub routed: bool,
 }
 
 /// Emit the one INFO line and the one counter increment a sidecar produces.
@@ -373,6 +376,7 @@ pub fn record_sidecar(request_id: &str, shape: &SidecarShape) {
         forwarded_messages = shape.forwarded_messages,
         model_from = %shape.model_from,
         model_to = %shape.model_to,
+        routed = shape.routed,
         "answering spinner-text sidecar on a shrunk request"
     );
     crate::observability::sidecar::observe_detected(DESCRIBE_ACTION_KIND);
@@ -421,6 +425,7 @@ pub async fn try_handle(
                 .map_or(0, |m| m.len()),
             model_from,
             model_to: sidecar_model.to_string(),
+            routed: false,
         },
     );
     forward(
