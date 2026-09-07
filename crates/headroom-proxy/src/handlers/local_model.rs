@@ -532,6 +532,12 @@ pub async fn handle_messages(
     // application downstream is a no-op (the id already equals the target).
     // Any serialization failure skips routing: it is an optimization, never
     // a breakage.
+    // The model the client asked for, when the router rewrote it below.
+    // Everything keyed on conversation identity (session key, prefix replay,
+    // roster pin, prefix fingerprint) must derive from this, so a rerouted
+    // turn stays on the key its conversation already has. `None` when the
+    // client routed itself.
+    let mut identity_model: Option<String> = None;
     {
         let router = crate::model_router::ModelRouter::new(Some(state.config.model_router.clone()));
         if router.enabled() {
@@ -551,6 +557,7 @@ pub async fn handle_messages(
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
                     if !after.is_empty() && after != before {
+                        identity_model = Some(before.to_string());
                         parsed = next;
                         body = routed;
                     }
@@ -718,9 +725,15 @@ pub async fn handle_messages(
     // searchable archive as the Claude passthrough path, gated on the same
     // flags. Mutates `parsed` before translation.
     let transform_started = std::time::Instant::now();
-    let mut ctx_report =
-        apply_ctx_request_transforms(&state, &mut parsed, &headers, &client_addr, &request_id)
-            .await;
+    let mut ctx_report = apply_ctx_request_transforms(
+        &state,
+        &mut parsed,
+        &headers,
+        &client_addr,
+        &request_id,
+        identity_model.as_deref(),
+    )
+    .await;
 
     // Live-zone compression + freeze-replay, on the same flags as the Claude
     // path and in the same order (compress, then replay the cached prefix).
@@ -737,13 +750,13 @@ pub async fn handle_messages(
         ctx_transform_tokens_saved = ctx_tokens_saved,
         "routed-model savings split by transform scope"
     );
-    // A rerouted turn that falls back must not re-run the CTX stages: the
-    // first run already parked the replay prefix and captured the session.
-    // Overwrite the saved original with the already-transformed body so the
-    // fallback's `forward_http` sees the work as done.
-    if let Some(fb) = route_fallback.as_mut() {
-        fb.original_body = Bytes::from(serde_json::to_vec(&parsed).unwrap_or_default());
-    }
+    // TODO(route-fallback): a rerouted turn whose upstream fails should be
+    // re-dispatched to the client's own model via `forward_http` without
+    // re-running the CTX stages above — the replay prefix is already parked
+    // and the session already captured, so the fallback must reuse the
+    // already-transformed `parsed` rather than the saved original. Only the
+    // call-site hooks for that dispatch existed (an undefined
+    // `route_fallback.original_body`), so this is a marker, not machinery.
 
     // Tool pruning, schema compaction, then order stabilization — the Claude
     // path's closing sequence, and order matters within it: compaction runs
@@ -1845,7 +1858,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        apply_ctx_request_transforms(&state, &mut with_tools, &headers, &addr, "req-test").await;
+        apply_ctx_request_transforms(&state, &mut with_tools, &headers, &addr, "req-test", None)
+            .await;
         let names: Vec<&str> = with_tools["tools"]
             .as_array()
             .unwrap()
@@ -1858,7 +1872,15 @@ mod tests {
             "model": "claude-codex-5.6",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        apply_ctx_request_transforms(&state, &mut without_tools, &headers, &addr, "req-test").await;
+        apply_ctx_request_transforms(
+            &state,
+            &mut without_tools,
+            &headers,
+            &addr,
+            "req-test",
+            None,
+        )
+        .await;
         assert!(
             without_tools.get("tools").is_none(),
             "a request with no tools array must not grow one"
@@ -1877,8 +1899,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test").await;
-        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test").await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None).await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None).await;
         let count = body["tools"]
             .as_array()
             .unwrap()
@@ -1906,7 +1928,8 @@ mod tests {
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
         let report =
-            apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test").await;
+            apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None)
+                .await;
         assert_eq!(report.transforms_applied, vec!["ccr_tool".to_string()]);
         assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
