@@ -514,7 +514,6 @@ HEADROOM_FLAGS=(
   --smart-crusher-compaction true
   --min-tokens-to-crush 200
   --max-items-after-crush 15
-  --mechanical-effort low
   # 0 = no ratio target; the transforms decide
   --target-ratio 0
   --lossless false
