@@ -47,7 +47,7 @@ export HEADROOM_MEMORY_MODE=tool
 # dropping `require_no_tools` for small turns or adding a haiku rule.
 # The target MUST be a route alias below; an unknown id would ride the
 # default upstream and 404. Disable by unsetting the first line.
-export HEADROOM_MODEL_ROUTER_ENABLED=1
+export HEADROOM_MODEL_ROUTER_ENABLED=0
 export HEADROOM_MODEL_ROUTES='[{"name": "no-tools->spark", "require_no_tools": true, "to_model": "claude-muse-spark-1.3"}]'
 
 HEADROOM_FLAGS=(
