@@ -542,10 +542,15 @@ pub async fn handle_messages(
         let router = crate::model_router::ModelRouter::new(Some(state.config.model_router.clone()));
         if router.enabled() {
             if let Ok(buf) = serde_json::to_vec(&parsed) {
-                let routed = crate::model_router::apply_to_anthropic_body(
+                // Cooldowns are consulted here as well as in `forward_http`:
+                // a target parked by an earlier fallback must be passed over
+                // on this path too, or the routed upstream that just failed
+                // would be probed again on the very next turn.
+                let routed = crate::model_router::apply_to_anthropic_body_with_cooldowns(
                     Bytes::from(buf),
                     &router,
                     &request_id,
+                    Some(&state.model_route_cooldowns),
                 );
                 if let Ok(next) = serde_json::from_slice::<Value>(&routed) {
                     let before = parsed
@@ -750,13 +755,11 @@ pub async fn handle_messages(
         ctx_transform_tokens_saved = ctx_tokens_saved,
         "routed-model savings split by transform scope"
     );
-    // TODO(route-fallback): a rerouted turn whose upstream fails should be
-    // re-dispatched to the client's own model via `forward_http` without
-    // re-running the CTX stages above — the replay prefix is already parked
-    // and the session already captured, so the fallback must reuse the
-    // already-transformed `parsed` rather than the saved original. Only the
-    // call-site hooks for that dispatch existed (an undefined
-    // `route_fallback.original_body`), so this is a marker, not machinery.
+    // `parsed` from here on is what the fallback re-dispatches if the routed
+    // upstream refuses the turn: the replay prefix is already parked and the
+    // session already captured against this shape, so the second attempt
+    // reuses it rather than the client's original. See
+    // [`dispatch_route_fallback`].
 
     // Tool pruning, schema compaction, then order stabilization — the Claude
     // path's closing sequence, and order matters within it: compaction runs
@@ -1188,6 +1191,42 @@ pub async fn handle_messages(
     });
 
     if upstream_status != StatusCode::OK {
+        // The router chose this upstream and the upstream will not serve the
+        // turn. The client asked for its own model and is owed an answer on
+        // it, so park the target and re-dispatch rather than passing the
+        // failure down. Only a turn the router moved can come back this way:
+        // when the client named the alias itself there is nothing to fall
+        // back to and the error is the honest answer.
+        if let Some(client_model) = identity_model.clone() {
+            let window = state.config.model_router.cooldown();
+            let parked = state.model_route_cooldowns.start(body_model, window);
+            tracing::warn!(
+                event = "model_route_fallback",
+                request_id = %request_id,
+                routed_model = %body_model,
+                client_model = %client_model,
+                status = upstream_status.as_u16(),
+                cooldown_secs = window.as_secs(),
+                parked,
+                "routed upstream refused the turn; re-dispatching on the client's model"
+            );
+            // The failed attempt is deliberately not booked: it never
+            // produced a turn, and the fallback dispatch books this request
+            // once, under the model the client actually got served on.
+            drop(outcome_ctx);
+            drop(upstream_resp);
+            return dispatch_route_fallback(
+                state,
+                client_addr,
+                method,
+                uri,
+                headers,
+                parsed,
+                &client_model,
+                &request_id,
+            )
+            .await;
+        }
         handle_routed_error_response(upstream_resp, upstream_status, outcome_ctx).await
     } else if downstream_is_stream {
         handle_streaming_response(
@@ -1210,6 +1249,73 @@ pub async fn handle_messages(
     } else {
         handle_buffered_response(upstream_resp, &parsed, upstream_status, outcome_ctx, ccr).await
     }
+}
+
+/// Re-dispatch a turn whose routed upstream failed to the client's own model.
+///
+/// The body handed on is `parsed` — the request as it stood after the CTX
+/// stages ran, with only the model put back. Re-serialising the client's
+/// original would throw away the compression and the parked replay prefix that
+/// the first attempt already committed to, and the second attempt has to close
+/// those out under the same request id. [`SkipModelRouting`] carries that id
+/// and keeps `forward_http` from applying the rules that sent this turn to the
+/// upstream that just refused it.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_route_fallback(
+    state: AppState,
+    client_addr: SocketAddr,
+    method: Method,
+    uri: Uri,
+    mut headers: HeaderMap,
+    mut parsed: Value,
+    client_model: &str,
+    request_id: &str,
+) -> Response {
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(client_model.to_string()));
+    }
+    let body = match serde_json::to_vec(&parsed) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(
+                event = "handler_error",
+                handler = "messages_local_model",
+                error = %e,
+                "failed to serialise the fallback body"
+            );
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal handler error"))
+                .expect("static response");
+        }
+    };
+    // The routed attempt rewrote the body; the client's length no longer
+    // describes it, and a stale one would truncate the fallback request.
+    headers.remove(http::header::CONTENT_LENGTH);
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(hs) = builder.headers_mut() {
+        *hs = headers;
+    }
+    let mut req = match builder.body(Body::from(body)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                event = "handler_error",
+                handler = "messages_local_model",
+                error = %e,
+                "failed to build the fallback request"
+            );
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal handler error"))
+                .expect("static response");
+        }
+    };
+    req.extensions_mut()
+        .insert(crate::proxy::SkipModelRouting(request_id.to_string()));
+    forward_http(state, client_addr, req)
+        .await
+        .unwrap_or_else(|e| e.into_response())
 }
 
 /// Return a routed upstream failure without translating its status or
