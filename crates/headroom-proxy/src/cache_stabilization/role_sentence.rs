@@ -281,8 +281,15 @@ mod tests {
         assert_eq!(pins.hold(&mut again, "c2"), Hold::Matched);
 
         let mut flipped = body(STYLED);
-        assert_eq!(pins.hold(&mut flipped, "c2"), Hold::Held(STYLED.to_string()));
-        assert_eq!(sentence_of(&flipped), PLAIN, "flip was held to the opening form");
+        assert_eq!(
+            pins.hold(&mut flipped, "c2"),
+            Hold::Held(STYLED.to_string())
+        );
+        assert_eq!(
+            sentence_of(&flipped),
+            PLAIN,
+            "flip was held to the opening form"
+        );
     }
 
     #[test]
@@ -292,6 +299,22 @@ mod tests {
         assert_eq!(Hold::Matched.label(), "matched");
         assert_eq!(Hold::Absent.label(), "absent");
         assert_eq!(Hold::Reshaped.label(), "reshaped");
+        assert_eq!(Hold::Relatched.label(), "relatched");
+        assert_eq!(Hold::NotWritable.label(), "not_writable");
+    }
+
+    #[test]
+    fn only_the_outcomes_worth_reading_are_noteworthy() {
+        // The healthy steady state happens on every turn and must not
+        // reach the proxy's default `info` level.
+        assert!(!Hold::Held(String::new()).is_noteworthy());
+        assert!(!Hold::Matched.is_noteworthy());
+        assert!(!Hold::Latched.is_noteworthy());
+        // Each of these means the hold wanted to act and could not.
+        assert!(Hold::Absent.is_noteworthy());
+        assert!(Hold::Reshaped.is_noteworthy());
+        assert!(Hold::Relatched.is_noteworthy());
+        assert!(Hold::NotWritable.is_noteworthy());
     }
 
     #[test]
@@ -299,7 +322,11 @@ mod tests {
         let pins = RoleSentencePins::new(4);
         pins.hold(&mut body(PLAIN), "c1");
         let mut other = body(STYLED);
-        assert_eq!(pins.hold(&mut other, "c2"), Hold::Latched, "c2's first sight");
+        assert_eq!(
+            pins.hold(&mut other, "c2"),
+            Hold::Latched,
+            "c2's first sight"
+        );
         assert_eq!(sentence_of(&other), STYLED);
     }
 
@@ -310,7 +337,11 @@ mod tests {
         assert_eq!(pins.hold(&mut b, "c1").rewrote(), None);
         assert_eq!(b["system"], "Be helpful.");
         let mut later = body(PLAIN);
-        assert_eq!(pins.hold(&mut later, "c1"), Hold::Latched, "still first sight");
+        assert_eq!(
+            pins.hold(&mut later, "c1"),
+            Hold::Latched,
+            "still first sight"
+        );
     }
 
     #[test]

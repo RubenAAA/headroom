@@ -152,6 +152,29 @@ impl Hold {
         }
     }
 
+    /// Whether this outcome is worth an operator's attention.
+    ///
+    /// The proxy runs at `info`, so a no-op logged at `debug` is a no-op
+    /// nobody can see — which is the hole this enum was added to close.
+    /// `Matched` and `Latched` are the healthy steady state and happen on
+    /// essentially every turn, so they stay at `debug`. The rest each mean
+    /// a hold wanted to act and could not, and there are few enough of
+    /// them per day to belong at `info`:
+    ///
+    /// - `Absent` every turn means the hold is aimed at a field this
+    ///   client does not send, or the shape moved under us.
+    /// - `Reshaped` means it found drift and declined, to avoid putting a
+    ///   value on the wrong line.
+    /// - `Relatched` means a pin aged out, so the next turn re-creates the
+    ///   prefix by design.
+    /// - `NotWritable` means the field was read but could not be written.
+    pub fn is_noteworthy(&self) -> bool {
+        matches!(
+            self,
+            Hold::Absent | Hold::Reshaped | Hold::Relatched | Hold::NotWritable
+        )
+    }
+
     /// A short stable label, for logs and for counting outcomes.
     pub fn label(&self) -> &'static str {
         match self {

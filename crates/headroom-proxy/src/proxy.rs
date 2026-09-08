@@ -2492,14 +2492,29 @@ fn hold_working_directory_value(
     let Some(live) = outcome.rewrote() else {
         // Every no-op reason gets a line. "Never fired" and "fired and
         // found nothing to do" are the same count of zero otherwise, and
-        // only one of them means the hold is working.
-        tracing::debug!(
-            event = "working_directory_hold_skipped",
-            request_id = %request_id,
-            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
-            outcome = outcome.label(),
-            "working-directory hold changed nothing"
-        );
+        // only one of them means the hold is working. The proxy runs at
+        // `info`, so the outcomes that mean something went wrong are
+        // logged there; the healthy steady state stays at `debug` rather
+        // than putting a line on every turn.
+        let session_key_hash =
+            cache_stabilization::drift_detector::session_key_log_prefix(session_key);
+        if outcome.is_noteworthy() {
+            tracing::info!(
+                event = "working_directory_hold_skipped",
+                request_id = %request_id,
+                session_key_hash = %session_key_hash,
+                outcome = outcome.label(),
+                "working-directory hold changed nothing"
+            );
+        } else {
+            tracing::debug!(
+                event = "working_directory_hold_skipped",
+                request_id = %request_id,
+                session_key_hash = %session_key_hash,
+                outcome = outcome.label(),
+                "working-directory hold changed nothing"
+            );
+        }
         return false;
     };
     // The path is the operator's own filesystem, and the session key is
@@ -2528,13 +2543,28 @@ fn hold_role_sentence_value(
 ) -> bool {
     let outcome = pins.hold(value, session_key);
     let Some(live) = outcome.rewrote() else {
-        tracing::debug!(
-            event = "role_sentence_hold_skipped",
-            request_id = %request_id,
-            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
-            outcome = outcome.label(),
-            "role-sentence hold changed nothing"
-        );
+        // Same split as the working-directory hold: an outcome that means
+        // the hold wanted to act and could not is worth an `info` line at
+        // the proxy's default level, the steady state is not.
+        let session_key_hash =
+            cache_stabilization::drift_detector::session_key_log_prefix(session_key);
+        if outcome.is_noteworthy() {
+            tracing::info!(
+                event = "role_sentence_hold_skipped",
+                request_id = %request_id,
+                session_key_hash = %session_key_hash,
+                outcome = outcome.label(),
+                "role-sentence hold changed nothing"
+            );
+        } else {
+            tracing::debug!(
+                event = "role_sentence_hold_skipped",
+                request_id = %request_id,
+                session_key_hash = %session_key_hash,
+                outcome = outcome.label(),
+                "role-sentence hold changed nothing"
+            );
+        }
         return false;
     };
     tracing::info!(
@@ -2989,7 +3019,7 @@ impl Drop for InflightGuard {
 /// attempt close out the replay and usage entries the first one parked.
 #[derive(Clone)]
 pub(crate) struct SkipModelRouting(pub(crate) String);
-pub(crate) struct SkipCtx;
+
 pub(crate) async fn forward_http(
     state: AppState,
     client_addr: SocketAddr,
@@ -4968,12 +4998,7 @@ pub(crate) async fn forward_http(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
         ) {
-            apply_system_holds_to_bytes(
-                &state,
-                body_to_send,
-                &request_session_key,
-                &request_id,
-            )
+            apply_system_holds_to_bytes(&state, body_to_send, &request_session_key, &request_id)
         } else {
             body_to_send
         };
@@ -8578,7 +8603,7 @@ async fn run_sse_state_machine(
                     observe_proactive_expansion_cache_write(ctx, cache_baseline_write);
                 }
                 usage_observer.note_output_tokens(&request_id, state.usage.output_tokens);
-            let class = usage_observer.complete(
+                let class = usage_observer.complete(
                     &request_id,
                     cache_baseline_input,
                     cache_baseline_read,
