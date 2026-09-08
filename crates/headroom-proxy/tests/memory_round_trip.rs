@@ -394,6 +394,7 @@ async fn an_explicit_project_files_the_memory_under_that_repository() {
     // resolves a live session's cwd.
     let other = dir.path().join("sibling-repo");
     std::fs::create_dir_all(other.join(".git")).unwrap();
+    std::fs::write(other.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
 
     let here = "default::somewhere-else-0000000000000000";
     let saved = call_as(

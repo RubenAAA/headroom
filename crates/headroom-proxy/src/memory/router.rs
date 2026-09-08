@@ -277,7 +277,14 @@ impl ProjectResolver {
         let mut cursor = Some(dir);
         while let Some(path) = cursor {
             let git = path.join(".git");
-            if git.is_dir() {
+            // A directory named `.git` is not a repository; one containing a
+            // `HEAD` is. Accepting the bare name let any stray or half-removed
+            // `.git` above a project re-root it -- an empty `/tmp/.git` on this
+            // machine made every temp-dir project resolve to `tmp`, which is
+            // two different projects sharing one memory partition. The `.git`
+            // *file* case below needs no such check: it is only accepted when
+            // its `gitdir:` pointer parses.
+            if git.is_dir() && git.join("HEAD").is_file() {
                 return path.to_path_buf();
             }
             if git.is_file() {
@@ -512,6 +519,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("shopkit");
         std::fs::create_dir_all(repo.join(".git/worktrees/access-gates")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(repo.join("apps/api")).unwrap();
 
         let worktree = tmp.path().join("wt-access-gates");

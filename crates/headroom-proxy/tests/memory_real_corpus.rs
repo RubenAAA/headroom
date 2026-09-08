@@ -547,6 +547,7 @@ async fn a_new_repository_gets_a_partition_on_first_save() {
     let tmp = tempfile::tempdir().unwrap();
     let fresh = tmp.path().join("freshly-cloned");
     std::fs::create_dir_all(fresh.join(".git")).unwrap();
+    std::fs::write(fresh.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     let store = tempfile::tempdir().unwrap();
     let handler = handler(store.path(), 5);
 
@@ -656,6 +657,7 @@ async fn repositories_with_the_same_name_do_not_collide() {
     let tmp = tempfile::tempdir().unwrap();
     let key = |dir: &std::path::Path| {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         headroom_proxy::memory::router::scoped_user_id(
             "default",
             &headroom_proxy::memory::router::RequestContext {
