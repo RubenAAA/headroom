@@ -123,6 +123,20 @@ def merge_request(iid):
     return mr if status == 200 else None
 
 
+def resolve(iid, discussion_id, resolved=True):
+    """Close a thread, or reopen it.
+
+    Separate from `reply` on purpose: a verdict is posted whether or not the
+    thread closes, and closing without saying why is the thing this whole
+    exercise exists to stop.
+    """
+    return call(
+        "PUT",
+        f"/projects/{PROJ_ENC}/merge_requests/{iid}/discussions/{discussion_id}"
+        f"?resolved={'true' if resolved else 'false'}",
+    )
+
+
 def reply(iid, discussion_id, body):
     """Append a note to an existing thread. No position: it inherits the
     thread's anchor, which is why replies cannot suffer the `position: null`

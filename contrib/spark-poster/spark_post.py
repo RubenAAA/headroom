@@ -84,7 +84,8 @@ def main():
             raise SystemExit(f"discussion {did} is not on MR !{iid}")
         mk = marker_for(did, body)
         (skipped if already_posted(before[did], mk) else planned).append(
-            {"discussion_id": did, "body": body, "marker": mk}
+            {"discussion_id": did, "body": body, "marker": mk,
+             "resolve": bool(r.get("resolve"))}
         )
 
     print(f"MR !{iid}: {len(planned)} to post, {len(skipped)} already present")
@@ -124,6 +125,22 @@ def main():
         else:
             missing.append(p)
 
+    # Resolve only what verified. A thread closed on the strength of a note
+    # that never landed is the worst of both: the objection looks answered and
+    # the answer is nowhere.
+    verified_ids = {v["discussion_id"] for v in verified}
+    resolved, resolve_failed = [], []
+    for p in planned + skipped:
+        if not p.get("resolve") or p["discussion_id"] not in verified_ids:
+            continue
+        status, _ = gl.resolve(iid, p["discussion_id"])
+        if status == 200:
+            resolved.append(p["discussion_id"])
+            print(f"resolved {p['discussion_id'][:12]}")
+        else:
+            resolve_failed.append({"discussion_id": p["discussion_id"], "status": status})
+            print(f"RESOLVE FAILED {status} on {p['discussion_id'][:12]}")
+
     os.makedirs(PROOF_DIR, exist_ok=True)
     proof_path = os.path.join(PROOF_DIR, f"{session}.proof.json")
     proof = {
@@ -137,11 +154,13 @@ def main():
         "posted": len(posted),
         "failed": failed,
         "verified": verified,
+        "resolved": resolved,
+        "resolve_failed": resolve_failed,
         "unverified": [
             {"discussion_id": m["discussion_id"], "marker": m["marker"]}
             for m in missing
         ],
-        "ok": not failed and not missing,
+        "ok": not failed and not missing and not resolve_failed,
     }
     with open(proof_path, "w") as fh:
         json.dump(proof, fh, indent=2)

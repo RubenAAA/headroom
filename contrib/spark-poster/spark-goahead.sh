@@ -27,7 +27,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DRAFT="$DIR/$SESSION.draft.json"
 GOAHEAD="$DIR/$SESSION.goahead"
-PROOF="$DIR/$SESSION.proof.json"
 LOG="$DIR/$SESSION.goahead.log"
 
 log() { echo "[$(date -Is)] $*" | tee -a "$LOG" >&2; }
@@ -35,6 +34,14 @@ log() { echo "[$(date -Is)] $*" | tee -a "$LOG" >&2; }
 mkdir -p "$DIR"
 
 [ -f "$DRAFT" ] || { log "no draft at $DRAFT; nothing to wait for"; exit 1; }
+
+# The poster names its proof after the draft's session_id, which need not match
+# the file stem we were invoked with. Deriving it from the draft rather than
+# from "$SESSION" is what makes the post-twice refusal below actually look at
+# the file the poster writes -- the first live run checked a path that never
+# existed and would have happily posted the whole batch again.
+PROOF_SESSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session_id") or "nosession")' "$DRAFT")"
+PROOF="$DIR/$PROOF_SESSION.proof.json"
 if [ -f "$PROOF" ]; then
   log "proof already exists at $PROOF; refusing to post twice"
   exit 0
