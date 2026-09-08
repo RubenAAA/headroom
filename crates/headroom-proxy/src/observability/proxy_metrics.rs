@@ -552,6 +552,39 @@ pub fn record_unified_rate_limit(snapshot: &UnifiedRateLimitSnapshot, request_id
         unified_fallback_percentage_gauge(registry).set(p);
     }
 
+    // Under subscription auth there is no Console usage export to check the
+    // books against — Console reports API-key traffic only. Anthropic's own
+    // utilization meter is then the one number about this account that the
+    // proxy did not compute itself, and it lived only in a Prometheus gauge,
+    // which holds the present value and no history. Logged here on change so a
+    // window's consumption can be set beside the tokens the books recorded
+    // over the same window. Changes arrive in roughly 1% steps, so this is a
+    // handful of lines an hour, not one per request.
+    for w in &snapshot.windows {
+        let Some(util) = w.utilization else {
+            continue;
+        };
+        static LAST: OnceLock<std::sync::Mutex<std::collections::HashMap<String, f64>>> =
+            OnceLock::new();
+        let last = LAST.get_or_init(Default::default);
+        let changed = match last.lock() {
+            Ok(mut seen) => seen.insert(w.window.clone(), util) != Some(util),
+            // A poisoned lock must not cost us the sample; log it and move on.
+            Err(_) => true,
+        };
+        if changed {
+            tracing::info!(
+                event = "unified_utilization_sample",
+                request_id = %request_id,
+                window = %w.window,
+                utilization = util,
+                reset_unix = w.reset.unwrap_or(0),
+                status = w.status.as_deref().unwrap_or(""),
+                "anthropic's own meter for this subscription window moved"
+            );
+        }
+    }
+
     tracing::debug!(
         event = "metric_recorded",
         metric = "proxy_ratelimit_unified_*",

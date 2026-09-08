@@ -1030,17 +1030,158 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             priced_cost_usd = priced_cost,
             "savings ledger pricing counterfactuals"
         );
-        tokio::task::spawn_blocking(move || {
-            headroom_core::savings_ledger::record_from_forwarded_with_cost(
+        let offload = offload_savings(outcome);
+        // Widening the gate above brought turns here that never reached this
+        // line before, including ones booked outside a runtime. `spawn_blocking`
+        // panics off-runtime, and a ledger append must never be the thing that
+        // takes a request down — write inline when there is no pool to hand it
+        // to. The counterfactuals are already logged either way.
+        if tokio::runtime::Handle::try_current().is_err() {
+            write_savings_ledger(
                 forwarded,
                 saved,
-                Some(&model),
+                &model,
                 client.as_deref(),
-                Some(priced_cost),
-                Some(&priced_basis),
+                priced_cost,
+                &priced_basis,
+                offload,
+            );
+            return;
+        }
+        tokio::task::spawn_blocking(move || {
+            write_savings_ledger(
+                forwarded,
+                saved,
+                &model,
+                client.as_deref(),
+                priced_cost,
+                &priced_basis,
+                offload,
             );
         });
     }
+}
+
+/// Append this turn's compression saving and, when the router moved it, the
+/// bill its original model never saw. Takes a cross-process flock, so callers
+/// hand it to the blocking pool when there is one.
+#[allow(clippy::too_many_arguments)]
+fn write_savings_ledger(
+    forwarded: i64,
+    saved: i64,
+    model: &str,
+    client: Option<&str>,
+    priced_cost: f64,
+    priced_basis: &str,
+    offload: Option<OffloadSavings>,
+) {
+    headroom_core::savings_ledger::record_from_forwarded_with_cost(
+        forwarded,
+        saved,
+        Some(model),
+        client,
+        Some(priced_cost),
+        Some(priced_basis),
+    );
+    if let Some(offload) = offload {
+        headroom_core::savings_ledger::record_savings_event(
+            headroom_core::savings_ledger::SavingsEvent {
+                tokens_before: offload.tokens,
+                tokens_after: 0,
+                model: Some(&offload.from_model),
+                client: None,
+                source: Some("proxy"),
+                timestamp: None,
+                cost_usd: Some(offload.saved_usd),
+                cost_basis: Some("model_offload"),
+                fallback_rate: None,
+                path: None,
+            },
+        );
+    }
+}
+
+/// What a rerouted turn saved by not running on the model the client asked
+/// for: the tokens that model never billed, and the money they would have
+/// cost there minus what they cost where the turn actually ran.
+///
+/// Both legs price through the same helper on the same token counts, so an
+/// unknown model on either side cannot make them disagree — it moves both.
+/// `uncached_input_tokens` rather than `optimized_tokens` because the
+/// routed path folds the cached prefix into its input count, and adding
+/// `cache_read_tokens` on top would bill that prefix twice.
+///
+/// `None` for a turn the client's own model served, and for a failed one:
+/// a reroute that 502s saved nothing, it just cost the user a turn.
+fn offload_savings(
+    outcome: &headroom_core::request_outcome::RequestOutcome,
+) -> Option<OffloadSavings> {
+    let from_model = outcome.routed_from_model.clone()?;
+    if !(200..300).contains(&outcome.status_code) {
+        return None;
+    }
+    let fresh = outcome.uncached_input_tokens.max(0);
+    let out = outcome.output_tokens.max(0);
+    let read = outcome.cache_read_tokens.max(0);
+    let write = outcome.cache_write_tokens.max(0);
+    let tokens = fresh + out + read + write;
+    if tokens <= 0 {
+        return None;
+    }
+    // The counterfactual has to price the write at the TTL the provider
+    // actually billed. The client's model would have been charged 2.0x input
+    // on a 1-hour write against 1.25x on a 5-minute one, and the 1h tier is the
+    // common case here, so pricing both legs flat at 5m understated what the
+    // reroute avoided.
+    let write_1h = outcome.cache_write_1h_tokens;
+    let fallback = headroom_core::savings_ledger::DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN;
+    let would_have_cost = headroom_core::pricing::estimate_cost_usd_split(
+        &from_model,
+        fresh,
+        out,
+        read,
+        write,
+        write_1h,
+        fallback,
+    );
+    let did_cost = headroom_core::pricing::estimate_cost_usd_split(
+        &outcome.model,
+        fresh,
+        out,
+        read,
+        write,
+        write_1h,
+        fallback,
+    );
+    let saved_usd = (would_have_cost - did_cost).max(0.0);
+    tracing::info!(
+        event = "model_offload_savings",
+        request_id = %outcome.request_id,
+        from_model = %from_model,
+        to_model = %outcome.model,
+        tokens,
+        fresh_input_tokens = fresh,
+        cache_read_tokens = read,
+        cache_write_tokens = write,
+        output_tokens = out,
+        would_have_cost_usd = would_have_cost,
+        did_cost_usd = did_cost,
+        saved_usd,
+        "turn served off the client's model: tokens and cost it never billed"
+    );
+    Some(OffloadSavings {
+        from_model,
+        tokens,
+        saved_usd,
+    })
+}
+
+/// One rerouted turn's contribution to the ledger, computed on the request
+/// thread and moved to the blocking pool with the compression entry.
+struct OffloadSavings {
+    from_model: String,
+    tokens: i64,
+    saved_usd: f64,
 }
 
 /// Build the axum app. `/healthz` and `/healthz/upstream` are intercepted;
@@ -8373,7 +8514,8 @@ async fn run_sse_state_machine(
                 if let Some(ctx) = outcome_ctx.as_ref() {
                     observe_proactive_expansion_cache_write(ctx, cache_baseline_write);
                 }
-                let class = usage_observer.complete(
+                usage_observer.note_output_tokens(&request_id, state.usage.output_tokens);
+            let class = usage_observer.complete(
                     &request_id,
                     cache_baseline_input,
                     cache_baseline_read,
@@ -8472,7 +8614,10 @@ async fn run_sse_state_machine(
                 // Prometheus counter above resets with the process; the books
                 // do not.
                 if let Some(ref ctx) = outcome_ctx {
-                    ctx.sink.savings_tracker.record_unbooked_turn();
+                    ctx.sink.savings_tracker.record_unbooked_turn(
+                        state.usage.input_tokens as i64,
+                        state.usage.output_tokens as i64,
+                    );
                 }
                 tracing::warn!(
                     request_id = %request_id,
@@ -12492,6 +12637,66 @@ mod image_census_tests {
         })];
 
         assert_eq!(image_census(&messages), (1, 0, 8));
+    }
+}
+
+#[cfg(test)]
+mod offload_savings_tests {
+    use super::*;
+    use headroom_core::request_outcome::RequestOutcome;
+
+    /// A tool-less Opus turn the router sent to the free Spark tier: 26,015
+    /// fresh input tokens, a 1,000-token cache read, 500 out.
+    fn spark_turn() -> RequestOutcome {
+        RequestOutcome {
+            model: "muse-spark-1.3-contributor-free".into(),
+            routed_from_model: Some("claude-opus-5".into()),
+            status_code: 200,
+            uncached_input_tokens: 26_015,
+            cache_read_tokens: 1_000,
+            cache_write_tokens: 0,
+            output_tokens: 500,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_rerouted_turn_is_credited_the_bill_it_never_sent() {
+        let s = offload_savings(&spark_turn()).expect("a served reroute saves something");
+        assert_eq!(s.from_model, "claude-opus-5");
+        assert_eq!(s.tokens, 27_515);
+        // Opus 5: $5/MTok in, $25/MTok out, $0.50/MTok cache read. Spark is
+        // free, so the whole counterfactual is the saving.
+        let expected = 26_015.0 * 5.0 / 1e6 + 500.0 * 25.0 / 1e6 + 1_000.0 * 0.5 / 1e6;
+        assert!(
+            (s.saved_usd - expected).abs() < 1e-12,
+            "{} != {expected}",
+            s.saved_usd
+        );
+    }
+
+    #[test]
+    fn a_turn_the_clients_own_model_served_is_not_an_offload() {
+        let mut o = spark_turn();
+        o.routed_from_model = None;
+        assert!(offload_savings(&o).is_none());
+    }
+
+    #[test]
+    fn a_failed_reroute_saves_nothing() {
+        // The Zen upstream 503s and, with no fallback wired, the turn dies.
+        // Booking a saving there would pay us for losing the user's turn.
+        let mut o = spark_turn();
+        o.status_code = 503;
+        assert!(offload_savings(&o).is_none());
+    }
+
+    #[test]
+    fn a_reroute_to_a_dearer_model_never_books_a_negative_saving() {
+        let mut o = spark_turn();
+        o.model = "claude-opus-5".into();
+        o.routed_from_model = Some("claude-haiku-4-5".into());
+        assert_eq!(offload_savings(&o).unwrap().saved_usd, 0.0);
     }
 }
 

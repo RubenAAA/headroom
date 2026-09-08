@@ -559,6 +559,7 @@ mod tests {
             request_id: "req-from-outcome".into(),
             provider: "anthropic".into(),
             model: "claude-sonnet-4-20250514".into(),
+            routed_from_model: None,
             status_code: 200,
             upstream_attempts: 1,
             provider_input_tokens: None,

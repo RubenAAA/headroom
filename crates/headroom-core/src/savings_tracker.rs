@@ -844,9 +844,10 @@ impl SavingsTracker {
     /// Record one turn dropped from the books because its stream ended without
     /// the terminal event carrying the usage totals. See
     /// [`crate::persistent_metrics::PersistentMetricsState::record_unbooked_turn`].
-    pub fn record_unbooked_turn(&self) {
+    pub fn record_unbooked_turn(&self, partial_input_tokens: i64, partial_output_tokens: i64) {
         let mut st = self.state.lock().unwrap();
-        st.metrics.record_unbooked_turn();
+        st.metrics
+            .record_unbooked_turn(partial_input_tokens, partial_output_tokens);
         self.save(&mut st);
     }
 

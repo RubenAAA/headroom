@@ -525,6 +525,16 @@ pub struct WireFootprintState {
     /// resets on restart while the books it qualifies do not: a lifetime
     /// savings figure needs a lifetime count of what it is missing.
     pub unbooked_turns: i64,
+    /// Input tokens on those dropped turns, as far as the stream got.
+    ///
+    /// A lower bound, not the bill: the counts are whatever the last
+    /// `message_start` reported before the stream broke. Kept because a count
+    /// of turns says nothing about size — one dropped turn can carry more
+    /// tokens than a hundred small ones, and without this the shortfall
+    /// between these books and the provider's invoice has no floor.
+    pub unbooked_input_tokens: i64,
+    /// Output tokens on those dropped turns, same partial basis.
+    pub unbooked_output_tokens: i64,
 }
 
 /// Per-tool definition size and call count.
@@ -793,6 +803,8 @@ impl PersistentMetricsState {
             provider_cache_write_tokens: coerce_int(get(raw_wire, "provider_cache_write_tokens")),
             measured_requests: coerce_int(get(raw_wire, "measured_requests")),
             unbooked_turns: coerce_int(get(raw_wire, "unbooked_turns")),
+            unbooked_input_tokens: coerce_int(get(raw_wire, "unbooked_input_tokens")),
+            unbooked_output_tokens: coerce_int(get(raw_wire, "unbooked_output_tokens")),
         };
         let raw_tools = dict_or_empty(get(raw, "tool_inventory"));
         let definition_bytes =
@@ -851,8 +863,11 @@ impl PersistentMetricsState {
 
     /// Record one turn the books had to drop because its stream ended without
     /// the terminal event carrying the usage totals.
-    pub fn record_unbooked_turn(&mut self) {
-        self.state.wire_footprint.unbooked_turns += 1;
+    pub fn record_unbooked_turn(&mut self, partial_input_tokens: i64, partial_output_tokens: i64) {
+        let wire = &mut self.state.wire_footprint;
+        wire.unbooked_turns += 1;
+        wire.unbooked_input_tokens += partial_input_tokens.max(0);
+        wire.unbooked_output_tokens += partial_output_tokens.max(0);
     }
 
     /// Record the tool definitions a request carried and the calls the model
@@ -1018,6 +1033,8 @@ impl PersistentMetricsState {
             // rather than leave it to a Prometheus counter that resets on
             // restart.
             "unbooked_turns": self.state.wire_footprint.unbooked_turns,
+            "unbooked_input_tokens": self.state.wire_footprint.unbooked_input_tokens,
+            "unbooked_output_tokens": self.state.wire_footprint.unbooked_output_tokens,
             // Free on a subscription, so a high read count against a low write
             // count is the shape you want.
             "verdict": if saved == 0 && busted == 0 {

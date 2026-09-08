@@ -23,6 +23,17 @@ impl Drop for StreamTranslator {
             let usage = self.last_usage.clone();
             self.emit_outcome(usage.as_ref(), 200);
         }
+        if self.outcome.is_some() && !self.observation_completed && self.last_usage.is_some() {
+            // A stream that died mid-flight still billed whatever the provider
+            // last reported. Booking it here is what keeps a dropped stream
+            // from leaving its tokens out of the cache-health totals.
+            //
+            // Only when usage actually arrived. With none, every counter would
+            // be a zero this code invented, and a fabricated turn class is
+            // worse than the pending entry the LRU is about to evict.
+            let usage = self.last_usage.clone();
+            self.complete_usage_observation(usage.as_ref());
+        }
     }
 }
 
@@ -68,6 +79,11 @@ pub(crate) struct StreamTranslator {
     /// event *and* a trailing `[DONE]`, and the buffered fallback can fire on
     /// top of that.
     outcome_emitted: bool,
+    /// Whether the CTX-7 usage observation parked by `begin_request` has been
+    /// closed. Separate from `outcome_emitted`: the outcome and the observation
+    /// are booked by different code on different events, and either can fire
+    /// without the other.
+    observation_completed: bool,
     /// Latched on the first upstream frame — the only point where TTFB is
     /// observable.
     ttfb_ms: f64,
@@ -154,6 +170,7 @@ impl StreamTranslator {
             codex_rate_limits_finished: false,
             outcome: None,
             outcome_emitted: false,
+            observation_completed: false,
             ttfb_ms: 0.0,
             last_usage: None,
         }
@@ -204,7 +221,10 @@ impl StreamTranslator {
     /// The observer takes Anthropic-named counters. The Responses API reports
     /// cache reads but has no cache-creation counter, so zero goes in for
     /// writes — the same mapping used elsewhere on this path.
-    fn complete_usage_observation(&self, usage: Option<&Value>) {
+    fn complete_usage_observation(&mut self, usage: Option<&Value>) {
+        if self.observation_completed {
+            return;
+        }
         let Some(ctx) = self.outcome.as_ref() else {
             return;
         };
@@ -225,9 +245,16 @@ impl StreamTranslator {
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        // Both OpenAI shapes report an `input_tokens` that *includes* the
+        // cached prefix; the observer's counter is Anthropic-shaped and
+        // excludes it, and it adds `cache_read` back on to form the
+        // denominator. Passing the provider's number straight through counts
+        // the prefix twice and drags every routed turn's hit rate down.
+        let provider_input = get("input_tokens").max(get("prompt_tokens"));
+        observer.note_output_tokens(&ctx.request_id, self.total_output_tokens);
         let class = observer.complete(
             &ctx.request_id,
-            get("input_tokens").max(get("prompt_tokens")),
+            provider_input.saturating_sub(cache_read),
             cache_read,
             0,
             // The Responses API publishes no cache-creation counter at all, so
@@ -235,6 +262,7 @@ impl StreamTranslator {
             // which would claim this endpoint wrote nothing at either tier.
             None,
         );
+        self.observation_completed = true;
         // Persist it, same as the Claude path: the observer's counters are
         // in-memory and reset on restart.
         if let Some(class) = class {
@@ -321,6 +349,13 @@ impl StreamTranslator {
                 // one arrives. No-op when a terminal event already booked it.
                 let usage = self.last_usage.clone();
                 self.emit_outcome(usage.as_ref(), 200);
+                // The observation needs the same last-chance close. Only
+                // `response.completed` closed it before, and that event exists
+                // only in the Responses API — every Chat Completions turn (all
+                // of the cost-routed traffic) left its pending entry to be
+                // evicted from the LRU unclassified, so routed turns never
+                // reached the cache-health counters at all.
+                self.complete_usage_observation(usage.as_ref());
             }
             if data.trim() == "[DONE]" && self.open.is_some() {
                 self.close_block_final(&mut events);

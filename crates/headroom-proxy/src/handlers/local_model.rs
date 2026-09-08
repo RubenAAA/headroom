@@ -8,7 +8,7 @@
 use crate::openai::response::{openai_to_anthropic_response, responses_stream_to_turn};
 use crate::openai::stream::translate_openai_stream_to_anthropic;
 use crate::routed::outcome::{
-    book_routed_outcome, book_routed_outcome_with_ccr, build_routed_outcome_context,
+    book_routed_outcome, book_routed_outcome_with_ccr, build_routed_outcome_context, RerouteOrigin,
     RoutedOutcomeContext,
 };
 use crate::routed::transforms::{
@@ -935,6 +935,17 @@ pub async fn handle_messages(
         replay_parked.then(|| state.replay_store.clone()),
         forwarded_tokens_estimate,
     );
+    // `build_routed_outcome_context` leaves this `None` because it cannot see
+    // the routing decision; this is the handler that made it. Without it the
+    // `model_route_served` line never fires and the savings ledger has no way
+    // to price what the reroute avoided — the turn books at the free model's
+    // rate and the offload looks like it saved nothing.
+    if let (Some(ctx), Some(from_model)) = (outcome_ctx.as_mut(), identity_model.as_deref()) {
+        ctx.reroute = Some(RerouteOrigin {
+            from_model: from_model.to_string(),
+            to_model: body_model.to_string(),
+        });
+    }
 
     let openai_body_bytes = match serde_json::to_vec(&openai_body) {
         Ok(b) => Bytes::from(b),

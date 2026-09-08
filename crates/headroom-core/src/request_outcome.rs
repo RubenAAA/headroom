@@ -28,6 +28,12 @@ pub struct RequestOutcome {
     pub request_id: String,
     pub provider: String,
     pub model: String,
+    /// The model the client asked for, when the cost-aware router sent this
+    /// turn somewhere else. `model` above is where it actually ran, so the two
+    /// together are what the reroute cost and what it would have cost — the
+    /// only place that difference can be priced. `None` on every turn the
+    /// client's own model served.
+    pub routed_from_model: Option<String>,
 
     /// Upstream HTTP status for this request (200 on success or response-cache
     /// hit; `Default` leaves it 0, which is likewise treated as success). When
@@ -322,6 +328,11 @@ impl RequestOutcome {
             request_id: p.request_id,
             provider: p.provider,
             model: p.model,
+            // The Anthropic stream path serves the model in the body it was
+            // handed. A rule that rewrites one `claude-*` id to another still
+            // lands here and is not booked as a reroute; only the routed
+            // handler, which knows both ids, fills this in.
+            routed_from_model: None,
             // Streaming finalize implies the upstream returned a 200 SSE stream.
             status_code: 200,
             upstream_attempts: 1,
@@ -505,7 +516,11 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
                                   // Durable savings ledger, immediately after the in-memory tracker — the
                                   // same position Python writes it from inside `record_request`. Gated on a
                                   // real saving so uncompressed requests never touch the disk.
-    if outcome.tokens_saved > 0 {
+                                  // A rerouted turn also books here even when it compressed nothing: what it
+                                  // saved is the bill it never sent to the client's model, and that is worth
+                                  // more than any compression delta. The ledger helper still ignores a
+                                  // zero-token compression saving, so the disk write stays gated as before.
+    if outcome.tokens_saved > 0 || outcome.routed_from_model.is_some() {
         sink.record_savings_ledger(outcome);
     }
     sink.record_tokens(outcome); // 2

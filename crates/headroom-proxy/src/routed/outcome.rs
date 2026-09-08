@@ -239,6 +239,7 @@ pub(crate) fn book_routed_outcome_with_ccr(
         request_id: ctx.request_id.clone(),
         provider: ctx.provider.clone(),
         model: ctx.model.clone(),
+        routed_from_model: ctx.reroute.as_ref().map(|r| r.from_model.clone()),
         status_code,
         upstream_attempts: ctx.upstream_attempts,
         provider_input_tokens: usage.map(|_| provider_reported_input + ccr_rounds.input_tokens),
