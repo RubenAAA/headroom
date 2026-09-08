@@ -12,7 +12,7 @@ import sys
 
 import gitlab_api as gl
 
-ME = "antey"
+ME = gl.me()
 REPO = ("/home/ruben/meta/ai-first-workspace/internal-b2b/"
         "b2b-technology/platform/b2b-amg")
 HEAD = "FETCH_HEAD"

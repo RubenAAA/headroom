@@ -38,7 +38,7 @@ import time
 
 import gitlab_api as gl
 
-PROOF_DIR = "/tmp/opencode/poc2"
+PROOF_DIR = os.path.expanduser("~/.local/state/spark-review")
 MARKER_PREFIX = "spark-poster"
 
 

@@ -86,6 +86,20 @@ def call(method, path, payload=None, timeout=60):
     return int(status or 0), parsed
 
 
+def me():
+    """Whose threads are 'mine', asked of the server rather than assumed.
+
+    This was hardcoded to a guessed username once, and the guess was another
+    reviewer on the same MR -- so the triage read their threads, and a reply
+    went onto one of them. The credential already knows who it belongs to;
+    there is no reason for anything here to hold an opinion about it.
+    """
+    status, user = call("GET", "/user")
+    if status != 200 or not isinstance(user, dict) or not user.get("username"):
+        raise RuntimeError(f"could not identify the token's owner (status {status})")
+    return user["username"]
+
+
 def discussions(iid):
     """Every discussion on the MR, following pagination."""
     out, page = [], 1

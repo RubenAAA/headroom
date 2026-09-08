@@ -10,7 +10,7 @@ import sys
 
 import gitlab_api as gl
 
-ME = "antey"
+ME = gl.me()
 
 
 def main():

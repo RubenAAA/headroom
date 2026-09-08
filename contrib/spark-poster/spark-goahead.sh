@@ -9,20 +9,20 @@
 # passing -- the whole point is that the write happens on a human's say-so, at a
 # moment they chose, and that saying so takes a deliberate act:
 #
-#     touch /tmp/opencode/poc2/<session>.goahead
+#     touch "$HOME"/.local/state/spark-review/<session>.goahead
 #
-# Runs as the worker (POC2_WORKER=1), so the review gate ignores anything it
+# Runs as the worker (SPARK_REVIEW_WORKER=1), so the review gate ignores anything it
 # does. That is correct here and only here: the gate exists to stop the
 # *reviewing model* from posting, and this process is not it.
 #
 # Usage: spark-goahead.sh <session_id> [timeout_seconds]
 
 set -uo pipefail
-export POC2_WORKER=1
+export SPARK_REVIEW_WORKER=1
 
 SESSION="${1:?usage: spark-goahead.sh <session_id> [timeout]}"
 TIMEOUT="${2:-3600}"
-DIR=/tmp/opencode/poc2
+DIR="$HOME"/.local/state/spark-review
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DRAFT="$DIR/$SESSION.draft.json"
