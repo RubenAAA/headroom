@@ -61,6 +61,10 @@ pub(crate) struct StreamTranslator {
     current_tool_name: String,
     total_output_tokens: u64,
     saw_tool_use: bool,
+    /// Whether any `output_text.delta` arrived for the message item currently
+    /// streaming. The `output_item.done` event carries the finished item, and
+    /// when the upstream sent no deltas that copy is the only one there is.
+    saw_text_delta: bool,
     /// Identity of the reasoning item currently streaming, assembled from the
     /// `output_item.added`/`.done` pair that describes it.
     pending_reasoning: PendingReasoning,
@@ -164,6 +168,7 @@ impl StreamTranslator {
             current_tool_name: String::new(),
             total_output_tokens: 0,
             saw_tool_use: false,
+            saw_text_delta: false,
             pending_reasoning: PendingReasoning::default(),
             codex_limits: None,
             codex_rate_limits_seen: false,
@@ -503,6 +508,7 @@ impl StreamTranslator {
                 if !delta.is_empty() {
                     self.open_block(OpenBlock::Text, &mut events);
                     events.push(self.emit_text_delta(delta));
+                    self.saw_text_delta = true;
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
@@ -561,6 +567,42 @@ impl StreamTranslator {
                     .and_then(|t| t.as_str());
                 if item_type == Some("function_call") {
                     self.close_block_if(OpenBlock::Tool, &mut events);
+                }
+                // A finished message item carries the whole answer. Normally
+                // we have already streamed it delta by delta and this is a
+                // no-op, but a reasoning delivery that sends the message whole
+                // emits no deltas at all -- and then this event holds the only
+                // copy. Dropping it hands the client a turn containing a
+                // thought and nothing else, which Claude Code renders as a
+                // stopped turn and answers with "your previous response had no
+                // visible output": the model is fine, the text was lost here.
+                if item_type == Some("message") {
+                    if !self.saw_text_delta {
+                        let text: String = chunk
+                            .get("item")
+                            .and_then(|i| i.get("content"))
+                            .and_then(|c| c.as_array())
+                            .map(|blocks| {
+                                blocks
+                                    .iter()
+                                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            tracing::debug!(
+                                event = "codex_message_without_deltas",
+                                chars = text.len(),
+                                "recovered a message item the upstream never streamed"
+                            );
+                            self.open_block(OpenBlock::Text, &mut events);
+                            events.push(self.emit_text_delta(&text));
+                            self.close_block(&mut events);
+                        }
+                    }
+                    // Per item, not per stream: a second message must be
+                    // judged on its own deltas.
+                    self.saw_text_delta = false;
                 }
                 // The reasoning item is complete: seal its identity into the
                 // thinking block's signature so the client hands it back next
@@ -668,7 +710,18 @@ impl StreamTranslator {
                 let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
                 self.emit_outcome(usage.as_ref(), 200);
             }
-            _ => {}
+            other => {
+                // Silence here is how the message-item gap stayed hidden: an
+                // event we do not translate is content the client never sees.
+                // Log the name so the next one is a grep, not an investigation.
+                if other.starts_with("response.") {
+                    tracing::debug!(
+                        event = "codex_unhandled_stream_event",
+                        stream_event = other,
+                        "no translation for this Responses event; nothing emitted"
+                    );
+                }
+            }
         }
 
         events
@@ -1419,5 +1472,101 @@ mod tests {
             }
         }
         None
+    }
+
+    /// The bug behind "Muse Spark randomly stops": a reasoning turn arrived as
+    /// a reasoning item plus a finished message item, with no
+    /// `output_text.delta` for the message. We translated the reasoning into a
+    /// thinking block and dropped the message, so the client got a turn made of
+    /// a thought and nothing else -- which Claude Code renders as a stopped
+    /// turn and answers with "your previous response had no visible output".
+    #[test]
+    fn a_message_item_that_never_streamed_deltas_still_reaches_the_client() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.output_item.done"),
+            &json!({
+                "item": {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "the answer is 391"}]
+                }
+            })
+            .to_string(),
+        ));
+        out.extend(t.process_frame(
+            Some("response.completed"),
+            &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 9}}}).to_string(),
+        ));
+
+        let joined = out.join("");
+        assert!(
+            joined.contains("the answer is 391"),
+            "the only copy of the answer was dropped: {joined}"
+        );
+        assert!(
+            joined.contains("\"type\":\"text\""),
+            "it has to arrive as a text block, not a thought: {joined}"
+        );
+    }
+
+    /// The other half: when deltas did arrive, the `done` event is a summary of
+    /// what the client already has and must not be replayed on top of it.
+    #[test]
+    fn a_message_item_that_streamed_is_not_sent_twice() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.output_text.delta"),
+            &json!({"delta": "the answer is 391"}).to_string(),
+        ));
+        out.extend(t.process_frame(
+            Some("response.output_item.done"),
+            &json!({
+                "item": {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "the answer is 391"}]
+                }
+            })
+            .to_string(),
+        ));
+
+        let joined = out.join("");
+        assert_eq!(
+            joined.matches("the answer is 391").count(),
+            1,
+            "the streamed text came through twice: {joined}"
+        );
+    }
+
+    /// Two messages in one response are judged separately: the second having
+    /// no deltas must not be silenced by the first having had some.
+    #[test]
+    fn each_message_item_is_judged_on_its_own_deltas() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.output_text.delta"),
+            &json!({"delta": "first"}).to_string(),
+        ));
+        let done = json!({
+            "item": {"type": "message", "content": [{"type": "output_text", "text": "first"}]}
+        })
+        .to_string();
+        out.extend(t.process_frame(Some("response.output_item.done"), &done));
+        out.extend(t.process_frame(
+            Some("response.output_item.done"),
+            &json!({
+                "item": {"type": "message", "content": [{"type": "output_text", "text": "second"}]}
+            })
+            .to_string(),
+        ));
+
+        let joined = out.join("");
+        assert_eq!(joined.matches("first").count(), 1, "{joined}");
+        assert!(joined.contains("second"), "{joined}");
     }
 }
