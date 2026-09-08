@@ -124,6 +124,11 @@ pub enum ApiKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StructuralHash {
     pub system: [u8; 32],
+    /// Line-level breakdown of the same system block, kept so a drift
+    /// event can say *what* changed inside it rather than only that it
+    /// changed. Purely diagnostic — the drift decision reads
+    /// [`StructuralHash::system`].
+    pub system_shape: SystemShape,
     pub tools: [u8; 32],
     pub early_messages: [Option<[u8; 32]>; EARLY_MESSAGES_WINDOW],
     /// Block-level breakdown of the same early messages, kept so a
@@ -153,6 +158,20 @@ pub const EARLY_MESSAGES_WINDOW: usize = 3;
 /// Claude Code and the Codex CLI; a change past that still shows up as
 /// drift, just without a block index attached.
 pub const EARLY_BLOCKS_WINDOW: usize = 8;
+
+/// How many lines of the system block are fingerprinted individually.
+///
+/// The system block is one or two long text blocks, so block-level
+/// attribution says only "the system prompt changed" — which is where
+/// this investigation stalled: 8 findings in a day worth ~1M wasted
+/// cache-read tokens, every one of them reading `system` and none
+/// naming a component. Lines are the granularity that separates a
+/// client's stable instructions from the handful of volatile lines
+/// wedged among them.
+///
+/// 192 covers the Claude Code system prompt with room to spare; past
+/// it the detail degrades to `line[>192]` rather than lying.
+pub const SYSTEM_LINES_WINDOW: usize = 192;
 
 /// What one early block *is*, alongside the hash of what it says.
 ///
@@ -226,6 +245,38 @@ impl BlockKind {
 /// larger. Blocks are canonicalized before hashing exactly as the
 /// message-level hash is, so a relocated `cache_control` breakpoint
 /// does not read as a rewritten block.
+/// Line-level fingerprint of the system block. Diagnostic only — the
+/// drift decision reads [`StructuralHash::system`] and never this.
+///
+/// Held by value inside a `Copy` [`StructuralHash`], so every field is
+/// a fixed-size array: a hash of 0 means "no such line".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemShape {
+    /// Lines in the flattened system text, however many blocks carried
+    /// them. Counted past [`SYSTEM_LINES_WINDOW`] so a change in the
+    /// total is still reported when the detail is not.
+    pub lines: usize,
+    /// One hash per line, capped at [`SYSTEM_LINES_WINDOW`].
+    pub line_hashes: [u32; SYSTEM_LINES_WINDOW],
+    /// Byte length of each hashed line, saturating at `u16::MAX`.
+    ///
+    /// Read together with the hash this is the tell for *what kind* of
+    /// thing moved: a line that changes hash while keeping its length
+    /// is a fixed-width field — a commit SHA, a timestamp, a counter —
+    /// whereas one that grows or shrinks is text arriving or leaving.
+    pub line_lens: [u16; SYSTEM_LINES_WINDOW],
+}
+
+impl Default for SystemShape {
+    fn default() -> Self {
+        Self {
+            lines: 0,
+            line_hashes: [0; SYSTEM_LINES_WINDOW],
+            line_lens: [0; SYSTEM_LINES_WINDOW],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageShape {
     /// Content blocks in the message, or `None` for a plain string
@@ -245,10 +296,12 @@ pub struct MessageShape {
 /// clone-and-compare assertion.
 pub fn compute_structural_hash(body: &serde_json::Value, kind: ApiKind) -> StructuralHash {
     let system = hash_value(&canonicalize_for_hash(&extract_system(body, kind), false));
+    let system_shape = system_shape(&extract_system(body, kind));
     let tools = hash_value(&canonicalize_for_hash(&extract_tools(body), false));
     let (early_messages, early_shapes) = early_message_hashes(body, kind);
     StructuralHash {
         system,
+        system_shape,
         tools,
         early_messages,
         early_shapes,
@@ -730,6 +783,12 @@ fn observe(
                         // Empty unless the early window moved; the other two
                         // axes are single values with nothing to break down.
                         early_drift = %early_drift_detail(&previous, &current),
+                        // Empty unless the system block moved; see
+                        // [`system_drift_detail`] for the vocabulary.
+                        system_drift = %system_drift_detail(
+                            &previous.system_shape,
+                            &current.system_shape,
+                        ),
                         previous_hash_prefix = %structural_hash_log_prefix(&previous),
                         current_hash_prefix = %structural_hash_log_prefix(&current),
                         "cache_drift detector observed structural change between turns of the same session"
@@ -743,6 +802,12 @@ fn observe(
                         session_key_hash = %session_prefix,
                         drift_dims = %dims,
                         early_drift = %early_drift_detail(&previous, &current),
+                        // Empty unless the system block moved; see
+                        // [`system_drift_detail`] for the vocabulary.
+                        system_drift = %system_drift_detail(
+                            &previous.system_shape,
+                            &current.system_shape,
+                        ),
                         previous_hash_prefix = %structural_hash_log_prefix(&previous),
                         current_hash_prefix = %structural_hash_log_prefix(&current),
                         "cache_drift detector observed structural change in the body the proxy forwarded"
@@ -888,6 +953,104 @@ fn early_window_drifted(
 /// Structure only. No message text reaches the log — the point is to
 /// name the component, and the shape does that without carrying user
 /// content into an operator's terminal.
+/// Flatten the system block to its text and fingerprint it line by line.
+///
+/// Only `text` is read, so a `cache_control` breakpoint moving between
+/// blocks does not read as a rewritten system prompt — the same reason
+/// [`message_shape`] canonicalizes before hashing. Blocks are joined
+/// with a newline, which makes the line index stable against a block
+/// boundary moving as long as the text itself holds still.
+fn system_shape(system: &serde_json::Value) -> SystemShape {
+    let mut text = String::new();
+    match system {
+        serde_json::Value::String(s) => text.push_str(s),
+        serde_json::Value::Array(blocks) => {
+            for block in blocks {
+                let piece = match block {
+                    serde_json::Value::String(s) => Some(s.as_str()),
+                    _ => block.get("text").and_then(serde_json::Value::as_str),
+                };
+                if let Some(piece) = piece {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(piece);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut shape = SystemShape::default();
+    for (index, line) in text.lines().enumerate() {
+        shape.lines = index + 1;
+        if index >= SYSTEM_LINES_WINDOW {
+            continue;
+        }
+        // 0 is reserved for "no such line", so fold it away rather than
+        // let an empty line read as absent.
+        let digest = hash_value(&serde_json::Value::String(line.to_string()));
+        let hash = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        shape.line_hashes[index] = if hash == 0 { 1 } else { hash };
+        shape.line_lens[index] = u16::try_from(line.len()).unwrap_or(u16::MAX);
+    }
+    shape
+}
+
+/// Name what changed inside the system block, line by line.
+///
+/// `system` on its own says the cached prefix's head was rewritten but
+/// not by whom, and the head is the most expensive thing to lose: eight
+/// such findings in one day cost ~1M cache-read tokens. This turns each
+/// one into one of:
+///
+/// - `lines 210->212` — lines were inserted or removed. Something is
+///   appending to the system prompt; the count is the tell.
+/// - `line[57]:42->60` — line 57 was rewritten and grew 18 bytes. Text
+///   arrived; the length delta says how much.
+/// - `line[57]:42->42` — line 57 changed without changing length. A
+///   fixed-width field moved: a commit SHA, a timestamp, a counter.
+///   These are the ones worth holding still, because nothing a client
+///   means to say varies this way.
+/// - `line[>192]` — changed past [`SYSTEM_LINES_WINDOW`], so no index.
+///
+/// Structure only. No system text reaches the log, on the same terms as
+/// [`early_drift_detail`]: the point is to name the component, and the
+/// shape does that without carrying a prompt into an operator's
+/// terminal.
+fn system_drift_detail(prev: &SystemShape, curr: &SystemShape) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if prev.lines != curr.lines {
+        parts.push(format!("lines {}->{}", prev.lines, curr.lines));
+    }
+
+    // Cap the named lines: a wholesale rewrite would otherwise print a
+    // line index per line and bury the cases worth reading.
+    const MAX_NAMED: usize = 4;
+    let mut named = 0;
+    for index in 0..SYSTEM_LINES_WINDOW {
+        if prev.line_hashes[index] == curr.line_hashes[index] {
+            continue;
+        }
+        if named == MAX_NAMED {
+            parts.push("...".to_string());
+            break;
+        }
+        parts.push(format!(
+            "line[{index}]:{}->{}",
+            prev.line_lens[index], curr.line_lens[index]
+        ));
+        named += 1;
+    }
+
+    // Both sides ran past the window and nothing inside it moved: the
+    // change is real but unindexable. Say so rather than stay silent.
+    if parts.is_empty() && (prev.lines > SYSTEM_LINES_WINDOW || curr.lines > SYSTEM_LINES_WINDOW) {
+        parts.push(format!("line[>{SYSTEM_LINES_WINDOW}]"));
+    }
+    parts.join(",")
+}
+
 fn early_drift_detail(prev: &StructuralHash, curr: &StructuralHash) -> String {
     let mut parts: Vec<String> = Vec::new();
     for slot in 0..EARLY_MESSAGES_WINDOW {
@@ -1396,6 +1559,107 @@ mod tests {
         assert!(!cache.contains("s1"));
         assert!(cache.contains("s2"));
         assert!(cache.contains("s3"));
+    }
+
+    /// The live signature this was built for: a commit SHA rotating in
+    /// the system prompt. Same length, different content — which is
+    /// what separates a volatile field from a client editing its
+    /// instructions, and the reason `line_lens` sits next to the hash.
+    #[test]
+    fn a_fixed_width_field_changing_is_named_with_an_unchanged_length() {
+        let before = serde_json::json!("instructions\ncommit abc1234\nmore");
+        let after = serde_json::json!("instructions\ncommit def5678\nmore");
+        let detail = system_drift_detail(&system_shape(&before), &system_shape(&after));
+        assert_eq!(detail, "line[1]:14->14");
+    }
+
+    /// Text arriving on a settled line reads as a length delta, so an
+    /// operator can tell "18 bytes appeared" from "a SHA rotated".
+    #[test]
+    fn text_arriving_on_a_line_is_named_with_its_growth() {
+        let before = serde_json::json!("instructions\nstatus: clean\nmore");
+        let after = serde_json::json!("instructions\nstatus: 3 files modified\nmore");
+        let detail = system_drift_detail(&system_shape(&before), &system_shape(&after));
+        assert_eq!(detail, "line[1]:13->24");
+    }
+
+    #[test]
+    fn lines_appearing_are_counted_as_well_as_named() {
+        let before = serde_json::json!("a\nb");
+        let after = serde_json::json!("a\nb\nc");
+        let detail = system_drift_detail(&system_shape(&before), &system_shape(&after));
+        assert_eq!(detail, "lines 2->3,line[2]:0->1");
+    }
+
+    #[test]
+    fn a_system_block_that_held_still_says_nothing() {
+        let system = serde_json::json!([
+            {"type": "text", "text": "instructions\nmore"},
+        ]);
+        let detail = system_drift_detail(&system_shape(&system), &system_shape(&system));
+        assert!(detail.is_empty(), "{detail}");
+    }
+
+    /// A breakpoint moving between system blocks must not read as a
+    /// rewritten prompt: only `text` is fingerprinted.
+    #[test]
+    fn a_relocated_breakpoint_does_not_read_as_system_drift() {
+        let before = serde_json::json!([
+            {"type": "text", "text": "one", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "two"},
+        ]);
+        let after = serde_json::json!([
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}},
+        ]);
+        let detail = system_drift_detail(&system_shape(&before), &system_shape(&after));
+        assert!(detail.is_empty(), "{detail}");
+    }
+
+    /// Blocks joining with a newline means a two-block system and the
+    /// same text as one block index their lines identically.
+    #[test]
+    fn blocks_and_one_string_index_the_same_lines() {
+        let split = serde_json::json!([
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two"},
+        ]);
+        let joined = serde_json::json!("one\ntwo");
+        assert_eq!(system_shape(&split), system_shape(&joined));
+    }
+
+    #[test]
+    fn a_wholesale_rewrite_names_a_few_lines_and_then_stops() {
+        let before = serde_json::json!("a\nb\nc\nd\ne\nf");
+        let after = serde_json::json!("A\nB\nC\nD\nE\nF");
+        let detail = system_drift_detail(&system_shape(&before), &system_shape(&after));
+        assert!(detail.ends_with(",..."), "{detail}");
+        assert_eq!(detail.matches("line[").count(), 4, "{detail}");
+    }
+
+    /// Past the window the detail degrades to a marker rather than
+    /// reporting "nothing changed" for a system block that did.
+    #[test]
+    fn a_change_past_the_window_is_reported_without_an_index() {
+        let mut before: Vec<String> = (0..SYSTEM_LINES_WINDOW + 2)
+            .map(|i| format!("line {i}"))
+            .collect();
+        let after_text = before.join("\n");
+        before[SYSTEM_LINES_WINDOW + 1] = "changed past the window".to_string();
+        let detail = system_drift_detail(
+            &system_shape(&serde_json::json!(before.join("\n"))),
+            &system_shape(&serde_json::json!(after_text)),
+        );
+        assert_eq!(detail, format!("line[>{SYSTEM_LINES_WINDOW}]"));
+    }
+
+    /// An empty line must not read as an absent one, or a blank line
+    /// arriving would be invisible.
+    #[test]
+    fn an_empty_line_is_hashed_rather_than_read_as_absent() {
+        let shape = system_shape(&serde_json::json!("a\n\nb"));
+        assert_eq!(shape.lines, 3);
+        assert_ne!(shape.line_hashes[1], 0);
     }
 
     #[test]
