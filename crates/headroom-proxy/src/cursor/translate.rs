@@ -91,6 +91,11 @@ pub(crate) struct Translator {
     pub(crate) outcome: Option<Outcome>,
     /// Whether tool-call reporting is surfaced to the caller as thinking.
     surface_tool_calls: bool,
+    /// Whether this turn has produced anything the client renders as output:
+    /// a text block or a `tool_use`. Thinking does not count — Claude Code
+    /// treats a turn of pure thinking as a turn that said nothing, prints
+    /// "your previous response had no visible output" and prompts again.
+    saw_visible_block: bool,
 }
 
 impl Translator {
@@ -107,6 +112,7 @@ impl Translator {
             usage: Usage::default(),
             outcome: None,
             surface_tool_calls: true,
+            saw_visible_block: false,
         }
     }
 
@@ -169,6 +175,7 @@ impl Translator {
                 out.extend(self.open_block(OpenBlock::Text));
                 out.push(self.delta_frame("text_delta", "text", &text));
                 out.extend(self.close_block());
+                self.saw_visible_block = true;
             }
             ("tool_call", Some("started")) if self.surface_tool_calls => {
                 if let Some(note) = describe_tool_call(event) {
@@ -189,6 +196,7 @@ impl Translator {
                     out.extend(self.open_block(OpenBlock::Text));
                     out.push(self.delta_frame("text_delta", "text", &text));
                     out.extend(self.close_block());
+                    self.saw_visible_block = true;
                 }
             }
             ("result", _) => {
@@ -199,6 +207,30 @@ impl Translator {
                 }
                 let failed = event.get("is_error").and_then(Value::as_bool) == Some(true)
                     || subtype == Some("error");
+                // A turn that only thought is a turn that said nothing: Claude
+                // Code renders it as stopped and prompts again, which is how a
+                // working agent looks like it halted at random. Cursor puts the
+                // final answer on `result` as well, so when nothing visible
+                // went out, that copy is the one there is.
+                if !failed && !self.saw_visible_block {
+                    let text = event.get("result").and_then(Value::as_str).unwrap_or("");
+                    if text.is_empty() {
+                        tracing::debug!(
+                            event = "cursor_turn_without_visible_output",
+                            "a turn ended with nothing to show and no result text to recover"
+                        );
+                    } else {
+                        tracing::debug!(
+                            event = "cursor_result_text_recovered",
+                            chars = text.len(),
+                            "recovered a turn's answer from the result event"
+                        );
+                        out.extend(self.open_block(OpenBlock::Text));
+                        out.push(self.delta_frame("text_delta", "text", text));
+                        out.extend(self.close_block());
+                        self.saw_visible_block = true;
+                    }
+                }
                 self.outcome = Some(if failed {
                     Outcome::Error(
                         event
@@ -224,6 +256,9 @@ impl Translator {
     /// events never become one — see the module header.
     pub(crate) fn emit_parked_tool_use(&mut self, id: &str, name: &str, args: &Value) -> Vec<String> {
         let mut out = self.ensure_started();
+        // A `tool_use` is something the client renders and acts on, so a turn
+        // that ends on one has spoken even if it never wrote a word.
+        self.saw_visible_block = true;
         out.extend(self.close_block());
         out.push(outbound::content_block_start(
             self.block_index,
@@ -544,6 +579,59 @@ mod tests {
         assert_eq!(deltas.len(), 2);
         assert_eq!(deltas[0]["delta"]["type"], "thinking_delta");
         assert_eq!(deltas[0]["delta"]["thinking"], "Reading ");
+    }
+
+    /// A turn of pure thinking renders in Claude Code as a turn that said
+    /// nothing: it prints "your previous response had no visible output" and
+    /// prompts again, which is what an agent stopping at random looks like.
+    /// Cursor carries the same answer on `result`, so it can be recovered.
+    #[test]
+    fn a_turn_that_only_thought_is_answered_from_the_result_event() {
+        let events = run(&[
+            r#"{"type":"thinking","subtype":"delta","text":"weighing it up"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer"}"#,
+        ]);
+        let text: Vec<&Value> = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_delta")
+            .map(|(_, d)| d)
+            .filter(|d| d["delta"]["type"] == "text_delta")
+            .collect();
+        assert_eq!(text.len(), 1, "the turn must reach the client having spoken");
+        assert_eq!(text[0]["delta"]["text"], "the answer");
+    }
+
+    /// The recovery is a floor, not a duplicate: a turn that already spoke
+    /// must not have `result` appended to what it said.
+    #[test]
+    fn a_turn_that_spoke_is_not_given_the_result_text_as_well() {
+        let events = run(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the answer"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer"}"#,
+        ]);
+        let text: Vec<&Value> = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_delta")
+            .map(|(_, d)| d)
+            .filter(|d| d["delta"]["type"] == "text_delta")
+            .collect();
+        assert_eq!(text.len(), 1, "said once, sent once");
+    }
+
+    /// A failed turn's `result` is the error message. Replaying it as the
+    /// agent's own words would put an upstream failure in the transcript as
+    /// something the model said.
+    #[test]
+    fn a_failed_turn_does_not_speak_its_error_as_an_answer() {
+        let events = run(&[
+            r#"{"type":"thinking","subtype":"delta","text":"trying"}"#,
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"rate limited"}"#,
+        ]);
+        let spoke = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_delta")
+            .any(|(_, d)| d["delta"]["type"] == "text_delta");
+        assert!(!spoke, "an error is not an answer");
     }
 
     /// Block indices have to advance, and every `content_block_start` needs its
