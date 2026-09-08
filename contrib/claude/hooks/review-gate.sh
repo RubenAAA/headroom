@@ -13,8 +13,35 @@ OUTDIR="$HOME"/.local/state/spark-review
 mkdir -p "$OUTDIR" 2>/dev/null
 
 # ── armed? /gitlab-review invoked + MR diff fetched (cached per session) ──
+#
+# The invocation has to be a real one. A plain grep over the transcript arms on
+# any line that merely contains the command's name, and three kinds of line do:
+# tool output from reading this file, the assistant's own Bash command text,
+# and a compaction summary describing how arming works. All three armed a
+# session where nobody ran /gitlab-review, and an armed session diverts writes.
+#
+# So look at where the string sits. Claude Code writes a slash command as a
+# user message that OPENS with the command wrapper; prose that discusses one
+# has it somewhere in the middle, and tool results carry `toolUseResult`.
+# Position and provenance separate the invocation from every mention of it.
+armed_by_invocation() {
+  grep -n 'command-name>/gitlab-review' "$TRANSCRIPT" 2>/dev/null | cut -d: -f1 |
+  while read -r ln; do
+    sed -n "${ln}p" "$TRANSCRIPT" | jq -e '
+      select(.toolUseResult == null and (.isSidechain != true))
+      | select(.message.role == "user")
+      | (.message.content
+         | if type == "array"
+           then (map(select(.type == "text") | .text // "") | join("\n"))
+           else tostring end)
+      | test("^\\s*<command-(message|name)>")
+        and test("<command-name>/gitlab-review</command-name>")
+    ' >/dev/null 2>&1 && echo armed && break
+  done
+}
+
 if [ ! -f "$OUTDIR/$SESSION_ID.armed" ]; then
-  grep -q 'command-name>/gitlab-review' "$TRANSCRIPT" 2>/dev/null || exit 0
+  [ -n "$(armed_by_invocation)" ] || exit 0
   { [ "$(grep -c 'merge_requests' "$TRANSCRIPT" 2>/dev/null)" -ge 2 ] || grep -q 'new_path' "$TRANSCRIPT" 2>/dev/null; } || exit 0
   touch "$OUTDIR/$SESSION_ID.armed"
 fi
@@ -92,14 +119,29 @@ TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 if [ "$TOOL" = "Bash" ]; then
   CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
   LOW=$(echo "$CMD" | tr '[:upper:]' '[:lower:]')
-  ARTICULATE=""
+  # Subject AND shape, never shape alone. A heredoc is how you write a review
+  # comment and also how you write everything else; blocking every `<<` stopped
+  # a commit whose message said "json.load" and two diagnostics that were
+  # reading an auth file. Each of those cost a round trip and taught nothing.
+  #
+  # A command earns a divert when it concerns a tracker or a draft AND either
+  # writes to one or composes text for one. Either half on its own is ordinary
+  # work: `curl -X POST` to something else is not review articulation, and a
+  # heredoc about anything else is just a heredoc.
+  SUBJECT=""
+  echo "$LOW" | grep -qE 'gitlab|youtrack|merge_requests|api/v4|discussion_id|spark_post' && SUBJECT=1
+
+  WRITES=""
+  echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|glab .*(note|comment)' && WRITES=1
+
+  COMPOSES=""
   case "$LOW" in
-    *'<<'*|*json.dump*|*json.load*) ARTICULATE=1 ;;
+    *'<<'*|*json.dump*|*json.load*) COMPOSES=1 ;;
   esac
-  if echo "$LOW" | grep -qE 'gitlab|youtrack|merge_requests|api/v4'; then
-    if echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|glab .*(note|comment)'; then
-      ARTICULATE=1
-    fi
+
+  ARTICULATE=""
+  if [ -n "$SUBJECT" ] && { [ -n "$WRITES" ] || [ -n "$COMPOSES" ]; }; then
+    ARTICULATE=1
   fi
   if [ -n "$ARTICULATE" ]; then
     spawn_worker
