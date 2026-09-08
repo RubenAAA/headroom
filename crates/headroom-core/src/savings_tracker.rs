@@ -300,18 +300,29 @@ fn estimate_cache_savings_usd(
     all_fresh - actual
 }
 
-/// Savings as a share of the all-fresh, uncompressed input-cost
-/// counterfactual. Actual spend is already cache-priced, so adding compression
-/// savings and *net* cache savings exactly once reconstructs that denominator.
-fn cost_savings_percent(
-    actual_input_cost_usd: f64,
-    compression_savings_usd: f64,
-    cache_savings_usd: f64,
-) -> f64 {
+/// Savings as a share of what the same work would have cost without the
+/// proxy.
+///
+/// The baseline is the client on its own, NOT an all-fresh uncached request.
+/// Claude Code sends its own `cache_control` markers and gets cache reads at
+/// 0.1x whether or not this proxy exists, so counting the whole cache discount
+/// as a saving credits us with Anthropic's cache. It made this figure read
+/// 87% on a session whose measured saving was under 1%: $1,095 of "cache
+/// savings" against $164 of actual spend.
+///
+/// What is left is what the proxy actually changed about the request -- the
+/// tokens it removed before forwarding. Actual spend is already cache-priced
+/// and the compression saving is priced on the basis it would have been billed
+/// at, so the two add to the baseline exactly once.
+///
+/// Still missing, and both would raise this number honestly: the model-offload
+/// counterfactual, and whatever cache stabilisation is worth against the
+/// client's own breakpoint placement. Neither is folded in here because
+/// neither is measured on this path yet.
+fn cost_savings_percent(actual_input_cost_usd: f64, compression_savings_usd: f64) -> f64 {
     let actual = coerce_float(actual_input_cost_usd);
     let compression = coerce_float(compression_savings_usd);
-    let cache = coerce_signed_float(cache_savings_usd);
-    let net_savings = compression + cache;
+    let net_savings = compression;
     let counterfactual = actual + net_savings;
     if counterfactual > 0.0 {
         round_n(net_savings / counterfactual * 100.0, 2)
@@ -356,8 +367,12 @@ struct DisplaySession {
     requests: i64,
     tokens_saved: i64,
     compression_savings_usd: f64,
-    /// Net cache discount after cache-write premiums. Added without a schema
-    /// bump: old state files deserialize/migrate this as zero.
+    /// What Anthropic's prompt cache was worth on this session, net of
+    /// cache-write premiums.
+    ///
+    /// Reported, not claimed: the client would have got most of this on its
+    /// own, so it is not part of `savings_percent`. Kept because it is the
+    /// right denominator for asking whether the cache is working at all.
     #[serde(default)]
     cache_savings_usd: f64,
     total_input_tokens: i64,
@@ -709,11 +724,8 @@ impl SavingsTracker {
         s.cache_savings_usd = round_n(s.cache_savings_usd + delta_cache_savings_usd, 6);
         s.total_input_tokens += session_tokens_delta;
         s.total_input_cost_usd = round_n(s.total_input_cost_usd + session_cost_delta, 6);
-        s.savings_percent = cost_savings_percent(
-            s.total_input_cost_usd,
-            s.compression_savings_usd,
-            s.cache_savings_usd,
-        );
+        s.savings_percent =
+            cost_savings_percent(s.total_input_cost_usd, s.compression_savings_usd);
         s.last_activity_at = Some(to_utc_iso(ts));
         if s.started_at.is_none() {
             s.started_at = s.last_activity_at.clone();
@@ -1006,11 +1018,8 @@ impl SavingsTracker {
         if expired {
             return empty_display_session_value();
         }
-        let savings_percent = cost_savings_percent(
-            s.total_input_cost_usd,
-            s.compression_savings_usd,
-            s.cache_savings_usd,
-        );
+        let savings_percent =
+            cost_savings_percent(s.total_input_cost_usd, s.compression_savings_usd);
         json!({
             "requests": s.requests,
             "tokens_saved": s.tokens_saved,
@@ -1802,11 +1811,7 @@ fn normalize_display_session(entry: Option<&Value>) -> DisplaySession {
             .unwrap_or(0.0),
         6,
     );
-    let savings_percent = cost_savings_percent(
-        total_input_cost_usd,
-        compression_savings_usd,
-        cache_savings_usd,
-    );
+    let savings_percent = cost_savings_percent(total_input_cost_usd, compression_savings_usd);
     DisplaySession {
         requests: obj
             .get("requests")
@@ -2526,8 +2531,16 @@ mod tests {
         assert_eq!(display["savings_percent"], json!(50.0));
     }
 
+    /// The cache discount is reported and not claimed.
+    ///
+    /// This test asserted the opposite until 2026-09-08, and the policy it
+    /// pinned made the headline figure meaningless: Claude Code sends its own
+    /// cache_control markers and gets the same 0.1x reads with no proxy in the
+    /// path, so counting the whole discount as a saving credits us with
+    /// Anthropic's cache. On one real session it read 87% where the measured
+    /// saving was under 1%.
     #[test]
-    fn display_session_percentage_combines_compression_and_cache_once() {
+    fn the_cache_discount_is_reported_but_not_counted_as_our_saving() {
         let dir = tempfile::tempdir().unwrap();
         let t = tracker(&dir.path().join("s.json"));
         t.record_request(&RequestRecord {
@@ -2543,9 +2556,13 @@ mod tests {
 
         let display = &t.snapshot()["display_session"];
         assert_eq!(display["compression_savings_usd"], json!(0.003));
+        // Still reported: it is the right denominator for asking whether the
+        // cache is working at all.
         assert_eq!(display["cache_savings_usd"], json!(0.0027));
-        // ($0.003 + $0.0027) / ($0.0033 actual + those savings).
-        assert_eq!(display["savings_percent"], json!(63.33));
+        // But out of the percentage. $0.003 compression over $0.0033 actual
+        // plus that same $0.003 -- what this request cost against what the
+        // client would have paid sending the tokens we removed.
+        assert_eq!(display["savings_percent"], json!(47.62));
     }
 
     #[test]
@@ -2871,7 +2888,9 @@ mod tests {
         assert_eq!(snap["lifetime"]["requests"], json!(1));
         assert_eq!(snap["lifetime"]["tokens_saved"], json!(300));
         assert_eq!(snap["display_session"]["requests"], json!(1));
-        assert_eq!(snap["display_session"]["savings_percent"], json!(36.92));
+        // Compression only; the cache discount is reported beside it, not
+        // folded in. See the_cache_discount_is_reported_but_not_counted.
+        assert_eq!(snap["display_session"]["savings_percent"], json!(26.79));
     }
 
     #[test]
