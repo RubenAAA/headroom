@@ -1148,6 +1148,19 @@ pub struct CacheHealthSnapshot {
     /// (free) and unbounded below, so a negative reading is a real regression
     /// and not a scaling artefact. `0.0` until a turn has been compared.
     pub vs_stock_saving_pct: f64,
+
+    /// The same comparison over the last [`RECENT_SAMPLE_CAPACITY`] compared
+    /// turns instead of all of them, and `None` until the first one.
+    ///
+    /// Prefer this to the lifetime figure when the question is "how is the
+    /// proxy doing". An ordinary turn -- nothing compressed away, hot zone
+    /// unmoved -- prices almost identically on both arms, so it pulls the
+    /// lifetime ratio toward the marginal rate no matter what came before. The
+    /// lifetime figure therefore decays toward the recent one in any long
+    /// session, which reads as a slide even when nothing has got worse.
+    pub vs_stock_saving_pct_recent: Option<f64>,
+    /// How many turns are in that window, so a reader can weigh it.
+    pub vs_stock_turns_recent: usize,
     /// The stock arm's one modelled rule -- "next turn reads back as much of
     /// the last prompt as still fits" -- scored every turn against our own
     /// observed reads, where the answer is billed rather than assumed. Read
@@ -1238,6 +1251,15 @@ struct Inner {
     ours_effective_tokens: f64,
     stock_effective_tokens: f64,
     stock_turns_compared: u64,
+    /// The same two arms per turn, last [`RECENT_SAMPLE_CAPACITY`] only.
+    ///
+    /// The cumulative ratio answers "since this process started", which is the
+    /// wrong question for a statusline: an ordinary turn contributes almost
+    /// identically to both arms, so every one of them drags the lifetime figure
+    /// toward the marginal rate and averages away whatever happened early. A
+    /// window says what the proxy is doing *now*, which is what someone reading
+    /// a statusline is asking.
+    recent_vs_stock: VecDeque<(f64, f64)>,
     /// Self-check for the stock arm's one modelled rule, run against our own
     /// observed reads.
     predicted_read_tokens: u64,
@@ -1347,6 +1369,7 @@ impl UsageObserver {
                 ours_effective_tokens: 0.0,
                 stock_effective_tokens: 0.0,
                 stock_turns_compared: 0,
+                recent_vs_stock: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
                 predicted_read_tokens: 0,
                 observed_read_tokens: 0,
                 predicted_read_abs_error: 0,
@@ -1471,6 +1494,17 @@ impl UsageObserver {
     fn age_pending(&self, request_id: &str, by: Duration) {
         if let Some(p) = self.lock().pending.peek_mut(request_id) {
             p.began -= by;
+        }
+    }
+
+    /// Test hook: pretend this conversation's last turn was `by` earlier, so
+    /// the next one lands after an idle gap.
+    #[cfg(test)]
+    fn age_conversation(&self, conversation_key: &str, by: Duration) {
+        if let Some(turns) = self.lock().conversations.peek_mut(conversation_key) {
+            for turn in turns.iter_mut() {
+                turn.at -= by;
+            }
         }
     }
 
@@ -2012,8 +2046,10 @@ impl UsageObserver {
             // Bytes to tokens by proportion. Both numbers are the same kind of
             // JSON measured at the same place, so the ratio carries over even
             // though neither side is a token count.
-            let stock_prompt = match (pending.client_request_bytes, pending.forwarded_request_bytes)
-            {
+            let stock_prompt = match (
+                pending.client_request_bytes,
+                pending.forwarded_request_bytes,
+            ) {
                 (Some(sent), Some(fwd)) if fwd > 0 && sent > fwd => {
                     ((ours_prompt as f64) * (sent as f64) / (fwd as f64)).round() as u64
                 }
@@ -2031,13 +2067,29 @@ impl UsageObserver {
             // idle gap is idle for both, and a body edit is the client's own.
             // A hot-zone change is the case where the arms part: our holds may
             // absorb it, and without them it is a rebuild every time.
-            let stock_kept = matches!(class, TurnClass::Healthy) && !head_changed;
+            //
+            // The gap test is the second place they part, and leaving it out
+            // made this whole comparison unfair to us. Under
+            // `--force-1h-cache-ttl` our writes price at 2.0x against the
+            // stock arm's flat 1.25x, so the hour's premium was charged to us
+            // on every writing turn -- while the modelled client was handed a
+            // prefix that never expired, which is the benefit we paid that
+            // premium to get. Charge the cost, credit the benefit: a gap we
+            // survived on an hour marker is a gap that ends a five-minute
+            // client's prefix, and it rebuilds.
+            let stock_kept = matches!(class, TurnClass::Healthy)
+                && !head_changed
+                && idle_gap <= ANTHROPIC_CACHE_TTL;
             // The tail after the last breakpoint is billed as fresh input on
             // both arms. Which message the breakpoint lands on is the client's
             // shape, not ours, so handing the stock arm a cheaper tail than we
             // got would be inventing a difference the transforms did not make.
             let stock_cacheable = stock_prompt.saturating_sub(input_tokens);
-            let stock_read = if stock_kept { prior.min(stock_cacheable) } else { 0 };
+            let stock_read = if stock_kept {
+                prior.min(stock_cacheable)
+            } else {
+                0
+            };
             let stock_write = stock_cacheable.saturating_sub(stock_read);
             inner
                 .stock_footprints
@@ -2064,6 +2116,42 @@ impl UsageObserver {
             inner.ours_effective_tokens += ours_effective;
             inner.stock_effective_tokens += stock_effective;
             inner.stock_turns_compared += 1;
+            if inner.recent_vs_stock.len() == RECENT_SAMPLE_CAPACITY {
+                inner.recent_vs_stock.pop_front();
+            }
+            inner
+                .recent_vs_stock
+                .push_back((ours_effective, stock_effective));
+
+            // One line per compared turn, with both arms broken into the parts
+            // that priced them. The aggregate can only say that the two arms
+            // diverged; it cannot say on which turns or through which term, and
+            // a ratio nobody can decompose is a ratio nobody should act on.
+            //
+            // Read `stock_kept` first. When it is true the modelled client is
+            // credited with a perfect read of its whole prior footprint and a
+            // write of only the growth since last turn -- the best case
+            // available to it -- while `ours_*` are what the provider actually
+            // billed. Those turns are where the comparison is least fair to us,
+            // so a persistent loss confined to them is a modelling artifact,
+            // and one that shows up with `stock_kept = false` is real.
+            tracing::info!(
+                event = "vs_stock_turn",
+                request_id = %request_id,
+                conversation_key = %pending.conversation_key,
+                turn_class = ?class,
+                head_changed,
+                stock_kept,
+                ours_effective = ours_effective.round() as u64,
+                stock_effective = stock_effective.round() as u64,
+                ours_input = input_tokens,
+                ours_read = cache_read_input_tokens,
+                ours_write_5m = w5,
+                ours_write_1h = w1h,
+                stock_read,
+                stock_write,
+                "priced this turn against a stock client"
+            );
 
             // The self-check, on the arm where the answer is observable: the
             // stock model's rule, applied to our own previous footprint,
@@ -2073,8 +2161,7 @@ impl UsageObserver {
             let predicted_ours_read = expected_cache_read.min(ours_prompt);
             inner.predicted_read_tokens += predicted_ours_read;
             inner.observed_read_tokens += cache_read_input_tokens;
-            inner.predicted_read_abs_error +=
-                predicted_ours_read.abs_diff(cache_read_input_tokens);
+            inner.predicted_read_abs_error += predicted_ours_read.abs_diff(cache_read_input_tokens);
         }
 
         // Every completed turn that wrote anything, not just the healthy ones.
@@ -2562,6 +2649,16 @@ impl UsageObserver {
                     (1.0 - inner.ours_effective_tokens / inner.stock_effective_tokens) * 100.0
                 }
             },
+            vs_stock_saving_pct_recent: {
+                let stock: f64 = inner.recent_vs_stock.iter().map(|(_, s)| s).sum();
+                if stock <= 0.0 {
+                    None
+                } else {
+                    let ours: f64 = inner.recent_vs_stock.iter().map(|(o, _)| o).sum();
+                    Some((1.0 - ours / stock) * 100.0)
+                }
+            },
+            vs_stock_turns_recent: inner.recent_vs_stock.len(),
             predicted_read_error_pct: {
                 // Denominator is the observed reads the rule was predicting.
                 // Before anything has been read back there is no error to
@@ -2992,7 +3089,11 @@ mod tests {
         };
         let obs = UsageObserver::new();
         obs.begin_request("stranded", "conv".into(), None, None, Some(print(10)));
-        assert_eq!(obs.snapshot().abandoned_requests_total, 0, "still in flight");
+        assert_eq!(
+            obs.snapshot().abandoned_requests_total,
+            0,
+            "still in flight"
+        );
 
         obs.age_pending("stranded", IN_FLIGHT_HORIZON);
         // The sweep runs on the next arrival, which is the only moment the
@@ -5121,6 +5222,90 @@ mod stock_baseline_tests {
     /// The holds' contribution, priced. The client moved its hot zone and our
     /// prefix survived; the stock client has no hold, so the same move costs
     /// it the whole prefix again.
+    /// The window is the point: a win early in a session is diluted out of the
+    /// lifetime ratio by every ordinary turn that follows, because an ordinary
+    /// turn prices the same on both arms. The lifetime figure slides toward
+    /// zero while nothing is getting worse, and only the window says so.
+    #[test]
+    fn ordinary_turns_dilute_the_lifetime_figure_but_empty_the_window() {
+        let obs = UsageObserver::new();
+
+        // One real win: client sent 2 KB, we forwarded 1 KB.
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 2_000, 1_000, "on");
+        obs.complete("r1", 0, 0, 10_000, None);
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r2", 2_000, 1_000, "on");
+        obs.complete("r2", 100, 10_000, 200, None);
+
+        let after_win = obs.snapshot();
+        assert!(after_win.vs_stock_saving_pct > 50.0);
+        assert!(after_win.vs_stock_saving_pct_recent.unwrap() > 50.0);
+
+        // Then a full window of cold/warm pairs we did not touch. Each pair
+        // prices identically on both arms, so each contributes nothing either
+        // way -- exactly the ordinary traffic that dilutes a lifetime ratio.
+        for i in 0..(RECENT_SAMPLE_CAPACITY / 2) {
+            let conv = format!("quiet{i}");
+            let cold = format!("c{i}");
+            let warm = format!("w{i}");
+            obs.begin_request(&cold, conv.clone(), None, None, Some(hot("bbbb")));
+            obs.note_wire_bytes(&cold, 1_000, 1_000, "off");
+            obs.complete(&cold, 0, 0, 10_000, None);
+            obs.begin_request(&warm, conv, None, None, Some(hot("bbbb")));
+            obs.note_wire_bytes(&warm, 1_000, 1_000, "off");
+            obs.complete(&warm, 100, 10_000, 200, None);
+        }
+
+        let s = obs.snapshot();
+        assert_eq!(s.vs_stock_turns_recent, RECENT_SAMPLE_CAPACITY);
+        // The win has been pushed out of the window entirely.
+        assert_eq!(s.vs_stock_saving_pct_recent, Some(0.0));
+        // But it is still in the lifetime figure, which is why that one keeps
+        // reporting a saving the proxy is no longer making.
+        assert!(
+            s.vs_stock_saving_pct > 0.0,
+            "lifetime still carries the win: {}",
+            s.vs_stock_saving_pct
+        );
+        assert!(
+            s.vs_stock_saving_pct < after_win.vs_stock_saving_pct,
+            "and it decays toward the window: {} -> {}",
+            after_win.vs_stock_saving_pct,
+            s.vs_stock_saving_pct
+        );
+    }
+
+    /// The hour we pay for is an hour we get. Pricing our write at 2.0x while
+    /// handing the modelled client a prefix that never expires is the bias
+    /// that drove this comparison steadily negative under
+    /// `--force-1h-cache-ttl`; a gap past the five-minute tier has to cost the
+    /// stock arm its cache.
+    #[test]
+    fn a_gap_only_an_hour_marker_survives_rebuilds_the_stock_prefix() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        obs.complete("r1", 0, 0, 10_000, None);
+
+        // Twenty minutes later: past five minutes, inside the hour we pinned.
+        obs.age_conversation("conv", Duration::from_secs(20 * 60));
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r2", 1_000, 1_000, "off");
+        // Our prefix survived: we read it back and paid the hour's rate.
+        obs.complete("r2", 100, 10_000, 200, Some((0, 200)));
+
+        let s = obs.snapshot();
+        let recent = s.vs_stock_saving_pct_recent.unwrap();
+        assert!(
+            recent > 0.0,
+            "surviving a gap the stock client could not is a saving, not a \
+             loss: {recent}"
+        );
+    }
+
     #[test]
     fn a_hot_zone_change_we_absorbed_is_a_full_rebuild_for_the_stock_client() {
         let obs = UsageObserver::new();

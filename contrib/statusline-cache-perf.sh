@@ -43,10 +43,21 @@ hold_pct=$(printf '%s' "$health" | jq -r '
 # `predicted_read_error_pct` rides along as the model's own error bar; the
 # segment is dropped once that exceeds 25%, because past there the number is
 # reporting the model rather than the proxy.
+#
+# Read over the last 50 compared turns, not since process start. An ordinary
+# turn prices almost identically on both arms, so it drags a lifetime ratio
+# toward the marginal rate whatever came before it -- which makes the lifetime
+# figure slide steadily downward in any long session and look like a
+# regression that has not happened. The window answers the question a
+# statusline is actually asked, which is what the proxy is doing now. Falls
+# back to the lifetime figure only if the window is somehow absent, so an
+# older proxy binary still renders.
 vs_stock=$(printf '%s' "$health" | jq -r '
-  if .vs_stock_saving_pct == null then empty
+  if (.predicted_read_error_pct // 0) > 25 then empty
+  elif (.vs_stock_saving_pct_recent != null) and ((.vs_stock_turns_recent // 0) > 0)
+    then (.vs_stock_saving_pct_recent | round)
+  elif .vs_stock_saving_pct == null then empty
   elif (.stock_turns_compared // 0) == 0 then empty
-  elif (.predicted_read_error_pct // 0) > 25 then empty
   else (.vs_stock_saving_pct | round) end')
 
 # Pre-filter before parsing: three event names out of ~17 lines a turn keeps
