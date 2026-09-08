@@ -743,6 +743,13 @@ pub async fn handle_messages(
     // Live-zone compression + freeze-replay, on the same flags as the Claude
     // path and in the same order (compress, then replay the cached prefix).
     let session_key = ctx_report.session_key.clone();
+    // A routed turn never passes through `forward_http`, so before this it
+    // reached its upstream with the volatile `system` lines the holds exist
+    // to pin — the client's own working directory and role sentence moving
+    // mid-conversation, re-creating the cached prefix from `system` down.
+    // Held here, on the Anthropic-shaped body, before any translation
+    // restructures it.
+    crate::proxy::apply_system_holds(&state, &mut parsed, &session_key, &request_id);
     let compression_report =
         apply_compression_and_replay(&state, &mut parsed, &headers, &request_id, &session_key);
     let compression_tokens_saved = compression_report.tokens_saved;

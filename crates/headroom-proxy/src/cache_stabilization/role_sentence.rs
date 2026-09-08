@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use serde_json::Value;
 
+use super::Hold;
+
 /// The sentence opens with this and runs to the first period. Anchored on the
 /// literal head so that no other prose in the block can match.
 const HEAD: &str = "You are an interactive agent that helps users ";
@@ -70,34 +72,43 @@ impl RoleSentencePins {
 
     /// Hold this conversation's opening sentence.
     ///
-    /// Returns the live sentence it replaced, or `None` when it changed
-    /// nothing — first sight of the conversation, no such sentence in `system`,
-    /// or the live sentence already matching the pin.
-    pub fn hold(&self, body: &mut Value, conversation_key: &str) -> Option<String> {
-        let live = read_sentence(body.get("system")?)?;
+    /// Answers what it did: [`Hold::Held`] carries the live sentence it
+    /// replaced, and every other variant names why it changed nothing —
+    /// first sight of the conversation, no such sentence in `system`, or
+    /// the live sentence already matching the pin.
+    pub fn hold(&self, body: &mut Value, conversation_key: &str) -> Hold {
+        let Some(system) = body.get("system") else {
+            return Hold::Absent;
+        };
+        let Some(live) = read_sentence(system) else {
+            return Hold::Absent;
+        };
 
         let held = {
             let mut pins = self.pins.lock().expect("RoleSentencePins mutex poisoned");
             match pins.get(conversation_key) {
                 Some((_, latched)) if latched.elapsed() > PIN_TTL => {
                     pins.put(conversation_key.to_string(), (live, Instant::now()));
-                    return None;
+                    return Hold::Relatched;
                 }
                 Some((held, _)) => held.clone(),
                 None => {
                     pins.put(conversation_key.to_string(), (live, Instant::now()));
-                    return None;
+                    return Hold::Latched;
                 }
             }
         };
 
         if held == live {
-            return None;
+            return Hold::Matched;
         }
-        if !write_sentence(body.get_mut("system")?, &held) {
-            return None;
+        let Some(system) = body.get_mut("system") else {
+            return Hold::NotWritable;
+        };
+        if !write_sentence(system, &held) {
+            return Hold::NotWritable;
         }
-        Some(live)
+        Hold::Held(live)
     }
 
     /// Rewrite the sentence to the held value and hand back the client's
@@ -210,7 +221,7 @@ mod tests {
         let pins = RoleSentencePins::new(4);
         let mut b = body(PLAIN);
         let before = b.clone();
-        assert_eq!(pins.hold(&mut b, "c1"), None);
+        assert_eq!(pins.hold(&mut b, "c1").rewrote(), None);
         assert_eq!(b, before, "first sight is a byte-equal passthrough");
     }
 
@@ -220,7 +231,7 @@ mod tests {
         pins.hold(&mut body(PLAIN), "c1");
 
         let mut b = body(STYLED);
-        assert_eq!(pins.hold(&mut b, "c1").as_deref(), Some(STYLED));
+        assert_eq!(pins.hold(&mut b, "c1").rewrote(), Some(STYLED));
         assert_eq!(sentence_of(&b), PLAIN);
         let text = b["system"][1]["text"].as_str().unwrap();
         assert!(
@@ -239,7 +250,7 @@ mod tests {
         pins.hold(&mut body(STYLED), "c1");
 
         let mut b = body(PLAIN);
-        assert_eq!(pins.hold(&mut b, "c1").as_deref(), Some(PLAIN));
+        assert_eq!(pins.hold(&mut b, "c1").rewrote(), Some(PLAIN));
         assert_eq!(sentence_of(&b), STYLED);
     }
 
@@ -249,8 +260,38 @@ mod tests {
         pins.hold(&mut body(PLAIN), "c1");
         let mut b = body(PLAIN);
         let before = b.clone();
-        assert_eq!(pins.hold(&mut b, "c1"), None);
+        assert_eq!(pins.hold(&mut b, "c1").rewrote(), None);
         assert_eq!(b, before);
+    }
+
+    /// The outcomes a caller logs. Each no-op has its own name because
+    /// "the hold never ran" and "the hold ran and had nothing to do" are
+    /// the same absence of a `role_sentence_held` line otherwise.
+    #[test]
+    fn every_outcome_is_named() {
+        let pins = RoleSentencePins::new(4);
+
+        let mut absent = json!({"system": "Be helpful.", "messages": []});
+        assert_eq!(pins.hold(&mut absent, "c1"), Hold::Absent);
+
+        let mut first = body(PLAIN);
+        assert_eq!(pins.hold(&mut first, "c2"), Hold::Latched);
+
+        let mut again = body(PLAIN);
+        assert_eq!(pins.hold(&mut again, "c2"), Hold::Matched);
+
+        let mut flipped = body(STYLED);
+        assert_eq!(pins.hold(&mut flipped, "c2"), Hold::Held(STYLED.to_string()));
+        assert_eq!(sentence_of(&flipped), PLAIN, "flip was held to the opening form");
+    }
+
+    #[test]
+    fn labels_are_stable_for_logs() {
+        assert_eq!(Hold::Held(String::new()).label(), "held");
+        assert_eq!(Hold::Latched.label(), "latched");
+        assert_eq!(Hold::Matched.label(), "matched");
+        assert_eq!(Hold::Absent.label(), "absent");
+        assert_eq!(Hold::Reshaped.label(), "reshaped");
     }
 
     #[test]
@@ -258,7 +299,7 @@ mod tests {
         let pins = RoleSentencePins::new(4);
         pins.hold(&mut body(PLAIN), "c1");
         let mut other = body(STYLED);
-        assert_eq!(pins.hold(&mut other, "c2"), None, "c2's first sight");
+        assert_eq!(pins.hold(&mut other, "c2"), Hold::Latched, "c2's first sight");
         assert_eq!(sentence_of(&other), STYLED);
     }
 
@@ -266,10 +307,10 @@ mod tests {
     fn no_sentence_means_no_pin_and_no_change() {
         let pins = RoleSentencePins::new(4);
         let mut b = json!({"system": "Be helpful.", "messages": []});
-        assert_eq!(pins.hold(&mut b, "c1"), None);
+        assert_eq!(pins.hold(&mut b, "c1").rewrote(), None);
         assert_eq!(b["system"], "Be helpful.");
         let mut later = body(PLAIN);
-        assert_eq!(pins.hold(&mut later, "c1"), None, "still first sight");
+        assert_eq!(pins.hold(&mut later, "c1"), Hold::Latched, "still first sight");
     }
 
     #[test]
@@ -278,7 +319,7 @@ mod tests {
         let mut first = json!({"system": format!("{PLAIN} More."), "messages": []});
         pins.hold(&mut first, "c1");
         let mut b = json!({"system": format!("{STYLED} More."), "messages": []});
-        assert_eq!(pins.hold(&mut b, "c1").as_deref(), Some(STYLED));
+        assert_eq!(pins.hold(&mut b, "c1").rewrote(), Some(STYLED));
         assert_eq!(b["system"], format!("{PLAIN} More."));
     }
 

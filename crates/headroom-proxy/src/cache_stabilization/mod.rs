@@ -108,3 +108,60 @@ pub mod ttl_order;
 pub mod usage_observer;
 pub mod volatile_detector;
 pub mod working_dir;
+
+/// What a hold did to a request, and when it did nothing, why.
+///
+/// The holds used to answer `Option<String>`, which collapsed five very
+/// different outcomes into `None` and left the one question an operator
+/// actually asks — *did this hold get a chance?* — unanswerable from the
+/// log. A hold that never fires because the field is absent and a hold
+/// that never fires because nothing ever drifted both read as a count of
+/// zero, and only one of them is healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hold {
+    /// Rewritten to the pinned value. Carries the live value the client
+    /// sent, which is what the pin overrode.
+    Held(String),
+    /// First sight of this conversation: the pin was latched, and there
+    /// was nothing yet to hold the request against.
+    Latched,
+    /// The pin aged out past its TTL and was relatched to the live value.
+    Relatched,
+    /// The client already sent the pinned value. The healthy steady state.
+    Matched,
+    /// No such field in the body. Either this client does not send one, or
+    /// the shape moved under us — worth telling apart from `Matched`,
+    /// because `Absent` on every turn means the hold is aimed at nothing.
+    Absent,
+    /// The pinned value and the live one disagree about shape, not just
+    /// content, so substituting by position would put the right value on
+    /// the wrong line. Declining is deliberate — and worth seeing, because
+    /// it is a hold that found drift and could not act on it.
+    Reshaped,
+    /// The field was read but could not be written back.
+    NotWritable,
+}
+
+impl Hold {
+    /// The live value a rewrite overrode, or `None` when nothing was
+    /// rewritten.
+    pub fn rewrote(&self) -> Option<&str> {
+        match self {
+            Hold::Held(live) => Some(live),
+            _ => None,
+        }
+    }
+
+    /// A short stable label, for logs and for counting outcomes.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Hold::Held(_) => "held",
+            Hold::Latched => "latched",
+            Hold::Relatched => "relatched",
+            Hold::Matched => "matched",
+            Hold::Absent => "absent",
+            Hold::Reshaped => "reshaped",
+            Hold::NotWritable => "not_writable",
+        }
+    }
+}

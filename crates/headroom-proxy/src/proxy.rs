@@ -2400,34 +2400,118 @@ fn image_census(messages: &[serde_json::Value]) -> (usize, usize, usize) {
 /// rewrites keep — when the body is not JSON, `system` names no working
 /// directory, this is the conversation's first sight, or the live directory
 /// already matches the pin. See [`cache_stabilization::working_dir`].
-fn hold_working_directory(
+/// Run every `system` hold this config enables, in place.
+///
+/// One entry point on purpose. The holds used to be applied inline in
+/// `forward_http` and nowhere else, so a routed turn — anything reaching
+/// an upstream through `handlers::local_model` rather than through
+/// `forward_http` — was forwarded unheld, and the gate conditions had no
+/// single place to be read off. Callers that hold an Anthropic body as a
+/// `Value` should call this; the byte-level wrappers below exist for the
+/// one caller that has bytes.
+///
+/// `AnthropicMessages`-shaped bodies only: the pins read `system`, which
+/// is where Claude Code puts the volatile lines and is not a field the
+/// other endpoints carry in that shape.
+pub(crate) fn apply_system_holds(
+    state: &AppState,
+    value: &mut serde_json::Value,
+    session_key: &str,
+    request_id: &str,
+) {
+    // Both holds depend on `--prefix-replay`: `working_dir` restates the
+    // live directory at the tail and needs replay to carry that note into
+    // later turns, and without it the note would break the prefix every
+    // turn — causing the churn the hold exists to stop.
+    if !state.config.prefix_replay || session_key.is_empty() {
+        return;
+    }
+    if state.config.hold_working_directory {
+        hold_working_directory_value(value, &state.working_dir_pins, session_key, request_id);
+    }
+    if state.config.hold_role_sentence {
+        hold_role_sentence_value(value, &state.role_sentence_pins, session_key, request_id);
+    }
+}
+
+/// [`apply_system_holds`] for a caller that holds bytes.
+///
+/// Byte-equal passthrough when nothing was held, so a turn no hold
+/// touched is not re-serialized and cannot pick up a formatting
+/// difference on its way through.
+fn apply_system_holds_to_bytes(
+    state: &AppState,
     body: bytes::Bytes,
-    pins: &cache_stabilization::working_dir::WorkingDirPins,
     session_key: &str,
     request_id: &str,
 ) -> bytes::Bytes {
+    if !state.config.prefix_replay
+        || session_key.is_empty()
+        || !(state.config.hold_working_directory || state.config.hold_role_sentence)
+    {
+        return body;
+    }
     let mut value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return body,
     };
-    let Some(live) = pins.hold(&mut value, session_key) else {
+    let mut held = false;
+    if state.config.hold_working_directory {
+        held |= hold_working_directory_value(
+            &mut value,
+            &state.working_dir_pins,
+            session_key,
+            request_id,
+        );
+    }
+    if state.config.hold_role_sentence {
+        held |= hold_role_sentence_value(
+            &mut value,
+            &state.role_sentence_pins,
+            session_key,
+            request_id,
+        );
+    }
+    if !held {
         return body;
-    };
+    }
     match serde_json::to_vec(&value) {
-        Ok(bytes) => {
-            // The path is the operator's own filesystem, and the session key is
-            // hashed for the same reason every other event here hashes it.
-            tracing::info!(
-                event = "working_directory_held",
-                request_id = %request_id,
-                session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
-                live_directory = %live,
-                "held the system preamble's working directory and restated the live one at the tail"
-            );
-            bytes::Bytes::from(bytes)
-        }
+        Ok(bytes) => bytes::Bytes::from(bytes),
         Err(_) => body,
     }
+}
+
+/// The hold itself. Returns whether `value` was rewritten.
+fn hold_working_directory_value(
+    value: &mut serde_json::Value,
+    pins: &cache_stabilization::working_dir::WorkingDirPins,
+    session_key: &str,
+    request_id: &str,
+) -> bool {
+    let outcome = pins.hold(value, session_key);
+    let Some(live) = outcome.rewrote() else {
+        // Every no-op reason gets a line. "Never fired" and "fired and
+        // found nothing to do" are the same count of zero otherwise, and
+        // only one of them means the hold is working.
+        tracing::debug!(
+            event = "working_directory_hold_skipped",
+            request_id = %request_id,
+            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+            outcome = outcome.label(),
+            "working-directory hold changed nothing"
+        );
+        return false;
+    };
+    // The path is the operator's own filesystem, and the session key is
+    // hashed for the same reason every other event here hashes it.
+    tracing::info!(
+        event = "working_directory_held",
+        request_id = %request_id,
+        session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+        live_directory = %live,
+        "held the system preamble's working directory and restated the live one at the tail"
+    );
+    true
 }
 
 /// Hold this conversation's opening role sentence still.
@@ -2435,31 +2519,31 @@ fn hold_working_directory(
 /// Byte-equal passthrough on the same terms as [`hold_working_directory`]:
 /// not JSON, no such sentence, first sight, or already matching the pin. See
 /// [`cache_stabilization::role_sentence`].
-fn hold_role_sentence(
-    body: bytes::Bytes,
+/// The hold itself. Returns whether `value` was rewritten.
+fn hold_role_sentence_value(
+    value: &mut serde_json::Value,
     pins: &cache_stabilization::role_sentence::RoleSentencePins,
     session_key: &str,
     request_id: &str,
-) -> bytes::Bytes {
-    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return body,
+) -> bool {
+    let outcome = pins.hold(value, session_key);
+    let Some(live) = outcome.rewrote() else {
+        tracing::debug!(
+            event = "role_sentence_hold_skipped",
+            request_id = %request_id,
+            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+            outcome = outcome.label(),
+            "role-sentence hold changed nothing"
+        );
+        return false;
     };
-    let Some(live) = pins.hold(&mut value, session_key) else {
-        return body;
-    };
-    match serde_json::to_vec(&value) {
-        Ok(bytes) => {
-            tracing::info!(
-                event = "role_sentence_held",
-                request_id = %request_id,
-                live_sentence_len = live.len(),
-                "held the opening role sentence to the conversation's opening form"
-            );
-            bytes::Bytes::from(bytes)
-        }
-        Err(_) => body,
-    }
+    tracing::info!(
+        event = "role_sentence_held",
+        request_id = %request_id,
+        live_sentence_len = live.len(),
+        "held the opening role sentence to the conversation's opening form"
+    );
+    true
 }
 
 /// How many times retrieval and memory may hand work back to each other.
@@ -4880,34 +4964,13 @@ pub(crate) async fn forward_http(
         // next turn replays what we forwarded. Without replay the client re-sends
         // that message without the note every turn, and the prefix breaks at the
         // tail each time — the hold would then cause the churn it exists to stop.
-        let body_to_send = if state.config.hold_working_directory
-            && state.config.prefix_replay
-            && matches!(
-                endpoint,
-                compression::CompressibleEndpoint::AnthropicMessages
-            )
-            && !request_session_key.is_empty()
-        {
-            hold_working_directory(
+        let body_to_send = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) {
+            apply_system_holds_to_bytes(
+                &state,
                 body_to_send,
-                &state.working_dir_pins,
-                &request_session_key,
-                &request_id,
-            )
-        } else {
-            body_to_send
-        };
-        let body_to_send = if state.config.hold_role_sentence
-            && state.config.prefix_replay
-            && matches!(
-                endpoint,
-                compression::CompressibleEndpoint::AnthropicMessages
-            )
-            && !request_session_key.is_empty()
-        {
-            hold_role_sentence(
-                body_to_send,
-                &state.role_sentence_pins,
                 &request_session_key,
                 &request_id,
             )
@@ -10715,6 +10778,67 @@ fn extract_tool_name(body: &[u8], endpoint: compression::CompressibleEndpoint) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gap this closed: a routed turn reaches its upstream through
+    /// `handlers::local_model`, never through `forward_http`, so for as
+    /// long as the holds lived inline in `forward_http` a routed turn was
+    /// forwarded with its volatile `system` lines intact. Both callers go
+    /// through `apply_system_holds` now, and this pins that it holds.
+    #[test]
+    fn the_role_sentence_is_held_for_any_caller_not_just_forward_http() {
+        const PLAIN: &str =
+            "You are an interactive agent that helps users with software engineering tasks.";
+        const STYLED: &str = "You are an interactive agent that helps users according to your \
+             \"Output Style\", which describes how you should respond to user queries.";
+        let state = crate::test_support::test_state(|c| {
+            c.prefix_replay = true;
+            c.hold_role_sentence = true;
+        });
+
+        let mut opening = serde_json::json!({"system": PLAIN, "messages": []});
+        apply_system_holds(&state, &mut opening, "sess-1", "req-1");
+
+        let mut flipped = serde_json::json!({"system": STYLED, "messages": []});
+        apply_system_holds(&state, &mut flipped, "sess-1", "req-2");
+        assert_eq!(
+            flipped["system"], PLAIN,
+            "the flipped sentence should have been held to the opening form"
+        );
+    }
+
+    /// Both holds depend on `--prefix-replay`, so with replay off the body
+    /// must go out exactly as it came in.
+    #[test]
+    fn holds_do_nothing_without_prefix_replay() {
+        const STYLED: &str = "You are an interactive agent that helps users according to your \
+             \"Output Style\", which describes how you should respond to user queries.";
+        let state = crate::test_support::test_state(|c| {
+            c.prefix_replay = false;
+            c.hold_role_sentence = true;
+        });
+
+        let mut opening = serde_json::json!({"system": "You are an interactive agent that helps \
+             users with software engineering tasks.", "messages": []});
+        apply_system_holds(&state, &mut opening, "sess-1", "req-1");
+
+        let mut flipped = serde_json::json!({"system": STYLED, "messages": []});
+        apply_system_holds(&state, &mut flipped, "sess-1", "req-2");
+        assert_eq!(flipped["system"], STYLED, "no pin should have been latched");
+    }
+
+    /// An unheld turn must come back byte-identical rather than
+    /// re-serialized, or a turn no hold touched could pick up a
+    /// formatting difference and break the prefix by itself.
+    #[test]
+    fn an_unheld_body_is_passed_through_byte_for_byte() {
+        let state = crate::test_support::test_state(|c| {
+            c.prefix_replay = true;
+            c.hold_role_sentence = true;
+        });
+        let body = bytes::Bytes::from_static(br#"{"system":"Be helpful.","messages":[]}"#);
+        let out = apply_system_holds_to_bytes(&state, body.clone(), "sess-1", "req-1");
+        assert_eq!(out, body);
+    }
 
     /// The footprint moved to the blocking pool; the tracker must not notice.
     #[tokio::test]

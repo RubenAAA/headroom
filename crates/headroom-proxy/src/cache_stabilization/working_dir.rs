@@ -55,6 +55,8 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use serde_json::Value;
 
+use super::Hold;
+
 /// Matches both `Primary working directory: ` and `Working directory: `, which
 /// is the whole set of forms the preamble uses. Deliberately a literal scan
 /// rather than a pattern: the value that follows is a path, and a pattern loose
@@ -96,13 +98,17 @@ impl WorkingDirPins {
     /// Hold this conversation's working directories, and state the live one at
     /// the message tail when a pin displaces it.
     ///
-    /// Returns the live directory it had to replace, or `None` when it changed
-    /// nothing — first sight of the conversation, no such line in `system`, the
-    /// live values already matching the pin, or a preamble whose shape changed.
-    pub fn hold(&self, body: &mut Value, conversation_key: &str) -> Option<String> {
-        let live = read_dirs(body.get("system")?);
+    /// Answers what it did: [`Hold::Held`] carries the live directory it had
+    /// to replace, and every other variant names why it changed nothing —
+    /// first sight of the conversation, no such line in `system`, the live
+    /// values already matching the pin, or a preamble whose shape changed.
+    pub fn hold(&self, body: &mut Value, conversation_key: &str) -> Hold {
+        let Some(system) = body.get("system") else {
+            return Hold::Absent;
+        };
+        let live = read_dirs(system);
         if live.is_empty() {
-            return None;
+            return Hold::Absent;
         }
 
         let held = {
@@ -112,33 +118,37 @@ impl WorkingDirPins {
                 // re-latch rather than resurrect a directory nobody is in.
                 Some((_, latched)) if latched.elapsed() > PIN_TTL => {
                     pins.put(conversation_key.to_string(), (live.clone(), Instant::now()));
-                    return None;
+                    return Hold::Relatched;
                 }
                 Some((held, _)) => held.clone(),
                 None => {
                     pins.put(conversation_key.to_string(), (live.clone(), Instant::now()));
-                    return None;
+                    return Hold::Latched;
                 }
             }
         };
 
         if held == live {
-            return None;
+            return Hold::Matched;
         }
         // A different count means the preamble's shape changed, not the
         // directory. Substituting by position would put a path on the wrong
         // line, which is worse than a re-cache.
         if held.len() != live.len() {
-            return None;
+            return Hold::Reshaped;
         }
 
-        let system = body.get_mut("system")?;
+        let Some(system) = body.get_mut("system") else {
+            return Hold::NotWritable;
+        };
         if !write_dirs(system, &held) {
-            return None;
+            return Hold::NotWritable;
         }
-        let live_dir = live.into_iter().next()?;
+        let Some(live_dir) = live.into_iter().next() else {
+            return Hold::NotWritable;
+        };
         note_at_tail(body, &live_dir, &held[0]);
-        Some(live_dir)
+        Hold::Held(live_dir)
     }
 
     /// Rewrite `system`'s working-directory lines to the held value and hand
@@ -315,7 +325,7 @@ mod tests {
         let pins = WorkingDirPins::new(4);
         let mut b = body("/repo", "user");
         let before = b.clone();
-        assert_eq!(pins.hold(&mut b, "conv"), None);
+        assert_eq!(pins.hold(&mut b, "conv").rewrote(), None);
         assert_eq!(b, before, "first turn must be byte-identical");
     }
 
@@ -326,7 +336,7 @@ mod tests {
 
         let mut b = body("/repo/apps/mobile", "user");
         assert_eq!(
-            pins.hold(&mut b, "conv").as_deref(),
+            pins.hold(&mut b, "conv").rewrote(),
             Some("/repo/apps/mobile")
         );
         assert_eq!(dirs(&b), vec!["/repo", "/repo"], "both lines held");
@@ -350,7 +360,7 @@ mod tests {
         pins.hold(&mut body("/repo", "user"), "conv");
         let mut b = body("/repo", "user");
         let before = b.clone();
-        assert_eq!(pins.hold(&mut b, "conv"), None);
+        assert_eq!(pins.hold(&mut b, "conv").rewrote(), None);
         assert_eq!(b, before);
     }
 
@@ -397,7 +407,7 @@ mod tests {
             "messages": [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
         });
         let before = b.clone();
-        assert_eq!(pins.hold(&mut b, "conv"), None);
+        assert_eq!(pins.hold(&mut b, "conv").rewrote(), None);
         assert_eq!(b, before);
     }
 
@@ -409,7 +419,7 @@ mod tests {
             "messages": [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
         });
         let before = b.clone();
-        assert_eq!(pins.hold(&mut b, "conv"), None);
+        assert_eq!(pins.hold(&mut b, "conv").rewrote(), None);
         assert_eq!(b, before);
     }
 
@@ -418,7 +428,7 @@ mod tests {
         let pins = WorkingDirPins::new(4);
         pins.hold(&mut body("/repo", "user"), "conv");
         let mut b = body("/elsewhere", "assistant");
-        assert_eq!(pins.hold(&mut b, "conv").as_deref(), Some("/elsewhere"));
+        assert_eq!(pins.hold(&mut b, "conv").rewrote(), Some("/elsewhere"));
         assert_eq!(dirs(&b), vec!["/repo", "/repo"]);
         assert_eq!(
             b["messages"][0]["content"].as_array().unwrap().len(),
@@ -439,7 +449,7 @@ mod tests {
             "system": " - Primary working directory: /moved\n",
             "messages": [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
         });
-        assert_eq!(pins.hold(&mut b, "conv").as_deref(), Some("/moved"));
+        assert_eq!(pins.hold(&mut b, "conv").rewrote(), Some("/moved"));
         assert_eq!(
             b["system"].as_str().unwrap(),
             " - Primary working directory: /repo\n"
@@ -459,7 +469,7 @@ mod tests {
     fn preview_shows_the_directory_the_hold_will_forward() {
         let pins = WorkingDirPins::new(4);
         let mut first = body("/repo", "user");
-        assert_eq!(pins.hold(&mut first, "conv"), None);
+        assert_eq!(pins.hold(&mut first, "conv").rewrote(), None);
         let pinned_system = first.get("system").unwrap().clone();
 
         let mut moved = body("/repo/sub", "user");
@@ -480,9 +490,9 @@ mod tests {
         assert_eq!(pins.preview(&mut b, "conv"), None);
         assert_eq!(dirs(&b), vec!["/repo", "/repo"]);
         // Still first sight for `hold`, which is what latches.
-        assert_eq!(pins.hold(&mut b, "conv"), None);
+        assert_eq!(pins.hold(&mut b, "conv").rewrote(), None);
         let mut moved = body("/elsewhere", "user");
-        assert_eq!(pins.hold(&mut moved, "conv").as_deref(), Some("/elsewhere"));
+        assert_eq!(pins.hold(&mut moved, "conv").rewrote(), Some("/elsewhere"));
     }
 
     /// Extra environment lines arriving with the move — entering a git worktree
@@ -492,7 +502,7 @@ mod tests {
     fn preview_declines_when_the_preamble_shape_changed() {
         let pins = WorkingDirPins::new(4);
         let mut first = body("/repo", "user");
-        assert_eq!(pins.hold(&mut first, "conv"), None);
+        assert_eq!(pins.hold(&mut first, "conv").rewrote(), None);
 
         let mut moved = json!({
             "system": [
