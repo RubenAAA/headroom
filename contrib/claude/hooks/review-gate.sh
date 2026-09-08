@@ -12,98 +12,140 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 OUTDIR="$HOME"/.local/state/spark-review
 mkdir -p "$OUTDIR" 2>/dev/null
 
-# ── armed? /gitlab-review invoked + MR diff fetched (cached per session) ──
+# ── armed? one of the review commands was actually run in this session ──
 #
 # The invocation has to be a real one. A plain grep over the transcript arms on
 # any line that merely contains the command's name, and three kinds of line do:
 # tool output from reading this file, the assistant's own Bash command text,
 # and a compaction summary describing how arming works. All three armed a
-# session where nobody ran /gitlab-review, and an armed session diverts writes.
+# session where nobody ran the command, and an armed session diverts.
 #
 # So look at where the string sits. Claude Code writes a slash command as a
 # user message that OPENS with the command wrapper; prose that discusses one
 # has it somewhere in the middle, and tool results carry `toolUseResult`.
 # Position and provenance separate the invocation from every mention of it.
+# grep narrows to candidate lines, then ONE jq decides. Per-line jq would spawn
+# a process for every mention, and mentions are exactly what a long review
+# session accumulates. `fromjson?` drops anything that will not parse rather
+# than failing the whole check on one bad line.
+REVIEW_COMMANDS='gitlab-review|fix-mr-comments'
+
 armed_by_invocation() {
-  grep -n 'command-name>/gitlab-review' "$TRANSCRIPT" 2>/dev/null | cut -d: -f1 |
-  while read -r ln; do
-    sed -n "${ln}p" "$TRANSCRIPT" | jq -e '
-      select(.toolUseResult == null and (.isSidechain != true))
-      | select(.message.role == "user")
-      | (.message.content
-         | if type == "array"
-           then (map(select(.type == "text") | .text // "") | join("\n"))
-           else tostring end)
-      | test("^\\s*<command-(message|name)>")
-        and test("<command-name>/gitlab-review</command-name>")
-    ' >/dev/null 2>&1 && echo armed && break
-  done
+  [ -f "$OUTDIR/$SESSION_ID.armed" ] && return 0
+  grep -E "command-name>/($REVIEW_COMMANDS)" "$TRANSCRIPT" 2>/dev/null |
+  jq -e -R -s --arg cmds "$REVIEW_COMMANDS" '
+    split("\n") | map(select(length > 0) | fromjson?)
+    | any(.[];
+        .toolUseResult == null
+        and (.isSidechain != true)
+        and .message.role == "user"
+        and ((.message.content
+              | if type == "array"
+                then (map(select(.type == "text") | .text // "") | join("\n"))
+                else tostring end)
+             | test("^\\s*<command-(message|name)>")
+               and test("<command-name>/(" + $cmds + ")</command-name>")))
+  ' >/dev/null 2>&1 || return 1
+  touch "$OUTDIR/$SESSION_ID.armed"
 }
 
-if [ ! -f "$OUTDIR/$SESSION_ID.armed" ]; then
-  [ -n "$(armed_by_invocation)" ] || exit 0
-  { [ "$(grep -c 'merge_requests' "$TRANSCRIPT" 2>/dev/null)" -ge 2 ] || grep -q 'new_path' "$TRANSCRIPT" 2>/dev/null; } || exit 0
-  touch "$OUTDIR/$SESSION_ID.armed"
-fi
+mr_in_transcript() {
+  grep -oE 'merge_requests/[0-9]+|MR![0-9]+|!\[0-9]+' "$TRANSCRIPT" 2>/dev/null |
+    grep -oE '[0-9]+' | tail -1
+}
 
 spawn_worker() {
   [ -f "$OUTDIR/$SESSION_ID.done" ] && return 0
   [ -f "$OUTDIR/$SESSION_ID.diverted" ] && return 0
   touch "$OUTDIR/$SESSION_ID.diverted"
+
+  # The MR number is the only thing taken from the transcript. Everything the
+  # drafter reasons about it fetches for itself.
+  #
+  # This used to scrape the assistant's own analysis out of the transcript and
+  # ask a worker to reshape it into comments -- which needed the analysis to
+  # exist before it ran, so it moved formatting off the reviewing model and
+  # left every expensive part where it was. spark_draft.py pulls the threads
+  # and the git history behind them, and does the deciding.
+  MR=$(mr_in_transcript)
+  [ -n "$MR" ] || { echo "no MR number in transcript; not drafting" >>"$OUTDIR/worker.log"; return 0; }
+
   (
-    MR=$(grep -oE 'merge_requests/[0-9]+|MR![0-9]+' "$TRANSCRIPT" 2>/dev/null | tail -1)
-    CTX=$(SUB=$(dirname "$TRANSCRIPT")/$(basename "$TRANSCRIPT" .jsonl)/subagents python3 - "$TRANSCRIPT" <<'PY' 2>/dev/null
-import json, sys, os, glob
-t = sys.argv[1]
-try: lines = open(t, errors='replace').read().splitlines()
-except Exception: sys.exit(0)
-inv = max([i for i, l in enumerate(lines) if 'command-name>/gitlab-review' in l] or [-1])
-buf, total = [], 0
-for l in lines[inv+1:]:
-    try: r = json.loads(l)
-    except Exception: continue
-    m = r.get('message')
-    if not isinstance(m, dict) or m.get('role') != 'assistant': continue
-    c = m.get('content')
-    texts = []
-    if isinstance(c, list):
-        for b in c:
-            if not isinstance(b, dict): continue
-            if b.get('type') == 'text' and b.get('text'): texts.append(b['text'][:4000])
-            elif b.get('type') == 'thinking' and b.get('thinking'): texts.append('[thinking] ' + b['thinking'][:2000])
-    for tx in texts:
-        if total + len(tx) > 12000: break
-        buf.append(tx); total += len(tx)
-print('\n---\n'.join(buf)[:12000])
-sub = os.environ.get('SUB', '')
-for f in sorted(glob.glob(os.path.join(sub, 'agent-*.jsonl')))[:6]:
-    try: sl = open(f, errors='replace').read().splitlines()
-    except Exception: continue
-    tail = []
-    for l in reversed(sl):
-        try: r = json.loads(l)
-        except Exception: continue
-        m = r.get('message')
-        if not isinstance(m, dict) or m.get('role') != 'assistant': continue
-        c = m.get('content')
-        got = False
-        if isinstance(c, list):
-            for b in reversed(c):
-                if isinstance(b, dict) and b.get('type') == 'text' and b.get('text'):
-                    tail.append(b['text'][:2000]); got = True
-        if got: break
-    if tail:
-        print('\n[subagent %s last message]\n%s' % (os.path.basename(f), '\n'.join(reversed(tail))[:2000]))
-PY
-)
-    PROMPT="Dry run only. Post nothing, call no tools, run no commands. Review target [$MR]. The excerpts below are Opus analysis traces (texts, thinking, subagent last messages) for that review. Draft the MR comments you WOULD post as a JSON array [{file, line, severity, comment}]. Output JSON only. Traces: $CTX"
-    DRAFT=$(SPARK_REVIEW_WORKER=1 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 timeout 120 claude -p --model claude-muse-spark-1.2 "$PROMPT" 2>&1 | head -c 6000)
-    jq -n --arg s "$SESSION_ID" --arg m "$MR" --arg d "$DRAFT" \
-      '{ts: now, session_id: $s, mr: $m, draft: $d}' > "$OUTDIR/$SESSION_ID.json" 2>/dev/null
+    SPARK_REVIEW_WORKER=1 timeout 900 \
+      python3 "$HOME"/headroom/contrib/spark-poster/spark_draft.py \
+      "$MR" "$SESSION_ID"
     touch "$OUTDIR/$SESSION_ID.done"
   ) >>"$OUTDIR/worker.log" 2>&1 &
   disown
 }
+
+# ── UserPromptSubmit: the approval IS the divert ──
+#
+# This is the moment that matters. The model asks "shall I reply on those
+# threads?", the answer is yes, and everything expensive happens next: reading
+# the diffs, weighing each objection, writing eleven paragraphs. A gate on the
+# Write tool fires after all of that is already spent and can only stop the
+# file from landing.
+#
+# So the yes routes straight to the worker. The model is told the drafting is
+# not its job before it starts, rather than after it finishes.
+#
+# Two conditions, both required. The session must have entered a review through
+# /gitlab-review or /fix-mr-comments, and the user must now be asking for the
+# threads to be answered. Arming alone would divert every "yes" in a long
+# review; the instruction alone would fire in any session that mentions an MR.
+if [ "$EVENT" = "UserPromptSubmit" ]; then
+  armed_by_invocation || exit 0
+
+  PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null |
+           tr '[:upper:]' '[:lower:]')
+
+  # Said outright: "post the threads", "answer the comments", "запости ответы".
+  # Length is not a filter here -- an instruction that names the action is an
+  # instruction however it is phrased.
+  #
+  # A verb and an object, matched separately. One combined pattern needed a
+  # Cyrillic bracket range to skip the words between them, and a range over
+  # multibyte characters does not survive the locale this hook runs under -- it
+  # silently matched nothing, so every Russian instruction and "post the
+  # threads" itself went through. Two greps need no ranges at all.
+  INTENT=""
+  if echo "$PROMPT" | grep -qE 'post|repl|answer|respond|resolve|close|запост|ответ|отвеч|закр' &&
+     echo "$PROMPT" | grep -qE 'thread|comment|note|discussion|review|mr|тред|коммент|ветк|замечан|ответ'; then
+    INTENT=1
+  fi
+
+  # "do not post the threads yet" names the action and forbids it. Diverting on
+  # it would start the worker against an explicit refusal, which is the one
+  # outcome worse than not diverting at all.
+  echo "$PROMPT" | grep -qE "^(no|nope|not? |don'?t|do not|stop|wait|hold|нет|не |стоп|погоди)" &&
+    INTENT=""
+
+  # Or said as a yes to the model's own question about posting.
+  if [ -z "$INTENT" ]; then
+    BARE=$(echo "$PROMPT" | tr -d '[:punct:]' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+    if echo "$BARE" | grep -qxE '(yes|y|yep|yeah|yup|ok|okay|sure|go|go ahead|do it|please do|post it|send it|post|go for it|да|ага|давай|давай да|запости|отвечай|ответь)'; then
+      ASKED=$(tail -c 200000 "$TRANSCRIPT" 2>/dev/null | jq -R -s '
+        split("\n") | map(select(length > 0) | fromjson?)
+        | map(select(.message.role == "assistant" and (.isSidechain != true)))
+        | last
+        | (.message.content // [] | map(select(.type == "text") | .text // "") | join("\n"))
+        // ""' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+      echo "$ASKED" | grep -qE '\?' &&
+      echo "$ASKED" | grep -qE 'post|repl|answer|comment|resolv|close .*thread|отвеч|запост|закрыв' &&
+        INTENT=1
+    fi
+  fi
+
+  if [ -n "$INTENT" ]; then
+    spawn_worker
+    echo "REVIEW REPLIES DIVERTED AT APPROVAL. The spark worker is drafting the thread replies from the MR and the repo; it reads the threads and the commits itself and must not be given your analysis. Do NOT write the reply text, do NOT draft it in a file, and do NOT summarise what you would have said. Tell the user the worker is drafting and that it posts on go-ahead: touch ~/.local/state/spark-review/<session>.goahead"
+  fi
+  exit 0
+fi
+
+# ── everything below is the write-time backstop; it needs the session armed ──
+armed_by_invocation || exit 0
 
 if [ "$EVENT" = "Stop" ]; then
   # Backstop only: retry if a divert fired but no draft landed.

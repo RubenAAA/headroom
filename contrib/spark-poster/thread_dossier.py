@@ -7,15 +7,17 @@ alternative, judging from the thread alone, cannot see a fix that landed as a
 commit rather than a reply.
 """
 
+import os
 import subprocess
 import sys
 
 import gitlab_api as gl
 
 ME = gl.me()
-REPO = ("/home/ruben/meta/ai-first-workspace/internal-b2b/"
-        "b2b-technology/platform/b2b-amg")
-HEAD = "FETCH_HEAD"
+REPO = os.environ.get("SPARK_REPO", (
+    "/home/ruben/meta/ai-first-workspace/internal-b2b/"
+    "b2b-technology/platform/b2b-amg"))
+HEAD = os.environ.get("SPARK_HEAD", "FETCH_HEAD")
 CONTEXT = 25
 
 
@@ -24,53 +26,73 @@ def git(*args):
     return r.stdout
 
 
-def main():
-    iid = sys.argv[1] if len(sys.argv) > 1 else "591"
-    want = sys.argv[2] if len(sys.argv) > 2 else None
+def my_threads(iid):
+    """The threads I opened, plus the timestamp of my earliest note.
 
+    Shared with the drafter so both halves agree on whose threads are in scope;
+    a drafter that disagreed with the dossier about that is how a reply once
+    landed on another reviewer's thread.
+    """
     ds = [d for d in gl.discussions(iid) if not d.get("individual_note")]
     mine = [
         d for d in ds
         if d.get("notes") and d["notes"][0].get("author", {}).get("username") == ME
     ]
-    first_review = min(d["notes"][0]["created_at"] for d in mine)
+    if not mine:
+        return [], None
+    return mine, min(d["notes"][0]["created_at"] for d in mine)
 
-    for d in mine:
-        did = d["id"]
-        if want and not did.startswith(want):
+
+def dossier(d, first_review):
+    """One thread's evidence as text: what I asked, who answered, what moved.
+
+    Everything here is read from the API and from git -- no model involved. That
+    is the point: the expensive half of a review is deciding what the evidence
+    means, and it cannot be moved off the reviewing model unless the evidence
+    arrives without it.
+    """
+    n0 = d["notes"][0]
+    pos = n0.get("position") or {}
+    path = pos.get("new_path")
+    line = pos.get("new_line") or pos.get("old_line")
+
+    out = [f"THREAD {d['id']}", f"ANCHOR {path}:{line}", "", "--- MY NOTE ---",
+           (n0.get("body") or "").strip()]
+
+    for n in d["notes"][1:]:
+        if n.get("system"):
             continue
-        n0 = d["notes"][0]
-        pos = n0.get("position") or {}
-        path = pos.get("new_path")
-        line = pos.get("new_line") or pos.get("old_line")
+        out += ["", f"--- REPLY by {n.get('author', {}).get('username')} "
+                    f"at {(n.get('created_at') or '')[:19]} ---",
+                (n.get("body") or "").strip()]
+    if len(out) == 5:
+        out += ["", "--- NO REPLIES: nobody wrote on this thread ---"]
 
+    if path:
+        log = git("log", "--oneline", f"--since={first_review}", HEAD, "--", path)
+        out += ["", f"--- COMMITS TOUCHING {path} SINCE REVIEW ---",
+                log.strip() or "(none)"]
+        if line:
+            lo, hi = max(1, int(line) - CONTEXT), int(line) + CONTEXT
+            lines = git("show", f"{HEAD}:{path}").splitlines()
+            out += ["", f"--- {path} @ {HEAD} lines {lo}-{hi} ---"]
+            out += [f"{i + 1:6d}| {lines[i]}"
+                    for i in range(lo - 1, min(hi, len(lines)))]
+    else:
+        out += ["", "--- UNANCHORED: no file position on this thread ---"]
+    return "\n".join(out)
+
+
+def main():
+    iid = sys.argv[1] if len(sys.argv) > 1 else "591"
+    want = sys.argv[2] if len(sys.argv) > 2 else None
+
+    mine, first_review = my_threads(iid)
+    for d in mine:
+        if want and not d["id"].startswith(want):
+            continue
         print("=" * 78)
-        print(f"THREAD {did}")
-        print(f"ANCHOR {path}:{line}")
-        print("=" * 78)
-        print("\n--- MY NOTE ---")
-        print((n0.get("body") or "").strip())
-
-        for n in d["notes"][1:]:
-            if n.get("system"):
-                continue
-            print(f"\n--- REPLY by {n.get('author', {}).get('username')} "
-                  f"at {(n.get('created_at') or '')[:19]} ---")
-            print((n.get("body") or "").strip())
-
-        if path:
-            log = git("log", "--oneline", f"--since={first_review}",
-                      f"{HEAD}", "--", path)
-            print(f"\n--- COMMITS TOUCHING {path} SINCE REVIEW ---")
-            print(log.strip() or "(none)")
-
-            if line:
-                lo, hi = max(1, int(line) - CONTEXT), int(line) + CONTEXT
-                blob = git("show", f"{HEAD}:{path}")
-                lines = blob.splitlines()
-                print(f"\n--- {path} @ {HEAD} lines {lo}-{hi} ---")
-                for i in range(lo - 1, min(hi, len(lines))):
-                    print(f"{i + 1:6d}| {lines[i]}")
+        print(dossier(d, first_review))
         print()
     return 0
 
