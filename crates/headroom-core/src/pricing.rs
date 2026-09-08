@@ -83,6 +83,17 @@ impl ModelPricing {
         }
     }
 
+    /// Cache-write (1h TTL) rate, falling back to the 5m rate where the family
+    /// publishes only one write price.
+    ///
+    /// No family in the table publishes an above-200k 1h rate, so the tier
+    /// argument only reaches the fallback — kept so the two write rates have
+    /// the same shape and a tiered 1h price can be added without a new caller.
+    pub fn cache_write_1h_rate(&self, long_context: bool) -> Option<f64> {
+        self.cache_write_1h_cost_per_token
+            .or_else(|| self.cache_write_rate(long_context))
+    }
+
     /// Cache-write (5m TTL) rate for the given context tier.
     pub fn cache_write_rate(&self, long_context: bool) -> Option<f64> {
         if long_context {
@@ -226,6 +237,15 @@ static TABLE: &[(&str, ModelPricing)] = &[
     ("claude-3-opus", per_1m_ttl(15.0, 75.0, 1.5, 18.75, 30.0)),
     // Family fallback for any other claude-* (Sonnet-class default).
     ("claude-", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    // ---- opencode.ai Zen, contributor-free tier ----
+    // Free for now. Both spellings are needed and both were wrong: the
+    // client-facing alias `claude-muse-spark-1.3` fell through the `claude-`
+    // catch-all above, and the upstream id `muse-spark-1.3-contributor-free`
+    // matched nothing and took the blended fallback — the same $3/MTok either
+    // way. A turn that cost nothing was booked as if it had run on Sonnet.
+    // Revisit if the tier ever starts charging; nothing here detects that.
+    ("claude-muse-spark", per_1m(0.0, 0.0, Some(0.0), Some(0.0))),
+    ("muse-spark", per_1m(0.0, 0.0, Some(0.0), Some(0.0))),
     // ---- OpenAI (cache_write not published → None) ----
     ("gpt-5-mini", per_1m(0.25, 2.0, Some(0.025), None)),
     ("gpt-5-nano", per_1m(0.05, 0.4, Some(0.005), None)),
@@ -309,31 +329,105 @@ pub fn estimate_cost_usd(
     cache_write_tokens: i64,
     fallback_rate: f64,
 ) -> f64 {
+    estimate_cost_usd_split(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        0,
+        fallback_rate,
+    )
+}
+
+/// As [`estimate_cost_usd`], but told how much of the write was billed at the
+/// 1-hour TTL.
+///
+/// Anthropic charges 2.0x input for a 1-hour write against 1.25x for a
+/// 5-minute one and reports the breakdown in
+/// `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`. Pricing the whole
+/// write at the 5m rate understated every 1h write by 37.5% — and on
+/// 2026-09-07, 14.3M of 16.9M written tokens were 1h.
+///
+/// `cache_write_1h_tokens` is a *part of* `cache_write_tokens`, not an
+/// addition to it, and is clamped into range: the providers that publish no
+/// breakdown send a `-1` sentinel, which clamps to zero and prices the write
+/// exactly as before.
+pub fn estimate_cost_usd_split(
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    cache_write_1h_tokens: i64,
+    fallback_rate: f64,
+) -> f64 {
     let inp = input_tokens.max(0) as f64;
     let out = output_tokens.max(0) as f64;
     let cr = cache_read_tokens.max(0) as f64;
-    let cw = cache_write_tokens.max(0) as f64;
+    let cw_total = cache_write_tokens.max(0);
+    let cw_1h = cache_write_1h_tokens.clamp(0, cw_total) as f64;
+    let cw = (cw_total as f64) - cw_1h;
 
     // The billed prompt (uncached + cache read + cache write) picks the price
     // tier, as it does in `CostTracker::record_tokens`.
-    let long =
-        is_long_context(input_tokens.max(0) + cache_read_tokens.max(0) + cache_write_tokens.max(0));
+    let long = is_long_context(input_tokens.max(0) + cache_read_tokens.max(0) + cw_total);
 
     match lookup(model) {
         Some(p) => {
             let cache_read_rate = p.cache_read_rate(long).unwrap_or(fallback_rate);
             let cache_write_rate = p.cache_write_rate(long).unwrap_or(p.input_rate(long));
+            let cache_write_1h_rate = p.cache_write_1h_rate(long).unwrap_or(cache_write_rate);
             inp * p.input_rate(long)
                 + out * p.output_rate(long)
                 + cr * cache_read_rate
                 + cw * cache_write_rate
+                + cw_1h * cache_write_1h_rate
         }
-        None => (inp + out + cr + cw) * fallback_rate,
+        None => (inp + out + cr + cw + cw_1h) * fallback_rate,
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Anthropic bills a 1-hour write at 2.0x input and a 5-minute one at
+    /// 1.25x. Every write was priced at 1.25x until this test existed, which
+    /// on 2026-09-07 was 14.3M of 16.9M written tokens understated by 37.5%.
+    #[test]
+    fn a_one_hour_write_costs_more_than_a_five_minute_one() {
+        let flat = estimate_cost_usd("claude-opus-5", 0, 0, 0, 1_000_000, 0.0);
+        let hour = estimate_cost_usd_split("claude-opus-5", 0, 0, 0, 1_000_000, 1_000_000, 0.0);
+        assert!((flat - 6.25).abs() < 1e-9, "5m write: {flat}");
+        assert!((hour - 10.0).abs() < 1e-9, "1h write: {hour}");
+    }
+
+    /// The 1h count is a part of the write, not an addition to it: a fully-1h
+    /// turn and a fully-5m turn bill the same token count, at different rates.
+    #[test]
+    fn the_one_hour_count_is_carved_out_of_the_write_not_added_to_it() {
+        let half = estimate_cost_usd_split("claude-opus-5", 0, 0, 0, 1_000_000, 500_000, 0.0);
+        assert!((half - (6.25 / 2.0 + 10.0 / 2.0)).abs() < 1e-9, "{half}");
+    }
+
+    /// Providers that publish no breakdown send `-1`. That must price exactly
+    /// as it did before the split existed, not clamp a million tokens to the
+    /// dearer tier or subtract one from the cheaper one.
+    #[test]
+    fn the_absent_split_sentinel_prices_as_a_plain_five_minute_write() {
+        let sentinel = estimate_cost_usd_split("claude-opus-5", 0, 0, 0, 1_000_000, -1, 0.0);
+        let flat = estimate_cost_usd("claude-opus-5", 0, 0, 0, 1_000_000, 0.0);
+        assert!((sentinel - flat).abs() < 1e-12);
+    }
+
+    /// A family with only one published write price must not lose the write.
+    #[test]
+    fn a_family_with_no_one_hour_price_falls_back_to_its_only_write_rate() {
+        // Haiku 4.5 publishes both, so it cannot make this point; the free
+        // Spark row is built by `per_1m`, which leaves the 1h price `None`.
+        let p = lookup("claude-muse-spark-1.3").expect("the spark row is in the table");
+        assert_eq!(p.cache_write_1h_rate(false), p.cache_write_rate(false));
+    }
     use super::*;
 
     #[test]
@@ -342,6 +436,29 @@ mod tests {
         let p = lookup("claude-sonnet-4-5-20250929").unwrap();
         assert!((p.input_cost_per_token - 3.0 / 1e6).abs() < 1e-18);
         assert!((p.output_cost_per_token - 15.0 / 1e6).abs() < 1e-18);
+    }
+
+    #[test]
+    fn the_free_spark_tier_is_free_under_both_of_its_names() {
+        // The alias the router writes into the body, and the id the Zen
+        // upstream is actually called with. Before these rows the first took
+        // the `claude-` catch-all and the second took the blended fallback,
+        // both $3/MTok, so a free turn was booked as a Sonnet turn.
+        for model in [
+            "claude-muse-spark-1.3",
+            "muse-spark-1.3-contributor-free",
+            "muse-spark-1.2-contributor-free",
+        ] {
+            let p = lookup(model).unwrap_or_else(|| panic!("{model} must resolve"));
+            assert_eq!(p.input_cost_per_token, 0.0, "{model} input");
+            assert_eq!(p.output_cost_per_token, 0.0, "{model} output");
+            assert_eq!(p.cache_read_cost_per_token, Some(0.0), "{model} cache read");
+            assert_eq!(
+                estimate_cost_usd(model, 26_015, 500, 1_000, 0, 3.0 / 1e6),
+                0.0,
+                "{model} costs nothing whatever the token counts"
+            );
+        }
     }
 
     #[test]

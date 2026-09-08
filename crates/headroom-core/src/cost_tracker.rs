@@ -248,20 +248,51 @@ impl CostTracker {
         cache_read_tokens: i64,
         cache_write_tokens: i64,
     ) -> Option<f64> {
+        self.estimate_cost_split(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            0,
+        )
+    }
+
+    /// As [`Self::estimate_cost`], but told how much of the write the provider
+    /// billed at the 1-hour TTL (2.0x input against the 5-minute tier's 1.25x).
+    /// `cache_write_1h_tokens` is a part of `cache_write_tokens`; a `-1`
+    /// sentinel from a provider that publishes no breakdown clamps to zero and
+    /// prices the write exactly as before.
+    pub fn estimate_cost_split(
+        &self,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        cache_write_1h_tokens: i64,
+    ) -> Option<f64> {
         let p = crate::pricing::lookup(model)?;
         let inp = input_tokens.max(0) as f64;
         let out = output_tokens.max(0) as f64;
         let cr = cache_read_tokens.max(0) as f64;
-        let cw = cache_write_tokens.max(0) as f64;
+        let cw_total = cache_write_tokens.max(0);
+        let cw_1h = cache_write_1h_tokens.clamp(0, cw_total) as f64;
+        let cw = (cw_total as f64) - cw_1h;
         // Billed prompt picks the price tier: past 200k the tiered families
         // re-price the whole request, output included.
         let long = crate::pricing::is_long_context(
-            input_tokens.max(0) + cache_read_tokens.max(0) + cache_write_tokens.max(0),
+            input_tokens.max(0) + cache_read_tokens.max(0) + cw_total,
         );
         let cr_rate = p.cache_read_rate(long).unwrap_or(p.input_rate(long));
         let cw_rate = p.cache_write_rate(long).unwrap_or(p.input_rate(long));
+        let cw_1h_rate = p.cache_write_1h_rate(long).unwrap_or(cw_rate);
         let total =
-            inp * p.input_rate(long) + out * p.output_rate(long) + cr * cr_rate + cw * cw_rate;
+            inp * p.input_rate(long)
+                + out * p.output_rate(long)
+                + cr * cr_rate
+                + cw * cw_rate
+                + cw_1h * cw_1h_rate;
         if total > 0.0 {
             Some(total)
         } else {
@@ -306,12 +337,13 @@ impl CostTracker {
         if rec.uncached_tokens == 0 && rec.cache_read_tokens == 0 && rec.cache_write_tokens == 0 {
             input_tokens = rec.tokens_sent;
         }
-        let cost = self.estimate_cost(
+        let cost = self.estimate_cost_split(
             model,
             input_tokens,
             rec.output_tokens,
             rec.cache_read_tokens,
             rec.cache_write_tokens,
+            rec.cache_write_1h_tokens,
         );
 
         // Post-guard invariant (all providers): Headroom never forwards a
