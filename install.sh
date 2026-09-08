@@ -16,20 +16,51 @@ SETTINGS="$CLAUDE_DIR/settings.json"
 OS=$(uname -s)
 BUILD=1
 LINK=0
+HOOKS_INTO="$HOME"
 
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --no-build) BUILD=0 ;;
         --link) LINK=1 ;;
+        --hooks-into) HOOKS_INTO="${2:?--hooks-into needs a directory}"; shift ;;
+        --hooks-into=*) HOOKS_INTO="${1#*=}" ;;
         -h|--help)
-            echo "usage: ./install.sh [--no-build] [--link]"
-            echo "  --no-build  skip cargo build; install whatever target/release holds"
-            echo "  --link      symlink the scripts and flags file into the checkout,"
-            echo "              so editing the repo edits the live setup"
+            echo "usage: ./install.sh [--no-build] [--link] [--hooks-into DIR]"
+            echo "  --no-build     skip cargo build; install whatever target/release holds"
+            echo "  --link         symlink the scripts and flags file into the checkout,"
+            echo "                 so editing the repo edits the live setup"
+            echo "  --hooks-into   project whose sessions should run the review hooks"
+            echo "                 (default: \$HOME, i.e. every session on this machine)"
             exit 0 ;;
-        *) echo "unknown option: $arg" >&2; exit 2 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
+    shift
 done
+
+# Where the review hooks get REGISTERED. The scripts themselves always install
+# to ~/.claude/hooks -- one copy, one path in every settings file. Only the
+# registration moves, because that is what decides which sessions pay for them.
+#
+# Registering at $HOME runs review-gate on every prompt and every Bash, Write
+# and Edit in every project on the machine. That is right only if reviews start
+# from anywhere. When the slash commands that arm it live in one repo, the hook
+# can never fire usefully elsewhere and a bug in it takes out every session
+# instead of one project's.
+#
+# Project targets get settings.local.json, not settings.json: the latter is
+# checked in, and switching on automated tracker writes for everyone who clones
+# the repo is not a thing an installer should do quietly.
+if [ "$HOOKS_INTO" = "$HOME" ]; then
+    HOOK_SETTINGS="$CLAUDE_DIR/settings.json"
+    HOOK_PRUNE=""
+else
+    HOOKS_INTO=$(cd "$HOOKS_INTO" 2>/dev/null && pwd) ||
+        { echo "--hooks-into: no such directory" >&2; exit 2; }
+    HOOK_SETTINGS="$HOOKS_INTO/.claude/settings.local.json"
+    # Anything left behind at user level would keep firing everywhere, so the
+    # move is a move rather than a copy.
+    HOOK_PRUNE="$CLAUDE_DIR/settings.json"
+fi
 
 say() { printf '  %s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -219,6 +250,109 @@ for src in "$CONTRIB"/claude/agents/*.md; do
     fi
 done
 say "agents in $CLAUDE_DIR/agents: $(ls "$CONTRIB"/claude/agents/*.md | xargs -n1 basename | sed 's/\.md$//' | tr '\n' ' ')"
+
+# ── Claude Code hooks ─────────────────────────────────────────────────────
+# Headroom-owned hook scripts (session map logger, review write-offload
+# gate). Installed the same way as the launcher: copied by default,
+# symlinked with --link so editing the checkout edits the live setup.
+# The settings entries below are then ensured idempotently — a re-run
+# never duplicates them.
+step "Hooks"
+mkdir -p "$CLAUDE_DIR/hooks"
+for src in "$CONTRIB"/claude/hooks/*.sh; do
+    dst="$CLAUDE_DIR/hooks/$(basename "$src")"
+    if [ "$LINK" = 1 ]; then
+        [ -e "$dst" ] && [ ! -L "$dst" ] && mv "$dst" "$dst.bak" \
+            && say "moved the old $dst to $dst.bak"
+        ln -sfn "$src" "$dst"
+        say "linked $dst -> $src"
+    else
+        install -m 755 "$src" "$dst"
+        say "installed $dst"
+    fi
+done
+
+if command -v node >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$HOOK_SETTINGS")"
+    [ -f "$HOOK_SETTINGS" ] && cp "$HOOK_SETTINGS" "$HOOK_SETTINGS.bak"
+    [ -n "$HOOK_PRUNE" ] && [ -f "$HOOK_PRUNE" ] && cp "$HOOK_PRUNE" "$HOOK_PRUNE.bak"
+    node -e '
+const fs = require("fs");
+const [file, dir, pruneFile] = process.argv.slice(1);
+
+// Every event the review chain needs, in one list, so a target change moves
+// all of them together. UserPromptSubmit is the one that matters: it fires on
+// the go-ahead, before the diffs are read and the replies are written, which
+// is the only point where diverting still saves anything.
+const WANT = [
+  ["UserPromptSubmit", null,                  "review-gate.sh",    10],
+  ["PreToolUse",       "Bash",                "review-gate.sh",    10],
+  ["PreToolUse",       "Write|Edit|MultiEdit", "review-gate.sh",   10],
+  ["Stop",             null,                  "review-gate.sh",    10],
+  ["SessionStart",     null,                  "session-map-log.sh", 5],
+];
+
+function load(f) { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return {}; } }
+
+const settings = load(file);
+settings.hooks = settings.hooks || {};
+function ensure(event, matcher, entry) {
+  settings.hooks[event] = settings.hooks[event] || [];
+  let group = settings.hooks[event].find(g => (g.matcher || null) === (matcher || null));
+  if (!group) { group = matcher ? { matcher: matcher, hooks: [] } : { hooks: [] }; settings.hooks[event].push(group); }
+  group.hooks = group.hooks || [];
+  if (!group.hooks.some(h => h.command === entry.command)) group.hooks.push(entry);
+}
+for (const [event, matcher, script, timeout] of WANT) {
+  ensure(event, matcher, { type: "command", command: dir + "/" + script, timeout: timeout });
+}
+
+// One registration per (event, matcher, command). A hand-added group with no
+// matcher and a generated one with matcher "" both normalise to null, so
+// ensure() appends to the first while the second still holds the same command
+// -- and the hook then runs twice on every prompt. Matchers that genuinely
+// differ are left alone: review-gate is registered for Bash and for
+// Write|Edit|MultiEdit on purpose.
+for (const event of Object.keys(settings.hooks)) {
+  const seen = new Set();
+  settings.hooks[event] = (settings.hooks[event] || []).map(g => {
+    const key = (g.matcher || null) + " ";
+    const keep = (g.hooks || []).filter(h => {
+      if (seen.has(key + h.command)) return false;
+      seen.add(key + h.command);
+      return true;
+    });
+    return Object.assign({}, g, { hooks: keep });
+  }).filter(g => (g.hooks || []).length > 0);
+}
+fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n");
+
+// Drop the same commands wherever they were registered before, or the old
+// registration keeps firing in every project alongside the new one.
+if (pruneFile && pruneFile !== file) {
+  const mine = new Set(WANT.map(w => dir + "/" + w[2]));
+  const other = load(pruneFile);
+  let removed = 0;
+  for (const event of Object.keys(other.hooks || {})) {
+    other.hooks[event] = (other.hooks[event] || []).map(g => {
+      const keep = (g.hooks || []).filter(h => !mine.has(h.command));
+      removed += (g.hooks || []).length - keep.length;
+      return Object.assign({}, g, { hooks: keep });
+    }).filter(g => (g.hooks || []).length > 0);
+    if (other.hooks[event].length === 0) delete other.hooks[event];
+  }
+  if (removed > 0) {
+    fs.writeFileSync(pruneFile, JSON.stringify(other, null, 2) + "\n");
+    console.log("  removed " + removed + " stale registration(s) from " + pruneFile);
+  }
+}
+' "$HOOK_SETTINGS" "$CLAUDE_DIR/hooks" "$HOOK_PRUNE"
+    say "hooks wired into $HOOK_SETTINGS"
+    [ -n "$HOOK_PRUNE" ] &&
+        say "sessions outside $HOOKS_INTO no longer run the review hooks"
+else
+    say "node not found — add the review-gate.sh / session-map-log.sh entries in $HOOK_SETTINGS by hand"
+fi
 
 # ── CLAUDE.md ─────────────────────────────────────────────────────────────
 # The proxy injects memory tools and headroom_retrieve; this excerpt tells
