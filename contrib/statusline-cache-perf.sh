@@ -19,6 +19,12 @@ health=$(curl -fsS --max-time 1 "${HEADROOM_CACHE_HEALTH_URL:-http://127.0.0.1:8
 cache_pct=$(printf '%s' "$health" | jq -r 'if .recent_hit_rate == null then empty else (.recent_hit_rate * 100 | floor) end')
 [ -z "$cache_pct" ] && cache_pct="?"
 
+# What share of the tokens written to the cache bought new cached ground, as
+# against re-covering ground the conversation already held. Writes only: reads
+# outnumber them about fifty to one and would pin this near 100% forever.
+# Rounds down, so a "99%" here has really cleared 99%.
+prod_pct=$(printf '%s' "$health" | jq -r 'if .productive_write_pct == null then empty else (.productive_write_pct | floor) end')
+
 # Pre-filter before parsing: three event names out of ~17 lines a turn keeps
 # this at a few hundred lines of JSON per statusline render.
 cr=$(tail -n "$WINDOW" "$LOG" 2>/dev/null \
@@ -131,6 +137,8 @@ print(" · ".join(out))
 ' 2>/dev/null)
 
 line="cache ✓ ${cache_pct}%"
+# Older proxies do not publish it; the segment stays byte-identical there.
+[ -n "$prod_pct" ] && line="$line | prod ${prod_pct}%"
 if [ -n "$cr" ]; then
     read -r steady crude _uncached <<<"$cr"
     line="$line | c/r ${steady} steady, ${crude} crude"
