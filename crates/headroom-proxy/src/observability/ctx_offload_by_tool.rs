@@ -92,10 +92,14 @@ mod tests {
     #[test]
     fn a_known_tool_counts_under_its_own_name() {
         let before = offloaded_tool_get("Read");
-        let before_other = offloaded_tool_get(OTHER);
         observe_offloaded_tool("Read");
         assert_eq!(offloaded_tool_get("Read"), before + 1);
-        assert_eq!(offloaded_tool_get(OTHER), before_other, "not bucketed");
+        // The "did not fall into OTHER" half is asserted on the bucketing
+        // itself rather than on OTHER's value: `an_unknown_tool_collapses_
+        // into_other` runs in parallel against the same process-global
+        // registry and moves that counter under us, which made this test fail
+        // on scheduling luck rather than on anything about `Read`.
+        assert_eq!(bucket("Read"), "Read", "not bucketed");
     }
 
     /// The cardinality guard. Tool names come from the request body, so an MCP

@@ -25,6 +25,30 @@ cache_pct=$(printf '%s' "$health" | jq -r 'if .recent_hit_rate == null then empt
 # Rounds down, so a "99%" here has really cleared 99%.
 prod_pct=$(printf '%s' "$health" | jq -r 'if .productive_write_pct == null then empty else (.productive_write_pct | floor) end')
 
+# What the holds bought. Denominator is the turns where the client's own hot
+# zone (model, system, tools) moved and the provider then ruled on the prefix:
+# it read it back (a hold absorbed the move) or it re-created it (the move got
+# through). Turns where the hot zone never moved are not evidence either way
+# and are excluded, so an idle session shows nothing rather than a flattering
+# 100%. Suppressed until something has actually been judged.
+hold_pct=$(printf '%s' "$health" | jq -r '
+  if .stabilization_absorb_pct == null then empty
+  elif ((.stabilization_absorbed_total // 0) + (.hot_zone_recaches_total // 0)) == 0 then empty
+  else (.stabilization_absorb_pct | floor) end')
+
+# How the proxy compares with a plain Claude Code client on the same traffic --
+# no compression, no offload, no holds. Both arms in input-equivalent tokens,
+# ours billed and stock modelled from the wire bytes. Positive is cheaper than
+# stock; negative is a regression and is shown as such rather than clamped.
+# `predicted_read_error_pct` rides along as the model's own error bar; the
+# segment is dropped once that exceeds 25%, because past there the number is
+# reporting the model rather than the proxy.
+vs_stock=$(printf '%s' "$health" | jq -r '
+  if .vs_stock_saving_pct == null then empty
+  elif (.stock_turns_compared // 0) == 0 then empty
+  elif (.predicted_read_error_pct // 0) > 25 then empty
+  else (.vs_stock_saving_pct | round) end')
+
 # Pre-filter before parsing: three event names out of ~17 lines a turn keeps
 # this at a few hundred lines of JSON per statusline render.
 cr=$(tail -n "$WINDOW" "$LOG" 2>/dev/null \
@@ -139,6 +163,8 @@ print(" · ".join(out))
 line="cache ✓ ${cache_pct}%"
 # Older proxies do not publish it; the segment stays byte-identical there.
 [ -n "$prod_pct" ] && line="$line | prod ${prod_pct}%"
+[ -n "$hold_pct" ] && line="$line | hold ${hold_pct}%"
+[ -n "$vs_stock" ] && line="$line | vs stock ${vs_stock}%"
 if [ -n "$cr" ]; then
     read -r steady crude _uncached <<<"$cr"
     line="$line | c/r ${steady} steady, ${crude} crude"

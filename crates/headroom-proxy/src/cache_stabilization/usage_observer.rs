@@ -137,6 +137,13 @@ const PENDING_CAPACITY: usize = 512;
 /// longer than this, so an older entry is a leftover, not a race.
 const IN_FLIGHT_HORIZON: Duration = Duration::from_secs(15 * 60);
 const CONVERSATION_CAPACITY: usize = 512;
+
+/// Anthropic's published multipliers against the base input rate. They are the
+/// same for every model on the price list, which is why the stock comparison
+/// can be run in input-equivalent tokens and never has to look up a price.
+const CACHE_READ_MULTIPLIER: f64 = 0.1;
+const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 /// Rolling window for the fleet-wide hit-rate shown in the
 /// statusline (`/cache-health`).
 const RECENT_SAMPLE_CAPACITY: usize = 50;
@@ -1098,6 +1105,55 @@ pub struct CacheHealthSnapshot {
     /// look at rather than a fault on its own. Zero is the only value that
     /// needs no explanation.
     pub abandoned_requests_total: u64,
+    /// Turns where the client's hot zone (model, system, tools) changed.
+    ///
+    /// Every one is a turn a stock client would have been at risk of
+    /// re-caching from the system block down. `head` is hashed over the body
+    /// the client sent, not the held view the drift detector sees, which is
+    /// what makes this a statement about the client rather than about us.
+    pub hot_zone_changes_total: u64,
+    /// The subset that re-cached anyway: stabilisation did not absorb them.
+    pub hot_zone_recaches_total: u64,
+    /// The subset that read its cache regardless — absorbed.
+    pub stabilization_absorbed_total: u64,
+    /// Footprint those turns kept, summed. Each is the previous turn's
+    /// observed read plus write, so it is what the provider billed last turn
+    /// and not a guess at what a rebuild would cost.
+    pub stabilization_absorbed_tokens_total: u64,
+    /// Share of the client's hot-zone changes that stabilisation absorbed.
+    ///
+    /// The honest headline for "what is stabilisation worth": of the changes
+    /// that would have cost a stock client its cache, this many did not cost
+    /// this one. 100.0 with no hot-zone changes yet, because nothing has been
+    /// missed. Read it beside `hot_zone_changes_total` -- a rate over three
+    /// turns means nothing.
+    pub stabilization_absorb_pct: f64,
+
+    /// How this proxy compares with a plain Claude Code client -- no
+    /// compression, no offload, no holds -- on the same traffic.
+    ///
+    /// Both arms are counted in input-equivalent tokens: fresh input at 1x,
+    /// cache reads at 0.1x, 5-minute writes at 1.25x, 1-hour writes at 2.0x.
+    /// Those multipliers are identical across the price list, so mixed routing
+    /// cannot skew the ratio and no price table has to be current for it to
+    /// hold. Ours is billed; stock is modelled, and
+    /// `predicted_read_error_pct` says how much to trust the model.
+    pub ours_effective_tokens: u64,
+    pub stock_effective_tokens: u64,
+    /// Turns where both arms could be priced. A turn with no billed usage is
+    /// in neither.
+    pub stock_turns_compared: u64,
+    /// `(1 - ours/stock) * 100`. Positive means we cost less than stock would
+    /// have. It can exceed nothing in particular: it is bounded above by 100
+    /// (free) and unbounded below, so a negative reading is a real regression
+    /// and not a scaling artefact. `0.0` until a turn has been compared.
+    pub vs_stock_saving_pct: f64,
+    /// The stock arm's one modelled rule -- "next turn reads back as much of
+    /// the last prompt as still fits" -- scored every turn against our own
+    /// observed reads, where the answer is billed rather than assumed. Read
+    /// as: the counterfactual is good to about this much. Absolute error over
+    /// observed reads, so it does not cancel.
+    pub predicted_read_error_pct: f64,
     /// `earned / (earned + unearned)`, as a percentage, over every cache-write
     /// token seen since the process started.
     ///
@@ -1170,6 +1226,23 @@ struct Inner {
     unearned_cache_write_tokens_total: u64,
     unearned_write_turns_total: u64,
     abandoned_requests_total: u64,
+    hot_zone_changes_total: u64,
+    hot_zone_recaches_total: u64,
+    stabilization_absorbed_total: u64,
+    stabilization_absorbed_tokens_total: u64,
+    /// The stock arm's cached prefix per conversation, carried turn to turn
+    /// the way `conversations` carries ours. Same capacity, so a conversation
+    /// that ages out of one ages out of the other.
+    stock_footprints: LruCache<String, u64>,
+    /// Input-equivalent tokens billed to us, and modelled for a plain client.
+    ours_effective_tokens: f64,
+    stock_effective_tokens: f64,
+    stock_turns_compared: u64,
+    /// Self-check for the stock arm's one modelled rule, run against our own
+    /// observed reads.
+    predicted_read_tokens: u64,
+    observed_read_tokens: u64,
+    predicted_read_abs_error: u64,
     first_turn_writes_total: u64,
     first_turn_write_tokens_total: u64,
     first_turn_contradictions_total: u64,
@@ -1264,6 +1337,19 @@ impl UsageObserver {
                 unearned_cache_write_tokens_total: 0,
                 unearned_write_turns_total: 0,
                 abandoned_requests_total: 0,
+                hot_zone_changes_total: 0,
+                hot_zone_recaches_total: 0,
+                stabilization_absorbed_total: 0,
+                stabilization_absorbed_tokens_total: 0,
+                stock_footprints: LruCache::new(
+                    NonZeroUsize::new(CONVERSATION_CAPACITY).expect("capacity is non-zero"),
+                ),
+                ours_effective_tokens: 0.0,
+                stock_effective_tokens: 0.0,
+                stock_turns_compared: 0,
+                predicted_read_tokens: 0,
+                observed_read_tokens: 0,
+                predicted_read_abs_error: 0,
                 first_turn_writes_total: 0,
                 first_turn_write_tokens_total: 0,
                 first_turn_contradictions_total: 0,
@@ -1867,6 +1953,130 @@ impl UsageObserver {
         // breakpoint advancing over new content and is money well spent — but
         // it was indistinguishable from the rest, so split it and count both
         // sides. Only the unearned half is a savings candidate.
+        // ---- what cache stabilisation is worth, measured rather than modelled
+        //
+        // The prefix `head` is hashed over the model, system and tools of the
+        // body the *client* sent: `forward_http` takes the drift hash on the
+        // held view but puts the client's own `system` back before this
+        // observer ever sees it. So `head_changed` says the client's hot zone
+        // moved -- the thing that re-caches a conversation from the system
+        // block down, and the thing the holds exist to absorb.
+        //
+        // What happened next is observed, not assumed. A hot-zone change that
+        // still read its cache is one the stabilisation absorbed; one that
+        // re-cached is one it did not. Counting both gives the absorb rate and
+        // the tokens, from real turns, with no counterfactual arm and no model
+        // of the provider's cache.
+        if head_changed {
+            inner.hot_zone_changes_total += 1;
+            match class {
+                TurnClass::Healthy => {
+                    inner.stabilization_absorbed_total += 1;
+                    // Worth the footprint that would have been rebuilt, which
+                    // is the previous turn's observed read plus write. Not an
+                    // estimate of it -- the number Anthropic billed last turn.
+                    inner.stabilization_absorbed_tokens_total += expected_cache_read;
+                }
+                TurnClass::Recache { .. } => {
+                    inner.hot_zone_recaches_total += 1;
+                }
+                // A first turn has no cache to lose, and a TTL expiry would
+                // have re-cached under any client. Neither says anything about
+                // stabilisation, so neither is counted either way.
+                TurnClass::FirstTurn | TurnClass::TtlExpiry => {}
+            }
+        }
+
+        // --- the stock arm -------------------------------------------------
+        //
+        // What the same turn would have cost a plain Claude Code client: no
+        // compression, no offload, no holds. It runs beside the real request
+        // rather than instead of it, so there is no A/B split and no session
+        // is ever served the worse arm.
+        //
+        // Three of the four inputs are measured, not modelled:
+        //
+        //   * our prompt is the billed `input + read + write` -- exact;
+        //   * the size the client sent and the size we forwarded are the wire
+        //     bytes from `note_wire_bytes` -- exact;
+        //   * the verdict the provider handed down on our prefix is `class`.
+        //
+        // The one model is the stock client's cache behaviour, and it is the
+        // simple one: Claude Code puts a breakpoint at the tail, so its whole
+        // prompt is cacheable and the next turn reads back as much of it as
+        // still fits. `predicted_read_error_pct` below measures that same rule
+        // against our own observed reads every turn, which is what bounds how
+        // far to trust this arm.
+        let ours_prompt = input_tokens + cache_read_input_tokens + cache_creation_input_tokens;
+        if ours_prompt > 0 {
+            // Bytes to tokens by proportion. Both numbers are the same kind of
+            // JSON measured at the same place, so the ratio carries over even
+            // though neither side is a token count.
+            let stock_prompt = match (pending.client_request_bytes, pending.forwarded_request_bytes)
+            {
+                (Some(sent), Some(fwd)) if fwd > 0 && sent > fwd => {
+                    ((ours_prompt as f64) * (sent as f64) / (fwd as f64)).round() as u64
+                }
+                // Nothing was removed, or we cannot prove anything was: the
+                // stock client would have sent what we sent.
+                _ => ours_prompt,
+            };
+
+            let prior = inner
+                .stock_footprints
+                .get(&pending.conversation_key)
+                .copied()
+                .unwrap_or(0);
+            // Anything that busted our prefix would have busted theirs -- an
+            // idle gap is idle for both, and a body edit is the client's own.
+            // A hot-zone change is the case where the arms part: our holds may
+            // absorb it, and without them it is a rebuild every time.
+            let stock_kept = matches!(class, TurnClass::Healthy) && !head_changed;
+            // The tail after the last breakpoint is billed as fresh input on
+            // both arms. Which message the breakpoint lands on is the client's
+            // shape, not ours, so handing the stock arm a cheaper tail than we
+            // got would be inventing a difference the transforms did not make.
+            let stock_cacheable = stock_prompt.saturating_sub(input_tokens);
+            let stock_read = if stock_kept { prior.min(stock_cacheable) } else { 0 };
+            let stock_write = stock_cacheable.saturating_sub(stock_read);
+            inner
+                .stock_footprints
+                .put(pending.conversation_key.clone(), stock_read + stock_write);
+
+            // Priced in input-equivalents rather than dollars: Anthropic's
+            // multipliers (read 0.1x, 5-minute write 1.25x, 1-hour write 2.0x)
+            // are the same for every model, so the ratio of the two arms holds
+            // whatever was routed where, and no price table has to be right
+            // for the comparison to be.
+            let (w5, w1h) = match cache_write_ttl_split {
+                Some((five, hour)) => (five, hour),
+                None => (cache_creation_input_tokens, 0),
+            };
+            let ours_effective = input_tokens as f64
+                + cache_read_input_tokens as f64 * CACHE_READ_MULTIPLIER
+                + w5 as f64 * CACHE_WRITE_5M_MULTIPLIER
+                + w1h as f64 * CACHE_WRITE_1H_MULTIPLIER;
+            // The stock client never asks for the hour, so its writes price at
+            // the 5-minute rate throughout.
+            let stock_effective = input_tokens as f64
+                + stock_read as f64 * CACHE_READ_MULTIPLIER
+                + stock_write as f64 * CACHE_WRITE_5M_MULTIPLIER;
+            inner.ours_effective_tokens += ours_effective;
+            inner.stock_effective_tokens += stock_effective;
+            inner.stock_turns_compared += 1;
+
+            // The self-check, on the arm where the answer is observable: the
+            // stock model's rule, applied to our own previous footprint,
+            // against what the provider actually read back. Reported as a
+            // share of the reads it was predicting, so it stays readable as
+            // "the counterfactual is good to about this much".
+            let predicted_ours_read = expected_cache_read.min(ours_prompt);
+            inner.predicted_read_tokens += predicted_ours_read;
+            inner.observed_read_tokens += cache_read_input_tokens;
+            inner.predicted_read_abs_error +=
+                predicted_ours_read.abs_diff(cache_read_input_tokens);
+        }
+
         // Every completed turn that wrote anything, not just the healthy ones.
         // Gating on `Healthy` made this dead arithmetic: healthy means
         // `read + RECACHE_SLACK_TOKENS >= previous footprint`, which forces
@@ -2337,6 +2547,45 @@ impl UsageObserver {
             unearned_cache_write_tokens_total: inner.unearned_cache_write_tokens_total,
             unearned_write_turns_total: inner.unearned_write_turns_total,
             abandoned_requests_total: inner.abandoned_requests_total,
+            hot_zone_changes_total: inner.hot_zone_changes_total,
+            hot_zone_recaches_total: inner.hot_zone_recaches_total,
+            stabilization_absorbed_total: inner.stabilization_absorbed_total,
+            stabilization_absorbed_tokens_total: inner.stabilization_absorbed_tokens_total,
+            ours_effective_tokens: inner.ours_effective_tokens.round() as u64,
+            stock_effective_tokens: inner.stock_effective_tokens.round() as u64,
+            stock_turns_compared: inner.stock_turns_compared,
+            vs_stock_saving_pct: {
+                // Nothing compared yet reads as "no difference", not as a win.
+                if inner.stock_effective_tokens <= 0.0 {
+                    0.0
+                } else {
+                    (1.0 - inner.ours_effective_tokens / inner.stock_effective_tokens) * 100.0
+                }
+            },
+            predicted_read_error_pct: {
+                // Denominator is the observed reads the rule was predicting.
+                // Before anything has been read back there is no error to
+                // report, and 0.0 says exactly that.
+                if inner.observed_read_tokens == 0 {
+                    0.0
+                } else {
+                    inner.predicted_read_abs_error as f64 * 100.0
+                        / inner.observed_read_tokens as f64
+                }
+            },
+            stabilization_absorb_pct: {
+                // Denominator is absorbed + re-cached, not every hot-zone
+                // change: first turns and TTL expiries are counted in neither
+                // and would drag the rate toward a number about idling.
+                let judged = inner
+                    .stabilization_absorbed_total
+                    .saturating_add(inner.hot_zone_recaches_total);
+                if judged == 0 {
+                    100.0
+                } else {
+                    inner.stabilization_absorbed_total as f64 * 100.0 / judged as f64
+                }
+            },
             productive_write_pct: {
                 let earned = inner.earned_cache_write_tokens_total;
                 let written = earned.saturating_add(inner.unearned_cache_write_tokens_total);
@@ -4680,5 +4929,254 @@ mod first_turn_attribution_tests {
             );
         });
         assert!(lines.is_empty(), "{lines:?}");
+    }
+}
+
+/// What the working-directory and role-sentence holds actually bought.
+///
+/// The counters live here rather than in a simulator because the holds are
+/// previewed for the structural hash and then *restored*, so the fingerprint
+/// the observer keeps is the client's own. Every turn below is a real verdict
+/// the provider handed down, not a replay.
+#[cfg(test)]
+mod stabilization_meter_tests {
+    use super::*;
+
+    /// A fingerprint that differs from `fp` only in the hot zone.
+    fn hot(head: &str) -> PrefixFingerprint {
+        PrefixFingerprint {
+            head: head.into(),
+            body: "body".into(),
+            stable: "stable".into(),
+            stable_msgs: 4,
+        }
+    }
+
+    /// The stabilisation meter is *observed*, not simulated. `head_changed`
+    /// compares the fingerprint taken on the client-shaped body -- the holds
+    /// are previewed for the structural hash and then restored before
+    /// `begin_request` runs -- so it says the client moved its model, system
+    /// or tools. When the provider reads the prefix back anyway, a hold
+    /// absorbed the move, and that is worth exactly the prefix it saved.
+    #[test]
+    fn a_hot_zone_change_the_provider_read_through_is_an_absorbed_turn() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.complete("r1", 100, 0, 10_000, None);
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("bbbb")));
+        obs.complete("r2", 100, 10_000, 200, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.hot_zone_changes_total, 1);
+        assert_eq!(s.stabilization_absorbed_total, 1);
+        assert_eq!(s.hot_zone_recaches_total, 0);
+        assert_eq!(
+            s.stabilization_absorbed_tokens_total, 10_000,
+            "an absorbed turn is worth the prefix that survived it"
+        );
+        assert_eq!(s.stabilization_absorb_pct, 100.0);
+    }
+
+    /// The other side of the same coin, and the one that keeps the meter
+    /// honest: the hot zone moved and the provider threw the prefix away.
+    #[test]
+    fn a_hot_zone_change_that_busted_the_prefix_is_counted_against_us() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.complete("r1", 100, 0, 10_000, None);
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("bbbb")));
+        obs.complete("r2", 100, 0, 10_200, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.hot_zone_changes_total, 1);
+        assert_eq!(s.hot_zone_recaches_total, 1);
+        assert_eq!(s.stabilization_absorbed_total, 0);
+        assert_eq!(s.stabilization_absorbed_tokens_total, 0);
+        assert_eq!(s.stabilization_absorb_pct, 0.0);
+    }
+
+    /// A recache with a steady hot zone is somebody else's fault -- a body
+    /// edit, a dropped tool result -- and must not be charged to the holds,
+    /// or the rate reads as a hold failure every time the transcript churns.
+    #[test]
+    fn a_recache_with_a_steady_hot_zone_never_reaches_the_stabilization_meter() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.complete("r1", 100, 0, 10_000, None);
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.complete("r2", 100, 0, 10_200, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.recache_events_total, 1, "it is still a recache");
+        assert_eq!(s.hot_zone_changes_total, 0);
+        assert_eq!(s.hot_zone_recaches_total, 0);
+        assert_eq!(
+            s.stabilization_absorb_pct, 100.0,
+            "nothing judged yet, so the meter reports no failures rather than \
+             a zero it cannot support"
+        );
+    }
+
+    /// The denominator is `absorbed + recaches`, not every hot-zone change.
+    /// A first turn has no prefix to lose and a TTL expiry lost it to the
+    /// clock; scoring either would move the rate for reasons the holds had
+    /// no say in.
+    #[test]
+    fn only_turns_the_holds_could_have_decided_are_in_the_denominator() {
+        let obs = UsageObserver::new();
+
+        // First turn on the conversation: a head change is unobservable,
+        // there being nothing to compare against.
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.complete("r1", 100, 0, 10_000, None);
+        assert_eq!(obs.snapshot().hot_zone_changes_total, 0);
+
+        // Two changes, one of each verdict.
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("bbbb")));
+        obs.complete("r2", 100, 10_000, 200, None);
+        obs.begin_request("r3", "conv".into(), None, None, Some(hot("cccc")));
+        obs.complete("r3", 100, 0, 10_500, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.hot_zone_changes_total, 2);
+        assert_eq!(s.stabilization_absorbed_total, 1);
+        assert_eq!(s.hot_zone_recaches_total, 1);
+        assert_eq!(s.stabilization_absorb_pct, 50.0);
+    }
+}
+
+/// The stock arm: what a plain Claude Code client would have been billed for
+/// the same traffic, run beside the real request rather than instead of it.
+#[cfg(test)]
+mod stock_baseline_tests {
+    use super::*;
+
+    fn hot(head: &str) -> PrefixFingerprint {
+        PrefixFingerprint {
+            head: head.into(),
+            body: "body".into(),
+            stable: "stable".into(),
+            stable_msgs: 4,
+        }
+    }
+
+    /// Baseline: nothing was removed from the body and the hot zone held
+    /// steady, so the two arms are the same request and must price the same.
+    /// A comparison that shows a win here is measuring itself.
+    #[test]
+    fn a_turn_we_did_not_touch_prices_identically_in_both_arms() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        obs.complete("r1", 0, 0, 10_000, None);
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r2", 1_000, 1_000, "off");
+        obs.complete("r2", 100, 10_000, 200, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.stock_turns_compared, 2);
+        assert_eq!(s.ours_effective_tokens, s.stock_effective_tokens);
+        assert_eq!(s.vs_stock_saving_pct, 0.0);
+    }
+
+    /// A body we shrank. The stock client carries the whole thing every turn,
+    /// so it writes a bigger prefix on the cold turn and reads a bigger one
+    /// back on the warm turn -- both scaled from the wire bytes, which are
+    /// measured at the point the request leaves.
+    #[test]
+    fn a_body_we_shrank_costs_the_stock_client_the_full_size_every_turn() {
+        let obs = UsageObserver::new();
+
+        // Client sent 2 KB, we forwarded 1 KB: stock's prompt is twice ours.
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 2_000, 1_000, "on");
+        obs.complete("r1", 0, 0, 10_000, None);
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r2", 2_000, 1_000, "on");
+        obs.complete("r2", 100, 10_000, 200, None);
+
+        let s = obs.snapshot();
+        // Ours: 10_000 written cold (x1.25), then 100 fresh + 10_000 read
+        // (x0.1) + 200 written (x1.25).
+        assert_eq!(s.ours_effective_tokens, 13_850);
+        // Stock: 20_000 written cold, then 20_000 read back, 500 of growth
+        // written, and the same 100-token fresh tail we were billed for.
+        assert_eq!(s.stock_effective_tokens, 27_725);
+        assert!(
+            (s.vs_stock_saving_pct - 50.05).abs() < 0.01,
+            "{}",
+            s.vs_stock_saving_pct
+        );
+    }
+
+    /// The holds' contribution, priced. The client moved its hot zone and our
+    /// prefix survived; the stock client has no hold, so the same move costs
+    /// it the whole prefix again.
+    #[test]
+    fn a_hot_zone_change_we_absorbed_is_a_full_rebuild_for_the_stock_client() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        obs.complete("r1", 0, 0, 10_000, None);
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("bbbb")));
+        obs.note_wire_bytes("r2", 1_000, 1_000, "off");
+        obs.complete("r2", 100, 10_000, 200, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.stabilization_absorbed_total, 1, "sanity: we absorbed it");
+        assert_eq!(s.ours_effective_tokens, 13_850);
+        // Stock re-writes the whole 10_200 prefix rather than reading it.
+        assert_eq!(s.stock_effective_tokens, 12_500 + 12_850);
+        assert!(
+            (s.vs_stock_saving_pct - 45.37).abs() < 0.01,
+            "{}",
+            s.vs_stock_saving_pct
+        );
+    }
+
+    /// The self-check. The stock arm's one modelled rule is scored every turn
+    /// against our own billed reads, so the counterfactual carries its own
+    /// error bar instead of asking to be believed.
+    #[test]
+    fn the_read_rule_is_scored_against_our_own_billed_reads() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        obs.complete("r1", 0, 0, 10_000, None);
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r2", 1_000, 1_000, "off");
+        obs.complete("r2", 100, 10_000, 200, None);
+        assert_eq!(
+            obs.snapshot().predicted_read_error_pct,
+            0.0,
+            "the rule called this one exactly"
+        );
+
+        // Now a turn the rule gets wrong: it expects the whole 10_200 prefix
+        // back and only half of it comes.
+        obs.begin_request("r3", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r3", 1_000, 1_000, "off");
+        obs.complete("r3", 100, 5_000, 5_300, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.stock_turns_compared, 3);
+        // |10_200 - 5_000| of error against 15_000 of reads observed so far.
+        assert!(
+            (s.predicted_read_error_pct - 34.67).abs() < 0.01,
+            "{}",
+            s.predicted_read_error_pct
+        );
     }
 }
