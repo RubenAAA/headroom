@@ -112,13 +112,46 @@ fi
 case "$TOOL" in
   Write|Edit|MultiEdit)
     FP=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
+
+    # Machinery, not drafts. These files necessarily contain the same words a
+    # draft does -- discussion_id, body, resolve -- because they are what reads
+    # and posts one. Matching them would wall the model off from its own tools.
     case "$FP" in
-      /tmp/mr*|/tmp/*post*|docs/mr-*)
-        spawn_worker
-        echo "REVIEW WRITE DIVERTED: analysis captured from transcript; spark poster is drafting and will post after go-ahead. Do not compose drafts yourself — acknowledge briefly and wait." >&2
-        exit 2
-        ;;
+      */spark-poster/gitlab_api.py|*/spark-poster/spark_post.py \
+      |*/spark-poster/triage.py|*/spark-poster/read_threads.py \
+      |*/spark-poster/since_review.py|*/spark-poster/thread_dossier.py \
+      |*/spark-poster/README.md|*/hooks/review-gate.sh)
+        exit 0 ;;
     esac
+
+    DIVERT=""
+    # Where drafts live. The old matcher was three /tmp globs and a draft
+    # written anywhere else -- a drafts/ dir in the repo, say -- walked
+    # straight through it.
+    case "$FP" in
+      */spark-review/*|*/drafts/*|/tmp/mr*|/tmp/*post*|docs/mr-*) DIVERT=1 ;;
+    esac
+
+    # What a draft looks like, wherever it was written. Path rules only catch
+    # the paths someone thought of; a reply body carrying a thread id is a
+    # draft no matter which directory it lands in.
+    if [ -z "$DIVERT" ]; then
+      BODY=$(echo "$INPUT" | jq -r '
+        [.tool_input.content // empty,
+         .tool_input.new_string // empty,
+         (.tool_input.edits // [] | map(.new_string // empty) | join("\n"))]
+        | join("\n")' 2>/dev/null)
+      if echo "$BODY" | grep -qE 'discussion_id' \
+         && echo "$BODY" | grep -qiE '"body"|resolve|закрываю|verdict'; then
+        DIVERT=1
+      fi
+    fi
+
+    if [ -n "$DIVERT" ]; then
+      spawn_worker
+      echo "REVIEW DRAFT DIVERTED. Do not compose the verdicts yourself -- that is the expensive half and it is what the offload exists to move. Delegate the assessment to a subagent (Task tool): give it the thread list, the commit range and the repo path, and have it write the draft. Then wait for the go-ahead. Composing here and posting there saves nothing." >&2
+      exit 2
+    fi
     ;;
 esac
 exit 0
