@@ -89,6 +89,38 @@ pub const ANTHROPIC_CACHE_TTL_1H: Duration = Duration::from_secs(60 * 60);
 /// (breakpoint rounding); anything inside the slack is Healthy.
 pub const RECACHE_SLACK_TOKENS: u64 = 64;
 
+/// Below this, an unearned write is breakpoint rounding and not worth a line.
+/// Chosen against 2026-09-07: a floor of 1,024 logs 188 turns of the day and
+/// still names 96% of the unearned tokens, where a floor at the slack would
+/// log 331 turns to catch the last 4%.
+pub const UNEARNED_WRITE_FLOOR_TOKENS: u64 = 1_024;
+
+/// Split a healthy turn's cache write into the part that bought new cached
+/// footprint and the part that re-wrote footprint the conversation already
+/// had.
+///
+/// A turn that reads its whole expected prefix is `Healthy` however much it
+/// writes, because the classifier only ever asked whether the *read* fell
+/// short. That left 65% of one day's written tokens in a bucket with no name
+/// — mostly the breakpoint advancing over genuinely new content, which is the
+/// mechanism working and money well spent, but not only that. Growth in the
+/// cached footprint is what a write is supposed to buy; anything written
+/// beyond it went over ground already covered.
+///
+/// Deliberately conservative: `growth` is the *whole* footprint increase, so
+/// a write is called earned whenever it plausibly paid for one. This
+/// undercounts rather than accuses.
+pub fn split_cache_write(
+    previous_footprint: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+) -> (u64, u64) {
+    let footprint = cache_read_input_tokens.saturating_add(cache_creation_input_tokens);
+    let growth = footprint.saturating_sub(previous_footprint);
+    let earned = cache_creation_input_tokens.min(growth);
+    (earned, cache_creation_input_tokens - earned)
+}
+
 /// Bounded capacities. Same rationale as the drift detector's LRU:
 /// a flood of unique keys must not grow memory unboundedly.
 const PENDING_CAPACITY: usize = 512;
@@ -426,6 +458,7 @@ pub enum TurnClass {
 pub fn classify_turn(
     prev: &TurnRecord,
     now: SystemTime,
+    input_tokens: u64,
     cache_read_input_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_ttl: Duration,
@@ -442,7 +475,21 @@ pub fn classify_turn(
         // e.g. a much shorter branched conversation reusing the same
         // conversation key, or a degenerate retry. Nothing was
         // billed for re-caching, so there is nothing to warn about.
-        return TurnClass::Healthy;
+        //
+        // Unless the prompt was billed as fresh input instead, which is the
+        // same money under another name and was invisible here until
+        // 2026-09-08: this arm only ever looked at what was *written*. Six
+        // turns on 09-07 read nothing of an expected prefix, wrote nothing,
+        // and paid full input price for the lot (one read 0 against an
+        // expected 14,080 while billing 14,226 fresh). Cap the charge at what
+        // was actually billed fresh, the way the written case caps at what
+        // was written.
+        if input_tokens <= RECACHE_SLACK_TOKENS {
+            return TurnClass::Healthy;
+        }
+        return TurnClass::Recache {
+            wasted_tokens: shortfall.min(input_tokens),
+        };
     }
     let gap = now.duration_since(prev.at).unwrap_or(Duration::ZERO);
     if gap > cache_ttl {
@@ -686,6 +733,10 @@ struct PendingRequest {
     /// still real money, so the ledger must add it back or it reports less than
     /// the bill. `None` on the common single-round path.
     billed_totals: Option<(u64, u64, u64)>,
+    /// Completion tokens, where the path that billed them reports them.
+    /// The ledger line is the richest per-turn record on disk for a turn that
+    /// saved nothing, and turn cost cannot be rebuilt from it without this.
+    billed_output: Option<u64>,
 }
 
 /// Where the provider's cache read landed against the two previous boundaries,
@@ -820,16 +871,29 @@ fn recache_attribution<'a>(
         };
     }
 
-    let reason = replay_skip.map(|evidence| evidence.reason.as_str());
-    let reason = match reason {
-        Some(
-            reason @ ("prefix_content_diverged"
-            | "forwarded_count_mismatch"
-            | "shorter_than_stored_prefix"
-            | "optimized_shorter_than_prefix"),
-        ) => Some(reason),
-        _ => None,
-    };
+    // Exhaustive on the enum, not on `as_str()`. The string form let three
+    // variants added after this filter — `SystemAdjacencyBroken` (09-02),
+    // `InflatedWithoutConfirmedFloor` (09-07), `OptimizedShorterThanOriginals`
+    // — join the unnamed bucket in silence, and a declined replay with no name
+    // reads as a benign cache reset. A ninth variant now fails to compile here
+    // until someone decides which side it belongs on.
+    let reason = replay_skip.and_then(|evidence| match evidence.reason {
+        // The client's own history no longer continues the prefix we stored:
+        // it edited inside the prefix, or a second stream shares one session
+        // key. Client evidence, ranked with a moved inbound hash below.
+        ReplaySkip::PrefixContentDiverged { .. } => Some("prefix_content_diverged"),
+        ReplaySkip::ForwardedCountMismatch => Some("forwarded_count_mismatch"),
+        ReplaySkip::ShorterThanStoredPrefix => Some("shorter_than_stored_prefix"),
+        ReplaySkip::OptimizedShorterThanPrefix => Some("optimized_shorter_than_prefix"),
+        ReplaySkip::OptimizedShorterThanOriginals => Some("optimized_shorter_than_originals"),
+        // These three say why the replay stood down, not why the cache moved,
+        // so they are not ranked as causes. They are no longer *lost*: a turn
+        // that burned tokens behind one of them now carries it as the reason
+        // of an `Unexplained` event rather than falling through to `Expected`.
+        ReplaySkip::NoPreviousTurn
+        | ReplaySkip::InflatedWithoutConfirmedFloor
+        | ReplaySkip::SystemAdjacencyBroken => None,
+    });
     // Two of those four say the client's own history no longer continues the
     // prefix we stored for it: it edited inside the prefix, or it is a second
     // stream sharing one session key. That is client evidence, like a moved
@@ -1011,6 +1075,47 @@ pub struct CacheHealthSnapshot {
     pub recache_events_total: u64,
     pub recache_wasted_tokens_total: u64,
     pub ttl_expiries_total: u64,
+    /// First completed turns under a conversation key that wrote cache, and
+    /// the tokens they wrote. Not waste — a cold start has nothing to read —
+    /// but 2,729,094 tokens went through here on 2026-09-07 with no counter
+    /// of any kind behind them, so the one category nobody could size was
+    /// also the largest. Countable now; still uncharged.
+    /// Healthy-turn cache writes split by whether they bought new cached
+    /// footprint. `earned` is normal operation — the breakpoint advancing over
+    /// content the conversation had not cached before — and is reported so the
+    /// total reconciles, not because anything is wrong with it. `unearned` is
+    /// the part that re-cached ground already covered — the savings-candidate
+    /// number. The two sum to every cache-write token observed, which is what
+    /// makes `productive_write_pct` below a share and not an estimate.
+    pub earned_cache_write_tokens_total: u64,
+    pub unearned_cache_write_tokens_total: u64,
+    pub unearned_write_turns_total: u64,
+    /// Requests that entered the pipeline and were pushed out of the pending
+    /// cache before anything completed them.
+    ///
+    /// Every one is tokens the proxy forwarded and the books never saw. Some
+    /// are legitimate — an upstream 429 bills nothing — so this is a seam to
+    /// look at rather than a fault on its own. Zero is the only value that
+    /// needs no explanation.
+    pub abandoned_requests_total: u64,
+    /// `earned / (earned + unearned)`, as a percentage, over every cache-write
+    /// token seen since the process started.
+    ///
+    /// Writes only. Cache *reads* outnumber writes about fifty to one, so
+    /// folding them in would pin this near 100% and it would never move — and a
+    /// number that never moves does not earn a statusline slot. Writes are the
+    /// tokens the proxy had a choice about, so they are the ones to watch.
+    ///
+    /// `100.0` before anything has been written, so a fresh process does not
+    /// open by reporting total waste.
+    pub productive_write_pct: f64,
+    pub first_turn_writes_total: u64,
+    pub first_turn_write_tokens_total: u64,
+    /// The subset whose stated reason contradicts what the turn did: a
+    /// `fresh_session` that read cache, or an `arrived_with_history` that read
+    /// none. Neither is a cold start — both are a live conversation rebuilding
+    /// itself under a new key — and both were filed as ordinary first turns.
+    pub first_turn_contradictions_total: u64,
     pub last_event: Option<RecacheEvent>,
     /// Convenience for statusline scripts: seconds since
     /// `last_event`, `null` when no event has occurred.
@@ -1061,6 +1166,13 @@ struct Inner {
     recache_events_total: u64,
     recache_wasted_tokens_total: u64,
     ttl_expiries_total: u64,
+    earned_cache_write_tokens_total: u64,
+    unearned_cache_write_tokens_total: u64,
+    unearned_write_turns_total: u64,
+    abandoned_requests_total: u64,
+    first_turn_writes_total: u64,
+    first_turn_write_tokens_total: u64,
+    first_turn_contradictions_total: u64,
     /// Turns booked `FirstTurn` only because their conversation had been
     /// evicted. The floor under any waste figure this observer reports.
     forgotten_conversations_total: u64,
@@ -1148,6 +1260,13 @@ impl UsageObserver {
                 recent_hit_rates: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
                 recent_cost_samples: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
                 recache_events_total: 0,
+                earned_cache_write_tokens_total: 0,
+                unearned_cache_write_tokens_total: 0,
+                unearned_write_turns_total: 0,
+                abandoned_requests_total: 0,
+                first_turn_writes_total: 0,
+                first_turn_write_tokens_total: 0,
+                first_turn_contradictions_total: 0,
                 recache_wasted_tokens_total: 0,
                 ttl_expiries_total: 0,
                 forgotten_conversations_total: 0,
@@ -1189,11 +1308,33 @@ impl UsageObserver {
         // Anything else already running under this key means the provider may
         // not have committed that turn's cache write yet.
         let now = Instant::now();
-        let concurrent_with_in_flight = inner.pending.iter().any(|(_, p)| {
-            p.conversation_key == conversation_key
-                && now.duration_since(p.began) < IN_FLIGHT_HORIZON
-        });
-        inner.pending.put(
+        let mut concurrent_with_in_flight = false;
+        let mut abandoned = Vec::new();
+        for (id, p) in inner.pending.iter() {
+            let age = now.duration_since(p.began);
+            if age >= IN_FLIGHT_HORIZON {
+                // Past the horizon nothing is going to complete it. Sweeping
+                // here rather than waiting for the LRU to push it out is what
+                // makes the count prompt: at 512 slots against a day of eight
+                // thousand turns, eviction alone would report zero for hours
+                // after the leak started.
+                abandoned.push(id.clone());
+            } else if p.conversation_key == conversation_key {
+                concurrent_with_in_flight = true;
+            }
+        }
+        for id in abandoned {
+            inner.pending.pop(&id);
+            inner.abandoned_requests_total += 1;
+        }
+        // `push` reports what fell off the end; `put` does not, and the
+        // eviction is the signal. A pending entry only leaves this cache two
+        // ways: `complete` takes it, or it is pushed out unfinished. The
+        // second is a request the proxy forwarded and never booked — the seam
+        // between what was sent and what the books know about. On 2026-09-07
+        // that was 132 of 8,209 turns, and finding it took a log-mining script
+        // because nothing counted it.
+        let evicted = inner.pending.push(
             request_id.to_string(),
             PendingRequest {
                 began: now,
@@ -1212,8 +1353,14 @@ impl UsageObserver {
                 compression_mode: None,
                 prefix,
                 billed_totals: None,
+                billed_output: None,
             },
         );
+        if let Some((evicted_id, _)) = evicted {
+            if evicted_id != request_id {
+                inner.abandoned_requests_total += 1;
+            }
+        }
     }
 
     /// Record what the provider billed across every round of this request.
@@ -1255,6 +1402,19 @@ impl UsageObserver {
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
             ));
+        }
+    }
+
+    /// Record the turn's completion count.
+    ///
+    /// Apart from `note_billed_totals` because that one only fires for
+    /// multi-round CCR turns, and output belongs on every turn: the ledger
+    /// line is the only per-turn record on disk for a turn that saved nothing,
+    /// and turn cost cannot be rebuilt from it without the output side.
+    pub fn note_output_tokens(&self, request_id: &str, output_tokens: u64) {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(request_id) {
+            pending.billed_output = Some(output_tokens);
         }
     }
 
@@ -1515,6 +1675,9 @@ impl UsageObserver {
                 // from "wrote nothing at that tier".
                 cache_write_5m_tokens = cache_write_ttl_split.map_or(-1_i64, |(m5, _)| m5 as i64),
                 cache_write_1h_tokens = cache_write_ttl_split.map_or(-1_i64, |(_, h1)| h1 as i64),
+                // `-1` where the path that booked this turn never reported an
+                // output count, same convention as the TTL split above.
+                output_tokens = pending.billed_output.map_or(-1_i64, |o| o as i64),
                 billed_fresh_equivalents = billed_fresh_equivalents,
                 // What the client handed us, before anything we did.
                 client_request_bytes = pending.client_request_bytes.unwrap_or(0),
@@ -1622,6 +1785,7 @@ impl UsageObserver {
                         classify_turn(
                             &prev,
                             now,
+                            input_tokens,
                             cache_read_input_tokens,
                             cache_creation_input_tokens,
                             cache_ttl,
@@ -1697,6 +1861,52 @@ impl UsageObserver {
             )
         };
 
+        // A healthy turn is the one class that reports nothing, and it is by
+        // far the largest: 5,747 turns and 10,935,835 written tokens on
+        // 2026-09-07, against 129 recache events. Most of that is the
+        // breakpoint advancing over new content and is money well spent — but
+        // it was indistinguishable from the rest, so split it and count both
+        // sides. Only the unearned half is a savings candidate.
+        // Every completed turn that wrote anything, not just the healthy ones.
+        // Gating on `Healthy` made this dead arithmetic: healthy means
+        // `read + RECACHE_SLACK_TOKENS >= previous footprint`, which forces
+        // `unearned <= RECACHE_SLACK_TOKENS` — under the warning floor, always.
+        // The turns actually re-writing ground they already held are the ones
+        // the gate threw away. Recache turns are counted here *and* by the
+        // recache detector; the two measure different things (this one, tokens
+        // re-written; that one, prefix not read) and must not be added up.
+        if cache_creation_input_tokens > 0 {
+            let (earned, unearned) = split_cache_write(
+                expected_cache_read,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            );
+            inner.earned_cache_write_tokens_total += earned;
+            inner.unearned_cache_write_tokens_total += unearned;
+            if unearned > 0 {
+                inner.unearned_write_turns_total += 1;
+            }
+            if unearned > UNEARNED_WRITE_FLOOR_TOKENS {
+                tracing::warn!(
+                    event = "unearned_cache_write_observed",
+                    request_id = %request_id,
+                    turn_class = match class {
+                        TurnClass::FirstTurn => "first_turn",
+                        TurnClass::Healthy => "healthy",
+                        TurnClass::TtlExpiry => "ttl_expiry",
+                        TurnClass::Recache { .. } => "recache",
+                    },
+                    conversation_key = %pending.conversation_key,
+                    session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    previous_footprint = expected_cache_read,
+                    earned_tokens = earned,
+                    unearned_tokens = unearned,
+                    "cache write re-covered footprint the conversation already held"
+                );
+            }
+        }
         // First completed turn under this key. The recache classifier has
         // nothing to score it against, so without this its cache write —
         // 41% of all write tokens, live — went unattributed.
@@ -1719,8 +1929,23 @@ impl UsageObserver {
             if cache_creation_input_tokens > RECACHE_SLACK_TOKENS {
                 let reason =
                     first_turn_reason(&ctx, pending.adoption.as_ref(), opener_seen_elsewhere);
+                // A cold start writing cache is normal and stays uncharged.
+                // Two shapes are not cold starts and were filed as if they
+                // were: a `fresh_session` that read cache is not fresh, and an
+                // `arrived_with_history` that read none is a live conversation
+                // whose key moved under it with no compaction to explain the
+                // move. On 2026-09-07 those two accounted for 549K of the
+                // 2.73M written here, and nothing counted either.
+                let contradicts_itself = (reason == "fresh_session" && cache_read_input_tokens > 0)
+                    || (reason == "arrived_with_history" && cache_read_input_tokens == 0);
+                inner.first_turn_writes_total += 1;
+                inner.first_turn_write_tokens_total += cache_creation_input_tokens;
+                if contradicts_itself {
+                    inner.first_turn_contradictions_total += 1;
+                }
                 tracing::info!(
                     event = "first_turn_write_observed",
+                    contradicts_itself,
                     request_id = %request_id,
                     conversation_key = %pending.conversation_key,
                     session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
@@ -1809,9 +2034,31 @@ impl UsageObserver {
                     0
                 };
                 inner.recache_wasted_tokens_total += charged_wasted_tokens;
+                // Tokens we charged as waste and could not name used to fall
+                // through to `Expected`, which logs at INFO and reads as a
+                // benign session reset. On 2026-09-07 that hid 1,471,795
+                // tokens across 96 events — one conversation rebuilding its
+                // own cache — behind a green statusline. Nothing that cost
+                // real tokens may log below WARN. When attribution found no
+                // cause, say that in the reason and hand over what the replay
+                // decline knew, which the ranking above deliberately drops.
+                let uncaused_waste = charged_wasted_tokens > 0 && attribution.reason.is_none();
+                let attribution = if uncaused_waste {
+                    RecacheAttribution {
+                        reason: Some(
+                            pending
+                                .replay_skip
+                                .map(|e| e.reason.as_str())
+                                .unwrap_or("no_cause_found"),
+                        ),
+                        ..attribution
+                    }
+                } else {
+                    attribution
+                };
                 let event_kind = if attribution.reason == Some("inbound_tail_replaced") {
                     RecacheEventKind::Branch
-                } else if unexplained {
+                } else if unexplained || uncaused_waste {
                     RecacheEventKind::Unexplained
                 } else if attribution.reason.is_some() {
                     RecacheEventKind::Drift
@@ -1922,6 +2169,16 @@ impl UsageObserver {
                         scope = "final_message",
                         event_kind = "branch",
                         wasted_tokens = 0,
+                        // Branch is the one kind that charges nothing: the
+                        // tail really did change, so the rebuild was earned.
+                        // But `is_inbound_tail_replacement` asks only for an
+                        // equal message count and a difference at the last
+                        // index, which a retry that re-rendered its final
+                        // message matches just as well — and then the
+                        // shortfall was real money written off. Report it
+                        // uncharged so the bucket can be audited instead of
+                        // reading as a flat zero.
+                        uncharged_shortfall_tokens = wasted_tokens,
                         prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
                         prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
                         prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
@@ -2076,6 +2333,22 @@ impl UsageObserver {
             recache_events_total: inner.recache_events_total,
             recache_wasted_tokens_total: inner.recache_wasted_tokens_total,
             ttl_expiries_total: inner.ttl_expiries_total,
+            earned_cache_write_tokens_total: inner.earned_cache_write_tokens_total,
+            unearned_cache_write_tokens_total: inner.unearned_cache_write_tokens_total,
+            unearned_write_turns_total: inner.unearned_write_turns_total,
+            abandoned_requests_total: inner.abandoned_requests_total,
+            productive_write_pct: {
+                let earned = inner.earned_cache_write_tokens_total;
+                let written = earned.saturating_add(inner.unearned_cache_write_tokens_total);
+                if written == 0 {
+                    100.0
+                } else {
+                    earned as f64 * 100.0 / written as f64
+                }
+            },
+            first_turn_writes_total: inner.first_turn_writes_total,
+            first_turn_write_tokens_total: inner.first_turn_write_tokens_total,
+            first_turn_contradictions_total: inner.first_turn_contradictions_total,
             last_event: inner.last_event.clone(),
             last_event_age_seconds,
             recent_cache_read_tokens,
@@ -2441,7 +2714,202 @@ mod tests {
     fn healthy_turn_reads_previous_prefix() {
         // prev cached 10_000 + wrote 2_000 → expect 12_000 read.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 12_000, 500, ANTHROPIC_CACHE_TTL);
+        let c = classify_turn(&p, SystemTime::now(), 0, 12_000, 500, ANTHROPIC_CACHE_TTL);
+        assert_eq!(c, TurnClass::Healthy);
+    }
+
+    /// The healthy bucket is not one thing. A turn that appends new content
+    /// and caches it spent well; a turn that re-writes footprint the
+    /// conversation already had spent for nothing. Both read their prefix
+    /// cleanly, so both used to report nothing at all.
+    #[test]
+    fn a_healthy_write_that_buys_new_footprint_is_earned() {
+        // Footprint went 10,000 -> 22,000 and the turn wrote the 12,000
+        // difference. Every token bought ground the conversation had not held.
+        let (earned, unearned) = split_cache_write(10_000, 10_000, 12_000);
+        assert_eq!((earned, unearned), (12_000, 0));
+    }
+
+    /// A forwarded request that nothing ever completes is the seam between
+    /// what the proxy sent and what the books know about. Two ways out of the
+    /// pending cache and only one of them is booking; this covers the other.
+    #[test]
+    fn a_request_nothing_completes_is_counted_as_abandoned() {
+        let print = |n: usize| PrefixFingerprint {
+            head: "head".into(),
+            body: "body".into(),
+            stable: format!("stable-{n}"),
+            stable_msgs: n,
+        };
+        let obs = UsageObserver::new();
+        obs.begin_request("stranded", "conv".into(), None, None, Some(print(10)));
+        assert_eq!(obs.snapshot().abandoned_requests_total, 0, "still in flight");
+
+        obs.age_pending("stranded", IN_FLIGHT_HORIZON);
+        // The sweep runs on the next arrival, which is the only moment the
+        // observer is awake.
+        obs.begin_request("next", "conv".into(), None, None, Some(print(10)));
+        assert_eq!(obs.snapshot().abandoned_requests_total, 1);
+
+        obs.complete("next", 10, 0, 0, None);
+        obs.begin_request("third", "conv".into(), None, None, Some(print(10)));
+        assert_eq!(
+            obs.snapshot().abandoned_requests_total,
+            1,
+            "a completed request is taken by `complete`, never swept"
+        );
+    }
+
+    /// The statusline number. Writes only, and the two buckets sum to every
+    /// written token, so it is a share and not an estimate.
+    #[test]
+    fn productive_write_pct_is_the_earned_share_of_every_written_token() {
+        let obs = UsageObserver::new();
+        assert_eq!(
+            obs.snapshot().productive_write_pct,
+            100.0,
+            "a process that has written nothing has wasted nothing"
+        );
+
+        {
+            let mut inner = obs.lock();
+            inner.earned_cache_write_tokens_total = 3_000;
+            inner.unearned_cache_write_tokens_total = 1_000;
+        }
+        assert_eq!(obs.snapshot().productive_write_pct, 75.0);
+    }
+
+    /// The gate this split first shipped behind made it dead code, and only
+    /// arithmetic showed it: `Healthy` means the read covered the previous
+    /// footprint to within `RECACHE_SLACK_TOKENS`, which bounds `unearned` by
+    /// that same slack — under the warning floor, on every turn that could
+    /// reach the counter. The turns worth naming are the ones that gate
+    /// excluded, so the split now runs on all of them. This holds the proof.
+    #[test]
+    fn a_healthy_turn_can_never_have_more_unearned_than_the_slack() {
+        for prev in [0u64, 1_000, 50_000, 249_949, 1_000_000] {
+            for creation in [1u64, 64, 5_000, 120_000] {
+                // The healthiest and the worst-but-still-healthy read.
+                for read in [prev, prev.saturating_sub(RECACHE_SLACK_TOKENS)] {
+                    let (_, unearned) = split_cache_write(prev, read, creation);
+                    assert!(
+                        unearned <= RECACHE_SLACK_TOKENS,
+                        "prev={prev} read={read} creation={creation} unearned={unearned}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_healthy_write_over_ground_already_held_is_unearned() {
+        // The shape that repeated every 30 seconds on conv fb553646 on
+        // 2026-09-07: footprint 249,949, read 186,655, wrote 63,838 — so the
+        // footprint ended at 250,493 and the write bought 544 tokens of it.
+        let (earned, unearned) = split_cache_write(249_949, 186_655, 63_838);
+        assert_eq!(earned, 544);
+        assert_eq!(unearned, 63_294);
+    }
+
+    #[test]
+    fn a_shrinking_footprint_earns_nothing_and_never_underflows() {
+        let (earned, unearned) = split_cache_write(500_000, 1_000, 9_000);
+        assert_eq!((earned, unearned), (0, 9_000));
+    }
+
+    /// The counters must reconcile: every token a healthy turn wrote lands on
+    /// exactly one side of the split. That is the whole point of the split —
+    /// the bucket that could not be reconciled was the one hiding money.
+    #[test]
+    fn the_split_accounts_for_every_written_token() {
+        for (prev, read, creation) in [
+            (0u64, 0u64, 5_000u64),
+            (10_000, 10_000, 12_000),
+            (249_949, 186_655, 63_838),
+            (500_000, 1_000, 9_000),
+            (77, 4_096, 64),
+        ] {
+            let (earned, unearned) = split_cache_write(prev, read, creation);
+            assert_eq!(earned + unearned, creation, "prev={prev} read={read}");
+        }
+    }
+
+    /// First-turn cache writes are not waste, but they were not countable
+    /// either: 2,729,094 tokens went through this path on 2026-09-07 with
+    /// nothing in `/cache-health` behind them. The snapshot now carries them,
+    /// and separates the ones whose stated reason contradicts what the turn
+    /// did — here, a turn that arrived carrying history yet read no cache,
+    /// which is a live conversation whose key moved, not a cold start.
+    #[test]
+    fn first_turn_writes_are_counted_and_contradictions_singled_out() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("f1", "conv-first-turn".into(), None, None, None);
+        obs.note_first_turn_context(
+            "f1",
+            FirstTurnContext {
+                msgs: 40,
+                message_zero_hash: None,
+                compaction_restart: false,
+                model: None,
+            },
+        );
+        obs.complete("f1", 100, 0, 50_000, None);
+        let snap = obs.snapshot();
+        assert_eq!(snap.first_turn_writes_total, 1);
+        assert_eq!(snap.first_turn_write_tokens_total, 50_000);
+        assert_eq!(
+            snap.first_turn_contradictions_total, 1,
+            "history but no read is not a cold start"
+        );
+    }
+
+    /// A genuine cold start counts as a write and not as a contradiction, so
+    /// the two numbers keep meaning different things.
+    #[test]
+    fn a_real_cold_start_is_counted_but_not_flagged() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("f1", "conv-cold-start".into(), None, None, None);
+        obs.note_first_turn_context(
+            "f1",
+            FirstTurnContext {
+                msgs: 1,
+                message_zero_hash: None,
+                compaction_restart: false,
+                model: None,
+            },
+        );
+        obs.complete("f1", 100, 0, 50_000, None);
+        let snap = obs.snapshot();
+        assert_eq!(snap.first_turn_writes_total, 1);
+        assert_eq!(snap.first_turn_contradictions_total, 0);
+    }
+
+    /// A turn that read nothing of a prefix it should have read, wrote
+    /// nothing, and paid full input price for the whole prompt. Until
+    /// 2026-09-08 this arm looked only at what was written, so it returned
+    /// `Healthy` and the money vanished. Six turns on 09-07 had this shape.
+    #[test]
+    fn a_shortfall_paid_as_fresh_input_is_not_healthy() {
+        let p = prev(14_080, 0, Duration::from_secs(30));
+        let c = classify_turn(&p, SystemTime::now(), 14_226, 0, 0, ANTHROPIC_CACHE_TTL);
+        assert_eq!(
+            c,
+            TurnClass::Recache {
+                wasted_tokens: 14_080
+            },
+            "capped at the shortfall, not the whole fresh prompt"
+        );
+    }
+
+    /// The other side of the same arm: nothing read, nothing written, and
+    /// nothing billed fresh either. A shorter branch under the same key costs
+    /// nothing and must stay quiet.
+    #[test]
+    fn a_shortfall_that_cost_nothing_stays_healthy() {
+        let p = prev(14_080, 0, Duration::from_secs(30));
+        let c = classify_turn(&p, SystemTime::now(), 0, 0, 0, ANTHROPIC_CACHE_TTL);
         assert_eq!(c, TurnClass::Healthy);
     }
 
@@ -2451,6 +2919,7 @@ mod tests {
         let c = classify_turn(
             &p,
             SystemTime::now(),
+            0,
             12_000 - RECACHE_SLACK_TOKENS,
             500,
             ANTHROPIC_CACHE_TTL,
@@ -2462,7 +2931,7 @@ mod tests {
     fn recache_inside_ttl_is_flagged_with_wasted_tokens() {
         // Expected read 12_000, got 0, re-wrote 12_500 → 12_000 wasted.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL);
+        let c = classify_turn(&p, SystemTime::now(), 0, 0, 12_500, ANTHROPIC_CACHE_TTL);
         assert_eq!(
             c,
             TurnClass::Recache {
@@ -2476,7 +2945,7 @@ mod tests {
         // Shortfall 12_000 but only 3_000 re-written (partial prefix
         // reuse via an earlier breakpoint) → waste is the re-write.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 0, 3_000, ANTHROPIC_CACHE_TTL);
+        let c = classify_turn(&p, SystemTime::now(), 0, 0, 3_000, ANTHROPIC_CACHE_TTL);
         assert_eq!(
             c,
             TurnClass::Recache {
@@ -2488,7 +2957,7 @@ mod tests {
     #[test]
     fn ttl_expiry_suppressed() {
         let p = prev(10_000, 2_000, ANTHROPIC_CACHE_TTL + Duration::from_secs(10));
-        let c = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL);
+        let c = classify_turn(&p, SystemTime::now(), 0, 0, 12_500, ANTHROPIC_CACHE_TTL);
         assert_eq!(c, TurnClass::TtlExpiry);
     }
 
@@ -2502,7 +2971,7 @@ mod tests {
         let gap = Duration::from_secs(20 * 60);
         let p = prev(10_000, 2_000, gap);
 
-        let excused = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL);
+        let excused = classify_turn(&p, SystemTime::now(), 0, 0, 12_500, ANTHROPIC_CACHE_TTL);
         assert_eq!(
             excused,
             TurnClass::TtlExpiry,
@@ -2510,7 +2979,7 @@ mod tests {
         );
 
         let p = prev(10_000, 2_000, gap);
-        let honest = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL_1H);
+        let honest = classify_turn(&p, SystemTime::now(), 0, 0, 12_500, ANTHROPIC_CACHE_TTL_1H);
         assert_eq!(
             honest,
             TurnClass::Recache {
@@ -2527,7 +2996,7 @@ mod tests {
             2_000,
             ANTHROPIC_CACHE_TTL_1H + Duration::from_secs(10),
         );
-        let c = classify_turn(&p, SystemTime::now(), 0, 12_500, ANTHROPIC_CACHE_TTL_1H);
+        let c = classify_turn(&p, SystemTime::now(), 0, 0, 12_500, ANTHROPIC_CACHE_TTL_1H);
         assert_eq!(c, TurnClass::TtlExpiry);
     }
 
@@ -2536,7 +3005,7 @@ mod tests {
         // Branched/shorter conversation: read dropped but nothing
         // significant was re-billed → nothing to warn about.
         let p = prev(10_000, 2_000, Duration::from_secs(30));
-        let c = classify_turn(&p, SystemTime::now(), 4_000, 10, ANTHROPIC_CACHE_TTL);
+        let c = classify_turn(&p, SystemTime::now(), 0, 4_000, 10, ANTHROPIC_CACHE_TTL);
         assert_eq!(c, TurnClass::Healthy);
     }
 
@@ -2594,9 +3063,11 @@ mod tests {
     }
 
     #[test]
-    fn recache_without_drift_dims_is_expected_kind() {
-        // Subagent close / `/clear`: cache busted upstream but the
-        // drift detector saw stable bytes → Expected, not Drift.
+    fn recache_without_drift_dims_is_not_drift_but_is_still_loud() {
+        // Subagent close / `/clear`: cache busted upstream but the drift
+        // detector saw stable bytes. Not Drift — nothing was attributed — yet
+        // the rebuild was billed, so it may not sink to the INFO bucket
+        // either. Unexplained is the honest middle: charged, and unnamed.
         let _guard = miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("req-1", "conv-a".into(), None, None, None);
@@ -2604,11 +3075,13 @@ mod tests {
         obs.begin_request("req-2", "conv-a".into(), None, None, None);
         obs.complete("req-2", 200, 0, 11_000, None);
         let ev = obs.snapshot().last_event.expect("event recorded");
-        assert_eq!(ev.event_kind, RecacheEventKind::Expected);
+        assert!(ev.wasted_tokens > 0);
+        assert_eq!(ev.event_kind, RecacheEventKind::Unexplained);
+        assert_eq!(ev.attribution_reason.as_deref(), Some("no_cause_found"));
     }
 
     #[test]
-    fn recache_with_empty_string_drift_dims_is_expected_kind() {
+    fn recache_with_empty_string_drift_dims_is_not_drift_but_is_still_loud() {
         let _guard = miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("req-1", "conv-a".into(), None, Some(String::new()), None);
@@ -2616,7 +3089,7 @@ mod tests {
         obs.begin_request("req-2", "conv-a".into(), None, Some(String::new()), None);
         obs.complete("req-2", 200, 0, 11_000, None);
         let ev = obs.snapshot().last_event.expect("event recorded");
-        assert_eq!(ev.event_kind, RecacheEventKind::Expected);
+        assert_eq!(ev.event_kind, RecacheEventKind::Unexplained);
     }
 
     /// A turn that never reached `message_stop` (a 429, a dropped stream, a
@@ -3427,6 +3900,47 @@ mod prefix_on_recache_event_tests {
         assert!(line.contains("replay_skipped=no_previous_turn"), "{line}");
     }
 
+    /// Billed waste may never log as `expected`. On 2026-09-07 one
+    /// conversation declined its replay on `system_adjacency_broken` for its
+    /// whole life and re-cached itself 96 times; every event landed in the
+    /// benign bucket at INFO with an empty `attribution_reason`, so 1,471,795
+    /// charged tokens went by under a green statusline. The decline reason was
+    /// in hand the entire time — the attribution ranking drops it on purpose,
+    /// which is right, but dropping it must not also cost the event its
+    /// severity.
+    #[test]
+    fn charged_waste_is_never_filed_as_an_expected_event() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("z1", "conv-uncaused-waste".into(), None, None, None);
+        obs.complete("z1", 200, 0, 50_000, None);
+        obs.begin_request("z2", "conv-uncaused-waste".into(), None, None, None);
+        // A declined replay, so `note_replay_applied` never runs and the turn
+        // cannot reach the unexplained-after-replay path. This is the exact
+        // shape that filed 1.47M tokens as benign.
+        obs.note_replay_skip(
+            "z2",
+            ReplaySkipEvidence::from_inbound_original_histories(
+                ReplaySkip::SystemAdjacencyBroken,
+                None,
+                &[serde_json::json!({"role":"user","content":"tail"})],
+            ),
+        );
+        obs.complete("z2", 200, 0, 50_000, None);
+        let event = obs.snapshot().last_event.expect("event recorded");
+        assert!(event.wasted_tokens > 0, "the turn must have been charged");
+        assert_ne!(
+            event.event_kind,
+            RecacheEventKind::Expected,
+            "waste filed as benign"
+        );
+        assert_eq!(
+            event.attribution_reason.as_deref(),
+            Some("system_adjacency_broken"),
+            "the decline reason was dropped"
+        );
+    }
+
     /// A turn shorter than every tracked stream is booked a first turn and
     /// reports no waste. That may be right — a subagent forking off a shared
     /// opener had no prefix to reuse — but it is silent either way, and
@@ -3810,7 +4324,7 @@ mod stream_matching_tests {
     }
 
     #[test]
-    fn non_causal_replay_skips_leave_the_bust_unattributed() {
+    fn non_causal_replay_skips_name_the_skip_without_ranking_it() {
         let _guard = super::tests::miss_metric_test_lock();
         for (i, reason) in [ReplaySkip::NoPreviousTurn].into_iter().enumerate() {
             let obs = UsageObserver::new();
@@ -3824,32 +4338,40 @@ mod stream_matching_tests {
                 ReplaySkipEvidence::from_inbound_original_histories(reason, None, &current),
             );
 
-            assert_eq!(
-                obs.complete("n2", 200, 0, 50_000, None),
-                Some(CompletionClass::Unknown)
-            );
+            obs.complete("n2", 200, 0, 50_000, None);
+            // Still not ranked as a cause — origin and scope stay unset — but
+            // the name survives to the event, and billed tokens keep it out of
+            // the benign bucket.
             let event = obs.snapshot().last_event.expect("event recorded");
-            assert_eq!(event.attribution_reason, None, "reason={reason:?}");
+            assert_eq!(
+                event.attribution_reason.as_deref(),
+                Some("no_previous_turn"),
+                "reason={reason:?}"
+            );
             assert_eq!(
                 event.event_kind,
-                RecacheEventKind::Expected,
+                RecacheEventKind::Unexplained,
                 "reason={reason:?}"
             );
         }
     }
 
-    /// The other half of the same rule: with no drift dims AND no declined
-    /// replay there genuinely is no cause to name, and the event must stay
-    /// `Expected` so the two buckets keep meaning different things.
+    /// The other half of the same rule. With no drift dims and no declined
+    /// replay there genuinely is no cause to name — but the rebuild was still
+    /// billed, and the split that matters to a reader is charged vs free, not
+    /// named vs unnamed. It says `no_cause_found` and logs at WARN.
     #[test]
-    fn a_bust_with_no_cause_at_all_stays_expected() {
+    fn a_bust_with_no_cause_at_all_is_named_no_cause_found() {
         let _guard = super::tests::miss_metric_test_lock();
         let obs = UsageObserver::new();
         obs.begin_request("u1", "conv-nocause".into(), None, None, Some(fp(40)));
         obs.complete("u1", 200, 0, 50_000, None);
         obs.begin_request("u2", "conv-nocause".into(), None, None, Some(fp(41)));
-        let class = obs.complete("u2", 200, 0, 50_000, None);
-        assert_eq!(class, Some(CompletionClass::Unknown));
+        obs.complete("u2", 200, 0, 50_000, None);
+        let event = obs.snapshot().last_event.expect("event recorded");
+        assert!(event.wasted_tokens > 0);
+        assert_eq!(event.event_kind, RecacheEventKind::Unexplained);
+        assert_eq!(event.attribution_reason.as_deref(), Some("no_cause_found"));
     }
 
     #[test]
