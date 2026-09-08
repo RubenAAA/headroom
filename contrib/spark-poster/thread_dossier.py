@@ -52,6 +52,8 @@ def main():
         print((n0.get("body") or "").strip())
 
         for n in d["notes"][1:]:
+            if n.get("system"):
+                continue
             print(f"\n--- REPLY by {n.get('author', {}).get('username')} "
                   f"at {(n.get('created_at') or '')[:19]} ---")
             print((n.get("body") or "").strip())

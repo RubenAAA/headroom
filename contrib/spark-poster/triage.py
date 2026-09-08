@@ -1,5 +1,11 @@
 """Which of my threads did the author answer, and where does each one stand.
 
+System notes do not count as answers. GitLab posts "changed this line in
+version N of the diff" into a thread under the author's name, with
+`system: true` -- it reads exactly like a reply in the API and means only that
+the line moved. Counting those as answers reported two of my threads as
+addressed when nobody had written a word on either.
+
 Splits the MR's threads into the three piles that matter for a follow-up pass:
 answered (someone replied after my note), silent (nobody did), and resolved
 (closed out). Prints anchors and the reply text so the judgement can be made
@@ -22,7 +28,11 @@ def main():
         notes = d.get("notes") or []
         if not notes or notes[0].get("author", {}).get("username") != ME:
             continue
-        replies = [n for n in notes[1:] if n.get("author", {}).get("username") != ME]
+        replies = [
+            n for n in notes[1:]
+            if not n.get("system")
+            and n.get("author", {}).get("username") != ME
+        ]
         if notes[0].get("resolved"):
             resolved.append((d, replies))
         elif replies:
