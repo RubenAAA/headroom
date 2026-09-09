@@ -41,6 +41,7 @@ pub mod probe_recorder;
 pub mod project_context;
 pub mod proxy;
 pub mod proxy_auth;
+pub mod redact;
 pub mod request_logger;
 pub mod responses_items;
 pub mod routed;

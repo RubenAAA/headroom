@@ -724,8 +724,7 @@ impl SavingsTracker {
         s.cache_savings_usd = round_n(s.cache_savings_usd + delta_cache_savings_usd, 6);
         s.total_input_tokens += session_tokens_delta;
         s.total_input_cost_usd = round_n(s.total_input_cost_usd + session_cost_delta, 6);
-        s.savings_percent =
-            cost_savings_percent(s.total_input_cost_usd, s.compression_savings_usd);
+        s.savings_percent = cost_savings_percent(s.total_input_cost_usd, s.compression_savings_usd);
         s.last_activity_at = Some(to_utc_iso(ts));
         if s.started_at.is_none() {
             s.started_at = s.last_activity_at.clone();

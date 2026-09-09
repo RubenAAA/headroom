@@ -70,7 +70,7 @@ fn turn_two() -> Vec<Value> {
 fn the_stored_pair_covers_one_span_when_the_overlay_replays_a_withdrawn_reminder() {
     let mut tracker = PrefixReplayTracker::default();
     let first = turn_one();
-    tracker.update_from_response(20_000, 0, &first, Some(&first));
+    tracker.update_from_response(20_000, 0, &first, Some(&first), String::new());
 
     // The overlay puts the withdrawn reminder back: those are the bytes the
     // provider cached, and the client dropping the message does not change
@@ -89,7 +89,7 @@ fn the_stored_pair_covers_one_span_when_the_overlay_replays_a_withdrawn_reminder
     );
     assert_eq!(forwarded[1], scaffolding());
 
-    tracker.update_from_response(20_000, 0, &forwarded, Some(&current));
+    tracker.update_from_response(20_000, 0, &forwarded, Some(&current), String::new());
 
     // The stored pair is the point. Both slices must end on the same message of
     // the conversation; storing a forwarded slice that stops earlier is what
@@ -112,7 +112,7 @@ fn the_stored_pair_covers_one_span_when_the_overlay_replays_a_withdrawn_reminder
 fn the_next_splice_drops_no_message_and_leaves_no_system_message_stranded() {
     let mut tracker = PrefixReplayTracker::default();
     let first = turn_one();
-    tracker.update_from_response(20_000, 0, &first, Some(&first));
+    tracker.update_from_response(20_000, 0, &first, Some(&first), String::new());
 
     let second = turn_two();
     let forwarded = overlay_cached_prefix(
@@ -121,7 +121,7 @@ fn the_next_splice_drops_no_message_and_leaves_no_system_message_stranded() {
         Some(tracker.last_original_messages()),
         Some(tracker.last_forwarded_messages()),
     );
-    tracker.update_from_response(20_000, 0, &forwarded, Some(&second));
+    tracker.update_from_response(20_000, 0, &forwarded, Some(&second), String::new());
 
     // Turn 3 appends a reply, a message, and a hook reminder behind it — the
     // tail Claude Code writes when a teammate wakes a long-lived agent.

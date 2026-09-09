@@ -254,7 +254,12 @@ impl Translator {
     ///
     /// This is the one place a `tool_use` is minted. Cursor's own `tool_call`
     /// events never become one — see the module header.
-    pub(crate) fn emit_parked_tool_use(&mut self, id: &str, name: &str, args: &Value) -> Vec<String> {
+    pub(crate) fn emit_parked_tool_use(
+        &mut self,
+        id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Vec<String> {
         let mut out = self.ensure_started();
         // A `tool_use` is something the client renders and acts on, so a turn
         // that ends on one has spoken even if it never wrote a word.
@@ -569,7 +574,10 @@ mod tests {
             r#"{"type":"thinking","subtype":"completed"}"#,
             r#"{"type":"result","subtype":"success","is_error":false}"#,
         ]);
-        let starts = events.iter().filter(|(e, _)| e == "content_block_start").count();
+        let starts = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_start")
+            .count();
         assert_eq!(starts, 1, "both deltas belong to one thinking block");
         let deltas: Vec<&Value> = events
             .iter()
@@ -597,7 +605,11 @@ mod tests {
             .map(|(_, d)| d)
             .filter(|d| d["delta"]["type"] == "text_delta")
             .collect();
-        assert_eq!(text.len(), 1, "the turn must reach the client having spoken");
+        assert_eq!(
+            text.len(),
+            1,
+            "the turn must reach the client having spoken"
+        );
         assert_eq!(text[0]["delta"]["text"], "the answer");
     }
 
@@ -657,7 +669,10 @@ mod tests {
             .map(|(_, d)| d["index"].as_u64().unwrap())
             .collect();
         assert_eq!(starts, vec![0, 1, 2, 3]);
-        assert_eq!(stops, starts, "each start is matched by a stop at its index");
+        assert_eq!(
+            stops, starts,
+            "each start is matched by a stop at its index"
+        );
     }
 
     #[test]
@@ -682,7 +697,9 @@ mod tests {
     #[test]
     fn a_failed_result_is_recorded_as_an_error_outcome() {
         let mut t = Translator::new("m");
-        t.push_line(r#"{"type":"result","subtype":"error","is_error":true,"result":"model refused"}"#);
+        t.push_line(
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"model refused"}"#,
+        );
         assert_eq!(t.outcome, Some(Outcome::Error("model refused".into())));
     }
 
@@ -696,7 +713,9 @@ mod tests {
             r#"{"type":"result","subtype":"success","is_error":false}"#,
         ]);
         assert!(
-            !events.iter().any(|(_, d)| d["content_block"]["type"] == "tool_use"),
+            !events
+                .iter()
+                .any(|(_, d)| d["content_block"]["type"] == "tool_use"),
             "a report must not become a request"
         );
         let note = events
@@ -704,7 +723,10 @@ mod tests {
             .find(|(e, _)| e == "content_block_delta")
             .expect("the call is surfaced");
         assert_eq!(note.1["delta"]["type"], "thinking_delta");
-        assert!(note.1["delta"]["thinking"].as_str().unwrap().contains("read"));
+        assert!(note.1["delta"]["thinking"]
+            .as_str()
+            .unwrap()
+            .contains("read"));
     }
 
     /// An MCP call is named by its arguments, not by the `mcpToolCall` key.
@@ -714,8 +736,14 @@ mod tests {
             r#"{"type":"tool_call","subtype":"started","tool_call":{"mcpToolCall":{"args":{"name":"headroom-Read","args":{}}}}}"#,
             r#"{"type":"result","subtype":"success","is_error":false}"#,
         ]);
-        let note = events.iter().find(|(e, _)| e == "content_block_delta").unwrap();
-        assert!(note.1["delta"]["thinking"].as_str().unwrap().contains("headroom-Read"));
+        let note = events
+            .iter()
+            .find(|(e, _)| e == "content_block_delta")
+            .unwrap();
+        assert!(note.1["delta"]["thinking"]
+            .as_str()
+            .unwrap()
+            .contains("headroom-Read"));
     }
 
     /// A built-in call the agent ran itself has its result surfaced as text.
@@ -825,7 +853,9 @@ mod tests {
     fn unknown_and_malformed_lines_are_ignored() {
         let mut t = Translator::new("m");
         assert!(t.push_line("not json at all").is_empty());
-        assert!(t.push_line(r#"{"type":"somethingNew","subtype":"whatever"}"#).is_empty());
+        assert!(t
+            .push_line(r#"{"type":"somethingNew","subtype":"whatever"}"#)
+            .is_empty());
         assert!(t.push_line("").is_empty());
     }
 
@@ -886,7 +916,10 @@ mod tests {
             .collect();
         assert!(said.contains("CRIMSON-42"), "got: {said}");
 
-        assert_eq!(t.session_id.as_deref(), Some("cf8812c0-d9cc-4a5c-90ab-fdb08209f2b0"));
+        assert_eq!(
+            t.session_id.as_deref(),
+            Some("cf8812c0-d9cc-4a5c-90ab-fdb08209f2b0")
+        );
         assert_eq!(t.outcome, Some(Outcome::EndTurn));
         assert_eq!(t.usage.input_tokens, 17882);
         assert_eq!(t.usage.cache_read_input_tokens, 27136);
@@ -915,7 +948,10 @@ mod resumed_response_tests {
                 .map(|l| l.trim_start_matches("event: ").to_string())
                 .collect()
         };
-        assert_eq!(names(&first).first().map(String::as_str), Some("message_start"));
+        assert_eq!(
+            names(&first).first().map(String::as_str),
+            Some("message_start")
+        );
 
         // Same translator, as a parked driver would have.
         let again: Vec<String> = t.push_line(
@@ -942,10 +978,17 @@ mod resumed_response_tests {
     #[test]
     fn the_resumed_message_gets_its_own_id() {
         let mut t = Translator::new("cursor-grok-4.6-high").with_fixed_id("msg_first");
-        let _ = t.push_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#);
+        let _ = t.push_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+        );
         t.begin_response();
-        let frames = t.push_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#);
-        let start = frames.iter().find(|f| f.starts_with("event: message_start")).expect("a start");
+        let frames = t.push_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#,
+        );
+        let start = frames
+            .iter()
+            .find(|f| f.starts_with("event: message_start"))
+            .expect("a start");
         assert!(
             !start.contains("msg_first"),
             "the second message reused the first id: {start}"

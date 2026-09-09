@@ -37,11 +37,13 @@
 //!   the pending entry, classifies against the conversation's
 //!   previous turn, and emits log + metrics + snapshot state.
 //!
-//! Conversations are keyed by [`conversation_key`] — hash of
-//! (session key, `system`, first message) — NOT by the auth-derived
-//! session key alone, because one client (e.g. Claude Code plus its
-//! subagents) runs many conversations concurrently and comparing
-//! usage across different conversations would be pure noise.
+//! Conversations are keyed by [`conversation_key`] — hash of a stream-lane
+//! key (session key + system digest) plus the first message — NOT by the
+//! auth-derived session key alone, because one client (e.g. Claude Code plus
+//! its subagents) runs many lineages concurrently and comparing usage across
+//! different lineages would be pure noise. Same-system streams sharing a lane
+//! separate inside the replay tracker's alternates; the lane keeps their
+//! baselines from annihilating each other on every switch.
 //!
 //! Everything here is a pure observer: no request or response byte
 //! is ever mutated, and all bookkeeping happens off the client byte
@@ -153,17 +155,24 @@ const RECENT_SAMPLE_CAPACITY: usize = 50;
 const FIRST_TURN_OPENER_CAPACITY: usize = 256;
 const IDENTICAL_PROMPT_FANOUT_WINDOW: Duration = Duration::from_secs(10 * 60);
 
-/// Watchdog conversation key — SHA-256 over the auth-derived session key
-/// plus the FIRST MESSAGE ONLY, deliberately excluding `system`.
+/// Watchdog conversation key — SHA-256 over the lane key (session key +
+/// system digest, see `stream_lane_key`) plus the FIRST MESSAGE ONLY.
+///
+/// The lane is what lets same-opener subagent streams stop sharing usage
+/// baselines. Price, stated plainly: a mid-conversation system rewrite now
+/// mints a fresh key, so the busted turn reads as a first turn of a new
+/// lineage rather than a recache of the old one. That is the correct
+/// accounting — new bytes must be written once — and the backstop still
+/// holds: a fresh key arriving WITH history trips the first-turn
+/// contradiction path (`arrived_with_history`), which is what distinguishes
+/// a genuine new lineage from a retry that abandoned its own.
 ///
 /// This differs from [`crate::ctx::identity::conversation_key`] (which also
-/// hashes `system`) on purpose: a mutated system prompt IS a cache bust, and
-/// the watchdog can only classify it as one if the conversation identity
-/// survives the mutation. Keying on `system` made the watchdog blind to
-/// exactly that failure — the busted turn hashed to a fresh key and was
-/// classified `FirstTurn` instead of `Recache` (proven live, 2026-07-04).
+/// hashes `system`) only in that the lane, not the raw system, is folded in.
 /// The CTX capture/injection stores keep the system-inclusive key; only the
-/// watchdog needs bust-surviving identity.
+/// watchdog needs bust-surviving identity, and the lane preserves exactly
+/// the failures that matter (same-lane rewrites) while retiring the ones
+/// that were always two streams (cross-lane alternation).
 pub fn conversation_key(parsed: &serde_json::Value, session_key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -396,6 +405,17 @@ pub struct TurnRecord {
     /// stays `Copy`. `None` when the request reached the observer without a
     /// fingerprint, which compares as "not known", never as "unchanged".
     pub head: Option<u64>,
+    /// The stock arm's cached prefix after this turn (`stock_read +
+    /// stock_write`), carried per stream the way the rest of this record is.
+    ///
+    /// One `u64` per conversation used to live in a side map, so two
+    /// same-lane streams sharing a key — a main loop and its subagent fork —
+    /// priced against each other's prefix: a large stream following a small
+    /// one read the small footprint back, rebuilt the difference on the stock
+    /// arm at 1.25x, and reported up to ~38 points of saving on byte-identical
+    /// traffic. A new lineage starts at 0, which is also what the rebuild
+    /// below assumes.
+    pub stock_footprint: u64,
 }
 
 /// Streams tracked per conversation key before the oldest is dropped.
@@ -737,8 +757,10 @@ struct PendingRequest {
     /// [`UsageObserver::complete`] is deliberately the *client baseline* — the
     /// footprint of the request the client sent — because that is what the next
     /// client turn can be compared against. A hidden CCR continuation round is
-    /// still real money, so the ledger must add it back or it reports less than
-    /// the bill. `None` on the common single-round path.
+    /// still real money, so the ledger adds it back or it reports less than
+    /// the bill, and the stock comparison's ours arm prices it the same way —
+    /// while the stock arm stays on the baseline, since a stock client never
+    /// runs continuation rounds. `None` on the common single-round path.
     billed_totals: Option<(u64, u64, u64)>,
     /// Completion tokens, where the path that billed them reports them.
     /// The ledger line is the richest per-turn record on disk for a turn that
@@ -1243,10 +1265,9 @@ struct Inner {
     hot_zone_recaches_total: u64,
     stabilization_absorbed_total: u64,
     stabilization_absorbed_tokens_total: u64,
-    /// The stock arm's cached prefix per conversation, carried turn to turn
-    /// the way `conversations` carries ours. Same capacity, so a conversation
-    /// that ages out of one ages out of the other.
-    stock_footprints: LruCache<String, u64>,
+    /// The stock arm's cached prefix lives on [`TurnRecord::stock_footprint`],
+    /// one per tracked stream: same-lane subagent streams sharing a
+    /// conversation key must price against their own prefix, not each other's.
     /// Input-equivalent tokens billed to us, and modelled for a plain client.
     ours_effective_tokens: f64,
     stock_effective_tokens: f64,
@@ -1363,9 +1384,6 @@ impl UsageObserver {
                 hot_zone_recaches_total: 0,
                 stabilization_absorbed_total: 0,
                 stabilization_absorbed_tokens_total: 0,
-                stock_footprints: LruCache::new(
-                    NonZeroUsize::new(CONVERSATION_CAPACITY).expect("capacity is non-zero"),
-                ),
                 ours_effective_tokens: 0.0,
                 stock_effective_tokens: 0.0,
                 stock_turns_compared: 0,
@@ -1828,6 +1846,8 @@ impl UsageObserver {
             head_changed,
             matched_stream_msgs,
             streams_tracked,
+            matched_stream_idx,
+            matched_stock_prior,
         ) = {
             if inner.conversations.get(&pending.conversation_key).is_none() {
                 if inner.forgotten.pop(&pending.conversation_key).is_some() {
@@ -1888,6 +1908,10 @@ impl UsageObserver {
             // difference between a finding and an argument.
             let matched_stream_msgs = matched.and_then(|i| streams[i].msgs);
             let streams_tracked = streams.len();
+            // The stock arm's prior is this stream's own footprint, not the
+            // conversation's last write: sibling streams sharing a key must
+            // not price against each other. A new lineage starts at 0.
+            let matched_stock_prior = matched.map(|i| streams[i].stock_footprint).unwrap_or(0);
             let outcome = match matched {
                 None => (
                     TurnClass::FirstTurn,
@@ -1948,9 +1972,18 @@ impl UsageObserver {
                         .saturating_add(streams[i].cache_creation_input_tokens)
                 }),
                 head: turn_head,
+                // Patched below once the stock arm prices this turn; 0 until
+                // then so a turn that never reaches the stock arm (empty
+                // prompt) leaves a rebuild, never a phantom hit.
+                stock_footprint: 0,
             };
-            match matched {
-                Some(i) => streams[i] = record,
+            // Index of the record just stored, carried out so the stock arm
+            // can file this turn's footprint on the stream it priced.
+            let matched_stream_idx = match matched {
+                Some(i) => {
+                    streams[i] = record;
+                    i
+                }
                 None => {
                     if streams.len() >= MAX_STREAMS_PER_CONVERSATION {
                         if let Some(oldest) = streams
@@ -1963,8 +1996,9 @@ impl UsageObserver {
                         }
                     }
                     streams.push(record);
+                    streams.len() - 1
                 }
-            }
+            };
             let (class, expected, gap, bytes, diverged, prev_read, prevprev_boundary, head_moved) =
                 outcome;
             (
@@ -1978,6 +2012,8 @@ impl UsageObserver {
                 head_moved,
                 matched_stream_msgs,
                 streams_tracked,
+                matched_stream_idx,
+                matched_stock_prior,
             )
         };
 
@@ -2058,11 +2094,13 @@ impl UsageObserver {
                 _ => ours_prompt,
             };
 
-            let prior = inner
-                .stock_footprints
-                .get(&pending.conversation_key)
-                .copied()
-                .unwrap_or(0);
+            // This stream's own prior footprint: sibling streams sharing one
+            // conversation key (a main loop and its subagent fork) must not
+            // price against each other. A new lineage starts at 0, which reads
+            // as a full rebuild below — the same assumption the classifier
+            // makes when it books the turn `FirstTurn`, on the grounds that a
+            // fork had no prefix to reuse.
+            let prior = matched_stock_prior;
             // Anything that busted our prefix would have busted theirs -- an
             // idle gap is idle for both, and a body edit is the client's own.
             // A hot-zone change is the case where the arms part: our holds may
@@ -2091,9 +2129,15 @@ impl UsageObserver {
                 0
             };
             let stock_write = stock_cacheable.saturating_sub(stock_read);
-            inner
-                .stock_footprints
-                .put(pending.conversation_key.clone(), stock_read + stock_write);
+            // File the footprint on the stream just stored, so the next turn
+            // of *this* stream reads its own prefix back. Keyed by position,
+            // not by key: the index was taken from the same `Vec` above and
+            // nothing between here and there touches it.
+            if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key) {
+                if let Some(rec) = streams.get_mut(matched_stream_idx) {
+                    rec.stock_footprint = stock_read + stock_write;
+                }
+            }
 
             // Priced in input-equivalents rather than dollars: Anthropic's
             // multipliers (read 0.1x, 5-minute write 1.25x, 1-hour write 2.0x)
@@ -2104,10 +2148,28 @@ impl UsageObserver {
                 Some((five, hour)) => (five, hour),
                 None => (cache_creation_input_tokens, 0),
             };
-            let ours_effective = input_tokens as f64
+            let mut ours_effective = input_tokens as f64
                 + cache_read_input_tokens as f64 * CACHE_READ_MULTIPLIER
                 + w5 as f64 * CACHE_WRITE_5M_MULTIPLIER
                 + w1h as f64 * CACHE_WRITE_1H_MULTIPLIER;
+            // Hidden continuation rounds were billed but are not in the client
+            // baseline above, and the stock client never runs them — so the
+            // stock arm must not include them, but ours must, or the
+            // comparison reports less than the bill. The extra write prices at
+            // the 5-minute rate, matching the ground-truth ledger below, which
+            // prices every billed write the same way; the true cost can only
+            // be higher (up to the 1-hour rate), never lower.
+            let ccr_hidden_effective = match pending.billed_totals {
+                Some((billed_input, billed_read, billed_write)) => {
+                    billed_input.saturating_sub(input_tokens) as f64
+                        + billed_read.saturating_sub(cache_read_input_tokens) as f64
+                            * CACHE_READ_MULTIPLIER
+                        + billed_write.saturating_sub(cache_creation_input_tokens) as f64
+                            * CACHE_WRITE_5M_MULTIPLIER
+                }
+                None => 0.0,
+            };
+            ours_effective += ccr_hidden_effective;
             // The stock client never asks for the hour, so its writes price at
             // the 5-minute rate throughout.
             let stock_effective = input_tokens as f64
@@ -2148,6 +2210,7 @@ impl UsageObserver {
                 ours_read = cache_read_input_tokens,
                 ours_write_5m = w5,
                 ours_write_1h = w1h,
+                ccr_hidden_effective = ccr_hidden_effective.round() as u64,
                 stock_read,
                 stock_write,
                 "priced this turn against a stock client"
@@ -3053,6 +3116,7 @@ mod tests {
             diverged: false,
             previous_boundary: None,
             head: None,
+            stock_footprint: read + creation,
         }
     }
 
@@ -3632,6 +3696,7 @@ mod tests {
                     diverged: false,
                     previous_boundary: None,
                     head: None,
+                    stock_footprint: 12_000,
                 }],
             );
         }
@@ -3673,6 +3738,7 @@ mod tests {
                     diverged: false,
                     previous_boundary: None,
                     head: None,
+                    stock_footprint: 12_000,
                 }],
             );
         }
@@ -3714,6 +3780,7 @@ mod tests {
                     diverged: false,
                     previous_boundary: None,
                     head: None,
+                    stock_footprint: 12_000,
                 }],
             );
         }
@@ -4405,6 +4472,7 @@ mod stream_matching_tests {
             diverged: false,
             previous_boundary: None,
             head: None,
+            stock_footprint: 0,
         }
     }
 
@@ -5362,6 +5430,78 @@ mod stock_baseline_tests {
             (s.predicted_read_error_pct - 34.67).abs() < 0.01,
             "{}",
             s.predicted_read_error_pct
+        );
+    }
+
+    /// Same-lane subagent streams sharing one conversation key must price
+    /// against their own prefix, not each other's. The stock footprint used
+    /// to be one `u64` per key, so a large stream following a small fork read
+    /// the fork's prefix back and rebuilt the difference at 1.25x — reporting
+    /// +38% saving on byte-identical traffic neither arm touched.
+    #[test]
+    fn interleaved_same_lane_streams_price_against_their_own_prefix() {
+        fn lane_fp(msgs: usize) -> PrefixFingerprint {
+            PrefixFingerprint {
+                head: "aaaa".into(),
+                body: "body".into(),
+                stable: "stable".into(),
+                stable_msgs: msgs,
+            }
+        }
+        let obs = UsageObserver::new();
+
+        // Main stream cold: 50 msgs, writes 50k.
+        obs.begin_request("r1", "conv".into(), None, None, Some(lane_fp(50)));
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        obs.complete("r1", 100, 0, 50_000, None);
+        // Subagent fork on the same lane: 10 msgs, writes 8k. Shorter than
+        // every tracked stream, so booked a first turn of its own stream.
+        obs.begin_request("r2", "conv".into(), None, None, Some(lane_fp(10)));
+        obs.note_wire_bytes("r2", 1_000, 1_000, "off");
+        obs.complete("r2", 100, 0, 8_000, None);
+        // Main stream warm: reads its own 50k back, writes 500 of growth.
+        obs.begin_request("r3", "conv".into(), None, None, Some(lane_fp(52)));
+        obs.note_wire_bytes("r3", 1_000, 1_000, "off");
+        obs.complete("r3", 100, 50_000, 500, None);
+        // Subagent warm: reads its own 8k back, writes 300 of growth.
+        obs.begin_request("r4", "conv".into(), None, None, Some(lane_fp(12)));
+        obs.note_wire_bytes("r4", 1_000, 1_000, "off");
+        obs.complete("r4", 100, 8_000, 300, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.stock_turns_compared, 4);
+        // Neither arm was touched and the traffic is identical, so both arms
+        // price the same: 62_600 + 10_100 + 5_725 + 1_275.
+        assert_eq!(s.ours_effective_tokens, 79_700);
+        assert_eq!(s.ours_effective_tokens, s.stock_effective_tokens);
+        assert_eq!(s.vs_stock_saving_pct, 0.0);
+        assert_eq!(s.vs_stock_saving_pct_recent, Some(0.0));
+    }
+
+    /// Hidden continuation rounds are billed but are not in the client
+    /// baseline `complete` receives. The stock client never runs them, so the
+    /// stock arm stays on the baseline — but the ours arm must add them back,
+    /// or the comparison reports less than the bill.
+    #[test]
+    fn hidden_continuation_rounds_count_on_the_ours_arm_only() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        // Baseline prices 100 + 10_000 + 200; the proxy burned an extra 5_000
+        // fresh, 5_000 read and 500 written behind the client's back.
+        obs.note_billed_totals("r1", 5_100, 15_000, 700);
+        obs.complete("r1", 100, 10_000, 200, None);
+
+        let s = obs.snapshot();
+        // Ours: 1_350 baseline + 5_000 + 500 + 625 hidden.
+        assert_eq!(s.ours_effective_tokens, 7_475);
+        // Stock: first turn, full 10_200 rebuild at the 5-minute rate.
+        assert_eq!(s.stock_effective_tokens, 12_850);
+        assert!(
+            (s.vs_stock_saving_pct - 41.83).abs() < 0.01,
+            "{}",
+            s.vs_stock_saving_pct
         );
     }
 }

@@ -113,6 +113,10 @@ pub(crate) struct CcrStreamContext {
     /// Present when memory tools were injected into this request. The proxy
     /// runs those too, for the same reason it runs `headroom_retrieve`.
     pub memory: Option<crate::proxy::MemoryToolContext>,
+    /// Redaction memory for continuations this turn (see
+    /// [`crate::handlers::local_model::RoutedCcr::redact`]). `None` on paths
+    /// that never redact, where continuations pass through.
+    pub redact: Option<crate::redact::RedactRef>,
 }
 
 /// Convert a rebuilt Anthropic assistant turn into the OpenAI
@@ -225,7 +229,14 @@ pub(crate) fn responses_output_as_anthropic_turn(resolved: &Value, original: &Va
                     .map(|parts| {
                         parts
                             .iter()
-                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .filter_map(|p| {
+                                p.get("text").and_then(Value::as_str).or_else(|| {
+                                    // A refusal part is the turn's only text;
+                                    // without this the client receives an empty
+                                    // `end_turn` it cannot tell from silence.
+                                    p.get("refusal").and_then(Value::as_str)
+                                })
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -233,16 +244,27 @@ pub(crate) fn responses_output_as_anthropic_turn(resolved: &Value, original: &Va
                     content.push(json!({"type": "text", "text": text}));
                 }
             }
-            Some("function_call") => content.push(json!({
-                "type": "tool_use",
-                "id": item.get("call_id").cloned().unwrap_or(Value::Null),
-                "name": item.get("name").cloned().unwrap_or(Value::Null),
-                "input": item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .unwrap_or_else(|| json!({})),
-            })),
+            Some("function_call") => {
+                let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                // A call without identity cannot round-trip: emitting it as a
+                // null-id `tool_use` has the client discard the whole turn.
+                // The stop reason below derives from surviving content, so the
+                // dropped call downgrades the turn instead of killing it.
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or_else(|| json!({})),
+                }))
+            }
             _ => {}
         }
     }
@@ -969,6 +991,31 @@ where
     (stream, usage_handle)
 }
 
+/// A continuation round is always a buffered JSON request: this code
+/// synthesises the client's stream itself and has no use for a second SSE
+/// body to splice.
+///
+/// `stream_options` is only valid with `stream: true` (the Responses API
+/// rejects the combination with `400 stream_options requires stream to be
+/// true`), and it only tunes streaming delivery (`reasoning_summary_delivery`,
+/// `include_usage`), so it must go when streaming does. Leaving it behind is
+/// what broke every `headroom_retrieve` continuation on routed Responses
+/// models: the retrieval was fetched and then dropped on a 400.
+fn non_streaming_continuation_request(forwarded_request: &Bytes) -> Bytes {
+    match serde_json::from_slice::<Value>(forwarded_request) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("stream".into(), json!(false));
+                obj.remove("stream_options");
+            }
+            serde_json::to_vec(&v)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| forwarded_request.clone())
+        }
+        Err(_) => forwarded_request.clone(),
+    }
+}
+
 /// Run the buffered continuation logic against a rebuilt streamed turn.
 async fn resolve_retrieval(
     ctx: &CcrStreamContext,
@@ -1002,17 +1049,7 @@ async fn resolve_retrieval(
 
     // Continuation rounds must come back as JSON — this code synthesises the
     // client's stream itself and has no use for a second SSE body to splice.
-    let continuation_request = match serde_json::from_slice::<Value>(&ctx.forwarded_request) {
-        Ok(mut v) => {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("stream".into(), json!(false));
-            }
-            serde_json::to_vec(&v)
-                .map(Bytes::from)
-                .unwrap_or_else(|_| ctx.forwarded_request.clone())
-        }
-        Err(_) => ctx.forwarded_request.clone(),
-    };
+    let continuation_request = non_streaming_continuation_request(&ctx.forwarded_request);
 
     // Memory tools run after retrieval, on whatever the retrieval left. A turn
     // can reach for both, and the client can run neither — but neither can the
@@ -1036,6 +1073,7 @@ async fn resolve_retrieval(
             &ctx.request_id,
             &ctx.outgoing_headers,
             provider,
+            ctx.redact.clone(),
         )
         .await;
         usage.absorb(extra);
@@ -1052,6 +1090,7 @@ async fn resolve_retrieval(
                 &ctx.request_id,
                 &ctx.outgoing_headers,
                 provider,
+                ctx.redact.clone(),
             )
             .await;
             usage.absorb(extra);
@@ -1097,6 +1136,25 @@ mod tests {
             .iter()
             .map(|b| String::from_utf8_lossy(b).to_string())
             .collect()
+    }
+
+    /// A continuation is buffered JSON: it must force `stream: false` and drop
+    /// `stream_options`, which the Responses API rejects with 400 alongside
+    /// `stream: false` (`stream_options requires stream to be true`). That
+    /// combination is what dropped every `headroom_retrieve` continuation on
+    /// routed Responses models after the retrieval had already been fetched.
+    #[test]
+    fn continuation_request_drops_stream_options_with_stream() {
+        let forwarded = Bytes::from(
+            r#"{"model":"m","stream":true,"stream_options":{"reasoning_summary_delivery":"sequential_cutoff"},"input":[]}"#,
+        );
+        let out = non_streaming_continuation_request(&forwarded);
+        let v: Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(v["stream"], json!(false));
+        assert!(
+            v.get("stream_options").is_none(),
+            "stream_options must not survive on a non-streaming continuation"
+        );
     }
 
     /// The whole point: the client must never see the tool it cannot run.
@@ -1555,6 +1613,50 @@ mod deferred_drop_reason_tests {
         for (i, reason) in DropReason::ALL.iter().enumerate() {
             assert_eq!(i, *reason as usize, "{} is out of order", reason.label());
         }
+    }
+
+    /// Buffered Responses twin of the chat-path downgrade: a `function_call`
+    /// without `call_id` or `name` cannot round-trip, so it is dropped and
+    /// the stop reason derives from surviving content instead of killing
+    /// the turn.
+    #[test]
+    fn an_identity_less_function_call_downgrades_to_end_turn() {
+        let resolved = json!({
+            "id": "resp_1",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "here is what I found"}]},
+                {"type": "function_call", "call_id": "", "name": "", "arguments": "{}"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let original = json!({"model": "claude-3-5-sonnet-20241022"});
+        let output = responses_output_as_anthropic_turn(&resolved, &original);
+        assert_eq!(output["stop_reason"], "end_turn");
+        assert!(
+            !output["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["type"] == "tool_use"),
+            "broken call must go out alone, not take the text with it: {output}"
+        );
+        assert_eq!(output["content"][0]["text"], "here is what I found");
+
+        // Nothing survives: an empty `end_turn`, not a `tool_use` the client
+        // would discard whole.
+        let resolved = json!({
+            "id": "resp_2",
+            "output": [
+                {"type": "function_call", "call_id": "call_1", "name": "", "arguments": "{}"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let output = responses_output_as_anthropic_turn(&resolved, &original);
+        assert_eq!(output["stop_reason"], "end_turn");
+        assert!(
+            output["content"].as_array().unwrap().is_empty(),
+            "no playable block survived: {output}"
+        );
     }
 }
 

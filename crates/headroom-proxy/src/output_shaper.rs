@@ -25,6 +25,10 @@ use serde_json::Value;
 /// agent resolver). Nothing lowers it anymore.
 fn effort_rank(s: &str) -> Option<i32> {
     match s {
+        // `minimal` is the Responses floor (killing reasoning entirely is a
+        // 400); without this arm a client asking for it got the backend
+        // default instead — a silent upgrade to `high`.
+        "minimal" => Some(-1),
         "low" => Some(0),
         "medium" => Some(1),
         "high" => Some(2),
@@ -37,7 +41,7 @@ fn effort_rank(s: &str) -> Option<i32> {
 /// The effort the client asked for, if it named one.
 ///
 /// Claude Code's `/effort` and `--effort` travel as `output_config.effort` —
-/// `low`, `medium`, `high` or `xhigh` — on every request, including ones for a
+/// `minimal`, `low`, `medium`, `high` or `xhigh` — on every request, including ones for a
 /// routed alias. `thinking` comes alongside as `{"type": "adaptive"}` and
 /// carries no budget, so a reader looking only at `thinking.budget_tokens`
 /// sees nothing and the setting is silently lost.
@@ -593,6 +597,16 @@ mod requested_effort_tests {
         assert_eq!(
             requested_effort(&json!({"output_config": {"effort": "turbo"}})),
             None
+        );
+    }
+
+    /// `minimal` is a real Responses effort and must survive the rank gate,
+    /// or the backend silently upgrades it to its default.
+    #[test]
+    fn minimal_is_reported_not_dropped() {
+        assert_eq!(
+            requested_effort(&json!({"output_config": {"effort": "minimal"}})),
+            Some("minimal")
         );
     }
 }

@@ -24,6 +24,12 @@ pub(crate) struct CtxTransformReport {
     /// must key off the same one — the Claude path shares a single key across
     /// all three deliberately, so they agree on what "this conversation" is.
     pub(crate) session_key: String,
+    /// The stream lane inside the session (session key + system digest).
+    /// Same-opener streams share the session key but must not share replay
+    /// trackers, drift baselines, or pins — every behavior store downstream
+    /// takes this instead of `session_key`. Derived from the body as
+    /// received, before any transform below mutates it.
+    pub(crate) lane_key: String,
 }
 
 /// Apply headroom's CTX request-side transforms to a routed model's parsed
@@ -86,7 +92,14 @@ pub(crate) async fn apply_ctx_request_transforms(
     // changed turn-to-turn) is available regardless of which CTX flags are on.
     // A drift means the codex prompt-cache prefix moved this turn.
     let hash = compute_structural_hash(parsed, ApiKind::Anthropic);
-    let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
+    // Per-stream lane inside the session: same-opener streams share the
+    // session key but carry different systems. The drift baseline, the
+    // usage conversation, and the replay tracker below take the lane so
+    // sibling streams stop invalidating each other; ctx/memory stores stay
+    // on the session (tenant-scoped recall is shared on purpose).
+    let lane_key = crate::cache_stabilization::drift_detector::stream_lane_key(&session_key, &hash);
+    report.lane_key = lane_key.clone();
+    let drift_dims = observe_drift(&state.drift_state, &lane_key, hash);
     let rebuild_boundary = drift_dims.is_some();
 
     // CTX-7: park conversation identity + drift dims under the request id so
@@ -96,7 +109,7 @@ pub(crate) async fn apply_ctx_request_transforms(
     // segment simply has nothing to say about routed turns.
     state.usage_observer.begin_request(
         request_id,
-        crate::cache_stabilization::usage_observer::conversation_key(parsed, &session_key),
+        crate::cache_stabilization::usage_observer::conversation_key(parsed, &lane_key),
         Some(session_key.as_str()),
         drift_dims,
         Some(
@@ -442,6 +455,11 @@ pub(crate) fn merge_routed_compression_report(
 /// puts the previously-forwarded bytes back so the provider's cache still hits.
 /// Turning compression on without replay moves the prefix every turn — true on
 /// both paths, and worth knowing before enabling one without the other.
+///
+/// `session_key` carries the stream lane (`CtxTransformReport::lane_key`),
+/// not the bare session: same-opener streams must not share the replay
+/// tracker. Bare session keys (tests, callers without identity) work
+/// unchanged — a key with no lane suffix keys exactly one lane.
 pub(crate) fn apply_compression_and_replay(
     state: &AppState,
     parsed: &mut Value,
@@ -552,6 +570,10 @@ pub(crate) fn apply_compression_and_replay(
             report.replay_parked = true;
             crate::proxy::apply_prefix_replay(
                 &state.replay_store,
+                // `session_key` here is really the lane: `parsed` was already
+                // mutated by the CTX transforms above, so the lane cannot be
+                // re-derived here and travels on the caller instead. See
+                // `apply_compression_and_replay`'s `session_key` parameter.
                 session_key,
                 request_id,
                 original_messages,

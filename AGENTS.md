@@ -93,7 +93,7 @@ generated from that output. Regenerate it when you add a flag.
 - `crates/headroom-parity` checks Rust output against Python.
   `crates/headroom-simulators` drives the benchmarks.
 - `crates/headroom-py` is a PyO3 module built with maturin, not cargo.
-- `contrib/` has the launcher, restart script, statuslines and flag file. Only
+- `contrib/` has the launcher, restart script, statuslines, flag file, and Claude hooks. Only
   `install.sh` reads it.
 - `docs/` is reference material. `docs/notes/` is working notes, some stale. Do
   not treat notes as a spec.

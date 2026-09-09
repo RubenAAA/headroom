@@ -1,15 +1,20 @@
 //! Integration tests for the PR-E6 cache-bust drift detector.
 //!
-//! Boots a real Rust proxy in front of a wiremock upstream, sends two
+//! Boots a real Rust proxy in front of a wiremock upstream, sends three
 //! requests on the same `Authorization` (= same session), and asserts
 //! that:
 //!
-//! 1. A second request with a *different* system prompt produces a
-//!    `cache_drift_observed` warn-level event whose `drift_dims`
-//!    field includes `system`.
-//! 2. The proxy still forwards bytes byte-equal to upstream — the
+//! 1. A second request with a *different* system prompt mints a new stream
+//!    lane — a `stream_lane_detected` warn-level event with `lane_count: 2`
+//!    — and does NOT log `cache_drift_observed` with `drift_dims=system`.
+//!    A rewritten system is a new provider lineage, not drift within one:
+//!    the old lane keeps its baseline instead of being invalidated.
+//! 2. A third request on the second lane that changes only `tools` DOES log
+//!    `cache_drift_observed` with `drift_dims=tools`: drift detection still
+//!    fires for genuine within-laneage changes.
+//! 3. The proxy still forwards bytes byte-equal to upstream — the
 //!    detector is read-only.
-//! 3. The session key is hashed in the log line; the raw bearer token
+//! 4. The session key is hashed in the log line; the raw bearer token
 //!    (`sk-test-this-is-a-secret`) never appears anywhere in the
 //!    captured log buffer.
 
@@ -61,6 +66,12 @@ fn anthropic_payload(system: &str) -> Value {
             {"role": "user", "content": "hello"},
         ],
     })
+}
+
+fn anthropic_payload_with_tools(system: &str) -> Value {
+    let mut body = anthropic_payload(system);
+    body["tools"] = json!([{"name": "bash"}]);
+    body
 }
 
 /// The cache-drift integration test installs a global JSON tracing
@@ -115,7 +126,7 @@ mod tracing_capture {
     }
 
     #[tokio::test]
-    async fn cache_drift_observed_when_system_prompt_changes_mid_session() {
+    async fn system_rewrite_mints_a_new_lane_without_drift_warn() {
         let buf = buffer();
         buf.lock().unwrap().clear();
 
@@ -129,8 +140,8 @@ mod tracing_capture {
         })
         .await;
 
-        // Same Authorization header → same session_key. Different
-        // system prompts on each turn → drift_dims=system on turn 2.
+        // Same Authorization header → same session_key. A different
+        // system prompt mints a new lane, it does not drift the old one.
         let secret = "Bearer sk-test-this-is-a-secret";
         let client = reqwest::Client::new();
 
@@ -156,42 +167,67 @@ mod tracing_capture {
             .unwrap();
         assert_eq!(r2.status(), 200);
 
+        // Turn 3 stays on lane 2 (same system) but adds tools: a genuine
+        // within-laneage change, which must still warn.
+        let body3 =
+            serde_json::to_vec(&anthropic_payload_with_tools("you are now a poet")).unwrap();
+        let r3 = client
+            .post(format!("{}/v1/messages", proxy.url()))
+            .header("authorization", secret)
+            .header("content-type", "application/json")
+            .body(body3.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), 200);
+
         // Byte-faithful passthrough: each upstream-received body must
         // SHA-256 match the corresponding inbound body.
         let received = captured.lock().unwrap().clone();
-        assert_eq!(received.len(), 2, "upstream should have seen 2 requests");
-        assert_eq!(
-            sha256_hex(&body1),
-            sha256_hex(&received[0]),
-            "request 1 byte-faithful passthrough violated",
-        );
-        assert_eq!(
-            sha256_hex(&body2),
-            sha256_hex(&received[1]),
-            "request 2 byte-faithful passthrough violated",
-        );
+        assert_eq!(received.len(), 3, "upstream should have seen 3 requests");
+        for (sent, got, n) in [
+            (&body1, &received[0], 1),
+            (&body2, &received[1], 2),
+            (&body3, &received[2], 3),
+        ] {
+            assert_eq!(
+                sha256_hex(sent),
+                sha256_hex(got),
+                "request {n} byte-faithful passthrough violated",
+            );
+        }
 
-        // Logs: a `cache_drift_observed` event must be present and
-        // include `system` in `drift_dims`.
         let logs = String::from_utf8(buf.lock().unwrap().clone()).expect("logs are utf-8");
         assert!(
             logs.contains(r#""event":"cache_drift_first_request""#),
             "expected first_request event in logs: {logs}",
         );
+        // The system rewrite is a lane switch, not drift: one
+        // `stream_lane_detected` warn, no `drift_dims=system` warn.
         assert!(
-            logs.contains(r#""event":"cache_drift_observed""#),
-            "expected drift_observed event in logs: {logs}",
+            logs.contains(r#""event":"stream_lane_detected""#),
+            "expected stream_lane_detected event in logs: {logs}",
         );
-        // `drift_dims` should include `system` when only the system
-        // prompt mutated. Find any `cache_drift_observed` line and
-        // assert its `drift_dims` contains `system`.
+        let lane_line = logs
+            .lines()
+            .find(|line| line.contains(r#""event":"stream_lane_detected""#))
+            .expect("stream_lane_detected line missing");
+        assert!(
+            lane_line.contains(r#""lane_count":2"#),
+            "expected lane_count=2 in lane line: {lane_line}",
+        );
+        assert!(
+            !logs.contains(r#""drift_dims":"system""#),
+            "system rewrite must not read as drift: {logs}",
+        );
+        // The within-lane tools change still warns.
         let drift_line = logs
             .lines()
             .find(|line| line.contains(r#""event":"cache_drift_observed""#))
-            .expect("drift_observed line missing");
+            .expect("drift_observed line missing for the tools change");
         assert!(
-            drift_line.contains(r#""drift_dims":"system""#),
-            "expected drift_dims=system in drift line: {drift_line}",
+            drift_line.contains(r#""drift_dims":"tools""#),
+            "expected drift_dims=tools in drift line: {drift_line}",
         );
 
         // Privacy invariant: the raw bearer secret must NEVER appear

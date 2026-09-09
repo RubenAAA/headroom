@@ -285,7 +285,7 @@ fn the_tracker_confirmed_floor_preserves_the_withdrawal_span() {
         assistant("first reply"),
         user("second question"),
     ];
-    tracker.update_from_response(20_000, 0, &first, Some(&first));
+    tracker.update_from_response(20_000, 0, &first, Some(&first), String::new());
     assert_eq!(tracker.frozen_message_count(), 4);
 
     let current = vec![
@@ -322,13 +322,25 @@ fn the_store_reports_the_provider_confirmed_floor() {
     );
 
     let originals = vec![user("q1"), assistant("r1"), user("q2")];
-    store.begin_request("req-1", "sess-a", originals.clone(), originals.clone());
+    store.begin_request(
+        "req-1",
+        "sess-a",
+        originals.clone(),
+        originals.clone(),
+        String::new(),
+    );
     store.complete("req-1", 50_000, 0);
     assert_eq!(store.confirmed_frozen_count("sess-a"), 3);
 
     // A cold provider count collapses the floor with it, so the next turn
     // re-baselines instead of pinning.
-    store.begin_request("req-2", "sess-a", originals.clone(), originals.clone());
+    store.begin_request(
+        "req-2",
+        "sess-a",
+        originals.clone(),
+        originals.clone(),
+        String::new(),
+    );
     store.complete("req-2", 0, 0);
     assert_eq!(store.confirmed_frozen_count("sess-a"), 0);
 }

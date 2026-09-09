@@ -714,7 +714,12 @@ fn observe(
     current: StructuralHash,
     origin: Origin,
 ) -> Option<String> {
-    let session_prefix = session_key_log_prefix(session_key);
+    // `session_key` is really a stream-lane key
+    // ([`stream_lane_key`]): the lookup is per lane, but the logged
+    // session hash stays the session part so existing dashboards keep
+    // joining. Bare session keys (no lane suffix) log exactly as before.
+    let session_prefix = session_key_log_prefix(lane_session_part(session_key));
+    let lane_prefix = session_key_log_prefix(session_key);
     let mut cache = match state.cache.lock() {
         Ok(c) => c,
         Err(poisoned) => {
@@ -732,15 +737,47 @@ fn observe(
     match cache.get(session_key).copied() {
         None => {
             match origin {
-                Origin::Inbound => tracing::info!(
-                    event = "cache_drift_first_request",
-                    session_key_hash = %session_prefix,
-                    current_hash_prefix = %structural_hash_log_prefix(&current),
-                    "cache_drift detector observed a new session"
-                ),
+                Origin::Inbound => {
+                    tracing::info!(
+                        event = "cache_drift_first_request",
+                        session_key_hash = %session_prefix,
+                        lane_key_hash = %lane_prefix,
+                        current_hash_prefix = %structural_hash_log_prefix(&current),
+                        "cache_drift detector observed a new session"
+                    );
+                    // A second lane under one session means same-opener
+                    // streams are sharing the credential (subagent fan-out).
+                    // Before lanes each alternation read as drift and dropped
+                    // the stored prefix; now it is one line per new stream.
+                    // Scan only (no recency change); first_request is rare.
+                    let session = lane_session_part(session_key);
+                    let mut siblings = 0;
+                    if session_key.contains(LANE_SEPARATOR) {
+                        for (key, _) in cache.iter() {
+                            if key.as_str() != session_key
+                                && lane_session_part(key.as_str()) == session
+                            {
+                                siblings += 1;
+                            }
+                        }
+                    }
+                    if siblings > 0 {
+                        tracing::warn!(
+                            event = "stream_lane_detected",
+                            session_key_hash = %session_prefix,
+                            lane_key_hash = %lane_prefix,
+                            lane_count = siblings + 1,
+                            "new stream lane under a known session: subagent \
+                             fan-out sharing one opener, or a rewritten \
+                             system/history. Each lane tracks its own prefix \
+                             baseline from here."
+                        );
+                    }
+                }
                 Origin::Outbound => tracing::info!(
                     event = "cache_drift_first_request_outbound",
                     session_key_hash = %session_prefix,
+                    lane_key_hash = %lane_prefix,
                     current_hash_prefix = %structural_hash_log_prefix(&current),
                     "cache_drift detector observed a new session on the forwarded body"
                 ),
@@ -766,6 +803,7 @@ fn observe(
                     tracing::info!(
                         event = "early_scaffolding_absorbed",
                         session_key_hash = %session_prefix,
+                        lane_key_hash = %lane_prefix,
                         "withdrawn client scaffolding in the early window no longer \
                          reads as drift; the stored prefix survives"
                     );
@@ -779,6 +817,7 @@ fn observe(
                     Origin::Inbound => tracing::warn!(
                         event = "cache_drift_observed",
                         session_key_hash = %session_prefix,
+                        lane_key_hash = %lane_prefix,
                         drift_dims = %dims,
                         // Empty unless the early window moved; the other two
                         // axes are single values with nothing to break down.
@@ -800,6 +839,7 @@ fn observe(
                     Origin::Outbound => tracing::info!(
                         event = "cache_drift_observed_outbound",
                         session_key_hash = %session_prefix,
+                        lane_key_hash = %lane_prefix,
                         drift_dims = %dims,
                         early_drift = %early_drift_detail(&previous, &current),
                         // Empty unless the system block moved; see
@@ -829,6 +869,52 @@ pub(crate) fn session_key_log_prefix(session_key: &str) -> String {
     hasher.update(session_key.as_bytes());
     let digest = hasher.finalize();
     hex_prefix(&digest, 16)
+}
+
+/// Separator between the session key and the lane suffix in a
+/// [`stream_lane_key`]. A control character no session-key arm emits:
+/// `auth:`/`apikey:`/`ip:`/`ipua:`/`session:` keys are all printable.
+pub(crate) const LANE_SEPARATOR: char = '\u{1f}';
+
+/// Stream lane: the behavior-store key for one lineage under a session.
+///
+/// Same-opener subagent streams share a session key (auth + model + first
+/// message) while carrying different systems. Keying the drift baseline, the
+/// replay tracker, and the tool/pin stores by session alone lets the streams
+/// overwrite each other's state: each system flip reads as drift, drops the
+/// stored prefix, and the next turn re-emits un-replayed bytes past the
+/// provider's stable entry. Measured 2026-09-08: Sonnet streams seconds
+/// apart, 83 recache events, ~535k tokens, `actual_cache_read` pinned while
+/// expected grew.
+///
+/// The lane folds the system hash into the key. It is stable from the first
+/// turn (the system block is present on every request) and under append-only
+/// growth, and it deliberately says nothing about tools: clients add tools
+/// mid-conversation, and a lane that rotated on every tool change would never
+/// engage replay. Same-system streams sharing a lane ride the replay
+/// tracker's existing alternates machinery; a flip is a lane switch, not an
+/// invalidation, so flipping back resumes with the tracker intact.
+///
+/// A rewritten system mints a new lane, which costs what today's rebuild
+/// costs (one full write) — the old lane survives, so returning is cheaper
+/// than it is today.
+pub(crate) fn stream_lane_key(session_key: &str, hash: &StructuralHash) -> String {
+    let mut lane = String::with_capacity(session_key.len() + 18);
+    lane.push_str(session_key);
+    lane.push(LANE_SEPARATOR);
+    lane.push_str(&hex_prefix(&hash.system, 8));
+    lane
+}
+
+/// The session part of a [`stream_lane_key`]: everything before the first
+/// [`LANE_SEPARATOR`]. A bare session key (pre-lane callers, unit tests)
+/// has no separator and is returned whole, so lane-aware lookups stay
+/// backward compatible with unlaned keys.
+pub(crate) fn lane_session_part(lane_key: &str) -> &str {
+    match lane_key.split_once(LANE_SEPARATOR) {
+        Some((session, _)) => session,
+        None => lane_key,
+    }
 }
 
 /// 24-char hex prefix (12 bytes) of a digest over the concatenated
@@ -1869,6 +1955,105 @@ mod tests {
             key_t1, key_t2,
             "turn growth and cache_control relocation must not rotate the session key"
         );
+    }
+
+    /// 2026-09-08: same-opener subagent streams share a session key while
+    /// carrying different systems. The lane must split them.
+    #[test]
+    fn lane_key_splits_streams_sharing_a_session() {
+        let session = "auth:abc123:conv456";
+        let hash_a = compute_structural_hash(&cc_turn1_body(), ApiKind::Anthropic);
+        let mut other = cc_turn1_body();
+        other["system"] = json!([{"type": "text", "text": "subagent preamble"}]);
+        let hash_b = compute_structural_hash(&other, ApiKind::Anthropic);
+        let lane_a = stream_lane_key(session, &hash_a);
+        let lane_b = stream_lane_key(session, &hash_b);
+        assert_ne!(lane_a, lane_b, "one system per lane");
+        assert_eq!(lane_session_part(&lane_a), session);
+        assert_eq!(lane_session_part(&lane_b), session);
+    }
+
+    #[test]
+    fn lane_key_survives_growth_and_ignores_tools() {
+        let session = "auth:abc123:conv456";
+        let h1 = compute_structural_hash(&cc_turn1_body(), ApiKind::Anthropic);
+        let h2 = compute_structural_hash(&cc_turn2_body(), ApiKind::Anthropic);
+        assert_eq!(
+            stream_lane_key(session, &h1),
+            stream_lane_key(session, &h2),
+            "append-only growth must not rotate the lane"
+        );
+        let mut retooled = cc_turn2_body();
+        retooled["tools"] = json!([{"name": "bash"}, {"name": "read"}]);
+        let h3 = compute_structural_hash(&retooled, ApiKind::Anthropic);
+        assert_eq!(
+            stream_lane_key(session, &h2),
+            stream_lane_key(session, &h3),
+            "a mid-conversation tool change must not rotate the lane"
+        );
+    }
+
+    #[test]
+    fn lane_session_part_passes_bare_keys_through() {
+        assert_eq!(lane_session_part("auth:abc"), "auth:abc");
+        assert_eq!(lane_session_part(""), "");
+    }
+
+    /// The invariant every lane consumer depends on: two same-opener streams
+    /// with different systems share one session key (the discriminator is
+    /// system-blind on purpose) but mint different lanes. Drift, usage and
+    /// replay take the lane; ctx/memory stores keep the session, so sibling
+    /// streams split caches without splitting recall.
+    #[test]
+    fn sibling_streams_share_the_session_but_not_the_lane() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-test".parse().unwrap());
+        let addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 4242);
+        let main = anthropic_body("main instructions", json!([]), vec!["shared opener"]);
+        let subagent = anthropic_body("subagent preamble", json!([]), vec!["shared opener"]);
+
+        let session_main = derive_session_key(&headers, &addr, &main, ApiKind::Anthropic);
+        let session_sub = derive_session_key(&headers, &addr, &subagent, ApiKind::Anthropic);
+        assert_eq!(
+            session_main, session_sub,
+            "the session discriminator must not see the system prompt"
+        );
+
+        let lane_main = stream_lane_key(
+            &session_main,
+            &compute_structural_hash(&main, ApiKind::Anthropic),
+        );
+        let lane_sub = stream_lane_key(
+            &session_sub,
+            &compute_structural_hash(&subagent, ApiKind::Anthropic),
+        );
+        assert_ne!(
+            lane_main, lane_sub,
+            "different systems must mint different lanes"
+        );
+        assert_eq!(lane_session_part(&lane_main), session_main);
+        assert_eq!(lane_session_part(&lane_sub), session_sub);
+    }
+
+    /// The incident shape: A, B, A turns of one session must not read as
+    /// drift. Return-value proof — `Some` means a `cache_drift_observed`
+    /// warn plus (downstream) a dropped stored prefix.
+    #[test]
+    fn alternating_lanes_do_not_drift() {
+        let state = DriftState::new(8);
+        let session = "auth:abc123:conv456";
+        let hash_a = compute_structural_hash(&cc_turn1_body(), ApiKind::Anthropic);
+        let mut body_b = cc_turn1_body();
+        body_b["system"] = json!([{"type": "text", "text": "subagent preamble"}]);
+        let hash_b = compute_structural_hash(&body_b, ApiKind::Anthropic);
+        let lane_a = stream_lane_key(session, &hash_a);
+        let lane_b = stream_lane_key(session, &hash_b);
+        assert_eq!(observe_drift(&state, &lane_a, hash_a), None);
+        assert_eq!(observe_drift(&state, &lane_b, hash_b), None);
+        // Back to A with growth: steady within its own lane.
+        let hash_a2 = compute_structural_hash(&cc_turn2_body(), ApiKind::Anthropic);
+        // cc_turn2 shares cc_turn1's system, so it stays on lane A.
+        assert_eq!(observe_drift(&state, &lane_a, hash_a2), None);
     }
 
     #[test]

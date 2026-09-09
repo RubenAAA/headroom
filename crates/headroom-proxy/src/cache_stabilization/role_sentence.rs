@@ -136,6 +136,25 @@ impl RoleSentencePins {
         }
         Some(system)
     }
+
+    /// Copy another lane's pin entry onto this lane, when this lane has none.
+    /// Same contract as [`super::working_dir::WorkingDirPins::inherit_pin`]:
+    /// the donor is a message-lineage match from the replay store, never an
+    /// unrelated stream, and the latch instant travels with the entry.
+    pub fn inherit_pin(&self, from_key: &str, to_key: &str) -> bool {
+        if from_key == to_key {
+            return false;
+        }
+        let mut pins = self.pins.lock().expect("RoleSentencePins mutex poisoned");
+        if pins.peek(to_key).is_some() {
+            return false;
+        }
+        let Some(entry) = pins.peek(from_key).cloned() else {
+            return false;
+        };
+        pins.put(to_key.to_string(), entry);
+        true
+    }
 }
 
 /// The opening sentence, from [`HEAD`] through its closing period, taken from
@@ -223,6 +242,25 @@ mod tests {
         let before = b.clone();
         assert_eq!(pins.hold(&mut b, "c1").rewrote(), None);
         assert_eq!(b, before, "first sight is a byte-equal passthrough");
+    }
+
+    /// Same contract as the working-dir pins: a fresh lane inherits its
+    /// lineage donor's sentence, and never overwrites its own.
+    #[test]
+    fn inherit_pin_lends_and_never_overwrites() {
+        let pins = RoleSentencePins::new(4);
+        pins.hold(&mut body(PLAIN), "lane-a");
+
+        assert!(pins.inherit_pin("lane-a", "lane-b"));
+        let mut b = body(STYLED);
+        assert_eq!(pins.hold(&mut b, "lane-b").rewrote(), Some(STYLED));
+        assert_eq!(sentence_of(&b), PLAIN);
+
+        assert!(
+            !pins.inherit_pin("lane-a", "lane-b"),
+            "lane-b owns its pin now"
+        );
+        assert!(!pins.inherit_pin("ghost", "lane-c"));
     }
 
     #[test]

@@ -957,6 +957,11 @@ pub enum PrefixMiss {
     /// A tracker exists but no turn has completed on it yet, so there are no
     /// forwarded bytes to replay.
     NothingForwardedYet,
+    /// Stored messages lead this turn but under a different system block.
+    /// Replaying them would splice donor bytes under a system no provider
+    /// cache holds — a miss that reports as a replay. The turn forwards its
+    /// own bytes instead: the same provider outcome, honestly measured.
+    SystemChanged,
     /// The tracker mutex was poisoned by a panicking task.
     LockPoisoned,
 }
@@ -968,6 +973,7 @@ impl PrefixMiss {
             PrefixMiss::NoTrackerForSession => "no_tracker_for_session",
             PrefixMiss::IdlePastTtl => "idle_past_ttl",
             PrefixMiss::NothingForwardedYet => "nothing_forwarded_yet",
+            PrefixMiss::SystemChanged => "system_changed",
             PrefixMiss::LockPoisoned => "lock_poisoned",
         }
     }
@@ -2391,6 +2397,14 @@ pub struct PrefixReplayTracker {
     last_activity: Instant,
     last_original_messages: Vec<Value>,
     last_forwarded_messages: Vec<Value>,
+    /// [`forwarded_system_digest`] of the system block `last_forwarded_messages`
+    /// went out under. The adoption gate compares it against the adopting
+    /// turn's post-hold system: an adopted prefix only replays under a system
+    /// the provider already holds. Updated on every served turn alongside the
+    /// messages, so it always describes exactly what `last_forwarded_messages`
+    /// describes — including content installed by adoption, whose digest the
+    /// gate verified before installing.
+    last_forwarded_system_hash: String,
     /// Prefixes belonging to OTHER streams interleaved on this session.
     ///
     /// One session key carries several streams — a subagent inheriting its
@@ -2401,8 +2415,10 @@ pub struct PrefixReplayTracker {
     /// provider already had cached. That is a bust the proxy causes itself.
     ///
     /// Bounded and ordered most-recent-first. Each carries the id of the chain
-    /// it belongs to.
-    alternates: Vec<(u64, Vec<Value>, Vec<Value>)>,
+    /// it belongs to, and the [`forwarded_system_digest`] of the system its
+    /// messages went out under — same gate input as the primary, per entry,
+    /// because a re-latched hold can move the system mid-lane.
+    alternates: Vec<(u64, Vec<Value>, Vec<Value>, String)>,
     /// Which chain the primary prefix belongs to. 0 before the first turn.
     ///
     /// A *chain* is a run of turns that each continue the previous one. It is
@@ -2429,6 +2445,7 @@ impl Default for PrefixReplayTracker {
             last_activity: Instant::now(),
             last_original_messages: Vec::new(),
             last_forwarded_messages: Vec::new(),
+            last_forwarded_system_hash: String::new(),
             alternates: Vec::new(),
             primary_chain_id: 0,
             next_chain_id: 1,
@@ -2473,6 +2490,7 @@ impl PrefixReplayTracker {
         cache_write_tokens: u64,
         forwarded: &[Value],
         original_messages: Option<&[Value]>,
+        forwarded_system_hash: String,
     ) {
         self.last_activity = Instant::now();
         self.turn_number += 1;
@@ -2522,9 +2540,10 @@ impl PrefixReplayTracker {
                 self.primary_chain_id,
                 std::mem::take(&mut self.last_original_messages),
                 std::mem::take(&mut self.last_forwarded_messages),
+                std::mem::take(&mut self.last_forwarded_system_hash),
             );
             self.primary_chain_id = 0;
-            self.alternates.retain(|(_, o, _)| o != &displaced.1);
+            self.alternates.retain(|(_, o, _, _)| o != &displaced.1);
             self.alternates.insert(0, displaced);
             let held_before_caps = self.alternates.len();
             // Spend the budget on the streams most likely to come back for it.
@@ -2592,8 +2611,8 @@ impl PrefixReplayTracker {
             self.primary_chain_id = self
                 .alternates
                 .iter()
-                .find(|(_, o, _)| matches_canonical_prefix(o, &canonical_incoming))
-                .map(|(id, _, _)| *id)
+                .find(|(_, o, _, _)| matches_canonical_prefix(o, &canonical_incoming))
+                .map(|(id, _, _, _)| *id)
                 .unwrap_or_else(|| {
                     let id = self.next_chain_id;
                     self.next_chain_id += 1;
@@ -2604,9 +2623,10 @@ impl PrefixReplayTracker {
         // alternate — it is the live prefix, and holding it twice would let a
         // stale copy win a later match.
         self.alternates
-            .retain(|(_, o, _)| !matches_canonical_prefix(o, &canonical_incoming));
+            .retain(|(_, o, _, _)| !matches_canonical_prefix(o, &canonical_incoming));
         self.last_original_messages = incoming_original;
         self.last_forwarded_messages = incoming_forwarded;
+        self.last_forwarded_system_hash = forwarded_system_hash;
 
         let total_cached = cache_read_tokens + cache_write_tokens;
         if total_cached == 0 {
@@ -2661,6 +2681,10 @@ struct PendingTurn {
     session_key: String,
     original_messages: Vec<Value>,
     forwarded_messages: Vec<Value>,
+    /// [`forwarded_system_digest`] of the system block the forwarded messages
+    /// went out under. Recorded into the tracker at completion so the adoption
+    /// gate can compare it against a later turn's post-hold system.
+    forwarded_system_hash: String,
 }
 
 /// One session's prefix, on disk, so a proxy restart does not throw it away.
@@ -2708,6 +2732,13 @@ struct PersistedPrefix {
     /// the field existed; those are hashed once when first scanned.
     #[serde(default)]
     head_hash: Option<String>,
+    /// [`forwarded_system_digest`] of the system block `forwarded` went out
+    /// under. The adoption gate only adopts a persisted prefix under a
+    /// matching post-hold system; files written before the field existed
+    /// decline adoption (safe direction — one honest miss until the session
+    /// turns again and rewrites the file).
+    #[serde(default)]
+    forwarded_system_hash: Option<String>,
 }
 
 /// Fewest original messages a request must carry, and a donor prefix must
@@ -2739,6 +2770,41 @@ fn adoption_head_hash(messages: &[Value]) -> Option<String> {
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
+/// Digest of the `system` block a turn forwarded, for the adoption gate.
+///
+/// An adopted prefix replays the donor's forwarded messages under THIS turn's
+/// system, so adoption is only a hit when the two systems match. `system`
+/// carries `cache_control` markers that the pipeline moves every turn (tail
+/// breakpoints, hold restatements), which are not cache-key material in
+/// themselves — hash with every `cache_control` key stripped at any depth, so
+/// marker placement never reads as a system change while real text always
+/// does. Both the recorded (donor) and compared (current) sides hash the
+/// post-hold, post-preview system through this one function, so the two are
+/// comparable by construction. Absent system digests to the digest of null,
+/// which only ever equals another absent system.
+pub(crate) fn forwarded_system_digest(system: Option<&Value>) -> String {
+    use sha2::{Digest, Sha256};
+    fn stripped(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (key, val) in map {
+                    if key == "cache_control" {
+                        continue;
+                    }
+                    out.insert(key.clone(), stripped(val));
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(stripped).collect()),
+            other => other.clone(),
+        }
+    }
+    let canonical = system.map(stripped).unwrap_or(Value::Null);
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
+}
+
 /// Which session a prefix was adopted from, for seeding whatever other
 /// per-session state has to travel with it (the offload gate).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2763,6 +2829,11 @@ type PersistedHeadCache =
 struct AdoptedPrefix {
     originals: Vec<Value>,
     forwarded: Vec<Value>,
+    /// [`forwarded_system_digest`] of the system block `forwarded` went out
+    /// under. The adoption gate compares it against the adopting turn's
+    /// post-hold system: equal means the provider holds this exact prefix
+    /// lineage, anything else declines.
+    forwarded_system_hash: String,
     cached_token_count: u64,
     cached_message_count: usize,
     turn_number: u64,
@@ -3046,6 +3117,10 @@ impl SessionReplayStore {
             last_activity: Instant::now(),
             last_original_messages: snapshot.originals,
             last_forwarded_messages: snapshot.forwarded,
+            // Files written before the field existed rehydrate without it and
+            // decline adoption and replay until the next served turn records
+            // the real digest — one honest miss, same contract as the gate.
+            last_forwarded_system_hash: snapshot.forwarded_system_hash.unwrap_or_default(),
             alternates: Vec::new(),
             primary_chain_id: snapshot.chain_id,
             next_chain_id: snapshot.chain_id.saturating_add(1),
@@ -3147,18 +3222,40 @@ impl SessionReplayStore {
         &self,
         session_key: &str,
         current_originals: &[Value],
+        current_system_hash: Option<&str>,
     ) -> Result<(Vec<Value>, Vec<Value>, u64), PrefixMiss> {
         // A restart empties this store, and the miss that follows is expensive
         // rather than free — see [`PersistedPrefix`]. No-op unless persistence is
         // configured or the session is already in memory.
+        //
+        // `current_system_hash` is the [`forwarded_system_digest`] of the
+        // system block this turn will forward (post-hold). Replaying stored
+        // messages is only a hit under the system they went out under, so a
+        // candidate whose recorded system differs is not a replay source —
+        // not a mismatch to splice around, a different cache lineage
+        // entirely. `None` (callers without the system in hand, and tests)
+        // skips the precondition and behaves exactly as before.
         let canonical_current = canonicalize_slice(current_originals);
-        self.hydrate_or_adopt(session_key, current_originals, &canonical_current);
+        let declined_on_system = self.hydrate_or_adopt(
+            session_key,
+            current_originals,
+            &canonical_current,
+            current_system_hash,
+        );
         let mut guard = match self.trackers.lock() {
             Ok(g) => g,
             Err(_) => return Err(PrefixMiss::LockPoisoned),
         };
         let Some(tracker) = guard.get(session_key) else {
-            return Err(PrefixMiss::NoTrackerForSession);
+            // A donor matched by messages but declined on system leaves no
+            // tracker behind: the lane is genuinely new, and the lineage
+            // event above already named why. Reporting the cold-start miss
+            // here would bury that cause.
+            return Err(if declined_on_system {
+                PrefixMiss::SystemChanged
+            } else {
+                PrefixMiss::NoTrackerForSession
+            });
         };
         if tracker.last_activity.elapsed() > self.session_ttl {
             if let Some(idle) = guard.pop(session_key) {
@@ -3169,38 +3266,69 @@ impl SessionReplayStore {
         if tracker.last_forwarded_messages.is_empty() && tracker.alternates.is_empty() {
             return Err(PrefixMiss::NothingForwardedYet);
         }
-        let best = std::iter::once((
-            tracker.primary_chain_id,
-            &tracker.last_original_messages,
-            &tracker.last_forwarded_messages,
-        ))
-        .chain(tracker.alternates.iter().map(|(id, o, f)| (*id, o, f)))
-        .filter(|(_, o, f)| !f.is_empty() && matches_canonical_prefix(o, &canonical_current))
-        .max_by_key(|(_, o, _)| o.len());
-        // Nothing leads this turn exactly. Before giving up on identity, look
-        // for a stream this turn continues with its tail edited — the client
-        // rewriting a message it already sent, which is what a content
-        // divergence is. The overlay can replay everything ahead of the edit,
-        // but only if it is told whose prefix this is, so the answer has to
-        // carry that stream's real chain id rather than the fallback's zero.
-        let best = best.or_else(|| {
-            std::iter::once((
+        // System precondition shared by both scans below: a candidate replays
+        // only under the system it went out under (see `current_system_hash`
+        // above). `None` callers pass a skip that keeps yesterday's behavior
+        // bit for bit; `Some` turns a foreign-system match from a splice
+        // into a decline.
+        let system_ok = |stored_hash: &str| {
+            current_system_hash
+                .map(|current| stored_hash == current)
+                .unwrap_or(true)
+        };
+        let pick = |system_ok: &dyn Fn(&str) -> bool| -> Option<(u64, &Vec<Value>, &Vec<Value>)> {
+            let best = std::iter::once((
                 tracker.primary_chain_id,
                 &tracker.last_original_messages,
                 &tracker.last_forwarded_messages,
+                tracker.last_forwarded_system_hash.as_str(),
             ))
-            .chain(tracker.alternates.iter().map(|(id, o, f)| (*id, o, f)))
-            .filter_map(|(id, o, f)| {
-                if f.is_empty() {
-                    return None;
-                }
-                let agreed = canonical_agreement_len(o, &canonical_current);
-                (agreed >= MIN_AGREEING_RUN && agreed + TAIL_EDIT_SLACK >= o.len())
-                    .then_some((agreed, id, o, f))
+            .chain(
+                tracker
+                    .alternates
+                    .iter()
+                    .map(|(id, o, f, s)| (*id, o, f, s.as_str())),
+            )
+            .filter(|(_, o, f, s)| {
+                !f.is_empty() && matches_canonical_prefix(o, &canonical_current) && system_ok(s)
             })
-            .max_by_key(|(agreed, ..)| *agreed)
-            .map(|(_, id, o, f)| (id, o, f))
-        });
+            .max_by_key(|(_, o, _, _)| o.len())
+            .map(|(id, o, f, _)| (id, o, f));
+            // Nothing leads this turn exactly. Before giving up on identity,
+            // look for a stream this turn continues with its tail edited —
+            // the client rewriting a message it already sent, which is what
+            // a content divergence is. The overlay can replay everything
+            // ahead of the edit, but only if it is told whose prefix this
+            // is, so the answer has to carry that stream's real chain id
+            // rather than the fallback's zero.
+            best.or_else(|| {
+                std::iter::once((
+                    tracker.primary_chain_id,
+                    &tracker.last_original_messages,
+                    &tracker.last_forwarded_messages,
+                    tracker.last_forwarded_system_hash.as_str(),
+                ))
+                .chain(
+                    tracker
+                        .alternates
+                        .iter()
+                        .map(|(id, o, f, s)| (*id, o, f, s.as_str())),
+                )
+                .filter_map(|(id, o, f, s)| {
+                    if f.is_empty() {
+                        return None;
+                    }
+                    let agreed = canonical_agreement_len(o, &canonical_current);
+                    (agreed >= MIN_AGREEING_RUN
+                        && agreed + TAIL_EDIT_SLACK >= o.len()
+                        && system_ok(s))
+                    .then_some((agreed, id, o, f))
+                })
+                .max_by_key(|(agreed, ..)| *agreed)
+                .map(|(_, id, o, f)| (id, o, f))
+            })
+        };
+        let best = pick(&system_ok);
         match best {
             Some((chain_id, o, f)) => {
                 // Did a stream other than the session's most recent one win?
@@ -3228,6 +3356,26 @@ impl SessionReplayStore {
             None if tracker.last_forwarded_messages.is_empty() => {
                 Err(PrefixMiss::NothingForwardedYet)
             }
+            // Held messages lead this turn, but under a different system.
+            // Replaying them would splice stored bytes under a system no
+            // provider cache holds — a miss that reports as a replay — so
+            // the turn forwards its own bytes instead. Same provider
+            // outcome as a clean miss, honestly measured: `miss_detail`
+            // carries `system_changed` and this event names the lineage.
+            // Only with a system in hand; `None` callers keep the arm below
+            // exactly as before.
+            None if current_system_hash.is_some() && pick(&|_: &str| true).is_some() => {
+                tracing::info!(
+                    event = "prefix_replay_system_changed",
+                    session_key_hash = %super::drift_detector::session_key_log_prefix(session_key),
+                    current_msgs = current_originals.len(),
+                    stored_prefix_msgs = tracker.last_original_messages.len(),
+                    alternates_held = tracker.alternates.len(),
+                    "held messages lead this turn under a different system; \
+                     forwarding fresh bytes instead of replaying across systems"
+                );
+                Err(PrefixMiss::SystemChanged)
+            }
             // Nothing held leads this turn. The prefix goes back for the
             // overlay to report against, but the chain id is 0: this turn
             // continues none of them, and saying otherwise would put two
@@ -3246,7 +3394,7 @@ impl SessionReplayStore {
                 // divergence). Only the longest agreeing run tells them apart,
                 // so it is computed here, on a path that already declined.
                 let best_agreement = std::iter::once(&tracker.last_original_messages)
-                    .chain(tracker.alternates.iter().map(|(_, o, _)| o))
+                    .chain(tracker.alternates.iter().map(|(_, o, _, _)| o))
                     .map(|o| canonical_agreement_len(o, &canonical_current))
                     .max()
                     .unwrap_or(0);
@@ -3256,7 +3404,7 @@ impl SessionReplayStore {
                     held_messages = tracker
                         .alternates
                         .iter()
-                        .map(|(_, o, _)| o.len())
+                        .map(|(_, o, _, _)| o.len())
                         .sum::<usize>(),
                     primary_prefix_msgs = tracker.last_original_messages.len(),
                     current_msgs = current_originals.len(),
@@ -3330,7 +3478,13 @@ impl SessionReplayStore {
         incoming_original: &[Value],
     ) -> bool {
         let canonical_incoming = canonicalize_slice(incoming_original);
-        self.hydrate_or_adopt(session_key, incoming_original, &canonical_incoming);
+        // Ungated (`None`): the probe has no post-hold system yet, and it must
+        // answer exactly as it always has — installing on message agreement so
+        // a turn that will replay reports fresh=false. The real path
+        // re-decides with the system in hand; a gate decline there only ever
+        // turns an adopted replay into an honest miss (offload skipped,
+        // verbatim bytes), never a replay into a wrong one.
+        self.hydrate_or_adopt(session_key, incoming_original, &canonical_incoming, None);
         let Ok(guard) = self.trackers.lock() else {
             return false;
         };
@@ -3345,7 +3499,7 @@ impl SessionReplayStore {
         }
         let replayable =
             matches_canonical_prefix(&tracker.last_original_messages, &canonical_incoming)
-                || tracker.alternates.iter().any(|(_, original, _)| {
+                || tracker.alternates.iter().any(|(_, original, _, _)| {
                     matches_canonical_prefix(original, &canonical_incoming)
                 });
         !replayable
@@ -3379,7 +3533,12 @@ impl SessionReplayStore {
             return None;
         }
         let best = std::iter::once(&tracker.last_original_messages)
-            .chain(tracker.alternates.iter().map(|(_, original, _)| original))
+            .chain(
+                tracker
+                    .alternates
+                    .iter()
+                    .map(|(_, original, _, _)| original),
+            )
             .map(|candidate| canonical_agreement_len(candidate, &canonical_incoming))
             .max()
             .unwrap_or(0);
@@ -3456,7 +3615,7 @@ impl SessionReplayStore {
             tracker
                 .alternates
                 .iter()
-                .map(|(_, original, _)| original.len())
+                .map(|(_, original, _, _)| original.len())
                 .fold(tracker.last_original_messages.len(), usize::max)
         };
         let in_flight = self
@@ -3523,12 +3682,16 @@ impl SessionReplayStore {
 
     /// Park this turn's original + forwarded messages under `request_id` so
     /// [`complete`](Self::complete) can attribute the response's cache tokens.
+    /// `forwarded_system_hash` is the [`forwarded_system_digest`] of the
+    /// system block the forwarded messages went out under — recorded into the
+    /// tracker at completion for the adoption gate.
     pub fn begin_request(
         &self,
         request_id: &str,
         session_key: &str,
         original_messages: Vec<Value>,
         forwarded_messages: Vec<Value>,
+        forwarded_system_hash: String,
     ) {
         if let Ok(mut guard) = self.pending.lock() {
             guard.put(
@@ -3537,6 +3700,7 @@ impl SessionReplayStore {
                     session_key: session_key.to_string(),
                     original_messages,
                     forwarded_messages,
+                    forwarded_system_hash,
                 },
             );
         }
@@ -3576,6 +3740,7 @@ impl SessionReplayStore {
                 cache_write_tokens,
                 &pending.forwarded_messages,
                 Some(&pending.original_messages),
+                pending.forwarded_system_hash,
             );
             let head_hash = adoption_head_hash(&tracker.last_original_messages);
             if self.persist_dir.is_some() && !tracker.last_forwarded_messages.is_empty() {
@@ -3588,6 +3753,7 @@ impl SessionReplayStore {
                     originals: tracker.last_original_messages.clone(),
                     forwarded: tracker.last_forwarded_messages.clone(),
                     head_hash: head_hash.clone(),
+                    forwarded_system_hash: Some(tracker.last_forwarded_system_hash.clone()),
                 });
             }
             self.index_head(&pending.session_key, head_hash);
@@ -3653,7 +3819,7 @@ impl SessionReplayStore {
             &tracker.last_original_messages,
             &tracker.last_forwarded_messages,
         ))
-        .chain(tracker.alternates.iter().map(|(_, o, f)| (o, f)))
+        .chain(tracker.alternates.iter().map(|(_, o, f, _)| (o, f)))
         .any(|(o, f)| !f.is_empty() && matches_canonical_prefix(o, canonical_current))
     }
 
@@ -3670,27 +3836,64 @@ impl SessionReplayStore {
     ///
     /// The donor is not touched. The adopter gets a copy of the matched slice
     /// as its own prefix and carries it forward from there.
+    ///
+    /// Returns whether a donor matched by messages but declined on system:
+    /// the caller reports that as [`PrefixMiss::SystemChanged`] rather than
+    /// a cold-start miss, so the decline is attributable instead of silent.
     fn hydrate_or_adopt(
         &self,
         session_key: &str,
         current_originals: &[Value],
         canonical_current: &[Value],
-    ) {
+        current_system_hash: Option<&str>,
+    ) -> bool {
         self.hydrate(session_key);
         if current_originals.len() < CROSS_SESSION_ADOPT_MIN_MESSAGES
             || self.leads_turn(session_key, canonical_current)
         {
-            return;
+            return false;
         }
         let Some(head) = adoption_head_hash(current_originals) else {
-            return;
+            return false;
         };
         let adopted = self
             .adoption_candidate_in_memory(session_key, &head, canonical_current)
             .or_else(|| self.adoption_candidate_on_disk(session_key, &head, canonical_current));
         let Some(adopted) = adopted else {
-            return;
+            return false;
         };
+        // The adoption gate: an adopted prefix replays the donor's forwarded
+        // messages under THIS turn's system, so the adoption is only a hit
+        // when the two systems match. A new lane implies a different system
+        // by construction (the lane key folds the system digest in), which is
+        // exactly when message agreement alone lies: the bytes are right but
+        // no provider cache holds them, so installing would both miss and
+        // misfile the turn as replayed. `None` (the freshness probe, which has
+        // no post-hold system yet) skips the gate — the probe only decides
+        // offload, and the real path re-decides with the system in hand.
+        if let Some(current) = current_system_hash {
+            if adopted.forwarded_system_hash != current {
+                let (donor_hash, source) = match &adopted.donor {
+                    AdoptionDonor::Session(key) => {
+                        (super::drift_detector::session_key_log_prefix(key), "memory")
+                    }
+                    AdoptionDonor::PersistedDigest(digest) => {
+                        (digest.chars().take(16).collect::<String>(), "disk")
+                    }
+                };
+                tracing::info!(
+                    event = "prefix_adoption_declined_system_mismatch",
+                    session_key_hash = %super::drift_detector::session_key_log_prefix(session_key),
+                    donor_session_key_hash = %donor_hash,
+                    source = source,
+                    adopted_msgs = adopted.originals.len(),
+                    incoming_msgs = current_originals.len(),
+                    "a session sharing this turn's history carries a different system; \
+                     forwarding fresh bytes instead of replaying under a system no cache holds"
+                );
+                return true;
+            }
+        }
         let (donor_hash, source) = match &adopted.donor {
             AdoptionDonor::Session(key) => {
                 (super::drift_detector::session_key_log_prefix(key), "memory")
@@ -3717,6 +3920,7 @@ impl SessionReplayStore {
         if let Some(hook) = self.adoption_hook.as_ref() {
             hook(&donor, session_key);
         }
+        false
     }
 
     /// The longest prefix held in memory by another live session that leads
@@ -3746,11 +3950,17 @@ impl SessionReplayStore {
             let found = std::iter::once((
                 &tracker.last_original_messages,
                 &tracker.last_forwarded_messages,
+                tracker.last_forwarded_system_hash.as_str(),
             ))
-            .chain(tracker.alternates.iter().map(|(_, o, f)| (o, f)))
-            .filter_map(|(o, f)| adoptable_len(o, f, canonical_current).map(|n| (n, o, f)))
+            .chain(
+                tracker
+                    .alternates
+                    .iter()
+                    .map(|(_, o, f, s)| (o, f, s.as_str())),
+            )
+            .filter_map(|(o, f, s)| adoptable_len(o, f, canonical_current).map(|n| (n, o, f, s)))
             .max_by_key(|(n, ..)| *n);
-            let Some((n, o, f)) = found else {
+            let Some((n, o, f, s)) = found else {
                 tracing::debug!(
                     event = "prefix_adoption_candidate_rejected",
                     donor_session_key_hash = %super::drift_detector::session_key_log_prefix(key),
@@ -3764,6 +3974,7 @@ impl SessionReplayStore {
             let candidate = AdoptedPrefix {
                 originals: o[..n].to_vec(),
                 forwarded: f[..n].to_vec(),
+                forwarded_system_hash: s.to_string(),
                 cached_token_count: tracker.cached_token_count,
                 cached_message_count: tracker.cached_message_count,
                 turn_number: tracker.turn_number,
@@ -3775,6 +3986,68 @@ impl SessionReplayStore {
             }
         }
         best
+    }
+
+    /// Newest live lane (in memory) whose tracked messages this turn's history
+    /// extends — the lineage hold pins should inherit along on a lane switch.
+    ///
+    /// Same bar as adoption ([`CROSS_SESSION_ADOPT_MIN_MESSAGES`], head hash,
+    /// TTL, longest-wins/recent-tiebreak): inheritance fires exactly when
+    /// adoption would find a donor, so a pin can never travel to an unrelated
+    /// stream. Memory only: pin stores are keyed by lane key while persisted
+    /// files are named by its digest, which is irreversible — and a
+    /// restart-and-`cd` in the same turn is vanishingly rarer than either
+    /// alone. The adoption gate still protects the turn when no pin travels.
+    pub(crate) fn lineage_donor_lane(
+        &self,
+        session_key: &str,
+        current_originals: &[Value],
+    ) -> Option<String> {
+        if current_originals.len() < CROSS_SESSION_ADOPT_MIN_MESSAGES {
+            return None;
+        }
+        let head = adoption_head_hash(current_originals)?;
+        let canonical_current = canonicalize_slice(current_originals);
+        let keys: Vec<String> = self
+            .head_index
+            .lock()
+            .ok()?
+            .get(&head)
+            .cloned()
+            .unwrap_or_default();
+        let guard = self.trackers.lock().ok()?;
+        // Best (n, age, key) — mirrors [`AdoptedPrefix::beats`] without
+        // cloning message bodies: this runs pre-preview on every long turn,
+        // and the bodies are only needed if adoption itself fires later.
+        let mut best: Option<(usize, Duration, String)> = None;
+        for key in keys.iter().filter(|k| k.as_str() != session_key) {
+            let Some(tracker) = guard.peek(key) else {
+                continue;
+            };
+            if tracker.last_activity.elapsed() > self.session_ttl {
+                continue;
+            }
+            let n = std::iter::once((
+                &tracker.last_original_messages,
+                &tracker.last_forwarded_messages,
+            ))
+            .chain(tracker.alternates.iter().map(|(_, o, f, _)| (o, f)))
+            .filter_map(|(o, f)| adoptable_len(o, f, &canonical_current))
+            .max()
+            .unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let age = tracker.last_activity.elapsed();
+            let wins = match &best {
+                None => true,
+                Some((best_n, best_age, _)) => n > *best_n || (n == *best_n && age < *best_age),
+            };
+            if wins {
+                best = Some((n, age, key.clone()));
+            }
+        }
+        best.map(|(_, _, key)| key)
     }
 
     /// The longest persisted prefix of another session that leads this turn.
@@ -3854,6 +4127,11 @@ impl SessionReplayStore {
             let candidate = AdoptedPrefix {
                 originals,
                 forwarded,
+                // Files written before the field existed carry `None` and
+                // decline at the gate (empty never equals a real digest) —
+                // one honest miss until the session turns again and rewrites
+                // the file with the digest.
+                forwarded_system_hash: snapshot.forwarded_system_hash.unwrap_or_default(),
                 cached_token_count: snapshot.cached_token_count,
                 cached_message_count: snapshot.cached_message_count,
                 turn_number: snapshot.turn_number,
@@ -3884,10 +4162,16 @@ impl SessionReplayStore {
             tracker.next_chain_id += 1;
             tracker
                 .alternates
-                .retain(|(_, o, _)| o != &adopted.originals);
-            tracker
-                .alternates
-                .insert(0, (id, adopted.originals, adopted.forwarded));
+                .retain(|(_, o, _, _)| o != &adopted.originals);
+            tracker.alternates.insert(
+                0,
+                (
+                    id,
+                    adopted.originals,
+                    adopted.forwarded,
+                    adopted.forwarded_system_hash,
+                ),
+            );
             tracker.alternates.truncate(MAX_ALTERNATE_PREFIXES);
             tracker.last_activity = Instant::now();
         } else {
@@ -3901,6 +4185,7 @@ impl SessionReplayStore {
                     last_activity: Instant::now(),
                     last_original_messages: adopted.originals,
                     last_forwarded_messages: adopted.forwarded,
+                    last_forwarded_system_hash: adopted.forwarded_system_hash,
                     alternates: Vec::new(),
                     primary_chain_id: 1,
                     next_chain_id: 2,
@@ -5249,7 +5534,7 @@ mod tests {
         let big = "x".repeat(7000); // ~2000 tokens
         let fwd = vec![text_msg("user", &big), text_msg("assistant", &big)];
         let first_tokens = estimate_message_tokens(&fwd)[0];
-        t.update_from_response(first_tokens, 0, &fwd, None);
+        t.update_from_response(first_tokens, 0, &fwd, None, String::new());
         assert_eq!(t.frozen_message_count(), 1);
     }
 
@@ -5273,7 +5558,7 @@ mod tests {
                 {"type": "text", "text": "<system-reminder>relocated</system-reminder>"}
             ]}),
         ];
-        store.begin_request("reminder-tail", "S", originals, forwarded);
+        store.begin_request("reminder-tail", "S", originals, forwarded, String::new());
         store.complete("reminder-tail", 5_000, 0);
 
         // On the next turn the client replaces the reminder-only tail with a
@@ -5282,7 +5567,7 @@ mod tests {
         let replacement = json!({"role": "assistant", "content": "real next message"});
         let current = vec![stable_original, replacement];
         let (stored_originals, stored_forwarded, _) = store
-            .previous_turn_for("S", &current)
+            .previous_turn_for("S", &current, None)
             .expect("the stable prefix remains replayable");
         assert_eq!(stored_originals.as_slice(), &current[..1]);
         assert_eq!(stored_forwarded, vec![stable_forwarded.clone()]);
@@ -5308,7 +5593,7 @@ mod tests {
         ]});
         let messages = vec![stable.clone(), directive_only];
 
-        tracker.update_from_response(5_000, 0, &messages, Some(&messages));
+        tracker.update_from_response(5_000, 0, &messages, Some(&messages), String::new());
 
         assert_eq!(tracker.last_original_messages(), &[stable.clone()]);
         assert_eq!(tracker.last_forwarded_messages(), &[stable]);
@@ -5325,7 +5610,13 @@ mod tests {
         let messages = vec![stable, reminder_only];
         let all_forwarded_tokens = estimate_message_tokens(&messages).iter().sum();
 
-        tracker.update_from_response(all_forwarded_tokens, 0, &messages, Some(&messages));
+        tracker.update_from_response(
+            all_forwarded_tokens,
+            0,
+            &messages,
+            Some(&messages),
+            String::new(),
+        );
 
         assert_eq!(tracker.last_forwarded_messages().len(), 1);
         assert_eq!(
@@ -5346,6 +5637,7 @@ mod tests {
             "S",
             vec![reminder_only.clone()],
             vec![reminder_only],
+            String::new(),
         );
         store.complete("reminder-only", 5_000, 0);
 
@@ -5361,7 +5653,7 @@ mod tests {
         let mut t = PrefixReplayTracker::default();
         let big = "x".repeat(7000);
         let fwd = vec![text_msg("user", &big)];
-        t.update_from_response(5000, 0, &fwd, None);
+        t.update_from_response(5000, 0, &fwd, None, String::new());
         t.invalidate();
         assert!(t.last_forwarded_messages().is_empty());
         assert_eq!(t.frozen_message_count(), 0);
@@ -5396,7 +5688,13 @@ mod tests {
     }
 
     fn record_turn(store: &SessionReplayStore, key: &str, request: &str, originals: &[Value]) {
-        store.begin_request(request, key, originals.to_vec(), forwarded_for(originals));
+        store.begin_request(
+            request,
+            key,
+            originals.to_vec(),
+            forwarded_for(originals),
+            String::new(),
+        );
         store.complete(request, 0, 5000);
     }
 
@@ -5420,7 +5718,7 @@ mod tests {
         let mut incoming = conversation(12);
         incoming.push(text_msg("user", "the adopter's own new tail"));
         let (originals, forwarded, chain_id) = store
-            .previous_turn_for("adopter", &incoming)
+            .previous_turn_for("adopter", &incoming, None)
             .expect("adopted");
         assert_eq!(originals, conversation(12));
         assert_eq!(forwarded, forwarded_for(&conversation(12)));
@@ -5437,8 +5735,112 @@ mod tests {
         );
 
         // The donor is untouched.
-        let (donor_originals, ..) = store.previous_turn_for("donor", &conversation(14)).unwrap();
+        let (donor_originals, ..) = store
+            .previous_turn_for("donor", &conversation(14), None)
+            .unwrap();
         assert_eq!(donor_originals.len(), 14);
+    }
+
+    /// `cache_control` marker placement is not cache-key material; text is.
+    /// The adoption gate hashes systems through [`forwarded_system_digest`],
+    /// so a marker that moved must digest equal while a word changed must
+    /// not — otherwise every turn declines or every system aliases.
+    #[test]
+    fn system_digest_ignores_markers_but_sees_text() {
+        let marked =
+            json!([{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}]);
+        let plain = json!([{"type": "text", "text": "hello"}]);
+        let edited = json!([{"type": "text", "text": "goodbye"}]);
+        assert_eq!(
+            forwarded_system_digest(Some(&marked)),
+            forwarded_system_digest(Some(&plain)),
+            "a moved marker must not rotate the digest"
+        );
+        assert_ne!(
+            forwarded_system_digest(Some(&marked)),
+            forwarded_system_digest(Some(&edited)),
+            "changed text must rotate the digest"
+        );
+        assert_eq!(forwarded_system_digest(None), forwarded_system_digest(None));
+        assert_ne!(
+            forwarded_system_digest(None),
+            forwarded_system_digest(Some(&plain)),
+            "absent and present systems are different lineages"
+        );
+    }
+
+    /// The adoption gate: message agreement alone is not a replay source. A
+    /// new lane continuing another lane's history under a different system
+    /// declines instead of splicing donor bytes under a system no provider
+    /// cache holds — the same provider outcome as a clean miss, honestly
+    /// measured, with no seeding left behind.
+    #[test]
+    fn adoption_declines_when_systems_differ() {
+        let store = SessionReplayStore::new(8);
+        let digest_a = forwarded_system_digest(Some(
+            &json!([{"type": "text", "text": "main instructions"}]),
+        ));
+        let digest_b = forwarded_system_digest(Some(
+            &json!([{"type": "text", "text": "subagent preamble"}]),
+        ));
+        assert_ne!(digest_a, digest_b);
+
+        // Donor lane served 12 turns under system A.
+        let history = conversation(12);
+        store.begin_request(
+            "req-a",
+            "donor-lane",
+            history.clone(),
+            forwarded_for(&history),
+            digest_a,
+        );
+        store.complete("req-a", 0, 5000);
+
+        // Adopter continues the history under system B.
+        let mut incoming = conversation(12);
+        incoming.push(text_msg("user", "the adopter's own new tail"));
+        let err = store
+            .previous_turn_for("adopter-lane", &incoming, Some(&digest_b))
+            .expect_err("foreign-system adoption must decline");
+        assert_eq!(err, PrefixMiss::SystemChanged);
+        // And nothing was installed: a retry declines the same way instead
+        // of finding a seeded tracker that leads.
+        let err = store
+            .previous_turn_for("adopter-lane", &incoming, Some(&digest_b))
+            .expect_err("declined adoption must not seed the tracker");
+        assert_eq!(err, PrefixMiss::SystemChanged);
+    }
+
+    /// Same lineage, same system — the `cd` whose pin travelled with it:
+    /// adoption proceeds and the turn replays the donor's bytes.
+    #[test]
+    fn adoption_allows_when_systems_match() {
+        let store = SessionReplayStore::new(8);
+        let digest = forwarded_system_digest(Some(
+            &json!([{"type": "text", "text": "shared instructions"}]),
+        ));
+
+        let history = conversation(12);
+        store.begin_request(
+            "req-a",
+            "donor-lane",
+            history.clone(),
+            forwarded_for(&history),
+            digest.clone(),
+        );
+        store.complete("req-a", 0, 5000);
+
+        let mut incoming = conversation(12);
+        incoming.push(text_msg("user", "the adopter's own new tail"));
+        let (originals, forwarded, chain_id) = store
+            .previous_turn_for("adopter-lane", &incoming, Some(&digest))
+            .expect("same-system adoption must proceed");
+        assert_eq!(originals, conversation(12));
+        assert_eq!(forwarded, forwarded_for(&conversation(12)));
+        assert_ne!(
+            chain_id, 0,
+            "an adopted prefix is a stream this turn continues"
+        );
     }
 
     #[test]
@@ -5448,14 +5850,14 @@ mod tests {
         let mut incoming = conversation(12);
         incoming.push(text_msg("user", "the adopter's own new tail"));
         store
-            .previous_turn_for("adopter", &incoming)
+            .previous_turn_for("adopter", &incoming, None)
             .expect("adopted");
         record_turn(&store, "adopter", "req-b", &incoming);
 
         incoming.push(text_msg("assistant", "reply"));
         incoming.push(text_msg("user", "and again"));
         let (originals, forwarded, _) = store
-            .previous_turn_for("adopter", &incoming)
+            .previous_turn_for("adopter", &incoming, None)
             .expect("the adopter replays its own previous turn");
         assert_eq!(originals.len(), 13);
         assert_eq!(forwarded, forwarded_for(&originals));
@@ -5480,7 +5882,7 @@ mod tests {
             Value::String("<system-reminder>CLAUDE.md v2, edited</system-reminder>".into());
         incoming.push(text_msg("user", "next turn under the new key"));
         let (originals, forwarded, _) = store
-            .previous_turn_for("auth:token:conv-v2", &incoming)
+            .previous_turn_for("auth:token:conv-v2", &incoming, None)
             .expect("the reminder is not part of the canonical prefix");
         assert_eq!(originals, donor_history);
         assert_eq!(forwarded, forwarded_for(&donor_history));
@@ -5499,7 +5901,7 @@ mod tests {
         let mut incoming = conversation(14);
         incoming.push(text_msg("user", "tail"));
         store
-            .previous_turn_for("adopter", &incoming)
+            .previous_turn_for("adopter", &incoming, None)
             .expect("adopted");
         assert_eq!(
             seen.lock().unwrap()[0].0,
@@ -5522,7 +5924,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(30));
         assert!(matches!(
-            store.previous_turn_for("second", &conversation(14)),
+            store.previous_turn_for("second", &conversation(14), None),
             Err(PrefixMiss::IdlePastTtl)
         ));
         assert!(
@@ -5546,6 +5948,7 @@ mod tests {
                         "shared",
                         originals.clone(),
                         forwarded_for(&originals),
+                        String::new(),
                     );
                     store.complete(&request, 0, 5000);
                 })
@@ -5577,7 +5980,7 @@ mod tests {
 
         let short = conversation(CROSS_SESSION_ADOPT_MIN_MESSAGES - 1);
         assert!(matches!(
-            store.previous_turn_for("adopter", &short),
+            store.previous_turn_for("adopter", &short, None),
             Err(PrefixMiss::NoTrackerForSession)
         ));
         assert!(store.history_will_be_rewritten("adopter", &short));
@@ -5592,7 +5995,7 @@ mod tests {
         let mut incoming = conversation(14);
         incoming[4] = text_msg("user", "a different fourth message");
         assert!(matches!(
-            store.previous_turn_for("adopter", &incoming),
+            store.previous_turn_for("adopter", &incoming, None),
             Err(PrefixMiss::NoTrackerForSession)
         ));
         assert!(store.history_will_be_rewritten("adopter", &incoming));
@@ -5611,7 +6014,7 @@ mod tests {
         let mut incoming = conversation(12);
         incoming.push(text_msg("user", "the adopter's own new tail"));
         let (originals, forwarded, _) = after
-            .previous_turn_for("adopter", &incoming)
+            .previous_turn_for("adopter", &incoming, None)
             .expect("adopted from disk");
         assert_eq!(originals, conversation(12));
         assert_eq!(forwarded, forwarded_for(&conversation(12)));
@@ -5646,7 +6049,7 @@ mod tests {
         let mut incoming = conversation(12);
         incoming.push(text_msg("user", "tail"));
         let (originals, ..) = after
-            .previous_turn_for("adopter", &incoming)
+            .previous_turn_for("adopter", &incoming, None)
             .expect("adopted from a file hashed on first scan");
         assert_eq!(originals.len(), 12);
     }
@@ -5676,7 +6079,13 @@ mod tests {
     fn persisted_turn(store: &SessionReplayStore, key: &str) -> Vec<Value> {
         let big = "x".repeat(7000);
         let forwarded = vec![text_msg("user", &big)];
-        store.begin_request("req-1", key, forwarded.clone(), forwarded.clone());
+        store.begin_request(
+            "req-1",
+            key,
+            forwarded.clone(),
+            forwarded.clone(),
+            String::new(),
+        );
         store.complete("req-1", 0, 5000);
         forwarded
     }
@@ -5760,7 +6169,7 @@ mod tests {
             next
         };
         let (originals, replayed, chain_id) = restarted
-            .previous_turn_for(key, &next)
+            .previous_turn_for(key, &next, None)
             .expect("the persisted prefix should be found");
         assert_eq!(
             replayed, forwarded,
@@ -5885,7 +6294,7 @@ mod tests {
         let restarted = SessionReplayStore::with_persistence(8, dir.0.clone());
         let unrelated = vec![text_msg("user", "an entirely different conversation")];
         let (_, _, chain_id) = restarted
-            .previous_turn_for(key, &unrelated)
+            .previous_turn_for(key, &unrelated, None)
             .expect("the prefix is returned for reporting");
         assert_eq!(chain_id, 0, "but not as a chain this turn continues");
     }
@@ -5896,7 +6305,7 @@ mod tests {
         let big = "x".repeat(7000);
         let orig = vec![text_msg("user", &big)];
         let fwd = vec![text_msg("user", "compressed")];
-        store.begin_request("req-1", "sess-A", orig.clone(), fwd.clone());
+        store.begin_request("req-1", "sess-A", orig.clone(), fwd.clone(), String::new());
         // no prefix until complete
         assert!(store.previous_turn("sess-A").is_none());
         store.complete("req-1", 5000, 0);
@@ -5910,7 +6319,7 @@ mod tests {
         let store = SessionReplayStore::new(8);
         let orig = vec![text_msg("user", &"x".repeat(7000))];
         let fwd = vec![text_msg("user", "c")];
-        store.begin_request("r", "S", orig, fwd);
+        store.begin_request("r", "S", orig, fwd, String::new());
         store.complete("r", 5000, 0);
         assert!(store.previous_turn("S").is_some());
         store.invalidate("S");
@@ -5928,6 +6337,7 @@ mod tests {
                 &sk,
                 vec![text_msg("user", "x")],
                 vec![text_msg("user", "x")],
+                String::new(),
             );
             store.complete(&rid, 5000, 0);
         }
@@ -6045,7 +6455,13 @@ mod tests {
             // Provider caches what we forwarded; record + feed the tracker.
             provider_cached_prefix = Some(current_provider_key);
             let rid = format!("req-{turn}");
-            store.begin_request(&rid, session, originals.clone(), forwarded.clone());
+            store.begin_request(
+                &rid,
+                session,
+                originals.clone(),
+                forwarded.clone(),
+                String::new(),
+            );
             // Claim a healthy cache read so the tracker keeps a live prefix.
             store.complete(&rid, 6000, 500);
         }
@@ -6212,7 +6628,7 @@ mod prefix_miss_tests {
     #[test]
     fn parking_a_turn_does_not_yet_create_a_replayable_prefix() {
         let store = SessionReplayStore::new(8);
-        store.begin_request("r1", "S", vec![msg("a")], vec![msg("a")]);
+        store.begin_request("r1", "S", vec![msg("a")], vec![msg("a")], String::new());
         // `begin_request` only fills the pending map; the tracker appears when
         // the response completes. Until then the session looks untracked.
         assert_eq!(
@@ -6227,7 +6643,7 @@ mod prefix_miss_tests {
         let store = SessionReplayStore::new(8);
         let orig = vec![msg("a")];
         let fwd = vec![msg("compressed-a")];
-        store.begin_request("r1", "S", orig.clone(), fwd.clone());
+        store.begin_request("r1", "S", orig.clone(), fwd.clone(), String::new());
         store.complete("r1", 5_000, 0);
         assert_eq!(store.previous_turn_detailed("S"), Ok((orig, fwd)));
     }
@@ -6239,7 +6655,7 @@ mod prefix_miss_tests {
     fn an_idle_session_is_named_as_ttl_rather_than_missing() {
         let mut store = SessionReplayStore::new(8);
         store.set_session_ttl_for_test(Duration::from_millis(1));
-        store.begin_request("r1", "S", vec![msg("a")], vec![msg("a")]);
+        store.begin_request("r1", "S", vec![msg("a")], vec![msg("a")], String::new());
         store.complete("r1", 5_000, 0);
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
@@ -6302,7 +6718,7 @@ mod interleaved_stream_tests {
     fn turn(store: &SessionReplayStore, rid: &str, orig: &[Value]) {
         // Forward a marked copy so a replay is identifiable by content.
         let fwd: Vec<Value> = orig.iter().map(|_| msg("compressed")).collect();
-        store.begin_request(rid, "S", orig.to_vec(), fwd);
+        store.begin_request(rid, "S", orig.to_vec(), fwd, String::new());
         store.complete(rid, 5_000, 0);
     }
 
@@ -6319,7 +6735,7 @@ mod interleaved_stream_tests {
         // A continues its own history, which B's stored prefix does not lead.
         let a2 = stream("a", 4);
         let (orig, fwd, _) = store
-            .previous_turn_for("S", &a2)
+            .previous_turn_for("S", &a2, None)
             .expect("A's own prefix is still held");
         assert_eq!(orig, a1, "A must be matched against A, not against B");
         assert_eq!(fwd.len(), a1.len());
@@ -6348,8 +6764,12 @@ mod interleaved_stream_tests {
 
         let a2 = stream("a", 4);
         let b2 = stream("b", 6);
-        let (_, _, a_id) = store.previous_turn_for("S", &a2).expect("A's prefix held");
-        let (_, _, b_id) = store.previous_turn_for("S", &b2).expect("B's prefix held");
+        let (_, _, a_id) = store
+            .previous_turn_for("S", &a2, None)
+            .expect("A's prefix held");
+        let (_, _, b_id) = store
+            .previous_turn_for("S", &b2, None)
+            .expect("B's prefix held");
         assert_ne!(a_id, 0, "a matched chain must be named");
         assert_ne!(b_id, 0);
         assert_ne!(a_id, b_id, "two streams must not share a chain id");
@@ -6357,7 +6777,7 @@ mod interleaved_stream_tests {
         // And the id survives the stream growing.
         turn(&store, "a2", &a2);
         let (_, _, a_id_again) = store
-            .previous_turn_for("S", &stream("a", 5))
+            .previous_turn_for("S", &stream("a", 5), None)
             .expect("A's prefix still held");
         assert_eq!(a_id_again, a_id, "a chain keeps its id as it grows");
     }
@@ -6368,7 +6788,7 @@ mod interleaved_stream_tests {
         turn(&store, "a1", &stream("a", 3));
         let unrelated = stream("c", 6);
         let (_, _, id) = store
-            .previous_turn_for("S", &unrelated)
+            .previous_turn_for("S", &unrelated, None)
             .expect("the fallback still returns a prefix to report against");
         assert_eq!(
             id, 0,
@@ -6387,7 +6807,7 @@ mod interleaved_stream_tests {
 
         // A conversation that continues neither branch.
         let c = stream("c", 6);
-        let got = store.previous_turn_for("S", &c);
+        let got = store.previous_turn_for("S", &c, None);
         if let Ok((orig, fwd, chain_id)) = got {
             assert_eq!(chain_id, 0, "the fallback must admit it continues nothing");
             // The fallback may hand back the most recent prefix, but the
@@ -6429,7 +6849,7 @@ mod interleaved_stream_tests {
         original.push(msg("a-9"));
 
         let (orig, fwd, chain_id) = store
-            .previous_turn_for("S", &original)
+            .previous_turn_for("S", &original, None)
             .expect("a tail edit must still find its own stream");
         assert_ne!(chain_id, 0, "an edited tail is not a stranger");
 
@@ -6469,7 +6889,9 @@ mod interleaved_stream_tests {
         turn(&store, "a2", &stream("a", 4));
         turn(&store, "a3", &stream("a", 5));
         let a4 = stream("a", 6);
-        let (orig, _, _) = store.previous_turn_for("S", &a4).expect("prefix held");
+        let (orig, _, _) = store
+            .previous_turn_for("S", &a4, None)
+            .expect("prefix held");
         assert_eq!(orig.len(), 5, "the longest matching prefix must win");
     }
 
@@ -6487,7 +6909,7 @@ mod interleaved_stream_tests {
         }
         let guard = store.trackers.lock().unwrap();
         let t = guard.peek("S").expect("tracker");
-        let held: usize = t.alternates.iter().map(|(_, o, _)| o.len()).sum();
+        let held: usize = t.alternates.iter().map(|(_, o, _, _)| o.len()).sum();
         assert!(
             held <= MAX_ALTERNATE_MESSAGES,
             "held {held} messages, budget is {MAX_ALTERNATE_MESSAGES}"
@@ -6524,7 +6946,7 @@ mod interleaved_stream_tests {
         let mut next = main.clone();
         next.push(msg("main next turn"));
         let (_, _, chain_id) = store
-            .previous_turn_for("S", &next)
+            .previous_turn_for("S", &next, None)
             .expect("the parent's prefix must still be held");
         assert_ne!(
             chain_id, 0,
@@ -6536,7 +6958,7 @@ mod interleaved_stream_tests {
             .expect("tracker")
             .alternates
             .iter()
-            .map(|(_, o, _)| o.len())
+            .map(|(_, o, _, _)| o.len())
             .sum();
         assert!(
             held <= MAX_ALTERNATE_MESSAGES,
@@ -6572,7 +6994,7 @@ mod interleaved_stream_tests {
         let mut next = main.clone();
         next.push(msg("main next turn"));
         let (_, _, chain_id) = store
-            .previous_turn_for("S", &next)
+            .previous_turn_for("S", &next, None)
             .expect("a prefix comes back either way");
         assert_ne!(
             chain_id, 0,
@@ -6623,7 +7045,7 @@ mod interleaved_stream_tests {
             next.push(msg(&format!("agent{i}-round0")));
             next.push(msg(&format!("agent{i}-next")));
             let (orig, fwd, _) = store
-                .previous_turn_for("S", &next)
+                .previous_turn_for("S", &next, None)
                 .unwrap_or_else(|e| panic!("agent{i} lost its prefix: {e:?}"));
             let (_, skip) = overlay_cached_prefix_reported(
                 next.clone(),
@@ -6662,7 +7084,7 @@ mod interleaved_stream_tests {
         turn(&store, "b1", &stream("b", 5));
         store.invalidate("S");
         assert_eq!(
-            store.previous_turn_for("S", &stream("a", 4)),
+            store.previous_turn_for("S", &stream("a", 4), None),
             Err(PrefixMiss::NothingForwardedYet),
             "no stream may replay across an invalidation"
         );

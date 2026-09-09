@@ -235,10 +235,15 @@ fi
 # One subagent definition per routed model (codex-*, grok-*, spark*), so
 # `Agent(subagent_type: "codex-sol")` works out of the box. A file the user
 # already has under the same name is left alone.
+# Installed into every config dir the launcher profiles use: `cclaude` reads
+# $HOME/.claude, but `claude-work`/`claude-personal` relocate to their own
+# dirs via CLAUDE_CONFIG_DIR, and agents missing there silently vanish from
+# the Agent tool (seen 2026-09-09: `codex-terra` not found in a work session).
 step "Agents"
-mkdir -p "$CLAUDE_DIR/agents"
+for agent_dir in "$CLAUDE_DIR/agents" "$HOME/.claude-work/agents" "$HOME/.claude-personal/agents"; do
+mkdir -p "$agent_dir"
 for src in "$CONTRIB"/claude/agents/*.md; do
-    dst="$CLAUDE_DIR/agents/$(basename "$src")"
+    dst="$agent_dir/$(basename "$src")"
     if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
         continue
     elif [ -e "$dst" ]; then
@@ -249,7 +254,8 @@ for src in "$CONTRIB"/claude/agents/*.md; do
         install -m 644 "$src" "$dst"
     fi
 done
-say "agents in $CLAUDE_DIR/agents: $(ls "$CONTRIB"/claude/agents/*.md | xargs -n1 basename | sed 's/\.md$//' | tr '\n' ' ')"
+say "agents in $agent_dir: $(ls "$CONTRIB"/claude/agents/*.md | xargs -n1 basename | sed 's/\.md$//' | tr '\n' ' ')"
+done
 
 # ── Claude Code hooks ─────────────────────────────────────────────────────
 # Headroom-owned hook scripts (session map logger, review write-offload

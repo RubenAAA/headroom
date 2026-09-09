@@ -287,12 +287,11 @@ impl CostTracker {
         let cr_rate = p.cache_read_rate(long).unwrap_or(p.input_rate(long));
         let cw_rate = p.cache_write_rate(long).unwrap_or(p.input_rate(long));
         let cw_1h_rate = p.cache_write_1h_rate(long).unwrap_or(cw_rate);
-        let total =
-            inp * p.input_rate(long)
-                + out * p.output_rate(long)
-                + cr * cr_rate
-                + cw * cw_rate
-                + cw_1h * cw_1h_rate;
+        let total = inp * p.input_rate(long)
+            + out * p.output_rate(long)
+            + cr * cr_rate
+            + cw * cw_rate
+            + cw_1h * cw_1h_rate;
         if total > 0.0 {
             Some(total)
         } else {

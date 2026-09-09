@@ -228,6 +228,15 @@ struct Parked {
 pub struct Bridge {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     drivers: Mutex<HashMap<String, Parked>>,
+    /// Cursor's chat id per conversation, kept across turns.
+    ///
+    /// The `Session` (which owns the live `chat_id`) is created fresh by
+    /// `open()` and destroyed by `close()` on every clean turn end — so
+    /// without this map the id died with the turn and the next spawn went
+    /// out without `--resume`, wiping Cursor-side history and re-emitting
+    /// the same discovery tool calls forever. This map outlives the session
+    /// precisely so a new session can pick the id back up.
+    chat_ids: Mutex<HashMap<String, String>>,
 }
 
 impl Bridge {
@@ -245,6 +254,12 @@ impl Bridge {
         key: &str,
     ) -> (Arc<Session>, mpsc::UnboundedReceiver<ParkedCall>) {
         let (session, inbox) = Session::new();
+        // A returning conversation resumes where Cursor left it: restore the
+        // chat id the previous turn recorded before its session was closed.
+        let resumed = self.chat_ids.lock().await.get(key).cloned();
+        if let Some(id) = resumed {
+            session.set_chat_id(id).await;
+        }
         self.sessions
             .lock()
             .await
@@ -328,14 +343,27 @@ impl Bridge {
                 "a conversation was abandoned mid-tool; killing its agent"
             );
             parked.driver.shutdown().await;
-            self.sessions.lock().await.remove(&key);
+            if let Some(session) = self.sessions.lock().await.remove(&key) {
+                if let Some(id) = session.chat_id().await {
+                    self.chat_ids.lock().await.insert(key.clone(), id);
+                }
+            }
         }
         reaped
     }
 
     /// Forget the conversation and kill any agent still running for it.
+    ///
+    /// The Cursor chat id survives: the session is per-turn state, the chat is
+    /// the conversation, and dropping the id here is what respawned every
+    /// follow-up turn without `--resume`.
     pub(crate) async fn close(&self, key: &str) {
-        self.sessions.lock().await.remove(key);
+        let removed = self.sessions.lock().await.remove(key);
+        if let Some(session) = removed {
+            if let Some(id) = session.chat_id().await {
+                self.chat_ids.lock().await.insert(key.to_string(), id);
+            }
+        }
         let parked = self.drivers.lock().await.remove(key);
         if let Some(mut parked) = parked {
             parked.driver.shutdown().await;
@@ -810,5 +838,24 @@ mod tests {
             "the re-parked driver is young again"
         );
         bridge.close("c").await;
+    }
+
+    /// Closing a turn ends the session, not the conversation: the next `open`
+    /// must resume the same Cursor chat, or every follow-up spawns without
+    /// `--resume` and replays the same discovery calls forever.
+    #[tokio::test]
+    async fn closing_a_turn_keeps_the_chat_id_for_the_next_open() {
+        let bridge = Bridge::new();
+        let (session, _inbox) = bridge.open("conv").await;
+        session.set_chat_id("chat-123".to_string()).await;
+        bridge.close("conv").await;
+
+        let (next, _inbox) = bridge.open("conv").await;
+        assert_eq!(
+            next.chat_id().await.as_deref(),
+            Some("chat-123"),
+            "the next turn must spawn with --resume"
+        );
+        bridge.close("conv").await;
     }
 }

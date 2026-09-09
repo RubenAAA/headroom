@@ -65,6 +65,15 @@ pub(crate) struct StreamTranslator {
     /// streaming. The `output_item.done` event carries the finished item, and
     /// when the upstream sent no deltas that copy is the only one there is.
     saw_text_delta: bool,
+    /// Same, for `response.refusal.delta` on the current item.
+    saw_refusal_delta: bool,
+    /// Whether any `function_call_arguments.delta` arrived for the tool call
+    /// currently streaming. `arguments.done` carries the whole arguments and
+    /// replays them when no delta did.
+    saw_arg_delta: bool,
+    /// Set once the turn was closed early (`abort_terminal`): any straggler
+    /// frames after a transport error must not reopen it.
+    terminated: bool,
     /// Identity of the reasoning item currently streaming, assembled from the
     /// `output_item.added`/`.done` pair that describes it.
     pending_reasoning: PendingReasoning,
@@ -169,6 +178,9 @@ impl StreamTranslator {
             total_output_tokens: 0,
             saw_tool_use: false,
             saw_text_delta: false,
+            saw_refusal_delta: false,
+            saw_arg_delta: false,
+            terminated: false,
             pending_reasoning: PendingReasoning::default(),
             codex_limits: None,
             codex_rate_limits_seen: false,
@@ -347,6 +359,10 @@ impl StreamTranslator {
         let mut events = Vec::new();
         self.latch_ttfb();
 
+        if self.terminated {
+            return events;
+        }
+
         if data.trim().is_empty() || data.trim() == "[DONE]" {
             if data.trim() == "[DONE]" {
                 // Last chance to book the turn: Chat Completions has no
@@ -511,6 +527,45 @@ impl StreamTranslator {
                     self.saw_text_delta = true;
                 }
             }
+            // `output_text.done` carries the whole text. Normally the deltas
+            // above already delivered it and this is a marker; when the
+            // upstream sent no deltas it is the only copy, mirroring the
+            // message-item recovery below.
+            "response.output_text.done" | "output_text.done" => {
+                if !self.saw_text_delta {
+                    if let Some(text) = chunk.get("text").and_then(|v| v.as_str()) {
+                        if !text.is_empty() {
+                            self.open_block(OpenBlock::Text, &mut events);
+                            events.push(self.emit_text_delta(text));
+                            self.close_block(&mut events);
+                            self.saw_text_delta = true;
+                        }
+                    }
+                }
+            }
+            // A refusal is the turn's only text. Anthropic has no refusal
+            // block, so it rides as a text block; without this the client
+            // receives an empty `end_turn` it cannot tell from silence.
+            "response.refusal.delta" | "refusal.delta" => {
+                let delta = chunk.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                if !delta.is_empty() {
+                    self.open_block(OpenBlock::Text, &mut events);
+                    events.push(self.emit_text_delta(delta));
+                    self.saw_refusal_delta = true;
+                }
+            }
+            "response.refusal.done" | "refusal.done" => {
+                if !self.saw_refusal_delta {
+                    if let Some(refusal) = chunk.get("refusal").and_then(|v| v.as_str()) {
+                        if !refusal.is_empty() {
+                            self.open_block(OpenBlock::Text, &mut events);
+                            events.push(self.emit_text_delta(refusal));
+                            self.close_block(&mut events);
+                            self.saw_refusal_delta = true;
+                        }
+                    }
+                }
+            }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
                     if !delta.is_empty() {
@@ -542,6 +597,10 @@ impl StreamTranslator {
                         .to_string();
                     self.open_tool_block(&mut events);
                     self.saw_tool_use = true;
+                    // Per call, not per stream: `arguments.done` below may
+                    // only replay the full arguments when no delta arrived
+                    // for this call.
+                    self.saw_arg_delta = false;
                 }
                 // A reasoning item may announce its id here and carry the blob
                 // on `.done`, so start assembling as soon as it appears.
@@ -556,6 +615,25 @@ impl StreamTranslator {
                     if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
                         if !delta.is_empty() {
                             events.push(self.emit_input_json_delta(delta));
+                            self.saw_arg_delta = true;
+                        }
+                    }
+                }
+                // A delta arriving before `output_item.added` (no open tool
+                // block to attribute it to) is skipped rather than guessed
+                // at: the `arguments.done` fallback below replays the whole
+                // arguments, so nothing is lost.
+            }
+            // `arguments.done` carries the whole arguments string. Normally
+            // the deltas above already delivered it; when they did not — or
+            // arrived before the item announced itself — this is the only
+            // copy, mirroring the message-item recovery.
+            "response.function_call_arguments.done" => {
+                if self.open == Some(OpenBlock::Tool) && !self.saw_arg_delta {
+                    if let Some(args) = chunk.get("arguments").and_then(|v| v.as_str()) {
+                        if !args.is_empty() {
+                            events.push(self.emit_input_json_delta(args));
+                            self.saw_arg_delta = true;
                         }
                     }
                 }
@@ -577,7 +655,7 @@ impl StreamTranslator {
                 // stopped turn and answers with "your previous response had no
                 // visible output": the model is fine, the text was lost here.
                 if item_type == Some("message") {
-                    if !self.saw_text_delta {
+                    if !self.saw_text_delta && !self.saw_refusal_delta {
                         let text: String = chunk
                             .get("item")
                             .and_then(|i| i.get("content"))
@@ -585,7 +663,11 @@ impl StreamTranslator {
                             .map(|blocks| {
                                 blocks
                                     .iter()
-                                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                    .filter_map(|b| {
+                                        b.get("text")
+                                            .and_then(|t| t.as_str())
+                                            .or_else(|| b.get("refusal").and_then(|r| r.as_str()))
+                                    })
                                     .collect::<String>()
                             })
                             .unwrap_or_default();
@@ -603,6 +685,7 @@ impl StreamTranslator {
                     // Per item, not per stream: a second message must be
                     // judged on its own deltas.
                     self.saw_text_delta = false;
+                    self.saw_refusal_delta = false;
                 }
                 // The reasoning item is complete: seal its identity into the
                 // thinking block's signature so the client hands it back next
@@ -688,24 +771,28 @@ impl StreamTranslator {
                 // `record_failed` — a failed turn must not feed the save-rate.
                 let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
                 self.emit_outcome(usage.as_ref(), 500);
+                // The turn still has to end on the wire: without terminal
+                // events the client hangs, and the `[DONE]` fallback cannot
+                // rescue it — the block above already closed `open`, which is
+                // the fallback's trigger. `end_turn`, never `tool_use`: a
+                // half-streamed call must not run.
+                events.push(self.emit_message_delta("end_turn"));
+                events.push(self.emit_message_stop());
             }
             "response.incomplete" => {
-                if let Some(reason) = chunk
+                let reason = chunk
                     .get("response")
                     .and_then(|v| v.get("incomplete_details"))
                     .and_then(|v| v.get("reason"))
-                    .and_then(|v| v.as_str())
-                {
-                    self.total_output_tokens = self.total_output_tokens.max(0);
-                    self.close_block_final(&mut events);
-                    let stop_reason = match reason {
-                        "max_output_tokens" => "max_tokens",
-                        _ => "end_turn",
-                    };
-                    events.push(self.emit_message_delta(stop_reason));
-                    events.push(self.emit_message_stop());
-                }
-                // Outside the `if let`: a response that stopped short still
+                    .and_then(|v| v.as_str());
+                self.close_block_final(&mut events);
+                let stop_reason = match reason {
+                    Some("max_output_tokens") => "max_tokens",
+                    _ => "end_turn",
+                };
+                events.push(self.emit_message_delta(stop_reason));
+                events.push(self.emit_message_stop());
+                // Outside the reason: a response that stopped short still
                 // spent tokens, whether or not it said why.
                 let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
                 self.emit_outcome(usage.as_ref(), 200);
@@ -790,6 +877,117 @@ impl StreamTranslator {
     fn emit_message_stop(&self) -> String {
         crate::sse::outbound::message_stop()
     }
+
+    /// Terminal events for a turn whose upstream died mid-stream.
+    ///
+    /// Mirrors the Anthropic path's `finish_on_drop`: the client keeps what
+    /// it already holds and the turn ends cleanly instead of truncating the
+    /// connection mid-frame. Empty when nothing started — no `message_start`
+    /// went out, so there is nothing to close and the caller propagates the
+    /// transport error instead. `end_turn`, never `tool_use`: a half-streamed
+    /// call must not run.
+    fn abort_terminal(&mut self) -> Vec<String> {
+        if !self.started {
+            return Vec::new();
+        }
+        self.terminated = true;
+        let mut events = Vec::new();
+        self.close_block_final(&mut events);
+        events.push(self.emit_message_delta("end_turn"));
+        events.push(self.emit_message_stop());
+        events
+    }
+}
+
+/// Carried across polls by the [`translate_openai_stream_to_anthropic`]
+/// adapter below.
+struct TranslateState<S> {
+    upstream: S,
+    translator: StreamTranslator,
+    buffer: String,
+    current_event: Option<String>,
+    current_data: Vec<String>,
+}
+
+impl<S> TranslateState<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    /// Fold one upstream chunk into SSE lines, dispatching each blank-line
+    /// terminated frame. Appends emitted bytes to `output`.
+    fn push_chunk(&mut self, text: &str, output: &mut Vec<u8>) {
+        self.buffer.push_str(text);
+        while let Some(newline_pos) = self.buffer.find('\n') {
+            let line = self.buffer[..newline_pos]
+                .trim_end_matches('\r')
+                .to_string();
+            self.buffer = self.buffer[newline_pos + 1..].to_string();
+            Self::push_line(
+                &line,
+                &mut self.translator,
+                &mut self.current_event,
+                &mut self.current_data,
+                output,
+            );
+        }
+    }
+
+    fn push_line(
+        line: &str,
+        translator: &mut StreamTranslator,
+        current_event: &mut Option<String>,
+        current_data: &mut Vec<String>,
+        output: &mut Vec<u8>,
+    ) {
+        if line.is_empty() {
+            let data = current_data.join("\n");
+            for event in translator.process_frame(current_event.as_deref(), &data) {
+                output.extend_from_slice(event.as_bytes());
+            }
+            *current_event = None;
+            current_data.clear();
+            return;
+        }
+        if let Some(event) = line.strip_prefix("event:") {
+            *current_event = Some(event.trim().to_string());
+            return;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            current_data.push(data.trim_start().to_string());
+        }
+    }
+
+    /// Dispatch whatever the upstream left behind: a trailing line without
+    /// its newline, then a final frame without its terminating blank line.
+    /// Without this the last event — potentially `response.completed`
+    /// itself, i.e. the usage, the stop reason, and the client's
+    /// `message_stop` — is silently dropped whenever a stream ends
+    /// mid-frame.
+    fn flush_trailing(&mut self, output: &mut Vec<u8>) {
+        if !self.buffer.is_empty() {
+            let rest = std::mem::take(&mut self.buffer);
+            for line in rest.split('\n') {
+                Self::push_line(
+                    line.trim_end_matches('\r'),
+                    &mut self.translator,
+                    &mut self.current_event,
+                    &mut self.current_data,
+                    output,
+                );
+            }
+        }
+        if self.current_event.is_some() || !self.current_data.is_empty() {
+            let data = self.current_data.join("\n");
+            for event in self
+                .translator
+                .process_frame(self.current_event.as_deref(), &data)
+            {
+                output.extend_from_slice(event.as_bytes());
+            }
+            self.current_event = None;
+            self.current_data.clear();
+        }
+    }
 }
 
 pub(crate) fn translate_openai_stream_to_anthropic(
@@ -801,72 +999,68 @@ pub(crate) fn translate_openai_stream_to_anthropic(
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     use futures_util::StreamExt;
 
-    let mut translator = StreamTranslator::new(model)
+    let translator = StreamTranslator::new(model)
         .with_codex_limits(codex_limits)
         .with_initial_rate_limits_seen(quota_seen_in_headers)
         .with_outcome(outcome);
-    let mut buffer = String::new();
-    let mut current_event: Option<String> = None;
-    let mut current_data: Vec<String> = Vec::new();
 
-    stream.filter_map(move |chunk| {
-        let translated = match chunk {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                buffer.push_str(&text);
-
-                let mut output = Vec::new();
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-                    buffer = buffer[newline_pos + 1..].to_string();
-
-                    if line.is_empty() {
-                        let data = current_data.join("\n");
-                        let events = translator.process_frame(current_event.as_deref(), &data);
-                        for event in events {
+    futures_util::stream::unfold(
+        TranslateState {
+            upstream: stream,
+            translator,
+            buffer: String::new(),
+            current_event: None,
+            current_data: Vec::new(),
+        },
+        |mut state| async move {
+            loop {
+                match state.upstream.next().await {
+                    Some(Ok(bytes)) => {
+                        let text = String::from_utf8_lossy(&bytes).to_string();
+                        let mut output = Vec::new();
+                        state.push_chunk(&text, &mut output);
+                        if !output.is_empty() {
+                            return Some((Ok(bytes::Bytes::from(output)), state));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // The client already holds part of this turn, so there
+                        // is no fallback to be had: re-dispatching now would
+                        // splice a second upstream's events onto a half-finished
+                        // message. Close the turn cleanly instead of truncating
+                        // the client's connection mid-frame, and leave a line
+                        // saying which turn died mid-body rather than at the
+                        // status line.
+                        tracing::warn!(
+                            event = "routed_stream_aborted",
+                            error = %e,
+                            "routed upstream stream failed after the client had events"
+                        );
+                        let terminal = state.translator.abort_terminal();
+                        if terminal.is_empty() {
+                            // Nothing started: no `message_start` went out, so
+                            // there is no turn to close — propagate the
+                            // transport error.
+                            return Some((Err(std::io::Error::other(e.to_string())), state));
+                        }
+                        let mut output = Vec::new();
+                        for event in terminal {
                             output.extend_from_slice(event.as_bytes());
                         }
-                        current_event = None;
-                        current_data.clear();
-                        continue;
+                        return Some((Ok(bytes::Bytes::from(output)), state));
                     }
-
-                    if let Some(event) = line.strip_prefix("event:") {
-                        current_event = Some(event.trim().to_string());
-                        continue;
-                    }
-
-                    if let Some(data) = line.strip_prefix("data:") {
-                        current_data.push(data.trim_start().to_string());
-                        continue;
+                    None => {
+                        let mut output = Vec::new();
+                        state.flush_trailing(&mut output);
+                        if output.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(bytes::Bytes::from(output)), state));
                     }
                 }
-
-                if output.is_empty() {
-                    None
-                } else {
-                    Some(Ok(bytes::Bytes::from(output)))
-                }
             }
-            Err(e) => {
-                // The client already holds part of this turn, so there is no
-                // fallback to be had: re-dispatching now would splice a second
-                // upstream's events onto a half-finished message. End as the
-                // transport ended, and leave a line saying which turn died
-                // mid-body rather than at the status line.
-                tracing::warn!(
-                    event = "routed_stream_aborted",
-                    error = %e,
-                    "routed upstream stream failed after the client had events"
-                );
-                Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
-            }
-        };
-        async { translated }
-    })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -912,6 +1106,7 @@ mod tests {
             overhead_ms: 1.5,
             forwarded_tokens_estimate: 777,
             upstream_attempts: 1,
+            redact_store: None,
         };
         let t = StreamTranslator::new(model.to_string()).with_outcome(Some(ctx));
         (t, request_logger, cost_tracker)
@@ -1485,16 +1680,18 @@ mod tests {
         let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
         let mut out = Vec::new();
         out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
-        out.extend(t.process_frame(
-            Some("response.output_item.done"),
-            &json!({
-                "item": {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "the answer is 391"}]
-                }
-            })
-            .to_string(),
-        ));
+        out.extend(
+            t.process_frame(
+                Some("response.output_item.done"),
+                &json!({
+                    "item": {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "the answer is 391"}]
+                    }
+                })
+                .to_string(),
+            ),
+        );
         out.extend(t.process_frame(
             Some("response.completed"),
             &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 9}}}).to_string(),
@@ -1522,16 +1719,18 @@ mod tests {
             Some("response.output_text.delta"),
             &json!({"delta": "the answer is 391"}).to_string(),
         ));
-        out.extend(t.process_frame(
-            Some("response.output_item.done"),
-            &json!({
-                "item": {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "the answer is 391"}]
-                }
-            })
-            .to_string(),
-        ));
+        out.extend(
+            t.process_frame(
+                Some("response.output_item.done"),
+                &json!({
+                    "item": {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "the answer is 391"}]
+                    }
+                })
+                .to_string(),
+            ),
+        );
 
         let joined = out.join("");
         assert_eq!(
@@ -1568,5 +1767,228 @@ mod tests {
         let joined = out.join("");
         assert_eq!(joined.matches("first").count(), 1, "{joined}");
         assert!(joined.contains("second"), "{joined}");
+    }
+
+    /// A failed turn still has to end on the wire. Before, `response.failed`
+    /// booked the outcome but emitted no terminal events, and the `[DONE]`
+    /// fallback could not rescue it (the block was already closed, which is
+    /// the fallback's trigger) — so the client hung.
+    #[test]
+    fn a_failed_turn_still_terminates() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.output_text.delta"),
+            &json!({"delta": "partial"}).to_string(),
+        ));
+        out.extend(t.process_frame(
+            Some("response.failed"),
+            &json!({"response": {}}).to_string(),
+        ));
+        out.extend(t.process_frame(None, "[DONE]"));
+
+        let joined = out.join("");
+        assert!(
+            joined.contains("message_stop"),
+            "failed turn left the client hanging: {joined}"
+        );
+        assert!(
+            joined.contains("end_turn"),
+            "a half-streamed call must not run as tool_use: {joined}"
+        );
+        assert_eq!(
+            joined.matches("event: message_stop").count(),
+            1,
+            "the [DONE] fallback must not double-terminate: {joined}"
+        );
+    }
+
+    /// `response.incomplete` without a reason still ended the turn upstream;
+    /// the client must see terminal events, not silence plus an outcome.
+    #[test]
+    fn an_incomplete_turn_without_a_reason_still_terminates() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.incomplete"),
+            &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 9}}}).to_string(),
+        ));
+
+        let joined = out.join("");
+        assert!(
+            joined.contains("message_stop"),
+            "reason-less incomplete left the client hanging: {joined}"
+        );
+    }
+
+    /// A stream ending mid-frame — no trailing blank line, no trailing
+    /// newline — must still deliver its last event. Before, the adapter only
+    /// dispatched on blank lines, so a cut-off `response.completed` took the
+    /// usage, the stop reason, and the client's `message_stop` with it.
+    #[tokio::test]
+    async fn trailing_frame_without_terminator_is_flushed() {
+        use futures_util::{stream, StreamExt};
+        redirect_savings_ledger();
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"hi\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}",
+        );
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![Ok(bytes::Bytes::from(sse))];
+        let translated = translate_openai_stream_to_anthropic(
+            stream::iter(chunks),
+            "muse-spark-1.3".to_string(),
+            crate::codex_rate_limits::CodexRateLimitStore::new(),
+            false,
+            None,
+        );
+        let out: Vec<String> = translated
+            .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
+            .collect()
+            .await;
+        let joined = out.join("");
+        assert!(joined.contains("hi"), "delta lost: {joined}");
+        assert!(
+            joined.contains("event: message_stop"),
+            "unterminated completed dropped the turn end: {joined}"
+        );
+    }
+
+    /// A refusal is the turn's only text and must reach the client as text,
+    /// not vanish into an empty `end_turn`.
+    #[test]
+    fn a_refused_turn_reaches_the_client_as_text() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.refusal.delta"),
+            &json!({"delta": "I cannot"}).to_string(),
+        ));
+        out.extend(t.process_frame(
+            Some("response.refusal.done"),
+            &json!({"refusal": "I cannot do that"}).to_string(),
+        ));
+        out.extend(t.process_frame(
+            Some("response.completed"),
+            &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 9}}}).to_string(),
+        ));
+
+        let joined = out.join("");
+        assert!(
+            joined.contains("I cannot do that") || joined.contains("I cannot"),
+            "refusal never reached the client: {joined}"
+        );
+        assert_eq!(
+            joined.matches("I cannot").count(),
+            1,
+            "refusal streamed twice: {joined}"
+        );
+    }
+
+    /// `arguments.done` carries the whole arguments string: when no argument
+    /// delta arrived for the call, it is the only copy.
+    #[test]
+    fn a_tool_call_without_argument_deltas_uses_the_done_fallback() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(
+            t.process_frame(
+                Some("response.output_item.added"),
+                &json!({"item": {"type": "function_call", "call_id": "c1", "name": "bash"}})
+                    .to_string(),
+            ),
+        );
+        out.extend(t.process_frame(
+            Some("response.function_call_arguments.done"),
+            &json!({"arguments": "{\"command\":\"ls\"}"}).to_string(),
+        ));
+        out.extend(
+            t.process_frame(
+                Some("response.output_item.done"),
+                &json!({"item": {"type": "function_call", "call_id": "c1", "name": "bash"}})
+                    .to_string(),
+            ),
+        );
+
+        let joined = out.join("");
+        assert!(
+            joined.contains("ls"),
+            "arguments lost when deltas never arrived: {joined}"
+        );
+    }
+
+    /// A transport error after the turn started must close it cleanly rather
+    /// than truncate the client's connection, and straggler frames after the
+    /// abort must not reopen it. Before anything started there is no turn to
+    /// close, so the abort is empty and the error propagates.
+    #[test]
+    fn an_aborted_turn_closes_cleanly_and_stays_closed() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        assert!(t.abort_terminal().is_empty());
+        t.process_frame(Some("response.created"), &json!({}).to_string());
+        t.process_frame(
+            Some("response.output_text.delta"),
+            &json!({"delta": "partial"}).to_string(),
+        );
+        let term = t.abort_terminal().join("");
+        assert!(
+            term.contains("end_turn"),
+            "half-streamed call must not run: {term}"
+        );
+        assert!(
+            term.contains("event: message_stop"),
+            "abort left the turn unterminated: {term}"
+        );
+        let after = t
+            .process_frame(
+                Some("response.output_text.delta"),
+                &json!({"delta": "late"}).to_string(),
+            )
+            .join("");
+        assert!(
+            !after.contains("late"),
+            "straggler reopened the turn: {after}"
+        );
+    }
+
+    /// `output_text.done` carries the whole text: when no delta arrived for
+    /// the item, it is the only copy.
+    #[test]
+    fn a_text_part_without_deltas_uses_the_done_fallback() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.output_text.done"),
+            &json!({"text": "the answer is 391"}).to_string(),
+        ));
+        out.extend(
+            t.process_frame(
+                Some("response.output_item.done"),
+                &json!({
+                    "item": {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "the answer is 391"}]
+                    }
+                })
+                .to_string(),
+            ),
+        );
+
+        let joined = out.join("");
+        assert_eq!(
+            joined.matches("the answer is 391").count(),
+            1,
+            "text lost or doubled without deltas: {joined}"
+        );
     }
 }

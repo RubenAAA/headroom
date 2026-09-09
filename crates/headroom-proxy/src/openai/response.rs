@@ -155,7 +155,7 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
         .and_then(|r| r.as_str())
         .unwrap_or("stop");
 
-    let stop_reason = match finish_reason {
+    let mut stop_reason = match finish_reason {
         "stop" => "end_turn",
         "tool_calls" => "tool_use",
         "length" => "max_tokens",
@@ -172,9 +172,34 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
             }
         }
 
-        if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-            if !text.is_empty() {
+        match msg.get("content") {
+            Some(Value::String(text)) if !text.is_empty() => {
                 content.push(json!({"type": "text", "text": text}));
+            }
+            // Some models return content as an array of parts rather than a
+            // string; the string-only read above dropped those turns whole.
+            Some(Value::Array(parts)) => {
+                let text: String = parts
+                    .iter()
+                    .filter_map(|p| {
+                        p.get("text")
+                            .and_then(|t| t.as_str())
+                            .or_else(|| p.get("refusal").and_then(|r| r.as_str()))
+                    })
+                    .collect();
+                if !text.is_empty() {
+                    content.push(json!({"type": "text", "text": text}));
+                }
+            }
+            _ => {}
+        }
+
+        // A chat-level refusal is the turn's only text; without this the
+        // client receives an empty `end_turn` and cannot tell refusal apart
+        // from silence.
+        if let Some(refusal) = msg.get("refusal").and_then(|v| v.as_str()) {
+            if !refusal.is_empty() {
+                content.push(json!({"type": "text", "text": refusal}));
             }
         }
 
@@ -186,6 +211,16 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or("");
+                // A call without identity cannot round-trip: the client
+                // discards the whole turn on it, so the broken call goes out
+                // alone rather than taking any text with it.
+                if id.is_empty() || name.is_empty() {
+                    tracing::debug!(
+                        event = "openai_tool_call_without_identity",
+                        "dropped a tool call with no id or name instead of emitting an unplayable tool_use block"
+                    );
+                    continue;
+                }
                 let arguments = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
@@ -200,6 +235,18 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
                 }));
             }
         }
+    }
+
+    // A promised tool call with no surviving block is what the client reports
+    // as "the model's tool call could not be parsed", killing the turn. The
+    // streamed path derives the stop reason from surviving content; do the
+    // same here.
+    if stop_reason == "tool_use"
+        && !content
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+    {
+        stop_reason = "end_turn";
     }
 
     let default_usage = json!({});
@@ -344,5 +391,71 @@ mod tests {
         assert_eq!(output["content"][0]["id"], "call_123");
         assert_eq!(output["content"][0]["name"], "bash");
         assert_eq!(output["content"][0]["input"]["command"], "ls");
+    }
+
+    /// A `tool_calls` finish with no usable call used to go out as
+    /// `content: []` + `stop_reason: tool_use`, which the client discards
+    /// whole ("the model's tool call could not be parsed").
+    #[test]
+    fn unusable_tool_calls_downgrade_to_end_turn() {
+        let openai = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "here is what I found",
+                    "tool_calls": [{"id": "", "function": {"name": "", "arguments": "{"}}]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let original = json!({"model": "claude-3-5-sonnet-20241022"});
+        let output = openai_to_anthropic_response(&openai, &original);
+        assert_eq!(output["stop_reason"], "end_turn");
+        assert!(
+            !output["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["type"] == "tool_use"),
+            "broken call must go out alone, not take the text with it: {output}"
+        );
+        assert_eq!(output["content"][0]["text"], "here is what I found");
+    }
+
+    /// Array-shaped content used to be dropped by the string-only read,
+    /// emptying the turn.
+    #[test]
+    fn array_content_parts_are_kept() {
+        let openai = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let original = json!({"model": "claude-3-5-sonnet-20241022"});
+        let output = openai_to_anthropic_response(&openai, &original);
+        assert_eq!(output["content"][0]["text"], "ab");
+    }
+
+    /// A refusal is the turn's only text; surface it instead of an empty
+    /// `end_turn` the client cannot tell apart from silence.
+    #[test]
+    fn chat_refusal_reaches_the_client_as_text() {
+        let openai = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "refusal": "I cannot do that"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let original = json!({"model": "claude-3-5-sonnet-20241022"});
+        let output = openai_to_anthropic_response(&openai, &original);
+        assert_eq!(output["content"][0]["type"], "text");
+        assert_eq!(output["content"][0]["text"], "I cannot do that");
     }
 }

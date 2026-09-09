@@ -468,7 +468,10 @@ HEADROOM_FLAGS=(
   --extra-model-route claude-codex-5.6-sol=https://api.openai.com/:translate:gpt-5.6-sol
   # Points at a Codex CLI auth.json; drop the line if you don't use Codex.
   # install.sh rewrites the path to whichever ~/.codex*/auth.json it finds.
-  --codex-auth-file $HOME/.codex-personal/auth.json
+  # NOTE: `codex` CLI with CODEX_HOME unset reads $HOME/.codex/auth.json
+  # (work account); keep this pointed there so the proxy and the CLI share
+  # credentials and token refreshes.
+  --codex-auth-file $HOME/.codex/auth.json
 
   # Grok on the Cursor subscription, laid out like the Codex routes above: one
   # alias per effort level, each with a matching agent in ~/.claude/agents.
@@ -545,6 +548,15 @@ HEADROOM_FLAGS=(
   # turn (SendUserFile, WaitForMcpServers) goes back in at its old spot.
   # Measured 2026-09-06: 19 recaches, 342k wasted tokens in one 3h run.
   --cache-pin-tool-roster true
+  # Reversible redaction on routed translate paths (e.g. the Contributor Free
+  # tier, which trains on prompts): secrets and emails go out as opaque
+  # __HR_*__ tokens; your home dir goes out as __HR_HOME__ with the rest of
+  # the path in the clear, so the model keeps the project structure it needs
+  # while your username and machine layout stay home. Everything is restored
+  # at the client edge — including inside tool_use inputs, so local tools keep
+  # working on real paths. Map lives in process memory only. Local artifacts
+  # (logs, sessions DB) still see real text; this guards the wire, not the disk.
+  --redact-sensitive true
 
   # Compression pipeline
   #

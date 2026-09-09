@@ -8,14 +8,47 @@ drafter could only ever end in `/tmp` as a dry run.
 ## Chain
 
 ```
-Opus reviews (reads only)
-  → draft written to /tmp/opencode/poc2/<session>.draft.json
-  → spark-goahead.sh <session> waits for <session>.goahead
+review command runs (/gitlab-review or /fix-mr-comments → session armed)
+  → user says "post the threads" (UserPromptSubmit divert)
+  → hook spawns the worker: spark_draft.py <MR> <session> <mode>
+  → draft written to ~/.local/state/spark-review/<session>.draft.json
+  → hook chains spark-goahead.sh <session>, which waits for <session>.goahead
   → operator touches <session>.goahead          ← the human's deliberate act
   → spark_post.py replies on the threads
   → re-reads from the server, verifies every marker
   → writes <session>.proof.json                 ← the trust contract
 ```
+
+The hook starts both halves -- draft and listener. Earlier the listener was
+never launched by anything, so the go-ahead file was an approval nobody
+heard; the one live posting (mr591) worked because the listener was started
+by hand. A stale go-ahead is deleted when a fresh worker starts, so approval
+can only ever apply to the draft it was given for.
+
+## Modes
+
+The scope depends on which command armed the session (recorded in
+`<session>.armed`):
+
+| mode | drafts replies to |
+|---|---|
+| `gitlab-review` | follow-ups on threads I opened |
+| `fix-mr-comments` | reviewers' still-open threads on my own MR |
+
+## State files (`~/.local/state/spark-review/`)
+
+| file | means |
+|---|---|
+| `<session>.armed` | a review command really ran; content is the mode |
+| `<session>.diverted` | a divert fired, worker started |
+| `<session>.started` | supervisor pid; alive check before any respawn |
+| `<session>.done` | worker finished (with draft, or with `.failed`) |
+| `<session>.failed` | finished with no draft; reason inside, first lines are the summary |
+| `<session>.worker.log` | that run's transcript |
+| `<session>.draft.json` | the replies, poster schema |
+| `<session>.goahead` | the approval; consumed once by the listener |
+| `<session>.goahead.log` | listener + poster output |
+| `<session>.proof.json` | verified note ids, markers, resolve results |
 
 ## Pieces
 

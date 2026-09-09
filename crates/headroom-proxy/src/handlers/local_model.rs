@@ -314,6 +314,17 @@ async fn try_routed_sidecar(
         .sidecar_model
         .clone()
         .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
+    // A routed sidecar would carry the client's raw text to a routed upstream
+    // past the redaction stage, which runs later. Skip it while redaction is
+    // on; the direct sidecar path answers instead, on the default upstream.
+    if state.config.redact_sensitive {
+        tracing::info!(
+            event = "sidecar_routed_skipped_redacted",
+            request_id = %request_id,
+            "routed sidecar disabled while redaction is on"
+        );
+        return None;
+    }
     let route = sidecar_responses_route(&state.config.model_routes, &sidecar_model)?;
     let target = route.target_model.clone()?;
     let upstream = route.upstream.clone()?;
@@ -743,15 +754,41 @@ pub async fn handle_messages(
     // Live-zone compression + freeze-replay, on the same flags as the Claude
     // path and in the same order (compress, then replay the cached prefix).
     let session_key = ctx_report.session_key.clone();
+    // Behavior stores take the lane, not the session: same-opener streams
+    // (subagent fan-out) share the session key but must not share replay
+    // trackers, drift baselines, or pins.
+    let lane_key = ctx_report.lane_key.clone();
+    // A lane switch that continues another lane's message lineage inherits
+    // its hold pins before the hold below reads them — same contract as the
+    // Claude path, and fully consistent here: the CTX transforms above
+    // already ran, so these messages are the snapshot replay will see.
+    if let Some(messages) = parsed.get("messages").and_then(|m| m.as_array()) {
+        crate::proxy::inherit_lane_pins(&state, &lane_key, messages, &request_id);
+    }
     // A routed turn never passes through `forward_http`, so before this it
     // reached its upstream with the volatile `system` lines the holds exist
     // to pin — the client's own working directory and role sentence moving
     // mid-conversation, re-creating the cached prefix from `system` down.
     // Held here, on the Anthropic-shaped body, before any translation
     // restructures it.
-    crate::proxy::apply_system_holds(&state, &mut parsed, &session_key, &request_id);
+    crate::proxy::apply_system_holds(&state, &mut parsed, &lane_key, &request_id);
+    // Reversible redaction, after every stage that reads the client's text
+    // (capture, holds) and before every stage that forwards it (compression,
+    // offload, replay, translation). Everything upstream-bound from here on
+    // carries placeholders; the response arms restore them at the edge.
+    // Only translate paths reach this point — the passthrough above returned
+    // early — so there is nothing extra to gate on.
+    let redacted = state.config.redact_sensitive
+        && maybe_redact_outbound(&state.redact_store, &session_key, &mut parsed, &request_id);
+    // Kept aside: a later `session_key` binding (the Codex turn-state one)
+    // shadows the String above, and the fallback below needs this one.
+    let redact_session_key = state
+        .config
+        .redact_sensitive
+        .then(|| session_key.clone())
+        .unwrap_or_default();
     let compression_report =
-        apply_compression_and_replay(&state, &mut parsed, &headers, &request_id, &session_key);
+        apply_compression_and_replay(&state, &mut parsed, &headers, &request_id, &lane_key);
     let compression_tokens_saved = compression_report.tokens_saved;
     let replay_parked = compression_report.replay_parked;
     let ctx_tokens_saved = merge_routed_compression_report(&mut ctx_report, compression_report);
@@ -955,6 +992,16 @@ pub async fn handle_messages(
             from_model: from_model.to_string(),
             to_model: body_model.to_string(),
         });
+    }
+    // Hand the response arms the redaction memory whenever the flag is on —
+    // not only when the outbound body had spans. A clean prompt can still
+    // pull secrets mid-turn (memory answers, cold-tier blocks), and the
+    // continuations must redact those too. Empty map snapshots are a
+    // passthrough, so clean turns keep the zero-overhead path.
+    if state.config.redact_sensitive {
+        if let Some(ctx) = outcome_ctx.as_mut() {
+            ctx.redact_store = Some(state.redact_store.clone());
+        }
     }
 
     let openai_body_bytes = match serde_json::to_vec(&openai_body) {
@@ -1195,6 +1242,17 @@ pub async fn handle_messages(
         config: state.config.clone(),
         request_id: request_id.to_string(),
         responses_shape: target_model.is_some(),
+        // Continuations inherit the turn's redaction: memory and cold-tier
+        // content fetched mid-turn is redacted before it goes back upstream.
+        // Gated on the flag, not on outbound spans — a clean prompt can
+        // still retrieve secrets mid-turn.
+        redact: state
+            .config
+            .redact_sensitive
+            .then(|| crate::redact::RedactRef {
+                store: state.redact_store.clone(),
+                session_key: redact_session_key.clone(),
+            }),
     });
 
     if upstream_status != StatusCode::OK {
@@ -1222,6 +1280,17 @@ pub async fn handle_messages(
             // once, under the model the client actually got served on.
             drop(outcome_ctx);
             drop(upstream_resp);
+            if redacted {
+                // The fallback serves the client's own model, whose client
+                // must see real paths — unredact first, or every tool call
+                // lands on a placeholder file that does not exist.
+                crate::redact::unredact_body(&state.redact_store, &redact_session_key, &mut parsed);
+                tracing::info!(
+                    event = "routed_redact_fallback_unredacted",
+                    request_id = %request_id,
+                    "fallback serves the client's model on restored text"
+                );
+            }
             return dispatch_route_fallback(
                 state,
                 client_addr,
@@ -1343,6 +1412,11 @@ async fn handle_routed_error_response(
     if let Some(ctx) = outcome.as_ref() {
         book_routed_outcome(ctx, None, 0, 0.0, upstream_status.as_u16() as i64);
     }
+    // An error body can echo the redacted request; restore before handing it
+    // to the client like any other inbound body.
+    let body_text =
+        String::from_utf8_lossy(&restore_buffered(outcome.as_ref(), body_text.into_bytes()))
+            .into_owned();
     tracing::warn!(
         event = "local_model_upstream_error",
         status = upstream_status.as_u16(),
@@ -1394,6 +1468,7 @@ async fn resolve_routed_ccr(
         &ccr.request_id,
         &ccr.headers,
         provider,
+        ccr.redact.clone(),
     )
     .await;
     match serde_json::from_slice(&resolved) {
@@ -1471,6 +1546,7 @@ async fn resolve_routed_memory(
         &ccr.request_id,
         &ccr.headers,
         provider,
+        ccr.redact.clone(),
     )
     .await;
     match serde_json::from_slice(&resolved) {
@@ -1503,6 +1579,92 @@ pub(crate) struct RoutedCcr {
     /// True when the upstream is the Responses API rather than
     /// chat-completions. The two disagree about where tool calls live.
     pub responses_shape: bool,
+    /// Redaction memory for continuations this turn: content fetched mid-turn
+    /// (memory answers, cold-tier blocks) is redacted before it joins an
+    /// upstream-bound continuation. `None` when the outbound body needed no
+    /// redaction — or the flag is off — and continuations pass through.
+    pub redact: Option<crate::redact::RedactRef>,
+}
+
+// ---------------------------------------------------------------------------
+// Reversible redaction: placeholders out, originals back before the client.
+// ---------------------------------------------------------------------------
+
+/// Redact one outbound body. True when anything was rewritten — only then do
+/// the response arms get the store. A turn with nothing sensitive keeps the
+/// zero-overhead path: no map snapshot, no restore pass.
+fn maybe_redact_outbound(
+    store: &crate::redact::RedactStore,
+    session_key: &str,
+    parsed: &mut Value,
+    request_id: &str,
+) -> bool {
+    let report = crate::redact::redact_body(store, session_key, parsed);
+    if report.spans_redacted > 0 {
+        tracing::info!(
+            event = "routed_redact_outbound",
+            request_id = %request_id,
+            spans_redacted = report.spans_redacted,
+            placeholders_live = report.placeholders_live,
+            "redacted sensitive spans before translation"
+        );
+    }
+    report.spans_redacted > 0
+}
+
+/// Restore placeholders in a buffered body about to go to the client.
+/// Nothing logged but counts: values stay in the map.
+fn restore_buffered(outcome: Option<&RoutedOutcomeContext>, mut body: Vec<u8>) -> Vec<u8> {
+    let request_id = outcome.map(|c| c.request_id.as_str()).unwrap_or("");
+    let Some(ctx) = outcome else { return body };
+    let Some(store) = ctx.redact_store.as_ref() else {
+        return body;
+    };
+    let Some(table) = crate::redact::restore_table(store, &ctx.session_key) else {
+        return body;
+    };
+    let (out, misses) = table.restore_bytes(&body);
+    if misses > 0 {
+        tracing::warn!(
+            event = "routed_redact_restore_miss",
+            request_id = %request_id,
+            misses,
+            "placeholders the map could not restore; left as-is"
+        );
+    }
+    body = out;
+    body
+}
+
+/// Wrap a translated SSE stream with placeholder restore. Chunk-boundary
+/// safe: a token split across two chunks still restores. `None` passes the
+/// stream through untouched.
+fn restore_streaming<S, E>(
+    table: Option<crate::redact::RestoreTable>,
+    request_id: &str,
+    stream: S,
+) -> axum::body::Body
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+{
+    let Some(table) = table else {
+        return axum::body::Body::from_stream(stream);
+    };
+    tracing::info!(
+        event = "routed_redact_stream",
+        request_id = %request_id,
+        "restoring placeholders on the routed stream"
+    );
+    axum::body::Body::from_stream(crate::redact::restore_stream(stream, table))
+}
+
+/// Snapshot this turn's restore table, if it redacted. Taken before `outcome`
+/// moves into the stream translator.
+fn redact_table_for(outcome: Option<&RoutedOutcomeContext>) -> Option<crate::redact::RestoreTable> {
+    let ctx = outcome?;
+    let store = ctx.redact_store.as_ref()?;
+    crate::redact::restore_table(store, &ctx.session_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1601,7 +1763,7 @@ async fn handle_buffered_response(
 
     let anthropic_response = openai_to_anthropic_response(&openai_body, original);
 
-    let body_bytes = match serde_json::to_vec(&anthropic_response) {
+    let mut body_bytes = match serde_json::to_vec(&anthropic_response) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(
@@ -1615,6 +1777,7 @@ async fn handle_buffered_response(
                 .expect("static response");
         }
     };
+    body_bytes = restore_buffered(outcome.as_ref(), body_bytes);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1660,8 +1823,8 @@ async fn handle_buffered_responses_response(
     let anthropic_response =
         crate::sse::ccr_stream::responses_output_as_anthropic_turn(&resolved, original);
 
-    let body_bytes = match serde_json::to_vec(&anthropic_response) {
-        Ok(b) => Bytes::from(b),
+    let mut body_bytes = match serde_json::to_vec(&anthropic_response) {
+        Ok(b) => b,
         Err(e) => {
             tracing::warn!(
                 event = "local_model_serialize_error",
@@ -1674,6 +1837,7 @@ async fn handle_buffered_responses_response(
                 .expect("static response");
         }
     };
+    body_bytes = restore_buffered(outcome.as_ref(), body_bytes);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1705,6 +1869,12 @@ async fn handle_streaming_response(
         codex_limits.record_headers(&original_model, upstream_resp.headers());
 
     let stream = upstream_resp.bytes_stream();
+    // Snapshot before `outcome` moves into the translator below.
+    let request_id = outcome
+        .as_ref()
+        .map(|c| c.request_id.clone())
+        .unwrap_or_default();
+    let redact_table = redact_table_for(outcome.as_ref());
     let translated_stream = translate_openai_stream_to_anthropic(
         stream,
         original_model,
@@ -1736,7 +1906,9 @@ async fn handle_streaming_response(
                             url = %ccr.upstream_url,
                             "cannot resolve headroom_retrieve on this turn"
                         );
-                        return streaming_body_response(axum::body::Body::from_stream(
+                        return streaming_body_response(restore_streaming(
+                            redact_table,
+                            &request_id,
                             translated_stream,
                         ));
                     }
@@ -1767,12 +1939,15 @@ async fn handle_streaming_response(
                 // rewriter watches for a tool the model was never handed.
                 // Narrowing this gate would reopen the bug above.
                 memory: ccr.memory,
+                // Continuations inherit the turn's redaction (see
+                // `RoutedCcr::redact`).
+                redact: ccr.redact,
             };
             let (rewritten, _usage) =
                 crate::sse::ccr_stream::rewrite_anthropic_stream(translated_stream, ctx);
-            axum::body::Body::from_stream(rewritten)
+            restore_streaming(redact_table, &request_id, rewritten)
         }
-        None => axum::body::Body::from_stream(translated_stream),
+        None => restore_streaming(redact_table, &request_id, translated_stream),
     };
 
     streaming_body_response(body)
@@ -2216,6 +2391,7 @@ mod tests {
             transforms_applied: vec!["ctx_offload".to_string()],
             tokens_saved: 4_522,
             session_key: "sess-stale".to_string(),
+            lane_key: "sess-stale".to_string(),
         };
         let compression_report = CompressionReport::default();
 
@@ -2725,6 +2901,7 @@ mod resolver_alternation_tests {
             )),
             request_id: "req-alt".to_string(),
             responses_shape: false,
+            redact: None,
         };
 
         let opening = turn_calling("memory_search", "{\"query\":\"anything\"}");
@@ -2765,6 +2942,7 @@ mod resolver_alternation_tests {
             )),
             request_id: "req-none".to_string(),
             responses_shape: false,
+            redact: None,
         };
 
         let plain = serde_json::json!({
@@ -2784,6 +2962,103 @@ mod resolver_alternation_tests {
                 .unwrap_or_default()
                 .is_empty(),
             "an idle pass must not call upstream"
+        );
+    }
+
+    /// A memory answer fetched mid-turn is upstream-bound content: the
+    /// continuation must carry the placeholder, never the secret — even when
+    /// the outbound prompt was clean and only the flag armed the turn.
+    #[tokio::test]
+    async fn memory_answers_are_redacted_before_the_continuation_goes_upstream() {
+        use crate::memory::backend::MemoryBackend;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = Arc::new(crate::memory::local_backend::LocalMemoryBackend::new());
+        backend
+            .save_memory(
+                "deploy key sk-abcdefghij1234567890 for staging",
+                "u1",
+                1.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut handler = crate::memory::handler::MemoryHandler::new(
+            crate::memory::handler::MemoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            "test",
+        );
+        handler.set_backend(backend);
+        let handler = Arc::new(handler);
+        let memory = crate::proxy::MemoryToolContext {
+            handler: handler.clone(),
+            provider: crate::memory::tool_adapter::Provider::Openai,
+            user_id: "u1".to_string(),
+        };
+
+        let redact_store = crate::redact::RedactStore::new();
+        let ccr = RoutedCcr {
+            stores: None,
+            store: Arc::new(InMemoryCcrStore::new()),
+            memory: Some(memory),
+            client: reqwest::Client::new(),
+            upstream_url: format!("{}/v1/chat/completions", server.uri()),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "gpt-x",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            ),
+            config: Arc::new(crate::config::Config::for_test(
+                server.uri().parse().unwrap(),
+            )),
+            request_id: "req-mem-redact".to_string(),
+            responses_shape: false,
+            redact: Some(crate::redact::RedactRef {
+                store: redact_store,
+                session_key: "sess-mem".to_string(),
+            }),
+        };
+
+        let opening = turn_calling("memory_search", "{\"query\":\"deploy key\"}");
+        let (resolved, _) = resolve_routed_proxy_tools(&opening, &ccr).await;
+        assert_eq!(resolved["choices"][0]["message"]["content"], "done");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(!received.is_empty(), "the continuation must have run");
+        let sent: String = received
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            !sent.contains("sk-abcdefghij1234567890"),
+            "the secret must never go upstream"
+        );
+        assert!(
+            sent.contains("__HR_SECRET_"),
+            "the continuation carries the placeholder: {sent}"
         );
     }
 }

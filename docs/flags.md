@@ -378,6 +378,13 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --redact-sensitive <REDACT_SENSITIVE>
+          Reversibly redact home-rooted paths, secrets and emails on routed translate paths, restoring them at the client edge. The map lives in process memory only. Default `false`: rewriting text the client sent is opt-in, like the other body rewrites
+          
+          [env: HEADROOM_PROXY_REDACT_SENSITIVE=]
+          [default: false]
+          [possible values: true, false]
+
       --force-1h-cache-ttl <FORCE_1H_CACHE_TTL>
           B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached prefix survives idle gaps past the 5-minute default. Anthropic only, and skipped on PAYG — a 1h write is priced at 2× base input against 1.25× for 5m, so it is free on a subscription (where writes are token-counted for the usage window) and 60% dearer in dollars on an API key.
           

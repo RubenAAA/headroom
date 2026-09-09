@@ -82,6 +82,8 @@ pub(crate) fn build_routed_outcome_context(
         upstream_attempts: 1,
         // Filled in by the handler, which is where the routing decision is.
         reroute: None,
+        // Filled in by the handler when it redacts; see above.
+        redact_store: None,
     })
 }
 
@@ -143,6 +145,10 @@ pub(crate) struct RoutedOutcomeContext {
     /// client. Drives the `model_route_served` line that closes out the
     /// `model_route_rerouted` line opened at request time.
     pub(crate) reroute: Option<RerouteOrigin>,
+    /// Redaction memory for this turn's session, set by the handler when
+    /// `--redact-sensitive` redacted the outbound body. Response arms restore
+    /// placeholders through it before anything reaches the client.
+    pub(crate) redact_store: Option<crate::redact::RedactStore>,
 }
 
 /// The two model ids a rerouted turn ran under.
@@ -304,6 +310,7 @@ mod tests {
             session_key: "sess-test".to_string(),
             usage_observer: None,
             reroute,
+            redact_store: None,
         }
     }
 

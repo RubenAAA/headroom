@@ -26,18 +26,38 @@ def git(*args):
     return r.stdout
 
 
-def my_threads(iid):
-    """The threads I opened, plus the timestamp of my earliest note.
+def select_threads(discussions, me, mode):
+    """Which threads get replies, by command. Pure -- takes what the API
+    returned, fetches nothing, so it stays testable without a token.
+
+    gitlab-review: follow-ups on threads I opened. My objections, their
+    answers; the verdict is whether the objection still stands.
+
+    fix-mr-comments: reviewers' threads on my MR that are still open. On my
+    own MR there is nothing to draft on a thread I opened myself -- those
+    are self-notes -- and a resolved thread needs no reply. Scoping this to
+    "threads I opened" drafted nothing on exactly the MRs the command is
+    for (MR !554: 44 threads, 20 open, zero opened by me).
+    """
+    ds = [d for d in discussions
+          if not d.get("individual_note") and d.get("notes")]
+    if mode == "fix-mr-comments":
+        return [d for d in ds
+                if not d.get("resolved")
+                and d["notes"][0].get("author", {}).get("username") != me]
+    return [d for d in ds
+            if d["notes"][0].get("author", {}).get("username") == me]
+
+
+def my_threads(iid, mode="gitlab-review"):
+    """The in-scope threads, plus the timestamp of the earliest opening note.
 
     Shared with the drafter so both halves agree on whose threads are in scope;
     a drafter that disagreed with the dossier about that is how a reply once
     landed on another reviewer's thread.
     """
     ds = [d for d in gl.discussions(iid) if not d.get("individual_note")]
-    mine = [
-        d for d in ds
-        if d.get("notes") and d["notes"][0].get("author", {}).get("username") == ME
-    ]
+    mine = select_threads(ds, ME, mode)
     if not mine:
         return [], None
     return mine, min(d["notes"][0]["created_at"] for d in mine)

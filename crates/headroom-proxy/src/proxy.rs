@@ -21,7 +21,8 @@ use http_body_util::BodyExt;
 use crate::cache_stabilization;
 use crate::cache_stabilization::beta_sticky::BetaProvider;
 use crate::cache_stabilization::drift_detector::{
-    compute_structural_hash, derive_session_key, observe_drift, ApiKind, DriftState,
+    compute_structural_hash, derive_session_key, observe_drift, stream_lane_key, ApiKind,
+    DriftState,
 };
 use crate::cache_stabilization::prefix_replay::{SessionReplayStore, REPLAY_STORE_CAPACITY};
 use crate::compression;
@@ -89,6 +90,10 @@ pub struct AppState {
     /// request, after tools are final.
     pub tool_order_state: cache_stabilization::tool_order::ToolOrderStore,
     pub roster_pin_state: cache_stabilization::tool_roster_pin::RosterPinStore,
+    /// Reversible redaction memory (placeholder <-> original per session).
+    /// Read and written on routed translate paths when `--redact-sensitive`
+    /// is on; in-memory only, never serialized or logged.
+    pub redact_store: crate::redact::RedactStore,
     /// Session-sticky beta-header tracker (parity port of the Python
     /// `SessionBetaTracker`, PR-A6): per-`(provider, session)` LRU of
     /// `anthropic-beta` / `openai-beta` tokens, unioned across turns
@@ -689,6 +694,7 @@ impl AppState {
             outbound_drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
             tool_order_state: cache_stabilization::tool_order::ToolOrderStore::default(),
             roster_pin_state: cache_stabilization::tool_roster_pin::RosterPinStore::default(),
+            redact_store: crate::redact::RedactStore::new(),
             replay_store,
             working_dir_pins: cache_stabilization::working_dir::WorkingDirPins::new(
                 REPLAY_STORE_CAPACITY,
@@ -2434,6 +2440,52 @@ pub(crate) fn apply_system_holds(
     }
 }
 
+/// Inherit hold pins along message lineage onto a fresh lane, before the
+/// preview/hold stages read them.
+///
+/// A lane switch (`cd`, preamble edit) mints a lane with no pins, so the
+/// preview misses and the hold latches the live form — even when the new
+/// lane continues another lane's history, in which case the lineage's pin is
+/// still the right one and the turn replays at zero cost instead of
+/// re-caching. The donor bar is the adoption bar (same floor, same head
+/// match), so an unrelated stream can never donate; a lane that already
+/// latched its own pin keeps it.
+///
+/// The probe reads the same snapshot replay does, on both paths, so there
+/// is no injection skew to be best-effort about: the Claude hook runs on
+/// `parsed` (client bytes — injection, CCR expansion, offload and the
+/// thinking strip all mutate downstream copies), and the replay snapshot,
+/// the stored histories and the adoption search all derive from those same
+/// client bytes. The routed hook runs post-CTX-transforms for the same
+/// reason — that path's replay snapshot is taken there too. When no donor
+/// is found this is a silent no-op and the adoption gate still keeps the
+/// turn honest.
+pub(crate) fn inherit_lane_pins(
+    state: &AppState,
+    lane_key: &str,
+    messages: &[serde_json::Value],
+    request_id: &str,
+) -> Option<String> {
+    if lane_key.is_empty() {
+        return None;
+    }
+    let donor = state.replay_store.lineage_donor_lane(lane_key, messages)?;
+    let dir = state.working_dir_pins.inherit_pin(&donor, lane_key);
+    let sentence = state.role_sentence_pins.inherit_pin(&donor, lane_key);
+    if dir || sentence {
+        tracing::info!(
+            event = "lane_pins_inherited",
+            request_id = %request_id,
+            donor_lane_hash = %cache_stabilization::drift_detector::session_key_log_prefix(&donor),
+            lane_hash = %cache_stabilization::drift_detector::session_key_log_prefix(lane_key),
+            working_dir = dir,
+            role_sentence = sentence,
+            "a lane switch continues another lane's history; its hold pins travel with it"
+        );
+    }
+    Some(donor)
+}
+
 /// [`apply_system_holds`] for a caller that holds bytes.
 ///
 /// Byte-equal passthrough when nothing was held, so a turn no hold
@@ -3520,6 +3572,15 @@ pub(crate) async fn forward_http(
         // inside the parse below so it shares that parse and is identical
         // to the drift detector's key by construction.
         let mut request_session_key = String::new();
+        // Per-stream lane inside the session: same-opener subagent streams
+        // share the session key but carry different systems, and keying the
+        // drift baseline / replay tracker / pins by session lets them wipe
+        // each other's state on every alternation. The lane is derived from
+        // the UNMUTATED body (previews below borrow it briefly and put it
+        // back byte-identical, so the key is the same either way) and every
+        // behavior store downstream takes it instead of the session key.
+        // Logging keeps the session hash so existing queries still join.
+        let mut request_lane_key = String::new();
         // Same reason, for the conversation the turn belongs to. The
         // fingerprint below is diffed turn-against-turn offline, and the
         // session key alone cannot separate two conversations sharing one
@@ -3562,9 +3623,20 @@ pub(crate) async fn forward_http(
             let session_identity = match (drift_kind, headers_snapshot.as_ref()) {
                 (Some(kind), Some(headers)) => {
                     let key = derive_session_key(headers, &client_addr, &parsed, kind);
+                    // Lane before the previews: the pins key by it, and the
+                    // drift baseline, replay store, and observer below take it
+                    // too. One extra structural hash on the unmutated body;
+                    // the previews restore byte-identical, so this is the same
+                    // lane the post-preview hash below would derive.
+                    let lane = stream_lane_key(&key, &compute_structural_hash(&parsed, kind));
+                    // Lane, not session: the usage observer files this turn
+                    // under the lane (begin_request below), and the volatile
+                    // warnings and turn fingerprint join on this key — a
+                    // session key would silently split one lane into two
+                    // conversations offline.
                     let conversation =
-                        cache_stabilization::usage_observer::conversation_key(&parsed, &key);
-                    Some((kind, key, conversation))
+                        cache_stabilization::usage_observer::conversation_key(&parsed, &lane);
+                    Some((kind, key, conversation, lane))
                 }
                 _ => None,
             };
@@ -3575,21 +3647,31 @@ pub(crate) async fn forward_http(
                 // causing. Item 4 cannot be settled without it: the warning
                 // fires on static sample text as readily as on real per-request
                 // churn, and only a per-conversation join tells the two apart.
-                let session_hash = session_identity.as_ref().map(|(_, key, _)| {
+                let session_hash = session_identity.as_ref().map(|(_, key, _, _)| {
                     cache_stabilization::drift_detector::session_key_log_prefix(key)
                 });
                 cache_stabilization::volatile_detector::emit_volatile_warnings(
                     &findings,
                     &request_id,
                     session_hash.as_deref(),
-                    session_identity.as_ref().map(|(_, _, conv)| conv.as_str()),
+                    session_identity
+                        .as_ref()
+                        .map(|(_, _, conv, _)| conv.as_str()),
                 );
             }
 
-            if let Some((kind, session_key, conversation)) = session_identity {
+            if let Some((kind, session_key, conversation, lane)) = session_identity {
                 request_session_key = session_key.clone();
                 request_conversation_key = conversation.clone();
                 request_api_kind = Some(kind);
+                request_lane_key = lane;
+                // A lane switch that continues another lane's message lineage
+                // inherits its hold pins before the previews below read them;
+                // without this the fresh lane latches the live form and the
+                // `cd` the holds exist to mask costs a full rewrite.
+                if let Some(messages) = parsed.get("messages").and_then(|m| m.as_array()) {
+                    inherit_lane_pins(&state, &request_lane_key, messages, &request_id);
+                }
                 // Hash the body the way it will be forwarded. The
                 // working-directory hold rewrites `system` further down, so
                 // hashing the client's own form calls a `cd` a hot-zone change
@@ -3600,7 +3682,9 @@ pub(crate) async fn forward_http(
                     && state.config.prefix_replay
                     && matches!(kind, ApiKind::Anthropic)
                 {
-                    state.working_dir_pins.preview(&mut parsed, &session_key)
+                    state
+                        .working_dir_pins
+                        .preview(&mut parsed, &request_lane_key)
                 } else {
                     None
                 };
@@ -3610,7 +3694,9 @@ pub(crate) async fn forward_http(
                     && state.config.prefix_replay
                     && matches!(kind, ApiKind::Anthropic)
                 {
-                    state.role_sentence_pins.preview(&mut parsed, &session_key)
+                    state
+                        .role_sentence_pins
+                        .preview(&mut parsed, &request_lane_key)
                 } else {
                     None
                 };
@@ -3624,17 +3710,20 @@ pub(crate) async fn forward_http(
                 if let (Some(original), Some(slot)) = (previewed, parsed.get_mut("system")) {
                     *slot = original;
                 }
-                let drift_dims = observe_drift(&state.drift_state, &session_key, hash);
+                let drift_dims = observe_drift(&state.drift_state, &request_lane_key, hash);
                 rebuild_boundary = drift_dims.is_some();
 
-                // The hot zone changed, so every prefix this session had
+                // The hot zone changed, so every prefix this lane had
                 // cached shares a preamble the provider no longer holds —
                 // including the alternates, which are prefixes for the same
                 // dead cache. Drop them before `apply_prefix_replay` runs
                 // below, so the next turn opens a fresh chain instead of
-                // splicing bytes against a cache that is gone.
+                // splicing bytes against a cache that is gone. A lane switch
+                // (same session, new system) does NOT land here — it mints a
+                // fresh baseline with no warn — so sibling streams stop
+                // invalidating each other.
                 if rebuild_boundary {
-                    state.replay_store.invalidate(&session_key);
+                    state.replay_store.invalidate(&request_lane_key);
                     tracing::info!(
                         event = "prefix_replay_invalidated_on_rebuild",
                         request_id = %request_id,
@@ -3646,10 +3735,14 @@ pub(crate) async fn forward_http(
                 // CTX-7: park conversation identity + drift dims under
                 // the request id so the response-side usage observer
                 // can classify this turn's billed usage against the
-                // conversation's previous turn.
+                // conversation's previous turn. Keyed by lane, not session:
+                // same-opener streams must not share usage baselines.
                 state.usage_observer.begin_request(
                     &request_id,
-                    conversation,
+                    cache_stabilization::usage_observer::conversation_key(
+                        &parsed,
+                        &request_lane_key,
+                    ),
                     Some(session_key.as_str()),
                     drift_dims,
                     Some(cache_stabilization::usage_observer::prefix_fingerprint(
@@ -3718,7 +3811,7 @@ pub(crate) async fn forward_http(
                     cache_stabilization::beta_sticky::apply_sticky_betas(
                         &state.beta_sticky,
                         provider,
-                        &session_key,
+                        &request_lane_key,
                         &mut outgoing_headers,
                         &request_id,
                     );
@@ -3924,7 +4017,7 @@ pub(crate) async fn forward_http(
                 messages.len() > 1
                     && state
                         .replay_store
-                        .history_will_be_rewritten(&request_session_key, messages)
+                        .history_will_be_rewritten(&request_lane_key, messages)
             });
         let offload_boundary = rebuild_boundary || history_rewritten;
 
@@ -3972,7 +4065,7 @@ pub(crate) async fn forward_http(
                                 .and_then(|m| {
                                     state
                                         .replay_store
-                                        .agreed_prefix_len(&request_session_key, m)
+                                        .agreed_prefix_len(&request_lane_key, m)
                                 })
                                 .map_or(-1_i64, |n| n as i64),
                             // The head as the provider actually holds it. The
@@ -3985,7 +4078,7 @@ pub(crate) async fn forward_http(
                                 .and_then(|m| {
                                     state
                                         .replay_store
-                                        .forwarded_agreement_len(&request_session_key, m)
+                                        .forwarded_agreement_len(&request_lane_key, m)
                                 })
                                 .map_or(-1_i64, |n| n as i64),
                             incoming_msgs = replay_original_messages
@@ -4086,7 +4179,7 @@ pub(crate) async fn forward_http(
                             let forwarded_before = state.config.prefix_replay.then(|| {
                                 state
                                     .replay_store
-                                    .forwarded_message_count(&request_session_key)
+                                    .forwarded_message_count(&request_lane_key)
                             });
                             let ccr = runtime.store.ccr();
                             let put = |record: &crate::compression::ctx_offload::OffloadRecord| {
@@ -4171,7 +4264,7 @@ pub(crate) async fn forward_http(
                                 bytes_after_deepest_deferral = out.bytes_after_deepest_deferral,
                                 turns_seen = state
                                     .replay_store
-                                    .turns_seen(&request_session_key)
+                                    .turns_seen(&request_lane_key)
                                     .map_or(-1, |t| t as i64),
                                 window_offloads = out.window_offloads,
                                 tokens_saved = out.tokens_saved,
@@ -4998,7 +5091,7 @@ pub(crate) async fn forward_http(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
         ) {
-            apply_system_holds_to_bytes(&state, body_to_send, &request_session_key, &request_id)
+            apply_system_holds_to_bytes(&state, body_to_send, &request_lane_key, &request_id)
         } else {
             body_to_send
         };
@@ -5033,10 +5126,10 @@ pub(crate) async fn forward_http(
         let body_to_send = match (replay_original_messages, headers_snapshot.as_ref()) {
             // `_headers` is matched, not used: the key was derived once above
             // from the unmutated body. The arm still guards on `Some` because
-            // `request_session_key` is empty without headers, which would key
+            // `request_lane_key` is empty without headers, which would key
             // every session into one replay slot.
             (Some(original_messages), Some(_headers)) => {
-                let session_key = request_session_key.clone();
+                let session_key = request_lane_key.clone();
                 apply_prefix_replay(
                     &state.replay_store,
                     &session_key,
@@ -5055,8 +5148,7 @@ pub(crate) async fn forward_http(
         // The replay stage above may have adopted another session's prefix
         // for this turn. Hand the donor to the observer so the first-turn
         // event files it as session-key drift rather than new history.
-        if let Some(donor_session_key_hash) = state.replay_store.take_adoption(&request_session_key)
-        {
+        if let Some(donor_session_key_hash) = state.replay_store.take_adoption(&request_lane_key) {
             state.usage_observer.note_prefix_adoption(
                 &request_id,
                 cache_stabilization::usage_observer::PrefixAdoption {
@@ -5179,7 +5271,7 @@ pub(crate) async fn forward_http(
             maybe_pin_tool_roster(
                 body_to_send,
                 &state.roster_pin_state,
-                &request_session_key,
+                &request_lane_key,
                 &request_id,
             )
         } else {
@@ -5194,7 +5286,7 @@ pub(crate) async fn forward_http(
             maybe_stabilize_tool_order(
                 body_to_send,
                 &state.tool_order_state,
-                &request_session_key,
+                &request_lane_key,
                 &request_id,
             )
         } else {
@@ -5363,7 +5455,24 @@ pub(crate) async fn forward_http(
             );
             // Same site, same bytes: this is what actually left the proxy, so
             // the fingerprints describe the prefix the provider keyed on.
-            log_prefix_composition(&request_id, &request_session_key, &body_to_send);
+            // Lane, not session: the roster baseline below is per prefix
+            // lineage, and sibling lanes carry different tool sets —
+            // sharing one baseline reads every alternation as churn.
+            log_prefix_composition(&request_id, &request_lane_key, &body_to_send);
+            // Tool-use pairing on the exact wire bytes, attributed against
+            // the client's own: a turn the provider is about to refuse for
+            // an unpaired tool_use gets named here first, with who broke it.
+            if matches!(
+                endpoint,
+                compression::CompressibleEndpoint::AnthropicMessages
+            ) {
+                check_outbound_tool_pairing(
+                    &request_id,
+                    &request_session_key,
+                    &original_buffered,
+                    &body_to_send,
+                );
+            }
             // Feed the ground-truth ledger. Sizes come off the wire, and the
             // arm label makes a compression-on vs compression-off comparison a
             // query instead of an argument.
@@ -5398,7 +5507,7 @@ pub(crate) async fn forward_http(
                 .and_then(|sent| {
                     cache_stabilization::drift_detector::observe_outbound_drift(
                         &state.outbound_drift_state,
-                        &request_session_key,
+                        &request_lane_key,
                         compute_structural_hash(&sent, kind),
                     )
                 });
@@ -5941,6 +6050,8 @@ pub(crate) async fn forward_http(
                 &original_buffered,
             )
             .await,
+            // Anthropic path: redaction lives on routed translate paths only.
+            redact: None,
         };
         let (stream, usage) = crate::sse::ccr_stream::rewrite_anthropic_stream(upstream_body, ctx);
         (Box::pin(stream), Some(usage))
@@ -6196,6 +6307,9 @@ pub(crate) async fn forward_http(
                                 &request_id,
                                 &outgoing_headers,
                                 ccr_provider,
+                                // Anthropic path: redaction lives on routed
+                                // translate paths only.
+                                None,
                             )
                             .await;
                             body_bytes = resolved;
@@ -6214,6 +6328,7 @@ pub(crate) async fn forward_http(
                             &request_id,
                             &outgoing_headers,
                             provider,
+                            None,
                         )
                         .await;
                         body_bytes = resolved;
@@ -7469,6 +7584,247 @@ fn note_tool_roster(session_key: &str, request_id: &str, names: &[&str]) {
     );
 }
 
+/// One `tool_use` block with no matching `tool_result` in the next message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairingOffense {
+    message_index: usize,
+    tool_use_id: String,
+}
+
+/// Every `tool_use` in `body` that the upstream would refuse: Anthropic
+/// requires each one (except in the final message, where a turn may legally
+/// end on a tool call whose result arrives next turn) to have a
+/// `tool_result` carrying its id in the immediately following message.
+/// Blocks without a string id are skipped — a missing id is a different
+/// malformation with its own error, and flagging it here would misname it.
+fn outbound_tool_pairing_offenses(body: &serde_json::Value) -> Vec<PairingOffense> {
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let mut offenses = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if index + 1 >= messages.len() {
+            break;
+        }
+        let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let Some(id) = block
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let answered = messages[index + 1]
+                .get("content")
+                .and_then(|c| c.as_array())
+                .is_some_and(|results| {
+                    results.iter().any(|r| {
+                        r.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                            && r.get("tool_use_id").and_then(|v| v.as_str()) == Some(id)
+                    })
+                });
+            if !answered {
+                offenses.push(PairingOffense {
+                    message_index: index,
+                    tool_use_id: id.to_string(),
+                });
+            }
+        }
+    }
+    offenses
+}
+
+/// Boundary between "the client sent it broken" and "a pipeline stage broke
+/// it", logged at the wire-footprint site on the exact bytes about to leave.
+/// Runs only on Anthropic-shaped bodies: other wire formats pair calls
+/// differently, and applying this rule to them would false-positive.
+///
+/// Log-only in both cases. An unanswerable `tool_use` cannot be repaired —
+/// its result does not exist anywhere — so blocking would only swap whose
+/// 400 the client sees. What this buys is attribution the `upstream_rejected`
+/// line cannot give: whether to look at the client's transcript or at the
+/// stages between it and the wire.
+fn check_outbound_tool_pairing(
+    request_id: &str,
+    session_key: &str,
+    client_body: &[u8],
+    wire_body: &[u8],
+) {
+    // Cheap gate first: no `tool_use` substring anywhere means no offense is
+    // possible, and most turns carry none. Over-approximate on purpose
+    // (`tool_use_id` contains it too) — the parse below decides.
+    const MARKER: &[u8] = b"tool_use";
+    if !wire_body
+        .windows(MARKER.len())
+        .any(|window| window == MARKER)
+    {
+        return;
+    }
+    let Ok(wire) = serde_json::from_slice::<serde_json::Value>(wire_body) else {
+        return;
+    };
+    let offenses = outbound_tool_pairing_offenses(&wire);
+    if offenses.is_empty() {
+        return;
+    }
+    // Attribute: an offense already present in the client's own bytes was
+    // sent broken (interrupted flow, compaction seam, concurrent writers to
+    // one transcript). Anything else unpaired at the wire but paired on
+    // arrival, a pipeline stage unpaired.
+    let client_broken: std::collections::HashSet<String> =
+        serde_json::from_slice::<serde_json::Value>(client_body)
+            .map(|client| outbound_tool_pairing_offenses(&client))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|offense| offense.tool_use_id)
+            .collect();
+    for offense in offenses.iter().take(10) {
+        tracing::warn!(
+            target: "headroom.proxy",
+            event = "outbound_tool_pairing_broken",
+            request_id = %request_id,
+            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+            message_index = offense.message_index,
+            tool_use_id = %offense.tool_use_id,
+            offenses_total = offenses.len(),
+            origin = if client_broken.contains(&offense.tool_use_id) {
+                "client"
+            } else {
+                "proxy"
+            },
+            "assistant tool_use has no matching tool_result in the next message; \
+             forwarding anyway — the upstream will refuse this turn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outbound_tool_pairing_tests {
+    use super::*;
+    use serde_json::json;
+    use serde_json::Value;
+
+    fn tool_use(id: &str) -> Value {
+        json!({"type": "tool_use", "id": id, "name": "bash", "input": {}})
+    }
+
+    fn tool_result(id: &str) -> Value {
+        json!({"type": "tool_result", "tool_use_id": id, "content": "ok"})
+    }
+
+    fn user_msg(blocks: Vec<Value>) -> Value {
+        json!({"role": "user", "content": blocks})
+    }
+
+    fn assistant_msg(blocks: Vec<Value>) -> Value {
+        json!({"role": "assistant", "content": blocks})
+    }
+
+    fn body(messages: Vec<Value>) -> Value {
+        json!({"model": "m", "messages": messages})
+    }
+
+    #[test]
+    fn paired_turn_has_no_offenses() {
+        let b = body(vec![
+            user_msg(vec![json!({"type": "text", "text": "run it"})]),
+            assistant_msg(vec![tool_use("call_1")]),
+            user_msg(vec![tool_result("call_1")]),
+            assistant_msg(vec![json!({"type": "text", "text": "done"})]),
+        ]);
+        assert!(outbound_tool_pairing_offenses(&b).is_empty());
+    }
+
+    /// The incident shape: a `tool_use` whose next message carries no result
+    /// for it is exactly what the upstream refuses.
+    #[test]
+    fn orphan_tool_use_is_named_with_index_and_id() {
+        let b = body(vec![
+            user_msg(vec![json!({"type": "text", "text": "run it"})]),
+            assistant_msg(vec![tool_use("call_9")]),
+            user_msg(vec![json!({"type": "text", "text": "meanwhile"})]),
+            assistant_msg(vec![json!({"type": "text", "text": "done"})]),
+        ]);
+        assert_eq!(
+            outbound_tool_pairing_offenses(&b),
+            vec![PairingOffense {
+                message_index: 1,
+                tool_use_id: "call_9".to_string(),
+            }]
+        );
+    }
+
+    /// A turn may legally end on a tool call — the result arrives next turn.
+    #[test]
+    fn trailing_tool_use_is_legal() {
+        let b = body(vec![
+            user_msg(vec![json!({"type": "text", "text": "run it"})]),
+            assistant_msg(vec![tool_use("call_1")]),
+        ]);
+        assert!(outbound_tool_pairing_offenses(&b).is_empty());
+    }
+
+    #[test]
+    fn wrong_id_result_is_still_an_orphan() {
+        let b = body(vec![
+            user_msg(vec![json!({"type": "text", "text": "run it"})]),
+            assistant_msg(vec![tool_use("call_1")]),
+            user_msg(vec![tool_result("call_other")]),
+        ]);
+        assert_eq!(outbound_tool_pairing_offenses(&b).len(), 1);
+    }
+
+    /// A result two messages down does not satisfy the next-message rule.
+    #[test]
+    fn non_immediate_result_is_still_an_orphan() {
+        let b = body(vec![
+            user_msg(vec![json!({"type": "text", "text": "run it"})]),
+            assistant_msg(vec![tool_use("call_1")]),
+            user_msg(vec![json!({"type": "text", "text": "chatter"})]),
+            user_msg(vec![tool_result("call_1")]),
+        ]);
+        assert_eq!(outbound_tool_pairing_offenses(&b).len(), 1);
+    }
+
+    #[test]
+    fn blocks_without_ids_and_string_content_are_skipped() {
+        let b = body(vec![
+            user_msg(vec![json!({"type": "text", "text": "run it"})]),
+            assistant_msg(vec![json!({"type": "tool_use", "name": "bash"})]),
+            user_msg(vec![json!({"type": "text", "text": "plain string"})]),
+        ]);
+        assert!(outbound_tool_pairing_offenses(&b).is_empty());
+    }
+
+    #[test]
+    fn multiple_orphans_are_all_named() {
+        let b = body(vec![
+            assistant_msg(vec![tool_use("call_1"), tool_use("call_2")]),
+            user_msg(vec![tool_result("call_1")]),
+            assistant_msg(vec![json!({"type": "text", "text": "done"})]),
+        ]);
+        assert_eq!(
+            outbound_tool_pairing_offenses(&b),
+            vec![PairingOffense {
+                message_index: 0,
+                tool_use_id: "call_2".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn body_without_messages_has_no_offenses() {
+        assert!(outbound_tool_pairing_offenses(&json!({"model": "m"})).is_empty());
+        assert!(outbound_tool_pairing_offenses(&json!({})).is_empty());
+    }
+}
+
 fn log_prefix_composition(request_id: &str, session_key: &str, body: &[u8]) {
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
         return;
@@ -7689,12 +8045,20 @@ pub(crate) fn apply_prefix_replay(
     // Ask for the prefix THIS turn continues, not merely the session's last
     // one: several streams share a session key, and handing back another
     // stream's prefix guarantees the append-only guard rejects it and the turn
-    // forwards fresh bytes over content the provider had cached.
-    let (prev_orig, prev_fwd, prefix_miss, chain_id) =
-        match store.previous_turn_for(session_key, &original_messages) {
-            Ok((o, f, chain_id)) => (Some(o), Some(f), None, chain_id),
-            Err(miss) => (None, None, Some(miss), 0),
-        };
+    // forwards fresh bytes over content the provider had cached. The system
+    // digest gates the answer on the prefix lineage the provider actually
+    // holds: replaying stored messages under a different system is a miss
+    // that reports as a replay.
+    let current_system_hash =
+        cache_stabilization::prefix_replay::forwarded_system_digest(parsed.get("system"));
+    let (prev_orig, prev_fwd, prefix_miss, chain_id) = match store.previous_turn_for(
+        session_key,
+        &original_messages,
+        Some(&current_system_hash),
+    ) {
+        Ok((o, f, chain_id)) => (Some(o), Some(f), None, chain_id),
+        Err(miss) => (None, None, Some(miss), 0),
+    };
     let (overlaid, skip_reason) = overlay_cached_prefix_reported(
         optimized.clone(),
         &original_messages,
@@ -8025,6 +8389,7 @@ pub(crate) fn apply_prefix_replay(
         session_key,
         original_messages,
         forwarded_messages,
+        cache_stabilization::prefix_replay::forwarded_system_digest(parsed.get("system")),
     );
     final_body
 }
@@ -9549,6 +9914,7 @@ pub(crate) async fn handle_ccr_response(
     request_id: &str,
     outgoing_headers: &http::HeaderMap,
     provider: &str,
+    redact: Option<crate::redact::RedactRef>,
 ) -> (bytes::Bytes, CcrRoundUsage) {
     // Usage from every response this function replaces. The caller parses the
     // usage of the body we return, so accounting for that one here too would
@@ -9664,6 +10030,15 @@ pub(crate) async fn handle_ccr_response(
                         }
                         None => content,
                     };
+                    // Continuation bodies go back upstream: redact what the
+                    // store returned through this turn's map first. Store hits
+                    // are usually already redacted (offload ran post-redact)
+                    // and re-redacting is idempotent; cold-tier recoveries may
+                    // not be.
+                    let content = match redact.as_ref() {
+                        Some(r) => crate::redact::redact_string(r, &content),
+                        None => content,
+                    };
                     results.push(CcrToolResult {
                         tool_call_id: call.tool_call_id.clone(),
                         content,
@@ -9751,9 +10126,14 @@ pub(crate) async fn handle_ccr_response(
                                 "ccr: missing from the CCR store, recovered from the content index"
                             );
                             crate::observability::ccr_retrieval::observe_cross_project_hit();
+                            let content = format!("{CCR_INDEX_RECOVERY_NOTE}\n\n{content}");
+                            let content = match redact.as_ref() {
+                                Some(r) => crate::redact::redact_string(r, &content),
+                                None => content,
+                            };
                             results.push(CcrToolResult {
                                 tool_call_id: call.tool_call_id.clone(),
-                                content: format!("{CCR_INDEX_RECOVERY_NOTE}\n\n{content}"),
+                                content,
                                 success: true,
                                 items_retrieved: 1,
                             });
@@ -10206,6 +10586,7 @@ pub(crate) async fn handle_memory_response(
     request_id: &str,
     outgoing_headers: &http::HeaderMap,
     provider: &str,
+    redact: Option<crate::redact::RedactRef>,
 ) -> (bytes::Bytes, CcrRoundUsage) {
     use headroom_core::ccr::response_handler::CCRResponseHandler;
 
@@ -10287,7 +10668,7 @@ pub(crate) async fn handle_memory_response(
     let mut trace: Vec<String> = Vec::new();
 
     while rounds < config.ccr_max_retrieval_rounds {
-        let results: Vec<serde_json::Value> = {
+        let mut results: Vec<serde_json::Value> = {
             let handler = memory.handler.as_ref();
             if !handler.has_memory_tool_calls(&current_response, memory.provider) {
                 break;
@@ -10298,6 +10679,13 @@ pub(crate) async fn handle_memory_response(
         };
         if results.is_empty() {
             break;
+        }
+        // Memory answers come from the local store, which captured the
+        // client's real text — redact before they join the continuation.
+        if let Some(r) = redact.as_ref() {
+            for res in results.iter_mut() {
+                crate::redact::redact_value(r, res);
+            }
         }
         trace.extend(memory_trace_lines(
             &current_response,
@@ -10988,6 +11376,7 @@ mod tests {
             "req-test",
             &headers,
             "openai_responses",
+            None,
         )
         .await;
 
@@ -11038,6 +11427,7 @@ mod tests {
             "req-test",
             &http::HeaderMap::new(),
             "openai_responses",
+            None,
         )
         .await;
         assert!(round_usage.is_empty());

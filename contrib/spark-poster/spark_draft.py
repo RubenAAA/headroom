@@ -19,7 +19,11 @@ Output is the poster's schema, so `spark-goahead.sh` can take it unchanged:
      "replies": [{"discussion_id": "...", "body": "...", "resolve": false}]}
 
 Usage:
-    SPARK_REVIEW_WORKER=1 python3 spark_draft.py <iid> [session_id]
+    SPARK_REVIEW_WORKER=1 python3 spark_draft.py <iid> [session_id] [mode]
+
+Mode is the review command that armed the session: `gitlab-review`
+(default) drafts follow-ups on threads I opened; `fix-mr-comments` drafts
+answers to reviewers' still-open threads on my own MR.
 """
 
 import json
@@ -61,6 +65,31 @@ resolve is true only if the objection is fully addressed.
 EVIDENCE:
 """
 
+FIX_TASK = """You authored this merge request, and a reviewer left the thread below.
+
+Below is everything known about it: the reviewer's note, any replies so far,
+the commits that touched the anchored file since the review, and that file's
+current contents around the anchor.
+
+Decide what the code as it now stands says about the reviewer's point, then
+write the reply you would post on the thread. Say, in this order: what
+actually changed (or what you checked), whether that settles the point, and
+what follows. If you are closing, the reason for closing. If you are not,
+what is still missing and what would close it. Cite files and lines you can
+see in the evidence. Never claim a change you cannot point to. If the
+reviewer is right and nothing has changed yet, say so plainly and say what
+you will do -- do not argue the thread closed.
+
+Answer in the language the reviewer's note is written in.
+
+Output ONLY a JSON object, no prose around it:
+{"resolve": true or false, "body": "the reply text"}
+
+resolve is true only if the reviewer's point is fully addressed.
+
+EVIDENCE:
+"""
+
 
 def ask(prompt):
     env = {**os.environ,
@@ -98,17 +127,23 @@ def main():
         raise SystemExit(__doc__)
     iid = sys.argv[1]
     session = sys.argv[2] if len(sys.argv) > 2 else f"mr{iid}"
+    mode = sys.argv[3] if len(sys.argv) > 3 else "gitlab-review"
+    if mode not in ("gitlab-review", "fix-mr-comments"):
+        raise SystemExit(f"unknown mode {mode!r}: want gitlab-review or fix-mr-comments")
+    task = FIX_TASK if mode == "fix-mr-comments" else TASK
 
-    mine, first_review = td.my_threads(iid)
+    mine, first_review = td.my_threads(iid, mode)
     if not mine:
-        raise SystemExit(f"MR !{iid}: no threads opened by {td.ME}")
-    print(f"MR !{iid}: {len(mine)} threads by {td.ME}", file=sys.stderr)
+        scope = ("open reviewer threads" if mode == "fix-mr-comments"
+                 else f"threads opened by {td.ME}")
+        raise SystemExit(f"MR !{iid}: no {scope}")
+    print(f"MR !{iid} [{mode}]: {len(mine)} threads in scope", file=sys.stderr)
 
     replies, failed = [], []
     for d in mine:
         did = d["id"]
         try:
-            verdict = parse(ask(TASK + td.dossier(d, first_review)))
+            verdict = parse(ask(task + td.dossier(d, first_review)))
         except subprocess.TimeoutExpired:
             verdict = None
         if verdict:

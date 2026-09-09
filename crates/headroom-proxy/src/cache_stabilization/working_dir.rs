@@ -188,6 +188,32 @@ impl WorkingDirPins {
         }
         Some(system)
     }
+
+    /// Copy another lane's pin entry onto this lane, when this lane has none.
+    ///
+    /// A lane switch (`cd`, preamble edit) mints a lane with no pins, so the
+    /// preview misses and the hold latches the live form — even when the new
+    /// lane continues the donor's message lineage, in which case the lineage's
+    /// pin is still the right one (same conversation, same directories). The
+    /// donor comes from the replay store's lineage search, which requires the
+    /// same message agreement the adoption path does, so an unrelated stream
+    /// can never donate. The latch instant travels with the entry: the TTL
+    /// keeps expiring on the donor's clock, not restarted by the copy.
+    /// Returns whether an entry was copied.
+    pub fn inherit_pin(&self, from_key: &str, to_key: &str) -> bool {
+        if from_key == to_key {
+            return false;
+        }
+        let mut pins = self.pins.lock().expect("WorkingDirPins mutex poisoned");
+        if pins.peek(to_key).is_some() {
+            return false;
+        }
+        let Some(entry) = pins.peek(from_key).cloned() else {
+            return false;
+        };
+        pins.put(to_key.to_string(), entry);
+        true
+    }
 }
 
 /// Every working directory named in `system`, in the order they appear.
@@ -493,6 +519,54 @@ mod tests {
         assert_eq!(pins.hold(&mut b, "conv").rewrote(), None);
         let mut moved = body("/elsewhere", "user");
         assert_eq!(pins.hold(&mut moved, "conv").rewrote(), Some("/elsewhere"));
+    }
+
+    /// A lane switch continuing another lane's lineage inherits its pin: the
+    /// fresh lane previews the donor's directories instead of latching the
+    /// live form, so the `cd` the hold exists to mask costs no rewrite.
+    #[test]
+    fn inherit_pin_lends_a_donor_lanes_pin_to_a_fresh_lane() {
+        let pins = WorkingDirPins::new(4);
+        let mut first = body("/repo", "user");
+        assert_eq!(pins.hold(&mut first, "lane-a").rewrote(), None);
+        let pinned_system = first.get("system").unwrap().clone();
+
+        assert!(
+            pins.inherit_pin("lane-a", "lane-b"),
+            "donor has a pin to lend"
+        );
+        let mut moved = body("/repo/sub", "user");
+        let original = pins
+            .preview(&mut moved, "lane-b")
+            .expect("the inherited pin applies on the fresh lane");
+        assert_eq!(moved.get("system").unwrap(), &pinned_system);
+
+        // And the hold below it latches nothing new: the inherited entry
+        // stays the lane's pin, exactly as if the lane had been there.
+        *moved.get_mut("system").unwrap() = original;
+        assert_eq!(pins.hold(&mut moved, "lane-b").rewrote(), Some("/repo/sub"));
+        assert_eq!(moved.get("system").unwrap(), &pinned_system);
+    }
+
+    /// Inheritance never overwrites: a lane that latched its own pin keeps
+    /// it, so sibling streams cannot corrupt each other through the donor
+    /// search, and neither can a repeated inherit call.
+    #[test]
+    fn inherit_pin_never_overwrites_a_lanes_own_pin() {
+        let pins = WorkingDirPins::new(4);
+        let mut a = body("/repo-a", "user");
+        assert_eq!(pins.hold(&mut a, "lane-a").rewrote(), None);
+        let mut b = body("/repo-b", "user");
+        assert_eq!(pins.hold(&mut b, "lane-b").rewrote(), None);
+
+        assert!(!pins.inherit_pin("lane-a", "lane-b"), "lane-b owns its pin");
+        let mut moved = body("/repo-c", "user");
+        assert_eq!(pins.hold(&mut moved, "lane-b").rewrote(), Some("/repo-c"));
+        assert_eq!(dirs(&moved), vec!["/repo-b", "/repo-b"]);
+
+        // No donor pin, no lane: nothing to copy, nothing to break.
+        assert!(!pins.inherit_pin("ghost", "lane-c"));
+        assert!(!pins.inherit_pin("lane-a", "lane-a"));
     }
 
     /// Extra environment lines arriving with the move — entering a git worktree

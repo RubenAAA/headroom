@@ -823,6 +823,18 @@ pub struct CliArgs {
     )]
     pub cache_pin_tool_roster: bool,
 
+    /// Reversibly redact home-rooted paths, secrets and emails on routed
+    /// translate paths, restoring them at the client edge. The map lives in
+    /// process memory only. Default `false`: rewriting text the client sent
+    /// is opt-in, like the other body rewrites.
+    #[arg(
+        long = "redact-sensitive",
+        env = "HEADROOM_PROXY_REDACT_SENSITIVE",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub redact_sensitive: bool,
+
     /// B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached
     /// prefix survives idle gaps past the 5-minute default. Anthropic only,
     /// and skipped on PAYG — a 1h write is priced at 2× base input against
@@ -2142,6 +2154,9 @@ pub struct Config {
     /// B3: put back a tool the client dropped from a session's roster, at its
     /// old position. Default `false`.
     pub cache_pin_tool_roster: bool,
+    /// Reversible redaction of paths/secrets/emails on routed paths. Off by
+    /// default; see the flag docs on the CLI side.
+    pub redact_sensitive: bool,
     /// B1: pin `cache_control.ttl` to `1h`. Non-PAYG only. Default `false`.
     pub force_1h_cache_ttl: bool,
     /// 1h on the tools and system prefix, 5m on the message tail. Takes
@@ -2453,6 +2468,7 @@ impl Config {
             strip_system_cache_breakpoints: args.strip_system_cache_breakpoints,
             cache_stable_tool_order: args.cache_stable_tool_order,
             cache_pin_tool_roster: args.cache_pin_tool_roster,
+            redact_sensitive: args.redact_sensitive,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
             cache_tail_breakpoint: args.cache_tail_breakpoint,
@@ -2698,6 +2714,7 @@ impl Config {
             // asserting byte-identical tool arrays; production defaults to on.
             cache_stable_tool_order: false,
             cache_pin_tool_roster: false,
+            redact_sensitive: false,
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
             cache_tail_breakpoint: false,

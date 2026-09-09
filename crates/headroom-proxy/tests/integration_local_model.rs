@@ -266,6 +266,233 @@ async fn codex_translate_route_uses_responses_endpoint() {
     proxy.shutdown().await;
 }
 
+/// Reversible redaction, end to end: the upstream sees placeholders, the
+/// client gets real values back — including inside streamed tool input.
+/// The mock model echoes the placeholder the way a real one would after
+/// reading redacted input.
+#[tokio::test]
+async fn redacted_routed_turn_hides_home_upstream_and_restores_for_client() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ruben".to_string());
+    let real_path = format!("{home}/fake-secret-dir/token.txt");
+
+    let mock = MockServer::start().await;
+    let response_body = [
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_redact\",\"model\":\"m\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"located at __HR_HOME__/fake-secret-dir/token.txt\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_redact\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
+    ]
+    .join("");
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(response_body),
+        )
+        .mount(&mock)
+        .await;
+    let upstream_url = Url::parse(&mock.uri()).unwrap();
+
+    let proxy = start_proxy_with(&mock.uri(), |cfg| {
+        cfg.redact_sensitive = true;
+        cfg.model_routes = vec![ModelRoute {
+            model_prefix: "claude-redact-test".to_string(),
+            prefix_match: false,
+            upstream: Some(upstream_url.clone()),
+            translate: true,
+            cursor_agent: None,
+            target_model: Some("muse-spark-1.3-contributor-free".to_string()),
+            auth_env: None,
+        }];
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-redact-test",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": format!("my file is at {real_path}")}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let text = body["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, format!("located at {real_path}"));
+    assert!(
+        !text.contains("__HR_"),
+        "no placeholder may reach the client"
+    );
+
+    let received = mock.received_requests().await.unwrap();
+    let upstream_body = received.last().expect("upstream request").body.clone();
+    let upstream_text = String::from_utf8_lossy(&upstream_body);
+    assert!(
+        upstream_text.contains("__HR_HOME__"),
+        "upstream must see the placeholder"
+    );
+    assert!(
+        !upstream_text.contains(&home),
+        "the home directory must never go upstream"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// Fallback after redaction: the routed upstream saw placeholders, but the
+/// fallback serves the client's own model — which must see real paths, or
+/// every tool call lands on a placeholder file that does not exist.
+#[tokio::test]
+async fn a_redacted_routed_turn_falls_back_on_restored_text() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ruben".to_string());
+    let real_path = format!("{home}/fallback-check/token.txt");
+
+    let default = anthropic_default_upstream("from default").await;
+    let zen = failing_zen_upstream().await;
+    let (_uri, route, router) = spark_router_config(&zen);
+
+    let proxy = start_proxy_with_state(
+        &default.uri(),
+        |cfg| {
+            fast_retries(cfg);
+            cfg.redact_sensitive = true;
+            cfg.model_routes = vec![route];
+            cfg.model_router = router;
+        },
+        |state| state,
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "stream": false,
+            "messages": [{"role": "user", "content": format!("my file is at {real_path}")}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "the client must not see the 503");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "from default");
+
+    // The routed attempt went out redacted...
+    let zen_received = zen.received_requests().await.unwrap();
+    assert!(
+        !zen_received.is_empty(),
+        "the routed upstream must have been tried"
+    );
+    let zen_text = String::from_utf8_lossy(&zen_received[0].body);
+    assert!(
+        zen_text.contains("__HR_HOME__"),
+        "the routed upstream must see the placeholder"
+    );
+    assert!(
+        !zen_text.contains(&home),
+        "the home directory must never go upstream"
+    );
+
+    // ...but the fallback re-dispatch carries restored text.
+    let default_received = default.received_requests().await.unwrap();
+    let fallback = default_received.last().expect("fallback request");
+    let fallback_text = String::from_utf8_lossy(&fallback.body);
+    assert!(
+        fallback_text.contains(&real_path),
+        "the fallback must serve restored text: {fallback_text}"
+    );
+    assert!(
+        !fallback_text.contains("__HR_"),
+        "no placeholder may reach the client's model"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// Explicit pick, redacted: the routed upstream's error echoes the redacted
+/// request, and the client must get real values back. A placeholder in an
+/// error body leaks the map's existence outward and hands the caller a path
+/// it cannot debug with.
+#[tokio::test]
+async fn an_explicit_routed_error_restores_placeholders_for_the_client() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ruben".to_string());
+    let real_path = format!("{home}/error-echo/token.txt");
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(|req: &wiremock::Request| {
+            let echoed = String::from_utf8_lossy(&req.body).into_owned();
+            ResponseTemplate::new(400)
+                .set_body_string(format!("upstream refused this input: {echoed}"))
+        })
+        .mount(&mock)
+        .await;
+    let (_uri, route, router) = spark_router_config(&mock);
+
+    let default = anthropic_default_upstream("from default").await;
+    let proxy = start_proxy_with_state(
+        &default.uri(),
+        |cfg| {
+            fast_retries(cfg);
+            cfg.redact_sensitive = true;
+            cfg.model_routes = vec![route];
+            cfg.model_router = router;
+        },
+        |state| state,
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-muse-spark-1.3",
+            "max_tokens": 100,
+            "stream": false,
+            "messages": [{"role": "user", "content": format!("my file is at {real_path}")}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400, "an explicit pick keeps its own error");
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains(&real_path),
+        "the error must carry restored text: {text}"
+    );
+    assert!(
+        !text.contains("__HR_"),
+        "no placeholder may reach the client, even in an error"
+    );
+    assert!(
+        default.received_requests().await.unwrap().is_empty(),
+        "the client's own choice must not be second-guessed"
+    );
+
+    proxy.shutdown().await;
+}
+
 /// Non-stream Codex requests still need to validate as normal Anthropic
 /// JSON, even though the upstream transport is streamed Responses SSE.
 #[tokio::test]

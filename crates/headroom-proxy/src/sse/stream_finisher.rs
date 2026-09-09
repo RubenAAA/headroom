@@ -473,8 +473,21 @@ where
         }
 
         // Anything still withheld belonged to a tool call the model never
-        // finished describing. It is dropped on purpose.
-        let discarded = withheld.len();
+        // finished describing. It is dropped on purpose. Count the calls,
+        // not the frames: one call is a start plus its deltas, and the frame
+        // count mislabeled the log line.
+        let discarded = withheld
+            .iter()
+            .filter(|raw| {
+                payload(raw).is_some_and(|v| {
+                    v.get("type").and_then(|t| t.as_str()) == Some("content_block_start")
+                        && v.get("content_block")
+                            .and_then(|b| b.get("type"))
+                            .and_then(|t| t.as_str())
+                            == Some("tool_use")
+                })
+            })
+            .count();
         let tail = wire.tail();
         if tail.is_empty() {
             let Some(e) = drop_err else {

@@ -45,8 +45,8 @@ armed_by_invocation() {
                 else tostring end)
              | test("^\\s*<command-(message|name)>")
                and test("<command-name>/(" + $cmds + ")</command-name>")))
-  ' >/dev/null 2>&1 || return 1
-  touch "$OUTDIR/$SESSION_ID.armed"
+   ' >/dev/null 2>&1 || return 1
+  arm_mode >"$OUTDIR/$SESSION_ID.armed"
 }
 
 mr_in_transcript() {
@@ -54,10 +54,57 @@ mr_in_transcript() {
     grep -oE '[0-9]+' | tail -1
 }
 
+POSTER="$HOME"/headroom/contrib/spark-poster
+
+# ── which review command armed this session ──
+#
+# The scope depends on it: /gitlab-review drafts follow-ups on threads I
+# opened, /fix-mr-comments drafts answers to reviewers' open threads on my
+# own MR. Arming itself stays strict (armed_by_invocation); this only picks
+# the scope once armed, so a loose last-mention scan is enough here.
+arm_mode() {
+  local m
+  if [ -s "$OUTDIR/$SESSION_ID.armed" ]; then
+    m=$(cat "$OUTDIR/$SESSION_ID.armed" 2>/dev/null)
+    case "$m" in
+      gitlab-review|fix-mr-comments) echo "$m"; return 0 ;;
+    esac
+  fi
+  m=$(grep -oE "command-name>/($REVIEW_COMMANDS)" "$TRANSCRIPT" 2>/dev/null |
+      grep -oE "($REVIEW_COMMANDS)" | tail -1)
+  [ -n "$m" ] && echo "$m" || echo "gitlab-review"
+}
+
+# done = worker finished WITH a draft ready (listener chained, see below).
+# done + .failed = worker finished with NO draft; the reason is in .failed.
+# diverted without done = worker still running (or crashed; worker_alive says).
+worker_state() {
+  if [ -f "$OUTDIR/$SESSION_ID.done" ]; then
+    if [ -f "$OUTDIR/$SESSION_ID.failed" ]; then echo "failed"; else echo "done"; fi
+  elif [ -f "$OUTDIR/$SESSION_ID.diverted" ]; then
+    echo "running"
+  else
+    echo "idle"
+  fi
+}
+
+worker_alive() {
+  local pid
+  pid=$(cat "$OUTDIR/$SESSION_ID.started" 2>/dev/null)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  # kill -0 alone trusts a recycled pid. The supervisor is a fork of this
+  # script, so its command line still names it; anything else behind that
+  # pid is not our worker. /proc is Linux-only -- elsewhere, kill -0 stands.
+  [ -r "/proc/$pid/cmdline" ] || return 0
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "review-gate"
+}
+
 spawn_worker() {
   [ -f "$OUTDIR/$SESSION_ID.done" ] && return 0
-  [ -f "$OUTDIR/$SESSION_ID.diverted" ] && return 0
-  touch "$OUTDIR/$SESSION_ID.diverted"
+  worker_alive && return 0
+  # A stale .diverted with no live worker is a previous crash, not a running
+  # worker: drop it so this attempt is a real one.
+  rm -f "$OUTDIR/$SESSION_ID.diverted"
 
   # The MR number is the only thing taken from the transcript. Everything the
   # drafter reasons about it fetches for itself.
@@ -67,16 +114,76 @@ spawn_worker() {
   # exist before it ran, so it moved formatting off the reviewing model and
   # left every expensive part where it was. spark_draft.py pulls the threads
   # and the git history behind them, and does the deciding.
+  #
+  # Checked BEFORE touching .diverted: a divert marker with no worker behind
+  # it reads as "drafting" to every later check, which is how an approval can
+  # name a worker that never existed.
   MR=$(mr_in_transcript)
-  [ -n "$MR" ] || { echo "no MR number in transcript; not drafting" >>"$OUTDIR/worker.log"; return 0; }
+  if [ -z "$MR" ]; then
+    echo "no MR number in transcript; not drafting" >>"$OUTDIR/worker.log"
+    return 1
+  fi
+  MODE=$(arm_mode)
+  touch "$OUTDIR/$SESSION_ID.diverted"
+  # A go-ahead approves the draft it was given for. A stale one must not
+  # auto-post a draft that lands later, so every fresh run starts clean.
+  rm -f "$OUTDIR/$SESSION_ID.goahead" "$OUTDIR/$SESSION_ID.failed"
 
   (
-    SPARK_REVIEW_WORKER=1 timeout 900 \
-      python3 "$HOME"/headroom/contrib/spark-poster/spark_draft.py \
-      "$MR" "$SESSION_ID"
-    touch "$OUTDIR/$SESSION_ID.done"
+    SESSLOG="$OUTDIR/$SESSION_ID.worker.log"
+    {
+      echo "=== worker start: MR !$MR mode $MODE ==="
+      if SPARK_REVIEW_WORKER=1 timeout 900 \
+          python3 "$POSTER/spark_draft.py" "$MR" "$SESSION_ID" "$MODE"; then
+        DRAFT="$OUTDIR/$SESSION_ID.draft.json"
+        if [ -f "$DRAFT" ]; then
+          touch "$OUTDIR/$SESSION_ID.done"
+          # Chain the listener HERE. Nothing else in the system launches
+          # spark-goahead.sh, and without this the go-ahead file is an
+          # approval nobody hears -- every session before this change ended
+          # exactly that way: "touch the go-ahead" followed by silence.
+          "$POSTER/spark-goahead.sh" "$SESSION_ID" >>"$OUTDIR/worker.log" 2>&1 &
+        else
+          echo "drafter exited 0 but no draft at $DRAFT" >"$OUTDIR/$SESSION_ID.failed"
+          touch "$OUTDIR/$SESSION_ID.done"
+        fi
+      else
+        rc=$?
+        {
+          echo "worker failed (rc=$rc) for MR !$MR mode $MODE; last lines:"
+          tail -8 "$SESSLOG"
+        } >"$OUTDIR/$SESSION_ID.failed"
+        touch "$OUTDIR/$SESSION_ID.done"
+      fi
+    } >"$SESSLOG" 2>&1
+    echo "session $SESSION_ID: MR !$MR $MODE finished (see $SESSION_ID.worker.log)" >>"$OUTDIR/worker.log"
+    rm -f "$OUTDIR/$SESSION_ID.started"
   ) >>"$OUTDIR/worker.log" 2>&1 &
+  echo $! >"$OUTDIR/$SESSION_ID.started"
   disown
+}
+
+# The listener dies with its timeout or its post; if the draft outlives it
+# (timeout, crash, a session from before the chaining fix), start another one.
+# spark-goahead.sh refuses to post twice when a proof exists, so relaunching
+# it is always safe.
+ensure_listener() {
+  [ -f "$OUTDIR/$SESSION_ID.draft.json" ] || return 0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  pgrep -f "spark-goahead.sh $SESSION_ID" >/dev/null 2>&1 && return 0
+  "$POSTER"/spark-goahead.sh "$SESSION_ID" >>"$OUTDIR/worker.log" 2>&1 &
+  disown
+}
+
+draft_stats() {
+  jq -r '"\(.replies | length) replies, \([.replies[] | select(.resolve)] | length) to close, MR !\(.iid)"' \
+    "$OUTDIR/$SESSION_ID.draft.json" 2>/dev/null || echo "unreadable draft"
+}
+
+proof_for_draft() {
+  local sid
+  sid=$(jq -r '.session_id // empty' "$OUTDIR/$SESSION_ID.draft.json" 2>/dev/null)
+  [ -n "$sid" ] && echo "$OUTDIR/$sid.proof.json"
 }
 
 # ── UserPromptSubmit: the approval IS the divert ──
@@ -138,8 +245,52 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   fi
 
   if [ -n "$INTENT" ]; then
-    spawn_worker
-    echo "REVIEW REPLIES DIVERTED AT APPROVAL. The spark worker is drafting the thread replies from the MR and the repo; it reads the threads and the commits itself and must not be given your analysis. Do NOT write the reply text, do NOT draft it in a file, and do NOT summarise what you would have said. Tell the user the worker is drafting and that it posts on go-ahead: touch ~/.local/state/spark-review/<session>.goahead"
+    # State-aware, and every word of it checkable: the old message said
+    # "the worker is drafting" on every path, including no-MR (no worker),
+    # finished-with-no-draft (no worker any more), and already-posted. The
+    # model relayed it as fact, the user approved into a void.
+    GO="$OUTDIR/$SESSION_ID.goahead"
+    MR=$(mr_in_transcript)
+    ST=$(worker_state)
+    # Diverted but no live worker is a crash, not a running worker. Saying
+    # "already running" here would wedge the session: every later prompt
+    # gets the same answer while nothing runs. Restart instead.
+    if [ "$ST" = "running" ] && ! worker_alive; then ST="idle"; fi
+    case $ST in
+      done)
+        PROOF=$(proof_for_draft)
+        if [ -n "$PROOF" ] && [ -f "$PROOF" ]; then
+          echo "REVIEW REPLIES POSTED AND VERIFIED. Proof: $PROOF. Nothing further to do; do not post anything yourself."
+        else
+          ensure_listener
+          if [ -f "$GO" ]; then
+            echo "REVIEW GO-AHEAD RECORDED. The poster is working through the draft; the proof lands next to the draft when it verifies. Do not post anything yourself."
+          else
+            echo "REVIEW DRAFT READY: $(draft_stats). It posts ONLY on your go-ahead, exactly once: touch $GO -- that file is the approval, nothing else is. Do NOT write the reply text, do NOT draft it in a file, do NOT post anything yourself."
+          fi
+        fi
+        ;;
+      failed)
+        echo "REVIEW WORKER FINISHED WITH NO DRAFT. Reason: $(head -3 "$OUTDIR/$SESSION_ID.failed" 2>/dev/null | tr '\n' ' '). Say 'post the threads' again to run it once more, or leave the threads. Do not draft replies yourself."
+        rm -f "$OUTDIR/$SESSION_ID.diverted" "$OUTDIR/$SESSION_ID.done" \
+          "$OUTDIR/$SESSION_ID.failed" "$OUTDIR/$SESSION_ID.started"
+        ;;
+      running)
+        echo "REVIEW WORKER ALREADY RUNNING for MR !${MR:-unknown}. It drafts, then waits for your go-ahead: touch $GO -- nothing posts before that file exists. Do NOT write the reply text, do NOT post anything yourself."
+        ;;
+      idle)
+        if [ -n "$MR" ]; then
+          spawn_worker
+          echo "REVIEW DIVERTED. Worker started for MR !$MR ($(arm_mode)): it reads the threads and the commits itself, drafts the replies, then waits. It posts ONLY on your go-ahead: touch $GO. Do NOT write the reply text, do NOT draft it in a file, do NOT post anything yourself."
+        else
+          echo "REVIEW DIVERT NOT STARTED: no merge_requests/NNN number in this session's transcript, so no worker was launched. Name the MR (e.g. !554) and repeat the instruction."
+          # A .diverted marker alongside no MR is a phantom -- nothing is
+          # behind it and nothing ever will be. Leaving it makes every Stop
+          # backstop log another "no MR number" line, forever.
+          rm -f "$OUTDIR/$SESSION_ID.diverted" "$OUTDIR/$SESSION_ID.started"
+        fi
+        ;;
+    esac
   fi
   exit 0
 fi
@@ -148,9 +299,9 @@ fi
 armed_by_invocation || exit 0
 
 if [ "$EVENT" = "Stop" ]; then
-  # Backstop only: retry if a divert fired but no draft landed.
+  # Backstop only: retry if a divert fired but no worker finished. spawn_worker
+  # no-ops when one is alive or done; it respawns only after a crash.
   if [ -f "$OUTDIR/$SESSION_ID.diverted" ] && [ ! -f "$OUTDIR/$SESSION_ID.done" ]; then
-    rm -f "$OUTDIR/$SESSION_ID.diverted"
     spawn_worker
   fi
   exit 0
@@ -174,11 +325,24 @@ if [ "$TOOL" = "Bash" ]; then
   echo "$LOW" | grep -qE 'gitlab|youtrack|merge_requests|api/v4|discussion_id|spark_post' && SUBJECT=1
 
   WRITES=""
-  echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|glab .*(note|comment)' && WRITES=1
+  # Transport verbs, not serialization calls. curl's -X/--data and glab's
+  # note/comment are how a write leaves the machine; requests.post/put/patch
+  # is the python equivalent. json.dump(s) is deliberately NOT here: every
+  # observed hit on it was a read summary printed to stdout, and a POST
+  # without any json call in the command (dict literal) walked past it
+  # anyway -- the transport is the layer that cannot lie about direction.
+  echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|glab .*(note|comment)|requests\.(post|put|patch)' && WRITES=1
 
   COMPOSES=""
+  # heredoc builds text; json.load only reads it, and json.dump(s) proved
+  # the same (see WRITES above). Loading sat here since the start and every
+  # one of its diverts was a read-summarize pipeline: the !597 session alone
+  # diverted both `curl ... merge_requests/597 | python3 -c "...json.load..."`
+  # (SUBJECT on api/v4) and `<sanctioned-script> > file; python3 -c
+  # "...json.load(open(...))"` (SUBJECT on the project's own script path).
+  # A load cannot articulate a review no matter what it reads.
   case "$LOW" in
-    *'<<'*|*json.dump*|*json.load*) COMPOSES=1 ;;
+    *'<<'*) COMPOSES=1 ;;
   esac
 
   ARTICULATE=""
