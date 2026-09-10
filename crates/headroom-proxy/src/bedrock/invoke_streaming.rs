@@ -166,6 +166,16 @@ pub async fn handle_invoke_streaming(
         body.clone()
     };
 
+    // Reversible redaction seam, before SigV4 like the non-streaming path:
+    // the signature must cover the bytes actually sent. Request-id keyed.
+    // All three return arms below restore through this seam.
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        &request_id,
+    );
+    let (outbound_body, seam) = gate.seam_bytes(outbound_body);
+
     // 2. Resolve the Bedrock streaming action from the inbound path and
     // build the upstream URL.
     let action = match extract_streaming_action(uri.path()) {
@@ -391,7 +401,7 @@ pub async fn handle_invoke_streaming(
             .bytes_stream()
             .map(|r| r.map_err(std::io::Error::other));
         let body_out = Body::from_stream(stream);
-        return finish(status, resp_headers, body_out, &request_id);
+        return finish(status, resp_headers, body_out, &request_id, seam);
     }
     // Always drop the upstream content-length: in passthrough mode
     // we may still re-frame; in SSE mode the byte-length changes.
@@ -424,7 +434,7 @@ pub async fn handle_invoke_streaming(
                 }
             }
             let body_out = Body::from_stream(upstream_stream);
-            finish(status, resp_headers, body_out, &request_id)
+            finish(status, resp_headers, body_out, &request_id, seam)
         }
         OutputMode::Sse => {
             // Translation mode. Override the response content-type to
@@ -444,7 +454,7 @@ pub async fn handle_invoke_streaming(
             );
             let translated = tee_to_anthropic_state(translated, request_id.clone());
             let body_out = Body::from_stream(translated);
-            finish(status, resp_headers, body_out, &request_id)
+            finish(status, resp_headers, body_out, &request_id, seam)
         }
     }
 }
@@ -837,7 +847,13 @@ fn error_sse_frame(event_kind: &str, message: &str) -> Bytes {
     Bytes::from(out)
 }
 
-fn finish(status: StatusCode, headers: HeaderMap, body: Body, request_id: &str) -> Response {
+fn finish(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Body,
+    request_id: &str,
+    seam: Option<crate::redact::Seam>,
+) -> Response {
     let mut builder = Response::builder().status(status);
     if let Some(h) = builder.headers_mut() {
         h.extend(headers);
@@ -845,18 +861,21 @@ fn finish(status: StatusCode, headers: HeaderMap, body: Body, request_id: &str) 
             h.insert(HeaderName::from_static("x-request-id"), v);
         }
     }
-    builder.body(body).unwrap_or_else(|e| {
-        tracing::error!(
-            event = "bedrock_response_build_failed",
-            request_id = %request_id,
-            error = %e,
-            "bedrock invoke-streaming: failed to build response"
-        );
-        Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("internal handler error"))
-            .expect("static response")
-    })
+    crate::redact::restore_response(
+        seam,
+        builder.body(body).unwrap_or_else(|e| {
+            tracing::error!(
+                event = "bedrock_response_build_failed",
+                request_id = %request_id,
+                error = %e,
+                "bedrock invoke-streaming: failed to build response"
+            );
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal handler error"))
+                .expect("static response")
+        }),
+    )
 }
 
 fn error_response(status: StatusCode, event: &str, msg: &str) -> Response {

@@ -89,15 +89,44 @@ async fn forward_conversations(
         "conversations request: passthrough with instrumentation (compression deferred to C5+)"
     );
 
-    forward_http(state, client_addr, req)
-        .await
-        .unwrap_or_else(|e| {
-            use axum::response::IntoResponse;
-            // No silent fallback: surface the upstream error verbatim.
-            // The structured `tracing::warn!` emitted by
-            // `ProxyError::into_response` carries the original cause.
-            e.into_response()
-        })
+    // Reversible redaction seam. Buffered only when the flag is on (foundry
+    // precedent): with redaction off the request reaches `forward_http`
+    // exactly as it arrived. Request-id keyed: the Conversations API has no
+    // ApiKind variant for conversation keys.
+    let mut seam = None;
+    let req = if state.config.redact_sensitive {
+        let session_key = crate::proxy::ensure_request_id(req.headers());
+        let (parts, body) = req.into_parts();
+        let max = state.config.compression_max_body_bytes as usize;
+        let buffered = match axum::body::to_bytes(body, max).await {
+            Ok(b) => b,
+            Err(_) => {
+                return Response::builder()
+                    .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(axum::body::Body::from("request body exceeds buffer limit"))
+                    .expect("static response");
+            }
+        };
+        let gate = crate::redact::RedactGate::new(true, &state.redact_store, &session_key);
+        let (gated, s) = gate.seam_bytes(buffered);
+        seam = s;
+        Request::from_parts(parts, axum::body::Body::from(gated))
+    } else {
+        req
+    };
+
+    crate::redact::restore_response(
+        seam,
+        forward_http(state, client_addr, req)
+            .await
+            .unwrap_or_else(|e| {
+                use axum::response::IntoResponse;
+                // No silent fallback: surface the upstream error verbatim.
+                // The structured `tracing::warn!` emitted by
+                // `ProxyError::into_response` carries the original cause.
+                e.into_response()
+            }),
+    )
 }
 
 /// `POST /v1/conversations` — create a new conversation.

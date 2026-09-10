@@ -108,6 +108,20 @@ pub(crate) async fn forward_to_upstream(
 ) -> Result<Response<Body>, ProxyError> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| ProxyError::InvalidUpstream(format!("invalid method: {e}")))?;
+    // Reversible redaction seam. Request-id keyed like the gemini path: these
+    // headers are a HashMap with no client addr at hand and no ApiKind for
+    // the batch envelope, so conversation keys are unavailable. Encrypt and
+    // decrypt pair inside this call, so the id suffices for correctness;
+    // same-secret turns remint per request (prefix churn, not a leak).
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        &headers
+            .get("x-request-id")
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+    );
+    let (body, seam) = gate.seam_bytes(body);
     let mut req_builder = state.client.request(method, url);
     for (k, v) in &headers {
         if let Ok(hv) = HeaderValue::from_str(v) {
@@ -122,7 +136,10 @@ pub(crate) async fn forward_to_upstream(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
     let resp_body = resp.bytes().await.map_err(ProxyError::Upstream)?;
-    response_from_upstream(status, resp_headers, resp_body)
+    Ok(crate::redact::restore_response(
+        seam,
+        response_from_upstream(status, resp_headers, resp_body)?,
+    ))
 }
 
 pub(crate) fn compression_auth_mode(headers: &HeaderMap) -> AuthMode {

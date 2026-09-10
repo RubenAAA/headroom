@@ -314,6 +314,17 @@ pub(crate) async fn forward_vertex_request(
         }
     }
 
+    // ─── 6b. REDACTION SEAM ──────────────────────────────────────────
+    // Request-id keyed: Vertex has no ApiKind variant for conversation
+    // keys (same rule as the gemini/batch seam). The response restores
+    // through the seam at the end, streaming or not.
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        &request_id,
+    );
+    let (body_to_send, seam) = gate.seam_bytes(body_to_send);
+
     // ─── 7. FORWARD ────────────────────────────────────────────────────
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,
@@ -442,7 +453,7 @@ pub(crate) async fn forward_vertex_request(
         "vertex request forwarded"
     );
 
-    response
+    crate::redact::restore_response(seam, response)
 }
 
 fn error_response(status: StatusCode, msg: &'static str) -> Response {

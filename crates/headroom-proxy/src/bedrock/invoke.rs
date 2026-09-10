@@ -187,6 +187,17 @@ pub async fn handle_invoke(
         body.clone()
     };
 
+    // Reversible redaction seam, before SigV4: the signature must cover the
+    // bytes actually sent. Request-id keyed (no ApiKind for Bedrock
+    // envelopes); encrypt/decrypt pair inside this turn, so the id suffices
+    // for correctness. The streaming response restores at the end.
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        &request_id,
+    );
+    let (outbound_body, seam) = gate.seam_bytes(outbound_body);
+
     // Resolve the Bedrock action from the inbound path so `/converse`
     // forwards to the upstream Converse endpoint instead of `/invoke`.
     // Both paths mount this handler (see `proxy.rs`); the streaming
@@ -398,18 +409,21 @@ pub async fn handle_invoke(
             h.insert(HeaderName::from_static("x-request-id"), v);
         }
     }
-    builder.body(body_out).unwrap_or_else(|e| {
-        tracing::error!(
-            event = "bedrock_response_build_failed",
-            request_id = %request_id,
-            error = %e,
-            "bedrock invoke: failed to build response"
-        );
-        Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("internal handler error"))
-            .expect("static response")
-    })
+    crate::redact::restore_response(
+        seam,
+        builder.body(body_out).unwrap_or_else(|e| {
+            tracing::error!(
+                event = "bedrock_response_build_failed",
+                request_id = %request_id,
+                error = %e,
+                "bedrock invoke: failed to build response"
+            );
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal handler error"))
+                .expect("static response")
+        }),
+    )
 }
 
 /// Run the live-zone Anthropic compressor over a Bedrock-shape body.
