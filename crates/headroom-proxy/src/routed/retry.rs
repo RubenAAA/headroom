@@ -162,6 +162,22 @@ pub(crate) async fn send_with_retry(
                         "local_model",
                         crate::observability::retry_reason::TRANSPORT,
                     );
+                    tracing::warn!(
+                        event = "local_model_upstream_error",
+                        error = %e,
+                        retryable = is_retryable,
+                        attempts = attempt,
+                        upstream = %upstream_url,
+                        "failed to connect to local model upstream"
+                    );
+                    // Transient (rotation RST, wifi flap, corpse-pool
+                    // first-write miss): 503 + Retry-After so the client
+                    // retries — the same contract `ProxyError::Upstream`
+                    // upholds in `crate::error`. A bare 502 here would stall
+                    // the session until a human nudges it.
+                    return Err(crate::error::transient_response(format!(
+                        "local upstream error: {e}"
+                    )));
                 }
                 tracing::warn!(
                     event = "local_model_upstream_error",
@@ -183,4 +199,42 @@ pub(crate) async fn send_with_retry(
         headers,
         attempts: attempt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Transport exhaustion on the routed path must answer 503 + Retry-After
+    /// (not a bare 502): rotation RSTs, wifi flaps, and corpse-pool misses
+    /// are transient, and the client should retry instead of stalling.
+    /// Single attempt so the test never sleeps in backoff.
+    #[tokio::test]
+    async fn transport_exhaustion_answers_503_with_retry_after() {
+        let upstream: url::Url = "http://127.0.0.1:1/unreachable".parse().unwrap();
+        let mut config = crate::config::Config::for_test(upstream);
+        config.retry_enabled = true;
+        config.retry_max_attempts = 1;
+        let state = AppState::new(config).expect("app state");
+        let err = match send_with_retry(
+            &state,
+            "http://127.0.0.1:1/unreachable",
+            HeaderMap::new(),
+            Bytes::from("{}"),
+            "test-exhaustion",
+            None,
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("closed port must fail"),
+            Err(resp) => resp,
+        };
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            err.headers().get(http::header::RETRY_AFTER).unwrap(),
+            "2",
+            "client must be told to retry shortly"
+        );
+    }
 }
