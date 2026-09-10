@@ -7,7 +7,7 @@ MATURIN ?= maturin
 PYTHON ?= python3
 FIXTURES ?= upstream-python/tests/parity/fixtures
 
-.PHONY: help test test-parity bench build-proxy build-wheel fmt fmt-check lint clippy clean ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
+.PHONY: help test test-parity bench build-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
 
 help:
 	@echo "Headroom Rust targets:"
@@ -21,6 +21,8 @@ help:
 	@echo "  make fmt-check          - cargo fmt --all -- --check"
 	@echo "  make lint               - cargo clippy --workspace -- -D warnings"
 	@echo "  make clean              - cargo clean"
+	@echo "  make gc                 - GC stale target/ artifacts now (cargo-sweep, conservative)"
+	@echo "  make gc-check           - preview what 'make gc' would delete (deletes nothing)"
 	@echo ""
 	@echo "E2e targets:"
 	@echo "  make build-e2e-wrap     - build the wrap-e2e Docker image"
@@ -35,6 +37,7 @@ help:
 
 test:
 	$(CARGO) test --workspace
+	@bash scripts/cargo-gc.sh --auto || true # build-triggered GC; gated, never fails the build
 
 # headroom-parity has no pyo3 dependency — its comparators call headroom-core
 # directly, so this target needs neither a venv nor a built extension module.
@@ -53,9 +56,11 @@ build-proxy:
 	if command -v strip >/dev/null 2>&1; then strip "$$BIN" || true; fi; \
 	SIZE=$$(wc -c < "$$BIN"); \
 	printf 'headroom-proxy: %s bytes (%.1f MiB)\n' "$$SIZE" "$$(echo "$$SIZE / 1048576" | bc -l)"
+	@bash scripts/cargo-gc.sh --auto || true # build-triggered GC; gated, never fails the build
 
 build-wheel:
 	$(MATURIN) build --release -m crates/headroom-py/Cargo.toml
+	@bash scripts/cargo-gc.sh --auto || true # build-triggered GC; gated, never fails the build
 
 # Hotfix-A0: maturin-develop + symlink + import-verify in one shot. Run this
 # any time you suspect the proxy is silently falling back to Python-only
@@ -80,6 +85,25 @@ clippy lint:
 
 clean:
 	$(CARGO) clean
+
+# ─── Build-triggered GC for target/ ─────────────────────────────────────
+#
+# `target/` grows without bound (every toolchain bump orphans the previous
+# fingerprint set; maturin leaves a versioned wheel per build). The hooks
+# at the end of `test` / `build-proxy` / `build-wheel` call
+# scripts/cargo-gc.sh --auto, which is a silent no-op unless the last
+# check is older than GC_INTERVAL_HOURS (default 24h) — so builds pay ~ms
+# and no background timer is involved. CI is skipped (ephemeral runners;
+# rust.yml manages its own cache). `make gc` forces a real run including
+# the age-based pass that --auto deliberately omits; `make gc-check`
+# previews it. Tune via GC_MAXSIZE / GC_MAXAGE_DAYS / GC_KEEP_WHEELS /
+# GC_INTERVAL_HOURS in the environment. Requires `cargo install
+# cargo-sweep`; when absent, --auto degrades to a hint and exits 0.
+gc:
+	bash scripts/cargo-gc.sh --force
+
+gc-check:
+	bash scripts/cargo-gc.sh --check
 
 # ─── Pre-push CI gate ──────────────────────────────────────────────────────
 #
