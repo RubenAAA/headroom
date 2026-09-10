@@ -8,30 +8,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Recursively drop `cache_control` annotations before hashing.
-fn strip_cache_control(obj: &Value) -> Value {
-    match obj {
-        Value::Object(map) => {
-            let filtered: serde_json::Map<String, Value> = map
-                .iter()
-                .filter(|(k, _)| k.as_str() != "cache_control")
-                .map(|(k, v)| (k.clone(), strip_cache_control(v)))
-                .collect();
-            Value::Object(filtered)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(strip_cache_control).collect()),
-        _ => obj.clone(),
-    }
-}
-
 /// Normalized key JSON: `{"model":..,"messages":[stripped..],extra..}`.
 ///
 /// Byte-identical to the `to_string(key_parts Map)` form this
 /// replaced: insertion order is `model`, `messages`, then `extra` in
 /// map order, with compact separators and `serde_json` escaping
-/// throughout. The strip rule matches [`strip_cache_control`]
-/// (drop `cache_control` members at any depth); the marker comment
-/// there applies here too — a moving breakpoint must not change the key.
+/// throughout. `cache_control` members are dropped at any depth; the
+/// marker comment from the old tree walker still applies — a moving
+/// breakpoint must not change the key.
 fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)]) -> Vec<u8> {
     use std::io::Write as _;
     fn write_stripped<W: std::io::Write>(w: &mut W, v: &Value) -> std::io::Result<()> {
@@ -377,21 +361,6 @@ mod tests {
     /// Borrowed view for the `&[&Value]` key/cache APIs.
     fn refs(v: &[Value]) -> Vec<&Value> {
         v.iter().collect()
-    }
-
-    #[test]
-    fn strip_cache_control_removes_key() {
-        let val = serde_json::json!({"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}});
-        let stripped = strip_cache_control(&val);
-        assert!(stripped.get("cache_control").is_none());
-        assert_eq!(stripped["text"], "hi");
-    }
-
-    #[test]
-    fn strip_cache_control_preserves_other_keys() {
-        let val = serde_json::json!({"type": "text", "text": "hi"});
-        let stripped = strip_cache_control(&val);
-        assert_eq!(stripped, val);
     }
 
     #[test]

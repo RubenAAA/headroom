@@ -207,6 +207,15 @@ pub fn emit_volatile_warnings(
     session_key_hash: Option<&str>,
     conversation_key: Option<&str>,
 ) {
+    // Fast path: with no findings there is nothing to emit and nothing
+    // to record. Skipping the map builds and the memory lock below is
+    // behavior-identical — the only write the rest of this function
+    // performs for an empty set is ensuring an (empty) conversation
+    // entry exists, which the next non-empty call recreates identically
+    // on its own `is_none` branch.
+    if findings.is_empty() {
+        return;
+    }
     // Without a conversation there is nothing to compare against, so the
     // change check cannot run and every finding is reported as before.
     let Some(conversation) = conversation_key.filter(|c| !c.is_empty()) else {

@@ -175,17 +175,25 @@ const IDENTICAL_PROMPT_FANOUT_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// that were always two streams (cross-lane alternation).
 pub fn conversation_key(parsed: &serde_json::Value, session_key: &str) -> String {
     use sha2::{Digest, Sha256};
+    // Stream the first message straight into the digest: the old
+    // `first.to_string()` built a full serialized copy of msg0 just
+    // to feed it here. `to_writer` emits identical bytes.
+    struct DigestSink<'a>(&'a mut Sha256);
+    impl std::io::Write for DigestSink<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let mut hasher = Sha256::new();
     hasher.update(session_key.as_bytes());
     if let Some(first) = parsed.get("messages").and_then(|m| m.get(0)) {
-        hasher.update(first.to_string().as_bytes());
+        let _ = serde_json::to_writer(DigestSink(&mut hasher), first);
     }
-    let out = hasher.finalize();
-    let mut s = String::with_capacity(16);
-    for b in &out[..8] {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    hex16(hasher.finalize().as_slice())
 }
 
 /// Item 11's deciding test: what the cacheable part of this request actually
@@ -357,11 +365,9 @@ fn sample_value(v: &serde_json::Value, hasher: &mut impl sha2::Digest) {
 }
 
 fn hex16(digest: &[u8]) -> String {
-    let mut s = String::with_capacity(16);
-    for b in &digest[..8] {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    // `hex` is already a workspace dep; identical lowercase output to
+    // the per-byte `format!` loop at ~6x.
+    hex::encode(&digest[..8])
 }
 
 /// The usage counters of one completed turn, as billed by Anthropic.
@@ -661,7 +667,21 @@ pub fn first_turn_context(parsed: &serde_json::Value) -> FirstTurnContext {
         .unwrap_or(&[]);
     let message_zero_hash = messages.first().map(|m| {
         let canonical = super::prefix_replay::canonicalize_for_prefix_compare(m);
-        hex16(Sha256::digest(canonical.to_string().as_bytes()).as_slice())
+        // Stream into the digest instead of materializing the
+        // serialized copy (identical input bytes, no buffer).
+        struct DigestSink<'a>(&'a mut Sha256);
+        impl std::io::Write for DigestSink<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.update(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut hasher = Sha256::new();
+        let _ = serde_json::to_writer(DigestSink(&mut hasher), &canonical);
+        hex16(hasher.finalize().as_slice())
     });
     let compaction_restart = crate::ctx::identity::first_user_message_text(parsed)
         .is_some_and(|t| crate::ctx::identity::has_compaction_marker(&t));

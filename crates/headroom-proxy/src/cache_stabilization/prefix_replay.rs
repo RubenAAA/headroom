@@ -661,8 +661,16 @@ pub fn extract_cache_stable_delta(
     if current_messages.len() < prefix_len {
         return None;
     }
-    if canonicalize_slice(&current_messages[..prefix_len]) != canonicalize_slice(prev_orig) {
-        return None;
+    // Compare canonicalized messages one at a time with early exit
+    // instead of materializing two full `Vec<Value>`s and `==`-ing
+    // them (identical semantics: `Vec` equality is length — checked
+    // above via the slice bound — plus ordered element equality with
+    // short-circuit). Steady-state cost is the same canonicalizations;
+    // a mismatch skips the rest plus both outer allocations.
+    for (cur, prev) in current_messages[..prefix_len].iter().zip(prev_orig.iter()) {
+        if canonicalize_for_prefix_compare(cur) != canonicalize_for_prefix_compare(prev) {
+            return None;
+        }
     }
     Some((prev_fwd.to_vec(), current_messages[prefix_len..].to_vec()))
 }

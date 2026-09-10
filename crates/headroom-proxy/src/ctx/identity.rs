@@ -176,7 +176,11 @@ fn write_without_cache_control(v: &Value, out: &mut String) {
                     out.push(',');
                 }
                 first = false;
-                out.push_str(&Value::String(k.clone()).to_string());
+                // Serialize the borrowed key directly: the old
+                // `Value::String(k.clone()).to_string()` cloned the key
+                // plus a wrapper `Value` per object key for identical
+                // output bytes.
+                out.push_str(&serde_json::to_string(k).unwrap_or_default());
                 out.push(':');
                 write_without_cache_control(val, out);
             }

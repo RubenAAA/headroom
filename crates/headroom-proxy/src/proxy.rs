@@ -3378,11 +3378,14 @@ pub(crate) async fn forward_http(
     // now (we don't terminate TLS in this binary; if a TLS terminator is in
     // front, it should rewrite this — which we'd handle by not overwriting
     // an existing one in a future change).
+    //
+    // Borrowed: every use of `req` between here and `into_body()` is a
+    // shared borrow, so NLL ends this borrow at the forward-headers call
+    // and no per-request `String` alloc is needed.
     let forwarded_host = req
         .headers()
         .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|v| v.to_str().ok());
 
     // Build the outgoing headers off the incoming ones, then optionally drop
     // Host (rewrite_host=true => let reqwest set its own Host for the upstream).
@@ -3407,7 +3410,7 @@ pub(crate) async fn forward_http(
         req.headers(),
         client_addr.ip(),
         "http",
-        forwarded_host.as_deref(),
+        forwarded_host,
         &request_id,
         strip_internal,
         header_auth_mode,
@@ -7131,8 +7134,16 @@ fn signed_reasoning_preserved(before: &[serde_json::Value], after: &[serde_json:
     if last_assistant_blocks(before) != last_assistant_blocks(after) {
         return false;
     }
-    let mut remaining = signed_reasoning_blocks(before).into_iter();
-    signed_reasoning_blocks(after)
+    // Length gate: `after` as a subsequence of `before` needs at most
+    // as many blocks (pigeonhole) — free exact pre-check before the
+    // O(n·m) deep-compare scan below.
+    let before_blocks = signed_reasoning_blocks(before);
+    let after_blocks = signed_reasoning_blocks(after);
+    if after_blocks.len() > before_blocks.len() {
+        return false;
+    }
+    let mut remaining = before_blocks.into_iter();
+    after_blocks
         .into_iter()
         .all(|block| remaining.any(|kept| kept == block))
 }
