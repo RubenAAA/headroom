@@ -12,6 +12,7 @@ pub mod batch;
 pub mod batch_anthropic;
 pub mod chat_completions;
 pub mod conversations;
+pub mod count_tokens;
 pub mod gemini;
 pub mod local_model;
 pub mod reasoning_signature;

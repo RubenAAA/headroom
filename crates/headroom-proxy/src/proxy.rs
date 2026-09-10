@@ -1529,6 +1529,15 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/messages",
             post(crate::handlers::local_model::handle_messages),
         );
+        // Token counting for translated routes: a routed alias forwarded
+        // verbatim is unknown to Anthropic (404 + a non-JSON page that also
+        // pollutes the upstream-health refusal window), so the handler
+        // answers those locally. Unrouted models forward byte-identical and
+        // keep the exact upstream count.
+        router = router.route(
+            "/v1/messages/count_tokens",
+            post(crate::handlers::count_tokens::handle_count_tokens),
+        );
         // Gateway model discovery (CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1):
         // Claude Code queries this at startup to populate the /model picker
         // with routed models. See handlers::local_model::handle_models.
