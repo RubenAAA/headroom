@@ -196,6 +196,27 @@ pub async fn handle_chat_completions(
     // live-zone dispatcher inside forward_http.
     let body = compact_chat_tool_descriptions(body);
 
+    // Reversible redaction seam. No-op when the flag is off, when the body
+    // is not JSON, or when it holds nothing sensitive. Keyed on the
+    // conversation (not the request id) so one turn's placeholders stay
+    // valid — and byte-identical upstream — for the next.
+    let session_key = if state.config.redact_sensitive {
+        crate::proxy::redact_session_key(
+            &headers,
+            &client_addr,
+            &body,
+            crate::cache_stabilization::drift_detector::ApiKind::OpenAiChat,
+        )
+    } else {
+        crate::proxy::ensure_request_id(&headers)
+    };
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        &session_key,
+    );
+    let (body, seam) = gate.seam_bytes(body);
+
     // Reconstruct the Request<Body> shape forward_http expects.
     // Cloning the headers into a fresh builder keeps the original
     // method/uri/version intact. `axum::body::Body::from(Bytes)` is
@@ -224,12 +245,13 @@ pub async fn handle_chat_completions(
         }
     };
 
-    forward_http(state, client_addr, req)
+    let response = forward_http(state, client_addr, req)
         .await
         .unwrap_or_else(|e| {
             use axum::response::IntoResponse;
             e.into_response()
-        })
+        });
+    crate::redact::restore_response(seam, response)
 }
 
 #[cfg(test)]

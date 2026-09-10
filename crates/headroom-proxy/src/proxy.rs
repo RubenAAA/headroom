@@ -9784,6 +9784,26 @@ pub(crate) fn ensure_request_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
+/// Conversation-stable session key for the redaction seam on passthrough
+/// paths. Per-request ids mint a fresh token (and rotate the provider
+/// prefix) for the same secret every turn; the conversation key keeps one
+/// turn's placeholders valid for the next, matching the routed path's
+/// `prepared.redact_session_key`. Falls back to [`ensure_request_id`] when
+/// the body is not JSON. Only call when redaction is on: deriving costs the
+/// same canonical-hash pass the drift detector pays, and doing it twice per
+/// request (here + `forward_http`) would put that on every hot path.
+pub(crate) fn redact_session_key(
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+    body: &bytes::Bytes,
+    kind: ApiKind,
+) -> String {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(parsed) => derive_session_key(headers, client_addr, &parsed, kind),
+        Err(_) => ensure_request_id(headers),
+    }
+}
+
 // ─── Turn hooks ───────────────────────────────────────────────────────────
 
 /// Provider label for a compressible endpoint, as `turn_hooks::TurnContext`

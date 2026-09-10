@@ -49,6 +49,7 @@ pub mod prometheus;
 pub mod proxy_counters;
 pub mod proxy_metrics;
 pub mod recache;
+pub mod redact_metrics;
 pub mod replay_alternates;
 pub mod sidecar;
 pub mod tail_breakpoint;

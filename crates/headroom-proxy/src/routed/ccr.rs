@@ -389,4 +389,100 @@ mod resolver_alternation_tests {
         );
     }
 
+    /// A memory answer fetched mid-turn is upstream-bound content: the
+    /// continuation must carry the placeholder, never the secret — even when
+    /// the outbound prompt was clean and only the flag armed the turn.
+    #[tokio::test]
+    async fn memory_answers_are_redacted_before_the_continuation_goes_upstream() {
+        use crate::memory::backend::MemoryBackend;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = Arc::new(crate::memory::local_backend::LocalMemoryBackend::new());
+        backend
+            .save_memory(
+                "deploy key sk-abcdefghij1234567890 for staging",
+                "u1",
+                1.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut handler = crate::memory::handler::MemoryHandler::new(
+            crate::memory::handler::MemoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            "test",
+        );
+        handler.set_backend(backend);
+        let handler = Arc::new(handler);
+        let memory = crate::proxy::MemoryToolContext {
+            handler: handler.clone(),
+            provider: crate::memory::tool_adapter::Provider::Openai,
+            user_id: "u1".to_string(),
+        };
+
+        let redact_store = crate::redact::RedactStore::with_key([0xA5; 32]);
+        let ccr = RoutedCcr {
+            stores: None,
+            store: Arc::new(InMemoryCcrStore::new()),
+            memory: Some(memory),
+            client: reqwest::Client::new(),
+            upstream_url: format!("{}/v1/chat/completions", server.uri()),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "gpt-x",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            ),
+            config: Arc::new(crate::config::Config::for_test(
+                server.uri().parse().unwrap(),
+            )),
+            request_id: "req-mem-redact".to_string(),
+            responses_shape: false,
+            redact: Some(crate::redact::RedactRef {
+                store: redact_store,
+                session_key: "sess-mem".to_string(),
+            }),
+        };
+
+        let opening = turn_calling("memory_search", "{\"query\":\"deploy key\"}");
+        let (resolved, _) = resolve_routed_proxy_tools(&opening, &ccr).await;
+        assert_eq!(resolved["choices"][0]["message"]["content"], "done");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(!received.is_empty(), "the continuation must have run");
+        let sent: String = received
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            !sent.contains("sk-abcdefghij1234567890"),
+            "the secret must never go upstream"
+        );
+        assert!(
+            sent.contains("__HR_SECRET_"),
+            "the continuation carries the placeholder: {sent}"
+        );
+    }
 }

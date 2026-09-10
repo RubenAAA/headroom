@@ -52,7 +52,9 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
         outbound_drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
         tool_order_state: crate::cache_stabilization::tool_order::ToolOrderStore::default(),
         roster_pin_state: crate::cache_stabilization::tool_roster_pin::RosterPinStore::default(),
-        redact_store: crate::redact::RedactStore::new(),
+        // A fixed key, not the machine's: a test must not read or write the
+        // real key file. See `redact::tests::store`.
+        redact_store: crate::redact::RedactStore::with_key([0xA5; 32]),
         beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
         replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
         working_dir_pins: crate::cache_stabilization::working_dir::WorkingDirPins::new(8),

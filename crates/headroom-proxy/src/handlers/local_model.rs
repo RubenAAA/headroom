@@ -474,4 +474,76 @@ mod tests {
         assert_eq!(a.chars().filter(|&ch| ch == '-').count(), 4);
     }
 
+    #[tokio::test]
+    async fn fallback_forwards_what_the_client_sent_with_redaction_on() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Ok(home) = std::env::var("HOME") else {
+            eprintln!("SKIP: no HOME in test env");
+            return;
+        };
+        let inner = "read ".to_string() + &home + "/src/main.rs" + " for the deploy key";
+        let probe_body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": inner.clone()}],
+        }))
+        .unwrap();
+        // Pin the fixture: without a sensitive body this test proves nothing.
+        {
+            let probe_store = crate::redact::RedactStore::with_key([0xA5; 32]);
+            let probe_gate = crate::redact::RedactGate::new(true, &probe_store, "probe");
+            let (_, seam) = probe_gate.seam_bytes(bytes::Bytes::from(probe_body));
+            assert!(
+                seam.is_some(),
+                "fixture must be sensitive under ambient HOME"
+            );
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            })))
+            .mount(&server)
+            .await;
+
+        let mock_uri: url::Url = server.uri().parse().unwrap();
+        let state = crate::test_support::test_state(|c| {
+            c.redact_sensitive = true;
+            c.upstream = mock_uri.clone();
+        });
+        let parsed = serde_json::json!({
+            "model": "routed-model",
+            "messages": [{"role": "user", "content": inner}],
+        });
+        let uri: axum::http::Uri = server.uri().parse().unwrap();
+        let response = dispatch_route_fallback(
+            state,
+            "127.0.0.1:0".parse().unwrap(),
+            axum::http::Method::POST,
+            uri,
+            axum::http::HeaderMap::new(),
+            parsed,
+            "client-model",
+            "req-fallback-original",
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(!received.is_empty(), "fallback must reach upstream");
+        let sent: String = received
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            sent.contains(&inner),
+            "fallback must forward what the client sent"
+        );
+        assert!(
+            !sent.contains("__HR_"),
+            "fallback must not forward placeholders"
+        );
+    }
 }

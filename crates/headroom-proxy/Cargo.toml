@@ -124,6 +124,7 @@ brotli = "7"
 tempfile = "3"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
 
 [dev-dependencies]
 # CTX-2: unit tests for the passive-capture observer open a throwaway

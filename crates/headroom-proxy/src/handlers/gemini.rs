@@ -832,6 +832,22 @@ async fn forward_to_upstream(
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| ProxyError::InvalidUpstream(format!("invalid method: {e}")))?;
     let body_bytes = Bytes::from(serde_json::to_vec(body).unwrap_or_default());
+    // Reversible redaction seam, the same one the forward_http routes use.
+    // Encrypt and decrypt are paired inside this call, so the request id (or
+    // a fresh one) is a sufficient session key. Deliberately NOT the
+    // conversation key the other seam sites use (`redact_session_key` needs a
+    // HeaderMap, a client addr, and an ApiKind — this path has a HashMap, no
+    // addr at hand, and no Gemini ApiKind variant): same-secret turns remint
+    // per request here and churn the provider prefix. Correct, not stable.
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        &headers
+            .get("x-request-id")
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+    );
+    let (body_bytes, seam) = gate.seam_bytes(body_bytes);
     let mut req_builder = state.client.request(method, url);
     for (k, v) in &headers {
         if let Ok(hv) = HeaderValue::from_str(v) {
@@ -860,6 +876,7 @@ async fn forward_to_upstream(
     }
     response
         .body(Body::from(resp_body))
+        .map(|r| crate::redact::restore_response(seam, r))
         .map_err(|e| ProxyError::InvalidUpstream(format!("response build: {e}")))
 }
 
@@ -921,6 +938,14 @@ async fn forward_streaming(
 
     let method = Method::POST;
     let body_bytes = Bytes::from(serde_json::to_vec(body).unwrap_or_default());
+    // Same seam as the buffered routes; `restore_response` restores an SSE
+    // body chunk by chunk.
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        request_id,
+    );
+    let (body_bytes, seam) = gate.seam_bytes(body_bytes);
     let mut req_builder = state.client.request(method, &url);
     for (k, v) in headers {
         if let Ok(hv) = HeaderValue::from_str(v) {
@@ -985,13 +1010,14 @@ async fn forward_streaming(
             h.insert(name.clone(), value.clone());
         }
     }
-    builder.body(body).unwrap_or_else(|e| {
+    let response = builder.body(body).unwrap_or_else(|e| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("stream response build: {e}"),
             500,
         )
-    })
+    });
+    crate::redact::restore_response(seam, response)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

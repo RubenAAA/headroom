@@ -151,9 +151,47 @@ pub async fn handle_foundry_messages(
     if let Some(base) = state.config.foundry_base_url.clone() {
         req.extensions_mut().insert(UpstreamOverride(base));
     }
-    forward_http(state, client_addr, req)
+    // Reversible redaction seam. Unlike the buffered handlers, this route
+    // receives a streaming `Request<Body>`, so buffering is guarded on the
+    // flag: with redaction off the request reaches `forward_http` exactly as
+    // it arrived. The gate itself is still the shared one.
+    let mut seam = None;
+    if state.config.redact_sensitive {
+        let (parts, body) = req.into_parts();
+        let max = state.config.compression_max_body_bytes as usize;
+        let buffered = match axum::body::to_bytes(body, max).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    event = "handler_error",
+                    handler = "foundry",
+                    error = %e,
+                    "failed to buffer body for redaction"
+                );
+                return Response::builder()
+                    .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Body::from("request body exceeds buffer limit"))
+                    .expect("static response");
+            }
+        };
+        // Conversation-stable key (not the request id): the path is
+        // normalized to /v1/messages above, so the Anthropic kind applies.
+        let session_key = crate::proxy::redact_session_key(
+            &parts.headers,
+            &client_addr,
+            &buffered,
+            crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
+        );
+        let gate = crate::redact::RedactGate::new(true, &state.redact_store, &session_key);
+        let (gated, s) = gate.seam_bytes(buffered);
+        seam = s;
+        req = Request::from_parts(parts, Body::from(gated));
+    }
+
+    let response = forward_http(state, client_addr, req)
         .await
-        .unwrap_or_else(|e| e.into_response())
+        .unwrap_or_else(|e| e.into_response());
+    crate::redact::restore_response(seam, response)
 }
 
 #[cfg(test)]
