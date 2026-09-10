@@ -211,11 +211,11 @@ pub(crate) async fn try_routed_sidecar(
         );
         // Same close-on-drop as the main routed path: a mid-response death
         // ends `end_turn` with a marker instead of a reset socket.
-        // (Stream-contracts commit wires the shared finisher here; until
-        // then the translated stream flows through directly.)
+        let finished =
+            crate::sse::stream_finisher::finish_on_drop(translated, request_id.to_string());
         crate::sidecar::record_sidecar(request_id, &shape);
         return Some(streaming_body_response(axum::body::Body::from_stream(
-            translated,
+            finished,
         )));
     }
 

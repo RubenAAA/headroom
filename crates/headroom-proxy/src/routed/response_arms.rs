@@ -290,6 +290,15 @@ pub(crate) async fn handle_streaming_response(
     // rewriter speaks — so the same rewriter that serves the Claude path
     // serves this one. Only the continuation differs: it has to go back to
     // the routed upstream in its own shape.
+    //
+    // A routed upstream can die mid-response exactly like a direct one, and
+    // the translator leaves the turn unstopped on purpose (`abort_terminal`
+    // emits no `message_stop` and never closes a half-streamed tool call)
+    // so the finisher below owns the close: partial tool calls are
+    // discarded with a named marker instead of reaching the client
+    // truncated, and the turn ends `end_turn` instead of a reset socket.
+    // Without this a routed drop ends as a clean-looking turn (silent cut)
+    // or a bare connection error (dead session).
     let inner: std::pin::Pin<
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
     > = match ccr {
@@ -303,7 +312,9 @@ pub(crate) async fn handle_streaming_response(
                     Err(e) => {
                         // Unparseable upstream means no continuation is
                         // possible. Stream on untouched rather than fail the
-                        // turn; the client is no worse off than before.
+                        // turn; the client is no worse off than before. The
+                        // finisher still owns the close: translator output
+                        // aborts unstopped on every path, not just the CCR one.
                         tracing::warn!(
                             event = "routed_ccr_bad_upstream_url",
                             error = %e,
@@ -313,7 +324,10 @@ pub(crate) async fn handle_streaming_response(
                         return streaming_body_response(restore_streaming(
                             redact_table,
                             &request_id,
-                            translated_stream,
+                            crate::sse::stream_finisher::finish_on_drop(
+                                translated_stream,
+                                request_id.clone(),
+                            ),
                         ));
                     }
                 },
@@ -353,7 +367,8 @@ pub(crate) async fn handle_streaming_response(
         }
         None => Box::pin(translated_stream),
     };
-    let body = restore_streaming(redact_table, &request_id, inner);
+    let finished = crate::sse::stream_finisher::finish_on_drop(inner, request_id.clone());
+    let body = restore_streaming(redact_table, &request_id, finished);
 
     streaming_body_response(body)
 }

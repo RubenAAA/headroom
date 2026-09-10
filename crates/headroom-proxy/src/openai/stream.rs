@@ -254,14 +254,18 @@ impl StreamTranslator {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0)
         };
-        let cache_read = usage
-            .and_then(|u| {
-                u.get("input_tokens_details")
-                    .or_else(|| u.get("prompt_tokens_details"))
-            })
+        let cache_details = usage.and_then(|u| {
+            u.get("input_tokens_details")
+                .or_else(|| u.get("prompt_tokens_details"))
+        });
+        let cache_read = cache_details
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        // A missing `cached_tokens` field is "the provider reported no cache
+        // data", not a miss: counting it as zero drags the fleet hit rate down
+        // on providers with no cache telemetry.
+        let cache_capable = cache_details.and_then(|d| d.get("cached_tokens")).is_some();
         // Both OpenAI shapes report an `input_tokens` that *includes* the
         // cached prefix; the observer's counter is Anthropic-shaped and
         // excludes it, and it adds `cache_read` back on to form the
@@ -269,7 +273,7 @@ impl StreamTranslator {
         // the prefix twice and drags every routed turn's hit rate down.
         let provider_input = get("input_tokens").max(get("prompt_tokens"));
         observer.note_output_tokens(&ctx.request_id, self.total_output_tokens);
-        let class = observer.complete(
+        let class = observer.complete_with_cache_capability(
             &ctx.request_id,
             provider_input.saturating_sub(cache_read),
             cache_read,
@@ -278,6 +282,7 @@ impl StreamTranslator {
             // there is no TTL breakdown to split — `None`, not a pair of zeros,
             // which would claim this endpoint wrote nothing at either tier.
             None,
+            cache_capable,
         );
         self.observation_completed = true;
         // Persist it, same as the Claude path: the observer's counters are
@@ -880,21 +885,27 @@ impl StreamTranslator {
 
     /// Terminal events for a turn whose upstream died mid-stream.
     ///
-    /// Mirrors the Anthropic path's `finish_on_drop`: the client keeps what
-    /// it already holds and the turn ends cleanly instead of truncating the
-    /// connection mid-frame. Empty when nothing started — no `message_start`
-    /// went out, so there is nothing to close and the caller propagates the
-    /// transport error instead. `end_turn`, never `tool_use`: a half-streamed
-    /// call must not run.
+    /// Deliberately NOT a complete close: no `message_stop`, and never a
+    /// `content_block_stop` for a half-streamed tool call. The translated
+    /// stream always runs under `sse::stream_finisher::finish_on_drop`
+    /// downstream, which owns the close — it withholds the partial tool
+    /// block, names it in the truncation marker, and ends `end_turn`.
+    /// Closing the tool block here would look complete downstream and the
+    /// call could run on truncated input; stopping the message here would
+    /// read as a clean finish with no marker. Empty when nothing started —
+    /// no `message_start` went out, so there is nothing to close and the
+    /// caller propagates the transport error instead. `end_turn`, never
+    /// `tool_use`: a half-streamed call must not run.
     fn abort_terminal(&mut self) -> Vec<String> {
         if !self.started {
             return Vec::new();
         }
         self.terminated = true;
         let mut events = Vec::new();
-        self.close_block_final(&mut events);
+        if self.open != Some(OpenBlock::Tool) {
+            self.close_block_final(&mut events);
+        }
         events.push(self.emit_message_delta("end_turn"));
-        events.push(self.emit_message_stop());
         events
     }
 }
@@ -907,6 +918,10 @@ struct TranslateState<S> {
     buffer: String,
     current_event: Option<String>,
     current_data: Vec<String>,
+    /// Set once the upstream has failed. A reqwest stream that has yielded an
+    /// error yields the same error on every later poll, so without this the
+    /// fold below would re-close the turn and re-log forever.
+    finished: bool,
 }
 
 impl<S> TranslateState<S>
@@ -1011,8 +1026,12 @@ pub(crate) fn translate_openai_stream_to_anthropic(
             buffer: String::new(),
             current_event: None,
             current_data: Vec::new(),
+            finished: false,
         },
         |mut state| async move {
+            if state.finished {
+                return None;
+            }
             loop {
                 match state.upstream.next().await {
                     Some(Ok(bytes)) => {
@@ -1027,16 +1046,22 @@ pub(crate) fn translate_openai_stream_to_anthropic(
                         // The client already holds part of this turn, so there
                         // is no fallback to be had: re-dispatching now would
                         // splice a second upstream's events onto a half-finished
-                        // message. Close the turn cleanly instead of truncating
-                        // the client's connection mid-frame, and leave a line
-                        // saying which turn died mid-body rather than at the
-                        // status line.
+                        // message. The abort below closes text/thinking and
+                        // downgrades to `end_turn` but deliberately leaves the
+                        // message unstopped and any half-streamed tool call
+                        // unclosed — `finish_on_drop` downstream owns that
+                        // close (partial tool discarded with a named marker).
+                        // Either way this turn is over: the upstream will hand
+                        // back the same error for as long as it is polled.
                         tracing::warn!(
                             event = "routed_stream_aborted",
                             error = %e,
                             "routed upstream stream failed after the client had events"
                         );
                         let terminal = state.translator.abort_terminal();
+                        // Either way this turn is over: the upstream will hand
+                        // back the same error for as long as it is polled.
+                        state.finished = true;
                         if terminal.is_empty() {
                             // Nothing started: no `message_start` went out, so
                             // there is no turn to close — propagate the
@@ -1052,6 +1077,7 @@ pub(crate) fn translate_openai_stream_to_anthropic(
                     None => {
                         let mut output = Vec::new();
                         state.flush_trailing(&mut output);
+                        state.finished = true;
                         if output.is_empty() {
                             return None;
                         }
@@ -1861,6 +1887,93 @@ mod tests {
         );
     }
 
+    /// A reqwest stream that has yielded an error yields that same error on
+    /// every later poll. The fold used to close the turn and keep the stream
+    /// alive, so it re-closed and re-logged as fast as the executor allowed:
+    /// on 2026-09-10 that wrote a 59 GB log at 55 MB/s and grew the proxy by
+    /// 3.2 GB a minute until the machine's OOM killer took it. The upstream
+    /// must not be polled again once it has failed.
+    #[tokio::test]
+    async fn a_failed_upstream_is_never_polled_again() {
+        use futures_util::StreamExt;
+        redirect_savings_ledger();
+        // A real `reqwest::Error`, made without touching the network.
+        let err = reqwest::Client::new()
+            .get("http://")
+            .send()
+            .await
+            .expect_err("no host in the url");
+        let started = concat!(
+            "event: response.created\n",
+            "data: {}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"hi\"}\n",
+            "\n",
+        );
+        let mut step = 0;
+        let mut err = Some(err);
+        let upstream = futures_util::stream::poll_fn(move |_| {
+            step += 1;
+            std::task::Poll::Ready(match step {
+                1 => Some(Ok(bytes::Bytes::from(started))),
+                2 => Some(Err(err.take().expect("one error"))),
+                _ => panic!("upstream polled after it failed"),
+            })
+        });
+        let translated = translate_openai_stream_to_anthropic(
+            Box::pin(upstream),
+            "muse-spark-1.3".to_string(),
+            crate::codex_rate_limits::CodexRateLimitStore::new(),
+            false,
+            None,
+        );
+        let out: Vec<String> = translated
+            .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
+            .collect()
+            .await;
+        let joined = out.join("");
+        assert!(joined.contains("hi"), "delta lost: {joined}");
+        // The translator leaves the turn unstopped on purpose: the stop
+        // (and the truncation marker) is `finish_on_drop`'s job downstream.
+        // A `message_stop` here would read as a clean finish with no marker.
+        assert!(
+            !joined.contains("event: message_stop"),
+            "abort stopped the turn; the finisher would read it as clean: {joined}"
+        );
+        assert!(
+            joined.contains("end_turn"),
+            "abort must downgrade to end_turn: {joined}"
+        );
+        // And the finisher does close it, exactly once, marked truncated.
+        let closed: Vec<String> = crate::sse::stream_finisher::finish_on_drop(
+            futures_util::stream::iter(
+                out.into_iter()
+                    .map(|s| Ok::<_, std::io::Error>(bytes::Bytes::from(s))),
+            ),
+            "test".to_string(),
+        )
+        .map(|r| {
+            String::from_utf8(
+                r.expect("finisher must not error on an aborted turn")
+                    .to_vec(),
+            )
+            .unwrap()
+        })
+        .collect()
+        .await;
+        let shut = closed.join("");
+        assert!(
+            shut.contains("dropped mid-response"),
+            "no truncation marker; the turn reads as finished: {shut}"
+        );
+        assert_eq!(
+            shut.matches("event: message_stop").count(),
+            1,
+            "the turn must be closed exactly once: {shut}"
+        );
+    }
+
     /// A refusal is the turn's only text and must reach the client as text,
     /// not vanish into an empty `end_turn`.
     #[test]
@@ -1926,12 +2039,13 @@ mod tests {
         );
     }
 
-    /// A transport error after the turn started must close it cleanly rather
-    /// than truncate the client's connection, and straggler frames after the
-    /// abort must not reopen it. Before anything started there is no turn to
-    /// close, so the abort is empty and the error propagates.
+    /// A transport error after the turn started must leave the close to
+    /// `finish_on_drop` downstream: no `message_stop` here (a stopped turn
+    /// reads as cleanly finished, with no marker), and straggler frames
+    /// after the abort must not reopen it. Before anything started there is
+    /// no turn to close, so the abort is empty and the error propagates.
     #[test]
-    fn an_aborted_turn_closes_cleanly_and_stays_closed() {
+    fn an_aborted_turn_stays_open_for_the_finisher_and_stays_closed() {
         let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
         assert!(t.abort_terminal().is_empty());
         t.process_frame(Some("response.created"), &json!({}).to_string());
@@ -1945,8 +2059,8 @@ mod tests {
             "half-streamed call must not run: {term}"
         );
         assert!(
-            term.contains("event: message_stop"),
-            "abort left the turn unterminated: {term}"
+            !term.contains("event: message_stop"),
+            "abort stopped the turn; the finisher would read it as clean: {term}"
         );
         let after = t
             .process_frame(
@@ -1957,6 +2071,109 @@ mod tests {
         assert!(
             !after.contains("late"),
             "straggler reopened the turn: {after}"
+        );
+    }
+
+    /// A half-streamed tool call must reach the finisher unclosed: a
+    /// `content_block_stop` here would look complete downstream and the call
+    /// could run on truncated input. The finisher withholds the partial
+    /// block and names it in the marker instead.
+    #[test]
+    fn an_aborted_tool_call_stays_open_for_the_finisher() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        t.process_frame(Some("response.created"), &json!({}).to_string());
+        t.process_frame(
+            Some("response.output_item.added"),
+            &json!({"item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}})
+                .to_string(),
+        );
+        t.process_frame(
+            Some("response.function_call_arguments.delta"),
+            &json!({"delta": "{\"comma"}).to_string(),
+        );
+        let term = t.abort_terminal().join("");
+        assert!(
+            term.contains("end_turn"),
+            "half-streamed call must not run: {term}"
+        );
+        assert!(
+            !term.contains("content_block_stop"),
+            "abort closed the partial tool call; it would run truncated: {term}"
+        );
+        assert!(
+            !term.contains("event: message_stop"),
+            "abort stopped the turn; the finisher would read it as clean: {term}"
+        );
+    }
+
+    /// End to end across the seam: translator abort frames through
+    /// `finish_on_drop` must come out marked truncated, ended `end_turn`,
+    /// stopped exactly once — with the partial tool input withheld, never
+    /// run. This is the contract the abort shape above exists for; it fails
+    /// if either side drifts (translator stopping the turn, finisher
+    /// releasing the partial call).
+    #[test]
+    fn aborted_routed_turn_closes_marked_through_the_finisher() {
+        use futures_util::StreamExt;
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut frames: Vec<String> = Vec::new();
+        frames.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        frames.extend(t.process_frame(
+            Some("response.output_text.delta"),
+            &json!({"delta": "working on it"}).to_string(),
+        ));
+        frames.extend(
+            t.process_frame(
+                Some("response.output_item.added"),
+                &json!({"item": {"type": "function_call", "call_id": "call_9", "name": "Read"}})
+                    .to_string(),
+            ),
+        );
+        frames.extend(t.process_frame(
+            Some("response.function_call_arguments.delta"),
+            &json!({"delta": "{\"path\""}).to_string(),
+        ));
+        frames.extend(t.abort_terminal());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = frames
+            .into_iter()
+            .map(|s| Ok(bytes::Bytes::from(s)))
+            .collect();
+        let out = rt.block_on(async {
+            let mut acc = String::new();
+            let mut s = Box::pin(crate::sse::stream_finisher::finish_on_drop(
+                futures_util::stream::iter(chunks),
+                "test".to_string(),
+            ));
+            while let Some(item) = s.next().await {
+                let b = item.expect("finisher must not error on an aborted turn");
+                acc.push_str(&String::from_utf8_lossy(&b));
+            }
+            acc
+        });
+        assert!(
+            out.contains("did NOT run"),
+            "no truncation marker; the turn reads as finished: {out}"
+        );
+        assert!(
+            out.contains("`Read`"),
+            "marker must name the discarded call so the model can re-issue it: {out}"
+        );
+        assert!(
+            !out.contains("{\"path\""),
+            "partial tool input reached the client and could run truncated: {out}"
+        );
+        assert!(
+            out.contains("\"stop_reason\":\"end_turn\""),
+            "turn must end end_turn, never tool_use: {out}"
+        );
+        assert_eq!(
+            out.matches("event: message_stop").count(),
+            1,
+            "turn must stop exactly once: {out}"
         );
     }
 

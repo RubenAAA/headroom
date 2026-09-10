@@ -114,7 +114,7 @@ pub(crate) struct CcrStreamContext {
     /// runs those too, for the same reason it runs `headroom_retrieve`.
     pub memory: Option<crate::proxy::MemoryToolContext>,
     /// Redaction memory for continuations this turn (see
-    /// [`crate::handlers::local_model::RoutedCcr::redact`]). `None` on paths
+    /// [`crate::routed::ccr::RoutedCcr::redact`]). `None` on paths
     /// that never redact, where continuations pass through.
     pub redact: Option<crate::redact::RedactRef>,
 }
@@ -692,11 +692,9 @@ impl Rewriter {
     /// from a complete picture of the turn.
     fn handle(&mut self, ev: SseEvent) -> Vec<Bytes> {
         let parsed: Value = serde_json::from_slice(&ev.data).unwrap_or(Value::Null);
-        let kind = parsed
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // Borrow the kind string: the old `.to_string()` allocated once per
+        // event (~25ns × ~500 events/stream) for a value only matched on.
+        let kind = parsed.get("type").and_then(Value::as_str).unwrap_or("");
 
         // Feed the state machine first; a parse failure there is not a reason
         // to drop the byte path.
@@ -705,7 +703,7 @@ impl Rewriter {
             data: ev.data.clone(),
         });
 
-        match kind.as_str() {
+        match kind {
             "content_block_start" => {
                 let index = parsed.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let block = parsed.get("content_block").cloned().unwrap_or(Value::Null);
@@ -1016,6 +1014,28 @@ fn non_streaming_continuation_request(forwarded_request: &Bytes) -> Bytes {
     }
 }
 
+/// Keep streaming on for backends that mandate it. The chatgpt codex gateway
+/// answers a de-streamed continuation with `400 Stream must be set to true`:
+/// the main turn streams, so only the continuation trips it, and the
+/// retrieval lands unresolved. `handle_ccr_response` folds the SSE back into
+/// a turn before parsing, so the round still resolves from equivalent
+/// content. Every other backend keeps the de-streamed request above.
+fn restore_stream_when_mandated(request: Bytes, upstream_url: &url::Url) -> Bytes {
+    if upstream_url.host_str() != Some("chatgpt.com") {
+        return request;
+    }
+    match serde_json::from_slice::<Value>(&request) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("stream".into(), json!(true));
+                obj.remove("stream_options");
+            }
+            serde_json::to_vec(&v).map(Bytes::from).unwrap_or(request)
+        }
+        Err(_) => request,
+    }
+}
+
 /// Run the buffered continuation logic against a rebuilt streamed turn.
 async fn resolve_retrieval(
     ctx: &CcrStreamContext,
@@ -1048,8 +1068,12 @@ async fn resolve_retrieval(
     };
 
     // Continuation rounds must come back as JSON — this code synthesises the
-    // client's stream itself and has no use for a second SSE body to splice.
-    let continuation_request = non_streaming_continuation_request(&ctx.forwarded_request);
+    // client's stream itself and has no use for a second SSE body to splice —
+    // except on backends that mandate streaming, where de-streaming 400s.
+    let continuation_request = restore_stream_when_mandated(
+        non_streaming_continuation_request(&ctx.forwarded_request),
+        &ctx.upstream_url,
+    );
 
     // Memory tools run after retrieval, on whatever the retrieval left. A turn
     // can reach for both, and the client can run neither — but neither can the
@@ -1154,6 +1178,36 @@ mod tests {
         assert!(
             v.get("stream_options").is_none(),
             "stream_options must not survive on a non-streaming continuation"
+        );
+    }
+
+    /// The chatgpt codex gateway mandates streaming: a de-streamed
+    /// continuation comes back `400 Stream must be set to true` and the
+    /// retrieval lands unresolved. Stream stays on there — and only there.
+    #[test]
+    fn mandating_backend_keeps_stream_on_continuations() {
+        let destreamed = Bytes::from(r#"{"model":"m","stream":false,"input":[]}"#);
+        let codex: url::Url = "https://chatgpt.com/backend-api/codex/responses"
+            .parse()
+            .unwrap();
+        let out = restore_stream_when_mandated(destreamed.clone(), &codex);
+        let v: Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(v["stream"], json!(true));
+
+        let zen: url::Url = "https://opencode.ai/zen/v1/responses".parse().unwrap();
+        let out = restore_stream_when_mandated(destreamed.clone(), &zen);
+        let v: Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(
+            v["stream"],
+            json!(false),
+            "backends that accept non-streamed continuations keep them"
+        );
+
+        let garbage = Bytes::from(b"not json".to_vec());
+        assert_eq!(
+            restore_stream_when_mandated(garbage.clone(), &codex),
+            garbage,
+            "unparseable bodies pass through untouched"
         );
     }
 

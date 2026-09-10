@@ -316,14 +316,20 @@ fn client_gone(request_id: &str) {
 }
 
 /// Wrap an Anthropic SSE body so it always ends as a well-formed message.
-pub(crate) fn finish_on_drop<S>(
+///
+/// Generic over the stream's error type (same shape as `rewrite_anthropic_stream`):
+/// the direct path feeds `reqwest::Error` straight from the upstream body, the
+/// routed path feeds `std::io::Error` out of its OpenAI→Anthropic translator.
+/// Errors are only ever logged and forwarded, never inspected.
+pub(crate) fn finish_on_drop<S, E>(
     inner: S,
     request_id: String,
-) -> impl Stream<Item = reqwest::Result<Bytes>>
+) -> impl Stream<Item = Result<Bytes, E>>
 where
-    S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + std::fmt::Debug + Send + 'static,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel::<reqwest::Result<Bytes>>(CLIENT_QUEUE_DEPTH);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, E>>(CLIENT_QUEUE_DEPTH);
 
     tokio::spawn(async move {
         let mut inner = Box::pin(inner);
@@ -340,7 +346,7 @@ where
         let mut abandoned = false;
         // Set when the body died. Held as the error, not a string: when there
         // is no message to close, the client is owed the error itself.
-        let mut drop_err: Option<reqwest::Error> = None;
+        let mut drop_err: Option<E> = None;
 
         loop {
             let chunk = match inner.next().await {
@@ -368,9 +374,14 @@ where
                 wire.observe(&v);
                 if ty == "message_start" {
                     // A second message through the same body. Whatever the
-                    // previous one left open says nothing about this one.
+                    // previous one left open says nothing about this one —
+                    // including whether a tool call completed: without the
+                    // reset, a round-1 tool_use would let a round-2 partial
+                    // through undowngraded and the client would run a
+                    // truncated call.
                     withheld.clear();
                     abandoned = false;
+                    delivered_tool_use = false;
                 }
                 if matches!(
                     ty,
@@ -525,8 +536,8 @@ where
             error = drop_err
                 .as_ref()
                 .map_or("body ended early".to_string(), |e| e.to_string()),
-            // `Display` on a `reqwest::Error` is only "error decoding response
-            // body" — the source chain, which is the part that names the TLS
+            // `Display` on these errors is terse ("error decoding response
+            // body") — the source chain, which is the part that names the TLS
             // alert or the broken pipe, is `Debug`-only. Without this every
             // turn that actually reached the user truncated was the one turn
             // whose cause we could not read: 8 of 8 between 08-24 and 08-26.
@@ -772,6 +783,40 @@ mod tests {
         assert!(
             !out.contains("\"index\":1"),
             "partial tool block leaked:\n{out}"
+        );
+    }
+
+    /// Two messages through one body: round 1 completes a tool (honest
+    /// `tool_use`), round 2 drops a partial one. The round-1 completion must
+    /// not license the round-2 fragment: without the `delivered_tool_use`
+    /// reset on `message_start`, the partial call would reach the client
+    /// runnable on truncated input.
+    #[test]
+    fn second_message_partial_tool_stays_downgraded() {
+        let out = drive(&[
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"x\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":2}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"y\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"b\"}}\n\n",
+            // The connection dies here, mid second tool.
+        ]);
+        assert_eq!(
+            out.matches("\"stop_reason\":\"tool_use\"").count(),
+            1,
+            "round-2 partial must not keep tool_use (round 1 owns the one):\n{out}"
+        );
+        assert!(
+            out.contains("\"stop_reason\":\"end_turn\""),
+            "round 2 needs the downgrade:\n{out}"
+        );
+        assert!(
+            !out.contains("{\\\"b"),
+            "round-2 partial input leaked:\n{out}"
         );
     }
 
