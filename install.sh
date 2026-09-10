@@ -121,6 +121,27 @@ for bin in headroom-proxy headroom; do
     say "installed $BIN_DIR/$bin"
 done
 
+# ── build cache GC ──────────────────────────────────────────────────────
+# Every Rust build leaves fingerprints in target/, and each toolchain bump
+# orphans the previous set — tens of GB over time. scripts/cargo-gc.sh runs
+# at the end of the make build targets (gated, never fails a build), but it
+# needs cargo-sweep to do anything. Install it once here; without it the
+# hook just prints a hint. Never fatal: a failed install leaves builds
+# working, only the automatic cleanup stays dormant.
+step "Build cache GC"
+if [ "$BUILD" = 0 ]; then
+    say "skipping (--no-build); run 'cargo install cargo-sweep' by hand for automatic target/ cleanup"
+elif command -v cargo-sweep >/dev/null 2>&1; then
+    say "cargo-sweep already installed"
+elif command -v cargo >/dev/null 2>&1; then
+    say "installing cargo-sweep (one-time 'target/' cleaner)"
+    cargo install cargo-sweep \
+        && say "installed cargo-sweep" \
+        || say "WARNING: could not install cargo-sweep — builds still work, run 'cargo install cargo-sweep' by hand for automatic target/ cleanup"
+else
+    say "cargo not found — skipping cargo-sweep (builds still work; install it by hand for automatic target/ cleanup)"
+fi
+
 # ── flag set ──────────────────────────────────────────────────────────────
 # contrib/headroom-flags.sh is the measured flag set — every option the
 # maintainer runs with, paths written as $HOME. An existing file is kept: it
