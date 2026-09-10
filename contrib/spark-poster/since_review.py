@@ -28,8 +28,9 @@ def main():
     first_review = min(mine)
     print(f"earliest review note: {first_review}\n")
 
+    proj_enc = gl.proj_enc()
     status, commits = gl.call(
-        "GET", f"/projects/{gl.PROJ_ENC}/merge_requests/{iid}/commits?per_page=100"
+        "GET", f"/projects/{proj_enc}/merge_requests/{iid}/commits?per_page=100"
     )
     if status != 200 or not isinstance(commits, list):
         print("could not list commits:", status)
@@ -42,7 +43,7 @@ def main():
               f"{c.get('author_name')}")
         print(f"  {(c.get('title') or '')[:100]}")
         st, diff = gl.call(
-            "GET", f"/projects/{gl.PROJ_ENC}/repository/commits/{c['id']}/diff"
+            "GET", f"/projects/{proj_enc}/repository/commits/{c['id']}/diff"
         )
         if st == 200 and isinstance(diff, list):
             for f in diff:
