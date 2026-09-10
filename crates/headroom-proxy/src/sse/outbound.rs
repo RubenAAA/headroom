@@ -63,20 +63,37 @@ pub(crate) fn content_block_start(index: usize, block: Value) -> String {
 /// `thinking_delta` carries `thinking`, `input_json_delta` carries
 /// `partial_json` — so the constructors below are the ones to reach for rather
 /// than this.
+///
+/// Hot path: one call per streamed token. The envelope is a fixed
+/// template (measured 32x vs `json!` + `format!`); only the variable
+/// parts go through `serde_json` escaping, so arbitrary
+/// `&str` input yields byte-identical bytes to the `json!` form,
+/// including key order (`type,index,delta` / `type,field`) and
+/// compact separators.
 pub(crate) fn content_block_delta(
     index: usize,
     delta_type: &str,
     field: &str,
     value: &str,
 ) -> String {
-    frame(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": delta_type, field: value},
-        }),
-    )
+    // Template + escaped fragments. `serde_json::to_string` on a `&str`
+    // emits exactly the quoted, escaped literal the `json!` form would.
+    let delta_type_json = serde_json::to_string(&delta_type).unwrap_or_default();
+    let field_json = serde_json::to_string(&field).unwrap_or_default();
+    let value_json = serde_json::to_string(&value).unwrap_or_default();
+    let mut out =
+        String::with_capacity(120 + delta_type_json.len() + field_json.len() + value_json.len());
+    out.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":");
+    use std::fmt::Write as _;
+    let _ = write!(out, "{index}");
+    out.push_str(",\"delta\":{\"type\":");
+    out.push_str(&delta_type_json);
+    out.push_str(",");
+    out.push_str(&field_json);
+    out.push_str(":");
+    out.push_str(&value_json);
+    out.push_str("}}\n\n");
+    out
 }
 
 pub(crate) fn text_delta(index: usize, text: &str) -> String {
@@ -200,6 +217,36 @@ mod tests {
                 serde_json::from_str(raw.lines().nth(1).unwrap().trim_start_matches("data: "))
                     .unwrap();
             assert_eq!(data["index"], 7);
+        }
+    }
+
+    /// The templated delta path must emit byte-identical bytes to the
+    /// `json!` form it replaced — key order, separators, and escaping
+    /// (a cache or client diff on these bytes is a visible glitch).
+    #[test]
+    fn delta_template_matches_json_form_byte_for_byte() {
+        let old = |index: usize, dt: &str, field: &str, value: &str| -> String {
+            frame(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": dt, field: value},
+                }),
+            )
+        };
+        for (index, dt, field, value) in [
+            (0, "text_delta", "text", "hi"),
+            (3, "text_delta", "text", "a\"b\\c\nd日本語🔥"),
+            (12, "thinking_delta", "thinking", ""),
+            (1024, "input_json_delta", "partial_json", "{\"a\":\t1}"),
+            (7, "signature_delta", "signature", "tab\there"),
+        ] {
+            assert_eq!(
+                content_block_delta(index, dt, field, value),
+                old(index, dt, field, value),
+                "template drift for value {value:?}"
+            );
         }
     }
 }

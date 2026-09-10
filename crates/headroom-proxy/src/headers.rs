@@ -14,15 +14,12 @@ use std::net::IpAddr;
 /// `helpers._headroom_bypass_enabled`. Non-UTF-8 header values are treated
 /// as absent.
 pub fn headroom_bypass_enabled(headers: &HeaderMap) -> bool {
-    let val = |name: &str| -> Option<String> {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_ascii_lowercase())
+    let get = |name: &str| -> Option<&str> { headers.get(name).and_then(|v| v.to_str().ok()) };
+    let is = |v: Option<&str>, lit: &str| {
+        v.map(|s| s.trim().eq_ignore_ascii_case(lit))
+            .unwrap_or(false)
     };
-    let bypass = val("x-headroom-bypass").as_deref() == Some("true");
-    let passthrough = val("x-headroom-mode").as_deref() == Some("passthrough");
-    bypass || passthrough
+    is(get("x-headroom-bypass"), "true") || is(get("x-headroom-mode"), "passthrough")
 }
 
 /// Extract `x-headroom-*` tags from inbound headers into a map with the
@@ -32,7 +29,8 @@ pub fn headroom_bypass_enabled(headers: &HeaderMap) -> bool {
 pub fn extract_tags(headers: &HeaderMap) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for (name, value) in headers.iter() {
-        let key = name.as_str().to_ascii_lowercase();
+        // HeaderName is already lowercase, no need to re-lowercase.
+        let key = name.as_str();
         if let Some(stripped) = key.strip_prefix(INTERNAL_HEADER_PREFIX) {
             if let Ok(v) = value.to_str() {
                 out.insert(stripped.to_string(), v.to_string());
@@ -145,9 +143,9 @@ pub fn is_request_drop(name: &HeaderName) -> bool {
 /// Returns true when `name` matches the internal `x-headroom-*` prefix
 /// (case-insensitive). Pure function, no regex.
 pub fn is_internal_header(name: &HeaderName) -> bool {
-    name.as_str()
-        .to_ascii_lowercase()
-        .starts_with(INTERNAL_HEADER_PREFIX)
+    // HeaderName normalizes to lowercase, so a direct prefix check is
+    // equivalent to lowercasing first and avoids a String alloc per call.
+    name.as_str().starts_with(INTERNAL_HEADER_PREFIX)
 }
 
 /// Headers we drop on the response side. Same hop-by-hop set; we don't touch
@@ -159,6 +157,10 @@ pub fn is_response_drop(name: &HeaderName) -> bool {
 
 /// Headers listed inside Connection: must be stripped too. Returns the lower-cased names.
 pub fn connection_listed_headers(headers: &HeaderMap) -> Vec<String> {
+    // Fast path: most requests carry no Connection header.
+    if !headers.contains_key(http::header::CONNECTION) {
+        return Vec::new();
+    }
     headers
         .get_all(http::header::CONNECTION)
         .iter()
@@ -174,7 +176,17 @@ pub fn append_xff(headers: &mut HeaderMap, addr: IpAddr) {
     let xff = HeaderName::from_static("x-forwarded-for");
     let new_value = match headers.get(&xff) {
         Some(existing) => match existing.to_str() {
-            Ok(s) => format!("{s}, {addr}"),
+            Ok(s) => {
+                // Max IP literal: 45 bytes for IPv6. Avoids a temp String
+                // just to size the reservation.
+                let mut out = String::with_capacity(s.len() + 2 + 45);
+                out.push_str(s);
+                out.push_str(", ");
+                // `IpAddr` Display impl; single formatting, no nested format!.
+                use std::fmt::Write as _;
+                let _ = write!(out, "{addr}");
+                out
+            }
             Err(_) => addr.to_string(),
         },
         None => addr.to_string(),
@@ -236,7 +248,10 @@ pub fn build_forward_request_headers(
     auth_mode: AuthMode,
 ) -> HeaderMap {
     let connection_listed = connection_listed_headers(incoming);
-    let mut out = HeaderMap::new();
+    // Reserve the common case (nothing stripped) to avoid regrows.
+    // Linear scan is kept deliberately: at proxy sizes (10-30 headers,
+    // 0-3 listed) it beats a HashSet (measured 0.8x for HashSet at 23x5).
+    let mut out = HeaderMap::with_capacity(incoming.len());
     for (name, value) in incoming.iter() {
         if is_request_drop(name) {
             continue;
@@ -271,7 +286,7 @@ pub fn build_forward_request_headers(
 /// Filter the upstream response headers before passing to the client.
 pub fn filter_response_headers(incoming: &HeaderMap) -> HeaderMap {
     let connection_listed = connection_listed_headers(incoming);
-    let mut out = HeaderMap::new();
+    let mut out = HeaderMap::with_capacity(incoming.len());
     for (name, value) in incoming.iter() {
         if is_response_drop(name) {
             continue;

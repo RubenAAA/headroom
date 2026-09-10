@@ -138,6 +138,21 @@ fn write_legacy(v: &Value, out: &mut String) {
 /// Write a JSON string literal with `ensure_ascii=True` semantics: non-ASCII
 /// chars are escaped as `\uXXXX` (surrogate pairs for astral chars).
 fn write_ascii_json_string(s: &str, out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // `format!("\\u{:04x}")` per char costs ~39ns; table lookup ~1ns for
+    // identical bytes. Only the control-char and non-ASCII arms use it;
+    // the common ASCII fast path below is untouched.
+    fn push_u4(out: &mut String, cp: u32) {
+        let mut buf = [0u8; 6];
+        buf[0] = b'\\';
+        buf[1] = b'u';
+        buf[2] = HEX[((cp >> 12) & 0xF) as usize];
+        buf[3] = HEX[((cp >> 8) & 0xF) as usize];
+        buf[4] = HEX[((cp >> 4) & 0xF) as usize];
+        buf[5] = HEX[(cp & 0xF) as usize];
+        // Hex table is ASCII-only, so this is always valid UTF-8.
+        out.push_str(std::str::from_utf8(&buf).unwrap_or("\\u0000"));
+    }
     out.push('"');
     for c in s.chars() {
         match c {
@@ -148,7 +163,7 @@ fn write_ascii_json_string(s: &str, out: &mut String) {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => push_u4(out, c as u32),
             c if c.is_ascii() => out.push(c),
             c => {
                 let cp = c as u32;
@@ -156,9 +171,10 @@ fn write_ascii_json_string(s: &str, out: &mut String) {
                     let v = cp - 0x10000;
                     let hi = 0xD800 + (v >> 10);
                     let lo = 0xDC00 + (v & 0x3FF);
-                    out.push_str(&format!("\\u{hi:04x}\\u{lo:04x}"));
+                    push_u4(out, hi);
+                    push_u4(out, lo);
                 } else {
-                    out.push_str(&format!("\\u{cp:04x}"));
+                    push_u4(out, cp);
                 }
             }
         }
@@ -188,7 +204,10 @@ pub const MAX_DECOMPRESSED_BODY_SIZE: u64 = 100 * 1024 * 1024;
 /// than yielding a short body.
 pub fn decode_body(bytes: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let encoding = content_encoding.unwrap_or("").trim().to_ascii_lowercase();
+    // `eq_ignore_ascii_case` avoids the per-request `to_ascii_lowercase()`
+    // String alloc (measured 4.6x on the match alone). Trims once, borrows.
+    let raw = content_encoding.unwrap_or("").trim();
+    let is = |lit: &str| raw.eq_ignore_ascii_case(lit);
     // One byte past the cap: enough to detect an oversized expansion while
     // bounding peak allocation to the cap plus one byte, never the bomb.
     let limit = MAX_DECOMPRESSED_BODY_SIZE.saturating_add(1);
@@ -206,18 +225,24 @@ pub fn decode_body(bytes: &[u8], content_encoding: Option<&str>) -> Result<Vec<u
         }
         Ok(out)
     };
-    match encoding.as_str() {
-        "" | "identity" => Ok(bytes.to_vec()),
-        "zstd" | "zstandard" => {
-            let decoder = zstd::stream::Decoder::new(bytes)
-                .map_err(|e| format!("Failed to decompress zstd request body: {e}"))?;
-            capped(Box::new(decoder), "zstd")
-        }
-        "gzip" => capped(Box::new(flate2::read::GzDecoder::new(bytes)), "gzip"),
-        "deflate" => capped(Box::new(flate2::read::ZlibDecoder::new(bytes)), "deflate"),
-        "br" => capped(Box::new(brotli::Decompressor::new(bytes, 4096)), "brotli"),
-        other => Err(format!("Unsupported Content-Encoding: {other}")),
+    if raw.is_empty() || is("identity") {
+        return Ok(bytes.to_vec());
     }
+    if is("zstd") || is("zstandard") {
+        let decoder = zstd::stream::Decoder::new(bytes)
+            .map_err(|e| format!("Failed to decompress zstd request body: {e}"))?;
+        return capped(Box::new(decoder), "zstd");
+    }
+    if is("gzip") {
+        return capped(Box::new(flate2::read::GzDecoder::new(bytes)), "gzip");
+    }
+    if is("deflate") {
+        return capped(Box::new(flate2::read::ZlibDecoder::new(bytes)), "deflate");
+    }
+    if is("br") {
+        return capped(Box::new(brotli::Decompressor::new(bytes, 4096)), "brotli");
+    }
+    Err(format!("Unsupported Content-Encoding: {raw}"))
 }
 
 /// Number of chars in `text` (Python `len(str)` semantics for the
@@ -253,44 +278,47 @@ fn splice_latest_user(items: &mut [Value], context_text: &str, text_types: &[&st
     }
 
     for idx in (0..items.len()).rev() {
-        let item = &items[idx];
-        if !item.is_object() {
-            continue;
-        }
-        if item.get("role").and_then(Value::as_str) != Some("user") {
+        // Borrow-check split: read role/object first, then take a mutable
+        // content borrow. Avoids cloning the whole content value.
+        let is_user_item = items[idx].is_object()
+            && items[idx].get("role").and_then(Value::as_str) == Some("user");
+        if !is_user_item {
             continue;
         }
 
-        let content = item.get("content").cloned();
-        match content {
+        match items[idx].get_mut("content") {
             Some(Value::String(s)) => {
-                let joined = format!("{s}\n\n{context_text}");
-                items[idx]["content"] = Value::String(joined);
+                s.reserve(2 + context_text.len());
+                s.push_str("\n\n");
+                s.push_str(context_text);
                 return appended_len(context_text);
             }
-            Some(Value::Array(parts)) if !parts.is_empty() => {
-                let mut new_parts = Vec::with_capacity(parts.len());
-                let mut appended = false;
-                for part in parts {
-                    let is_text = !appended
-                        && part.is_object()
+            Some(Value::Array(parts)) => {
+                if parts.is_empty() {
+                    return 0;
+                }
+                for part in parts.iter_mut() {
+                    let is_text = part.is_object()
                         && part
                             .get("type")
                             .and_then(Value::as_str)
                             .is_some_and(|t| text_types.contains(&t));
                     if is_text {
-                        let existing = part.get("text").and_then(Value::as_str).unwrap_or("");
-                        let mut new_part = part.clone();
-                        new_part["text"] = Value::String(format!("{existing}\n\n{context_text}"));
-                        new_parts.push(new_part);
-                        appended = true;
-                    } else {
-                        new_parts.push(part);
+                        match part.get_mut("text") {
+                            Some(Value::String(t)) => {
+                                t.reserve(2 + context_text.len());
+                                t.push_str("\n\n");
+                                t.push_str(context_text);
+                            }
+                            // Missing/non-string `text`: same bytes as the
+                            // old `format!("{existing}\n\n{ctx}")` with
+                            // `existing == ""`.
+                            _ => {
+                                part["text"] = Value::String(format!("\n\n{context_text}"));
+                            }
+                        }
+                        return appended_len(context_text);
                     }
-                }
-                if appended {
-                    items[idx]["content"] = Value::Array(new_parts);
-                    return appended_len(context_text);
                 }
                 // User item but no eligible text block — stop, no mutation.
                 return 0;

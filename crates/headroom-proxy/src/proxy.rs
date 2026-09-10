@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use url::Url;
 
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
@@ -3594,8 +3594,7 @@ pub(crate) async fn forward_http(
             );
             let mut limited = http_body_util::Limited::new(req.into_body(), max);
             let result: Result<bytes::Bytes, String> = async {
-                while let Some(frame) = limited
-                    .frame()
+                while let Some(frame) = http_body_util::BodyExt::frame(&mut limited)
                     .await
                     .transpose()
                     .map_err(|e| e.to_string())?
@@ -3622,22 +3621,6 @@ pub(crate) async fn forward_http(
                         "request body exceeds compression buffer limit ({max} bytes): {e}"
                     )));
                 }
-            }
-        };
-        match Ok::<_, String>(()) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    path = %path_for_log,
-                    limit_bytes = max,
-                    error = %e,
-                    "compression: body exceeds buffer limit; failing loudly (cannot \
-                     resume streaming once the body has been partially consumed)"
-                );
-                return Err(ProxyError::PayloadTooLarge(format!(
-                    "request body exceeds compression buffer limit ({max} bytes): {e}"
-                )));
             }
         };
 

@@ -92,12 +92,19 @@ pub(crate) fn name_candidates(model: &str) -> Vec<String> {
         add(tail, &mut seen);
         rest = tail;
     }
-    // Bedrock dotted ids: [region.]vendor.model
-    for candidate in seen.clone() {
+    // Bedrock dotted ids: [region.]vendor.model. Index-based (no
+    // `seen.clone()` per call): the dotted unwraps only append, so
+    // indices stay valid while pushing.
+    let mut i = 0;
+    while i < seen.len() {
+        // Bound the borrow: clone the one candidate being split (a
+        // single short string), not the whole vec.
+        let candidate = seen[i].clone();
         let parts: Vec<&str> = candidate.split('.').collect();
-        for i in 1..parts.len() {
-            add(&parts[i..].join("."), &mut seen);
+        for j in 1..parts.len() {
+            add(&parts[j..].join("."), &mut seen);
         }
+        i += 1;
     }
     seen
 }
@@ -131,7 +138,7 @@ pub fn get_tokenizer(model: &str) -> Box<dyn Tokenizer> {
     Box::new(
         candidates
             .iter()
-            .find_map(family_estimator_for)
+            .find_map(|m| family_estimator_for(m))
             .unwrap_or_default(),
     )
 }
@@ -139,11 +146,17 @@ pub fn get_tokenizer(model: &str) -> Box<dyn Tokenizer> {
 /// Per-family estimator density, or `None` when `model` names no known family.
 /// Returning `None` lets the caller keep unwrapping before settling for the
 /// default density.
-fn family_estimator_for(model: &String) -> Option<EstimatingCounter> {
-    let m = model.to_ascii_lowercase();
-    if m.starts_with("claude-") {
+///
+/// Takes `&str`: every caller passes `name_candidates` output, which is
+/// already lowercase, so the old per-candidate `to_ascii_lowercase()` was a
+/// redundant alloc + scan per form.
+fn family_estimator_for(model: &str) -> Option<EstimatingCounter> {
+    if model.starts_with("claude-") {
         Some(EstimatingCounter::new(3.5))
-    } else if m.starts_with("gemini") || m.starts_with("palm") || m.starts_with("command") {
+    } else if model.starts_with("gemini")
+        || model.starts_with("palm")
+        || model.starts_with("command")
+    {
         Some(EstimatingCounter::new(4.0))
     } else {
         None

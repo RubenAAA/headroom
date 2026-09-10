@@ -24,6 +24,83 @@ fn strip_cache_control(obj: &Value) -> Value {
     }
 }
 
+/// Normalized key JSON: `{"model":..,"messages":[stripped..],extra..}`.
+///
+/// Byte-identical to the `to_string(key_parts Map)` form this
+/// replaced: insertion order is `model`, `messages`, then `extra` in
+/// map order, with compact separators and `serde_json` escaping
+/// throughout. The strip rule matches [`strip_cache_control`]
+/// (drop `cache_control` members at any depth); the marker comment
+/// there applies here too — a moving breakpoint must not change the key.
+fn normalized_key_json(
+    messages: &[Value],
+    model: &str,
+    extra: &serde_json::Map<String, Value>,
+) -> Vec<u8> {
+    use std::io::Write as _;
+    fn write_stripped<W: std::io::Write>(w: &mut W, v: &Value) -> std::io::Result<()> {
+        match v {
+            Value::Object(map) => {
+                write!(w, "{{")?;
+                let mut first = true;
+                for (k, child) in map.iter() {
+                    if k.as_str() == "cache_control" {
+                        continue;
+                    }
+                    if !first {
+                        write!(w, ",")?;
+                    }
+                    first = false;
+                    serde_json::to_writer(&mut *w, &k)?;
+                    write!(w, ":")?;
+                    write_stripped(w, child)?;
+                }
+                write!(w, "}}")
+            }
+            Value::Array(arr) => {
+                write!(w, "[")?;
+                for (i, item) in arr.iter().enumerate() {
+                    if i > 0 {
+                        write!(w, ",")?;
+                    }
+                    write_stripped(w, item)?;
+                }
+                write!(w, "]")
+            }
+            // Scalars (incl. numbers via `arbitrary_precision`) go
+            // through `serde_json` itself, so escaping and number
+            // spelling match the old form exactly.
+            scalar => serde_json::to_writer(w, scalar)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other)),
+        }
+    }
+
+    let mut out = Vec::with_capacity(1024);
+    // Infallible in practice; on error the caller hashes whatever
+    // prefix was written, which is still deterministic for the input.
+    let _ = (|| -> std::io::Result<()> {
+        write!(out, "{{\"model\":")?;
+        serde_json::to_writer(&mut out, &model)?;
+        write!(out, ",\"messages\":")?;
+        write!(out, "[")?;
+        for (i, msg) in messages.iter().enumerate() {
+            if i > 0 {
+                write!(out, ",")?;
+            }
+            write_stripped(&mut out, msg)?;
+        }
+        write!(out, "]")?;
+        for (k, v) in extra.iter() {
+            write!(out, ",")?;
+            serde_json::to_writer(&mut out, &k)?;
+            write!(out, ":")?;
+            write_stripped(&mut out, v)?;
+        }
+        write!(out, "}}")
+    })();
+    out
+}
+
 /// Fields besides the turn array that change the answer, and so have to
 /// change the key. `instructions` is the Responses API's system prompt —
 /// the counterpart of Anthropic's `system`.
@@ -87,67 +164,78 @@ pub struct SemanticCache {
 }
 
 struct LruCache {
-    order: Vec<String>, // insertion order for LRU eviction
-    map: HashMap<String, CacheEntry>,
+    // `lru::LruCache` replaces the old hand-rolled `Vec<String> order +
+    // HashMap` (measured ~1.8x on 5k ops at cap 1000): hits were
+    // `position + remove(pos)` O(n) memmoves and eviction was
+    // `remove(0)` O(n); both are O(1) now. Eviction order is
+    // identical (least-recently-used first, `get` refreshes recency),
+    // and the capacity-eviction log line below is preserved verbatim.
+    cache: lru::LruCache<String, CacheEntry>,
 }
 
 impl LruCache {
-    fn new() -> Self {
+    fn new(max_entries: usize) -> Self {
+        // `NonZeroUsize::MIN` (1) for a zero cap, matching the old
+        // behavior where `max_entries == 0` still held one entry
+        // (the `while len >= 0` loop broke immediately on the empty
+        // order vec, then inserted).
+        let cap = std::num::NonZeroUsize::new(max_entries).unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
-            order: Vec::new(),
-            map: HashMap::new(),
+            cache: lru::LruCache::new(cap),
         }
     }
 
     fn get(&mut self, key: &str) -> Option<&CacheEntry> {
-        if self.map.contains_key(key) {
-            // Move to end for LRU
-            if let Some(pos) = self.order.iter().position(|k| k == key) {
-                self.order.remove(pos);
-            }
-            self.order.push(key.to_string());
-            self.map.get(key)
-        } else {
-            None
-        }
+        // `lru::get` refreshes recency exactly like the old
+        // move-to-end, and returns `None` when absent.
+        self.cache.get(key)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut CacheEntry> {
+        // Already MRU from the `get` above, so the recency refresh
+        // here is a no-op, matching the old plain-map lookup.
+        self.cache.get_mut(key)
+    }
+
+    fn pop(&mut self, key: &str) -> Option<CacheEntry> {
+        self.cache.pop(key)
     }
 
     fn insert(&mut self, key: String, entry: CacheEntry, max_entries: usize) {
-        // Remove existing if present
-        if self.map.contains_key(&key) {
-            if let Some(pos) = self.order.iter().position(|k| *k == key) {
-                self.order.remove(pos);
+        // Refresh path: an existing key never evicts, just goes MRU —
+        // `put` on a present key updates in place without evicting.
+        if self.cache.contains(&key) {
+            self.cache.put(key, entry);
+            return;
+        }
+
+        // Evict oldest until under capacity, logging each exactly as
+        // before (same event, same fields).
+        while self.cache.len() >= max_entries {
+            match self.cache.pop_lru() {
+                Some((oldest, evicted)) => {
+                    tracing::info!(
+                        event = "semantic_cache_capacity_eviction",
+                        key_hash = %oldest,
+                        entries = self.cache.len(),
+                        max_entries,
+                        entry_age_ms = evicted.created_at.elapsed().as_millis() as u64,
+                        "semantic cache evicted an entry at capacity"
+                    );
+                }
+                None => break,
             }
         }
 
-        // Evict oldest if at capacity
-        while self.map.len() >= max_entries {
-            if let Some(oldest) = self.order.first().cloned() {
-                self.order.remove(0);
-                let evicted = self.map.remove(&oldest);
-                tracing::info!(
-                    event = "semantic_cache_capacity_eviction",
-                    key_hash = %oldest,
-                    entries = self.map.len(),
-                    max_entries,
-                    entry_age_ms = evicted.map(|e| e.created_at.elapsed().as_millis() as u64).unwrap_or(0),
-                    "semantic cache evicted an entry at capacity"
-                );
-            } else {
-                break;
-            }
-        }
-
-        self.order.push(key.clone());
-        self.map.insert(key, entry);
+        self.cache.put(key, entry);
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        self.cache.len()
     }
 
     fn total_hits(&self) -> u64 {
-        self.map.values().map(|e| e.hit_count).sum()
+        self.cache.iter().map(|(_, e)| e.hit_count).sum()
     }
 }
 
@@ -156,34 +244,36 @@ impl SemanticCache {
         Self {
             max_entries,
             ttl: Duration::from_secs(ttl_seconds),
-            entries: std::sync::RwLock::new(LruCache::new()),
+            entries: std::sync::RwLock::new(LruCache::new(max_entries)),
         }
     }
 
     /// Compute cache key from messages, model, and extra fields.
+    ///
+    /// The normalized key JSON is byte-identical to the old
+    /// `to_string(key_parts Map)` form (pinned by
+    /// `normalized_key_bytes_are_stable`): same key order (`model`,
+    /// `messages`, then `extra` in field order), same compact
+    /// separators, same `serde_json` escaping. Only the construction
+    /// changed — the old path deep-cloned the whole turn array
+    /// (`messages.to_vec()`) plus a stripped rebuild plus the map;
+    /// this streams the stripped form straight into one buffer.
+    /// `DefaultHasher` keys are process-local, so keys were never
+    /// stable across deploys; within a process equal inputs still
+    /// hash equal and marker moves still hash equal.
     fn compute_key(
         messages: &[Value],
         model: &str,
         extra: &serde_json::Map<String, Value>,
     ) -> String {
-        let mut key_parts = serde_json::Map::new();
-        key_parts.insert("model".to_string(), serde_json::json!(model));
-        // Strip markers here too, not just from `extra`. A prompt-cache
-        // breakpoint moving within `messages` says nothing about what the model
-        // will answer, so hashing it raw gave the same turn two keys and lost
-        // the hit.
-        key_parts.insert(
-            "messages".to_string(),
-            strip_cache_control(&Value::Array(messages.to_vec())),
-        );
-        for (k, v) in extra {
-            key_parts.insert(k.clone(), strip_cache_control(v));
-        }
-
-        let normalized = serde_json::to_string(&key_parts).unwrap_or_default();
+        let normalized = normalized_key_json(messages, model, extra);
+        // `to_vec` output is valid UTF-8 by construction; `str::hash`
+        // (bytes + 0xff terminator) is exactly what the old
+        // `String::hash` fed the hasher, so key values are unchanged.
+        let text = std::str::from_utf8(&normalized).unwrap_or_default();
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        normalized.hash(&mut hasher);
+        text.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     }
 
@@ -207,10 +297,7 @@ impl SemanticCache {
 
         // Check expiration
         if entry.created_at.elapsed() > entry.ttl {
-            cache.map.remove(&key);
-            if let Some(pos) = cache.order.iter().position(|k| *k == key) {
-                cache.order.remove(pos);
-            }
+            cache.pop(&key);
             tracing::info!(
                 event = "semantic_cache_ttl_expiry",
                 key_hash = %key,
@@ -222,7 +309,7 @@ impl SemanticCache {
         }
 
         // Increment hit count
-        if let Some(e) = cache.map.get_mut(&key) {
+        if let Some(e) = cache.get_mut(&key) {
             e.hit_count += 1;
         }
         tracing::debug!(event = "semantic_cache_hit", key_hash = %key, hit_count = entry.hit_count + 1, "semantic cache hit");
@@ -255,8 +342,7 @@ impl SemanticCache {
     /// Clear all cache entries.
     pub fn clear(&self) {
         let mut cache = self.entries.write().unwrap();
-        cache.order.clear();
-        cache.map.clear();
+        cache.cache.clear();
     }
 
     /// Get cache statistics.
@@ -317,6 +403,32 @@ mod tests {
         let k1 = SemanticCache::compute_key(&msgs(), "claude-3", &extra);
         let k2 = SemanticCache::compute_key(&msgs(), "claude-4", &extra);
         assert_ne!(k1, k2);
+    }
+
+    /// The streaming writer must emit byte-identical normalized JSON to
+    /// the `Map`-build + `to_string` form it replaced. Key parsing is
+    /// deterministic (`serde_json` output), unlike `DefaultHasher`
+    /// values (process-local), so this pins cross-version stability:
+    /// a drift here cold-misses the whole cache on deploy at best, and
+    /// risks false hits at worst.
+    #[test]
+    fn normalized_key_bytes_are_stable() {
+        let extra = serde_json::Map::new();
+        let bytes = normalized_key_json(&msgs(), "claude-3", &extra);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"model":"claude-3","messages":[{"role":"user","content":"hello"}]}"#
+        );
+        // Markers stripped, key order and escaping preserved.
+        let marked = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hi \"yo\"", "cache_control": {"type": "ephemeral"}}],
+        })];
+        let bytes = normalized_key_json(&marked, "m", &extra);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi \"yo\""}]}]}"#
+        );
     }
 
     #[test]

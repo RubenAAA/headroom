@@ -144,7 +144,10 @@ pub async fn handle_messages(
     let body = routing.body;
     let identity_model = routing.identity_model;
 
-    let body_model = parsed
+    // Owned (not borrowed): `parsed` is moved into `prepare_turn` below
+    // while `body_model` is still needed after, so a borrow would dangle.
+    // One tiny alloc; the serialize-once below is the real win here.
+    let body_model: String = parsed
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -268,11 +271,30 @@ pub async fn handle_messages(
     // Book this turn through the same outcome funnel `forward_http` uses, so
     // routed spend shows up in /stats, /stats-history, and the dashboard
     // alongside Claude traffic.
-    let forwarded_tokens_estimate = serde_json::to_string(&openai_body)
+    //
+    // Serialize once: these bytes go upstream below AND feed the token
+    // estimate. `to_vec` emits identical compact bytes to the old
+    // `to_string` here, and `from_utf8` on them is free, so the estimate
+    // is unchanged while a full second serialization is gone.
+    let openai_body_vec = match serde_json::to_vec(&openai_body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                event = "local_model_serialize_error",
+                error = %e,
+                "failed to serialize OpenAI request"
+            );
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("serialization error"))
+                .expect("static response");
+        }
+    };
+    let forwarded_tokens_estimate = std::str::from_utf8(&openai_body_vec)
         .ok()
         .map(|body| {
             headroom_core::tokenizer::get_tokenizer(target_model.as_deref().unwrap_or(body_model))
-                .count_text(&body) as i64
+                .count_text(body) as i64
         })
         .unwrap_or(0);
     let mut outcome_ctx = build_routed_outcome_context(
@@ -313,20 +335,7 @@ pub async fn handle_messages(
         }
     }
 
-    let openai_body_bytes = match serde_json::to_vec(&openai_body) {
-        Ok(b) => Bytes::from(b),
-        Err(e) => {
-            tracing::warn!(
-                event = "local_model_serialize_error",
-                error = %e,
-                "failed to serialize OpenAI request"
-            );
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("serialization error"))
-                .expect("static response");
-        }
-    };
+    let openai_body_bytes = Bytes::from(openai_body_vec);
 
     let mut upstream_headers = upstream_headers;
 
