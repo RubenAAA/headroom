@@ -66,6 +66,51 @@ pub async fn handle_codex_limits(State(state): State<AppState>) -> Json<serde_js
     }
 }
 
+// ── /spark-context ──
+
+/// Muse Spark context window, in tokens. Per Meta's model docs every
+/// `muse-spark` variant (1.1–1.3, standard and contributor tiers) shares a
+/// 1,048,576-token window.
+pub const SPARK_CONTEXT_WINDOW: u32 = 1_048_576;
+
+/// Latest Spark turn's context usage, for the statusline.
+///
+/// Claude Code sends no usable `context_window` for routed Spark models — the
+/// same gap that motivates `/codex-limits` for quota — so the proxy serves
+/// what it saw instead. Each Anthropic turn resends the full transcript, so
+/// the last turn's `input_tokens_original` (what the client sent,
+/// pre-compression) is the session's live context usage, rendered by the
+/// statusline script as `spark ctx:used/window`.
+///
+/// Pure observer over the bounded request log; empty until a Spark turn lands.
+/// Single-session heuristic: with parallel Spark sessions this reports the
+/// most recent turn globally, so the script ages the snapshot out via
+/// `age_seconds`.
+pub async fn handle_spark_context(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let hit = state.request_logger.latest_matching(|e| {
+        e.error.is_none() && e.input_tokens_original > 0 && e.model.to_lowercase().contains("spark")
+    });
+    let Some(entry) = hit else {
+        return Json(serde_json::json!({"observed_at": null}));
+    };
+    let Ok(observed_at) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+        .map(|dt| dt.timestamp().max(0) as u64)
+    else {
+        return Json(serde_json::json!({"observed_at": null}));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(observed_at);
+    Json(serde_json::json!({
+        "observed_at": observed_at,
+        "age_seconds": now.saturating_sub(observed_at),
+        "model": entry.model,
+        "input_tokens": entry.input_tokens_original,
+        "context_window": SPARK_CONTEXT_WINDOW,
+    }))
+}
+
 // ── /stats/reset ──
 
 pub async fn handle_stats_reset(State(state): State<AppState>) -> Response {

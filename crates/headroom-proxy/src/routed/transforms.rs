@@ -30,6 +30,11 @@ pub(crate) struct CtxTransformReport {
     /// takes this instead of `session_key`. Derived from the body as
     /// received, before any transform below mutates it.
     pub(crate) lane_key: String,
+    /// The usage-observer conversation for this turn, derived from the same
+    /// pre-transform body as the lane. Carried so a caller that can return
+    /// early (the concurrency-cap shed) decides on the key the observer
+    /// actually parked, rather than re-deriving it from mutated bytes.
+    pub(crate) conversation_key: String,
 }
 
 /// Apply headroom's CTX request-side transforms to a routed model's parsed
@@ -107,9 +112,12 @@ pub(crate) async fn apply_ctx_request_transforms(
     // conversation's previous turn. This is what feeds the re-cache watchdog
     // that `scripts/statusline-cache-health.sh` renders — without it the cache
     // segment simply has nothing to say about routed turns.
+    let conversation_key =
+        crate::cache_stabilization::usage_observer::conversation_key(parsed, &lane_key);
+    report.conversation_key = conversation_key.clone();
     state.usage_observer.begin_request(
         request_id,
-        crate::cache_stabilization::usage_observer::conversation_key(parsed, &lane_key),
+        conversation_key,
         Some(session_key.as_str()),
         drift_dims,
         Some(
@@ -118,6 +126,12 @@ pub(crate) async fn apply_ctx_request_transforms(
                 identity_model,
             ),
         ),
+    );
+    // Same tier read as the Claude path: `parsed` is pre-transform here, so
+    // this is what the client asked for, before translation reshapes it.
+    state.usage_observer.note_client_cache_ttl(
+        request_id,
+        crate::cache_stabilization::cache_ttl::client_ttl_shape(parsed),
     );
 
     // CTX-2: passive session capture. Read-only — clones the body onto a
@@ -221,8 +235,16 @@ pub(crate) async fn apply_ctx_request_transforms(
                     request_id,
                 );
             } else if state.ccr_context_tracker.is_some() {
+                // Volume the fallback would have to absorb: records and bytes
+                // that entered the store but no tracker index.
                 tracing::info!(
                     event = "codex_ccr_workspace_unresolved",
+                    records_skipped = out.records.len(),
+                    bytes_skipped = out
+                        .records
+                        .iter()
+                        .map(|r| r.original.len() as u64)
+                        .sum::<u64>(),
                     "CCR: workspace unresolved; skipping compression tracking"
                 );
             }
@@ -605,4 +627,478 @@ pub(crate) fn apply_compression_and_replay(
     }
 
     report
+}
+
+#[cfg(test)]
+mod routed_request_tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use axum::http::HeaderValue;
+
+    fn conversation(tail: &str) -> Value {
+        json!({
+            "model": "claude-codex-5.6",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": tail}
+            ]
+        })
+    }
+
+    /// Compression is off unless the operator turned it on — the routed path
+    /// must not start rewriting bodies that the Claude path would forward
+    /// untouched.
+    #[test]
+    fn routed_compression_is_off_by_default() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = false;
+        });
+        let mut body = conversation("hello");
+        let before = body.clone();
+        let report =
+            apply_compression_and_replay(&state, &mut body, &HeaderMap::new(), "req-1", "sess-1");
+        assert_eq!(body, before, "body must forward byte-equal");
+        assert_eq!(report.tokens_saved, 0);
+        assert!(!report.replay_parked);
+    }
+
+    /// `x-headroom-bypass` wins over the config, same as on the Claude path.
+    #[test]
+    fn routed_compression_honours_the_bypass_header() {
+        let state = test_state(|c| {
+            c.compression = true;
+            c.compression_mode = crate::config::CompressionMode::AllMessages;
+            c.prefix_replay = false;
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-headroom-bypass", HeaderValue::from_static("true"));
+        let mut body = conversation("hello");
+        let before = body.clone();
+        let report = apply_compression_and_replay(&state, &mut body, &headers, "req-2", "sess-2");
+        assert_eq!(body, before);
+        assert!(report.transforms_applied.is_empty());
+    }
+
+    /// A conversation whose client-side `cache_control` markers move each turn
+    /// — exactly the churn the replay stage exists to absorb. The stage
+    /// rewrites these, so the forwarded bytes differ from the input and the
+    /// replay assertion below cannot pass vacuously.
+    fn conversation_with_cache_markers(marker_on: usize) -> Value {
+        let mut messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "first turn"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "reply"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "second turn"}]}),
+        ];
+        messages[marker_on]["content"][0]["cache_control"] = json!({"type": "ephemeral"});
+        json!({"model": "claude-codex-5.6", "messages": messages})
+    }
+
+    /// The point of the stage: turn two forwards the bytes turn one forwarded,
+    /// so the provider's prompt-cache prefix does not move even though the
+    /// client shuffled its `cache_control` breakpoint in between.
+    #[test]
+    fn prefix_replay_reuses_the_previously_forwarded_prefix() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = true;
+        });
+        let headers = HeaderMap::new();
+
+        let mut turn1 = conversation_with_cache_markers(0);
+        let raw1 = turn1["messages"].as_array().unwrap().clone();
+        let r1 = apply_compression_and_replay(&state, &mut turn1, &headers, "req-a", "sess-x");
+        assert!(r1.replay_parked, "turn one must park for turn two");
+        let forwarded1 = turn1["messages"].as_array().unwrap().clone();
+        assert_ne!(
+            forwarded1, raw1,
+            "guard: the stage must rewrite something, else the assertion below proves nothing"
+        );
+
+        // Close the turn out the way a clean stream does, then extend the
+        // conversation append-only with the marker moved, as a client does.
+        state.replay_store.complete("req-a", 1_000, 0);
+        let mut turn2 = conversation_with_cache_markers(2);
+        turn2["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "assistant", "content": [{"type": "text", "text": "third"}]}));
+        apply_compression_and_replay(&state, &mut turn2, &headers, "req-b", "sess-x");
+
+        let forwarded2 = turn2["messages"].as_array().unwrap();
+        assert_eq!(
+            forwarded2.len(),
+            forwarded1.len() + 1,
+            "only the new message should be appended"
+        );
+        // Compared with `cache_control` stripped, matching the contract: the
+        // replayed prefix is byte-identical in *content*, while the single
+        // ephemeral breakpoint is deliberately re-placed on the new last
+        // message each turn. That re-placement is the mechanism keeping the
+        // marker count bounded — Anthropic hard-errors above four.
+        assert_eq!(
+            strip_cache_control(&forwarded2[..forwarded1.len()]),
+            strip_cache_control(&forwarded1),
+            "the replayed prefix must match what turn one forwarded"
+        );
+        let markers = forwarded2
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
+            })
+            .count();
+        assert_eq!(markers, 1, "markers must not accumulate across turns");
+    }
+
+    fn strip_cache_control(messages: &[Value]) -> Vec<Value> {
+        messages
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if let Some(blocks) = m["content"].as_array_mut() {
+                    for b in blocks {
+                        if let Some(obj) = b.as_object_mut() {
+                            obj.remove("cache_control");
+                        }
+                    }
+                }
+                m
+            })
+            .collect()
+    }
+
+    /// The append-only guard: when an earlier message actually changed, the
+    /// stored prefix no longer describes this conversation and replaying it
+    /// would forward content the client did not send.
+    #[test]
+    fn prefix_replay_declines_when_history_was_rewritten() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = true;
+        });
+        let headers = HeaderMap::new();
+
+        let mut turn1 = conversation_with_cache_markers(0);
+        apply_compression_and_replay(&state, &mut turn1, &headers, "req-a", "sess-y");
+        state.replay_store.complete("req-a", 1_000, 0);
+
+        // Rewrite history rather than appending to it.
+        let mut turn2 = conversation_with_cache_markers(0);
+        turn2["messages"][0]["content"][0]["text"] = json!("a different first turn");
+        let expected_tail = turn2["messages"][0].clone();
+        apply_compression_and_replay(&state, &mut turn2, &headers, "req-b", "sess-y");
+
+        assert_eq!(
+            turn2["messages"][0]["content"][0]["text"], expected_tail["content"][0]["text"],
+            "the client's own first message must survive, not turn one's"
+        );
+    }
+
+    /// CCR's retrieve tool only extends an existing `tools` array — the Claude
+    /// path does not create one here, and a routed request must not either.
+    #[tokio::test]
+    async fn ccr_tool_is_injected_only_when_the_request_carries_tools() {
+        let state = test_state(|c| c.ccr_inject_tool = true);
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let mut with_tools = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        apply_ctx_request_transforms(&state, &mut with_tools, &headers, &addr, "req-test", None)
+            .await;
+        let names: Vec<&str> = with_tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"headroom_retrieve"), "got {names:?}");
+
+        let mut without_tools = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        apply_ctx_request_transforms(
+            &state,
+            &mut without_tools,
+            &headers,
+            &addr,
+            "req-test",
+            None,
+        )
+        .await;
+        assert!(
+            without_tools.get("tools").is_none(),
+            "a request with no tools array must not grow one"
+        );
+    }
+
+    /// Injecting the same tool twice would send the model a duplicate
+    /// definition and move the cached prefix every turn.
+    #[tokio::test]
+    async fn ccr_tool_injection_is_idempotent() {
+        let state = test_state(|c| c.ccr_inject_tool = true);
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None).await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None).await;
+        let count = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["name"] == "headroom_retrieve")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    /// `--ccr-inject-tool` defaults to *true*, so the retrieve tool is the one
+    /// stage that lands without being asked for — on both paths. Everything
+    /// else here stays dormant until its flag is set.
+    #[tokio::test]
+    async fn only_ccr_injects_under_default_config() {
+        let state = test_state(|_| {});
+        assert!(
+            state.config.ccr_inject_tool,
+            "guard: this test encodes the shipped default"
+        );
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        let report =
+            apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None)
+                .await;
+        assert_eq!(report.transforms_applied, vec!["ccr_tool".to_string()]);
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+    }
+
+    /// Ordering guarantee: compaction runs after injection, so an injected
+    /// tool is compacted like any other rather than slipping in behind it.
+    #[test]
+    fn tool_schema_compaction_strips_injected_tool_noise() {
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "tools": [{
+                "name": "headroom_retrieve",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "Retrieve",
+                    "type": "object",
+                    "properties": {"hash": {"type": "string"}}
+                }
+            }]
+        });
+        let (changed, saved) = apply_tool_schema_compaction(&mut body);
+        assert!(changed);
+        assert!(saved > 0, "stripping schema noise should save tokens");
+        let schema = &body["tools"][0]["input_schema"];
+        assert!(schema.get("$schema").is_none());
+        assert!(schema.get("title").is_none());
+        assert_eq!(schema["properties"]["hash"]["type"], "string");
+    }
+
+    /// A late MCP handshake splicing tools into the middle of the array moves
+    /// the cached prefix. Stabilization replays last turn's order and appends
+    /// genuinely-new tools at the end.
+    #[test]
+    fn tool_order_is_stable_when_a_late_tool_appears() {
+        let store = crate::cache_stabilization::tool_order::ToolOrderStore::default();
+        let tools = |names: &[&str]| {
+            json!({
+                "model": "claude-codex-5.6",
+                "tools": names
+                    .iter()
+                    .map(|n| json!({"name": n, "input_schema": {"type": "object"}}))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let order_of = |v: &Value| -> Vec<String> {
+            v["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let mut turn1 = tools(&["Read", "Write"]);
+        apply_bytes_stage(&mut turn1, |b| {
+            crate::proxy::maybe_stabilize_tool_order(b, &store, "sess-order", "r1")
+        });
+        assert_eq!(order_of(&turn1), vec!["Read", "Write"]);
+
+        // An MCP server registers and the client splices its tool in first.
+        let mut turn2 = tools(&["mcp__late__tool", "Read", "Write"]);
+        apply_bytes_stage(&mut turn2, |b| {
+            crate::proxy::maybe_stabilize_tool_order(b, &store, "sess-order", "r2")
+        });
+        assert_eq!(
+            order_of(&turn2),
+            vec!["Read", "Write", "mcp__late__tool"],
+            "the established prefix must keep its order, new tools go last"
+        );
+    }
+
+    /// `prompt_cache_key` belongs to the OpenAI request shape, so it is
+    /// injected after translation — and only for PAYG callers.
+    #[test]
+    fn prompt_cache_key_is_injected_only_for_payg() {
+        use crate::cache_stabilization::openai_cache_key::OpenAiShape;
+        let inject = |auth| {
+            let mut body = json!({"model": "gpt-5.6-luna", "input": [], "store": false});
+            apply_bytes_stage(&mut body, |b| {
+                crate::proxy::maybe_inject_openai_prompt_cache_key(
+                    b,
+                    OpenAiShape::Responses,
+                    auth,
+                    "r1",
+                    "/v1/responses",
+                )
+            });
+            body
+        };
+        assert!(
+            inject(headroom_core::auth_mode::AuthMode::Payg)
+                .get("prompt_cache_key")
+                .is_some(),
+            "a PAYG caller should get a synthesised key"
+        );
+        assert!(
+            inject(headroom_core::auth_mode::AuthMode::Subscription)
+                .get("prompt_cache_key")
+                .is_none(),
+            "a subscription caller is fingerprinted upstream; injecting would work against them"
+        );
+    }
+
+    /// The bytes adapter must leave the body alone when a stage hands back
+    /// something unparseable, rather than dropping the request on the floor.
+    #[test]
+    fn bytes_stage_adapter_preserves_the_body_on_failure() {
+        let mut body = json!({"model": "m", "messages": []});
+        let before = body.clone();
+        apply_bytes_stage(&mut body, |_| bytes::Bytes::from_static(b"not json"));
+        assert_eq!(body, before);
+    }
+
+    /// Compression is wired to a live dispatcher, not just gated correctly:
+    /// a body with a compressible block must come back smaller.
+    #[test]
+    fn routed_compression_actually_shrinks_a_compressible_body() {
+        let state = test_state(|c| {
+            c.compression = true;
+            c.compression_mode = crate::config::CompressionMode::AllMessages;
+            c.prefix_replay = false;
+        });
+        // Repeated whitespace-heavy log output: the shape the live-zone
+        // strategies are built for.
+        let noisy = "ERROR   module.rs:12    something failed\n".repeat(400);
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": noisy},
+                    {"type": "text", "text": "what went wrong?"}
+                ]
+            }]
+        });
+        let before = serde_json::to_string(&body).unwrap().len();
+        let report =
+            apply_compression_and_replay(&state, &mut body, &HeaderMap::new(), "req-c", "sess-c");
+        let after = serde_json::to_string(&body).unwrap().len();
+        assert!(
+            report.tokens_saved > 0,
+            "expected a real saving, got {} (bytes {before} -> {after})",
+            report.tokens_saved
+        );
+        assert!(after < before, "body should shrink: {before} -> {after}");
+        assert!(
+            !report.transforms_applied.is_empty(),
+            "the strategy that ran should be named in the outcome"
+        );
+    }
+
+    /// Regression for observation item 15: a conversation-sized CTX saving
+    /// used to survive into later routed turns even when the live-zone
+    /// dispatcher did nothing. The booked value must be this turn's measured
+    /// compression result, including zero, never the incoming CTX value.
+    #[test]
+    fn routed_booking_does_not_reemit_ctx_savings_without_compression() {
+        let mut ctx_report = CtxTransformReport {
+            transforms_applied: vec!["ctx_offload".to_string()],
+            tokens_saved: 4_522,
+            session_key: "sess-stale".to_string(),
+            lane_key: "sess-stale".to_string(),
+            conversation_key: "conv-stale".to_string(),
+        };
+        let compression_report = CompressionReport::default();
+
+        let separately_measured_ctx =
+            merge_routed_compression_report(&mut ctx_report, compression_report);
+
+        assert_eq!(separately_measured_ctx, 4_522);
+        assert_eq!(
+            ctx_report.tokens_saved, 0,
+            "no routed compression means the outcome must book zero, not a stale CTX value"
+        );
+        assert_eq!(ctx_report.transforms_applied, vec!["ctx_offload"]);
+    }
+
+    /// A different session must not inherit another's prefix.
+    #[test]
+    fn prefix_replay_is_scoped_to_its_session() {
+        let state = test_state(|c| {
+            c.compression = false;
+            c.compression_mode = crate::config::CompressionMode::Off;
+            c.prefix_replay = true;
+        });
+        let headers = HeaderMap::new();
+        let mut a = conversation("session a");
+        apply_compression_and_replay(&state, &mut a, &headers, "req-a", "sess-a");
+        state.replay_store.complete("req-a", 1_000, 0);
+
+        let mut b = conversation("session b");
+        let before = b.clone();
+        apply_compression_and_replay(&state, &mut b, &headers, "req-b", "sess-b");
+        assert_eq!(
+            crate::cache_stabilization::prefix_replay::canonicalize_for_prefix_compare(&b),
+            crate::cache_stabilization::prefix_replay::canonicalize_for_prefix_compare(&before),
+            "a cold session may gain a marker but must not replay session a"
+        );
+        let after_messages = b["messages"].as_array().unwrap();
+        // Wrapped to block form (every eligible string is), so compare content
+        // rather than bytes: session a's prefix would show up as other text.
+        assert_eq!(after_messages[0]["content"][0]["text"], "first turn");
+        assert_eq!(after_messages[1]["content"][0]["text"], "reply");
+        assert!(
+            after_messages[..2]
+                .iter()
+                .all(|m| m["content"][0]["cache_control"].is_null()),
+            "history must not carry the breakpoint — it belongs on the newest message"
+        );
+        assert_eq!(after_messages[2]["content"][0]["text"], "session b");
+        assert_eq!(
+            after_messages[2]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
 }

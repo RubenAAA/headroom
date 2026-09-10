@@ -15,7 +15,6 @@ use axum::Router;
 #[cfg(test)]
 use bytes::Bytes;
 use futures_util::{StreamExt as _, TryStreamExt};
-#[cfg(test)]
 use http_body_util::BodyExt;
 
 use crate::cache_stabilization;
@@ -255,6 +254,57 @@ const MAX_MESSAGE_ARRAY_LENGTH: usize = 10_000;
 /// costs is the model's answer; three attempts covers the overload bursts that
 /// produced every observed continuation failure.
 const CCR_CONTINUATION_RETRIES: u32 = 2;
+
+/// Ceiling on waiting for a continuation round's response headers, per
+/// attempt. The shared client timeout (600s, sized for streams) cannot see a
+/// stalled headers wait: measured 2026-09-09, one round hung 43s/31s/26s
+/// across its three attempts on flaky egress while the 600s bound sat
+/// untouched, holding the client's turn 107s for a retrieval that died.
+/// `.send()` resolves at response headers, so this cannot cut a slow model
+/// short — body streaming happens after, under the total timeout. A headers
+/// wait past this is a stall, not thinking; fail it fast so the retry can
+/// actually help instead of re-waiting the same stall.
+const CCR_CONTINUATION_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Short classification of a reqwest transport failure for log lines.
+/// reqwest's Display names the URL but not the phase; without this every
+/// continuation stall reads identically and the next one is undebuggable
+/// the same way.
+fn ccr_transport_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_builder() {
+        "builder"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_request() {
+        "request"
+    } else if e.is_decode() {
+        "decode"
+    } else {
+        "unknown"
+    }
+}
+
+/// The source chain behind a reqwest error, outermost first, length-capped.
+/// This is where the actual cause lives (hyper: connection closed early,
+/// TLS alert, DNS) — Display alone never shows it.
+fn ccr_error_chain(e: &reqwest::Error) -> String {
+    use std::error::Error;
+    let mut parts = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(s) = source {
+        parts.push(s.to_string());
+        if parts.len() >= 4 {
+            break;
+        }
+        source = s.source();
+    }
+    let joined = parts.join(" <- ");
+    joined.chars().take(500).collect()
+}
 const CALLER_CLIENT_CACHE_CAPACITY: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -278,7 +328,7 @@ fn upstream_client_builder(config: &Config) -> reqwest::ClientBuilder {
         // caller-selected public endpoint cannot redirect this process into a
         // private network.
         .redirect(reqwest::redirect::Policy::none())
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_idle_timeout(config.pool_idle_timeout)
         .http2_keep_alive_interval(std::time::Duration::from_secs(20))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)
@@ -332,12 +382,18 @@ fn caller_upstream_client(
         host: upstream.host().to_string(),
         addresses: key_addresses,
     };
-    let mut clients = state
+    // Fast path under a short critical section: never hold the mutex
+    // across `Client::build()` (TLS/pool setup, potentially ms). Two
+    // concurrent misses may both build; `put` is idempotent so the
+    // loser simply overwrites with an equivalent client.
+    if let Some(client) = state
         .caller_clients
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(client) = clients.get(&key) {
-        return Ok(client.clone());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
+        return Ok(client);
     }
 
     let client = upstream_client_builder(&state.config)
@@ -345,7 +401,11 @@ fn caller_upstream_client(
         .resolve_to_addrs(upstream.host(), upstream.addresses())
         .build()
         .map_err(ProxyError::Upstream)?;
-    clients.put(key, client.clone());
+    state
+        .caller_clients
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .put(key, client.clone());
     Ok(client)
 }
 
@@ -1234,6 +1294,13 @@ pub fn build_app(state: AppState) -> Router {
             "/codex-limits",
             get(crate::handlers::stats::handle_codex_limits),
         )
+        // Same split-out rationale as /codex-limits: the statusline polls
+        // this on every prompt for routed Spark models, whose own
+        // `context_window` never arrives from Claude Code.
+        .route(
+            "/spark-context",
+            get(crate::handlers::stats::handle_spark_context),
+        )
         .route(
             "/stats/reset",
             post(crate::handlers::stats::handle_stats_reset),
@@ -1534,6 +1601,16 @@ pub fn build_app(state: AppState) -> Router {
             .route("/debug/tasks", get(debug_tasks))
             .route("/debug/ws-sessions", get(debug_ws_sessions))
             .route("/debug/warmup", get(debug_warmup))
+            .route(
+                "/debug/inflight",
+                get(
+                    |axum::extract::State(_state): axum::extract::State<AppState>| async {
+                        axum::response::Json(serde_json::json!({
+                            "in_flight": InflightGuard::count_global(),
+                        }))
+                    },
+                ),
+            )
             .layer(middleware::from_fn(loopback_guard));
 
         router = router.merge(debug_router);
@@ -1897,12 +1974,34 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
         || !state.config.ccr_proactive_expansion
         || crate::modes::is_cache_mode(Some(&state.config.mode))
     {
+        // Shadow signal for the expansion re-enable decision: how often the
+        // gate alone keeps expansion out of play. `flag` separates the
+        // switched-off volume from the rest.
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_expansion_evaluation",
+            outcome = "skipped_gate",
+            flag = state.config.ccr_proactive_expansion,
+            "ccr: expansion gated out before consulting the tracker"
+        );
         return false;
     }
     let Some(tracker) = state.ccr_context_tracker.as_ref() else {
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_expansion_evaluation",
+            outcome = "no_tracker",
+            "ccr: expansion has no context tracker to consult"
+        );
         return false;
     };
     let Some(runtime) = state.ctx_offload.as_ref() else {
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_expansion_evaluation",
+            outcome = "no_runtime",
+            "ccr: expansion has no offload runtime to fetch from"
+        );
         return false;
     };
 
@@ -1917,11 +2016,18 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
         }
     };
     if recommendations.is_empty() {
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_expansion_evaluation",
+            outcome = "no_match",
+            "ccr: tracker consulted, nothing relevant to expand"
+        );
         return false;
     }
 
     let ccr = runtime.store.ccr();
     let mut expansions = Vec::new();
+    let rec_count = recommendations.len();
     for rec in recommendations {
         if let Some(content) = ccr.get(&rec.hash_key) {
             let item_count = content.lines().count().max(1);
@@ -1934,6 +2040,13 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
         }
     }
     if expansions.is_empty() {
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_expansion_evaluation",
+            outcome = "store_miss",
+            recs = rec_count,
+            "ccr: tracker recommended content the store no longer has"
+        );
         return false;
     }
 
@@ -1944,10 +2057,18 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
         );
     // Charge the shared budget. Expansion appends to the live tail, which is
     // re-sent every turn, so clipping it here is cache-safe.
+    let expansion_bytes_uncapped = expansion_text.len() as u64;
     let Some(expansion_text) = budget.take(
         crate::injection_budget::InjectionStage::ProactiveExpansion,
         expansion_text,
     ) else {
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_expansion_evaluation",
+            outcome = "over_budget",
+            bytes = expansion_bytes_uncapped,
+            "ccr: expansion did not fit the injection budget"
+        );
         return false;
     };
     // Measure before the move: this is what the request grows by, and it is
@@ -3088,6 +3209,45 @@ impl Drop for InflightGuard {
 #[derive(Clone)]
 pub(crate) struct SkipModelRouting(pub(crate) String);
 
+/// Seconds a shed turn is asked to wait before retrying. One commit window:
+/// the sibling turn whose overlap tripped the cap is seconds from done, and
+/// the client's own 429 backoff stacks on top of this.
+const CONCURRENCY_SHED_RETRY_AFTER_SECS: u64 = 1;
+
+/// 429 for a turn shed by `--max-conversation-concurrency`, shared by the
+/// passthrough and routed paths (both serve Anthropic-shaped clients).
+///
+/// Status 429 so the client's standard rate-limit retry fires — clients
+/// retry on the status, and the forward paths do the same upstream. The body
+/// type mirrors Anthropic's own rate-limit shape for that compatibility,
+/// while the message and the `x-headroom-shed` header say this is the proxy
+/// pacing one conversation's fan-out, not the provider throttling the
+/// account: the two must not be confused on a dashboard.
+pub(crate) fn conversation_concurrency_shed_response(
+    in_flight: usize,
+    cap: usize,
+) -> Response<Body> {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "rate_limit_error",
+            "message": format!(
+                "headroom: conversation concurrency cap exceeded ({in_flight} in flight, cap {cap}); retrying shortly lands against a committed prefix"
+            ),
+        },
+    });
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(
+            http::header::RETRY_AFTER,
+            CONCURRENCY_SHED_RETRY_AFTER_SECS.to_string(),
+        )
+        .header("content-type", "application/json")
+        .header("x-headroom-shed", "conversation-concurrency")
+        .body(Body::from(body.to_string()))
+        .expect("static shed response")
+}
+
 pub(crate) async fn forward_http(
     state: AppState,
     client_addr: SocketAddr,
@@ -3121,24 +3281,16 @@ pub(crate) async fn forward_http(
     let auth_mode = classify_auth_mode(req.headers());
     req.extensions_mut().insert(auth_mode);
 
-    // Resolve client IP through trusted gateway CIDRs.
-    let _client_ip = crate::forwarded_headers::resolve_client_ip(
-        Some(&client_addr.ip().to_string()),
-        req.headers(),
-        &state.trusted_gateway_cidrs,
-    );
-
     // Phase F PR-F2.1, c2/6: derive the per-mode CompressionPolicy at
     // request entry and stash alongside auth_mode. Storing the policy
     // (not just auth_mode) in extensions lets downstream stages read
     // the gate they need directly — no per-stage `for_mode` call.
     //
-    // c3/6: when `auth_mode_policy_enforcement` is `Disabled` (default
-    // until c6/6), force the policy to PAYG regardless of classifier
-    // output. This means c4/6 + c5/6 only ship behaviour change when
-    // an operator opts in via the env var, so the PR sequence is
-    // safely landed in main without flipping the live wire on default
-    // users until the final commit.
+    // c3/6: when `auth_mode_policy_enforcement` is `Disabled`,
+    // force the policy to PAYG regardless of classifier output.
+    // (Historical note: `Disabled` used to be the default so the
+    // rollout could land without changing live behavior; the default
+    // is now `Enabled`, see `config.rs`.)
     let policy = if state.config.auth_mode_policy_enforcement.is_enabled() {
         CompressionPolicy::for_mode(auth_mode)
     } else {
@@ -3419,7 +3571,51 @@ pub(crate) async fn forward_http(
             }
         }
         let body_read_start = Instant::now();
-        let buffered = match to_bytes(req.into_body(), max).await {
+        // Manual frame loop instead of `to_bytes`: the Content-Length
+        // hint above sizes the accumulator up front (no regrows on
+        // large bodies) and `freeze()` hands the bytes over with no
+        // final memcpy (`Collected::to_bytes` copies once). Byte
+        // contract matches `to_bytes(req.into_body(), max)` exactly:
+        // data frames concatenated in order, trailers ignored, and any
+        // error (including the `max` limit) falls into the same
+        // `PayloadTooLarge` arm below.
+        let buffered = {
+            let mut acc = bytes::BytesMut::with_capacity(
+                body_bytes_hint.map(|n| (n as usize).min(max)).unwrap_or(0),
+            );
+            let mut limited = http_body_util::Limited::new(req.into_body(), max);
+            let result: Result<bytes::Bytes, String> = async {
+                while let Some(frame) = limited
+                    .frame()
+                    .await
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                {
+                    if let Ok(data) = frame.into_data() {
+                        acc.extend_from_slice(&data);
+                    }
+                }
+                Ok(acc.freeze())
+            }
+            .await;
+            match result {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        path = %path_for_log,
+                        limit_bytes = max,
+                        error = %e,
+                        "compression: body exceeds buffer limit; failing loudly (cannot \
+                         resume streaming once the body has been partially consumed)"
+                    );
+                    return Err(ProxyError::PayloadTooLarge(format!(
+                        "request body exceeds compression buffer limit ({max} bytes): {e}"
+                    )));
+                }
+            }
+        };
+        match Ok::<_, String>(()) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -3765,6 +3961,40 @@ pub(crate) async fn forward_http(
                         &parsed,
                     )),
                 );
+                // Price the stock arm at the tier the client actually bought:
+                // `parsed` still carries its own markers here, before the
+                // pipeline adds or rewrites any. Main-loop traffic arrives
+                // on 1h, subagent traffic on the 5-minute default.
+                state.usage_observer.note_client_cache_ttl(
+                    &request_id,
+                    cache_stabilization::cache_ttl::client_ttl_shape(&parsed),
+                );
+                // Conversation-concurrency cap (`--max-conversation-concurrency`):
+                // shed fan-out overlap with the client's own retry instead of
+                // racing the provider's cache commit on every turn. The pending
+                // entry just parked is popped by the shed call, so the turn
+                // neither flags later turns concurrent nor lingers as
+                // abandoned. Disabled at 0. Ordinary interactive overlap never
+                // reaches a cap worth setting; only storms trip it.
+                if let Some(in_flight) = state.usage_observer.shed_if_over_conversation_cap(
+                    &request_id,
+                    &conversation,
+                    state.config.max_conversation_concurrency,
+                ) {
+                    crate::observability::proxy_counters::record_concurrency_shed();
+                    tracing::warn!(
+                        event = "conversation_concurrency_shed",
+                        request_id = %request_id,
+                        conversation_key = %conversation,
+                        in_flight,
+                        cap = state.config.max_conversation_concurrency,
+                        "conversation over its concurrency cap; shed with 429 so the client retries against a committed prefix"
+                    );
+                    return Ok(conversation_concurrency_shed_response(
+                        in_flight,
+                        state.config.max_conversation_concurrency,
+                    ));
+                }
                 // Read off the client's body here, once: the observer has no
                 // messages by the time usage comes back, and a first turn
                 // that writes cache needs them to say why.
@@ -5325,7 +5555,31 @@ pub(crate) async fn forward_http(
         // placed or moved is covered. Skipped on PAYG, where a 1h write is
         // priced 60% above a 5m one and the operator pays the difference in
         // dollars rather than in a token-counted usage window.
+        //
+        // Subagent passthrough: with `--respect-client-5m-ttl`, a body whose
+        // markers are all explicitly 5m keeps the tier it asked for instead
+        // of being upgraded to 1h entries that die unused. Read back from
+        // the observer, which saw the client's markers before any stage
+        // added or moved one; a turn that never reached the gate falls back
+        // to pinning.
+        let pin_1h = state
+            .usage_observer
+            .client_ttl_for(&request_id)
+            .map_or(true, |shape| {
+                cache_stabilization::cache_ttl::pin_1h_applies(
+                    shape,
+                    state.config.respect_client_5m_ttl,
+                )
+            });
+        if !pin_1h {
+            tracing::info!(
+                event = "ttl_1h_pin_skipped",
+                request_id = %request_id,
+                "client asked 5m everywhere; leaving its tier alone (--respect-client-5m-ttl)"
+            );
+        }
         let body_to_send = if (state.config.force_1h_cache_ttl || state.config.split_cache_ttl)
+            && pin_1h
             && auth_mode != AuthMode::Payg
             && matches!(
                 endpoint,
@@ -5572,6 +5826,11 @@ pub(crate) async fn forward_http(
                     // rewrites are expected and harmless if deterministic; only a
                     // ladder checkpoint that moves between turns costs cache.
                     prefix_ladder = %prefix_digest_ladder(&body_to_send).unwrap_or_default(),
+                    // The head ladder stops doubling at 32, so on a long turn
+                    // the whole disputed tail sits past its last checkpoint.
+                    // These windows cover the last 1/2/4 messages instead; the
+                    // smallest one that moved bounds the churn.
+                    tail_ladder = %tail_digest_ladder(&body_to_send).unwrap_or_default(),
                     beta_digest = %short_hash(beta),
                     // Which account sent the turn. The provider's cache is per
                     // credential, so a `/login` account switch recaches every
@@ -7444,6 +7703,41 @@ fn prefix_digest_ladder(body: &[u8]) -> Option<String> {
             out.push(format!("{depth}:{:04x}", hasher.finish() & 0xffff));
             depth *= 2;
         }
+    }
+    Some(out.join(","))
+}
+
+/// Windowed digests of the forwarded tail — `t1` covers the last message,
+/// `t2` the last two, `t4` the last four — so churn in the tail can be placed
+/// without logging a digest per message.
+///
+/// The head-anchored [`prefix_digest_ladder`] goes blind exactly where the
+/// residual misses live: its checkpoints stop doubling at 32, while the
+/// disputed region on a 50-message turn is messages 33+. Two turns sharing
+/// every head checkpoint can still differ anywhere in the tail, and that is
+/// the whole residue. Read this one back to front: the smallest window whose
+/// digest moved bounds the churn to that many tail messages (`t1` moved: the
+/// last message; `t1` held but `t2` moved: the second-to-last).
+///
+/// Same projection and hasher as the head ladder, so the two agree on what
+/// counts as a difference. Windows clamp to the messages there are, keeping
+/// the `t1,t2,t4` schema fixed for log queries. Emitted as its own
+/// `tail_ladder` field rather than folded into `prefix_ladder`, so existing
+/// parsers of that field keep working untouched.
+fn tail_digest_ladder(body: &[u8]) -> Option<String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = parsed.get("messages")?.as_array()?;
+    let mut out = Vec::new();
+    for k in [1usize, 2, 4] {
+        let start = messages.len().saturating_sub(k);
+        let mut hasher = DefaultHasher::new();
+        for m in &messages[start..] {
+            cache_stabilization::prefix_replay::canonicalize_for_prefix_compare(m)
+                .to_string()
+                .hash(&mut hasher);
+        }
+        out.push(format!("t{k}:{:04x}", hasher.finish() & 0xffff));
     }
     Some(out.join(","))
 }
@@ -9891,6 +10185,44 @@ fn extend_or_push(
     items.push(entry);
 }
 
+/// Read a continuation response into the turn JSON the CCR machinery speaks.
+///
+/// Continuations normally come back as JSON, which parses directly. A
+/// Responses backend that mandates streaming (the chatgpt codex gateway
+/// answers `stream: false` with `400 Stream must be set to true`, so
+/// continuations there go out streamed) answers SSE instead, which
+/// `serde_json` cannot read — fold it back into a turn first. JSON-first, so
+/// a JSON body never changes shape no matter its content type; the fold only
+/// runs when plain parsing already failed. Returns `None` when the body is
+/// neither, and the caller ends the round as it always has.
+fn continuation_turn_from_body(
+    body: &bytes::Bytes,
+    content_type: Option<&str>,
+    provider: &str,
+) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        return Some(v);
+    }
+    if provider != "openai_responses" {
+        return None;
+    }
+    let is_sse = content_type.is_some_and(|ct| ct.contains("text/event-stream"));
+    if !is_sse {
+        return None;
+    }
+    let text = std::string::String::from_utf8_lossy(body);
+    let (turn, _) = crate::openai::response::responses_stream_to_turn(&text);
+    let has_blocks = turn
+        .get("output")
+        .and_then(|o| o.as_array())
+        .is_some_and(|o| !o.is_empty());
+    if has_blocks {
+        Some(turn)
+    } else {
+        None
+    }
+}
+
 /// The compression pipeline is not re-applied to continuation requests, and
 /// must not be: `forwarded_request` is the body that already went upstream,
 /// transforms and all, so each round only appends the assistant turn and its
@@ -10021,6 +10353,15 @@ pub(crate) async fn handle_ccr_response(
         // Fetch original content for each CCR call.
         let mut results: Vec<CcrToolResult> = Vec::new();
         for call in &ccr_calls {
+            // One line per asked hash: sizes repeat-hash waste and names the
+            // misses a store-side fix would have to cover.
+            tracing::info!(
+                request_id = %request_id,
+                round = rounds + 1,
+                hash = %call.hash_key,
+                event = "ccr_retrieval_call",
+                "ccr: model asked for hash"
+            );
             let fetched = ccr_store.get(&call.hash_key);
             // Count the tool-driven retrieval here, at the only place both
             // outcomes are known. `/ctx/get` counts the HTTP surface, which
@@ -10202,6 +10543,27 @@ pub(crate) async fn handle_ccr_response(
             break;
         }
 
+        // Every retrieval failed: a continuation would pay a full-prefix
+        // round to deliver errors the model can read in place for free.
+        // Only break when the splice replaced every call — otherwise the
+        // client would get a tool call for a tool it never declared.
+        if !results.is_empty() && results.iter().all(|r| !r.success) {
+            let spliced =
+                handler.splice_ccr_results_as_text(&mut current_response, &results, provider);
+            if spliced == ccr_calls.len() {
+                tracing::info!(
+                    request_id = %request_id,
+                    ccr_count = ccr_calls.len(),
+                    "ccr: all retrievals failed; answered in place, skipping continuation"
+                );
+                crate::observability::ccr_retrieval::observe_outcome(
+                    crate::observability::ccr_retrieval::OUTCOME_SPLICED_FAILED,
+                    spliced as u64,
+                );
+                break;
+            }
+        }
+
         // Build continuation messages: append assistant message + tool results.
         //
         // Some providers return sentinel-keyed shapes (a wrapper dict holding a
@@ -10284,12 +10646,35 @@ pub(crate) async fn handle_ccr_response(
         let mut attempt = 0;
         let resp = loop {
             let body = continuation_body.clone();
-            let outcome = client
-                .post(upstream_url.clone())
-                .headers(outgoing_headers.clone())
-                .body(body)
-                .send()
-                .await;
+            // Bounded headers wait: `.send()` resolves at response headers,
+            // so a stall here is transport, never a slow model (body streams
+            // after, under the total timeout). Without this the 600s client
+            // timeout is the only bound and a hung attempt sits for tens of
+            // seconds before the retry can help. `None` is that stall, logged
+            // once here; the shared retry/backoff below treats it like any
+            // other retryable transport failure.
+            let outcome: Result<reqwest::Response, Option<reqwest::Error>> =
+                match tokio::time::timeout(
+                    CCR_CONTINUATION_SEND_TIMEOUT,
+                    client
+                        .post(upstream_url.clone())
+                        .headers(outgoing_headers.clone())
+                        .body(body)
+                        .send(),
+                )
+                .await
+                {
+                    Ok(r) => r.map_err(Some),
+                    Err(_) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            attempt = attempt,
+                            timeout_secs = CCR_CONTINUATION_SEND_TIMEOUT.as_secs(),
+                            "ccr: continuation timed out waiting for response headers; retrying"
+                        );
+                        Err(None)
+                    }
+                };
             let retryable = match &outcome {
                 Err(_) => true,
                 Ok(r) => {
@@ -10303,13 +10688,17 @@ pub(crate) async fn handle_ccr_response(
             attempt += 1;
             let backoff = std::time::Duration::from_millis(250 << (attempt - 1));
             match &outcome {
-                Err(e) => tracing::warn!(
+                Err(Some(e)) => tracing::warn!(
                     request_id = %request_id,
-                    error = %e,
+                    error_kind = ccr_transport_kind(e),
+                    error_chain = %ccr_error_chain(e),
                     attempt = attempt,
                     backoff_ms = backoff.as_millis() as u64,
                     "ccr: continuation transport error; retrying"
                 ),
+                // Headers-wait stall: already logged above with its timeout;
+                // nothing more to say, just back off and resend.
+                Err(None) => {}
                 Ok(r) => tracing::warn!(
                     request_id = %request_id,
                     status = %r.status(),
@@ -10328,7 +10717,14 @@ pub(crate) async fn handle_ccr_response(
                 tracing::warn!(
                     request_id = %request_id,
                     attempts = attempt + 1,
-                    error = %e,
+                    error_kind = e.as_ref().map_or("headers_timeout", ccr_transport_kind),
+                    error_chain = %e.as_ref().map_or_else(
+                        || format!(
+                            "no response headers within {}s",
+                            CCR_CONTINUATION_SEND_TIMEOUT.as_secs()
+                        ),
+                        ccr_error_chain
+                    ),
                     upstream_ms = continuation_started.elapsed().as_millis() as u64,
                     "ccr: upstream request failed during continuation"
                 );
@@ -10338,6 +10734,7 @@ pub(crate) async fn handle_ccr_response(
         tracing::info!(
             request_id = %request_id,
             event = "ccr_continuation_upstream",
+            provider = provider,
             round = rounds + 1,
             attempts = attempt + 1,
             status = resp.status().as_u16(),
@@ -10365,21 +10762,30 @@ pub(crate) async fn handle_ccr_response(
             break;
         }
 
+        // `bytes()` consumes the response; snapshot what the fold needs first.
+        let content_type = resp
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         match resp.bytes().await {
             Ok(bytes) => {
                 // The response about to be dropped was still billed.
                 round_usage.add_response(&current_response);
-                current_response = match serde_json::from_slice(&bytes) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            request_id = %request_id,
-                            error = %e,
-                            "ccr: failed to parse continuation response"
-                        );
-                        break;
-                    }
-                };
+                current_response =
+                    match continuation_turn_from_body(&bytes, Some(&content_type), provider) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                body_bytes = bytes.len(),
+                                content_type = %content_type,
+                                "ccr: failed to parse continuation response"
+                            );
+                            break;
+                        }
+                    };
             }
             Err(e) => {
                 tracing::warn!(
@@ -10810,9 +11216,18 @@ pub(crate) async fn handle_memory_response(
             }
         };
         let Some(resp) = resp else { break };
+        // As in `handle_ccr_response`: a mandating Responses backend answers
+        // a streamed continuation with SSE, which plain JSON parsing cannot
+        // read — fold it back into a turn first.
+        let content_type = resp
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let Ok(bytes) = resp.bytes().await else { break };
         round_usage.add_response(&current_response);
-        let Ok(next) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        let Some(next) = continuation_turn_from_body(&bytes, Some(&content_type), provider) else {
             break;
         };
         current_response = next;
@@ -11430,6 +11845,183 @@ mod tests {
         // The returned body's own usage stays out of it — the caller adds that.
         assert_eq!(parsed["usage"]["input_tokens"], 7_777);
         assert_ne!(round_usage.input_tokens, 4_000 + 7_777);
+    }
+
+    /// A streamed continuation response folds back into a turn: backends that
+    /// mandate streaming (the chatgpt codex gateway 400s `stream: false`)
+    /// answer continuations with SSE, which plain JSON parsing cannot read.
+    #[tokio::test]
+    async fn handle_ccr_response_openai_responses_reads_sse_continuation() {
+        use headroom_core::ccr::backends::InMemoryCcrStore;
+        use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
+        use headroom_core::ccr::CcrStore;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let store = InMemoryCcrStore::new();
+        let hash = "abc123def456abc123def456";
+        store.put(hash, "the original large content");
+
+        // The continuation went out streamed and comes back SSE.
+        let server = MockServer::start().await;
+        let sse = "event: response.output_item.done\n\
+                   data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}\n\
+                   \n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+                   \n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let forwarded_request = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-x",
+                "stream": true,
+                "input": [{"type": "message", "role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        );
+        let upstream_reply = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "output": [
+                    {"type": "function_call", "call_id": "call_1", "name": CCR_TOOL_NAME,
+                     "arguments": format!("{{\"hash\":\"{hash}\"}}")}
+                ],
+                "usage": {"input_tokens": 4_000, "output_tokens": 60}
+            }))
+            .unwrap(),
+        );
+
+        let config = Config::for_test(server.uri().parse().unwrap());
+        let upstream_url: url::Url = format!("{}/v1/responses", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let headers = http::HeaderMap::new();
+
+        let (body, round_usage) = handle_ccr_response(
+            &upstream_reply,
+            &forwarded_request,
+            &upstream_url,
+            &client,
+            &store as &dyn headroom_core::ccr::CcrStore,
+            None,
+            &config,
+            "req-test-sse",
+            &headers,
+            "openai_responses",
+            None,
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["output"][0]["content"][0]["text"], "done",
+            "the SSE continuation must resolve like a JSON one: {parsed}"
+        );
+        assert_eq!(round_usage.rounds, 1);
+    }
+
+    /// Unit coverage for the continuation body reader: JSON passes through
+    /// untouched, SSE folds only for the Responses shape, garbage stays loud.
+    #[test]
+    fn continuation_turn_from_body_reads_json_then_sse() {
+        let json = bytes::Bytes::from(r#"{"output":[{"type":"message"}]}"#);
+        let v = continuation_turn_from_body(&json, Some("text/event-stream"), "openai_responses")
+            .expect("JSON parses regardless of content type");
+        assert_eq!(v["output"][0]["type"], "message");
+
+        let sse = bytes::Bytes::from(
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let v = continuation_turn_from_body(&sse, Some("text/event-stream"), "openai_responses")
+            .expect("Responses SSE folds into a turn");
+        assert_eq!(v["output"][0]["content"][0]["text"], "hi");
+
+        assert!(
+            continuation_turn_from_body(&sse, Some("text/event-stream"), "anthropic").is_none(),
+            "other providers never expect SSE here"
+        );
+        let garbage = bytes::Bytes::from("data: not json\n\n");
+        assert!(
+            continuation_turn_from_body(&garbage, Some("text/event-stream"), "openai_responses")
+                .is_none(),
+            "SSE garbage must fail loudly, not resolve into an empty turn"
+        );
+        assert!(
+            continuation_turn_from_body(&garbage, Some("application/json"), "openai_responses")
+                .is_none(),
+            "non-SSE garbage has no fold to try"
+        );
+    }
+
+    /// All retrievals failed: the loop must answer the errors in place
+    /// instead of paying a full-prefix continuation round to deliver them.
+    #[tokio::test]
+    async fn handle_ccr_response_skips_continuation_when_everything_failed() {
+        use headroom_core::ccr::backends::InMemoryCcrStore;
+        use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
+        use wiremock::MockServer;
+
+        // Empty store: the hash below is a guaranteed miss.
+        let store = InMemoryCcrStore::new();
+        let server = MockServer::start().await;
+        // No mock mounted on purpose — any continuation POST would 404,
+        // and the received-requests assertion below proves none happened.
+
+        let forwarded_request = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-x",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        );
+        let upstream_reply = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "Let me retrieve that."},
+                    {"type": "tool_use", "id": "toolu_1", "name": CCR_TOOL_NAME,
+                        "input": {"hash": "ffffffffffffffffffffffff"}},
+                ],
+            }))
+            .unwrap(),
+        );
+
+        let config = Config::for_test(server.uri().parse().unwrap());
+        let upstream_url: url::Url = format!("{}/v1/messages", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let headers = http::HeaderMap::new();
+
+        let (body, round_usage) = handle_ccr_response(
+            &upstream_reply,
+            &forwarded_request,
+            &upstream_url,
+            &client,
+            &store as &dyn headroom_core::ccr::CcrStore,
+            None,
+            &config,
+            "req-test-failed",
+            &headers,
+            "anthropic",
+            None,
+        )
+        .await;
+
+        // No continuation round ran: zero billed rounds, zero upstream calls.
+        assert_eq!(round_usage.rounds, 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+        // The failure is answered as text, so the client sees the error
+        // instead of a tool_use for a tool it never declared.
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let blocks = parsed["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], "text");
+        assert!(blocks[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ffffffffffffffffffffffff"));
     }
 
     /// No retrieval, no extra rounds — the common path must report nothing so
@@ -12402,6 +12994,90 @@ mod tests {
         );
     }
 
+    /// Tail-anchored counterpart to the head ladder: the head checkpoints stop
+    /// doubling at 32, so on a long turn the disputed tail sits past every one
+    /// of them. These windows cover the last 1/2/4 forwarded messages instead.
+    fn ladder_body(texts: &[&str]) -> Vec<u8> {
+        let messages: Vec<serde_json::Value> = texts
+            .iter()
+            .map(|t| serde_json::json!({"role": "user", "content": t}))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({"messages": messages})).unwrap()
+    }
+
+    fn ladder_map(s: &str) -> std::collections::HashMap<String, String> {
+        s.split(',')
+            .filter_map(|p| p.split_once(':'))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn tail_ladder_keeps_a_fixed_schema_and_is_deterministic() {
+        let body = ladder_body(&["a", "b", "c", "d", "e"]);
+        let first = tail_digest_ladder(&body).unwrap();
+        let first_map = ladder_map(&first);
+        let mut keys: Vec<&str> = first_map.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["t1", "t2", "t4"]);
+        assert_eq!(first, tail_digest_ladder(&body).unwrap());
+        // Short bodies clamp the windows rather than dropping keys.
+        let short = tail_digest_ladder(&ladder_body(&["a"])).unwrap();
+        assert_eq!(ladder_map(&short).len(), 3);
+        // Non-JSON is None, like the head ladder.
+        assert_eq!(tail_digest_ladder(b"not json"), None);
+    }
+
+    /// The blind spot this exists for: on a 6-message turn the head ladder's
+    /// checkpoints (1, 2, 4) all sit at or before the tail, so a last-message
+    /// edit moves nothing on it — while the tail windows catch it.
+    #[test]
+    fn tail_ladder_moves_where_the_head_ladder_cannot_see() {
+        let before = ladder_body(&["m0", "m1", "m2", "m3", "m4", "m5"]);
+        let mut parsed: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        parsed["messages"][5]["content"] = serde_json::json!("m5 EDITED");
+        let after = serde_json::to_vec(&parsed).unwrap();
+
+        let head_before = ladder_map(&prefix_digest_ladder(&before).unwrap());
+        let head_after = ladder_map(&prefix_digest_ladder(&after).unwrap());
+        assert_eq!(
+            head_before, head_after,
+            "depths 1,2,4 all precede the edit, so the head ladder holds still"
+        );
+
+        let tail_before = ladder_map(&tail_digest_ladder(&before).unwrap());
+        let tail_after = ladder_map(&tail_digest_ladder(&after).unwrap());
+        assert_ne!(tail_before["t1"], tail_after["t1"]);
+        assert_ne!(tail_before["t2"], tail_after["t2"]);
+        assert_ne!(tail_before["t4"], tail_after["t4"]);
+    }
+
+    /// Gradient: an edit confined to the second-to-last message leaves the
+    /// last-message window alone, bounding the churn to the tail pair.
+    #[test]
+    fn tail_ladder_bounds_churn_to_the_smallest_moved_window() {
+        let before = ladder_body(&["m0", "m1", "m2", "m3", "m4", "m5"]);
+        let mut parsed: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        parsed["messages"][4]["content"] = serde_json::json!("m4 EDITED");
+        let after = serde_json::to_vec(&parsed).unwrap();
+
+        let tail_before = ladder_map(&tail_digest_ladder(&before).unwrap());
+        let tail_after = ladder_map(&tail_digest_ladder(&after).unwrap());
+        assert_eq!(tail_before["t1"], tail_after["t1"]);
+        assert_ne!(tail_before["t2"], tail_after["t2"]);
+        assert_ne!(tail_before["t4"], tail_after["t4"]);
+
+        // And the reverse direction: a head edit must not move any tail
+        // window that does not cover it.
+        let mut parsed: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        parsed["messages"][0]["content"] = serde_json::json!("m0 EDITED");
+        let head_edited = serde_json::to_vec(&parsed).unwrap();
+        let tail_head_edited = ladder_map(&tail_digest_ladder(&head_edited).unwrap());
+        assert_eq!(tail_before["t1"], tail_head_edited["t1"]);
+        assert_eq!(tail_before["t2"], tail_head_edited["t2"]);
+        assert_eq!(tail_before["t4"], tail_head_edited["t4"]);
+    }
+
     #[test]
     fn append_anthropic_beta_deduplicates() {
         let mut h = HeaderMap::new();
@@ -12425,6 +13101,44 @@ mod tests {
             h.get("anthropic-beta").unwrap().to_str().unwrap(),
             "existing-beta,new-beta"
         );
+    }
+
+    /// The continuation retry log names the failure phase, so the next stall
+    /// is diagnosable from one line instead of needing a repro.
+    #[tokio::test]
+    async fn ccr_transport_kind_names_the_failure_phase() {
+        // Unresolvable numeric host: DNS fails fast with no packets, which
+        // surfaces as a connect-phase error. (Localhost TCP is filtered in
+        // some sandboxes, so a connect-refused target is not hermetic here.)
+        let e = reqwest::Client::new()
+            .post("http://invalid.invalid/")
+            .body("x")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(ccr_transport_kind(&e), "connect");
+        assert!(
+            !ccr_error_chain(&e).is_empty(),
+            "the chain must carry more than the top-level message"
+        );
+
+        // Listener holds the connection open without answering: the client
+        // timeout fires while still waiting for headers. Built from the
+        // TLS-aware constructor like every other outbound client (see
+        // `tls_client_wiring`), with only a timeout added.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let slow = crate::ssl_context::client_builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let e = slow.post(server.uri()).body("x").send().await.unwrap_err();
+        assert_eq!(ccr_transport_kind(&e), "timeout");
     }
 
     #[test]

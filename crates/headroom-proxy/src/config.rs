@@ -316,6 +316,19 @@ pub struct CliArgs {
     #[arg(long, default_value = "150s", value_parser = parse_duration)]
     pub upstream_write_timeout: Duration,
 
+    /// How long an idle keepalive socket stays in the upstream pool.
+    /// A pooled socket survives a VPN exit rotation as a corpse: the next
+    /// turn served from it RSTs instantly. Lower shortens the corpse window
+    /// after rotations at the price of more TLS handshakes fleet-wide.
+    /// Default 90s (unchanged behavior); rotation-heavy setups want ~25s.
+    #[arg(
+        long = "pool-idle-timeout",
+        env = "HEADROOM_POOL_IDLE_TIMEOUT",
+        default_value = "90s",
+        value_parser = parse_duration
+    )]
+    pub pool_idle_timeout: Duration,
+
     /// Optional HTTP proxy for upstream provider calls only (e.g.
     /// http://127.0.0.1:3128). Scoped to the proxy's provider HTTP
     /// client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY`
@@ -823,10 +836,41 @@ pub struct CliArgs {
     )]
     pub cache_pin_tool_roster: bool,
 
+    /// Pace one conversation's concurrent turns: past this many in flight on
+    /// the same conversation key, shed the excess with a 429 plus
+    /// `Retry-After: 1` so the client retries against a committed prefix.
+    ///
+    /// Overlapping turns of one conversation race the provider's cache commit
+    /// — measured 2026-09-09, 43 overlapping turns on one subagent fan-out
+    /// burned 27.8k tokens re-writing prefixes their siblings had not finished
+    /// committing (14% of everything that conversation wrote). Shedding paces
+    /// the fan-out with the client's own retry instead of paying the race.
+    ///
+    /// `0` (the default) disables the check: every turn forwards, whatever is
+    /// in flight. Ordinary interactive overlap (one or two turns) never reaches
+    /// a cap worth setting — start at 3 or 4, where only storms trip it, and
+    /// weigh the shed rate against fan-out makespan: the turns still run, just
+    /// spaced a retry apart.
+    ///
+    /// Only read on intercepted (buffered) requests, like every other
+    /// stabilization feature: with interception off the usage observer never
+    /// sees the turn, so there is nothing to count it against.
+    #[arg(
+        long = "max-conversation-concurrency",
+        env = "HEADROOM_PROXY_MAX_CONVERSATION_CONCURRENCY",
+        default_value_t = 0
+    )]
+    pub max_conversation_concurrency: usize,
+
     /// Reversibly redact home-rooted paths, secrets and emails on routed
-    /// translate paths, restoring them at the client edge. The map lives in
-    /// process memory only. Default `false`: rewriting text the client sent
-    /// is opt-in, like the other body rewrites.
+    /// paths, restoring them at the client edge. Each placeholder carries its
+    /// own ciphertext, so restoring it is decryption rather than a lookup: a
+    /// placeholder still resolves in another session, and after a restart.
+    /// The key lives in `$XDG_STATE_HOME/headroom/redact.key` (mode 0600,
+    /// created on first use, overridable with `HEADROOM_REDACT_KEY_FILE`);
+    /// delete it and every placeholder minted before then stops resolving.
+    /// Default `false`: rewriting text the client sent is opt-in, like the
+    /// other body rewrites.
     #[arg(
         long = "redact-sensitive",
         env = "HEADROOM_PROXY_REDACT_SENSITIVE",
@@ -887,6 +931,28 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub split_cache_ttl: bool,
+
+    /// Leave a body whose markers are all explicitly `5m` on the tier it
+    /// asked for instead of pinning it to `1h`.
+    ///
+    /// Subagent traffic arrives on the 5-minute default and runs to completion
+    /// in seconds — 0 of 2,011 inter-turn gaps in sub-5-minute conversations
+    /// exceeded five minutes — so hour entries bought at 2.0x die unused where
+    /// 1.25x entries do. Main-loop traffic arrives on `1h` and mixed bodies
+    /// keep the pin (the tail hedge needs the older entry alive), so this only
+    /// ever touches the all-`5m` shape. See
+    /// [`crate::cache_stabilization::cache_ttl::pin_1h_applies`].
+    ///
+    /// Default `false`: TTL wire changes get burned once, so this enables on
+    /// a live depth-binned A/B (`upstream-python/bench/_ttlsubagent.py`), not
+    /// on reasoning.
+    #[arg(
+        long = "respect-client-5m-ttl",
+        env = "HEADROOM_PROXY_RESPECT_CLIENT_5M_TTL",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub respect_client_5m_ttl: bool,
 
     /// Persist forwarded prefixes here so a proxy restart does not throw them
     /// away. Empty (the default) keeps them in memory only.
@@ -2050,6 +2116,8 @@ pub struct Config {
     /// honored on paths that set their own per-request bound (the
     /// Codex WS→HTTP fallback).
     pub upstream_write_timeout: Duration,
+    /// Idle keepalive pool TTL. See the CLI flag of the same name.
+    pub pool_idle_timeout: Duration,
     /// Provider-only HTTP proxy for upstream calls. See the CLI arg of
     /// the same name; scoped to the provider HTTP client, never exported
     /// to the process environment.
@@ -2154,6 +2222,9 @@ pub struct Config {
     /// B3: put back a tool the client dropped from a session's roster, at its
     /// old position. Default `false`.
     pub cache_pin_tool_roster: bool,
+    /// Max turns in flight on one conversation before the excess is shed
+    /// with a 429. `0` disables the check. Default `0`.
+    pub max_conversation_concurrency: usize,
     /// Reversible redaction of paths/secrets/emails on routed paths. Off by
     /// default; see the flag docs on the CLI side.
     pub redact_sensitive: bool,
@@ -2164,6 +2235,9 @@ pub struct Config {
     /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`].
     pub cache_tail_breakpoint: bool,
     pub split_cache_ttl: bool,
+    /// Leave all-`5m` bodies on the tier they asked for. Default `false`;
+    /// see the flag docs on the CLI side.
+    pub respect_client_5m_ttl: bool,
     /// Hold each conversation's working-directory line in `system` still, and
     /// state the live one at the message tail. See
     /// [`crate::cache_stabilization::working_dir`].
@@ -2416,6 +2490,7 @@ impl Config {
             upstream_timeout: args.upstream_timeout,
             upstream_connect_timeout: args.upstream_connect_timeout,
             upstream_write_timeout: args.upstream_write_timeout,
+            pool_idle_timeout: args.pool_idle_timeout,
             http_proxy: args.http_proxy,
             max_body_bytes: args.max_body_bytes,
             log_level: args.log_level,
@@ -2468,9 +2543,11 @@ impl Config {
             strip_system_cache_breakpoints: args.strip_system_cache_breakpoints,
             cache_stable_tool_order: args.cache_stable_tool_order,
             cache_pin_tool_roster: args.cache_pin_tool_roster,
+            max_conversation_concurrency: args.max_conversation_concurrency,
             redact_sensitive: args.redact_sensitive,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
+            respect_client_5m_ttl: args.respect_client_5m_ttl,
             cache_tail_breakpoint: args.cache_tail_breakpoint,
             hold_working_directory: args.hold_working_directory,
             hold_role_sentence: args.hold_role_sentence,
@@ -2650,6 +2727,7 @@ impl Config {
             upstream_timeout: Duration::from_secs(60),
             upstream_connect_timeout: Duration::from_secs(5),
             upstream_write_timeout: Duration::from_secs(150),
+            pool_idle_timeout: Duration::from_secs(90),
             http_proxy: None,
             max_body_bytes: 100 * 1024 * 1024,
             log_level: "warn".into(),
@@ -2714,9 +2792,11 @@ impl Config {
             // asserting byte-identical tool arrays; production defaults to on.
             cache_stable_tool_order: false,
             cache_pin_tool_roster: false,
+            max_conversation_concurrency: 0,
             redact_sensitive: false,
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
+            respect_client_5m_ttl: false,
             cache_tail_breakpoint: false,
             hold_working_directory: false,
             hold_role_sentence: false,
@@ -2893,6 +2973,16 @@ mod upstream_write_timeout_tests {
     fn for_test_carries_the_python_default() {
         let config = Config::for_test("http://127.0.0.1:9".parse().unwrap());
         assert_eq!(config.upstream_write_timeout, Duration::from_secs(150));
+    }
+
+    #[test]
+    fn pool_idle_timeout_defaults_to_90s_and_parses() {
+        let args = parse(&[]);
+        assert_eq!(args.pool_idle_timeout, Duration::from_secs(90));
+        let config = Config::from_cli(args);
+        assert_eq!(config.pool_idle_timeout, Duration::from_secs(90));
+        let config = Config::from_cli(parse(&["--pool-idle-timeout", "25s"]));
+        assert_eq!(config.pool_idle_timeout, Duration::from_secs(25));
     }
 }
 
