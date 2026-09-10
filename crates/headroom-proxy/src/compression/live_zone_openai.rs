@@ -348,12 +348,10 @@ fn normalize_tool_definitions_openai_chat(
         else {
             continue;
         };
-        let before = serde_json::to_vec(parameters).unwrap_or_default();
-        sort_schema_keys_recursive(parameters);
-        let after = serde_json::to_vec(parameters).unwrap_or_default();
-        if before != after {
-            applied.e2_schema_sort = true;
-        }
+        // `sort_schema_keys_recursive` reports whether it moved anything,
+        // so no before/after byte-compare is needed. `|=`, not `||`:
+        // every tool must still be visited even after one changed.
+        applied.e2_schema_sort |= sort_schema_keys_recursive(parameters);
     }
     if applied.e2_schema_sort {
         tracing::info!(

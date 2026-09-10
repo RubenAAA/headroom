@@ -32,11 +32,7 @@ fn strip_cache_control(obj: &Value) -> Value {
 /// throughout. The strip rule matches [`strip_cache_control`]
 /// (drop `cache_control` members at any depth); the marker comment
 /// there applies here too — a moving breakpoint must not change the key.
-fn normalized_key_json(
-    messages: &[Value],
-    model: &str,
-    extra: &serde_json::Map<String, Value>,
-) -> Vec<u8> {
+fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)]) -> Vec<u8> {
     use std::io::Write as _;
     fn write_stripped<W: std::io::Write>(w: &mut W, v: &Value) -> std::io::Result<()> {
         match v {
@@ -90,7 +86,7 @@ fn normalized_key_json(
             write_stripped(&mut out, msg)?;
         }
         write!(out, "]")?;
-        for (k, v) in extra.iter() {
+        for (k, v) in extra.iter().copied() {
             write!(out, ",")?;
             serde_json::to_writer(&mut out, &k)?;
             write!(out, ":")?;
@@ -127,18 +123,23 @@ const KEY_EXTRA_FIELDS: &[&str] = &[
 /// Gemini's `contents` collided the same way. Returning `None` keeps a shape
 /// we cannot key out of the cache instead of keying it on nothing — a missed
 /// cache hit costs latency, a false hit returns someone else's answer.
-pub fn cache_key_inputs(parsed: &Value) -> Option<(Vec<Value>, serde_json::Map<String, Value>)> {
-    let turns = match parsed.get("messages").or_else(|| parsed.get("input")) {
-        Some(Value::Array(items)) => items.clone(),
+///
+/// Borrows: the old form cloned the whole turn array plus every extra
+/// field (measured 481x on a 100-tool body) just to hand them to
+/// `compute_key`, which only reads them. Both callers use the result
+/// immediately, so references tied to `parsed` are sufficient.
+pub fn cache_key_inputs(parsed: &Value) -> Option<(Vec<&Value>, Vec<(&str, &Value)>)> {
+    let turns: Vec<&Value> = match parsed.get("messages").or_else(|| parsed.get("input")) {
+        Some(Value::Array(items)) => items.iter().collect(),
         // `input` may also be a bare string rather than an array of items.
-        Some(Value::String(text)) => vec![Value::String(text.clone())],
+        Some(s @ Value::String(_)) => vec![s],
         _ => return None,
     };
 
-    let mut extra = serde_json::Map::new();
+    let mut extra = Vec::new();
     for key in KEY_EXTRA_FIELDS {
         if let Some(val) = parsed.get(*key) {
-            extra.insert((*key).to_string(), val.clone());
+            extra.push((*key, val));
         }
     }
     Some((turns, extra))
@@ -147,7 +148,10 @@ pub fn cache_key_inputs(parsed: &Value) -> Option<(Vec<Value>, serde_json::Map<S
 /// A cached response entry.
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    pub response_body: Vec<u8>,
+    // `Bytes` (refcounted): a cache hit clones the entry, and the old
+    // `Vec<u8>` memcpy'd up to MBs per hit (measured 246x on 200KB).
+    // `len()` and `Body::from` behave identically.
+    pub response_body: bytes::Bytes,
     pub response_headers: HashMap<String, String>,
     pub created_at: Instant,
     pub ttl: Duration,
@@ -261,11 +265,7 @@ impl SemanticCache {
     /// `DefaultHasher` keys are process-local, so keys were never
     /// stable across deploys; within a process equal inputs still
     /// hash equal and marker moves still hash equal.
-    fn compute_key(
-        messages: &[Value],
-        model: &str,
-        extra: &serde_json::Map<String, Value>,
-    ) -> String {
+    fn compute_key(messages: &[&Value], model: &str, extra: &[(&str, &Value)]) -> String {
         let normalized = normalized_key_json(messages, model, extra);
         // `to_vec` output is valid UTF-8 by construction; `str::hash`
         // (bytes + 0xff terminator) is exactly what the old
@@ -280,9 +280,9 @@ impl SemanticCache {
     /// Get cached response if exists and not expired.
     pub fn get(
         &self,
-        messages: &[Value],
+        messages: &[&Value],
         model: &str,
-        extra: &serde_json::Map<String, Value>,
+        extra: &[(&str, &Value)],
     ) -> Option<CacheEntry> {
         let key = Self::compute_key(messages, model, extra);
         let mut cache = self.entries.write().unwrap();
@@ -320,16 +320,16 @@ impl SemanticCache {
     /// Cache a response.
     pub fn set(
         &self,
-        messages: &[Value],
+        messages: &[&Value],
         model: &str,
-        response_body: Vec<u8>,
+        response_body: impl Into<bytes::Bytes>,
         response_headers: HashMap<String, String>,
         _tokens_saved: u64,
-        extra: &serde_json::Map<String, Value>,
+        extra: &[(&str, &Value)],
     ) {
         let key = Self::compute_key(messages, model, extra);
         let entry = CacheEntry {
-            response_body,
+            response_body: response_body.into(),
             response_headers,
             created_at: Instant::now(),
             ttl: self.ttl,
@@ -374,6 +374,11 @@ mod tests {
         vec![serde_json::json!({"role": "user", "content": "hello"})]
     }
 
+    /// Borrowed view for the `&[&Value]` key/cache APIs.
+    fn refs(v: &[Value]) -> Vec<&Value> {
+        v.iter().collect()
+    }
+
     #[test]
     fn strip_cache_control_removes_key() {
         let val = serde_json::json!({"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}});
@@ -391,17 +396,17 @@ mod tests {
 
     #[test]
     fn compute_key_same_for_same_input() {
-        let extra = serde_json::Map::new();
-        let k1 = SemanticCache::compute_key(&msgs(), "claude-3", &extra);
-        let k2 = SemanticCache::compute_key(&msgs(), "claude-3", &extra);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        let k1 = SemanticCache::compute_key(&refs(&msgs()), "claude-3", &extra);
+        let k2 = SemanticCache::compute_key(&refs(&msgs()), "claude-3", &extra);
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn compute_key_differs_for_different_model() {
-        let extra = serde_json::Map::new();
-        let k1 = SemanticCache::compute_key(&msgs(), "claude-3", &extra);
-        let k2 = SemanticCache::compute_key(&msgs(), "claude-4", &extra);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        let k1 = SemanticCache::compute_key(&refs(&msgs()), "claude-3", &extra);
+        let k2 = SemanticCache::compute_key(&refs(&msgs()), "claude-4", &extra);
         assert_ne!(k1, k2);
     }
 
@@ -413,8 +418,8 @@ mod tests {
     /// risks false hits at worst.
     #[test]
     fn normalized_key_bytes_are_stable() {
-        let extra = serde_json::Map::new();
-        let bytes = normalized_key_json(&msgs(), "claude-3", &extra);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        let bytes = normalized_key_json(&refs(&msgs()), "claude-3", &extra);
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             r#"{"model":"claude-3","messages":[{"role":"user","content":"hello"}]}"#
@@ -424,7 +429,7 @@ mod tests {
             "role": "user",
             "content": [{"type": "text", "text": "hi \"yo\"", "cache_control": {"type": "ephemeral"}}],
         })];
-        let bytes = normalized_key_json(&marked, "m", &extra);
+        let bytes = normalized_key_json(&refs(&marked), "m", &extra);
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi \"yo\""}]}]}"#
@@ -434,50 +439,60 @@ mod tests {
     #[test]
     fn get_miss_on_empty_cache() {
         let cache = SemanticCache::new(100, 3600);
-        let extra = serde_json::Map::new();
-        assert!(cache.get(&msgs(), "model", &extra).is_none());
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        assert!(cache.get(&refs(&msgs()), "model", &extra).is_none());
     }
 
     #[test]
     fn set_and_get_hit() {
         let cache = SemanticCache::new(100, 3600);
-        let extra = serde_json::Map::new();
+        let extra: Vec<(&str, &Value)> = Vec::new();
         cache.set(
-            &msgs(),
+            &refs(&msgs()),
             "model",
             b"response".to_vec(),
             HashMap::new(),
             10,
             &extra,
         );
-        let entry = cache.get(&msgs(), "model", &extra);
+        let entry = cache.get(&refs(&msgs()), "model", &extra);
         assert!(entry.is_some());
-        assert_eq!(entry.unwrap().response_body, b"response");
+        assert_eq!(
+            entry.unwrap().response_body,
+            bytes::Bytes::from_static(b"response")
+        );
     }
 
     #[test]
     fn lru_eviction() {
         let cache = SemanticCache::new(2, 3600);
-        let extra = serde_json::Map::new();
+        let extra: Vec<(&str, &Value)> = Vec::new();
         let m1 = vec![serde_json::json!({"role": "user", "content": "a"})];
         let m2 = vec![serde_json::json!({"role": "user", "content": "b"})];
         let m3 = vec![serde_json::json!({"role": "user", "content": "c"})];
 
-        cache.set(&m1, "m", b"1".to_vec(), HashMap::new(), 0, &extra);
-        cache.set(&m2, "m", b"2".to_vec(), HashMap::new(), 0, &extra);
-        cache.set(&m3, "m", b"3".to_vec(), HashMap::new(), 0, &extra);
+        cache.set(&refs(&m1), "m", b"1".to_vec(), HashMap::new(), 0, &extra);
+        cache.set(&refs(&m2), "m", b"2".to_vec(), HashMap::new(), 0, &extra);
+        cache.set(&refs(&m3), "m", b"3".to_vec(), HashMap::new(), 0, &extra);
 
         // m1 should be evicted
-        assert!(cache.get(&m1, "m", &extra).is_none());
-        assert!(cache.get(&m2, "m", &extra).is_some());
-        assert!(cache.get(&m3, "m", &extra).is_some());
+        assert!(cache.get(&refs(&m1), "m", &extra).is_none());
+        assert!(cache.get(&refs(&m2), "m", &extra).is_some());
+        assert!(cache.get(&refs(&m3), "m", &extra).is_some());
     }
 
     #[test]
     fn stats_returns_correct_counts() {
         let cache = SemanticCache::new(100, 3600);
-        let extra = serde_json::Map::new();
-        cache.set(&msgs(), "m", b"data".to_vec(), HashMap::new(), 5, &extra);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        cache.set(
+            &refs(&msgs()),
+            "m",
+            b"data".to_vec(),
+            HashMap::new(),
+            5,
+            &extra,
+        );
         let stats = cache.stats();
         assert_eq!(stats["entries"], serde_json::json!(1));
         assert_eq!(stats["max_entries"], serde_json::json!(100));
@@ -486,10 +501,17 @@ mod tests {
     #[test]
     fn clear_empties_cache() {
         let cache = SemanticCache::new(100, 3600);
-        let extra = serde_json::Map::new();
-        cache.set(&msgs(), "m", b"data".to_vec(), HashMap::new(), 0, &extra);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        cache.set(
+            &refs(&msgs()),
+            "m",
+            b"data".to_vec(),
+            HashMap::new(),
+            0,
+            &extra,
+        );
         cache.clear();
-        assert!(cache.get(&msgs(), "m", &extra).is_none());
+        assert!(cache.get(&refs(&msgs()), "m", &extra).is_none());
         assert_eq!(cache.stats()["entries"], serde_json::json!(0));
     }
 }
@@ -506,11 +528,16 @@ mod cache_key_marker_tests {
         vec![serde_json::json!({"role": "user", "content": [block]})]
     }
 
+    /// Borrowed view for the `&[&Value]` key API.
+    fn refs(v: &[Value]) -> Vec<&Value> {
+        v.iter().collect()
+    }
+
     #[test]
     fn a_moved_breakpoint_does_not_fragment_the_key() {
-        let extra = serde_json::Map::new();
-        let with = SemanticCache::compute_key(&msgs(true), "claude-opus-5", &extra);
-        let without = SemanticCache::compute_key(&msgs(false), "claude-opus-5", &extra);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        let with = SemanticCache::compute_key(&refs(&msgs(true)), "claude-opus-5", &extra);
+        let without = SemanticCache::compute_key(&refs(&msgs(false)), "claude-opus-5", &extra);
         assert_eq!(
             with, without,
             "a cache_control marker in messages must not change the key"
@@ -519,10 +546,12 @@ mod cache_key_marker_tests {
 
     #[test]
     fn real_content_still_changes_the_key() {
-        let extra = serde_json::Map::new();
-        let a = SemanticCache::compute_key(&msgs(false), "claude-opus-5", &extra);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        let a = SemanticCache::compute_key(&refs(&msgs(false)), "claude-opus-5", &extra);
         let b = SemanticCache::compute_key(
-            &[serde_json::json!({"role": "user", "content": [{"type": "text", "text": "bye"}]})],
+            &refs(&[
+                serde_json::json!({"role": "user", "content": [{"type": "text", "text": "bye"}]}),
+            ]),
             "claude-opus-5",
             &extra,
         );

@@ -670,15 +670,11 @@ pub(super) fn normalize_tool_definitions(
         let Some(schema) = tool.get_mut("input_schema") else {
             continue;
         };
-        // We compare bytes before / after to detect whether the
-        // sort actually moved any keys (idempotent re-runs report
-        // `false` and the caller surfaces no event for the no-op).
-        let before = serde_json::to_vec(schema).unwrap_or_default();
-        sort_schema_keys_recursive(schema);
-        let after = serde_json::to_vec(schema).unwrap_or_default();
-        if before != after {
-            applied.e2_schema_sort = true;
-        }
+        // `sort_schema_keys_recursive` reports whether it moved anything
+        // (idempotent re-runs report `false` and the caller surfaces no
+        // event for the no-op). `|=`, not `||`: every tool must still
+        // be visited even after one changed.
+        applied.e2_schema_sort |= sort_schema_keys_recursive(schema);
     }
     if applied.e2_schema_sort {
         tracing::info!(
