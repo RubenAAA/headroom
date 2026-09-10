@@ -242,7 +242,13 @@ pub fn decode_body(bytes: &[u8], content_encoding: Option<&str>) -> Result<Vec<u
     if is("br") {
         return capped(Box::new(brotli::Decompressor::new(bytes, 4096)), "brotli");
     }
-    Err(format!("Unsupported Content-Encoding: {raw}"))
+    // Echo the lowercased encoding, matching the pre-`eq_ignore_ascii_case`
+    // behavior (the match used to run on the lowered string). Error path
+    // only; the alloc is irrelevant here, exactness is not.
+    Err(format!(
+        "Unsupported Content-Encoding: {}",
+        raw.to_ascii_lowercase()
+    ))
 }
 
 /// Number of chars in `text` (Python `len(str)` semantics for the
@@ -473,6 +479,12 @@ mod tests {
     #[test]
     fn test_decode_unsupported_encoding_errors() {
         assert!(decode_body(b"x", Some("snappy")).is_err());
+        // The error echoes the lowercased encoding (pre-existing contract
+        // from when the match ran on the lowered string).
+        assert_eq!(
+            decode_body(b"x", Some("X-Snappy")).unwrap_err(),
+            "Unsupported Content-Encoding: x-snappy"
+        );
     }
 
     // ── decode_body decompression cap (zip-bomb guard) ───────────

@@ -120,9 +120,16 @@ pub fn sanitize_anthropic_model_id_in_body(body: bytes::Bytes) -> bytes::Bytes {
     // Fast path (measured 166x on a 5KB no-suffix body): the common case
     // has no `[1m]` marker at all. `memmem` is ~24x cheaper than the JSON
     // parse below, and returning the input `Bytes` is zero-copy.
-    // Both markers must be present for work to be possible.
-    if memchr::memmem::find(&body, b"[1m]").is_none()
-        || memchr::memmem::find(&body, b"\"model\"").is_none()
+    // Both markers must be present for work to be possible — unless the
+    // body contains a `\u` escape, which can synthesize any char on
+    // decode (e.g. key `"\u006dodel"` or value `"x[\u0031m]"` carry no
+    // literal marker bytes yet parse to a strippable shape). `\u` is the
+    // only escape class that can do this (`\"`/`\\`/`\/`/controls decode
+    // to chars outside both markers), so its absence keeps the skip exact
+    // and its presence takes the slow path.
+    if (memchr::memmem::find(&body, b"[1m]").is_none()
+        || memchr::memmem::find(&body, b"\"model\"").is_none())
+        && memchr::memmem::find(&body, b"\\u").is_none()
     {
         return body;
     }
@@ -274,6 +281,21 @@ mod tests {
         let original = bytes::Bytes::copy_from_slice(body);
         let out = sanitize_anthropic_model_id_in_body(original.clone());
         assert_eq!(out, original);
+    }
+
+    #[test]
+    fn sanitizer_strips_suffix_hidden_behind_unicode_escapes() {
+        // `\u` escapes carry no literal marker bytes, so the fast path
+        // must decline and the slow path must still strip: both decode to
+        // a `model` ending in `[1m]`.
+        for body in [
+            br#"{"\u006dodel":"claude-x[1m]","max_tokens":1}"#.as_slice(),
+            br#"{"model":"claude-x[\u0031m]","max_tokens":1}"#.as_slice(),
+        ] {
+            let out = sanitize_anthropic_model_id_in_body(bytes::Bytes::copy_from_slice(body));
+            let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(parsed["model"], "claude-x");
+        }
     }
 
     #[test]
