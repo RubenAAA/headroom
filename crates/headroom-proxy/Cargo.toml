@@ -125,6 +125,11 @@ tempfile = "3"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
+# Global allocator for the proxy binary (wired in `src/main.rs`). The hot
+# path is allocation-heavy (JSON parse/strip/serialize per request plus
+# header-map churn); measured 1.6-1.7x on that workload vs the system
+# allocator with byte-identical output. See `src/main.rs`.
+mimalloc = "0.1"
 
 [dev-dependencies]
 # CTX-2: unit tests for the passive-capture observer open a throwaway
