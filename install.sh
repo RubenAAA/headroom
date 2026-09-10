@@ -180,6 +180,31 @@ elif [ "$LINK" = 1 ] && [ -z "$CODEX_AUTH" ]; then
     say "WARNING: flags reference --codex-auth-file but no ~/.codex*/auth.json exists; edit contrib/headroom-flags.sh"
 fi
 
+# ── memory guard ──────────────────────────────────────────────────────────
+# The proxy holds whole request bodies while it works on them, and a background
+# worker that falls behind holds more. On 2026-09-10 one reached 38 GB; the
+# kernel's own OOM killer only fires when the box is already thrashing, and on
+# WSL2 that took the whole VM down. earlyoom kills the offender while the
+# machine still responds. Advisory only: this script does not sudo on your
+# behalf, it tells you what to run.
+step "Memory guard"
+if [ "$OS" = "Darwin" ]; then
+    say "macOS — no earlyoom; the kernel's memory pressure handling covers this"
+elif command -v systemctl >/dev/null 2>&1 && systemctl is-active earlyoom >/dev/null 2>&1; then
+    if pgrep -a earlyoom 2>/dev/null | grep -q -- '--prefer'; then
+        say "earlyoom is running with a victim preference"
+    else
+        say "earlyoom is running on its defaults — it will still save the box, but"
+        say "  it has no reason to pick the proxy over your editor. To set one:"
+        say "  see 'Give the box an OOM guard' in README.md"
+    fi
+else
+    say "earlyoom not running. Strongly recommended — without it a runaway proxy"
+    say "  takes the machine down rather than itself:"
+    say "    sudo apt install earlyoom   (or your distribution's package)"
+    say "    then follow 'Give the box an OOM guard' in README.md"
+fi
+
 # ── ONNX Runtime ─────────────────────────────────────────────────────────
 # The `ml` feature (on by default) loads libonnxruntime at startup for file
 # type detection and embeddings. It is found via ORT_DYLIB_PATH or a Python
@@ -200,10 +225,14 @@ step "Launcher"
 if [ "$LINK" = 1 ]; then
     ln -sfn "$CONTRIB/claude-launcher" "$BIN_DIR/claude-launcher"
     ln -sfn "$CONTRIB/restart-headroom.sh" "$BIN_DIR/restart-headroom.sh"
+    ln -sfn "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
+    ln -sfn "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     say "linked claude-launcher and restart-headroom.sh into the checkout"
 else
     install -m 755 "$CONTRIB/claude-launcher" "$BIN_DIR/claude-launcher"
     install -m 755 "$CONTRIB/restart-headroom.sh" "$BIN_DIR/restart-headroom.sh"
+    install -m 755 "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
+    install -m 755 "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     say "installed claude-launcher and restart-headroom.sh"
 fi
 ln -sfn claude-launcher "$BIN_DIR/cclaude"
@@ -213,6 +242,14 @@ case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) say "WARNING: $BIN_DIR is not on your PATH — add it to your shell profile" ;;
 esac
+
+# One binary, one path — same warning as `make install-proxy` and the
+# launcher's startup check. Duplicates shadow each other silently, and a
+# stale copy rejects flags the flags file has grown.
+_dupes=$(type -pa headroom-proxy 2>/dev/null | awk '!seen[$0]++')
+if [ -n "$_dupes" ] && [ "$(printf '%s\n' "$_dupes" | wc -l)" -gt 1 ]; then
+    say "WARNING: multiple headroom-proxy copies on PATH — the first wins: $(echo "$_dupes" | tr '\n' ' ')"
+fi
 
 # ── status line ───────────────────────────────────────────────────────────
 # The checkout path is baked into the installed copy: Claude Code runs the
@@ -307,15 +344,32 @@ if command -v node >/dev/null 2>&1; then
 const fs = require("fs");
 const [file, dir, pruneFile] = process.argv.slice(1);
 
-// Every event the review chain needs, in one list, so a target change moves
-// all of them together. UserPromptSubmit is the one that matters: it fires on
+// Every event the review and ticket chains need, in one list, so a target
+// change moves all of them together. UserPromptSubmit is the one that matters: it fires on
 // the go-ahead, before the diffs are read and the replies are written, which
 // is the only point where diverting still saves anything.
 const WANT = [
   ["UserPromptSubmit", null,                  "review-gate.sh",    10],
+  ["UserPromptSubmit", null,                  "ticket-gate.sh",    10],
   ["PreToolUse",       "Bash",                "review-gate.sh",    10],
+  ["PreToolUse",       "Bash",                "ticket-gate.sh",    10],
   ["PreToolUse",       "Write|Edit|MultiEdit", "review-gate.sh",   10],
+  // Vendored since the redaction work but never registered, which is how a
+  // masked path reached ~/.claude/settings.json on 2026-09-10 and broke the
+  // review hook it overwrote. Write paths only: on Bash it would block every
+  // grep for the token shape, including the one that finds a leak.
+  ["PreToolUse",       "Write|Edit|MultiEdit", "scrub-placeholders.sh", 5],
+  // Blocks commands that would dump credentials into the transcript. Bash
+  // only: it reads the command line, and there is nothing to check on a write.
+  ["PreToolUse",       "Bash",                "scrub-secrets.sh",  5],
   ["Stop",             null,                  "review-gate.sh",    10],
+  // Auto-continue turns parked on a dropped API connection (stream H owns
+  // the matching logic). Stop only: it reads the transcript tail, and there
+  // is nothing to check on any other event.
+  ["Stop",             null,                  "retry-dropped-turn.sh", 10],
+  // VPN-rotation notices: the watcher leaves per-session files, this relays
+  // each once on the next prompt. Informational, never blocks.
+  ["UserPromptSubmit", null,                  "rotation-notice.sh",  5],
   ["SessionStart",     null,                  "session-map-log.sh", 5],
 ];
 
@@ -378,7 +432,7 @@ if (pruneFile && pruneFile !== file) {
     [ -n "$HOOK_PRUNE" ] &&
         say "sessions outside $HOOKS_INTO no longer run the review hooks"
 else
-    say "node not found — add the review-gate.sh / session-map-log.sh entries in $HOOK_SETTINGS by hand"
+    say "node not found — add the review-gate.sh / ticket-gate.sh / session-map-log.sh entries in $HOOK_SETTINGS by hand"
 fi
 
 # ── CLAUDE.md ─────────────────────────────────────────────────────────────

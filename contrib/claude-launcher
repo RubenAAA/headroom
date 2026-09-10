@@ -64,6 +64,21 @@ if command -v headroom-proxy >/dev/null 2>&1; then
              awk '$1 != "--help" && $1 != "--version" { print $1, ($2 == "" ? 0 : 1) }')
 fi
 
+# One binary, one path. On 2026-09-10 a cargo-installed build in
+# ~/.cargo/bin shadowed the fresh one in ~/.local/bin and rejected a flag the
+# flags file had grown, so every start died on clap usage text and the flag
+# table above was read off the stale binary too. Say which copy wins rather
+# than let the next stale one fail the same way.
+proxy_bins=()
+while read -r line; do
+    [ -n "$line" ] && proxy_bins+=("$line")
+done < <(type -pa headroom-proxy 2>/dev/null | awk '!seen[$0]++')
+if [ "${#proxy_bins[@]}" -gt 1 ]; then
+    echo "headroom: ${#proxy_bins[@]} copies of headroom-proxy on PATH; the first wins:" >&2
+    printf '          %s\n' "${proxy_bins[@]}" >&2
+    echo "          Remove the others — 'make install-proxy' writes only ~/.local/bin." >&2
+fi
+
 # ── flags ─────────────────────────────────────────────────────────────────
 use_context=0
 use_qwen=0

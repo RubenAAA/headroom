@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Sample headroom-proxy RSS once a minute so growth over a session is visible
+# after the fact. Added 2026-09-10, after a proxy reached 26 GB and OOM-killed
+# the WSL VM. One line per sample: ISO time, pid, RSS in KiB, elapsed.
+out="${1:-$HOME/headroom-rss.log}"
+while :; do
+    for pid in $(pgrep -x headroom-proxy); do
+        read -r rss etime < <(ps -o rss=,etime= -p "$pid")
+        printf '%s %s %s %s\n' "$(date -Is)" "$pid" "$rss" "$etime" >> "$out"
+    done
+    sleep 60
+done

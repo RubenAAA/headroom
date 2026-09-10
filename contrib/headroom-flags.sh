@@ -278,6 +278,20 @@ HEADROOM_FLAGS=(
   --split-cache-ttl false
   --force-1h-cache-ttl true
 
+  # PENDING, off until the mapping holds. Subagent traffic arrives on the
+  # 5-minute default and runs to completion in seconds (0 of 2,011 gaps past
+  # 5 minutes in sub-5-minute conversations over ~90h of ledger), so the 1h
+  # upgrade above buys those turns 2.0x entries that die unused: 9.0M
+  # creation tokens, 12.7% of all creation, ~6.7M input-equivs at stake.
+  # When true, bodies whose markers are all explicitly 5m skip the pin;
+  # main-loop (1h) and mixed bodies still pin, so the tail hedge from the
+  # +511% split-TTL lesson is untouched.
+  #
+  # Enable only after `upstream-python/bench/_ttlsubagent.py` (mapping mode)
+  # confirms all-5m ⟺ short conversations over days of `client_ttl` lines,
+  # then settle with the same script in A/B mode across the flip epoch.
+  # --respect-client-5m-ttl true
+
   # ON 2026-08-17. Holds the working-directory line in the system preamble to
   # the value each conversation opened with, and restates the live one at the
   # message tail where changing it costs nothing. The line sits inside every
@@ -641,6 +655,13 @@ HEADROOM_FLAGS=(
   --retry-max-delay-ms 30000
   --upstream-timeout 600s
   --upstream-connect-timeout 10s
+  # Idle keepalive pool TTL. Short for rotation safety: a VPN exit change
+  # RSTs in-flight TCP and strands pooled sockets as corpses, and every turn
+  # served from a corpse fails. 25s bounds the corpse window (vs 90s
+  # default) at the price of more TLS handshakes; in-flight turns are
+  # covered by the stream hold + finisher, and the watcher drains before
+  # rotating, so this only prices the stragglers.
+  --pool-idle-timeout 25s
   # Single-attempt bound for a routed spinner sidecar (see --sidecar-model
   # above). No retry by design: on timeout the sidecar falls back to Haiku.
   # 15s is 3x the measured ~5s Zen answer for a minimal-effort summary.

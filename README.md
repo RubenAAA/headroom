@@ -164,6 +164,33 @@ Counters reset on restart. The savings ledger on disk does not, and the CLI
 reads it: `headroom savings` for savings over time, `headroom doctor` for
 liveness and ledger health, `headroom ctx search` for captured context.
 
+### Give the box an OOM guard
+
+Run `earlyoom` next to the proxy. The proxy holds whole request bodies while it
+works on them, and a background worker that falls behind holds more; twice on
+2026-09-10 a proxy reached tens of gigabytes. The first time the kernel's own
+OOM killer arrived too late to matter and the WSL2 VM had to be restarted from
+Windows. The second time earlyoom took the proxy at 38 GB and the box carried
+on — losing a proxy costs a restart, losing the VM costs the session.
+
+```bash
+sudo apt install earlyoom     # or your distribution's package
+sudo tee /etc/default/earlyoom >/dev/null <<'EOF'
+EARLYOOM_ARGS="-r 60 -m 8 -s 5 --avoid ^(systemd|init|sshd|dbus-daemon)$ --prefer ^(headroom-proxy|rustc|node)$"
+EOF
+sudo systemctl enable --now earlyoom
+pgrep -a earlyoom             # must echo the arguments back
+```
+
+Two traps, both worth the check on that last line. systemd's `EnvironmentFile`
+does not strip quotes the way a shell does, so quoting the regexes passes the
+quote marks as part of the pattern and it matches nothing. And a service that
+was already running when the file was written keeps its old arguments until it
+is restarted.
+
+`headroom-rss-sample` writes the proxy's RSS to `~/headroom-rss.log` once a
+minute, which is what turns "it felt slow before it died" into a growth curve.
+
 ## Repository layout
 
 | Path | What is in it |

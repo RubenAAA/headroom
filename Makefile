@@ -6,8 +6,9 @@ CARGO ?= cargo
 MATURIN ?= maturin
 PYTHON ?= python3
 FIXTURES ?= upstream-python/tests/parity/fixtures
+PREFIX ?= $(HOME)/.local
 
-.PHONY: help test test-parity bench build-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
+.PHONY: help test test-parity bench build-proxy install-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
 
 help:
 	@echo "Headroom Rust targets:"
@@ -15,6 +16,7 @@ help:
 	@echo "  make test-parity        - parity-run against recorded fixtures"
 	@echo "  make bench              - cargo bench --workspace"
 	@echo "  make build-proxy        - release build + strip headroom-proxy, print size"
+	@echo "  make install-proxy      - build-proxy, then install it to $$PREFIX/bin (default ~/.local)"
 	@echo "  make build-wheel        - release wheel for headroom-py"
 	@echo "  make verify-rust-core   - build + install + import-verify headroom._core"
 	@echo "  make fmt                - cargo fmt --all"
@@ -57,6 +59,31 @@ build-proxy:
 	SIZE=$$(wc -c < "$$BIN"); \
 	printf 'headroom-proxy: %s bytes (%.1f MiB)\n' "$$SIZE" "$$(echo "$$SIZE / 1048576" | bc -l)"
 	@bash scripts/cargo-gc.sh --auto || true # build-triggered GC; gated, never fails the build
+
+# One install path, checked. `cargo install --path` writes ~/.cargo/bin, which
+# sits ahead of ~/.local/bin on a normal PATH; on 2026-09-10 a copy left there
+# shadowed a fresh build for two days and every proxy start died on a flag the
+# old binary had never heard of. So: install to PREFIX, then refuse to call it
+# done while another copy answers first.
+install-proxy: build-proxy
+	@mkdir -p "$(PREFIX)/bin"
+	@install -m 0755 target/release/headroom-proxy "$(PREFIX)/bin/headroom-proxy"
+	@echo "installed $(PREFIX)/bin/headroom-proxy"
+	@RESOLVED=$$(command -v headroom-proxy || true); \
+	if [ -z "$$RESOLVED" ]; then \
+		echo "warning: $(PREFIX)/bin is not on PATH" >&2; \
+	else \
+		N=0; LIST=""; SEEN=""; OLDIFS="$$IFS"; IFS=":"; \
+		for d in $$PATH; do \
+			[ -z "$$d" ] && d="."; \
+			case " $$SEEN " in *" $$d "*) continue;; esac; \
+			SEEN="$$SEEN $$d"; \
+			if [ -x "$$d/headroom-proxy" ]; then N=$$((N+1)); LIST="$$LIST $$d/headroom-proxy"; fi; \
+		done; IFS="$$OLDIFS"; \
+		if [ "$$N" -gt 1 ]; then \
+			echo "warning:$$LIST — the first wins; remove the others (this target writes only $(PREFIX)/bin)" >&2; \
+		fi; \
+	fi
 
 build-wheel:
 	$(MATURIN) build --release -m crates/headroom-py/Cargo.toml

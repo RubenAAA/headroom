@@ -35,6 +35,7 @@ import argparse
 import collections
 import csv
 import json
+import os
 import re
 import sys
 
@@ -184,7 +185,7 @@ def read_console(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--log", default="/home/ruben/headroom-proxy.log")
+    ap.add_argument("--log", default=os.path.expanduser("~/headroom-proxy.log"))
     ap.add_argument("--date", help="YYYY-MM-DD; omit for the whole log")
     ap.add_argument("--console-csv")
     args = ap.parse_args()
