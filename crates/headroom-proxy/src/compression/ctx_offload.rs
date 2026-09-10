@@ -321,9 +321,11 @@ pub struct OffloadGate {
     /// first-message hash) → session keys, most-recent-birth-first. Lets a
     /// newborn session (model switch, resumed conversation) find the donor
     /// session whose conversions it should inherit. Same-credential only by
-    /// construction of the key; bounded per entry, updated on the rare
-    /// first-request path only.
-    lineages: Mutex<HashMap<(String, String), VecDeque<String>>>,
+    /// construction of the key; bounded per entry AND bounded map (an entry
+    /// is a few dozen bytes, but distinct conversations are unbounded over a
+    /// proxy's lifetime — eviction just means no donor, i.e. today's
+    /// behavior). Updated on the rare first-request path only.
+    lineages: Mutex<LruCache<(String, String), VecDeque<String>>>,
     /// Where the sets are kept so they survive a restart. `None` keeps them in
     /// memory only, which is the pre-2026-08-17 behaviour.
     persist_dir: Option<Arc<std::path::PathBuf>>,
@@ -407,7 +409,7 @@ impl OffloadGate {
         let cap = NonZeroUsize::new(capacity).expect("OffloadGate capacity must be > 0");
         Self {
             sessions: Mutex::new(LruCache::new(cap)),
-            lineages: Mutex::new(HashMap::new()),
+            lineages: Mutex::new(LruCache::new(cap)),
             persist_dir: None,
             persist_lock: Mutex::new(()),
         }
@@ -581,10 +583,13 @@ impl OffloadGate {
     /// drift-first-sight path only, never per request.
     pub fn note_session_birth(&self, lineage: &(String, String), session: &str) {
         let mut lineages = self.lineages.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = lineages.entry(lineage.clone()).or_default();
+        // LruCache has no entry API: pop + re-put keeps most-recent-first
+        // with dedup and refreshes recency in one move.
+        let mut entry: VecDeque<String> = lineages.pop(lineage).unwrap_or_default();
         entry.retain(|s| s != session);
         entry.push_front(session.to_string());
         entry.truncate(SEED_LINEAGE_CAP);
+        lineages.put(lineage.clone(), entry);
     }
 
     /// Birth-ordered candidate donors for `lineage`, excluding `exclude`.

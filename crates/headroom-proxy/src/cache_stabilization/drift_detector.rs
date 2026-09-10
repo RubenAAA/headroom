@@ -1412,22 +1412,14 @@ pub fn derive_session_key_with_model(
     kind: ApiKind,
     identity_model: Option<&str>,
 ) -> String {
-    if let Some(sid) = headers
-        .get("x-headroom-session-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-    {
-        return format!("session:{}", hash_secret(sid));
+    match identity_branch(headers, client_addr) {
+        IdentityBranch::Pinned(sid) => format!("session:{}", hash_secret(&sid)),
+        IdentityBranch::Branch(branch) => {
+            let conv = conversation_discriminator(body, kind, identity_model);
+            format!("{branch}:{conv}")
+        }
     }
-    let conv = conversation_discriminator(body, kind, identity_model);
-    // `None` is the explicit-sid branch, handled above. `expect` (not a
-    // silent fallback) so a future branch added to `identity_branch_id`
-    // without updating this call fails loudly in tests, not by merging
-    // sessions.
-    let branch = identity_branch_id(headers, client_addr).expect("explicit sid handled above");
-    format!("{branch}:{conv}")
 }
-
 /// 16-hex-char fingerprint of `(model, first conversation message)`,
 /// the message canonicalized via [`canonicalize_for_hash`] so a
 /// relocated `cache_control` marker does not rotate the conversation's
@@ -1485,29 +1477,37 @@ fn conversation_discriminator(
     }
 }
 
-/// Identity branch shared by [`derive_session_key_with_model`] and
-/// [`model_free_lineage_key`]: everything in the session key EXCEPT the
-/// conversation discriminator. `None` for an explicit
-/// `x-headroom-session-id` (operator-managed identity already shares all
-/// state across models; nothing to seed).
-fn identity_branch_id(headers: &HeaderMap, client_addr: &SocketAddr) -> Option<String> {
-    if headers
+/// Auto-derived identity branch, split from the conversation discriminator
+/// so [`derive_session_key_with_model`] and [`model_free_lineage_key`] share
+/// it by construction. `match` arms are exhaustive: adding a branch forces
+/// updating both callers at compile time, so identity can never silently
+/// merge (or split) for one consumer and not the other.
+enum IdentityBranch {
+    /// Explicit `x-headroom-session-id`: operator-managed identity, shared
+    /// across models and systems already.
+    Pinned(String),
+    /// Everything in the session key except the discriminator
+    /// (`auth:<h16>`, `apikey:<h>`, `ipua:<h16>`, `ip:<addr>`).
+    Branch(String),
+}
+
+fn identity_branch(headers: &HeaderMap, client_addr: &SocketAddr) -> IdentityBranch {
+    if let Some(sid) = headers
         .get("x-headroom-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .is_some()
     {
-        return None;
+        return IdentityBranch::Pinned(sid.to_string());
     }
     if let Some(token) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
-        return Some(format!("auth:{}", hash_secret(token)));
+        return IdentityBranch::Branch(format!("auth:{}", hash_secret(token)));
     }
     // `x-api-key` is the Anthropic/OpenAI-Responses convention.
     if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        return Some(format!("apikey:{}", hash_secret(key)));
+        return IdentityBranch::Branch(format!("apikey:{}", hash_secret(key)));
     }
     let ip = client_addr.ip().to_string();
     if let Some(ua) = headers
@@ -1520,9 +1520,9 @@ fn identity_branch_id(headers: &HeaderMap, client_addr: &SocketAddr) -> Option<S
         let mut h = DefaultHasher::new();
         ip.hash(&mut h);
         ua.hash(&mut h);
-        return Some(format!("ipua:{:016x}", h.finish()));
+        return IdentityBranch::Branch(format!("ipua:{:016x}", h.finish()));
     }
-    Some(format!("ip:{ip}"))
+    IdentityBranch::Branch(format!("ip:{ip}"))
 }
 
 /// Cross-model lineage key: `(identity branch, H(canonical first message))`.
@@ -1542,7 +1542,9 @@ pub(crate) fn model_free_lineage_key(
     body: &serde_json::Value,
     kind: ApiKind,
 ) -> Option<(String, String)> {
-    let branch = identity_branch_id(headers, client_addr)?;
+    let IdentityBranch::Branch(branch) = identity_branch(headers, client_addr) else {
+        return None;
+    };
     let first = conversation_messages(body, kind).into_iter().next()?;
     let mut hasher = Sha256::new();
     let _ = write_canonical(&mut DigestSink(&mut hasher), first, false);
