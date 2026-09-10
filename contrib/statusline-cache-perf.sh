@@ -8,6 +8,21 @@
 # aggregates. `~/headroom-savings.py` prints the same two numbers per run.
 set -u
 
+RED=$'\033[31m'
+GREEN=$'\033[32m'
+RESET=$'\033[0m'
+
+# Wrap $1 in green when it parses as a number <= $2, red otherwise; non-numeric
+# passes through plain so a "?" or "-" never lies.
+color_le() {
+  case "$1" in ''|*[!0-9.]*) printf '%s' "$1"; return ;; esac
+  if awk -v v="$1" -v t="$2" 'BEGIN{exit !(v <= t)}' 2>/dev/null; then
+    printf '%s' "${GREEN}$1${RESET}"
+  else
+    printf '%s' "${RED}$1${RESET}"
+  fi
+}
+
 LOG="${HEADROOM_PROXY_LOG:-$HOME/headroom-proxy.log}"
 # ~17 log lines per turn, so this is a rolling window of roughly 230 turns —
 # recent enough to react, long enough that one bad turn does not own the number.
@@ -165,20 +180,45 @@ for name in ("5h", "7d"):
     # where a small divisor makes the projection meaningless.
     elapsed = 1 - (reset - now) / SPAN[name]
     if 0.15 <= elapsed <= 1:
-        out.append(f"{text}→{util / elapsed * 100:.0f}%")
+        proj = util / elapsed * 100
+        proj_txt = f"{proj:.0f}%"
+        if proj > 100:
+            proj_txt = f"\x1b[31m{proj_txt}\x1b[0m"
+        out.append(f"{text}→{proj_txt}")
     else:
         out.append(text)
 print(" · ".join(out))
 ' 2>/dev/null)
 
-line="cache ✓ ${cache_pct}%"
+cache_txt="${cache_pct}%"
+case "$cache_pct" in ''|'?') ;; *)
+  if [ "$cache_pct" -ge 97 ] 2>/dev/null; then
+    cache_txt="${GREEN}${cache_txt}${RESET}"
+  else
+    cache_txt="${RED}${cache_txt}${RESET}"
+  fi ;;
+esac
+line="cache ✓ ${cache_txt}"
 # Older proxies do not publish it; the segment stays byte-identical there.
-[ -n "$prod_pct" ] && line="$line | prod ${prod_pct}%"
+if [ -n "$prod_pct" ]; then
+  if [ "$prod_pct" = "100" ]; then
+    line="$line | prod ${GREEN}${prod_pct}%${RESET}"
+  else
+    line="$line | prod ${RED}${prod_pct}%${RESET}"
+  fi
+fi
 [ -n "$hold_pct" ] && line="$line | hold ${hold_pct}%"
-[ -n "$vs_stock" ] && line="$line | vs stock ${vs_stock}%"
+if [ -n "$vs_stock" ]; then
+  case "$vs_stock" in
+    -*) vs_txt="${RED}${vs_stock}%${RESET}" ;;
+    0) vs_txt="${vs_stock}%" ;;
+    *) vs_txt="${GREEN}${vs_stock}%${RESET}" ;;
+  esac
+  line="$line | vs stock ${vs_txt}"
+fi
 if [ -n "$cr" ]; then
     read -r steady crude _uncached <<<"$cr"
-    line="$line | c/r ${steady} steady, ${crude} crude"
+    line="$line | c/r $(color_le "$steady" 0.01) steady, $(color_le "$crude" 0.01) crude"
 fi
 # Last, because it is the one number that is not about the proxy at all: the
 # three above say how well the cache is working, this says how much of the

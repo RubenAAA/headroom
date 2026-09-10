@@ -17,6 +17,7 @@
 //! failure is logged loudly (no silent fallbacks) and swallowed.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -32,6 +33,12 @@ use crate::compression::ctx_offload::OffloadRecord;
 /// worker exits.
 pub struct OffloadStore {
     tx: Sender<Batch>,
+    /// Bytes of parked originals the worker has not taken yet.
+    queued_bytes: Arc<AtomicU64>,
+    /// Batches shed because the queue was already at its budget.
+    shed: AtomicU64,
+    /// The budget itself, so a test can set one it can exhaust.
+    budget: u64,
     /// Shared reference to the CCR store — used by CTX-5 `/ctx/get`.
     ccr: Arc<dyn CcrStore>,
     /// Per-project FTS content stores — used by CTX-5 `/ctx/search` and
@@ -39,10 +46,22 @@ pub struct OffloadStore {
     stores: Arc<ProjectStores>,
 }
 
+/// How many bytes of parked originals the FTS queue may hold before it sheds
+/// rather than grows. Each record carries a full copy of the tool output it
+/// replaced, and the worker chunks and indexes them one at a time while the
+/// request path keeps handing it more — the queue was measured minutes deep on
+/// live traffic (see `persist`). On 2026-09-10 that unbounded backlog was the
+/// likeliest of two paths by which a proxy reached 26 GB RSS and the OOM
+/// killer took the WSL VM with it.
+const MAX_QUEUED_BYTES: u64 = 128 * 1024 * 1024;
+
 /// A batch of originals plus the project whose index they belong in.
 struct Batch {
     records: Vec<OffloadRecord>,
     project_dir: String,
+    /// Bytes of originals in this batch, charged against `MAX_QUEUED_BYTES`
+    /// while it waits and refunded when the worker takes it.
+    bytes: u64,
 }
 
 impl OffloadStore {
@@ -72,13 +91,18 @@ impl OffloadStore {
         );
 
         let (tx, rx) = mpsc::channel::<Batch>();
+        let queued_bytes = Arc::new(AtomicU64::new(0));
         // Clone Arcs for the background thread — cheap (atomic refcount).
         let ccr_bg = Arc::clone(&ccr);
         let stores_bg = Arc::clone(&stores);
+        let queued_bg = Arc::clone(&queued_bytes);
         thread::Builder::new()
             .name("ctx-offload-store".to_string())
             .spawn(move || {
                 for batch in rx {
+                    // Refund on receipt: the batch is off the queue, and what
+                    // it still holds is one batch, not a backlog.
+                    queued_bg.fetch_sub(batch.bytes, Ordering::Relaxed);
                     let Some(content) = stores_bg.content(&batch.project_dir) else {
                         // The registry logged why. Persistence is best-effort
                         // and the wire bytes are already correct.
@@ -93,7 +117,14 @@ impl OffloadStore {
                 }
             })?;
 
-        Ok(Self { tx, ccr, stores })
+        Ok(Self {
+            tx,
+            queued_bytes,
+            shed: AtomicU64::new(0),
+            budget: MAX_QUEUED_BYTES,
+            ccr,
+            stores,
+        })
     }
 
     /// CCR store handle — used by CTX-5 `/ctx/get` to retrieve offloaded
@@ -151,17 +182,75 @@ impl OffloadStore {
             "CTX-3 CCR originals stored on the request path"
         );
 
+        // Shed rather than queue when the worker is already `MAX_QUEUED_BYTES`
+        // behind. What is lost is the FTS index entry, not the original: the
+        // CCR put above already happened on this path, so `headroom ctx get`
+        // still serves every one of these blocks by hash. Search misses them
+        // until they are re-indexed.
+        // Charge first, refund if that broke the budget — see the same guard in
+        // `ctx::observer`: a read-then-add lets a burst of threads past a check
+        // none of them would pass together.
+        let bytes: u64 = records.iter().map(|r| r.original.len() as u64).sum();
+        if self.queued_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes > self.budget {
+            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            let n = self.shed.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_report(n) {
+                tracing::warn!(
+                    event = "ctx_offload_index_queue_full",
+                    shed = n,
+                    queued_bytes = self.queued_bytes.load(Ordering::Relaxed),
+                    max_queued_bytes = self.budget,
+                    "CTX-3 index queue at its byte budget; these originals stay retrievable by hash but unindexed"
+                );
+            }
+            return;
+        }
+
         let batch = Batch {
             records,
             project_dir: project_dir.to_string(),
+            bytes,
         };
         if self.tx.send(batch).is_err() {
+            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
             tracing::warn!(
                 event = "ctx_offload_store_worker_gone",
                 "CTX-3 offload-store worker unavailable; dropping persistence"
             );
         }
     }
+
+    /// Set the queue's byte budget. Tests only: a real backlog depends on
+    /// losing a race with a worker that drains in microseconds, so the shed
+    /// path is deterministic only when nothing fits.
+    #[cfg(test)]
+    fn with_budget(mut self, bytes: u64) -> Self {
+        self.budget = bytes;
+        self
+    }
+
+    /// Batches shed because the index queue was at its byte budget.
+    pub fn shed_batches(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of parked originals waiting on the index worker.
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Report the first shed, then only at powers of ten — a full queue repeats
+/// per request, and the count on each line carries what the repeats would.
+fn should_report(n: u64) -> bool {
+    let mut threshold = 1u64;
+    while threshold < n {
+        threshold = match threshold.checked_mul(10) {
+            Some(t) => t,
+            None => return false,
+        };
+    }
+    threshold == n
 }
 
 /// Store one record in both backends. Off the request path; failures are
@@ -283,6 +372,34 @@ mod tests {
             Some(record.original.as_str()),
             "the original must be retrievable the instant persist returns, \
              without waiting on the indexing worker"
+        );
+    }
+
+    /// A shed batch costs the FTS index entry and nothing else — the CCR put
+    /// happens on the request path, before the queue is consulted.
+    #[test]
+    fn a_shed_batch_still_leaves_the_original_retrievable() {
+        let dir = TempDir::new().unwrap();
+        let stores = std::sync::Arc::new(crate::ctx::projects::ProjectStores::new(
+            dir.path().to_path_buf(),
+        ));
+        let store = OffloadStore::start(dir.path(), 3600, stores)
+            .unwrap()
+            .with_budget(1);
+
+        let record = OffloadRecord {
+            hash: "fedcba9876543210fedcba98".to_string(),
+            original: "output the index will not see".to_string(),
+            title: "rg needle".to_string(),
+        };
+        store.persist(vec![record.clone()], "/home/dev/alpha");
+
+        assert_eq!(store.shed_batches(), 1, "the batch should be shed");
+        assert_eq!(store.queued_bytes(), 0, "a shed batch charges nothing");
+        assert_eq!(
+            store.ccr().get(&record.hash).as_deref(),
+            Some(record.original.as_str()),
+            "shedding the index write must not cost the original"
         );
     }
 }

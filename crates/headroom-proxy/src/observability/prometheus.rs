@@ -198,7 +198,7 @@ pub fn record_bedrock_eventstream_message(model: &str, region: &str, event_type:
 /// Axum handler for `GET /metrics`. Renders the registry in the
 /// Prometheus text format. Per Phase D acceptance: the scrape MUST
 /// include each metric family as soon as it has been touched at
-/// least once with a label set. The `prometheus` v0.13 crate skips
+/// least once with a label set. The `prometheus` v0.14 crate skips
 /// empty `MetricVec` families from `gather()`, so until a counter
 /// has incremented (or a histogram has observed) once, neither its
 /// HELP/TYPE nor any row appears — a documented quirk we lean on
@@ -220,7 +220,7 @@ pub async fn handle_metrics() -> Response {
     // registration on first scrape.
     //
     // H3 fix: registration alone is NOT enough — the prometheus
-    // crate's v0.13 `gather()` skips empty MetricVec families
+    // crate's v0.14 `gather()` skips empty MetricVec families
     // entirely (no HELP/TYPE lines either). Operators who curl
     // /metrics on a fresh boot would otherwise see NO trace of the
     // catalogue. We force-touch each counter / gauge MetricVec

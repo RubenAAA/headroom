@@ -207,37 +207,132 @@ impl CCRResponseHandler {
     /// assistant prose rather than a tool result, which is the price of not
     /// having a turn to put a tool_result in.
     ///
-    /// Anthropic shape only. Other providers keep the old hand-back: their
-    /// content arrays are not laid out this way and this path has never run
-    /// against them. Returns how many blocks were replaced.
+    /// Anthropic, OpenAI chat, and OpenAI Responses shapes. Anything else
+    /// keeps the old hand-back. Returns how many calls were replaced.
+    ///
+    /// OpenAI chat has no per-call block to rewrite — the call is removed
+    /// from `message.tool_calls` and the text is appended to
+    /// `message.content`, which the client already renders. Responses items
+    /// become `message` items, the same item type a text answer arrives as.
     pub fn splice_ccr_results_as_text(
         &self,
         response: &mut Value,
         results: &[CcrToolResult],
         provider: &str,
     ) -> usize {
-        if provider != "anthropic" {
-            return 0;
-        }
-        let Some(blocks) = response.get_mut("content").and_then(Value::as_array_mut) else {
-            return 0;
-        };
-        let mut spliced = 0;
-        for block in blocks.iter_mut() {
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
+        match provider {
+            "anthropic" => {
+                let Some(blocks) = response.get_mut("content").and_then(Value::as_array_mut) else {
+                    return 0;
+                };
+                let mut spliced = 0;
+                for block in blocks.iter_mut() {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let Some(result) = results.iter().find(|r| r.tool_call_id == id) else {
+                        continue;
+                    };
+                    *block = json!({
+                        "type": "text",
+                        "text": format!("<retrieved_context>\n{}\n</retrieved_context>", result.content),
+                    });
+                    spliced += 1;
+                }
+                spliced
             }
-            let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-            let Some(result) = results.iter().find(|r| r.tool_call_id == id) else {
-                continue;
-            };
-            *block = json!({
-                "type": "text",
-                "text": format!("<retrieved_context>\n{}\n</retrieved_context>", result.content),
-            });
-            spliced += 1;
+            "openai" => {
+                let hits: Vec<(String, String)> = response
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .and_then(|c| c.first())
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("tool_calls"))
+                    .and_then(Value::as_array)
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter_map(|call| {
+                                let id = call.get("id").and_then(Value::as_str)?;
+                                let r = results.iter().find(|r| r.tool_call_id == id)?;
+                                Some((id.to_string(), r.content.clone()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if hits.is_empty() {
+                    return 0;
+                }
+                let Some(message) = response
+                    .get_mut("choices")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|c| c.first_mut())
+                    .and_then(|c| c.get_mut("message"))
+                else {
+                    return 0;
+                };
+                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    calls.retain(|call| {
+                        let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                        !hits.iter().any(|(hid, _)| hid == id)
+                    });
+                }
+                let joined = hits
+                    .iter()
+                    .map(|(_, text)| format!("<retrieved_context>\n{text}\n</retrieved_context>"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                match message.get_mut("content") {
+                    Some(Value::String(prev)) => {
+                        if !prev.is_empty() {
+                            *prev = format!("{prev}\n{joined}");
+                        } else {
+                            *prev = joined;
+                        }
+                    }
+                    // Multimodal content: append a text block rather than
+                    // replacing the array and dropping image parts.
+                    Some(Value::Array(blocks)) => {
+                        blocks.push(json!({"type": "text", "text": joined}));
+                    }
+                    _ => {
+                        message["content"] = Value::String(joined);
+                    }
+                }
+                hits.len()
+            }
+            "openai_responses" => {
+                let Some(items) = response.get_mut("output").and_then(Value::as_array_mut) else {
+                    return 0;
+                };
+                let mut spliced = 0;
+                for item in items.iter_mut() {
+                    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                        continue;
+                    }
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("id").and_then(Value::as_str))
+                        .unwrap_or_default();
+                    let Some(result) = results.iter().find(|r| r.tool_call_id == call_id) else {
+                        continue;
+                    };
+                    *item = json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": format!("<retrieved_context>\n{}\n</retrieved_context>", result.content),
+                        }],
+                    });
+                    spliced += 1;
+                }
+                spliced
+            }
+            _ => 0,
         }
-        spliced
     }
 
     /// Parse CCR tool calls, separating them from other tool calls.
@@ -1548,15 +1643,155 @@ mod splice_tests {
     }
 
     #[test]
-    fn other_providers_keep_the_old_hand_back() {
+    fn unsupported_providers_keep_the_old_hand_back() {
         let handler = CCRResponseHandler::new(None);
         let mut response = json!({"content": [retrieve_block("toolu_1")]});
         let spliced = handler.splice_ccr_results_as_text(
             &mut response,
             &[result("toolu_1", "bytes")],
-            "openai",
+            "google",
         );
         assert_eq!(spliced, 0);
         assert_eq!(response["content"][0]["type"], "tool_use");
+    }
+
+    fn openai_response(content: Value, calls: Value) -> Value {
+        json!({"choices": [{"message": {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": calls,
+        }}]})
+    }
+
+    fn openai_call(id: &str, name: &str) -> Value {
+        json!({"id": id, "type": "function",
+            "function": {"name": name, "arguments": "{\"hash\": \"aaaaaaaaaaaaaaaaaaaaaaaa\"}"}})
+    }
+
+    #[test]
+    fn openai_splice_removes_the_call_and_appends_the_text() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response = openai_response(
+            Value::String("Working on it.".into()),
+            json!([
+                openai_call("tc_1", CCR_TOOL_NAME),
+                openai_call("tc_2", "Bash")
+            ]),
+        );
+        let spliced = handler.splice_ccr_results_as_text(
+            &mut response,
+            &[result("tc_1", "the original bytes")],
+            "openai",
+        );
+        assert_eq!(spliced, 1);
+        let message = &response["choices"][0]["message"];
+        let calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "tc_2");
+        let content = message["content"].as_str().unwrap();
+        assert!(content.contains("Working on it."));
+        assert!(content.contains("the original bytes"));
+        assert_eq!(
+            handler.residual_ccr_status(&response, "openai"),
+            RESIDUAL_CCR_RESOLVED
+        );
+    }
+
+    #[test]
+    fn openai_splice_handles_null_content() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response =
+            openai_response(Value::Null, json!([openai_call("tc_1", CCR_TOOL_NAME)]));
+        let spliced =
+            handler.splice_ccr_results_as_text(&mut response, &[result("tc_1", "bytes")], "openai");
+        assert_eq!(spliced, 1);
+        let message = &response["choices"][0]["message"];
+        assert!(message["tool_calls"].as_array().unwrap().is_empty());
+        assert!(message["content"].as_str().unwrap().contains("bytes"));
+    }
+
+    #[test]
+    fn openai_splice_preserves_array_content_blocks() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response = openai_response(
+            json!([
+                {"type": "text", "text": "Working on it."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            ]),
+            json!([openai_call("tc_1", CCR_TOOL_NAME)]),
+        );
+        let spliced =
+            handler.splice_ccr_results_as_text(&mut response, &[result("tc_1", "bytes")], "openai");
+        assert_eq!(spliced, 1);
+        let blocks = response["choices"][0]["message"]["content"]
+            .as_array()
+            .expect("array content must stay an array");
+        assert_eq!(
+            blocks.len(),
+            3,
+            "text + image + appended retrieval, got: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(blocks[2]["type"], "text");
+        assert!(blocks[2]["text"].as_str().unwrap().contains("bytes"));
+    }
+
+    #[test]
+    fn openai_splice_with_no_matching_result_leaves_the_call() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response =
+            openai_response(Value::Null, json!([openai_call("tc_1", CCR_TOOL_NAME)]));
+        let spliced =
+            handler.splice_ccr_results_as_text(&mut response, &[result("other", "x")], "openai");
+        assert_eq!(spliced, 0);
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["id"],
+            "tc_1"
+        );
+    }
+
+    #[test]
+    fn responses_splice_replaces_the_function_call_with_a_message() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response = json!({"output": [
+            {"type": "function_call", "call_id": "fc_1", "name": CCR_TOOL_NAME,
+                "arguments": "{\"hash\": \"aaaaaaaaaaaaaaaaaaaaaaaa\"}"},
+            {"type": "function_call", "call_id": "fc_2", "name": "Bash",
+                "arguments": "{}"},
+        ]});
+        let spliced = handler.splice_ccr_results_as_text(
+            &mut response,
+            &[result("fc_1", "the original bytes")],
+            "openai_responses",
+        );
+        assert_eq!(spliced, 1);
+        let items = response["output"].as_array().unwrap();
+        assert_eq!(items[0]["type"], "message");
+        assert!(items[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("the original bytes"));
+        assert_eq!(items[1]["call_id"], "fc_2");
+        assert_eq!(
+            handler.residual_ccr_status(&response, "openai_responses"),
+            RESIDUAL_CCR_RESOLVED
+        );
+    }
+
+    #[test]
+    fn responses_splice_with_no_matching_result_leaves_the_call() {
+        let handler = CCRResponseHandler::new(None);
+        let mut response = json!({"output": [
+            {"type": "function_call", "call_id": "fc_1", "name": CCR_TOOL_NAME,
+                "arguments": "{}"},
+        ]});
+        let spliced = handler.splice_ccr_results_as_text(
+            &mut response,
+            &[result("other", "x")],
+            "openai_responses",
+        );
+        assert_eq!(spliced, 0);
+        assert_eq!(response["output"][0]["type"], "function_call");
     }
 }

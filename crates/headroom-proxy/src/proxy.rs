@@ -902,6 +902,11 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             cached: outcome.cache_hit(),
             stack: outcome.client.as_deref(),
             waste_signals: outcome.waste_signals.clone(),
+            // Router offload: the bill the requested model never saw because
+            // the turn was served cheaper. Same value the ledger books as the
+            // `model_offload` line; the tracker accumulates it into lifetime
+            // totals and `savings_percent`.
+            offload_savings_usd: offload_savings(outcome).map(|o| o.saved_usd).unwrap_or(0.0),
         };
         self.savings_tracker.record_request(&rec);
 

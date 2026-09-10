@@ -13,8 +13,9 @@
 //!
 //! Neither showed up in `ctx_retrieval_hits_total`, which counts the store
 //! lookup and not whether the content ever reached the model. `outcome` here
-//! is the terminal fate of the call: `continuation` and `spliced_mixed` both
-//! mean the model was answered, `unresolved` means it was not.
+//! is the terminal fate of the call: `continuation`, `spliced_mixed`, and
+//! `spliced_failed` (all-failed splice, fell through to continuation) mean
+//! the model was answered, `unresolved` means it was not.
 use std::sync::OnceLock;
 
 use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
@@ -29,6 +30,9 @@ use super::metric_names::{
 pub const OUTCOME_CONTINUATION: &str = "continuation";
 /// Answered as text, because a real client tool call shared the turn.
 pub const OUTCOME_SPLICED_MIXED: &str = "spliced_mixed";
+/// Answered as text, because every retrieval failed and a continuation
+/// would pay a full-prefix round to deliver errors the model can read free.
+pub const OUTCOME_SPLICED_FAILED: &str = "spliced_failed";
 /// Not answered: out of rounds, upstream refused, or an unsupported shape.
 pub const OUTCOME_UNRESOLVED: &str = "unresolved";
 

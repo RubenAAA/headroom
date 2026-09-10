@@ -72,12 +72,13 @@ fn stage_timings_re() -> &'static Regex {
     })
 }
 
-/// List input price per 1M tokens from the vendored table (LiteLLM in Python).
-/// Mirrors Python truthiness: a zero price reads as "unknown".
+/// List input price per 1M tokens from the vendored table.
+/// A model IN the table reports its own rate even when that rate is 0.0
+/// (free tier renders as `$0.00/MTok`, not `unknown`); only a failed lookup
+/// returns `None`. (Python's `get_list_price` treats 0 as unknown via
+/// truthiness — deliberately not mirrored: it mislabels free models.)
 fn get_list_price(model: &str) -> Option<f64> {
-    crate::pricing::lookup(model)
-        .map(|p| p.input_cost_per_token * 1_000_000.0)
-        .filter(|v| *v > 0.0)
+    crate::pricing::lookup(model).map(|p| p.input_cost_per_token * 1_000_000.0)
 }
 
 /// Parse key=value pairs from a PERF log line. The `transforms=` field is

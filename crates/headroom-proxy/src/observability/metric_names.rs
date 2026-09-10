@@ -359,8 +359,8 @@ pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL: &str =
     "proxy_ccr_splice_dropped_blocks_total";
 pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL_HELP: &str =
     "Content blocks the CCR retrieval splice refused to forward to the \
-     client, labelled by reason. `unresolved_proxy_tool` is routine; \
-     `continuation_thinking` and `already_streamed` are the two shapes \
+     client, labelled by reason. `unresolved_proxy_tool` and \
+     `continuation_thinking` are routine; `already_streamed` is the shape \
      that made upstream refuse the *following* turn, so a non-zero \
      count next to a rising rejection rate names the cause.";
 
@@ -372,8 +372,9 @@ pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP: &str =
      `continuation` is the normal path: a second upstream call carried the \
      content back as a tool_result. `spliced_mixed` is a turn that also held \
      a real client tool call, so the content went in as text instead — that \
-     turn used to lose the retrieval outright. `unresolved` means the model \
-     asked and got nothing, and should stay at zero.";
+     turn used to lose the retrieval outright. `spliced_failed` is a turn \
+     whose spliced results all failed, falling through to continuation. \
+     `unresolved` means the model asked and got nothing, and should stay at zero.";
 
 // ---------- proxy_ccr_cross_project_hits_total ----------
 

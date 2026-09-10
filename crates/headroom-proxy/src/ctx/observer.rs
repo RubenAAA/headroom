@@ -2,7 +2,7 @@
 //!
 //! A pure observer that mirrors `cache_stabilization::capture`'s discipline:
 //! the request path only clones the parsed body and hands it to a **detached
-//! background worker** over an unbounded channel; identity classification,
+//! background worker** over a byte-budgeted channel; identity classification,
 //! event extraction, and all sessions-DB writes happen off the hot path. The
 //! request/response bytes are never read for mutation and never blocked.
 //!
@@ -21,9 +21,21 @@ use super::extract::{self, ExtractedEvent};
 use super::identity;
 use super::projects::ProjectStores;
 
+/// How many bytes of parked request bodies the queue may hold before capture
+/// sheds rather than grows. The worker writes SQLite one job at a time while
+/// every turn hands it another full copy of the conversation, so a worker that
+/// falls behind is the one path here that can hold memory without limit — on
+/// 2026-09-10 a proxy reached 26 GB RSS over three hours and the OOM killer
+/// took the WSL VM down with it. A healthy queue sits near empty; anything
+/// approaching this is a backlog worth losing.
+const MAX_QUEUED_BYTES: u64 = 128 * 1024 * 1024;
+
 /// A unit of work parked for the background worker.
 struct Job {
     parsed: Value,
+    /// Rough heap cost of `parsed`, charged against `MAX_QUEUED_BYTES` while
+    /// this job waits and refunded when the worker takes it.
+    bytes: u64,
     session_key: String,
     /// The project this request belongs to — decides which sessions DB the
     /// worker writes to. Resolved on the request path, where the headers and
@@ -44,6 +56,12 @@ pub struct CtxObserver {
     /// Expected to stay at zero — see `observe` for why, and `should_report`
     /// for what happens if it does not.
     dropped: AtomicU64,
+    /// Bytes of parked bodies the worker has not taken yet.
+    queued_bytes: Arc<AtomicU64>,
+    /// Captures shed because the queue was already at its budget.
+    shed: AtomicU64,
+    /// The budget itself, so a test can set one it can exhaust.
+    budget: u64,
 }
 
 impl CtxObserver {
@@ -54,12 +72,18 @@ impl CtxObserver {
     /// project is a property of a request, and at start-up there are none.
     pub fn start(stores: Arc<ProjectStores>) -> std::io::Result<Self> {
         let worker_stores = Arc::clone(&stores);
+        let queued_bytes = Arc::new(AtomicU64::new(0));
+        let queued_bg = Arc::clone(&queued_bytes);
         let (tx, rx) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("ctx-observer".to_string())
             .spawn(move || {
                 // Blocks until the channel closes (all senders dropped).
                 for job in rx {
+                    // Refund the budget on receipt rather than after the work:
+                    // the job is off the queue, and what it still holds is one
+                    // body, not a backlog.
+                    queued_bg.fetch_sub(job.bytes, Ordering::Relaxed);
                     // One bad request must not end capture for the process.
                     //
                     // Restarting the thread would be the wrong shape: the
@@ -94,6 +118,9 @@ impl CtxObserver {
             tx,
             stores,
             dropped: AtomicU64::new(0),
+            queued_bytes,
+            shed: AtomicU64::new(0),
+            budget: MAX_QUEUED_BYTES,
         })
     }
 
@@ -105,13 +132,39 @@ impl CtxObserver {
     /// Hand a request body to the worker. Non-blocking: clones the body once
     /// and enqueues. A send failure means the worker is gone — reported, never
     /// fatal (capture must never break or slow a live request).
+    ///
+    /// Sheds the capture instead of enqueueing it when the queue already holds
+    /// `MAX_QUEUED_BYTES`. Dropping the newest is what an `mpsc` sender can do,
+    /// and it is the right one to drop anyway: the backlog ahead of it is
+    /// older context, and the next turn resends everything this one carried.
     pub fn observe(&self, parsed: &Value, session_key: &str, project_dir: &str) {
+        let bytes = approx_size(parsed) as u64;
+        // Charge first, refund if that broke the budget. Reading the budget
+        // and then adding to it lets every thread in a burst pass a check none
+        // of them would pass together, which is the shape of the bug this
+        // guards against in the first place.
+        if self.queued_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes > self.budget {
+            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            let n = self.shed.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_report(n) {
+                tracing::warn!(
+                    event = "ctx_observe_queue_full",
+                    shed = n,
+                    queued_bytes = self.queued_bytes.load(Ordering::Relaxed),
+                    max_queued_bytes = self.budget,
+                    "CTX-2 capture queue at its byte budget; shedding this capture"
+                );
+            }
+            return;
+        }
         let job = Job {
             parsed: parsed.clone(),
+            bytes,
             session_key: session_key.to_string(),
             project_dir: project_dir.to_string(),
         };
         if self.tx.send(job).is_err() {
+            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
             // Nothing known can reach this branch: the panic that used to
             // kill the worker is caught per job above, so the loop no longer
             // exits while a sender is alive. It stays because the failure it
@@ -141,6 +194,48 @@ impl CtxObserver {
     pub fn dropped_captures(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    /// Captures shed because the queue was at its byte budget. Zero unless the
+    /// worker fell behind live traffic.
+    pub fn shed_captures(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of parked bodies waiting on the worker.
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Rough heap cost of a parsed body, for the queue budget.
+///
+/// Walks the tree rather than re-serialising it: the clone this charges for
+/// costs more than the walk, and `to_string` on a megabyte of JSON per request
+/// would be a real tax on the request path. Counts the string bytes plus a
+/// flat per-node overhead, so the number tracks the clone within a small
+/// factor — which is all a budget needs.
+fn approx_size(v: &Value) -> usize {
+    const NODE: usize = 16;
+    // Iterative: this runs on the request thread, where a body nested deeply
+    // enough to exhaust the stack would take request handling down with it
+    // rather than one worker.
+    let mut total = 0usize;
+    let mut stack = vec![v];
+    while let Some(node) = stack.pop() {
+        total += NODE;
+        match node {
+            Value::String(s) => total += s.len(),
+            Value::Array(items) => stack.extend(items.iter()),
+            Value::Object(map) => {
+                for (k, val) in map {
+                    total += NODE + k.len();
+                    stack.push(val);
+                }
+            }
+            _ => {}
+        }
+    }
+    total
 }
 
 /// Report the first drop, then only at powers of ten.
@@ -260,7 +355,52 @@ mod tests {
             tx,
             stores,
             dropped: AtomicU64::new(0),
+            queued_bytes: Arc::new(AtomicU64::new(0)),
+            shed: AtomicU64::new(0),
+            budget: MAX_QUEUED_BYTES,
         }
+    }
+
+    /// A live observer whose queue budget is one byte — so every capture
+    /// exceeds it, whatever the worker is doing. Nothing else can make the
+    /// shed path deterministic: a real backlog depends on losing a race with
+    /// a worker that drains in microseconds.
+    fn observer_with_no_room(dir: &TempDir) -> CtxObserver {
+        let stores = Arc::new(ProjectStores::new(dir.path().to_path_buf()));
+        let mut obs = CtxObserver::start(stores).unwrap();
+        obs.budget = 1;
+        obs
+    }
+
+    #[test]
+    fn sheds_the_capture_when_the_queue_is_at_its_budget() {
+        let dir = TempDir::new().unwrap();
+        let obs = observer_with_no_room(&dir);
+        let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+
+        obs.observe(&body, "sk", "/home/dev/alpha");
+
+        assert_eq!(obs.shed_captures(), 1, "the capture should be shed");
+        assert_eq!(
+            obs.queued_bytes(),
+            0,
+            "a shed capture must not charge the budget it refused"
+        );
+        assert_eq!(
+            obs.dropped_captures(),
+            0,
+            "shedding is a full queue, not a dead worker"
+        );
+    }
+
+    #[test]
+    fn approx_size_tracks_the_bytes_it_charges_for() {
+        let body = json!({"content": "x".repeat(1000)});
+        let n = approx_size(&body);
+        assert!(
+            (1000..2000).contains(&n),
+            "a 1000-byte string should cost about 1000 bytes, got {n}"
+        );
     }
 
     #[test]

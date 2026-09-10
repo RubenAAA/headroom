@@ -64,6 +64,8 @@
 //! No beta header is needed: the 1-hour TTL went generally available on
 //! 2025-08-13 and `extended-cache-ttl-2025-04-11` is no longer required.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 /// The TTL string Anthropic accepts for the extended cache.
@@ -260,6 +262,112 @@ pub fn force_1h_ttl(body: &mut Value) -> bool {
     changed
 }
 
+/// What the client asked for on its own markers, for the stock
+/// counterfactual in [`super::usage_observer`] and the subagent TTL pin.
+/// A stock client sends what we sent, so its prefix lives as long as the
+/// TTL on its own markers. Claude Code asks `1h` on the main conversation
+/// and leaves the 5-minute default on subagent traffic, so reading the
+/// markers is what separates the two — a single flat assumption fits
+/// neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientTtl {
+    /// Every explicit marker says `1h`: the main conversation shape.
+    AllOneHour,
+    /// Every explicit marker says `5m`: the subagent shape.
+    AllFiveMinutes,
+    /// Both tiers present. Minimum governs survival: the prefix outlives a
+    /// gap only while every tier is alive.
+    Mixed,
+    /// No explicit TTL anywhere: the provider default, five minutes. Only
+    /// `ephemeral` markers count, the same guard the rewrites use.
+    Unmarked,
+}
+
+/// The tier the stock comparison prices and expires: the minimum the
+/// client bought, or the default when it bought nothing explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl ClientTtl {
+    pub fn stock_tier(self) -> StockTtl {
+        match self {
+            ClientTtl::AllOneHour => StockTtl::OneHour,
+            ClientTtl::AllFiveMinutes | ClientTtl::Mixed | ClientTtl::Unmarked => {
+                StockTtl::FiveMinutes
+            }
+        }
+    }
+}
+
+impl StockTtl {
+    /// Pricing multiplier for writes at this tier, in base-input units.
+    pub fn write_multiplier(self) -> f64 {
+        match self {
+            StockTtl::FiveMinutes => 1.25,
+            StockTtl::OneHour => 2.0,
+        }
+    }
+
+    /// How long an entry at this tier lives without a refreshing read.
+    pub fn horizon(self) -> Duration {
+        match self {
+            StockTtl::FiveMinutes => Duration::from_secs(5 * 60),
+            StockTtl::OneHour => Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+/// Read the TTL shape off the client's own markers, before any rewrite.
+pub fn client_ttl_shape(body: &Value) -> ClientTtl {
+    fn scan(node: &Value, seen: &mut (bool, bool)) {
+        match node {
+            Value::Array(items) => {
+                for item in items {
+                    scan(item, seen);
+                }
+            }
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("ephemeral") {
+                    match map.get("ttl").and_then(Value::as_str) {
+                        Some("5m") => seen.1 = true,
+                        Some("1h") => seen.0 = true,
+                        _ => {}
+                    }
+                }
+                for (_, value) in map.iter() {
+                    scan(value, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut seen = (false, false);
+    scan(body, &mut seen);
+    match seen {
+        (true, false) => ClientTtl::AllOneHour,
+        (false, true) => ClientTtl::AllFiveMinutes,
+        (true, true) => ClientTtl::Mixed,
+        (false, false) => ClientTtl::Unmarked,
+    }
+}
+
+/// Whether the 1h pin applies to a body of this shape. With
+/// `respect_client_5m`, an all-`5m` body keeps the tier it asked for:
+/// subagent traffic runs to completion in seconds, so hour entries bought
+/// at 2.0x die unused where 1.25x entries do. Anything else still pins —
+/// mixed bodies keep the pin because the tail hedge needs the older entry
+/// alive (see the +511% split-TTL lesson in [`tail_5m_prefix_1h`]).
+pub fn pin_1h_applies(shape: ClientTtl, respect_client_5m: bool) -> bool {
+    if respect_client_5m && shape == ClientTtl::AllFiveMinutes {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +507,82 @@ mod tests {
         });
         assert!(force_1h_ttl(&mut body));
         assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    /// The stock counterfactual reads what the client asked for: an hour
+    /// everywhere means the modelled client holds the hour too.
+    #[test]
+    fn client_ttl_reads_an_hour_when_the_client_asked_for_one() {
+        let body = json!({
+            "tools": [{"name": "a", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": "u", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        });
+        assert_eq!(client_ttl_shape(&body), ClientTtl::AllOneHour);
+        assert_eq!(client_ttl_shape(&body).stock_tier(), StockTtl::OneHour);
+    }
+
+    /// Subagent traffic arrives on the 5-minute default.
+    #[test]
+    fn client_ttl_reads_five_minutes_when_the_client_did() {
+        let body = json!({
+            "tools": [{"name": "a", "cache_control": {"type": "ephemeral", "ttl": "5m"}}],
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "5m"}}]
+        });
+        assert_eq!(client_ttl_shape(&body), ClientTtl::AllFiveMinutes);
+        assert_eq!(client_ttl_shape(&body).stock_tier(), StockTtl::FiveMinutes);
+    }
+
+    /// Minimum governs: the prefix survives a gap only while every tier is
+    /// alive, so one explicit 5m beside 1h markers still means five minutes.
+    #[test]
+    fn client_ttl_takes_the_minimum_over_mixed_markers() {
+        let body = json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": "u", "cache_control": {"type": "ephemeral", "ttl": "5m"}}]
+        });
+        assert_eq!(client_ttl_shape(&body), ClientTtl::Mixed);
+        assert_eq!(client_ttl_shape(&body).stock_tier(), StockTtl::FiveMinutes);
+    }
+
+    /// No explicit TTL anywhere is the provider default: five minutes. Only
+    /// `ephemeral` markers count — any other shape is not a cache entry.
+    #[test]
+    fn client_ttl_defaults_to_five_minutes() {
+        let bare = json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "u"}]
+        });
+        assert_eq!(client_ttl_shape(&bare), ClientTtl::Unmarked);
+        assert_eq!(
+            client_ttl_shape(&json!({"messages": []})),
+            ClientTtl::Unmarked
+        );
+        let odd = json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "other", "ttl": "1h"}}]
+        });
+        assert_eq!(client_ttl_shape(&odd), ClientTtl::Unmarked);
+    }
+
+    /// The subagent skip fires only on the pure shape. Mixed bodies keep the
+    /// pin: the tail hedge needs the older entry alive, and a 5m system tier
+    /// beside a 1h tail is not a shape any client sends — pinning it is the
+    /// conservative arm.
+    #[test]
+    fn pin_skip_fires_only_on_all_5m() {
+        assert!(pin_1h_applies(ClientTtl::AllOneHour, true));
+        assert!(pin_1h_applies(ClientTtl::Mixed, true));
+        assert!(pin_1h_applies(ClientTtl::Unmarked, true));
+        assert!(!pin_1h_applies(ClientTtl::AllFiveMinutes, true));
+        // Flag off: everything pins, the long-standing behaviour.
+        for shape in [
+            ClientTtl::AllOneHour,
+            ClientTtl::AllFiveMinutes,
+            ClientTtl::Mixed,
+            ClientTtl::Unmarked,
+        ] {
+            assert!(pin_1h_applies(shape, false), "{shape:?}");
+        }
     }
 
     /// A body with no markers at all is untouched — B1 never creates a

@@ -2,19 +2,22 @@
 //!
 //! `sse::ccr_stream` resolves a mid-stream `headroom_retrieve` with a second
 //! upstream call and splices that call's content onto a turn the client is
-//! already receiving. Some of that content must never be forwarded, and the
-//! two interesting reasons are defects that cost a day to find:
+//! already receiving. Some of that content must never be forwarded:
 //!
 //! - `continuation_thinking` — reasoning signed for the continuation request.
 //!   The client stores it and replays it next turn, where the signature cannot
-//!   verify and the API refuses the whole conversation.
+//!   verify and the API refuses the whole conversation. Dropping it is routine
+//!   protection: any streamed CCR turn whose continuation thinks produces
+//!   these, so this count scales with thinking-model usage, not with breakage.
 //! - `already_streamed` — a block the client already has, re-sent under a new
-//!   index, including a `tool_use` id the client is already acting on.
+//!   index, including a `tool_use` id the client is already acting on. This
+//!   one has no legitimate cause, which is why it is the only reason the
+//!   health summary counts.
 //!
 //! Both fail on the *next* request, so the log line at the splice and the
 //! rejection are a turn apart and were never joined up. Counting them by
 //! reason is what makes the pair visible: a rising
-//! `continuation_thinking` count alongside a rising rejection rate
+//! `already_streamed` count alongside a rising rejection rate
 //! (`upstream_health`) names the cause without a capture corpus.
 //!
 //! `unresolved_proxy_tool` is the routine reason and is counted for the
@@ -63,10 +66,13 @@ pub fn dropped_get(reason: &str) -> u64 {
         .get()
 }
 
-/// The two counts worth watching, for the health snapshot. Both should stay at
-/// zero; neither has a legitimate cause.
+/// The counts worth watching, for the health snapshot. Only `already_streamed`
+/// has no legitimate cause. `continuation_thinking` is routine protection —
+/// it fires on any streamed CCR turn whose continuation thinks — so counting
+/// it here would measure thinking-model usage, not breakage. Per-reason
+/// totals remain visible in `proxy_ccr_splice_dropped_blocks_total`.
 pub fn unusable_blocks_get() -> u64 {
-    dropped_get("continuation_thinking") + dropped_get("already_streamed")
+    dropped_get("already_streamed")
 }
 
 #[cfg(test)]
@@ -88,15 +94,18 @@ mod tests {
         assert_eq!(dropped_get(TEST_ONLY_REASON), before + 3);
     }
 
-    /// The health summary must count both defect reasons and ignore the
-    /// routine one — a proxy tool the continuation could not run is not a sign
-    /// that anything is broken.
+    /// The health summary counts only genuine faults: a block the client
+    /// already has, re-sent under a new index. A proxy tool the continuation
+    /// could not run, and continuation thinking the client must never
+    /// receive, are both routine protection — not signs that anything is
+    /// broken.
     #[test]
-    fn the_summary_ignores_the_routine_reason() {
+    fn the_summary_counts_only_genuine_faults() {
         let before = unusable_blocks_get();
         observe_dropped("unresolved_proxy_tool", 5);
+        observe_dropped("continuation_thinking", 7);
         assert_eq!(unusable_blocks_get(), before);
-        observe_dropped("continuation_thinking", 1);
+        observe_dropped("already_streamed", 1);
         assert_eq!(unusable_blocks_get(), before + 1);
     }
 }

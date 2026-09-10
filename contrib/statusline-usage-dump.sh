@@ -36,8 +36,9 @@ week_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empt
 week_reset=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
 
 # Claude Code fills `rate_limits` only for Anthropic subscription auth, so a
-# session on a routed model (codex) reports none and the 5h/7d segments would
-# vanish mid-session. Keep the last values we did see and show them marked `~`.
+# session on a routed model (codex, spark) reports none and the 5h/7d segments
+# would vanish mid-session. Keep the last values we did see and show them
+# marked `~`.
 # They stay meaningful until their own reset time, which is an absolute stamp,
 # so a stale reading expires on its own rather than going quietly wrong.
 cache="$HOME/.claude/rate-limits-cache.json"
@@ -59,7 +60,24 @@ ctx_in=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0'
 ctx_cc=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
 ctx_cr=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
 ctx_size=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
+case "$ctx_size" in '' | null | *[!0-9]*) ctx_size=0 ;; esac
 ctx_used=$((ctx_in + ctx_cc + ctx_cr))
+# Some payloads carry only the flat total; use it when the parts sum to zero.
+if [ "$ctx_used" -eq 0 ]; then
+  ctx_total=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
+  case "$ctx_total" in '' | null | *[!0-9]*) ctx_total=0 ;; esac
+  [ "$ctx_total" -gt 0 ] 2>/dev/null && ctx_used=$ctx_total
+fi
+# Routed spark models report no (or zero-sized) context_window, so the ctx
+# segment vanishes. Fall back to the known 1MiB window (1,048,576 tokens per
+# Meta's model docs, shared by every muse-spark variant) when usage is present
+# but the size is missing.
+if [ "$ctx_size" -eq 0 ] && [ "$ctx_used" -gt 0 ] 2>/dev/null; then
+  model_id=$(echo "$input" | jq -r '.model.id // .model.display_name // empty')
+  if printf '%s' "$model_id" | grep -qi spark; then
+    ctx_size=1048576
+  fi
+fi
 
 cwd=$(echo "$input" | jq -r '.workspace.project_dir // .cwd // empty')
 

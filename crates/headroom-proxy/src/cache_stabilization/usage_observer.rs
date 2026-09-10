@@ -766,6 +766,13 @@ struct PendingRequest {
     /// The ledger line is the richest per-turn record on disk for a turn that
     /// saved nothing, and turn cost cannot be rebuilt from it without this.
     billed_output: Option<u64>,
+    /// The TTL shape the client asked for on this turn's own markers, for
+    /// the stock arm: a stock client sends what we sent, so its prefix
+    /// lives as long as the tier this turn bought. Set by
+    /// [`UsageObserver::note_client_cache_ttl`]; unmarked when the path
+    /// never noted one (the provider default, and the old flat
+    /// assumption).
+    client_ttl: super::cache_ttl::ClientTtl,
 }
 
 /// Where the provider's cache read landed against the two previous boundaries,
@@ -1099,6 +1106,10 @@ pub struct CacheHealthSnapshot {
     /// completed Anthropic requests across every session handled by this proxy
     /// process; `null` until the first sample. This is an ambient fleet signal,
     /// not the rate for the session that happens to render the statusline.
+    /// Turns whose provider reported no cache-usage data at all leave no
+    /// capable sample and are excluded from the mean, so a provider with no
+    /// cache telemetry cannot drag the fleet rate toward zero. `samples`
+    /// counts the capable turns the mean is over.
     pub recent_hit_rate: Option<f64>,
     pub samples: usize,
     pub recache_events_total: u64,
@@ -1127,6 +1138,11 @@ pub struct CacheHealthSnapshot {
     /// look at rather than a fault on its own. Zero is the only value that
     /// needs no explanation.
     pub abandoned_requests_total: u64,
+    /// Turns shed by the conversation-concurrency cap before anything was
+    /// forwarded, so unlike `abandoned_requests_total` these cost nothing and
+    /// miss nothing: the client retries them against a committed prefix.
+    /// Zero until the cap is configured and a fan-out trips it.
+    pub concurrency_sheds_total: u64,
     /// Turns where the client's hot zone (model, system, tools) changed.
     ///
     /// Every one is a turn a stock client would have been at risk of
@@ -1234,6 +1250,14 @@ struct CostSample {
     billed_fresh_equivalents: f64,
 }
 
+/// One turn's contribution to the fleet-wide hit-rate window.
+struct RecentHitRateSample {
+    rate: f64,
+    /// False when the provider turn reported no cache-usage data at all (no
+    /// cache fields in the usage block): "no signal", not a cache miss.
+    cache_capable: bool,
+}
+
 struct Inner {
     pending: LruCache<String, PendingRequest>,
     /// Several streams can share one key — see [`match_stream`].
@@ -1252,7 +1276,7 @@ struct Inner {
     forgotten: LruCache<String, ()>,
     /// Message-0 hash of each recent first turn → `(seen, conversation_key)`.
     first_turn_openers: LruCache<String, (Instant, String)>,
-    recent_hit_rates: VecDeque<f64>,
+    recent_hit_rates: VecDeque<RecentHitRateSample>,
     recent_cost_samples: VecDeque<CostSample>,
     recache_events_total: u64,
     recache_wasted_tokens_total: u64,
@@ -1261,6 +1285,7 @@ struct Inner {
     unearned_cache_write_tokens_total: u64,
     unearned_write_turns_total: u64,
     abandoned_requests_total: u64,
+    concurrency_sheds_total: u64,
     hot_zone_changes_total: u64,
     hot_zone_recaches_total: u64,
     stabilization_absorbed_total: u64,
@@ -1380,6 +1405,7 @@ impl UsageObserver {
                 unearned_cache_write_tokens_total: 0,
                 unearned_write_turns_total: 0,
                 abandoned_requests_total: 0,
+                concurrency_sheds_total: 0,
                 hot_zone_changes_total: 0,
                 hot_zone_recaches_total: 0,
                 stabilization_absorbed_total: 0,
@@ -1481,6 +1507,7 @@ impl UsageObserver {
                 prefix,
                 billed_totals: None,
                 billed_output: None,
+                client_ttl: super::cache_ttl::ClientTtl::Unmarked,
             },
         );
         if let Some((evicted_id, _)) = evicted {
@@ -1488,6 +1515,57 @@ impl UsageObserver {
                 inner.abandoned_requests_total += 1;
             }
         }
+    }
+
+    /// Shed this turn when its conversation already has more than `cap` turns
+    /// in flight, returning the in-flight count (this turn included) so the
+    /// caller can say what it saw. `cap == 0` disables the check and always
+    /// returns `None`.
+    ///
+    /// Overlapping turns of one conversation race the provider's cache commit:
+    /// measured 2026-09-09, 43 overlapping turns on one fan-out burned 27.8k
+    /// tokens re-writing prefixes their siblings had not finished committing
+    /// (14% of everything that conversation wrote). Shedding paces the fan-out
+    /// with the client's own retry instead of paying the race on every turn.
+    /// Ordinary interactive overlap (one or two in flight) never reaches a cap
+    /// worth setting, so only storms trip it.
+    ///
+    /// A shed turn is popped, not completed: nothing was forwarded, so unlike
+    /// an abandoned request there is no seam — it must not count there, and a
+    /// later turn of the conversation must not read it as concurrent. Counted
+    /// in `concurrency_sheds_total` instead. Atomic under one lock with the
+    /// count, so two turns arriving together cannot both pass on each other's
+    /// stale view; the residual race (both count, one sheds) errs toward one
+    /// extra client backoff, never toward an uncounted overlap.
+    pub fn shed_if_over_conversation_cap(
+        &self,
+        request_id: &str,
+        conversation_key: &str,
+        cap: usize,
+    ) -> Option<usize> {
+        if cap == 0 {
+            return None;
+        }
+        let mut inner = self.lock();
+        let now = Instant::now();
+        let in_flight = inner
+            .pending
+            .iter()
+            .filter(|(_, p)| {
+                p.conversation_key == conversation_key
+                    && now.duration_since(p.began) < IN_FLIGHT_HORIZON
+            })
+            .count();
+        if in_flight <= cap {
+            return None;
+        }
+        // Count only a real shed: if this id never parked (compression-off,
+        // non-JSON, eviction race), popping books a phantom.
+        if inner.pending.pop(request_id).is_none() {
+            return Some(in_flight);
+        }
+        inner.concurrency_sheds_total += 1;
+        Some(in_flight)
     }
 
     /// Record what the provider billed across every round of this request.
@@ -1573,6 +1651,26 @@ impl UsageObserver {
             pending.forwarded_request_bytes = Some(forwarded_bytes);
             pending.compression_mode = Some(compression_mode);
         }
+    }
+
+    /// Record the TTL shape the client asked for on its own markers, read
+    /// before any rewrite. Prices the stock arm at the tier this turn
+    /// actually bought: main-loop traffic arrives on `1h`, subagent traffic
+    /// on the 5-minute default, and a single flat assumption fits neither.
+    /// Also the record the subagent TTL pin reads back at the pin site.
+    pub fn note_client_cache_ttl(&self, request_id: &str, ttl: super::cache_ttl::ClientTtl) {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(request_id) {
+            pending.client_ttl = ttl;
+        }
+    }
+
+    /// What the client asked for on a turn already past the gate, if it got
+    /// that far. `None` falls back to pinning: a turn the observer never
+    /// saw is not a turn to change TTL behaviour on.
+    pub fn client_ttl_for(&self, request_id: &str) -> Option<super::cache_ttl::ClientTtl> {
+        let inner = self.lock();
+        inner.pending.peek(request_id).map(|p| p.client_ttl)
     }
 
     /// Record what this turn's compression removed, so the response side can
@@ -1681,6 +1779,32 @@ impl UsageObserver {
         cache_creation_input_tokens: u64,
         cache_write_ttl_split: Option<(u64, u64)>,
     ) -> Option<CompletionClass> {
+        self.complete_with_cache_capability(
+            request_id,
+            input_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_write_ttl_split,
+            true,
+        )
+    }
+
+    /// Same as `complete`, for providers that may not report cache usage.
+    ///
+    /// Pass `cache_capable: false` when the turn's usage block carried no
+    /// cache fields at all. The sample still joins the window (so capacity
+    /// accounting is unchanged) but `snapshot` leaves it out of the
+    /// `recent_hit_rate` mean. A capable turn that simply read nothing from
+    /// cache still counts as a genuine 0%.
+    pub fn complete_with_cache_capability(
+        &self,
+        request_id: &str,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_write_ttl_split: Option<(u64, u64)>,
+        cache_capable: bool,
+    ) -> Option<CompletionClass> {
         let now = SystemTime::now();
         let now_instant = Instant::now();
         let cache_ttl = self.cache_ttl;
@@ -1694,9 +1818,10 @@ impl UsageObserver {
             if inner.recent_hit_rates.len() == RECENT_SAMPLE_CAPACITY {
                 inner.recent_hit_rates.pop_front();
             }
-            inner
-                .recent_hit_rates
-                .push_back(cache_read_input_tokens as f64 / denom as f64);
+            inner.recent_hit_rates.push_back(RecentHitRateSample {
+                rate: cache_read_input_tokens as f64 / denom as f64,
+                cache_capable,
+            });
         }
 
         let Some(pending) = inner.pending.pop(request_id) else {
@@ -2074,7 +2199,10 @@ impl UsageObserver {
         // The one model is the stock client's cache behaviour, and it is the
         // simple one: Claude Code puts a breakpoint at the tail, so its whole
         // prompt is cacheable and the next turn reads back as much of it as
-        // still fits. `predicted_read_error_pct` below measures that same rule
+        // still fits. The tier and the horizon come from the turn's own
+        // markers, read before any rewrite: hour-marked traffic prices and
+        // expires like an hour entry, five-minute traffic like a five-minute
+        // one. `predicted_read_error_pct` below measures that same rule
         // against our own observed reads every turn, which is what bounds how
         // far to trust this arm.
         let ours_prompt = input_tokens + cache_read_input_tokens + cache_creation_input_tokens;
@@ -2106,18 +2234,16 @@ impl UsageObserver {
             // A hot-zone change is the case where the arms part: our holds may
             // absorb it, and without them it is a rebuild every time.
             //
-            // The gap test is the second place they part, and leaving it out
-            // made this whole comparison unfair to us. Under
-            // `--force-1h-cache-ttl` our writes price at 2.0x against the
-            // stock arm's flat 1.25x, so the hour's premium was charged to us
-            // on every writing turn -- while the modelled client was handed a
-            // prefix that never expired, which is the benefit we paid that
-            // premium to get. Charge the cost, credit the benefit: a gap we
-            // survived on an hour marker is a gap that ends a five-minute
-            // client's prefix, and it rebuilds.
-            let stock_kept = matches!(class, TurnClass::Healthy)
-                && !head_changed
-                && idle_gap <= ANTHROPIC_CACHE_TTL;
+            // The gap test is the second place they part. The horizon is the
+            // tier this turn's own markers bought, read before any rewrite:
+            // a gap we survived on an hour marker ends a five-minute
+            // client's prefix (and it rebuilds), but an hour-marked stock
+            // client survives it alongside us. Charge the cost, credit the
+            // benefit, both at the tier the client actually asked for.
+            let stock_tier = pending.client_ttl.stock_tier();
+            let stock_horizon = stock_tier.horizon();
+            let stock_kept =
+                matches!(class, TurnClass::Healthy) && !head_changed && idle_gap <= stock_horizon;
             // The tail after the last breakpoint is billed as fresh input on
             // both arms. Which message the breakpoint lands on is the client's
             // shape, not ours, so handing the stock arm a cheaper tail than we
@@ -2170,11 +2296,11 @@ impl UsageObserver {
                 None => 0.0,
             };
             ours_effective += ccr_hidden_effective;
-            // The stock client never asks for the hour, so its writes price at
-            // the 5-minute rate throughout.
+            // The stock client pays the tier its own markers bought: hour
+            // writes at 2.0x, five-minute writes at 1.25x.
             let stock_effective = input_tokens as f64
                 + stock_read as f64 * CACHE_READ_MULTIPLIER
-                + stock_write as f64 * CACHE_WRITE_5M_MULTIPLIER;
+                + stock_write as f64 * stock_tier.write_multiplier();
             inner.ours_effective_tokens += ours_effective;
             inner.stock_effective_tokens += stock_effective;
             inner.stock_turns_compared += 1;
@@ -2204,6 +2330,7 @@ impl UsageObserver {
                 turn_class = ?class,
                 head_changed,
                 stock_kept,
+                client_ttl = ?pending.client_ttl,
                 ours_effective = ours_effective.round() as u64,
                 stock_effective = stock_effective.round() as u64,
                 ours_input = input_tokens,
@@ -2650,10 +2777,16 @@ impl UsageObserver {
     /// One cheap in-memory snapshot for `GET /cache-health`.
     pub fn snapshot(&self) -> CacheHealthSnapshot {
         let inner = self.lock();
-        let recent_hit_rate = if inner.recent_hit_rates.is_empty() {
+        let mut capable_sum = 0.0;
+        let mut capable_samples = 0usize;
+        for sample in inner.recent_hit_rates.iter().filter(|s| s.cache_capable) {
+            capable_sum += sample.rate;
+            capable_samples += 1;
+        }
+        let recent_hit_rate = if capable_samples == 0 {
             None
         } else {
-            Some(inner.recent_hit_rates.iter().sum::<f64>() / inner.recent_hit_rates.len() as f64)
+            Some(capable_sum / capable_samples as f64)
         };
         let last_event_age_seconds = inner.last_event.as_ref().map(|e| {
             SystemTime::now()
@@ -2689,7 +2822,7 @@ impl UsageObserver {
         };
         CacheHealthSnapshot {
             recent_hit_rate,
-            samples: inner.recent_hit_rates.len(),
+            samples: capable_samples,
             recache_events_total: inner.recache_events_total,
             recache_wasted_tokens_total: inner.recache_wasted_tokens_total,
             ttl_expiries_total: inner.ttl_expiries_total,
@@ -2697,6 +2830,7 @@ impl UsageObserver {
             unearned_cache_write_tokens_total: inner.unearned_cache_write_tokens_total,
             unearned_write_turns_total: inner.unearned_write_turns_total,
             abandoned_requests_total: inner.abandoned_requests_total,
+            concurrency_sheds_total: inner.concurrency_sheds_total,
             hot_zone_changes_total: inner.hot_zone_changes_total,
             hot_zone_recaches_total: inner.hot_zone_recaches_total,
             stabilization_absorbed_total: inner.stabilization_absorbed_total,
@@ -3174,6 +3308,71 @@ mod tests {
         );
     }
 
+    /// The concurrency cap sheds only past the cap, pops the shed turn so it
+    /// neither flags later turns concurrent nor counts as abandoned, and
+    /// leaves other conversations alone.
+    #[test]
+    fn the_cap_sheds_only_past_the_cap_and_pops_the_shed_turn() {
+        let obs = UsageObserver::new();
+        obs.begin_request("r1", "conv".into(), None, None, None);
+        obs.begin_request("r2", "conv".into(), None, None, None);
+        assert_eq!(
+            obs.shed_if_over_conversation_cap("r2", "conv", 2),
+            None,
+            "at the cap, not past it"
+        );
+        obs.begin_request("other", "elsewhere".into(), None, None, None);
+        assert_eq!(
+            obs.shed_if_over_conversation_cap("other", "elsewhere", 2),
+            None,
+            "other conversations are not counted"
+        );
+        obs.begin_request("r3", "conv".into(), None, None, None);
+        assert_eq!(
+            obs.shed_if_over_conversation_cap("r3", "conv", 2),
+            Some(3),
+            "self plus two in flight exceeds a cap of two"
+        );
+        let s = obs.snapshot();
+        assert_eq!(s.concurrency_sheds_total, 1);
+        assert_eq!(
+            s.abandoned_requests_total, 0,
+            "a shed turn was never forwarded; it must not read as abandoned"
+        );
+        // The shed turn is gone: completing it is a no-op, and the survivors
+        // complete normally without seeing it as concurrent baggage.
+        assert_eq!(obs.complete("r3", 10, 0, 0, None), None);
+        obs.complete("r1", 10, 0, 0, None);
+        assert_eq!(obs.snapshot().concurrency_sheds_total, 1);
+    }
+
+    /// `cap == 0` is the off switch: whatever is in flight, nothing sheds.
+    #[test]
+    fn a_zero_cap_disables_the_check() {
+        let obs = UsageObserver::new();
+        for i in 0..5 {
+            let id = format!("r{i}");
+            obs.begin_request(&id, "conv".into(), None, None, None);
+            assert_eq!(obs.shed_if_over_conversation_cap(&id, "conv", 0), None);
+        }
+        assert_eq!(obs.snapshot().concurrency_sheds_total, 0);
+    }
+
+    /// Stale entries past the horizon are not in flight, so a leftover from
+    /// a dead turn cannot keep tripping the cap for the turns after it.
+    #[test]
+    fn stale_entries_do_not_count_toward_the_cap() {
+        let obs = UsageObserver::new();
+        obs.begin_request("old", "conv".into(), None, None, None);
+        obs.age_pending("old", IN_FLIGHT_HORIZON);
+        obs.begin_request("r1", "conv".into(), None, None, None);
+        obs.begin_request("r2", "conv".into(), None, None, None);
+        // "old" was swept as abandoned by r1's arrival; r1 and r2 are the
+        // only live entries, exactly at a cap of two.
+        assert_eq!(obs.shed_if_over_conversation_cap("r2", "conv", 2), None);
+        assert_eq!(obs.snapshot().concurrency_sheds_total, 0);
+    }
+
     /// The statusline number. Writes only, and the two buckets sum to every
     /// written token, so it is a share and not an estimate.
     #[test]
@@ -3449,6 +3648,36 @@ mod tests {
         assert_eq!(snap.recache_wasted_tokens_total, 10_800);
         assert!(snap.recent_hit_rate.is_some());
         assert_eq!(snap.samples, 3);
+    }
+
+    /// A turn whose provider reported no cache-usage data is "no signal", not
+    /// a miss: the mean covers capable turns only, while a capable genuine
+    /// 0% still counts.
+    #[test]
+    fn recent_hit_rate_ignores_turns_without_cache_data() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("cap-1", "conv-a".into(), None, None, None);
+        obs.complete_with_cache_capability("cap-1", 100, 900, 0, None, true);
+        obs.begin_request("dark-1", "conv-b".into(), None, None, None);
+        obs.complete_with_cache_capability("dark-1", 1_000, 0, 0, None, false);
+        obs.begin_request("cap-2", "conv-c".into(), None, None, None);
+        obs.complete_with_cache_capability("cap-2", 1_000, 0, 0, None, true);
+        let snap = obs.snapshot();
+        assert!((snap.recent_hit_rate.unwrap() - 0.45).abs() < 1e-9);
+        assert_eq!(snap.samples, 2);
+    }
+
+    /// No capable sample yet reads exactly like no samples at all.
+    #[test]
+    fn recent_hit_rate_stays_null_without_capable_samples() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("dark-1", "conv-a".into(), None, None, None);
+        obs.complete_with_cache_capability("dark-1", 1_000, 0, 0, None, false);
+        let snap = obs.snapshot();
+        assert_eq!(snap.recent_hit_rate, None);
+        assert_eq!(snap.samples, 0);
     }
 
     /// These four fields were served by one binary, dropped from the tree, and
@@ -5285,6 +5514,49 @@ mod stock_baseline_tests {
             "{}",
             s.vs_stock_saving_pct
         );
+    }
+
+    /// A 30-minute gap ends a five-minute prefix but not an hour one. Same
+    /// billed turn, two different stock verdicts, decided by the noted tier —
+    /// and the ours arm prices identically either way.
+    #[test]
+    fn stock_arm_honours_the_noted_tier_across_a_30min_gap() {
+        for (ttl, want_stock) in [
+            (
+                crate::cache_stabilization::cache_ttl::ClientTtl::AllFiveMinutes,
+                // Cold turn writes the whole 10_000 at 1.25x; the warm turn
+                // rebuilds everything past a lapsed prefix at the same rate.
+                12_500 + 200 + (12_500.0 * 1.25) as u64,
+            ),
+            (
+                crate::cache_stabilization::cache_ttl::ClientTtl::AllOneHour,
+                // Same cold turn, then a 10_000 read plus the 2_500 of
+                // growth since, written at the hour rate.
+                12_500 + 200 + 1_000 + 2_500 * 2,
+            ),
+        ] {
+            let obs = UsageObserver::new();
+            obs.begin_request("g0", "conv-gap".into(), None, None, Some(hot("aaaa")));
+            obs.complete("g0", 0, 0, 10_000, None);
+            {
+                // Date the established footprint 30 minutes back: past the
+                // five-minute horizon, inside the hour one.
+                let mut inner = obs.lock();
+                if let Some(streams) = inner.conversations.peek_mut("conv-gap") {
+                    for rec in streams.iter_mut() {
+                        rec.at = SystemTime::now() - Duration::from_secs(30 * 60);
+                    }
+                }
+            }
+            obs.begin_request("g1", "conv-gap".into(), None, None, Some(hot("aaaa")));
+            obs.note_client_cache_ttl("g1", ttl);
+            obs.complete("g1", 200, 12_000, 500, None);
+            let s = obs.snapshot();
+            assert_eq!(s.stock_effective_tokens, want_stock, "{ttl:?}");
+            // Ours never depends on the noted tier: 12_500 cold plus
+            // 200 fresh + 12_000 read + 500 written at 1.25x.
+            assert_eq!(s.ours_effective_tokens, 12_500 + 2025);
+        }
     }
 
     /// The holds' contribution, priced. The client moved its hot zone and our

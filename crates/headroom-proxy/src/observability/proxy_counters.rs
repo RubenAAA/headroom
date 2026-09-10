@@ -113,6 +113,21 @@ fn requests_failed() -> &'static IntCounter {
     })
 }
 
+fn conversation_concurrency_sheds() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            "headroom_conversation_concurrency_sheds_total",
+            "Turns shed by the per-conversation concurrency cap before forwarding",
+        )
+        .expect("headroom_conversation_concurrency_sheds_total is well-formed");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("headroom_conversation_concurrency_sheds_total registers once");
+        c
+    })
+}
+
 // ─── Token counters ─────────────────────────────────────────────────────
 
 fn tokens_input() -> &'static IntCounter {
@@ -530,6 +545,13 @@ pub fn record_compression(strategy: &str, original_tokens: u64, compressed_token
 /// Record a rate-limited request.
 pub fn record_rate_limited() {
     requests_rate_limited().inc();
+}
+
+/// Record a turn shed by the conversation-concurrency cap before anything
+/// was forwarded. Unlike a rate limit this is the proxy pacing one
+/// conversation's fan-out, not the provider throttling the account.
+pub fn record_concurrency_shed() {
+    conversation_concurrency_sheds().inc();
 }
 
 /// Record a failed request.
@@ -1159,6 +1181,7 @@ pub fn force_register_all(reg: &Registry) {
     requests_cached().inc_by(0);
     requests_rate_limited().inc_by(0);
     requests_failed().inc_by(0);
+    conversation_concurrency_sheds().inc_by(0);
 
     tokens_input().inc_by(0);
     tokens_output().inc_by(0);

@@ -244,7 +244,11 @@ fn estimate_input_cost_usd(
     if chargeable <= 0 {
         return 0.0;
     }
-    match crate::pricing::lookup(model).filter(|p| p.input_cost_per_token > 0.0) {
+    // Same zero-price-versus-unknown-price distinction as
+    // `estimate_compression_savings_usd`: a model IN the table is priced at
+    // its own rate even when that rate is 0.0 — only a failed lookup falls
+    // back. Filtering on `> 0.0` here once billed free models at $3/M.
+    match crate::pricing::lookup(model) {
         None => chargeable as f64 * DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
         Some(p) => {
             let input_rate = p.input_cost_per_token;
@@ -315,14 +319,25 @@ fn estimate_cache_savings_usd(
 /// and the compression saving is priced on the basis it would have been billed
 /// at, so the two add to the baseline exactly once.
 ///
-/// Still missing, and both would raise this number honestly: the model-offload
-/// counterfactual, and whatever cache stabilisation is worth against the
-/// client's own breakpoint placement. Neither is folded in here because
-/// neither is measured on this path yet.
-fn cost_savings_percent(actual_input_cost_usd: f64, compression_savings_usd: f64) -> f64 {
+/// Still missing, and it would raise this number honestly: whatever cache
+/// stabilisation is worth against the client's own breakpoint placement. Not
+/// folded in here because it is not measured on this path yet.
+///
+/// The model-offload counterfactual IS folded in (third parameter): when the
+/// router serves a turn on a cheaper model than the client asked for, the
+/// bill the original model never saw is a real reduction of what could have
+/// been consumed — e.g. Opus asked, Spark served at $0. `offload_savings_usd`
+/// is `max(0, would_have_cost − did_cost)` on identical token counts, so it
+/// adds to the baseline exactly once, like compression.
+fn cost_savings_percent(
+    actual_input_cost_usd: f64,
+    compression_savings_usd: f64,
+    offload_savings_usd: f64,
+) -> f64 {
     let actual = coerce_float(actual_input_cost_usd);
     let compression = coerce_float(compression_savings_usd);
-    let net_savings = compression;
+    let offload = coerce_float(offload_savings_usd).max(0.0);
+    let net_savings = compression + offload;
     let counterfactual = actual + net_savings;
     if counterfactual > 0.0 {
         round_n(net_savings / counterfactual * 100.0, 2)
@@ -346,6 +361,11 @@ struct Lifetime {
     output_tokens_saved: i64,
     #[serde(default)]
     output_savings_usd: f64,
+    /// Bill the requested model never saw because the router served the turn
+    /// on a cheaper one (`would_have_cost − did_cost`, clamped ≥ 0).
+    /// `#[serde(default)]` so older state files still load.
+    #[serde(default)]
+    offload_savings_usd: f64,
 }
 
 impl Default for Lifetime {
@@ -358,6 +378,7 @@ impl Default for Lifetime {
             total_input_cost_usd: 0.0,
             output_tokens_saved: 0,
             output_savings_usd: 0.0,
+            offload_savings_usd: 0.0,
         }
     }
 }
@@ -375,6 +396,10 @@ struct DisplaySession {
     /// right denominator for asking whether the cache is working at all.
     #[serde(default)]
     cache_savings_usd: f64,
+    /// Router offload savings booked on this session (see `Lifetime`).
+    /// Part of `savings_percent`; cache savings stay reported-only.
+    #[serde(default)]
+    offload_savings_usd: f64,
     total_input_tokens: i64,
     total_input_cost_usd: f64,
     savings_percent: f64,
@@ -527,6 +552,11 @@ pub struct RequestRecord<'a> {
     pub stack: Option<&'a str>,
     /// Waste-signal token counts, keyed by signal name.
     pub waste_signals: Option<Vec<(String, i64)>>,
+    /// Bill the requested model never saw: the router served this turn on a
+    /// cheaper model. Priced as `would_have_cost − did_cost` on identical
+    /// token counts (clamped ≥ 0 by the caller), so routing to a free model
+    /// instead of a paying one counts as the saving it is.
+    pub offload_savings_usd: f64,
 }
 
 /// Inputs to [`SavingsTracker::record_failed_work`]. Provider usage stays
@@ -672,6 +702,7 @@ impl SavingsTracker {
             rec.cache_write_1h_tokens,
             rec.uncached_input_tokens,
         );
+        let delta_offload_savings_usd = coerce_float(rec.offload_savings_usd).max(0.0);
 
         let mut st = self.state.lock().unwrap();
         let prev_tokens = st.lifetime.total_input_tokens;
@@ -700,6 +731,10 @@ impl SavingsTracker {
         st.lifetime.output_tokens_saved += delta_output_tokens_saved;
         st.lifetime.output_savings_usd =
             round_n(st.lifetime.output_savings_usd + delta_output_savings_usd, 6);
+        st.lifetime.offload_savings_usd = round_n(
+            st.lifetime.offload_savings_usd + delta_offload_savings_usd,
+            6,
+        );
 
         // Display-session rollover on inactivity.
         let expired = match st
@@ -722,9 +757,14 @@ impl SavingsTracker {
         s.tokens_saved += delta_tokens_saved;
         s.compression_savings_usd = round_n(s.compression_savings_usd + delta_savings_usd, 6);
         s.cache_savings_usd = round_n(s.cache_savings_usd + delta_cache_savings_usd, 6);
+        s.offload_savings_usd = round_n(s.offload_savings_usd + delta_offload_savings_usd, 6);
         s.total_input_tokens += session_tokens_delta;
         s.total_input_cost_usd = round_n(s.total_input_cost_usd + session_cost_delta, 6);
-        s.savings_percent = cost_savings_percent(s.total_input_cost_usd, s.compression_savings_usd);
+        s.savings_percent = cost_savings_percent(
+            s.total_input_cost_usd,
+            s.compression_savings_usd,
+            s.offload_savings_usd,
+        );
         s.last_activity_at = Some(to_utc_iso(ts));
         if s.started_at.is_none() {
             s.started_at = s.last_activity_at.clone();
@@ -1017,13 +1057,17 @@ impl SavingsTracker {
         if expired {
             return empty_display_session_value();
         }
-        let savings_percent =
-            cost_savings_percent(s.total_input_cost_usd, s.compression_savings_usd);
+        let savings_percent = cost_savings_percent(
+            s.total_input_cost_usd,
+            s.compression_savings_usd,
+            s.offload_savings_usd,
+        );
         json!({
             "requests": s.requests,
             "tokens_saved": s.tokens_saved,
             "compression_savings_usd": round_n(coerce_float(s.compression_savings_usd), 6),
             "cache_savings_usd": round_n(coerce_signed_float(s.cache_savings_usd), 6),
+            "offload_savings_usd": round_n(coerce_float(s.offload_savings_usd), 6),
             "total_input_tokens": s.total_input_tokens,
             "total_input_cost_usd": round_n(coerce_float(s.total_input_cost_usd), 6),
             "savings_percent": savings_percent,
@@ -1415,6 +1459,13 @@ impl SavingsTracker {
                 .and_then(Value::as_f64)
                 .map(coerce_float)
                 .unwrap_or(0.0),
+            // Absent from state files written before router-offload
+            // accounting; default to zero rather than rejecting the file.
+            offload_savings_usd: lr
+                .and_then(|l| l.get("offload_savings_usd"))
+                .and_then(Value::as_f64)
+                .map(coerce_float)
+                .unwrap_or(0.0),
         };
         if let Some(last) = history.last() {
             lifetime.tokens_saved = lifetime.tokens_saved.max(last.total_tokens_saved);
@@ -1583,6 +1634,7 @@ fn empty_display_session_value() -> Value {
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
         "cache_savings_usd": 0.0,
+        "offload_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
         "savings_percent": 0.0,
@@ -1600,6 +1652,7 @@ fn lifetime_value(l: &Lifetime) -> Value {
         "total_input_cost_usd": l.total_input_cost_usd,
         "output_tokens_saved": l.output_tokens_saved,
         "output_savings_usd": l.output_savings_usd,
+        "offload_savings_usd": l.offload_savings_usd,
     })
 }
 
@@ -1661,6 +1714,7 @@ fn display_session_value(s: &DisplaySession) -> Value {
         "tokens_saved": s.tokens_saved,
         "compression_savings_usd": s.compression_savings_usd,
         "cache_savings_usd": s.cache_savings_usd,
+        "offload_savings_usd": s.offload_savings_usd,
         "total_input_tokens": s.total_input_tokens,
         "total_input_cost_usd": s.total_input_cost_usd,
         "savings_percent": s.savings_percent,
@@ -1810,7 +1864,18 @@ fn normalize_display_session(entry: Option<&Value>) -> DisplaySession {
             .unwrap_or(0.0),
         6,
     );
-    let savings_percent = cost_savings_percent(total_input_cost_usd, compression_savings_usd);
+    let offload_savings_usd = round_n(
+        obj.get("offload_savings_usd")
+            .and_then(Value::as_f64)
+            .map(coerce_float)
+            .unwrap_or(0.0),
+        6,
+    );
+    let savings_percent = cost_savings_percent(
+        total_input_cost_usd,
+        compression_savings_usd,
+        offload_savings_usd,
+    );
     DisplaySession {
         requests: obj
             .get("requests")
@@ -1820,6 +1885,7 @@ fn normalize_display_session(entry: Option<&Value>) -> DisplaySession {
         tokens_saved,
         compression_savings_usd,
         cache_savings_usd,
+        offload_savings_usd,
         total_input_tokens,
         total_input_cost_usd,
         savings_percent,
@@ -2824,6 +2890,9 @@ mod tests {
             "compression_savings_usd",
             "total_input_tokens",
             "total_input_cost_usd",
+            "output_tokens_saved",
+            "output_savings_usd",
+            "offload_savings_usd",
         ] {
             assert!(lt.get(*key).is_some(), "lifetime missing key: {key}");
         }
@@ -2836,6 +2905,7 @@ mod tests {
             "tokens_saved",
             "compression_savings_usd",
             "cache_savings_usd",
+            "offload_savings_usd",
             "total_input_tokens",
             "total_input_cost_usd",
             "savings_percent",
@@ -3049,6 +3119,51 @@ mod tests {
         assert!(
             (estimate_compression_savings_usd("claude-sonnet-4", 1000) - in_priced).abs() < 1e-12
         );
+    }
+
+    #[test]
+    fn a_free_model_costs_zero_input_not_fallback() {
+        // Companion to `a_free_model_is_not_billed_the_fallback_rate` for the
+        // input-cost path: `estimate_input_cost_usd` filtered the lookup on
+        // `> 0.0`, so Spark turns were billed at the $3/M fallback in
+        // `proxy_savings.json` while the cost tracker correctly reported 0.
+        assert_eq!(
+            estimate_input_cost_usd("muse-spark-1.3-contributor-free", 1000, 0, 0, 0, 0, 0),
+            0.0
+        );
+        assert_eq!(
+            estimate_input_cost_usd("claude-muse-spark-1.3", 1000, 0, 0, 0, 0, 0),
+            0.0
+        );
+        // Unknown models still fail open to the blended fallback.
+        assert!(
+            (estimate_input_cost_usd("totally-unknown-model", 1000, 0, 0, 0, 0, 0)
+                - 1000.0 * DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn router_offload_counts_as_saving() {
+        // Serving a turn on a cheaper model than requested is a saving vs
+        // potential consumption: it lands in lifetime/session totals and in
+        // `savings_percent`, kept separate from compression savings.
+        let dir = tempfile::tempdir().unwrap();
+        let t = tracker(&dir.path().join("s.json"));
+        t.record_request(&RequestRecord {
+            model: "muse-spark-1.3-contributor-free",
+            input_tokens: 1000,
+            offload_savings_usd: 2.5,
+            ..Default::default()
+        });
+        let snap = t.snapshot();
+        assert_eq!(snap["lifetime"]["offload_savings_usd"], json!(2.5));
+        assert_eq!(snap["display_session"]["offload_savings_usd"], json!(2.5));
+        // Billed cost is 0 (free serving model, fixed above), compression 0:
+        // the avoided $2.50 is the whole counterfactual → 100%.
+        assert_eq!(snap["lifetime"]["total_input_cost_usd"], json!(0.0));
+        assert_eq!(snap["display_session"]["savings_percent"], json!(100.0));
     }
 
     #[test]

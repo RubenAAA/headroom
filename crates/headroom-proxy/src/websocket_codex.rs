@@ -718,6 +718,8 @@ impl OutcomeSink for CodexWsOutcomeSink {
             cached: outcome.cache_hit(),
             stack: outcome.client.as_deref(),
             waste_signals: outcome.waste_signals.clone(),
+            // No model offload on the WebSocket path: reroutes never serve here.
+            offload_savings_usd: 0.0,
         };
         self.savings_tracker.record_request(&rec);
     }
