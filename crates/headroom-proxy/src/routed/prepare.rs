@@ -29,8 +29,8 @@ pub(crate) struct PreparedTurn {
     pub overhead_ms: f64,
 }
 
-/// Run the preparation chain. `Err` is the response to return directly;
-/// `Ok` hands the prepared turn on.
+/// Run the preparation chain. `Err` is the response to return directly (today
+/// only the concurrency-cap shed); `Ok` hands the prepared turn on.
 pub(crate) async fn prepare_turn(
     state: &AppState,
     mut parsed: Value,
@@ -53,6 +53,32 @@ pub(crate) async fn prepare_turn(
         identity_model,
     )
     .await;
+
+    // Conversation-concurrency cap, same contract as the passthrough path:
+    // shed fan-out overlap with a 429 the client retries, before compression
+    // or translation spend work on a turn that would race the provider's
+    // cache commit. The pending entry parked above is popped by the shed
+    // call. The key rides on the transform report so the decision uses the
+    // pre-transform identity the observer parked, not re-derived bytes.
+    if let Some(in_flight) = state.usage_observer.shed_if_over_conversation_cap(
+        request_id,
+        &ctx_report.conversation_key,
+        state.config.max_conversation_concurrency,
+    ) {
+        crate::observability::proxy_counters::record_concurrency_shed();
+        tracing::warn!(
+            event = "conversation_concurrency_shed",
+            request_id = %request_id,
+            conversation_key = %ctx_report.conversation_key,
+            in_flight,
+            cap = state.config.max_conversation_concurrency,
+            "conversation over its concurrency cap; shed with 429 so the client retries against a committed prefix"
+        );
+        return Err(crate::proxy::conversation_concurrency_shed_response(
+            in_flight,
+            state.config.max_conversation_concurrency,
+        ));
+    }
 
     // Live-zone compression + freeze-replay, on the same flags as the Claude
     // path and in the same order (compress, then replay the cached prefix).
