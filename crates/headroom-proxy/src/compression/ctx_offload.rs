@@ -53,7 +53,7 @@
 //! composes with this transform: after offload, `clear_tool_uses` simply fires
 //! on already-small digests, which is harmless. Both-on is the default posture.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -295,10 +295,35 @@ use headroom_core::transforms::live_zone::CTX_OFFLOAD_MARKER_PREFIX as MARKER_PR
 /// Measured on 2026-08-17: 296 blocks sat deferred across the restarts of one
 /// afternoon, all of them previously converted. Persisting the set is the same
 /// move `--replay-store-dir` made for forwarded prefixes, for the same reason.
+/// Cap on session keys remembered per cross-model lineage for gate seeding.
+pub const SEED_LINEAGE_CAP: usize = 4;
+
+/// Cap on hashes installed by one seed. Per-session sets are unbounded, so a
+/// pathological donor must not clone unbounded into every newborn session.
+/// Live traffic shows ~26 conversions per 51 turns; this is headroom, not a
+/// working-set estimate.
+pub const SEED_MAX_HASHES: usize = 4096;
+
+/// Outcome of [`OffloadGate::seed_if_absent`]. Returned (not logged) so the
+/// wiring layer can count `Seeded` vs `RefusedLive` vs `DonorEmpty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    Seeded { count: usize },
+    RefusedLive,
+    DonorEmpty,
+}
+
 pub struct OffloadGate {
     /// session key → hashes already offloaded in that session. Bounded LRU;
     /// eviction re-reads from disk when the session is next seen.
     sessions: Mutex<LruCache<String, HashSet<String>>>,
+    /// Cross-session lineage index for gate seeding: (identity branch,
+    /// first-message hash) → session keys, most-recent-birth-first. Lets a
+    /// newborn session (model switch, resumed conversation) find the donor
+    /// session whose conversions it should inherit. Same-credential only by
+    /// construction of the key; bounded per entry, updated on the rare
+    /// first-request path only.
+    lineages: Mutex<HashMap<(String, String), VecDeque<String>>>,
     /// Where the sets are kept so they survive a restart. `None` keeps them in
     /// memory only, which is the pre-2026-08-17 behaviour.
     persist_dir: Option<Arc<std::path::PathBuf>>,
@@ -382,6 +407,7 @@ impl OffloadGate {
         let cap = NonZeroUsize::new(capacity).expect("OffloadGate capacity must be > 0");
         Self {
             sessions: Mutex::new(LruCache::new(cap)),
+            lineages: Mutex::new(HashMap::new()),
             persist_dir: None,
             persist_lock: Mutex::new(()),
         }
@@ -489,6 +515,94 @@ impl OffloadGate {
         if let (Some(dir), Some(set)) = (self.persist_dir.as_deref(), snapshot) {
             self.persist(dir, session, set);
         }
+    }
+
+    /// Cross-session seeding for newborn sessions (model switch, resumed
+    /// conversation). Unlike [`Self::adopt_from`], the recipient does NOT
+    /// continue the donor's bytes — it starts a fresh lineage whose history
+    /// happens to hold identical content. Safe only at birth: the recipient
+    /// must never have forwarded bytes on this session, or converting
+    /// previously-raw blocks mid-history would shift its prefix. The caller
+    /// guarantees birth (drift first-sight); this method additionally refuses
+    /// any session the gate already knows, including hydrate-installed empty
+    /// sets — a live session that never converted anything holds `{}` and
+    /// must NOT be seeded.
+    ///
+    /// Outcome:
+    /// - `Seeded` — donor set cloned (verbatim, `p512:` namespace intact),
+    ///   truncated to [`SEED_MAX_HASHES`], installed and persisted.
+    /// - `RefusedLive` — gate already knows the session (live session,
+    ///   drift-eviction rebirth with surviving gate state, or concurrent
+    ///   double birth — all benign refusals).
+    /// - `DonorEmpty` — donor yielded nothing; nothing installed.
+    pub fn seed_if_absent(&self, donor_session: &str, new_session: &str) -> SeedOutcome {
+        {
+            let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if sessions.contains(new_session) {
+                return SeedOutcome::RefusedLive;
+            }
+        }
+        // Same two donor sources as `adopt_from`: in-memory set (rehydrating
+        // from disk first so an evicted-but-persisted donor still seeds),
+        // with the same freshness filter. No locks held across the read.
+        self.hydrate(donor_session);
+        let donor: HashSet<String> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peek(donor_session)
+            .cloned()
+            .unwrap_or_default();
+        if donor.is_empty() {
+            return SeedOutcome::DonorEmpty;
+        }
+        let _serialised = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        // Re-check under the same hold that installs: a concurrent birth may
+        // have installed (or the session recorded) since the first check.
+        // Refusal here is benign — both writers carry same-conversation sets.
+        if sessions.contains(new_session) {
+            return SeedOutcome::RefusedLive;
+        }
+        let set: HashSet<String> = donor.into_iter().take(SEED_MAX_HASHES).collect();
+        let count = set.len();
+        sessions.put(new_session.to_string(), set);
+        let snapshot = sessions.get(new_session).cloned();
+        drop(sessions);
+        if let (Some(dir), Some(set)) = (self.persist_dir.as_deref(), snapshot) {
+            self.persist(dir, new_session, set);
+        }
+        SeedOutcome::Seeded { count }
+    }
+
+    /// Record a newborn session under its cross-model lineage so a later
+    /// session on the same lineage (model switch, resume) can seed from it.
+    /// Most-recent-birth-first, bounded per lineage; call on the rare
+    /// drift-first-sight path only, never per request.
+    pub fn note_session_birth(&self, lineage: &(String, String), session: &str) {
+        let mut lineages = self.lineages.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = lineages.entry(lineage.clone()).or_default();
+        entry.retain(|s| s != session);
+        entry.push_front(session.to_string());
+        entry.truncate(SEED_LINEAGE_CAP);
+    }
+
+    /// Birth-ordered candidate donors for `lineage`, excluding `exclude`.
+    /// The caller tries them via [`Self::seed_if_absent`], first non-empty
+    /// wins; "most recent" is most-recently-born (birth-only updates cannot
+    /// track activity — and need not: hashes do not expire semantically).
+    pub fn seed_candidates(&self, lineage: &(String, String), exclude: &str) -> Vec<String> {
+        self.lineages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(lineage)
+            .map(|v| {
+                v.iter()
+                    .filter(|s| s.as_str() != exclude)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Copy the donor's conversions onto `session`, which has just adopted the
@@ -2275,5 +2389,274 @@ mod tests {
         let out = offload_anthropic_request(&mut b, &cfg(200), Some(&pb));
         assert_eq!(out.blocks_offloaded, 0);
         assert_eq!(out.blocks_deferred, 1);
+    }
+
+    // ─── Cross-session gate seeding (P1 proof) ────────────────────────
+    //
+    // A model switch mints a fresh session key, so the new lineage's gate is
+    // empty and its frozen history would stall Deferred until a boundary.
+    // Seeding the newborn session from the donor's converted set lets it
+    // convert known blocks on first sight, through the existing `prior`
+    // path, with byte-identical digests.
+
+    fn frozen_result_text(parsed: &Value) -> String {
+        tool_result_text(&parsed["messages"][1]["content"][0]["content"]).unwrap_or_default()
+    }
+
+    /// Donor converts on a boundary; returns the gate and the digest bytes.
+    fn donor_with_one_conversion(gate: &OffloadGate, body: &str) -> String {
+        let mut donor = req_frozen(body);
+        let policy = OffloadPolicy {
+            gate,
+            session_key: "sess-opus",
+            rebuild_boundary: true,
+        };
+        let out = offload_anthropic_request(&mut donor, &cfg(200), Some(&policy));
+        assert_eq!(out.blocks_offloaded, 1, "donor converts on the boundary");
+        frozen_result_text(&donor)
+    }
+
+    #[test]
+    fn seeded_newborn_converts_on_first_sight_without_boundary() {
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        let donor_digest = donor_with_one_conversion(&gate, &body);
+
+        let outcome = gate.seed_if_absent("sess-opus", "sess-sonnet");
+        assert_eq!(outcome, SeedOutcome::Seeded { count: 1 });
+
+        // Same frozen history, steady-state turn, NEW session: converts on
+        // first sight — the Deferred stall is gone.
+        let mut fresh = req_frozen(&body);
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess-sonnet",
+            rebuild_boundary: false,
+        };
+        let out = offload_anthropic_request(&mut fresh, &cfg(200), Some(&policy));
+        assert_eq!(
+            out.blocks_offloaded, 1,
+            "seeded prior rides, no boundary needed"
+        );
+        assert_eq!(out.blocks_deferred, 0);
+        assert_eq!(
+            frozen_result_text(&fresh),
+            donor_digest,
+            "seeded digest is byte-identical to the donor's"
+        );
+    }
+
+    #[test]
+    fn seeded_session_reapplies_identically_on_later_turns() {
+        // I2/cache-safety: what the seeded session emits on turn 1 it must
+        // re-emit on turn 2, or the upstream prefix diverges and re-caches.
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        donor_with_one_conversion(&gate, &body);
+        assert_eq!(
+            gate.seed_if_absent("sess-opus", "sess-sonnet"),
+            SeedOutcome::Seeded { count: 1 }
+        );
+
+        let turn1 = {
+            let mut parsed = req_frozen(&body);
+            let policy = OffloadPolicy {
+                gate: &gate,
+                session_key: "sess-sonnet",
+                rebuild_boundary: false,
+            };
+            offload_anthropic_request(&mut parsed, &cfg(200), Some(&policy));
+            frozen_result_text(&parsed)
+        };
+        let turn2 = {
+            let mut parsed = req_frozen(&body);
+            let policy = OffloadPolicy {
+                gate: &gate,
+                session_key: "sess-sonnet",
+                rebuild_boundary: false,
+            };
+            let out = offload_anthropic_request(&mut parsed, &cfg(200), Some(&policy));
+            assert_eq!(
+                out.blocks_offloaded, 1,
+                "still converted, never reverts to raw"
+            );
+            frozen_result_text(&parsed)
+        };
+        assert_eq!(turn1, turn2, "byte-stable across turns");
+    }
+
+    #[test]
+    fn seed_into_live_session_is_refused_and_changes_nothing() {
+        let gate = OffloadGate::new(8);
+        let donor_body = "ERROR: disk full\n".repeat(50);
+        donor_with_one_conversion(&gate, &donor_body);
+
+        // Session C lives its own life first: converts a DIFFERENT block.
+        let own_body = "OTHER: out of inodes\n".repeat(50);
+        let mut c = req_frozen(&own_body);
+        let pc = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess-C",
+            rebuild_boundary: true,
+        };
+        assert_eq!(
+            offload_anthropic_request(&mut c, &cfg(200), Some(&pc)).blocks_offloaded,
+            1
+        );
+
+        assert_eq!(
+            gate.seed_if_absent("sess-opus", "sess-C"),
+            SeedOutcome::RefusedLive
+        );
+        // C's set holds only its own conversion — donor hashes NOT merged.
+        // Merging now would flip C's previously-raw donor-shaped blocks
+        // mid-history and bust its prefix.
+        let sessions = gate.sessions.lock().unwrap();
+        let c_set = sessions.peek("sess-C").expect("C recorded");
+        assert_eq!(c_set.len(), 1);
+        let donor_set = sessions.peek("sess-opus").expect("donor recorded");
+        assert!(
+            c_set.is_disjoint(donor_set),
+            "live session keeps exactly its own conversions"
+        );
+    }
+
+    #[test]
+    fn hydrate_installed_empty_set_counts_as_live() {
+        // S1a pin: absence alone is not the birth signal. An empty set —
+        // installed by `hydrate` on miss, or held by a live session that
+        // simply never converted — must refuse seeding, or turn-11 seeding
+        // of a 10-turn-raw session would shift its prefix. The caller gates
+        // on drift first-sight; this refusal is the backstop.
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        donor_with_one_conversion(&gate, &body);
+
+        gate.sessions
+            .lock()
+            .unwrap()
+            .put("sess-live-empty".to_string(), HashSet::new());
+        assert_eq!(
+            gate.seed_if_absent("sess-opus", "sess-live-empty"),
+            SeedOutcome::RefusedLive
+        );
+    }
+
+    #[test]
+    fn seed_if_absent_trusts_the_caller_birth_signal() {
+        // The callee refuses KNOWN sessions; it cannot tell a newborn from a
+        // live-never-converted session (both hold no set). Birth knowledge
+        // lives with the caller (drift first-sight) — pin that contract here
+        // so a future "improvement" to this method cannot silently assume it.
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        donor_with_one_conversion(&gate, &body);
+
+        // Live session, three steady-state turns, nothing converted, no set.
+        for _ in 0..3 {
+            let mut parsed = req_frozen(&body);
+            let policy = OffloadPolicy {
+                gate: &gate,
+                session_key: "sess-live-raw",
+                rebuild_boundary: false,
+            };
+            let out = offload_anthropic_request(&mut parsed, &cfg(200), Some(&policy));
+            assert_eq!(out.blocks_offloaded, 0);
+        }
+        // Callee proceeds (absent); only the caller's birth gate makes this
+        // safe. If this assertion ever flips to RefusedLive, the caller
+        // contract changed — update S1a accordingly.
+        assert_eq!(
+            gate.seed_if_absent("sess-opus", "sess-live-raw"),
+            SeedOutcome::Seeded { count: 1 }
+        );
+    }
+
+    #[test]
+    fn donor_is_untouched_by_seeding() {
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        donor_with_one_conversion(&gate, &body);
+        let before = gate
+            .sessions
+            .lock()
+            .unwrap()
+            .peek("sess-opus")
+            .cloned()
+            .expect("donor recorded");
+        assert_eq!(
+            gate.seed_if_absent("sess-opus", "sess-sonnet"),
+            SeedOutcome::Seeded { count: 1 }
+        );
+        let after = gate
+            .sessions
+            .lock()
+            .unwrap()
+            .peek("sess-opus")
+            .cloned()
+            .expect("donor still recorded");
+        assert_eq!(before, after, "donor lineage bit-for-bit unaffected");
+    }
+
+    #[test]
+    fn empty_donor_installs_nothing() {
+        let gate = OffloadGate::new(8);
+        assert_eq!(
+            gate.seed_if_absent("sess-nobody", "sess-new"),
+            SeedOutcome::DonorEmpty
+        );
+        assert!(
+            !gate.sessions.lock().unwrap().contains("sess-new"),
+            "no empty set installed"
+        );
+    }
+
+    #[test]
+    fn seed_truncates_pathological_donor_sets() {
+        let gate = OffloadGate::new(8);
+        for i in 0..(SEED_MAX_HASHES + 10) {
+            gate.record("sess-big", &format!("hash{i:06}"));
+        }
+        assert_eq!(
+            gate.seed_if_absent("sess-big", "sess-new"),
+            SeedOutcome::Seeded {
+                count: SEED_MAX_HASHES
+            }
+        );
+        assert_eq!(
+            gate.sessions
+                .lock()
+                .unwrap()
+                .peek("sess-new")
+                .unwrap()
+                .len(),
+            SEED_MAX_HASHES
+        );
+    }
+
+    #[test]
+    fn lineage_birth_order_and_candidates() {
+        let gate = OffloadGate::new(8);
+        let lineage = ("auth:abc".to_string(), "msghash".to_string());
+        assert!(gate.seed_candidates(&lineage, "sess-x").is_empty());
+        gate.note_session_birth(&lineage, "sess-A");
+        gate.note_session_birth(&lineage, "sess-B");
+        gate.note_session_birth(&lineage, "sess-A"); // re-birth dedups, refreshes
+        assert_eq!(
+            gate.seed_candidates(&lineage, "sess-B"),
+            vec!["sess-A".to_string()]
+        );
+        assert_eq!(
+            gate.seed_candidates(&lineage, "sess-A"),
+            vec!["sess-B".to_string()]
+        );
+        // Bounded per lineage.
+        for i in 0..(SEED_LINEAGE_CAP + 3) {
+            gate.note_session_birth(&lineage, &format!("sess-{i}"));
+        }
+        assert_eq!(
+            gate.seed_candidates(&lineage, "nobody").len(),
+            SEED_LINEAGE_CAP
+        );
     }
 }

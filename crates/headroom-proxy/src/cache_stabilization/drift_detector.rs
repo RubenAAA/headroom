@@ -1420,30 +1420,12 @@ pub fn derive_session_key_with_model(
         return format!("session:{}", hash_secret(sid));
     }
     let conv = conversation_discriminator(body, kind, identity_model);
-    if let Some(token) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        return format!("auth:{}:{conv}", hash_secret(token));
-    }
-    // `x-api-key` is the Anthropic/OpenAI-Responses convention.
-    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        return format!("apikey:{}:{conv}", hash_secret(key));
-    }
-    let ip = client_addr.ip().to_string();
-    if let Some(ua) = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-    {
-        // Hash the (ip, ua) tuple so the resulting key remains opaque
-        // and does not leak full UA strings into downstream logs that
-        // forget our "log only the prefix" contract.
-        let mut h = DefaultHasher::new();
-        ip.hash(&mut h);
-        ua.hash(&mut h);
-        return format!("ipua:{:016x}:{conv}", h.finish());
-    }
-    format!("ip:{ip}:{conv}")
+    // `None` is the explicit-sid branch, handled above. `expect` (not a
+    // silent fallback) so a future branch added to `identity_branch_id`
+    // without updating this call fails loudly in tests, not by merging
+    // sessions.
+    let branch = identity_branch_id(headers, client_addr).expect("explicit sid handled above");
+    format!("{branch}:{conv}")
 }
 
 /// 16-hex-char fingerprint of `(model, first conversation message)`,
@@ -1483,16 +1465,6 @@ fn conversation_discriminator(
         .unwrap_or("");
     match conversation_messages(body, kind).first() {
         Some(first) => {
-            struct DigestSink<'a>(&'a mut Sha256);
-            impl std::io::Write for DigestSink<'_> {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.update(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
             let mut hasher = Sha256::new();
             hasher.update(model.as_bytes());
             // NUL separator: domain-separate the model from the
@@ -1510,6 +1482,85 @@ fn conversation_discriminator(
             hex_prefix(&digest, 8)
         }
         None => "-".to_string(),
+    }
+}
+
+/// Identity branch shared by [`derive_session_key_with_model`] and
+/// [`model_free_lineage_key`]: everything in the session key EXCEPT the
+/// conversation discriminator. `None` for an explicit
+/// `x-headroom-session-id` (operator-managed identity already shares all
+/// state across models; nothing to seed).
+fn identity_branch_id(headers: &HeaderMap, client_addr: &SocketAddr) -> Option<String> {
+    if headers
+        .get("x-headroom-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        return None;
+    }
+    if let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        return Some(format!("auth:{}", hash_secret(token)));
+    }
+    // `x-api-key` is the Anthropic/OpenAI-Responses convention.
+    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(format!("apikey:{}", hash_secret(key)));
+    }
+    let ip = client_addr.ip().to_string();
+    if let Some(ua) = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+    {
+        // Hash the (ip, ua) tuple so the resulting key remains opaque
+        // and does not leak full UA strings into downstream logs that
+        // forget our "log only the prefix" contract.
+        let mut h = DefaultHasher::new();
+        ip.hash(&mut h);
+        ua.hash(&mut h);
+        return Some(format!("ipua:{:016x}", h.finish()));
+    }
+    Some(format!("ip:{ip}"))
+}
+
+/// Cross-model lineage key: `(identity branch, H(canonical first message))`.
+///
+/// Two sessions share a lineage iff they share credential/opener AND opening
+/// message, whatever the model or system prompt. Used to find donor sessions
+/// for offload-gate seeding when a model switch (or resumed conversation)
+/// mints a fresh session key. Full 64-hex message hash, deliberately NOT the
+/// 8-hex session prefix: the index must not conflate distinct conversations
+/// the way session keys may.
+///
+/// `None` when there is no auto-derived identity to match on (explicit
+/// session id — already shared — or a body with no conversation messages).
+pub(crate) fn model_free_lineage_key(
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+    body: &serde_json::Value,
+    kind: ApiKind,
+) -> Option<(String, String)> {
+    let branch = identity_branch_id(headers, client_addr)?;
+    let first = conversation_messages(body, kind).into_iter().next()?;
+    let mut hasher = Sha256::new();
+    let _ = write_canonical(&mut DigestSink(&mut hasher), first, false);
+    Some((branch, hex_prefix(&hasher.finalize(), 32)))
+}
+
+/// Sink shared by [`conversation_discriminator`] and
+/// [`model_free_lineage_key`]: canonical bytes straight into the digest.
+struct DigestSink<'a>(&'a mut Sha256);
+
+impl std::io::Write for DigestSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -2484,6 +2535,67 @@ mod tests {
         let key_main = derive_session_key(&headers, &addr, &main_conv, ApiKind::Anthropic);
         let key_side = derive_session_key(&headers, &addr, &sidecar, ApiKind::Anthropic);
         assert_ne!(key_main, key_side);
+    }
+
+    #[test]
+    fn lineage_key_matches_across_models_not_conversations() {
+        // The seeding index: same credential + same opener match whatever
+        // the model; anything else must not.
+        fn headers_for(token: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::header::AUTHORIZATION, token.parse().unwrap());
+            headers
+        }
+        fn addr() -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 4242)
+        }
+        let mut opus = anthropic_body("sys", json!([]), vec!["shared opener"]);
+        let mut sonnet = anthropic_body("sys", json!([]), vec!["shared opener"]);
+        opus["model"] = json!("opus-large");
+        sonnet["model"] = json!("sonnet-small");
+        let headers = headers_for("Bearer shared-workspace-token");
+        let ko =
+            model_free_lineage_key(&headers, &addr(), &opus, ApiKind::Anthropic).expect("lineage");
+        let ks = model_free_lineage_key(&headers, &addr(), &sonnet, ApiKind::Anthropic)
+            .expect("lineage");
+        assert_eq!(ko, ks, "same credential+opener seeds across models");
+        // Full 64-hex message half: session prefixes are 8 hex, the index
+        // must not conflate distinct conversations.
+        assert_eq!(ko.1.len(), 64);
+
+        // Different opener → different lineage.
+        let mut other = anthropic_body("sys", json!([]), vec!["other opener"]);
+        other["model"] = json!("sonnet-small");
+        let kx =
+            model_free_lineage_key(&headers, &addr(), &other, ApiKind::Anthropic).expect("lineage");
+        assert_ne!(ks, kx);
+
+        // Different credential → different lineage.
+        let headers2 = headers_for("Bearer other-token");
+        let ky = model_free_lineage_key(&headers2, &addr(), &sonnet, ApiKind::Anthropic)
+            .expect("lineage");
+        assert_ne!(ks, ky);
+
+        // Explicit session id → None: operator-managed identity already
+        // shares all state, nothing to seed.
+        let mut pinned = headers.clone();
+        pinned.insert(
+            "x-headroom-session-id"
+                .parse::<axum::http::HeaderName>()
+                .unwrap(),
+            "pinned".parse().unwrap(),
+        );
+        assert_eq!(
+            model_free_lineage_key(&pinned, &addr(), &sonnet, ApiKind::Anthropic),
+            None
+        );
+
+        // No conversation messages → None.
+        let empty = anthropic_body("sys", json!([]), vec![]);
+        assert_eq!(
+            model_free_lineage_key(&headers, &addr(), &empty, ApiKind::Anthropic),
+            None
+        );
     }
 
     #[test]
