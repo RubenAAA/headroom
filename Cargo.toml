@@ -116,7 +116,10 @@ gcp_auth = "0.12"
 # `codegen-units = 1` + LTO; acceptable for the size win.
 [profile.release]
 strip = "symbols"
-lto = "thin"
+# fat over thin: measured -13% on the proxy dep tree (569KB -> 493KB),
+# identical build wall time, byte-identical output. Runtime delta was
+# inside run-to-run noise; this profile exists for size, so take it.
+lto = "fat"
 codegen-units = 1
 
 # Fast-to-compile profile for CI test wheels. The shipped wheel uses
