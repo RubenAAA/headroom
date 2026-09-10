@@ -10,6 +10,11 @@ Scripts: `/tmp/join.py` (builds `/tmp/req.json` from the log), `/tmp/an1.py`
 (spend by day and model), `/tmp/an2.py` (output, TTL, duplicates),
 `/tmp/an3.py` (sidecar, recache, CCR), `/tmp/comp.py` (transcript composition).
 
+> Note (2026-09-10): `proxy.rs`/`config.rs`/`sidecar.rs` line numbers are
+> 2026-09-03-era (`proxy.rs` is now ~14k lines). Measurements stand;
+> re-resolve cites before acting (current anchors: `ccr_continuation_usage`
+> at `proxy.rs:6692/9346`, cache gate `semantic_cache_hit` at `:4014`).
+
 ## Where the money goes
 
 Per day, averaged over the four logged days (measured):
@@ -33,6 +38,12 @@ assistant text 4.6-4.8%, user text 3-7%.
 ## Ideas, ranked by $/day
 
 ### 1. Sidecar forwards the 1M-context beta to haiku; 66% of sidecars fall back
+
+> **DONE (2026-09-10).** The fix below shipped: `strip_long_context_beta`
+> in `crates/headroom-proxy/src/sidecar.rs:524-536` drops `context-1m*`
+> tokens (unit tests beside it use the doc's exact example values).
+> Kept for the measurement record; re-run the live check to confirm the
+> fallback share fell.
 
 **Value:** $10-14/day (estimated from $2.27 in 3.8 hours after the 13:56
 restart; $6.91 measured for 09-03). Quality risk: none. The sidecar answers

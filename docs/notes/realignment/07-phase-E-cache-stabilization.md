@@ -4,6 +4,16 @@
 
 **Calendar:** 1 week.
 
+> Note (2026-09-10): as built, everything in this phase lives under
+> `crates/headroom-proxy/src/cache_stabilization/`, not `compression/`. The
+> volatile detector is `cache_stabilization/volatile_detector.rs`, the drift
+> detector is `cache_stabilization/drift_detector.rs` (there is no
+> `observability/prefix_drift.rs`), there is no `session.rs` with
+> `derive_prompt_cache_key` (no such symbol in the tree — the key logic is
+> `inject_prompt_cache_key` in `cache_stabilization/openai_cache_key.rs`), and
+> the PR-E1–E3 paths below that say `compression/…` read as their
+> `cache_stabilization/…` counterparts.
+
 **Shape:** 6 PRs. Mostly parallel; E3 + E4 should land paired (per-mode policy).
 
 ---
@@ -21,7 +31,7 @@ Eliminate P3-28. Sort `tools[]` alphabetically by name on the way out. Idempoten
 ### Files
 
 **Add:**
-- `crates/headroom-proxy/src/compression/tool_def_normalize.rs`:
+- `crates/headroom-proxy/src/cache_stabilization/tool_def_normalize.rs`:
   ```rust
   pub fn sort_tools_deterministically(tools: &mut Vec<&RawValue>) -> Result<()> {
       // Sort key: tool["name"] string, fallback to MD5(serialized) for unnamed tools.
@@ -75,7 +85,7 @@ Eliminate P3-29. Recursively sort JSON Schema object keys in every tool's `input
 ### Files
 
 **Modify:**
-- `crates/headroom-proxy/src/compression/tool_def_normalize.rs` — add `sort_schema_keys_recursive`. Walks every Object node; replaces with `IndexMap` rebuilt in alphabetic key order. Preserves Array order (JSON Schema arrays are ordered: `prefixItems`, `oneOf` alternatives, etc.).
+- `crates/headroom-proxy/src/cache_stabilization/tool_def_normalize.rs` — add `sort_schema_keys_recursive`. Walks every Object node; replaces with `IndexMap` rebuilt in alphabetic key order. Preserves Array order (JSON Schema arrays are ordered: `prefixItems`, `oneOf` alternatives, etc.).
 
 **Tests added:**
 - `crates/headroom-proxy/tests/integration_schema_sort.rs::flat_schema_keys_sorted`
@@ -122,7 +132,7 @@ OAuth and subscription modes: never auto-place (could void scope).
 ### Files
 
 **Add:**
-- `crates/headroom-proxy/src/compression/cache_control.rs` — `pub fn auto_place_breakpoints(body: &mut serde_json::Value, auth_mode: AuthMode)`. Walks the structure; appends `cache_control: {type: "ephemeral"}` to the trailing block of system, tools, history, and current user message.
+- `crates/headroom-proxy/src/cache_stabilization/anthropic_cache_control.rs` — `pub fn auto_place_breakpoints(body: &mut serde_json::Value, auth_mode: AuthMode)`. Walks the structure; appends `cache_control: {type: "ephemeral"}` to the trailing block of system, tools, history, and current user message.
 
 **Modify:**
 - `crates/headroom-proxy/src/compression/live_zone_anthropic.rs` — call `auto_place_breakpoints` on PAYG only.
@@ -171,7 +181,7 @@ Eliminate P3-30. For OpenAI Chat Completions and Responses requests on PAYG mode
 - `crates/headroom-proxy/src/compression/live_zone_responses.rs` — same.
 
 **Add:**
-- `crates/headroom-proxy/src/session.rs` — `pub fn derive_prompt_cache_key(session_id: &str, model: &str) -> String` — returns `{session_id}_{model_family}` (deterministic per session+model).
+- Key logic is `inject_prompt_cache_key` in `crates/headroom-proxy/src/cache_stabilization/openai_cache_key.rs` (deterministic per session+model; no `session.rs`, no `derive_prompt_cache_key`).
 
 **Tests added:**
 - `crates/headroom-proxy/tests/integration_prompt_cache_key.rs::payg_auto_injects_when_absent`
@@ -279,7 +289,7 @@ Eliminate P3-35. Hash the prefix (system + tools + first N stable messages) of e
 ### Files
 
 **Add:**
-- `crates/headroom-proxy/src/observability/prefix_drift.rs`:
+- `crates/headroom-proxy/src/cache_stabilization/drift_detector.rs`:
   ```rust
   pub struct PrefixDriftDetector {
       // Keyed by session_id; stores last-seen prefix hash + timestamp.

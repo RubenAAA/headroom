@@ -9,13 +9,15 @@ Method note: "Rust equivalent exists" means a module with a matching name is pre
 
 Freshness note (2026-08-21): "not touched" below records what *upstream* did in the range. Local work has since landed on two of these modules — `content_router.rs` (`7dd551ac`, `e539a3b0`) and `savings_tracker.rs` (six commits through `e920e5a8`) — so their rows are partly done. `output_shaper.rs`, `kompress.rs` and `lossless_compaction.rs` remain untouched on both sides. Re-check with `git log --oneline 9af63499..HEAD -- <path>` before picking up a row.
 
+Freshness note (2026-09-10): six more Group B rows have since landed in Rust and are struck through above (`persistent_metrics`, `thinking_compactor`, `tool_schema_compaction`, `compression_batches`/`compressor_registry`/`config_compressor`/`cold_prefix`, `model_router`, `kompress_remote`). Their rows now mean "re-diff for parity", not "build from scratch".
+
 ## Group A — Rust module exists but is now stale (needs porting the upstream Python delta)
 
 | Theme | Python files (+/-) | Rust module | Upstream touched Rust in-range? | Size | What changed |
 |---|---|---|---|---|---|
 | content_router rewrite | `transforms/content_router.py` (+1518/-313) | `crates/headroom-core/src/transforms/content_router.rs` (exists, **not** touched in range; locally updated since — see freshness note) | No | Large | Router dispatch logic rewritten in Python (scope `content_router`/`code`/`router` commits); Rust router was behind the Python decision logic. Partly closed by `7dd551ac` and `e539a3b0` (router/gemini correctness fixes, PHP support, tool-exclusion matching) — re-diff before porting more. |
 | output_shaper policies | `proxy/output_shaper.py` (+279/-282), plus new `output_savings_policy.py`, `output_turn_policy.py`, `output_steering.py`, `request_log_redaction_policy.py`, `memory_query_policy.py`, `auth_policy.py`, `forwarded_policy.py` (all new, 0 prior) | `crates/headroom-proxy/src/output_shaper.rs` (exists, not touched) | No | Large (~1000 lines across new policy files) | Upstream split output-shaping into several small single-purpose "policy" modules (turn policy, steering, redaction, auth, forwarded-header trust) — this is the `proxy/output-shaping`, `auth`, `forwarded_policy` scope work. None of these policy modules exist in Rust yet. |
-| kompress_compressor | `transforms/kompress_compressor.py` (+413/-57) | `crates/headroom-core/src/transforms/kompress.rs` (exists, not touched — but `kompress_remote.py`, new, has no Rust match) | No | Medium | `kompress` scope commits (5) — remote Kompress endpoint support (`transforms/kompress_remote.py`, new file) has no Rust counterpart at all (`headroom_core/src/transforms/kompress.rs` is local-model only). |
+| kompress_compressor | `transforms/kompress_compressor.py` (+413/-57) | `crates/headroom-core/src/transforms/kompress.rs` + `kompress_remote.rs` (both exist now) | No | Medium | `kompress` scope commits (5) — remote Kompress endpoint support (`transforms/kompress_remote.py`, new file) has since landed in Rust (`transforms/kompress_remote.rs`). |
 | savings_tracker | `proxy/savings_tracker.py` (+394/-26) | `crates/headroom-core/src/savings_tracker.rs` (exists, not touched in range; locally rewritten since — see freshness note) | No | Medium | `savings` scope (5 commits) — savings-sink aggregation and double-count fixes landed only in Python. Six local commits through `e920e5a8` have since reworked the Rust tracker (cost accounting, failed-work metrics, cache savings); check what is left rather than porting wholesale. |
 | lossless_compaction | `transforms/lossless_compaction.py` (+180/-5) | `crates/headroom-core/src/transforms/lossless_compaction.rs` (exists, not touched) | No | Small-Medium | `lossless` scope work (shared-prefix folding in grep search, etc.) is Python-only so far. |
 
@@ -29,12 +31,12 @@ Freshness note (2026-08-21): "not touched" below records what *upstream* did in 
 | `proxy/server.py` | +838/-67 | Large | Core proxy server wiring — request_scope import guard, health/readiness changes. |
 | `providers/codex/recovery.py` (new file) | +748/-0 | Large | Codex response-recovery logic — new, entirely Python; `codex` is a 6-commit scope (Codex WS cancel logging, responses aggregate floor, pyo3 fixes). Note: your branch's own commit `0fed13b8 feat(local-model): full Codex integration for the translate route` is local NPU work, separate from this. |
 | `cli/install.py` | +493/-47 | Medium-Large | Install-mode defaults (cache-mode default matching `headroom proxy`), Windows CREATE_NO_WINDOW fix. `install` is an 11-commit scope. |
-| `proxy/persistent_metrics.py` (new) | +470/-0 | Medium | New persistent metrics store for the proxy — no Rust metrics-persistence module exists (`prometheus_metrics.py`, also new at +209, is related). |
-| `transforms/thinking_compactor.py` (new) | +417/-0 | Medium | New transform to compact `<thinking>` blocks — no Rust port. |
-| `proxy/tool_schema_compaction.py` (new) | +416/-0 | Medium | Compacts tool-schema JSON before sending upstream — no Rust equivalent. |
+| `proxy/persistent_metrics.py` (new) | +470/-0 | Medium | ~~No Rust metrics-persistence module~~ Landed: `headroom-core/src/persistent_metrics.rs` (`core/src/lib.rs:16`). Re-diff for parity before treating as open. |
+| `transforms/thinking_compactor.py` (new) | +417/-0 | Medium | ~~No Rust port~~ Landed: `headroom-core/src/transforms/thinking_compactor.rs`. Re-diff for parity before treating as open. |
+| `proxy/tool_schema_compaction.py` (new) | +416/-0 | Medium | ~~No Rust equivalent~~ Landed: `headroom-proxy/src/tool_schema_compaction.rs` (`lib.rs:58`, wired in `proxy.rs:2262` and routed `transforms.rs:418`). Re-diff for parity before treating as open. |
 | `providers/codex/model_metadata.py` (new) + `integrations/autogen/agents.py` (new) + `integrations/crewai/agents.py` (new) | +386, +386, +361 | Medium x3 | Codex model metadata table, and brand-new AutoGen/CrewAI tool-compression integrations (`feat: add CrewAI and AutoGen tool compression integrations`). Purely additive Python SDK integrations; only relevant if you use those frameworks. |
-| `transforms/compression_batches.py`, `compressor_registry.py`, `config_compressor.py`, `cold_prefix.py` (all new) | +363, +299, +283, +282 | Medium x4 | New compressor-registry/dispatch layer (3-layer L1+L2+L3 compression pipeline) plus a `cold_prefix` hook and a dedicated config-file compressor. This is a fairly deep architectural layer with no Rust counterpart — worth reading before committing to port vs. redesign. |
-| `proxy/model_router.py` (new) | +289/-0 | Medium | New model-routing logic, separate from `content_router`. |
+| `transforms/compression_batches.py`, `compressor_registry.py`, `config_compressor.py`, `cold_prefix.py` (all new) | +363, +299, +283, +282 | Medium x4 | ~~No Rust counterpart~~ Landed: `transforms/{compression_batches,compressor_registry,config_compressor,cold_prefix}.rs` all exist. Re-diff for parity before treating as open. |
+| `proxy/model_router.py` (new) | +289/-0 | Medium | ~~No Rust home~~ Landed: `headroom-proxy/src/model_router.rs` (cost-aware rerouter, distinct from the `config::ModelRoute` provider table). Re-diff for parity before treating as open. |
 | `proxy/helpers.py` | +385/-709 (net shrink) | Medium | Large refactor/extraction out of a helpers grab-bag — mostly logic moved elsewhere in Python; low urgency since it's largely internal reshuffling. |
 | `providers/proxy_routes.py` | +223/-807 (net shrink) | Medium | Route table consolidation — again, largely a Python-side reorganization. |
 | `mcp_registry/grok.py`, `learn/plugins/grok.py`, `providers/hermes.py`, `providers/omp/runtime.py`, `providers/zcode/runtime.py`, `providers/grok_build/config.py` | 100-230 lines each | Small-Medium each | New provider/runtime support for Grok, Hermes, OMP, zcode agent CLIs. Only matters if you route through those providers. |
@@ -66,7 +68,7 @@ These Rust files were touched by upstream in the same range — no manual portin
 
 ## Reply summary (per team-lead's request)
 
-Group counts: A = 5 themes (~3,000 Python lines stale vs. existing Rust modules). B = 15 themes (~9,700 Python lines, zero Rust home). C = 12 Rust files/~2,700 lines already ported free by the merge. D = infra/docs/deps/tests, no action needed.
+Group counts: A = 5 themes (~3,000 Python lines stale vs. existing Rust modules). B = 15 themes as of 2026-08-21, of which 5 rows (~8 modules) have since landed (struck through above) — ~10 themes still with zero Rust home. C = 12 Rust files/~2,700 lines already ported free by the merge. D = infra/docs/deps/tests, no action needed.
 
 Top 5 by impact:
 1. `cli/wrap.py` (+2760) — CLI agent-wrapper rewrite; no Rust wrapper exists at all (Group B).

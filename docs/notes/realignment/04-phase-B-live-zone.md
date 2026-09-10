@@ -38,6 +38,11 @@ Delete the wrong-mental-model machinery wholesale. After Phase A PR-A1 made the 
 - All of `crates/headroom-core/src/scoring/*.rs` (~1500 LOC)
 - All of `crates/headroom-core/src/relevance/*.rs` (~1600 LOC)
 - `crates/headroom-core/.fastembed_cache/` directory and its `bge-small-en-v1.5` ONNX artifacts (~50 MB)
+-
+- Note (2026-09-10): the `relevance/` delete above did NOT happen — per
+- `12-decisions-needed.md` Q2 RESOLVED, `relevance/` was kept and repurposed
+- (`crates/headroom-core/src/relevance/{base,bm25,embedding,hybrid,mod}.rs` back
+- `transforms/relevance_split.rs`; `pub mod relevance` still in `headroom-core/src/lib.rs:19`).
 
 **Move:**
 - `crates/headroom-core/src/context/safety.rs` → `crates/headroom-core/src/transforms/safety.rs`. Update all callers' `use` paths. The tool-pair atomicity logic is preserved verbatim (it's correct and live-zone code needs it).
@@ -133,6 +138,10 @@ Build the new compressor: a function that takes an Anthropic `/v1/messages` body
 - `crates/headroom-proxy/src/compression/mod.rs` — add `pub mod live_zone_anthropic;` and route `/v1/messages` to it (replacing the no-op stub from PR-A1).
 - `crates/headroom-proxy/src/compression/live_zone_anthropic.rs` (new) — calls `compress_live_zone` with `frozen_count = compute_frozen_count(parsed)` (from PR-A4).
 - `crates/headroom-proxy/src/compression/anthropic.rs` — delete (replaced by `live_zone_anthropic.rs`).
+-
+- Note (2026-09-10): the `anthropic.rs` delete above did NOT happen — the file is
+- retained as a thin wrapper (`resolve_frozen_count` around
+- `headroom_core::compute_frozen_count`).
 
 **Tests added:**
 - `crates/headroom-core/tests/live_zone_skeleton.rs::dispatches_only_to_latest_user_message`

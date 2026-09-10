@@ -1,5 +1,11 @@
 # Proxy experiments and findings (2026-08)
 
+> Note (2026-09-10): code references have drifted since August —
+> `proxy.rs` is now ~14k lines, so every `proxy.rs:NNNN` cite below is
+> stale (e.g. `:3144-3147` is now `InflightGuard` boilerplate, outcome
+> code moved to `~5063-5090`). Check any line number against current
+> source before quoting it. Substance (measurements, closures) stands.
+
 **Closed.** Every item below was resolved between 2026-08-09 and 2026-08-12.
 The closure evidence — what was measured, and what changed — is in
 [proxy-experiments-closures.md](proxy-experiments-closures.md). Nothing here is outstanding work.

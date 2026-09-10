@@ -150,7 +150,7 @@ crates/headroom-core/src/
 │   ├── tiktoken_impl.rs
 │   ├── estimator.rs
 │   └── registry.rs
-├── ccr.rs                     # KEEP, hardened (persistent backend)
+├── ccr/                      # KEEP, hardened (persistent backend; now a dir: ccr/mod.rs + backends/)
 ├── signals/                   # KEEP — drives live-zone consumers
 │   ├── mod.rs
 │   ├── line_importance.rs
@@ -170,7 +170,7 @@ crates/headroom-core/src/
 │   ├── log_compressor.rs      # KEEP
 │   ├── search_compressor.rs   # KEEP
 │   ├── diff_compressor.rs     # KEEP
-│   ├── kompress_compressor.rs # NEW — Phase H Rust port via `ort` crate
+│   ├── kompress.rs (+ kompress_remote.rs) # Phase H Rust port (no kompress_compressor.rs)
 │   ├── smart_crusher/         # KEEP (25 files, correctly scoped)
 │   └── pipeline/              # SHRUNK — only the live-zone orchestrator
 │       ├── mod.rs
@@ -182,7 +182,7 @@ crates/headroom-core/src/
 # DELETED in Phase B:
 # context/                     ← except safety.rs which moved
 # scoring/
-# relevance/
+# (relevance/ KEPT per 12-decisions-needed.md Q2 RESOLVED — backs transforms/relevance_split.rs)
 ```
 
 ```
@@ -197,7 +197,7 @@ crates/headroom-proxy/src/
 ├── websocket.rs               # Phase C: WS Codex flow
 ├── sse/                       # NEW — Phase C
 │   ├── mod.rs
-│   ├── parser.rs              # byte-level state machine
+│   ├── framing.rs             # byte-level framing layer (no parser.rs)
 │   ├── anthropic.rs           # 4-event dance + delta types
 │   ├── openai_chat.rs         # tool_call accumulation
 │   └── openai_responses.rs    # output items + reasoning summary
@@ -205,8 +205,8 @@ crates/headroom-proxy/src/
 │   ├── mod.rs                 # routing by path × auth_mode
 │   ├── live_zone_anthropic.rs # NEW (Phase B)
 │   ├── live_zone_openai.rs    # NEW (Phase C)
-│   ├── tool_def_normalize.rs  # NEW (Phase E)
-│   ├── cache_control.rs       # NEW (Phase E)
+│   │   # Phase E stabilization lives in cache_stabilization/, not compression/:
+│   │   # cache_stabilization/{tool_def_normalize,anthropic_cache_control,openai_cache_key}.rs
 │   └── model_limits.rs        # KEEP
 ├── bedrock/                   # NEW — Phase D
 │   ├── mod.rs
@@ -225,7 +225,8 @@ crates/headroom-proxy/src/
 
 # DELETED:
 # compression/icm.rs           ← Phase A PR-A1
-# compression/anthropic.rs     ← Phase A PR-A1 (replaced with live_zone_anthropic.rs in Phase B)
+# (compression/anthropic.rs RETAINED as thin wrapper: resolve_frozen_count
+#  around headroom_core::compute_frozen_count — not replaced by live_zone_anthropic.rs)
 ```
 
 ---

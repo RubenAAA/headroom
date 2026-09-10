@@ -1,5 +1,11 @@
 # Proxy follow-ups
 
+> Note (2026-09-10): `proxy.rs`/`ccr_stream.rs` line numbers below are
+> August-era — current anchors: upstream client build at `proxy.rs:323`
+> (keepalive + 90s pool at `:332-336`), `tool_schema_compaction`
+> cache at `tool_schema_compaction.rs:207/250/258` (call `:367-383`).
+> Statuses ("fixed"/"open") were re-verified 2026-09-10 and still hold.
+
 Items 1 to 4 were investigated 2026-08-23 against `~/headroom-proxy.log`
 (~3,200 streams, proxy restarted 16:47). Items 5 and 6 come from the offload-gap
 round of 2026-08-18 to 08-21. Each entry records what the evidence says, not

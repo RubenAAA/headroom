@@ -195,6 +195,13 @@ None.
 
 ## What survives in Python after Phase H
 
+> Note (2026-09-10): retirement overshot what this table assumes — the ENTIRE
+> root `headroom/` tree is gone (`ls headroom` → No such file or directory), so
+> the `headroom/…` paths below resolve nowhere at their claimed locations. The
+> Python side survives only as the read-only mirror under `upstream-python/`
+> (e.g. `upstream-python/headroom/cli/`, `upstream-python/headroom/telemetry/`);
+> read each row below with that prefix.
+
 | Module | Role | Reason |
 |---|---|---|
 | `headroom/cli/wrap/*.py` | Agent launchers | Off-path; orchestrates filesystem + subprocess. Python is the right tool. |

@@ -74,7 +74,9 @@ edge. That is the repair if the edges ever drift from the records.
 
 ### What feeds it
 
-Only the `memory_save` tool path passes entities (`handler.rs:948`). The
+Only the `memory_save` tool path passes entities (tool layer at
+`memory/handler.rs:894-903`, entities flow at `:1062-1065`; the backend
+still discards them — `_extracted_*` at `ctx_backend.rs:676-678`). The
 auto-tail and file-write save paths pass `None`, so those memories have no
 edges and expansion neither helps nor hurts them.
 

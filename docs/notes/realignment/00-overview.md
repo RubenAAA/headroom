@@ -12,6 +12,13 @@
 > which touches only the latest turn and leaves the frozen prefix byte-identical.
 > Read the ICM sections as the diagnosis that motivated the realignment, not as a
 > description of what runs.
+>
+> Note (2026-09-10): the whole `headroom/` Python tree has since moved to
+> `upstream-python/headroom/` (read-only mirror; root `headroom/` no longer
+> exists). Map every `headroom/…py` path in this doc series, e.g.
+> `headroom/proxy/server.py` → `upstream-python/headroom/proxy/server.py`,
+> `headroom/transforms/pipeline.py` →
+> `upstream-python/headroom/transforms/pipeline.py`.
 
 ## Executive summary
 

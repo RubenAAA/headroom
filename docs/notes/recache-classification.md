@@ -3,6 +3,11 @@
 **Created:** 2026-07-07 | **Updated:** 2026-07-09
 **Status:** Implemented 2026-07-09 — `RecacheEventKind` (Drift/Expected) in `usage_observer.rs`, `event_kind` on `/cache-health`, two-window ⚠/ℹ statusline, Prometheus `unknown` reason relabelled `expected`. Not done: `compression_applied` plumbing (open question, not needed for the classification rule).
 
+> Note (2026-09-10): bare `prefix_replay.rs:*` cites below mean
+> `cache_stabilization/prefix_replay.rs`; `proxy.rs` numbers are July-era
+> (file is now ~14k lines). Entries are a living ledger — refuted entries
+> stay by policy.
+
 ---
 
 ## Problem
@@ -605,8 +610,8 @@ into a bucket nobody reads. Checked after every structural cause, so a real edit
 still wins. Pinned by `a_turn_racing_its_own_conversation_is_named_but_still_billed`
 and `a_named_cause_outranks_concurrency`.
 
-**Both crush flags are dead.** `--min-tokens-to-crush` (`config.rs:1326`,
-default 200) and `--max-items-after-crush` (`config.rs:1334`, default 15) are
+**Both crush flags are dead.** `--min-tokens-to-crush` (`config.rs:1510`,
+default 200) and `--max-items-after-crush` (`config.rs:1518`, default 15) are
 declared, copied into the runtime `Config`, and never read by the request path.
 The live `SmartCrusher` is built once from `SmartCrusherConfig::default()` at
 `live_zone.rs:607`, so the CLI values cannot reach it. Same three-layer pattern

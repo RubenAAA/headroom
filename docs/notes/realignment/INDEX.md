@@ -19,7 +19,7 @@
    - [09-phase-G-rtk-observability.md](./09-phase-G-rtk-observability.md) — RTK breadth + metrics (3 PRs, ~1 week)
    - [10-phase-H-python-retirement.md](./10-phase-H-python-retirement.md) — delete Python proxy (3 PRs, ~2 weeks)
    - [11-phase-I-test-infra.md](./11-phase-I-test-infra.md) — test/CI gates (parallel)
-   - [13-phase-J-history-offload.md](./13-phase-J-history-offload.md) — **PROPOSED (fork)**: frozen-history CCR offload for long-session prefix shrink (6 PRs, ~2–3 weeks)
+   - [13-phase-J-history-offload.md](./13-phase-J-history-offload.md) — **SHIPPED (fork)**: frozen-history CCR offload for long-session prefix shrink (6 PRs, ~2–3 weeks; implementation in tree since 2026-07-03, tuned through 2026-08-19)
 5. [12-decisions-needed.md](./12-decisions-needed.md) — open questions
 
 ## Conventions
@@ -75,9 +75,14 @@ These never get violated by any PR:
 
 - ICM (Python `intelligent_context.py`, Rust `context/manager.rs`)
 - `RollingWindow`, `ProgressiveSummarizer`, `scoring.py`, `tool_crusher.py` (Python)
-- `crates/headroom-core/src/scoring/`, `relevance/`, most of `context/` (Rust)
+- `crates/headroom-core/src/scoring/`, most of `context/` (Rust) — `relevance/` KEPT per `12-decisions-needed.md` Q2 RESOLVED (backs `transforms/relevance_split.rs`), not retired
 - `crates/headroom-proxy/src/compression/icm.rs`
 - `headroom/transforms/cache_aligner.py` rewrite path (keep detector + warning)
 - `headroom/proxy/server.py`, `handlers/anthropic.py`, `handlers/openai.py`, `handlers/streaming.py`, `handlers/gemini.py`, `responses_converter.py`, `memory_handler.py`, `memory_tool_adapter.py`, `semantic_cache.py`, `batch.py` — once Rust hits parity (Phase H)
 - `headroom/backends/litellm.py` Bedrock/Vertex converter — replaced by native envelopes (Phase D)
 - MessageScorer Rust port (PR #338, #343) — wasted work; deleted in Phase B
+
+## Drift notes (2026-09-10)
+
+- Phase E stabilization lives under `crates/headroom-proxy/src/cache_stabilization/`, not `compression/` (`tool_def_normalize`, `anthropic_cache_control`, `openai_cache_key`, `volatile_detector`, `drift_detector`).
+- The whole `headroom/` Python tree moved to the read-only mirror `upstream-python/headroom/`; root `headroom/` no longer exists.

@@ -246,7 +246,11 @@ Streaming for `/v1/responses` using the SSE state machine from PR-C1. Plus first
 - `crates/headroom-proxy/src/sse/openai_responses.rs` — add usage extraction from `response.completed`.
 
 **Add:**
-- `crates/headroom-proxy/src/conversations.rs` — detect `conversation: {"id": "conv_..."}` in request body. When present, log a warning and disable live-zone compression for that request (until Phase 4 cross-request shared cache lands). Telemetry: `proxy_conversations_api_request_count_total`.
+- `crates/headroom-proxy/src/handlers/conversations.rs` — detect `conversation: {"id": "conv_..."}` in request body. When present, log a warning and disable live-zone compression for that request (until Phase 4 cross-request shared cache lands). Telemetry: `proxy_conversations_api_request_count_total`.
+-
+- Note (2026-09-10): there is no `src/conversations.rs` — the module is
+- `src/handlers/conversations.rs`. (SSE framing was already correct in this doc as
+- `sse/framing.rs`; the stray `sse/parser.rs` name lived in 02-architecture.md and is fixed there.)
 
 **Tests added:**
 - `crates/headroom-proxy/tests/integration_responses_streaming.rs::reasoning_summary_streamed_correctly`

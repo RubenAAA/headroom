@@ -196,7 +196,7 @@ force-touches every Phase G PR-G3 family before scraping.
 
 ### H3 force-zero
 
-The `prometheus` crate v0.13 skips empty MetricVecs from `gather()`
+The `prometheus` crate v0.14 skips empty MetricVecs from `gather()`
 entirely — neither HELP/TYPE lines nor rows appear until the
 family has been incremented at least once with a label tuple.
 Operators expect to see the catalogue from boot, so
@@ -221,7 +221,7 @@ after the first real session, by design.
 
 ### H4 prometheus crate version pin
 
-The H3 contract above relies on the `prometheus` crate's v0.13
+The H3 contract above relies on the `prometheus` crate's v0.14
 `gather()` semantics — empty MetricVec families are omitted from
 the scrape. **This is implementation-defined behaviour.** If
 `crates/headroom-proxy/Cargo.toml` ever bumps the `prometheus`
@@ -238,7 +238,7 @@ dependency, retest the alarm contract:
 5. Confirm `passthrough_bytes_modified_total` stays at 0 across
    passthrough requests.
 
-The crate version is pinned exactly (`= "0.13.4"`, no caret) in
+The crate version is pinned exactly (`= "0.14.0"`, no caret) in
 `Cargo.toml` precisely so a silent semver bump cannot break the
 contract without a code-review trigger.
 

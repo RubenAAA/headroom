@@ -79,6 +79,12 @@ Options:
           
           [default: 150s]
 
+      --pool-idle-timeout <POOL_IDLE_TIMEOUT>
+          How long an idle keepalive socket stays in the upstream pool. A pooled socket survives a VPN exit rotation as a corpse: the next turn served from it RSTs instantly. Lower shortens the corpse window after rotations at the price of more TLS handshakes fleet-wide. Default 90s (unchanged behavior); rotation-heavy setups want ~25s
+          
+          [env: HEADROOM_POOL_IDLE_TIMEOUT=]
+          [default: 90s]
+
       --http-proxy <HTTP_PROXY>
           Optional HTTP proxy for upstream provider calls only (e.g. http://127.0.0.1:3128). Scoped to the proxy's provider HTTP client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY` env vars, which would leak into tool executions inheriting the environment. HTTP/2 is disabled for provider clients when this is set so HTTPS provider APIs can tunnel through a CONNECT proxy
           
@@ -378,8 +384,20 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --max-conversation-concurrency <MAX_CONVERSATION_CONCURRENCY>
+          Pace one conversation's concurrent turns: past this many in flight on the same conversation key, shed the excess with a 429 plus `Retry-After: 1` so the client retries against a committed prefix.
+          
+          Overlapping turns of one conversation race the provider's cache commit — measured 2026-09-09, 43 overlapping turns on one subagent fan-out burned 27.8k tokens re-writing prefixes their siblings had not finished committing (14% of everything that conversation wrote). Shedding paces the fan-out with the client's own retry instead of paying the race.
+          
+          `0` (the default) disables the check: every turn forwards, whatever is in flight. Ordinary interactive overlap (one or two turns) never reaches a cap worth setting — start at 3 or 4, where only storms trip it, and weigh the shed rate against fan-out makespan: the turns still run, just spaced a retry apart.
+          
+          Only read on intercepted (buffered) requests, like every other stabilization feature: with interception off the usage observer never sees the turn, so there is nothing to count it against.
+          
+          [env: HEADROOM_PROXY_MAX_CONVERSATION_CONCURRENCY=]
+          [default: 0]
+
       --redact-sensitive <REDACT_SENSITIVE>
-          Reversibly redact home-rooted paths, secrets and emails on routed translate paths, restoring them at the client edge. The map lives in process memory only. Default `false`: rewriting text the client sent is opt-in, like the other body rewrites
+          Reversibly redact home-rooted paths, secrets and emails on routed paths, restoring them at the client edge. Each placeholder carries its own ciphertext, so restoring it is decryption rather than a lookup: a placeholder still resolves in another session, and after a restart. The key lives in `$XDG_STATE_HOME/headroom/redact.key` (mode 0600, created on first use, overridable with `HEADROOM_REDACT_KEY_FILE`); delete it and every placeholder minted before then stops resolving. Default `false`: rewriting text the client sent is opt-in, like the other body rewrites
           
           [env: HEADROOM_PROXY_REDACT_SENSITIVE=]
           [default: false]
@@ -411,6 +429,17 @@ Options:
           Default `false`, and measured at +511% depth-standardised creation on live traffic on 2026-08-17 — see [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`] for the numbers and the mechanism. Do not enable without a live A/B.
           
           [env: HEADROOM_PROXY_SPLIT_CACHE_TTL=]
+          [default: false]
+          [possible values: true, false]
+
+      --respect-client-5m-ttl <RESPECT_CLIENT_5M_TTL>
+          Leave a body whose markers are all explicitly `5m` on the tier it asked for instead of pinning it to `1h`.
+          
+          Subagent traffic arrives on the 5-minute default and runs to completion in seconds — 0 of 2,011 inter-turn gaps in sub-5-minute conversations exceeded five minutes — so hour entries bought at 2.0x die unused where 1.25x entries do. Main-loop traffic arrives on `1h` and mixed bodies keep the pin (the tail hedge needs the older entry alive), so this only ever touches the all-`5m` shape. See [`crate::cache_stabilization::cache_ttl::pin_1h_applies`].
+          
+          Default `false`: TTL wire changes get burned once, so this enables on a live depth-binned A/B (`upstream-python/bench/_ttlsubagent.py`), not on reasoning.
+          
+          [env: HEADROOM_PROXY_RESPECT_CLIENT_5M_TTL=]
           [default: false]
           [possible values: true, false]
 

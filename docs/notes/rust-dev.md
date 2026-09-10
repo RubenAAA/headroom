@@ -15,10 +15,10 @@ crates/
   headroom-py/                   # PyO3 cdylib exposing `headroom._core`
   headroom-parity/               # lib + `parity-run` CLI for Python parity tests
   headroom-simulators/           # binary: deterministic local upstream stub for proxy tests
-tests/parity/
+tests/parity/                       # under upstream-python/ (mirror move 2026-09):
   fixtures/<transform>/*.json    # recorded Python outputs (Phase 1 ports match)
   recorder.py                    # Python-side fixture recorder
-scripts/record_fixtures.py       # entry point for running the recorder
+scripts/record_fixtures.py       # under upstream-python/ — entry point
 ```
 
 `cargo build --workspace` builds every crate. `default-members` drops
@@ -181,8 +181,10 @@ macos-x86_64 wheels via `PyO3/maturin-action` and uploads them as artifacts.
 
 `crates/headroom-parity` owns the Rust-vs-Python oracle:
 
-- JSON fixtures under `tests/parity/fixtures/<transform>/` (schema:
-  `{ transform, input, config, output, recorded_at, input_sha256 }`).
+- JSON fixtures under `upstream-python/tests/parity/fixtures/<transform>/`
+  (schema: `{ transform, input, config, output, recorded_at, input_sha256 }`).
+  (Paths below are relative to `upstream-python/` — the Python tree moved
+  there in the 2026-09 mirror move.)
 - `TransformComparator` trait — one impl per transform. Phase 0 stubs return
   `Err(...)`; the harness flags those as `Skipped`, not panics.
 - `parity-run` CLI: `cargo run -p headroom-parity -- run [--only TRANSFORM]`.
@@ -196,6 +198,7 @@ macos-x86_64 wheels via `PyO3/maturin-action` and uploads them as artifacts.
 source .venv/bin/activate           # the main Python SDK venv
 python scripts/record_fixtures.py   # uses tests/parity/recorder.py
 ls tests/parity/fixtures/*/ | sort | uniq -c
+# (run from upstream-python/ — see note above)
 ```
 
 The recorder monkey-patches the in-process transform classes (see

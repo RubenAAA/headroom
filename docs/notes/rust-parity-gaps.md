@@ -1,5 +1,15 @@
 # TODO: Rust/Python parity gaps (larger feature ports)
 
+> Note (2026-09-10): line numbers below are stale — `proxy.rs` has grown
+> to ~14k lines and `local_model.rs` was rewritten (~3100 lines). Current
+> anchors: main upstream client at `proxy.rs:323`
+> (`upstream_client_builder`), `header_upstream_override` at
+> `proxy.rs:3063` (call site `:3319`). Also, `extract_json_block`
+> (`headroom-core/src/transforms/content_router.rs:1105`) now has a
+> production caller at `:1194` — the §9 claim that neither function is
+> called outside tests is half-wrong (`split_into_sections` at `:1154`
+> is still test-only).
+
 Tracking doc for parity work identified while auditing `42ebbc6c..origin/main`
 (40 commits, 23 Python-only with no corresponding Rust change). The small
 correctness-bug batch (status_code/5xx accounting, x-headroom-base-url,

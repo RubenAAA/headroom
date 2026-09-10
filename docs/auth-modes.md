@@ -74,8 +74,8 @@ polls the subscription API with the token read from
 ## Staged rollout
 
 All auth-mode-dependent behavior is gated behind
-`auth_mode_policy_enforcement` (config; default **disabled**). While
-disabled, every request is treated as `payg` — identical to pre-Phase-F
-behavior. The classifier still runs and labels logs/metrics in every mode,
-so operators can validate classification in production before flipping
-enforcement on.
+`auth_mode_policy_enforcement` (config; default **enabled** since c5/5 —
+`config.rs:527`). When disabled, every request is treated as `payg` —
+identical to pre-Phase-F behavior. The classifier still runs and labels
+logs/metrics in every mode, so operators can validate classification in
+production before flipping enforcement on (or off, for a safe fallback).

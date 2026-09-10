@@ -8,8 +8,8 @@ HEADROOM_WORKSPACE_DIR   read-write state   default ~/.headroom
 HEADROOM_CONFIG_DIR      read-mostly config default ~/.headroom/config
 ```
 
-`crates/headroom-core/src/paths.rs` owns both, and every per-resource helper
-resolves in the same order:
+`crates/headroom-core/src/paths.rs` owns the two roots, and the
+per-resource helpers it carries resolve in the same order:
 
 ```
 explicit argument > per-resource env var > derived from the root > default
@@ -28,6 +28,12 @@ explicit argument > per-resource env var > derived from the root > default
 | `~/.headroom/ccr_store.db` | CCR — offloaded content, retrievable by hash | yes |
 | `~/.headroom/config/` | read-mostly config | yes |
 | `$HEADROOM_CAPTURE_DIR/req-*.json` | request capture, off unless the var is set | yes |
+
+Note: `paths.rs` is a partial port — it carries the roots plus the
+resources the subscription stack and savings ledger need. The
+ctx/memory/ccr rows above resolve through `config.ctx_store_dir` /
+`headroom_core::ctx::default_base_dir` (`proxy.rs:467-471`), not
+through `paths.rs` helpers.
 
 ## What is not ours
 

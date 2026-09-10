@@ -45,6 +45,10 @@ for raw in open(LOG, errors="replace"):
         # conversation grows, so diffing it as a flat field would call every
         # turn "changed". The stability section below compares shared depths.
         fp[rid]["prefix_ladder"] = f.get("prefix_ladder")
+        # Tail-anchored windows (t1/t2/t4 over the last 1/2/4 messages), added
+        # for the residual misses whose disputed region sits past the head
+        # ladder's last doubling depth. Absent on lines from older binaries.
+        fp[rid]["tail_ladder"] = f.get("tail_ladder")
         order[f.get("session_key_hash", "?")].append((d.get("timestamp", ""), rid))
     elif ev == "cache_recache_observed":
         recache[rid] = f.get("attribution_reason") or "unattributed"
@@ -127,3 +131,43 @@ if first_move or stable:
     print("\n  A depth that moves on turns whose tail did NOT reach it is a real")
     print("  rewrite of already-cached bytes. Depths at or past the tail are the")
     print("  turn's own new messages and are expected.")
+
+# Same question for the tail, where the head ladder cannot see: the disputed
+# region on a long turn sits past depth 32, so a tail-churned turn looks
+# identical to a healthy one above. Read back to front: the smallest moved
+# window bounds the churn (t1: last message; t1 held but t2 moved:
+# second-to-last). Pairs where either side predates the field are skipped.
+def tail_ladder(s):
+    out = {}
+    for part in (s or "").split(","):
+        if ":" in part:
+            d, h = part.split(":", 1)
+            if d in ("t1", "t2", "t4"):
+                out[d] = h
+    return out
+
+tail_move = collections.Counter()
+tail_stable = collections.Counter()
+for sess, turns in order.items():
+    for (_, prev), (_, cur) in zip(turns, turns[1:]):
+        a, b = tail_ladder(fp[prev].get("tail_ladder")), tail_ladder(fp[cur].get("tail_ladder"))
+        shared = [k for k in ("t1", "t2", "t4") if k in a and k in b]
+        if not shared:
+            continue
+        moved = [k for k in shared if a[k] != b[k]]
+        g = recache.get(cur) or "healthy"
+        if moved:
+            tail_move[(g, min(moved))] += 1
+        else:
+            tail_stable[g] += 1
+
+if tail_move or tail_stable:
+    print("\nforwarded-tail stability, turn against previous turn:")
+    for g in sorted(set([k[0] for k in tail_move] + list(tail_stable))):
+        n = tail_stable[g]
+        moves = {k: c for (gg, k), c in tail_move.items() if gg == g}
+        detail = "  ".join(f"{k}: {c}" for k in ("t1", "t2", "t4") if k in moves) or "-"
+        print(f"  {g:<26} stable {n:>5}   smallest moved window -> {detail}")
+    print("\n  A t1 that holds while the turn still lost cache bounds the churn")
+    print("  to the second-to-last message or earlier — past the tail the turn")
+    print("  appended, i.e. a rewrite of already-cached bytes.")

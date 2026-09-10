@@ -35,6 +35,10 @@ Eliminate P6-63. The single most important regression test for cache safety. Rec
 - `crates/headroom-proxy/tests/integration_byte_faithful.rs::sha256_round_trip_anthropic_messages_compression_off_via_auth_mode`
 - `crates/headroom-proxy/tests/integration_byte_faithful.rs::sha256_round_trip_openai_chat`
 - `crates/headroom-proxy/tests/integration_byte_faithful.rs::sha256_round_trip_openai_responses`
+-
+- Note (2026-09-10): `integration_byte_faithful.rs` was never created under that
+- name (no such file in `crates/headroom-proxy/tests/`). Neighboring tests that
+- do exist: `integration_compression.rs`, `integration_body.rs`, `sse_framing.rs`.
 - `tests/test_python_byte_faithful.py::test_sha256_round_trip_anthropic_passthrough` — Python side, gates Phase H readiness.
 
 **Modify:**

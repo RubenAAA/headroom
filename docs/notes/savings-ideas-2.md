@@ -109,7 +109,7 @@ That hash at index 1 appears 0 times on 08-31 and 09-01/02, 691 times in
 `.log.1` (first at 08:33:24Z) and 76 times live. Cost when it lands
 mid-session: read collapses to 23,682 and the conversation is rewritten.
 Live: 6 turns, 222,716 tokens. AM: 5 turns, 274,506. Client origin; the
-proxy declines replay correctly (`prefix_replay.rs:304` already knows the
+proxy declines replay correctly (`cache_stabilization/prefix_replay.rs` already knows the
 API accepts system-role messages). `cache_recache_observed` tags these
 `origin=proxy / early_messages / forwarded_hot_zone`, which is wrong.
 
@@ -119,8 +119,8 @@ design question, not a bug.
 
 ### 4.2 `history_rewritten` + `prior_thinking_dropped` mid-conversation
 
-`proxy.rs:3462` defines `history_rewritten` as "the replay store cannot
-replay this session's history"; `proxy.rs:3469` makes that an offload
+`proxy.rs:4182` defines `history_rewritten` as "the replay store cannot
+replay this session's history"; `:4189` makes that an offload
 boundary, and `compression/prior_thinking.rs` runs on it on the premise that
 the provider writes the prefix fresh anyway.
 
@@ -140,6 +140,10 @@ What to do: run the drop only when the divergence index is 0 or 1, or when
 the tracker is gone. A tail divergence is not a fresh write of the head.
 
 ### 4.3 Spinner-text sidecar falls back two times in three
+
+> **DONE (2026-09-10)** — `strip_long_context_beta`
+> (`sidecar.rs:524-536`) strips `context-1m` as proposed below. Kept
+> for the measurement record.
 
 `sidecar_detected` 557 in AM, 378 fell back; live 99 detected, 62 fell
 back, every one with status 400 "The long context beta is not yet available

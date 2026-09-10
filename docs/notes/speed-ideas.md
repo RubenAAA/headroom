@@ -5,6 +5,10 @@ Measured on the live log (`~/headroom-proxy.log` + `.log.1`, 2026-09-03
 `outbound_body_bytes`). Scripts: `/tmp/lat_profile.py`, `/tmp/final.py`,
 `/tmp/mem_trace.py`, `/tmp/gaps.py`, `/tmp/fts_time.py`.
 
+> Note (2026-09-10): §0 is current; §§1–2 are the 2026-09-03 baseline
+> and their `proxy.rs` line numbers predate growth to ~14k lines.
+> Re-resolve cites before costing work.
+
 ## 0. Pick up here (2026-09-04)
 
 Plan 0 and plan 3 shipped and are live. Three things to know before doing

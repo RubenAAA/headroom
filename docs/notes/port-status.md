@@ -7,6 +7,10 @@
 > and `README.md`), and many modules listed here as partial or missing have
 > landed. Read this only as a record of where the port stood in July 2026.
 > For open work, use `upstream-port-backlog.md`.
+> Note (2026-09-10): every `headroom/…py` path below now lives under
+> `upstream-python/headroom/…` after the mirror move, and the
+> log_compressor / cache_aligner / ccr parity comparators listed as
+> stubs are real (`crates/headroom-parity/src/lib.rs`).
 
 Generated: 2026-07-05T02:14:40+02:00
 

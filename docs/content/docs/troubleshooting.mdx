@@ -25,6 +25,36 @@ pip install "headroom-ai[proxy]"
 headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 ```
 
+### Proxy is killed, or the whole machine locks up
+
+**Symptom**: the proxy disappears with nothing in its log; on WSL2 the VM stops
+responding and needs a restart from Windows.
+
+The proxy holds whole request bodies while it works on them, and a background
+worker that falls behind holds more. A proxy that grows into tens of gigabytes
+takes the box with it, because the kernel's OOM killer only fires once the
+machine is already thrashing — far too late to stay interactive.
+
+Run `earlyoom` alongside it, which kills the offender while the box still
+responds:
+
+```bash
+sudo apt install earlyoom     # or your distribution's package
+sudo tee /etc/default/earlyoom >/dev/null <<'EOF'
+EARLYOOM_ARGS="-r 60 -m 8 -s 5 --avoid ^(systemd|init|sshd|dbus-daemon)$ --prefer ^(headroom-proxy|rustc|node)$"
+EOF
+sudo systemctl enable --now earlyoom
+pgrep -a earlyoom             # must echo the arguments back
+```
+
+That last line is the check that matters. systemd's `EnvironmentFile` does not
+strip quotes the way a shell does, so quoting the regexes passes the quote marks
+as part of the pattern and nothing matches; and a service already running when
+the file was written keeps its old arguments until restarted.
+
+To see growth rather than guess at it, `contrib/headroom-rss-sample` logs the
+proxy's RSS to `~/headroom-rss.log` once a minute.
+
 ### Connection refused when calling proxy
 
 **Symptom**: `curl: (7) Failed to connect to localhost port 8787`

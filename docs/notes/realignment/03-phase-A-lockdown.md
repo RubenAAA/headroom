@@ -27,6 +27,10 @@ Stop calling ICM from the Rust proxy on `/v1/messages`. The proxy becomes a pure
 - `crates/headroom-proxy/src/compression/mod.rs` — remove `pub mod icm;`, remove ICM dispatch in `maybe_compress`. The `is_compressible_path` check still matches `/v1/messages` but `compress_anthropic_request` becomes a no-op stub returning `Outcome::NoCompression`.
 - `crates/headroom-proxy/src/compression/anthropic.rs` — replace function body with `Ok(Outcome::NoCompression)`. Keep the function signature so callers compile; subsequent PRs in Phase B replace this with the live-zone block dispatcher.
 - `crates/headroom-proxy/src/proxy.rs` — confirm the `Outcome::NoCompression` branch forwards original bytes (already does at line 296-298; just verify with the new test).
+-
+- Note (2026-09-10): as built, the A1 `Outcome::NoCompression` stub is gone.
+- `Outcome` now lives in `crates/headroom-proxy/src/compression/live_zone_anthropic.rs`
+- (re-exported via `compression/mod.rs`); `compression/mod.rs` defines no `Outcome` enum itself.
 
 **Tests added:**
 - `crates/headroom-proxy/tests/integration_compression.rs::compression_on_message_passes_body_unchanged_sha256` — record a real Anthropic request body to a fixture; send through proxy; assert SHA-256 of upstream-received body equals SHA-256 of inbound body.
@@ -174,6 +178,10 @@ Eliminate P0-3 and P0-5 directly. In Rust, walk customer-set `cache_control` mar
 - `Cargo.toml:34` — add features: `serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision", "raw_value"] }`. Run `cargo update -p serde_json`.
 - `crates/headroom-proxy/src/compression/anthropic.rs` — add `pub fn compute_frozen_count(parsed: &serde_json::Value) -> usize` that walks `messages[*].content[*].cache_control`, `system[*].cache_control`, `tools[*].cache_control` and returns the highest message index whose content contains a marker. (Used by Phase B; currently called only by tests.)
 - `crates/headroom-core/src/lib.rs` — re-export `compute_frozen_count` for use in Phase B.
+-
+- Note (2026-09-10): as built, `compute_frozen_count` lives in
+- `headroom-core/src/cache_control.rs:109`; `crates/headroom-proxy/src/compression/anthropic.rs`
+- holds only the thin wrapper `resolve_frozen_count` around it.
 
 **Add:**
 - `crates/headroom-proxy/tests/integration_cache_control.rs::cache_control_marker_at_message_3_yields_frozen_count_3`

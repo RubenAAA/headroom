@@ -37,7 +37,7 @@ fall once both honour it — that is the exclusion working, not offload breaking
 ## Retrieval and storage
 
 One `CcrStore` instance, owned by `OffloadStore` and reached through
-`AppState::ccr_store` (`proxy.rs:213`). Offload writes each original twice, to
+`AppState::ccr_store()` (`proxy.rs:418`). Offload writes each original twice, to
 two stores, under the same hash:
 
 | store | serves |
@@ -84,7 +84,7 @@ Three hashing passes run over overlapping parts of the same message array:
 | site | key | why it differs |
 |---|---|---|
 | `ctx/identity.rs` | `session_key` + `system` + first message | conversation identity for recall |
-| `cache_stabilization/usage_observer.rs` | `session_key` + first message only | **deliberately** excludes `system` — including it would hash a mutated system prompt to a "new" conversation and hide the cache bust it caused |
+| `cache_stabilization/usage_observer.rs` | lane key (session key + system digest) + first message | the raw system text is excluded — hashing it directly would turn a mutated system prompt into a "new" conversation and hide the cache bust it caused; the lane carries only its digest |
 | `ctx/identity.rs::prefix_hash` | per-message, length-prefixed | prefix-drift detection |
 
 **Additive by design, duplicated in compute.** The divergence between the first

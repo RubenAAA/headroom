@@ -12,6 +12,9 @@ In flight, uncommitted: `crates/headroom-proxy/src/bin/offload_replay.rs`
 (offline corpus replay through the real transform) and
 `crates/headroom-proxy/src/memory/deferred.rs` (holding memory answers for the
 next request), plus the gap analysis in `bench/HANDOFF-offload-gap.md`.
+Note (2026-09-10): SHIPPED since — both files are committed
+(`git log` shows `offload_replay.rs` / `deferred.rs` commits) with clean git
+status for those paths.
 Note: the shipped marker is `<<ctx:HASH>>`, not the `<<ccr:HASH>>` this design
 sketched — read the marker syntax below as a design draft.
 **Owner:** RubenAAA (fork initiative; not part of the original A–I realignment audit).
@@ -133,7 +136,9 @@ subsystem, and the store-lifetime changes.
 ## 5. Hard dependency: the retrieve-tool subsystem (does not exist in Rust)
 
 Confirmed by audit: `grep headroom_retrieve crates/headroom-proxy/src` returns
-**nothing**. The Python proxy (`headroom/ccr/tool_injection.py`) owns tool
+**nothing**. Note (2026-09-10): STALE — the symbol now exists across the Rust
+tree, including `proxy.rs`, `bedrock/invoke.rs`, `openai/request.rs`, and
+`routed/transforms.rs` (plus `sse/ccr_stream.rs`, `ctx_offload.rs`). The Python proxy (`headroom/ccr/tool_injection.py`) owns tool
 injection + serving; the Rust live-zone port only *emits* markers and *tracks*
 retrieve call-ids to avoid re-compressing their output. **Offloading content the
 model cannot retrieve = silent information loss = wrong answers.** Therefore J3 is
@@ -250,8 +255,12 @@ beats the token win.
 - **I6 — Structural validity:** the post-offload request re-parses to a valid
   provider envelope with no orphaned tool pairs.
 
-A property test per invariant; a kill-switch flag (`--enable-history-offload`,
+A property test per invariant; a kill-switch flag (`--ctx-offload`,
 default **off**) so the feature can be disabled instantly in prod.
+Note (2026-09-10): the `--enable-history-offload` string from the draft never
+landed in code (no hits outside this doc) — the actual CTX-3 offload flag is
+`--ctx-offload` / `HEADROOM_PROXY_CTX_OFFLOAD` (`ctx_offload: bool`) at
+`crates/headroom-proxy/src/config.rs:685`.
 
 ---
 
@@ -263,7 +272,7 @@ default **off**) so the feature can be disabled instantly in prod.
 | **J1** | `feat/J1-ccr-store-session-pinned` | MED | +250 | Session-scoped, eviction-exempt, no-TTL store mode for offload entries (§8). Property tests for no-evict + session isolation (T5/T6). |
 | **J2** | `feat/J2-frozen-offload-selector` | **HIGH** | +500 | Eligibility selector (§6) + deterministic marker rewrite (§7) + structural-validity guard (§6/I6). Pure function over a parsed body; no I/O. Heavy property/fixture tests. |
 | **J3** | `feat/J3-retrieve-tool-subsystem` | **HIGH** | +600 | Inject `headroom_retrieve` tool when markers present; intercept its `tool_use` in the response stream; serve from store; namespacing (T9). The blocking prerequisite (§5). |
-| **J4** | `feat/J4-boundary-gated-policy` | MED | +200 | Wire J2 to fire **only** on a `drift_detector` rebuild boundary (§3); `--enable-history-offload` kill-switch; monotonic per-session offload-set state (I3). |
+| **J4** | `feat/J4-boundary-gated-policy` | MED | +200 | Wire J2 to fire **only** on a `drift_detector` rebuild boundary (§3); `--ctx-offload` kill-switch; monotonic per-session offload-set state (I3). |
 | **J5** | `feat/J5-offload-observability` | LOW | +150 | `history_offload_applied{blocks, tokens_freed, prefix_before, prefix_after}` event; retrieval hit/miss counters; thrash guard (warn if offload fires on a non-boundary turn). |
 | **J6** | `feat/J6-offload-e2e` | MED | +300 | End-to-end: simulated long session, assert prefix shrinks, cache-write count does NOT increase vs baseline, retrieval round-trips byte-exact, zero information loss across TTL boundary. |
 
@@ -321,14 +330,14 @@ above; the architecture choices are settled by the threat model, not a sweep.
   retrieves byte-exact; (d) a forced store-expiry triggers fail-open restore, not
   a corrupt `tool_result`.
 - Threat-model table (§9) each mapped to a test or an explicit accepted-risk note.
-- Kill-switch verified: `--enable-history-offload=false` ⇒ byte-identical to
+- Kill-switch verified: `--ctx-offload=false` ⇒ byte-identical to
   today's Phase B output.
 
 ---
 
 ## 13. Failure modes & rollback
 
-- **Rollback:** flip `--enable-history-offload` off → instant revert to Phase B
+- **Rollback:** flip `--ctx-offload` off → instant revert to Phase B
   behavior (I4/kill-switch). No migration, no persisted state to unwind (store is
   in-proc).
 - **Degradation:** store pressure / OOM → stop offloading (eligibility fails

@@ -34,7 +34,7 @@ record and cannot trust the rest of the session, so it sends a fatal alert and
 tears the connection down.
 
 Everything riding on that connection dies at the same instant. The proxy's
-upstream client speaks HTTP/2 (`proxy.rs:245`; `http1_only` is set only when an
+upstream client speaks HTTP/2 (`proxy.rs:433`; `http1_only` is set only when an
 HTTP proxy is configured), so parallel requests to Anthropic are multiplexed
 over one connection. Four in-flight turns, one bad record, four dead streams —
 which is exactly the pattern in the log, drops arriving in twos and threes with
