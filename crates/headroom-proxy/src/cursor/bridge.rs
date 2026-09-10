@@ -176,6 +176,12 @@ impl Session {
         };
         tx.send(outcome).is_ok()
     }
+
+    /// Ids of calls still parked. Diagnostics only: naming what the agent is
+    /// actually blocked on when a `tool_result` arrives for something else.
+    pub(crate) async fn waiting_ids(&self) -> Vec<String> {
+        self.waiting.lock().await.keys().cloned().collect()
+    }
 }
 
 /// How long a conversation may sit parked before it is reaped.
@@ -200,6 +206,15 @@ pub const MAX_PARK: std::time::Duration = std::time::Duration::from_secs(30 * 60
 /// faster than it finishes them would otherwise stay under the deadline the
 /// whole way up.
 pub(crate) const MAX_PARKED: usize = 32;
+
+/// Consecutive tool-result misses past which a conversation stops respawning.
+///
+/// One miss is a restarted client replaying its transcript; the next turn
+/// heals it. Several in a row is the fresh-spawn loop — every result missing
+/// every parked call, a new agent per tool call — and spawning again only
+/// burns another turn. Past this the handler answers with an error so the
+/// client sees the failure instead of circling.
+pub(crate) const MAX_CONSECUTIVE_MISMATCHES: u32 = 3;
 
 struct Parked {
     driver: super::turn::Conversation,
@@ -237,6 +252,10 @@ pub struct Bridge {
     /// the same discovery tool calls forever. This map outlives the session
     /// precisely so a new session can pick the id back up.
     chat_ids: Mutex<HashMap<String, String>>,
+    /// Consecutive tool-result misses per conversation. Reset on every
+    /// answered result and every result-free turn; only a run of misses
+    /// trips [`MAX_CONSECUTIVE_MISMATCHES`].
+    mismatches: Mutex<HashMap<String, u32>>,
 }
 
 impl Bridge {
@@ -314,6 +333,27 @@ impl Bridge {
     /// Take the parked driver, if this conversation has one waiting.
     pub(crate) async fn take_driver(&self, key: &str) -> Option<super::turn::Conversation> {
         self.drivers.lock().await.remove(key).map(|p| p.driver)
+    }
+
+    /// Whether a driver is parked for this conversation. Used to tell an
+    /// abandoned tool call (results never came) from an ordinary new turn.
+    pub(crate) async fn has_driver(&self, key: &str) -> bool {
+        self.drivers.lock().await.contains_key(key)
+    }
+
+    /// Record a turn whose results matched nothing parked. Returns the
+    /// conversation's consecutive-miss count.
+    pub(crate) async fn mismatch_strike(&self, key: &str) -> u32 {
+        let mut strikes = self.mismatches.lock().await;
+        let n = strikes.get(key).copied().unwrap_or(0) + 1;
+        strikes.insert(key.to_string(), n);
+        n
+    }
+
+    /// A result got through, or a result-free turn arrived: the miss run, if
+    /// any, is over.
+    pub(crate) async fn clear_mismatches(&self, key: &str) {
+        self.mismatches.lock().await.remove(key);
     }
 
     /// Kill every conversation parked longer than `max_park`. Returns how many.
