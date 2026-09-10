@@ -192,6 +192,22 @@ make test                                 # cargo test --workspace
 make ci-precheck                          # fmt, clippy, tests, the whole gate
 ```
 
+`target/` grows without bound: every toolchain bump orphans the previous
+fingerprint set, and each maturin build leaves a versioned wheel. Install
+the cleaner once (`install.sh` does this for you on a fresh setup):
+
+```bash
+cargo install cargo-sweep
+```
+
+After that `make test`, `make build-proxy` and `make build-wheel`
+garbage-collect at most once a day, removing only artifacts from toolchains
+you no longer have installed and the oldest files past 15 GiB (plus old
+wheels, keeping the last three). It never fails a build and stays out of
+CI. `make gc-check` previews what would go; `make gc` runs it now,
+including the 90-day age pass the automatic run omits. Caps are tunable
+via `GC_MAXSIZE`, `GC_MAXAGE_DAYS`, `GC_KEEP_WHEELS`, `GC_INTERVAL_HOURS`.
+
 Run `make ci-precheck` before pushing. It runs what CI runs. `make help` lists
 the rest, of which `make fmt` and `make test-parity` are the useful ones.
 

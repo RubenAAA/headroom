@@ -119,6 +119,12 @@ make test          # cargo test --workspace alone
 break CI without firing locally. Do not bump it casually. Code must pass
 `cargo fmt --check` and `cargo clippy -- -D warnings`.
 
+`target/` is garbage-collected by `make test` / `make build-proxy` /
+`make build-wheel` (at most once a day, never fails the build) once
+`cargo install cargo-sweep` has run — `install.sh` does that on fresh
+setups. `make gc-check` previews, `make gc` forces. See
+`scripts/cargo-gc.sh` for the policy.
+
 ## Rules
 
 - Never commit secrets. `~/.headroom-flags.sh` names auth file paths, not keys,
