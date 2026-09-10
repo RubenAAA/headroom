@@ -5148,6 +5148,21 @@ pub(crate) async fn forward_http(
                 wire_bytes: None,
                 forwarded_tokens_estimate: 0,
                 upstream_attempts: 1,
+                // Derived from the client's own body, before compression:
+                // a rewritten first user message must not move the key
+                // mid-conversation. `None` on every shape but
+                // whole-transcript `/v1/responses`, where the booked
+                // per-turn diff is the conversation's running total.
+                conversation_key: headroom_core::conversation_savings::savings_conversation_key(
+                    &parsed_body,
+                    headers_snapshot.as_ref().and_then(|headers| {
+                        headers
+                            .get("conversation_id")
+                            .or_else(|| headers.get("session_id"))
+                            .or_else(|| headers.get("x-headroom-session-id"))
+                            .and_then(|v| v.to_str().ok())
+                    }),
+                ),
             });
         }
 
@@ -6353,6 +6368,7 @@ pub(crate) async fn forward_http(
             outcome_ctx.clone(),
             replay_store_for_parser,
             ccr_round_usage.clone(),
+            status,
         ));
         // Keep the parser detached from response forwarding, but do not drop
         // its JoinHandle: a panic would otherwise erase the only completion
@@ -6829,6 +6845,8 @@ pub(crate) async fn forward_http(
                             optimized_tokens: ctx.sizes(attempted_input).1,
                             output_tokens: output_tok,
                             tokens_saved: ctx.tokens_saved,
+                            conversation_key: ctx.conversation_key.clone(),
+                            conversation_tokens_saved: Some(ctx.tokens_saved),
                             attempted_input_tokens: ctx.attempted(attempted_input),
                             cache_read_tokens: cache_read,
                             cache_write_tokens: cache_write,
@@ -8863,6 +8881,12 @@ struct OutcomeContext {
     forwarded_tokens_estimate: i64,
     /// Number of upstream transmissions made for this client turn.
     upstream_attempts: i64,
+    /// Conversation identity for novel-vs-repeat savings attribution
+    /// (upstream `427fa76f`). `Some` only when the request carries a whole
+    /// transcript under an explicit conversation id (`/v1/responses`
+    /// shape); `None` keeps ordinary per-request accounting, which is
+    /// already novel-only on frozen-prefix paths.
+    conversation_key: Option<String>,
 }
 
 /// Book this request's wire bytes against the usage the provider reported for
@@ -9052,6 +9076,12 @@ fn emit_openai_stream_outcome(
     input_tok: i64,
     cached_tok: i64,
     output_tok: i64,
+    // Upstream 4949cd55: the HTTP status the stream arrived with. The old
+    // code left this at the `Default` 0 (success), so an exhausted 529
+    // served as `text/event-stream` booked a success at stream close. A
+    // real >= 500 diverts through the failure funnel in
+    // `emit_request_outcome`; anything else behaves exactly as before.
+    status_code: i64,
 ) {
     let outcome = headroom_core::request_outcome::RequestOutcome {
         request_id: request_id.to_string(),
@@ -9061,6 +9091,8 @@ fn emit_openai_stream_outcome(
         optimized_tokens: ctx.sizes(input_tok).1,
         output_tokens: output_tok,
         tokens_saved: ctx.tokens_saved,
+        conversation_key: ctx.conversation_key.clone(),
+        conversation_tokens_saved: Some(ctx.tokens_saved),
         attempted_input_tokens: ctx.attempted(input_tok),
         cache_read_tokens: cached_tok,
         // Both providers report a total that includes the cached prefix, unlike
@@ -9074,6 +9106,7 @@ fn emit_openai_stream_outcome(
         tags: ctx.tags.clone(),
         client: ctx.client.clone(),
         project: ctx.project.clone(),
+        status_code,
         ..Default::default()
     };
     headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
@@ -9125,6 +9158,10 @@ async fn run_sse_state_machine(
     // `sse::ccr_stream` before this task's channel closes. `None` when the
     // rewriter did not run.
     ccr_round_usage: Option<Arc<Mutex<CcrRoundUsage>>>,
+    // HTTP status the stream arrived with (upstream 4949cd55). The close
+    // arms stamp it onto the outcome so a 5xx served as SSE books failed
+    // instead of success. `Copy`, so the spawn site just moves it in.
+    upstream_status: StatusCode,
 ) {
     use crate::sse::framing::SseFramer;
 
@@ -9379,7 +9416,35 @@ async fn run_sse_state_machine(
                 // verdict can report how many turns it is missing. The
                 // Prometheus counter above resets with the process; the books
                 // do not.
-                if let Some(ref ctx) = outcome_ctx {
+                //
+                // Upstream 4949cd55: when the HTTP status itself is a 5xx, the
+                // errored stream is failed work, not a missing turn — an
+                // exhausted 529 served as SSE must land in `record_failed`,
+                // never in the success stats nor the unbooked counter.
+                if upstream_status.is_server_error() {
+                    if let Some(ref ctx) = outcome_ctx {
+                        let outcome = headroom_core::request_outcome::RequestOutcome {
+                            request_id: request_id.clone(),
+                            provider: ctx.provider.clone(),
+                            model: ctx.model.clone(),
+                            status_code: upstream_status.as_u16() as i64,
+                            output_tokens: state.usage.output_tokens as i64,
+                            uncached_input_tokens: state.usage.input_tokens as i64,
+                            total_latency_ms: ctx.started_at.elapsed().as_secs_f64() * 1000.0,
+                            overhead_ms: ctx.overhead_ms,
+                            transforms_applied: ctx.transforms_applied.clone(),
+                            num_messages: ctx.num_messages,
+                            tags: ctx.tags.clone(),
+                            client: ctx.client.clone(),
+                            project: ctx.project.clone(),
+                            ..Default::default()
+                        };
+                        headroom_core::request_outcome::emit_failed_request_outcome(
+                            ctx.sink.as_ref(),
+                            &outcome,
+                        );
+                    }
+                } else if let Some(ref ctx) = outcome_ctx {
                     ctx.sink.savings_tracker.record_unbooked_turn(
                         state.usage.input_tokens as i64,
                         state.usage.output_tokens as i64,
@@ -9450,6 +9515,8 @@ async fn run_sse_state_machine(
                     optimized_tokens: ctx.sizes(attempted_input).1,
                     output_tokens: state.usage.output_tokens as i64 + ccr_rounds.output_tokens,
                     tokens_saved: ctx.tokens_saved,
+                    conversation_key: ctx.conversation_key.clone(),
+                    conversation_tokens_saved: Some(ctx.tokens_saved),
                     attempted_input_tokens: ctx.attempted(attempted_input),
                     cache_read_tokens: state.usage.cache_read_input_tokens as i64
                         + ccr_rounds.cache_read_tokens,
@@ -9472,6 +9539,10 @@ async fn run_sse_state_machine(
                     tags: ctx.tags.clone(),
                     client: ctx.client.clone(),
                     project: ctx.project.clone(),
+                    // Upstream 4949cd55: stamp the real HTTP status so a
+                    // 5xx served as SSE diverts to the failure funnel
+                    // instead of booking a success.
+                    status_code: upstream_status.as_u16() as i64,
                     ..Default::default()
                 };
                 record_wire_footprint(
@@ -9612,6 +9683,7 @@ async fn run_sse_state_machine(
                     input_tok,
                     cached_tok,
                     output_tok,
+                    upstream_status.as_u16() as i64,
                 );
             }
         }
@@ -9772,6 +9844,7 @@ async fn run_sse_state_machine(
                     input_tok,
                     cached_tok,
                     output_tok,
+                    upstream_status.as_u16() as i64,
                 );
             }
         }
@@ -12202,6 +12275,7 @@ mod tests {
             wire_bytes: None,
             forwarded_tokens_estimate: 0,
             upstream_attempts: 1,
+            conversation_key: None,
         }
     }
 

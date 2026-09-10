@@ -81,6 +81,16 @@ impl RecencyBoostRanker {
                 if age_secs <= 0.0 {
                     return 1.0; // future-dated, clock skew
                 }
+                // A non-positive decay carries no decay information: zero
+                // would collapse every dated score to 0.0 (`-age/0.0` →
+                // `-inf` → `exp(-inf)`), and a negative one would amplify
+                // age into a boost (factor > 1). The field is public so the
+                // guard lives here, not at construction. Neutral 1.0 keeps
+                // ranking cosine-ordered instead of silently discarding or
+                // inverting recency (follow-up #2 in TODO_PORT_09_10.md).
+                if self.decay_days <= 0.0 {
+                    return 1.0;
+                }
                 let age_days = age_secs / 86400.0;
                 (-age_days / self.decay_days).exp()
             }
@@ -282,10 +292,26 @@ mod tests {
     fn custom_decay_days_zero_panics_not() {
         let ranker = RecencyBoostRanker { decay_days: 0.0 };
         let now = now_secs();
-        // decay_days=0 means exp(-age/0) would be exp(-inf) = 0 for any age > 0
+        // decay_days=0 used to be exp(-inf) = 0 for any age > 0, silently
+        // zeroing every dated score; now it is recency-neutral.
         let c = candidate(0.5, Some(now - 100.0));
         let ranked = ranker.rank(&[c]);
         // Should not panic; result is a valid score
         assert!(!ranked.is_empty());
+        assert!((ranked[0].score - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn nonpositive_decay_is_recency_neutral() {
+        // Zero must not collapse dated scores; a negative decay must not
+        // amplify age into a boost (factor > 1).
+        for decay_days in [0.0, -30.0] {
+            let ranker = RecencyBoostRanker { decay_days };
+            let factor = ranker.recency_factor(1_000_000.0, Some(1_000_000.0 - 86400.0 * 10.0));
+            assert!(
+                (factor - 1.0).abs() < f64::EPSILON,
+                "decay_days={decay_days} gave factor {factor}"
+            );
+        }
     }
 }

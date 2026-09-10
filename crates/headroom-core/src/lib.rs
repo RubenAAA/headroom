@@ -4,6 +4,7 @@ pub mod auth_mode;
 pub mod cache_control;
 pub mod ccr;
 pub mod compression_policy;
+pub mod conversation_savings;
 pub mod cost_tracker;
 pub mod ctx;
 pub mod memory;

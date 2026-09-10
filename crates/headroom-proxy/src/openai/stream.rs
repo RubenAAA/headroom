@@ -1104,6 +1104,7 @@ mod tests {
         std::sync::Arc<headroom_core::cost_tracker::CostTracker>,
     ) {
         redirect_savings_ledger();
+        redirect_savings_tracker();
         let cost_tracker = std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
             None, "monthly",
         ));
@@ -1133,6 +1134,7 @@ mod tests {
             forwarded_tokens_estimate: 777,
             upstream_attempts: 1,
             redact_store: None,
+            conversation_key: None,
         };
         let t = StreamTranslator::new(model.to_string()).with_outcome(Some(ctx));
         (t, request_logger, cost_tracker)
@@ -1677,6 +1679,20 @@ mod tests {
             dir.path().join("savings_events.jsonl")
         });
         std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path);
+    }
+
+    /// Same isolation as [`redirect_savings_ledger`] for the lifetime state
+    /// file: a `None`-path tracker resolves the developer's live
+    /// `~/.headroom/proxy_savings.json`, and every booking test would append
+    /// test turns to real lifetime totals. Must run before any
+    /// `SavingsTracker::new(None, …)` in this process.
+    fn redirect_savings_tracker() {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let path = DIR.get_or_init(|| {
+            let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
+            dir.path().join("proxy_savings.json")
+        });
+        std::env::set_var("HEADROOM_SAVINGS_PATH", path);
     }
 
     fn signature_from_stream(sse: &str) -> Option<String> {

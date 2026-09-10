@@ -1846,9 +1846,9 @@ version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
-  "crc32fast",
-  "miniz_oxide 0.9.1",
-  "zlib-rs",
+ "crc32fast",
+ "miniz_oxide 0.9.1",
+ "zlib-rs",
 ]
 
 [[package]]

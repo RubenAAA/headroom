@@ -58,6 +58,17 @@ pub struct RequestOutcome {
     pub tokens_saved: i64,
     /// Compressible-portion denominator for active-savings-percent.
     pub attempted_input_tokens: i64,
+    /// Stable across every turn of one conversation, from
+    /// [`crate::conversation_savings::savings_conversation_key`]. Paired with
+    /// `conversation_tokens_saved` it lets the funnel tell a first-time
+    /// removal from a re-removal: on `/v1/responses` the compressor reports
+    /// the CONVERSATION's running removed-total every turn (the whole
+    /// transcript is re-sent and recompressed), not this turn's figure.
+    pub conversation_key: Option<String>,
+    /// The conversation's running removed-token total as of this request.
+    /// `None` on paths that do not distinguish (frozen-prefix providers,
+    /// whose `tokens_saved` is already novel-only).
+    pub conversation_tokens_saved: Option<i64>,
 
     // ── Cache (provider-agnostic; unused fields stay 0) ──
     pub cache_read_tokens: i64,
@@ -243,6 +254,11 @@ pub struct StreamParams<'a> {
     pub pipeline_timing: Option<Vec<(String, f64)>>,
     pub waste_signals: Option<Vec<(String, i64)>>,
     pub original_messages: Option<Vec<Value>>,
+    /// Set only by paths whose `tokens_saved` is the CONVERSATION's running
+    /// total rather than this turn's — OpenAI `/v1/responses`, which
+    /// re-sends and recompresses the whole transcript every turn.
+    pub conversation_key: Option<String>,
+    pub conversation_tokens_saved: Option<i64>,
 }
 
 impl RequestOutcome {
@@ -342,6 +358,8 @@ impl RequestOutcome {
             optimized_tokens: p.optimized_tokens,
             output_tokens: p.output_tokens,
             tokens_saved: p.tokens_saved,
+            conversation_key: p.conversation_key,
+            conversation_tokens_saved: p.conversation_tokens_saved,
             attempted_input_tokens: p.optimized_tokens + p.tokens_saved,
             cache_read_tokens: p.cache_read_tokens,
             cache_write_tokens: p.cache_write_tokens,
@@ -512,18 +530,45 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
         sink.record_output_savings(&outcome.transforms_applied, outcome.output_tokens);
     }
 
-    sink.record_request(outcome); // 1
-                                  // Durable savings ledger, immediately after the in-memory tracker — the
-                                  // same position Python writes it from inside `record_request`. Gated on a
-                                  // real saving so uncompressed requests never touch the disk.
-                                  // A rerouted turn also books here even when it compressed nothing: what it
-                                  // saved is the bill it never sent to the client's model, and that is worth
-                                  // more than any compression delta. The ledger helper still ignores a
-                                  // zero-token compression saving, so the disk write stays gated as before.
+    // Savings that are new to this conversation (upstream `427fa76f`). Per
+    // request descriptions below keep `outcome.tokens_saved` — the wire truth
+    // for THIS request — while everything that accumulates across turns uses
+    // this, so a removed token is counted once per conversation instead of
+    // once per turn. Falls back to `tokens_saved` on paths that do not
+    // distinguish, which is already the novel figure there.
+    let novel_tokens_saved = crate::conversation_savings::conversation_ledger()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .novel(
+            outcome.conversation_key.as_deref(),
+            outcome.conversation_tokens_saved,
+        )
+        .unwrap_or(outcome.tokens_saved);
+    // The accumulation sinks book through one adjusted view; the ledger
+    // event, request log, and PERF line keep the wire truth.
+    let booked;
+    let booked_outcome = if novel_tokens_saved == outcome.tokens_saved {
+        outcome
+    } else {
+        booked = RequestOutcome {
+            tokens_saved: novel_tokens_saved,
+            ..outcome.clone()
+        };
+        &booked
+    };
+
+    sink.record_request(booked_outcome); // 1
+                                         // Durable savings ledger, immediately after the in-memory tracker — the
+                                         // same position Python writes it from inside `record_request`. Gated on a
+                                         // real saving so uncompressed requests never touch the disk.
+                                         // A rerouted turn also books here even when it compressed nothing: what it
+                                         // saved is the bill it never sent to the client's model, and that is worth
+                                         // more than any compression delta. The ledger helper still ignores a
+                                         // zero-token compression saving, so the disk write stays gated as before.
     if outcome.tokens_saved > 0 || outcome.routed_from_model.is_some() {
         sink.record_savings_ledger(outcome);
     }
-    sink.record_tokens(outcome); // 2
+    sink.record_tokens(booked_outcome); // 2
     sink.log_request(outcome); // 3
 
     // 4. Structured PERF trace line. `client=X` appended only when identified.
@@ -532,10 +577,17 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
         .as_deref()
         .map(|c| format!(" client={c}"))
         .unwrap_or_default();
+    // Only when it differs: on every path that reports novel-only savings the
+    // two are equal and a second identical number is noise.
+    let novel_part = if novel_tokens_saved != outcome.tokens_saved {
+        format!("tok_novel={novel_tokens_saved} ")
+    } else {
+        String::new()
+    };
     tracing::info!(
         target: "headroom.proxy",
         "[{}] PERF model={} msgs={} tok_before={} tok_after={} tok_saved={} \
-         tok_inflated={} \
+         {}tok_inflated={} \
          cache_read={} cache_write={} cache_hit_pct={} opt_ms={:.0} total_ms={:.0} \
          tok_out={} ttfb_ms={:.0} transforms={}{}",
         outcome.request_id,
@@ -544,6 +596,7 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
         outcome.original_tokens,
         outcome.optimized_tokens,
         outcome.tokens_saved,
+        novel_part,
         outcome.tokens_inflated(),
         outcome.cache_read_tokens,
         outcome.cache_write_tokens,
@@ -801,6 +854,73 @@ mod tests {
             // Only the failure path fires; the success funnel is skipped.
             assert_eq!(*sink.calls.borrow(), vec!["record_failed"]);
         }
+    }
+
+    // A sink that records the `tokens_saved` figure each funnel call saw.
+    #[derive(Default)]
+    struct FigureSink {
+        requested: RefCell<Vec<i64>>,
+        tokened: RefCell<Vec<i64>>,
+        ledgered: RefCell<Vec<i64>>,
+    }
+    impl OutcomeSink for FigureSink {
+        fn record_request(&self, o: &RequestOutcome) {
+            self.requested.borrow_mut().push(o.tokens_saved);
+        }
+        fn record_tokens(&self, o: &RequestOutcome) {
+            self.tokened.borrow_mut().push(o.tokens_saved);
+        }
+        fn record_savings_ledger(&self, o: &RequestOutcome) {
+            self.ledgered.borrow_mut().push(o.tokens_saved);
+        }
+    }
+
+    #[test]
+    fn emit_books_novel_savings_to_accumulators_and_wire_truth_to_records() {
+        // Upstream `427fa76f`: a conversation whose running removed-total
+        // went 62_806 -> 76_020 across two turns removed 13_214 new tokens on
+        // the second turn not 76_020. Accumulators (tracker totals, cost)
+        // must see the novel figure; the durable ledger event keeps the
+        // wire truth for this request.
+        crate::conversation_savings::reset_conversation_ledger();
+        let sink = FigureSink::default();
+        let key = Some("emit_novel_test_conv".to_string());
+        for (saved, total) in [(62_806i64, 62_806i64), (76_020, 76_020)] {
+            emit_request_outcome(
+                &sink,
+                &RequestOutcome {
+                    status_code: 200,
+                    tokens_saved: saved,
+                    conversation_key: key.clone(),
+                    conversation_tokens_saved: Some(total),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(*sink.requested.borrow(), vec![62_806, 13_214]);
+        assert_eq!(*sink.tokened.borrow(), vec![62_806, 13_214]);
+        assert_eq!(*sink.ledgered.borrow(), vec![62_806, 76_020]);
+        crate::conversation_savings::reset_conversation_ledger();
+    }
+
+    #[test]
+    fn emit_without_conversation_key_books_per_request_unchanged() {
+        crate::conversation_savings::reset_conversation_ledger();
+        let sink = FigureSink::default();
+        for saved in [100i64, 150] {
+            emit_request_outcome(
+                &sink,
+                &RequestOutcome {
+                    status_code: 200,
+                    tokens_saved: saved,
+                    ..Default::default()
+                },
+            );
+        }
+        // No key: the funnel falls back to `tokens_saved` unchanged.
+        assert_eq!(*sink.requested.borrow(), vec![100, 150]);
+        assert_eq!(*sink.tokened.borrow(), vec![100, 150]);
+        crate::conversation_savings::reset_conversation_ledger();
     }
 
     #[test]

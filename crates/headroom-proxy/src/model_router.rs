@@ -40,6 +40,14 @@ pub struct ModelRoute {
     pub min_input_tokens: Option<u64>,
     /// Match only when the request declares no tools (a proxy for low-risk work).
     pub require_no_tools: bool,
+    /// Match only when the request declares tools (a proxy for agentic work).
+    ///
+    /// The inverse of [`ModelRoute::require_no_tools`] (upstream `ae75ca49`):
+    /// lets an operator route tool-using turns to a *more* capable model
+    /// while keeping plain chat on a cheaper one. Setting both on one rule
+    /// makes it unmatchable (an AND of contradictory conditions), which is a
+    /// harmless operator error, not a crash.
+    pub require_tools: bool,
     /// Restrict this rule to these source models. Empty = any source model.
     pub from_models: Vec<String>,
     /// Human-readable label surfaced in decision logs.
@@ -53,6 +61,9 @@ impl ModelRoute {
             return false;
         }
         if self.require_no_tools && has_tools {
+            return false;
+        }
+        if self.require_tools && !has_tools {
             return false;
         }
         if let Some(max) = self.max_input_tokens {
@@ -399,11 +410,12 @@ fn truthy(value: Option<&str>) -> bool {
 
 /// Route object keys the parser understands. Anything else is a typo, and a
 /// typo would silently widen the rule — so it is rejected.
-const ALLOWED_ROUTE_KEYS: [&str; 6] = [
+const ALLOWED_ROUTE_KEYS: [&str; 7] = [
     "to_model",
     "max_input_tokens",
     "min_input_tokens",
     "require_no_tools",
+    "require_tools",
     "from_models",
     "name",
 ];
@@ -482,6 +494,20 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<ModelRoute> {
         }
     };
 
+    // Same strictness as `require_no_tools`: only an absent key defaults to
+    // `false`; an explicit non-boolean skips the route (fail open, never
+    // coerced).
+    let require_tools = match map.get("require_tools") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            tracing::warn!(
+                "model route #{index} 'require_tools' must be a boolean; skipping route"
+            );
+            return None;
+        }
+    };
+
     // As above: `entry.get("from_models", [])` only defaults when the key is
     // absent; an explicit `null` is not a list and skips the route.
     let from_models: Vec<String> = match map.get("from_models") {
@@ -519,6 +545,7 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<ModelRoute> {
         max_input_tokens: max_tokens,
         min_input_tokens: min_tokens,
         require_no_tools,
+        require_tools,
         from_models,
         name,
     })
@@ -819,6 +846,7 @@ mod tests {
             max_input_tokens: Some(100),
             min_input_tokens: Some(10),
             require_no_tools: true,
+            require_tools: false,
             from_models: vec!["a".into(), "b".into()],
             name: String::new(),
         };
@@ -829,6 +857,33 @@ mod tests {
         assert!(!r.matches("a", 9, false)); // min
         assert!(r.matches("a", 10, false)); // inclusive bounds
         assert!(r.matches("a", 100, false));
+    }
+
+    #[test]
+    fn require_tools_matches_only_with_tools() {
+        // Inverse of `require_no_tools` (upstream `ae75ca49`): route agentic
+        // (tool-using) turns to a stronger model, leaving plain chat alone.
+        let r = ModelRoute {
+            to_model: "strong".into(),
+            require_tools: true,
+            ..Default::default()
+        };
+        assert!(r.matches("cheap", 1, true));
+        assert!(!r.matches("cheap", 1, false));
+    }
+
+    #[test]
+    fn require_tools_and_require_no_tools_never_matches() {
+        // Contradictory conditions on one rule are an AND that can never be
+        // true — a harmless operator error, not a crash.
+        let r = ModelRoute {
+            to_model: "x".into(),
+            require_tools: true,
+            require_no_tools: true,
+            ..Default::default()
+        };
+        assert!(!r.matches("m", 1, true));
+        assert!(!r.matches("m", 1, false));
     }
 
     // -- from_env ----------------------------------------------------------
@@ -875,6 +930,7 @@ mod tests {
                 max_input_tokens: Some(4000),
                 min_input_tokens: Some(10),
                 require_no_tools: true,
+                require_tools: false,
                 from_models: vec!["gpt-5.4".into()],
                 name: "small->mini".into(),
             }]
@@ -924,6 +980,29 @@ mod tests {
             assert!(cfg.routes.is_empty(), "{raw} should skip the route");
             assert!(!cfg.enabled);
         }
+    }
+
+    #[test]
+    fn from_env_parses_require_tools() {
+        let cfg = ModelRouterConfig::from_env(
+            Some("yes"),
+            Some(r#"[{"name":"agentic","require_tools":true,"to_model":"strong"}]"#),
+        );
+        assert_eq!(cfg.routes.len(), 1);
+        let route = &cfg.routes[0];
+        assert!(route.require_tools);
+        assert_eq!(route.to_model, "strong");
+    }
+
+    #[test]
+    fn from_env_malformed_require_tools_skips_route() {
+        // A non-boolean must fail open (skip), never be coerced.
+        let cfg = ModelRouterConfig::from_env(
+            Some("yes"),
+            Some(r#"[{"to_model":"m","require_tools":"yes"}]"#),
+        );
+        assert!(cfg.routes.is_empty());
+        assert!(!cfg.enabled);
     }
 
     #[test]

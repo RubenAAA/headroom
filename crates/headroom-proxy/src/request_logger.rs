@@ -614,6 +614,8 @@ mod tests {
             optimized_tokens: 400,
             output_tokens: 200,
             tokens_saved: 600,
+            conversation_key: None,
+            conversation_tokens_saved: None,
             attempted_input_tokens: 1000,
             cache_read_tokens: 0,
             cache_write_tokens: 0,

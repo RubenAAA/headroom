@@ -34,11 +34,22 @@ use serde_json::Value;
 
 use super::compressor_registry::{CompressInput, CompressOutput, Compressor, CompressorDescriptor};
 use super::kompress::{KompressResult, DEFAULT_MIN_WORDS, DEFAULT_MODEL_ID, MIN_WORDS};
+use crate::tokenizer::Tokenizer;
 
-/// Accept-any-shrink CCR gate, identical to Python's `KompressCompressor
-/// .compress`: only store + mark when the shrink is worth the retrieval
-/// marker's own cost.
-const CCR_RATIO_GATE: f64 = 0.8;
+/// Token count of a complete payload, in one consistent unit, for the CCR
+/// marker-pays gate (upstream `7bd4dbaf`).
+///
+/// The unit is the generic fixed estimate (4 chars/token). Upstream uses
+/// cl100k_base as its fixed estimate with the same caveat: actual model
+/// tokenizers can differ, and without an encoder the fallback compares
+/// character counts. The gate measures the whole original and the whole
+/// candidate-plus-marker with this — never a marker-only cost against a word
+/// count: the marker is ~90 chars for a 2-word candidate, the words Kompress
+/// drops can be short, and only a comparison of the two complete texts in
+/// one unit establishes that the shipped payload is smaller.
+pub fn payload_tokens(text: &str) -> usize {
+    crate::tokenizer::EstimatingCounter::default().count_text(text)
+}
 
 /// Registered name. Deliberately the same as the in-process compressor's — the
 /// remote client is a drop-in replacement, not a second entry in the registry.
@@ -90,7 +101,7 @@ pub struct RemoteKompressConfig {
     /// Reported as `model_used` when the response omits the field.
     pub model_id: String,
     /// Store the original in the proxy-local CCR store and append a retrieval
-    /// marker when the shrink clears [`CCR_RATIO_GATE`].
+    /// marker when the marked payload pays for itself (see `compress_remote`).
     pub enable_ccr: bool,
     /// Same floor contract as the in-process compressor: configurable, and
     /// clamped up to [`MIN_WORDS`] at the check.
@@ -315,16 +326,46 @@ impl RemoteKompressCompressor {
         // CCR stays PROXY-LOCAL: the endpoint is stateless, so we store the
         // mapping + append the retrieval marker here — same policy and marker
         // format as the in-process compressor.
-        if self.config.enable_ccr && result.compression_ratio < CCR_RATIO_GATE {
+        //
+        // Upstream `7bd4dbaf`: anything the lossy pass shrank must stay
+        // retrievable, and the complete marked payload must be smaller than
+        // the original. Both are measured whole, in one unit
+        // (`payload_tokens`); a candidate that is not strictly smaller
+        // passes through, and the accounting reports that same measurement
+        // so `tokens_saved` describes the shipped payload. The old fixed
+        // `0.8` word-ratio gate did neither: sub-20% shrinks shipped lossy
+        // with no marker (and were then discarded unrecoverable), while a
+        // 12→2 shrink admitted a marker that cost more than the shrink.
+        if self.config.enable_ccr && result.compressed != content {
             if let Some(store) = &self.store {
                 if let Some(cache_key) = store(content, &result.compressed, result.original_tokens)
                 {
-                    result.compressed.push_str(&ccr_marker(
-                        result.original_tokens,
-                        result.compressed_tokens,
-                        content,
-                        &cache_key,
-                    ));
+                    let marked = format!(
+                        "{}{}",
+                        result.compressed,
+                        ccr_marker(
+                            result.original_tokens,
+                            result.compressed_tokens,
+                            content,
+                            &cache_key,
+                        )
+                    );
+                    let original_tokens = payload_tokens(content);
+                    let compressed_tokens = payload_tokens(&marked);
+                    if compressed_tokens >= original_tokens {
+                        return (
+                            self.passthrough(content, n_words),
+                            RemoteOutcome::Compressed(None),
+                        );
+                    }
+                    result.compressed = marked;
+                    result.original_tokens = original_tokens;
+                    result.compressed_tokens = compressed_tokens;
+                    result.compression_ratio = if original_tokens > 0 {
+                        compressed_tokens as f64 / original_tokens as f64
+                    } else {
+                        1.0
+                    };
                     return (result, RemoteOutcome::Compressed(Some(cache_key)));
                 }
             }
@@ -772,7 +813,7 @@ mod tests {
         assert_eq!(r.compressed_tokens, 2);
         assert_eq!(r.compression_ratio, 0.9);
         assert_eq!(r.model_used, "remote-v3");
-        // 0.9 is above the gate, so no CCR store and no marker.
+        // No store wired, so no CCR marking regardless of the ratio.
         assert_eq!(outcome, RemoteOutcome::Compressed(None));
         assert!(!r.compressed.contains("Retrieve more"));
     }
@@ -855,19 +896,61 @@ mod tests {
         assert_eq!(r.model_used, "None");
     }
 
+    /// Content large enough that a real shrink pays for its marker: LONG is
+    /// 12 words (~18 estimated tokens) and the marker alone is ~23, so no
+    /// shrink of LONG can ever clear the marker-pays gate — which is exactly
+    /// the upstream `7bd4dbaf` defect the old tests pinned.
+    fn big_content() -> String {
+        vec![LONG; 20].join(" ")
+    }
+
     #[test]
-    fn a_shrink_below_the_gate_is_stored_and_marked() {
+    fn a_shrink_that_cannot_pay_for_its_marker_passes_through() {
+        // Upstream `7bd4dbaf`: the old 0.17-ratio gate admitted this 12→2
+        // shrink with a marker that cost MORE than the shrink (18 original
+        // tokens vs 23 marked). The whole marked payload must be strictly
+        // smaller, so this passes through with the content intact — and the
+        // store still saw the attempt first (the key is needed to build the
+        // measured candidate).
+        let seen: Arc<Mutex<Vec<(String, String, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let c = client(StubTransport::ok(
+            r#"{"compressed": "alpha bravo", "original_tokens": 12,
+                "compressed_tokens": 2, "compression_ratio": 0.17}"#,
+        ))
+        .with_ccr_store(Arc::new(move |orig, comp, tokens| {
+            sink.lock()
+                .unwrap()
+                .push((orig.to_string(), comp.to_string(), tokens));
+            Some("abc123def456".to_string())
+        }));
+        let (r, outcome) = c.compress_remote(LONG, None);
+        assert_eq!(r.compressed, LONG, "unpayable marker must not ship");
+        assert_eq!(r.original_tokens, 12);
+        assert_eq!(r.compressed_tokens, 12);
+        assert_eq!(r.compression_ratio, 1.0);
+        assert_eq!(outcome, RemoteOutcome::Compressed(None));
+        assert_eq!(seen.lock().unwrap().len(), 1, "store runs before the gate");
+    }
+
+    #[test]
+    fn a_shrink_that_pays_for_its_marker_is_stored_and_marked() {
         let c = client(StubTransport::ok(
             r#"{"compressed": "alpha bravo", "original_tokens": 12,
                 "compressed_tokens": 2, "compression_ratio": 0.17}"#,
         ))
         .with_ccr_store(Arc::new(|_, _, _| Some("abc123def456".to_string())));
-        let (r, outcome) = c.compress_remote(LONG, None);
+        let big = big_content();
+        let (r, outcome) = c.compress_remote(&big, None);
         assert_eq!(
             outcome,
             RemoteOutcome::Compressed(Some("abc123def456".to_string()))
         );
-        // LONG is a single line, hence the singular "source line".
+        // Measured whole-payload accounting, not the endpoint's word counts:
+        // 370 estimated tokens of original vs 23 marked.
+        assert_eq!(r.original_tokens, 370);
+        assert_eq!(r.compressed_tokens, 23);
+        assert!((r.compression_ratio - 23.0 / 370.0).abs() < 1e-12);
         assert_eq!(
             r.compressed,
             "alpha bravo\n[12 items compressed to 2 (from 1 source line). \
@@ -882,12 +965,14 @@ mod tests {
                 "compressed_tokens": 2, "compression_ratio": 0.17}"#,
         ))
         .with_ccr_store(Arc::new(|_, _, _| Some("abc123def456".to_string())));
-        // 12 words over 3 lines: the marker must report lines, not words.
-        let source = "alpha bravo charlie delta\necho foxtrot golf hotel\nindia juliett kilo lima";
-        let (r, _) = c.compress_remote(source, None);
+        // 12 words over 3 lines, repeated past the marker-pays floor: the
+        // marker must report lines, not words.
+        let unit = "a b c d\ne f g h\ni j k l";
+        let source = vec![unit; 15].join("\n");
+        let (r, _) = c.compress_remote(&source, None);
         assert!(
             r.compressed.ends_with(
-                "[12 items compressed to 2 (from 3 source lines). \
+                "[12 items compressed to 2 (from 45 source lines). \
                  Retrieve more: hash=abc123def456]"
             ),
             "{}",
@@ -896,28 +981,25 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_is_exclusive_at_exactly_zero_point_eight() {
-        // Python: `result.compression_ratio < _CCR_RATIO_GATE`.
-        let store: CcrStoreHook = Arc::new(|_, _, _| Some("deadbeef".to_string()));
-        let at_gate = client(StubTransport::ok(
-            r#"{"compressed": "alpha bravo", "compression_ratio": 0.8}"#,
-        ))
-        .with_ccr_store(store.clone());
-        assert!(!at_gate
-            .compress_remote(LONG, None)
-            .0
-            .compressed
-            .contains("hash="));
-
-        let below = client(StubTransport::ok(
-            r#"{"compressed": "alpha bravo", "compression_ratio": 0.79}"#,
-        ))
-        .with_ccr_store(store);
-        assert!(below
-            .compress_remote(LONG, None)
-            .0
-            .compressed
-            .contains("hash="));
+    fn an_unchanged_result_is_neither_stored_nor_marked() {
+        // The endpoint echoed the content: no shrink, nothing to retrieve.
+        let seen: Arc<Mutex<Vec<(String, String, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let body = format!(r#"{{"compressed": "{LONG}"}}"#);
+        let c =
+            client(StubTransport::ok(&body)).with_ccr_store(Arc::new(move |orig, comp, tokens| {
+                sink.lock()
+                    .unwrap()
+                    .push((orig.to_string(), comp.to_string(), tokens));
+                Some("abc123def456".to_string())
+            }));
+        let (r, outcome) = c.compress_remote(LONG, None);
+        assert_eq!(r.compressed, LONG);
+        assert_eq!(outcome, RemoteOutcome::Compressed(None));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an unchanged result must not touch the store"
+        );
     }
 
     #[test]
@@ -995,15 +1077,18 @@ mod tests {
                 "compressed_tokens": 2, "compression_ratio": 0.17}"#,
         ))
         .with_ccr_store(Arc::new(|_, _, _| Some("abc123def456".to_string())));
-        let out = c.compress(&input(LONG));
+        let out = c.compress(&input(&big_content()));
         assert!(out.compressed);
-        assert_eq!(out.tokens_before, 12);
-        assert_eq!(out.tokens_after, 2);
+        // Marker-inclusive accounting: the shipped payload measures 23
+        // estimated tokens against 370 of original.
+        assert_eq!(out.tokens_before, 370);
+        assert_eq!(out.tokens_after, 23);
         assert!(!out.lossless);
         assert_eq!(out.markers.len(), 1);
+        assert!(out.markers[0].contains("hash=abc123def456"));
         assert_eq!(
             out.recoverable.get("abc123def456").map(String::as_str),
-            Some(LONG)
+            Some(big_content().as_str())
         );
         assert!(out.warnings.is_empty());
     }

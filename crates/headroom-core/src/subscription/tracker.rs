@@ -125,9 +125,11 @@ impl SubscriptionTracker {
     /// PR-F3: only a one-way hash + last-4 of the token is retained (for
     /// debugging); the raw bearer never persists past this call.
     pub fn notify_active(&self, token: &str) {
-        let raw = match token.strip_prefix("Bearer ") {
-            Some(r) => r,
-            None => return,
+        // Scheme match is case-insensitive per RFC 7235 §2.1 (upstream
+        // 75105e23); the credential itself stays case-sensitive.
+        let raw = match token.split_once(' ') {
+            Some((scheme, credentials)) if scheme.eq_ignore_ascii_case("bearer") => credentials,
+            _ => return,
         };
         if raw.starts_with("sk-ant-api") {
             return;
@@ -579,6 +581,17 @@ mod tests {
         assert!(!tracker.is_active());
         tracker.notify_active("Bearer oauth-token-abc");
         assert!(tracker.is_active());
+    }
+
+    #[test]
+    fn notify_active_accepts_lowercase_bearer_scheme() {
+        // RFC 7235 §2.1 (upstream 75105e23): the scheme folds.
+        let tracker = tracker_with(None);
+        tracker.notify_active("bearer oauth-token-abc");
+        assert!(tracker.is_active());
+        let tracker = tracker_with(None);
+        tracker.notify_active("bearer sk-ant-api-xyz");
+        assert!(!tracker.is_active());
     }
 
     #[test]

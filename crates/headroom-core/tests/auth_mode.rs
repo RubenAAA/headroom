@@ -57,6 +57,38 @@ fn oauth_real_sk_ant_oat01_classified_oauth() {
 }
 
 #[test]
+fn bearer_scheme_case_insensitive_payg() {
+    // RFC 7235 §2.1 (upstream 75105e23): the scheme folds, so `bearer`
+    // classifies exactly like `Bearer` — previously a PAYG key under a
+    // lowercase scheme fell through to OAuth.
+    let h = headers(&[("authorization", "bearer sk-ant-api03-abc123def456")]);
+    assert_eq!(classify(&h), AuthMode::Payg);
+    let h = headers(&[("authorization", "BeArEr sk-proj-abcdef0123456789")]);
+    assert_eq!(classify(&h), AuthMode::Payg);
+}
+
+#[test]
+fn bearer_scheme_case_insensitive_oauth_shapes() {
+    // OAuth shapes under a lowercase scheme stay OAuth.
+    let h = headers(&[("authorization", "bearer sk-ant-oat01-abc123def456")]);
+    assert_eq!(classify(&h), AuthMode::OAuth);
+    let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.signaturepart";
+    let h = headers(&[("authorization", &format!("bearer {}", jwt))]);
+    assert_eq!(classify(&h), AuthMode::OAuth);
+}
+
+#[test]
+fn bearer_scheme_folds_only_scheme_not_credential() {
+    // Only the scheme is case-folded: an uppercased credential must not
+    // match the lowercase `sk-` PAYG prefixes, and a non-Bearer scheme
+    // keeps the OAuth passthrough-prefer classification.
+    let h = headers(&[("authorization", "bearer SK-ANT-API03-ABC123DEF456")]);
+    assert_eq!(classify(&h), AuthMode::Payg);
+    let h = headers(&[("authorization", "AWS4-HMAC-SHA256 Credential=AKID")]);
+    assert_eq!(classify(&h), AuthMode::OAuth);
+}
+
+#[test]
 fn claude_code_ua_classified_subscription() {
     // Claude Code CLI: `User-Agent: claude-code/1.2.3 ...`.
     let h = headers(&[("user-agent", "claude-code/1.2.3 (darwin; arm64)")]);

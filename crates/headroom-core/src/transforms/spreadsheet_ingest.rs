@@ -8,20 +8,19 @@
 //!
 //! # Parity notes (locked against the Python reference)
 //!
-//! - Python renders rows with stdlib `csv.writer` defaults: comma delimiter,
-//!   minimal quoting (a field is quoted only when it contains a comma, quote,
-//!   CR or LF), embedded `"` doubled, and — crucially — a `\r\n` line
-//!   terminator. The final buffer is `.strip("\n")`-ed, which strips ONLY
-//!   newlines, so every non-empty sheet ends with a dangling `\r` and rows are
-//!   joined by `\r\n`. We reproduce that byte-for-byte (verified against
-//!   CPython output; see the pinned constants in the tests below).
+//! - Python renders rows with stdlib `csv.writer` with `lineterminator="\n"`
+//!   (upstream 10d8f15b; the old `\r\n` default plus `.strip("\n")` left a
+//!   dangling `\r` on the final line) and minimal quoting (a field is quoted
+//!   only when it contains a comma, quote, CR or LF), embedded `"` doubled.
+//!   Fully-blank trailing rows are dropped before rendering (openpyxl's used
+//!   range routinely extends past the last data row). Pinned constants below
+//!   are verified against the fixed CPython output.
 //! - Sheets whose rendered CSV is empty after a whitespace strip are excluded
 //!   from the output entirely, and worksheet insertion order is preserved
 //!   (Python returns a `dict`; we return `Vec<(name, csv)>`).
 //! - openpyxl (`read_only=True, data_only=True`) yields cached formula VALUES,
 //!   not formula strings — calamine does the same by default.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use calamine::{open_workbook, Data, Reader, Xlsx};
@@ -98,19 +97,39 @@ fn write_csv_field(out: &mut String, field: &str) {
     }
 }
 
-/// Render rows to CSV text — Python `_rows_to_csv` semantics: `csv.writer`
-/// defaults (`\r\n` terminator) then `.strip("\n")`, which strips ONLY
-/// newlines at both ends (a trailing `\r` survives).
+/// A row is blank when every field is empty or whitespace-only. Operates on
+/// the stringified row because `cell_to_string` already maps `Data::Empty`
+/// (openpyxl `None`) to `""` — matching Python's `cell is None or
+/// str(cell).strip() == ""` check.
+fn is_blank_row(row: &[String]) -> bool {
+    row.iter().all(|field| field.trim().is_empty())
+}
+
+/// Render rows to CSV text — Python `_rows_to_csv` semantics (upstream
+/// 10d8f15b): drop fully-blank trailing rows, `\n` line terminator.
+///
+/// openpyxl's `iter_rows` walks the sheet's *used range*, which routinely
+/// extends past the last data row (leftover formatting, a cleared cell), so
+/// a real sheet commonly ends in `(None, None, ...)` tuples. Those used to
+/// be written out as blank `,` rows.
+///
+/// `lineterminator="\n"` is load-bearing: `csv.writer` defaults to `\r\n`,
+/// and the old `.strip("\n")` removed only the `\n`, leaving a dangling
+/// `\r` on the final line — noise fed straight to the LLM.
 fn rows_to_csv(rows: &[Vec<String>]) -> String {
+    let mut last = rows.len();
+    while last > 0 && is_blank_row(&rows[last - 1]) {
+        last -= 1;
+    }
     let mut buf = String::new();
-    for row in rows {
+    for row in &rows[..last] {
         for (i, field) in row.iter().enumerate() {
             if i > 0 {
                 buf.push(',');
             }
             write_csv_field(&mut buf, field);
         }
-        let _ = write!(buf, "\r\n");
+        buf.push('\n');
     }
     buf.trim_matches('\n').to_string()
 }
@@ -171,8 +190,8 @@ mod tests {
     /// `headroom.transforms.spreadsheet_ingest.load_spreadsheet` on the same
     /// fixture (see the fixture-generation script in the port notes). Locks:
     /// int→`30`, float→`2.5`/`0.1`, bool→`True`/`False`, None→``, comma/quote/
-    /// newline quoting, doubled quotes, `\r\n` joins, trailing `\r`.
-    const TYPES_EXPECTED: &str = "int,float,text,bool,none,comma,quote,newline\r\n30,2.5,plain,True,,\"a,b\",\"say \"\"hi\"\"\",\"line1\nline2\"\r\n-7,0.1,trail ,False,,,'',end\r";
+    /// newline quoting, doubled quotes, `\n` joins, no trailing `\r`.
+    const TYPES_EXPECTED: &str = "int,float,text,bool,none,comma,quote,newline\n30,2.5,plain,True,,\"a,b\",\"say \"\"hi\"\"\",\"line1\nline2\"\n-7,0.1,trail ,False,,,'',end";
 
     /// The "Data" sheet is deterministic (header + 40 rows); build the pinned
     /// Python reference programmatically. Verified byte-equal against CPython
@@ -181,10 +200,42 @@ mod tests {
         let mut s = String::from("id,name,dept,status");
         for i in 0..40 {
             let dept = ["eng", "sales", "ops"][i % 3];
-            s.push_str(&format!("\r\n{i},user_{i},{dept},active"));
+            s.push_str(&format!("\n{i},user_{i},{dept},active"));
         }
-        s.push('\r'); // trailing \r survives Python's strip("\n")
         s
+    }
+
+    // Mirrors Python test_rows_to_csv_drops_trailing_empty_rows_and_has_no_dangling_cr
+    // (upstream 10d8f15b): trailing all-empty rows are dropped, interior
+    // empties preserved, no stray `\r` anywhere.
+    #[test]
+    fn test_rows_to_csv_drops_trailing_empty_rows_and_has_no_dangling_cr() {
+        let rendered = rows_to_csv(&[
+            vec!["Name".into(), "Age".into()],
+            vec!["Alice".into(), "30".into()],
+            vec!["".into(), "".into()],
+            vec!["".into(), "  ".into()],
+            vec!["".into(), "".into()],
+        ]);
+        assert_eq!(rendered, "Name,Age\nAlice,30");
+        assert!(!rendered.contains('\r'));
+
+        // Interior empty rows are preserved (only the trailing run is dropped).
+        assert_eq!(
+            rows_to_csv(&[
+                vec!["a".into(), "b".into()],
+                vec!["".into(), "".into()],
+                vec!["c".into(), "d".into()],
+                vec!["".into(), "".into()],
+            ]),
+            "a,b\n,\nc,d"
+        );
+
+        // A fully empty sheet renders to the empty string.
+        assert_eq!(
+            rows_to_csv(&[vec!["".into(), "".into()], vec!["".into(), "".into()]]),
+            ""
+        );
     }
 
     // Mirrors Python test_load_and_compress_xlsx (load half): "Empty" sheet

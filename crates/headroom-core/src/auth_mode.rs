@@ -161,7 +161,17 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
         None => "",
     };
 
-    if let Some(token) = auth.strip_prefix("Bearer ") {
+    // The auth-scheme token ("Bearer") is case-insensitive per RFC 7235
+    // §2.1: `Authorization: bearer sk-...` must classify exactly like
+    // `Bearer ...` (upstream 75105e23 — a lowercase scheme used to skip
+    // this branch and misclassify a PAYG key as OAuth). Only the scheme
+    // is folded; the credential keeps its original case (tokens are
+    // case-sensitive, and PAYG `sk-` prefixes are lowercase).
+    let token = match auth.split_once(' ') {
+        Some((scheme, credentials)) if scheme.eq_ignore_ascii_case("bearer") => Some(credentials),
+        _ => None,
+    };
+    if let Some(token) = token {
         // Order matters: the OAuth shape `sk-ant-oat*` shares a
         // prefix with `sk-ant-api*` only at `sk-ant-`, so we check
         // the OAuth shape FIRST. Real OAuth access tokens are

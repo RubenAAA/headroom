@@ -84,6 +84,8 @@ pub(crate) fn build_routed_outcome_context(
         reroute: None,
         // Filled in by the handler when it redacts; see above.
         redact_store: None,
+        // Filled in by the handler from the translated body; see above.
+        conversation_key: None,
     })
 }
 
@@ -149,6 +151,12 @@ pub(crate) struct RoutedOutcomeContext {
     /// `--redact-sensitive` redacted the outbound body. Response arms restore
     /// placeholders through it before anything reaches the client.
     pub(crate) redact_store: Option<crate::redact::RedactStore>,
+    /// Conversation identity for novel-vs-repeat savings attribution
+    /// (upstream `427fa76f`). Set by the handler from the translated body:
+    /// `Some` only on Responses-shape translations carrying an explicit
+    /// conversation id, where the booked per-turn diff is the conversation's
+    /// running total. `None` keeps ordinary per-request accounting.
+    pub(crate) conversation_key: Option<String>,
 }
 
 /// The two model ids a rerouted turn ran under.
@@ -256,6 +264,12 @@ pub(crate) fn book_routed_outcome_with_ccr(
         optimized_tokens: input_tokens,
         output_tokens,
         tokens_saved: ctx.tokens_saved.max(0),
+        // The booked figure is the conversation's running removed-total on
+        // Responses-shape turns, so it is also the ledger total: the funnel
+        // differences it against the stored high-water mark and accumulates
+        // only what is novel this turn.
+        conversation_key: ctx.conversation_key.clone(),
+        conversation_tokens_saved: Some(ctx.tokens_saved.max(0)),
         // Same denominator as `original_tokens` above: the material the
         // transforms were asked to work on, not the provider's billing count.
         // See `OutcomeContext::attempted` on the Claude path for why.
@@ -281,14 +295,24 @@ mod tests {
     use serde_json::json;
     use tracing_subscriber::layer::SubscriberExt;
 
-    fn context(reroute: Option<RerouteOrigin>) -> RoutedOutcomeContext {
+    fn context(
+        reroute: Option<RerouteOrigin>,
+        savings_path: &std::path::Path,
+    ) -> RoutedOutcomeContext {
         RoutedOutcomeContext {
             sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink {
                 cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
                     None, "monthly",
                 )),
+                // Throwaway file: these tests book real outcomes through the
+                // funnel, and the default path is the developer's live
+                // savings file. Booking test turns into it corrupts real
+                // lifetime totals on every `cargo test` run.
                 savings_tracker: std::sync::Arc::new(
-                    headroom_core::savings_tracker::SavingsTracker::new(None, false),
+                    headroom_core::savings_tracker::SavingsTracker::new(
+                        Some(savings_path.join("savings.json")),
+                        false,
+                    ),
                 ),
                 request_logger: std::sync::Arc::new(crate::request_logger::RequestLogger::new(
                     None,
@@ -311,6 +335,7 @@ mod tests {
             usage_observer: None,
             reroute,
             redact_store: None,
+            conversation_key: None,
         }
     }
 
@@ -328,10 +353,14 @@ mod tests {
     /// the upstream has said anything at all.
     #[test]
     fn a_rerouted_turn_reports_what_it_served() {
-        let ctx = context(Some(RerouteOrigin {
-            from_model: "claude-opus-5".to_string(),
-            to_model: "claude-muse-spark-1.3".to_string(),
-        }));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = context(
+            Some(RerouteOrigin {
+                from_model: "claude-opus-5".to_string(),
+                to_model: "claude-muse-spark-1.3".to_string(),
+            }),
+            dir.path(),
+        );
         let usage = json!({"input_tokens": 120, "output_tokens": 34});
         let joined = lines_from(|| book_routed_outcome(&ctx, Some(&usage), 0, 0.0, 200));
 
@@ -360,9 +389,38 @@ mod tests {
     /// nothing to report and the log stays quiet.
     #[test]
     fn a_turn_the_client_routed_itself_reports_nothing() {
-        let ctx = context(None);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = context(None, dir.path());
         let usage = json!({"input_tokens": 120, "output_tokens": 34});
         let joined = lines_from(|| book_routed_outcome(&ctx, Some(&usage), 0, 0.0, 200));
         assert!(!joined.contains("model_route_served"), "{joined}");
+    }
+
+    /// Upstream `427fa76f`: two Responses-shape turns of one conversation
+    /// whose booked totals ran 100 -> 150 removed 50 new tokens on the
+    /// second turn, not 150. The tracker lifetime must hold the running
+    /// novel total (150), not the per-turn sum (250).
+    #[test]
+    fn routed_conversation_turns_accumulate_novel_savings_only() {
+        headroom_core::conversation_savings::reset_conversation_ledger();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut ctx = context(None, dir.path());
+        ctx.conversation_key = Some("routed-novel-test-conv".to_string());
+        ctx.tokens_saved = 100;
+        book_routed_outcome(&ctx, None, 0, 0.0, 200);
+        ctx.tokens_saved = 150;
+        book_routed_outcome(&ctx, None, 0, 0.0, 200);
+        let lifetime = ctx.sink.savings_tracker.snapshot()["lifetime"].clone();
+        assert_eq!(
+            lifetime["requests"].as_i64().unwrap_or(-1),
+            2,
+            "both turns are served requests: {lifetime}"
+        );
+        assert_eq!(
+            lifetime["tokens_saved"].as_i64().unwrap_or(-1),
+            150,
+            "second turn adds only what is novel: {lifetime}"
+        );
+        headroom_core::conversation_savings::reset_conversation_ledger();
     }
 }

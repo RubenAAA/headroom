@@ -34,6 +34,17 @@ use serde_json::json;
 /// when `complete` is set. Everything else about the two streams is identical,
 /// which is what makes the pair a controlled comparison.
 async fn anthropic_upstream(complete: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    anthropic_upstream_with_status(complete, 200).await
+}
+
+/// As [`anthropic_upstream`], but answering with `status`. A 5xx answers a
+/// single `error` event (the shape an exhausted upstream returns) instead of
+/// the usage-carrying frames — the parser lands `Errored`, never
+/// `MessageStop`.
+async fn anthropic_upstream_with_status(
+    complete: bool,
+    status: u16,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral");
@@ -53,11 +64,17 @@ async fn anthropic_upstream(complete: bool) -> (SocketAddr, tokio::task::JoinHan
                                 Result<Frame<Bytes>, std::io::Error>,
                             >(8);
                             tokio::spawn(async move {
-                                let mut frames: Vec<Vec<u8>> = vec![
+                                let mut frames: Vec<Vec<u8>> = if status >= 500 {
+                                    vec![
+                                        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n".to_vec(),
+                                    ]
+                                } else {
+                                    vec![
                                     b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_trunc\",\"model\":\"claude\",\"usage\":{\"input_tokens\":300,\"output_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n".to_vec(),
                                     b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":300,\"output_tokens\":64,\"cache_read_input_tokens\":0}}\n\n".to_vec(),
-                                ];
-                                if complete {
+                                ]
+                                };
+                                if complete && status < 500 {
                                     frames.push(
                                         b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
                                             .to_vec(),
@@ -76,7 +93,7 @@ async fn anthropic_upstream(complete: bool) -> (SocketAddr, tokio::task::JoinHan
                             let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
                             Ok::<_, Infallible>(
                                 Response::builder()
-                                    .status(200)
+                                    .status(status)
                                     .header("content-type", "text/event-stream")
                                     .body(StreamBody::new(stream))
                                     .unwrap(),
@@ -164,4 +181,75 @@ async fn complete_stream_is_booked() {
         "the same stream with its terminal event must still be booked — \
          the gate must not swallow healthy turns"
     );
+}
+
+/// Upstream 4949cd55: an errored stream on a 5xx HTTP status is failed work,
+/// not a success and not an unbooked turn. Before the port the 529 arrived
+/// as `text/event-stream`, skipped the failure branch, and booked a success
+/// at stream close (inflating the save-rate); the `Errored` parser state
+/// alone only reached the unbooked counter.
+#[tokio::test]
+async fn errored_stream_on_5xx_is_booked_failed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let savings_path = dir.path().join("savings.json");
+    let (addr, _upstream) = anthropic_upstream_with_status(false, 529).await;
+    let tracker = Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+        Some(savings_path),
+        false,
+    ));
+    let probe = tracker.clone();
+    let proxy = start_proxy_with_state(
+        &format!("http://{addr}"),
+        |c| {
+            c.compression = true;
+            c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            c.retry_enabled = true;
+            c.retry_max_attempts = 3;
+            c.retry_base_delay_ms = 1;
+            c.retry_max_delay_ms = 10;
+        },
+        move |mut s| {
+            s.savings_tracker = tracker;
+            s
+        },
+    )
+    .await;
+
+    let body = json!({
+        "model": "claude-3-haiku-20240307",
+        "stream": true,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .expect("proxy responds");
+    assert_eq!(resp.status(), 529);
+    let _ = resp.bytes().await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let snap = probe.snapshot();
+    assert_eq!(
+        snap["lifetime"]["requests"].as_i64().unwrap_or(-1),
+        0,
+        "an exhausted 529 must not feed the success stats"
+    );
+    assert_eq!(
+        snap["failed_work"]["requests"].as_i64().unwrap_or(-1),
+        1,
+        "an exhausted 529 must land in failed work"
+    );
+    assert_eq!(
+        snap["failed_work"]["by_status"]["529"]
+            .as_i64()
+            .unwrap_or(-1),
+        1,
+        "failed work is attributed by status"
+    );
+    proxy.shutdown().await;
 }

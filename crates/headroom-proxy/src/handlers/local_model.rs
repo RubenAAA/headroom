@@ -324,6 +324,24 @@ pub async fn handle_messages(
             to_model: body_model.to_string(),
         });
     }
+    // Novel-vs-repeat savings attribution (upstream `427fa76f`): on a
+    // Responses-shape translation the booked per-turn diff is the
+    // conversation's running removed-total, so carry the ledger key. Derived
+    // from the translated body, whose `input` shape the key rules inspect;
+    // identity itself (explicit body ids, session headers) is
+    // transform-stable, so deriving post-translation cannot move the key
+    // mid-conversation the way content-derived identity could. Chat-shape
+    // translations yield `None` by the shape rules and keep per-request
+    // accounting, which is already novel-only there.
+    if let Some(ctx) = outcome_ctx.as_mut() {
+        let session_id = headers
+            .get("conversation_id")
+            .or_else(|| headers.get("session_id"))
+            .or_else(|| headers.get("x-headroom-session-id"))
+            .and_then(|v| v.to_str().ok());
+        ctx.conversation_key =
+            headroom_core::conversation_savings::savings_conversation_key(&openai_body, session_id);
+    }
     // Hand the response arms the redaction memory whenever the flag is on —
     // not only when the outbound body had spans. A clean prompt can still
     // pull secrets mid-turn (memory answers, cold-tier blocks), and the
@@ -481,6 +499,71 @@ mod tests {
         assert_ne!(a, c);
         assert_eq!(a.len(), 36);
         assert_eq!(a.chars().filter(|&ch| ch == '-').count(), 4);
+    }
+
+    /// Upstream `427fa76f` wiring: the translated Responses body carries the
+    /// whole transcript under `input`, so the conversation key derives from
+    /// it plus the session header; a Chat-shape translation yields no key
+    /// (novel-only accounting there, per-request as today).
+    #[test]
+    fn translated_body_feeds_conversation_key_on_responses_shape_only() {
+        use crate::routed::translation::translate_routed_request;
+
+        let parsed = serde_json::json!({
+            "model": "claude-muse-spark-1.3",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-headroom-session-id",
+            axum::http::HeaderValue::from_static("sess-conv-7"),
+        );
+        let upstream: url::Url = "https://example.invalid/v1".parse().unwrap();
+
+        let translated = translate_routed_request(
+            &parsed,
+            &headers,
+            Some("muse-spark-1.3"),
+            &upstream,
+            false,
+            "claude-muse-spark-1.3",
+            "req-conv-key",
+        )
+        .expect("translation succeeds");
+        assert!(
+            translated.openai_body.get("input").is_some(),
+            "Responses translation carries the transcript under `input`"
+        );
+        let session = headers
+            .get("x-headroom-session-id")
+            .and_then(|v| v.to_str().ok());
+        assert!(
+            headroom_core::conversation_savings::savings_conversation_key(
+                &translated.openai_body,
+                session
+            )
+            .is_some(),
+            "session header identifies the conversation"
+        );
+
+        // Chat-shape translation: no `input`, no key.
+        let translated = translate_routed_request(
+            &parsed,
+            &headers,
+            None,
+            &upstream,
+            false,
+            "claude-muse-spark-1.3",
+            "req-conv-key",
+        )
+        .expect("translation succeeds");
+        assert_eq!(
+            headroom_core::conversation_savings::savings_conversation_key(
+                &translated.openai_body,
+                session
+            ),
+            None
+        );
     }
 
     #[tokio::test]

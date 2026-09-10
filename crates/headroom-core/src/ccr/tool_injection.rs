@@ -50,6 +50,21 @@ fn marker_smartcrusher() -> &'static Regex {
     })
 }
 
+/// Bare `Retrieve more: hash=` phrase, regardless of surrounding wording.
+///
+/// CodeCompressor emits `[128 tokens compressed. ... Retrieve more:
+/// hash=<24hex>. Expires in 30m.]` (upstream 12a26b8f): it says "N tokens
+/// compressed." rather than "compressed to M", and the hash is followed by
+/// ". Expires in Nm." before the closing `]` — so every bracket pattern
+/// above misses it. Match the load-bearing phrase directly, the way
+/// `parser.rs` and `compression_units.rs` already detect it by substring.
+fn marker_retrieve_more() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"Retrieve more: hash=([a-f0-9]{12,24})").expect("MARKER_RETRIEVE_MORE is valid")
+    })
+}
+
 // ─── Tool definition creation ────────────────────────────────────────────
 
 /// Create the CCR retrieval tool definition.
@@ -172,6 +187,7 @@ pub fn scan_text_for_markers(text: &str) -> Vec<String> {
     scan(marker_legacy(), text);
     scan(marker_generic(), text);
     scan(marker_smartcrusher(), text);
+    scan(marker_retrieve_more(), text);
 
     hashes
 }
@@ -539,6 +555,17 @@ mod tests {
         let hashes = scan_text_for_markers(text);
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], "abc123def456");
+    }
+
+    #[test]
+    fn scan_text_code_compressor_marker_with_expires_suffix() {
+        // Upstream 12a26b8f: `[128 tokens compressed. ... Retrieve more:
+        // hash=<24hex>. Expires in 30m.]` — no "compressed to M", hash not
+        // followed by `]`. The bracket patterns all miss it.
+        let text = "# [128 tokens compressed. 3 function bodies elided. Retrieve more: \
+                    hash=abc123def456abc123def456. Expires in 30m.]";
+        let hashes = scan_text_for_markers(text);
+        assert_eq!(hashes, vec!["abc123def456abc123def456".to_string()]);
     }
 
     #[test]
