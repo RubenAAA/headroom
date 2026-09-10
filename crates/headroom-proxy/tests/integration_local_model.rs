@@ -272,7 +272,7 @@ async fn codex_translate_route_uses_responses_endpoint() {
 /// reading redacted input.
 #[tokio::test]
 async fn redacted_routed_turn_hides_home_upstream_and_restores_for_client() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ruben".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/testuser".to_string());
     let real_path = format!("{home}/fake-secret-dir/token.txt");
 
     let mock = MockServer::start().await;
@@ -354,7 +354,7 @@ async fn redacted_routed_turn_hides_home_upstream_and_restores_for_client() {
 /// every tool call lands on a placeholder file that does not exist.
 #[tokio::test]
 async fn a_redacted_routed_turn_falls_back_on_restored_text() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ruben".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/testuser".to_string());
     let real_path = format!("{home}/fallback-check/token.txt");
 
     let default = anthropic_default_upstream("from default").await;
@@ -431,7 +431,7 @@ async fn a_redacted_routed_turn_falls_back_on_restored_text() {
 /// it cannot debug with.
 #[tokio::test]
 async fn an_explicit_routed_error_restores_placeholders_for_the_client() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ruben".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/testuser".to_string());
     let real_path = format!("{home}/error-echo/token.txt");
 
     let mock = MockServer::start().await;

@@ -3041,16 +3041,27 @@ static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 
 /// Holds one slot in `INFLIGHT` from `forward_http` entry to any exit,
 /// including `?` returns.
-struct InflightGuard;
+pub(crate) struct InflightGuard;
 
 impl InflightGuard {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self
     }
 
     /// Requests in flight, this one included.
     fn count(&self) -> usize {
+        INFLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Process-wide in-flight requests, for the rotation drain check
+    /// (`GET /debug/inflight`). Covers `forward_http` and the routed
+    /// `handle_messages` path — both hold a guard until the response is
+    /// dispatched (headers-wait, buffered/CCR/fallback), NOT for streamed
+    /// body bytes, which flow after the guard drops. The drain can therefore
+    /// read 0 mid-stream: bounded straggler risk the 90 s timeout accepts,
+    /// not a guarantee of silence.
+    pub(crate) fn count_global() -> usize {
         INFLIGHT.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -10557,7 +10568,7 @@ pub(crate) async fn memory_tool_context(
 }
 
 /// What a memory continuation needs. Assembled at the seam that has the
-/// request in scope, the same way [`crate::handlers::local_model::RoutedCcr`]
+/// request in scope, the same way [`crate::routed::ccr::RoutedCcr`]
 /// is.
 pub(crate) struct MemoryToolContext {
     pub handler: Arc<crate::memory::handler::MemoryHandler>,
@@ -11191,6 +11202,23 @@ fn extract_tool_name(body: &[u8], endpoint: compression::CompressibleEndpoint) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rotation-drain contract (`GET /debug/inflight`): guards held for
+    /// whole turns must move the process counter up on entry and back down
+    /// on drop. Exact asserts are safe here — no lib test drives
+    /// `forward_http`/`handle_messages`, so nothing else holds a guard.
+    #[test]
+    fn inflight_count_tracks_whole_turn_guards() {
+        let before = InflightGuard::count_global();
+        let g1 = InflightGuard::enter();
+        assert_eq!(g1.count(), before + 1);
+        let g2 = InflightGuard::enter();
+        assert_eq!(InflightGuard::count_global(), before + 2);
+        drop(g1);
+        assert_eq!(InflightGuard::count_global(), before + 1);
+        drop(g2);
+        assert_eq!(InflightGuard::count_global(), before);
+    }
 
     /// The gap this closed: a routed turn reaches its upstream through
     /// `handlers::local_model`, never through `forward_http`, so for as
