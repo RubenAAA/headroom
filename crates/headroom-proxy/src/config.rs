@@ -1087,6 +1087,22 @@ pub struct CliArgs {
     )]
     pub ctx_offload_tool_use: bool,
 
+    /// CTX-3: seed a newborn session's offload gate from the same
+    /// conversation's prior session (model switch, resume), so its frozen
+    /// history converts on first sight instead of stalling Deferred until a
+    /// rebuild boundary. Only effective with `--ctx-offload`. Off by default:
+    /// it changes newborn-session wire bytes (raw → digest from request 1,
+    /// which is the entire point), and only same-credential, same-opener
+    /// sessions can donate. Live sessions are never merged into — seeding
+    /// refuses anything the gate already knows.
+    #[arg(
+        long = "ctx-offload-cross-session-seed",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_CROSS_SESSION_SEED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    pub ctx_offload_cross_session_seed: bool,
+
     /// Drop `thinking` blocks from every assistant message but the last, on
     /// rebuild boundaries and history arrivals only — the turns where the
     /// prefix is written fresh anyway. The replay store keeps the stripped
@@ -2259,6 +2275,9 @@ pub struct Config {
     pub ctx_offload_ttl_seconds: u64,
     /// CTX-3: offload large `tool_use` input strings too. Needs `ctx_offload`.
     pub ctx_offload_tool_use: bool,
+    /// CTX-3: seed newborn sessions from the same conversation's prior
+    /// session. Needs `ctx_offload`. Off by default.
+    pub ctx_offload_cross_session_seed: bool,
     /// Drop prior-turn `thinking` blocks on rebuild boundaries and history
     /// arrivals. Never touches the last assistant message.
     pub ctx_drop_prior_thinking: bool,
@@ -2557,6 +2576,7 @@ impl Config {
             ctx_offload_stale_window: args.ctx_offload_stale_window,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_offload_tool_use: args.ctx_offload_tool_use,
+            ctx_offload_cross_session_seed: args.ctx_offload_cross_session_seed,
             ctx_drop_prior_thinking: args.ctx_drop_prior_thinking,
             ctx_inject: args.ctx_inject,
             ccr_context_tracking: args.ccr_context_tracking,
@@ -2806,6 +2826,7 @@ impl Config {
             ctx_offload_stale_window: 0,
             ctx_offload_ttl_seconds: 604_800,
             ctx_offload_tool_use: false,
+            ctx_offload_cross_session_seed: false,
             ctx_drop_prior_thinking: true,
             ctx_inject: false,
             ccr_context_tracking: true,
@@ -3220,6 +3241,16 @@ mod ctx_implies_interception_tests {
     fn exclude_tools_can_be_emptied_explicitly() {
         let c = cfg(&["--exclude-tools", ""]);
         assert!(c.exclude_tools.is_empty());
+    }
+
+    /// Cross-session seeding changes newborn-session wire bytes, so it must
+    /// stay off unless explicitly requested — through the flag and the env.
+    #[test]
+    fn cross_session_seed_defaults_off_and_parses() {
+        assert!(!cfg(&[]).ctx_offload_cross_session_seed);
+        // Bool flags take an explicit value in this CLI (`ArgAction::Set`).
+        assert!(cfg(&["--ctx-offload-cross-session-seed=true"]).ctx_offload_cross_session_seed);
+        assert!(!cfg(&["--ctx-offload-cross-session-seed=false"]).ctx_offload_cross_session_seed);
     }
 
     #[test]

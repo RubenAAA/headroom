@@ -811,7 +811,7 @@ pub fn observe_drift(
     session_key: &str,
     current: StructuralHash,
 ) -> Option<String> {
-    observe(state, session_key, current, Origin::Inbound)
+    observe(state, session_key, current, Origin::Inbound).0
 }
 
 /// The same comparison run over the body the proxy forwards, against its own
@@ -826,7 +826,7 @@ pub fn observe_outbound_drift(
     session_key: &str,
     current: StructuralHash,
 ) -> Option<String> {
-    observe(state, session_key, current, Origin::Outbound)
+    observe(state, session_key, current, Origin::Outbound).0
 }
 
 #[derive(Clone, Copy)]
@@ -835,12 +835,26 @@ enum Origin {
     Outbound,
 }
 
+/// Like [`observe_drift`], plus whether this lane key was observed for the
+/// first time (the `cache_drift_first_request` arm).
+///
+/// Seeding decisions need birth, and `dims.is_none()` is NOT birth — stable
+/// append-only turns also return `None`. Callers must not infer birth from
+/// the dims; use this function.
+pub fn observe_drift_with_birth(
+    state: &DriftState,
+    session_key: &str,
+    current: StructuralHash,
+) -> (Option<String>, bool) {
+    observe(state, session_key, current, Origin::Inbound)
+}
+
 fn observe(
     state: &DriftState,
     session_key: &str,
     current: StructuralHash,
     origin: Origin,
-) -> Option<String> {
+) -> (Option<String>, bool) {
     // `session_key` is really a stream-lane key
     // ([`stream_lane_key`]): the lookup is per lane, but the logged
     // session hash stays the session part so existing dashboards keep
@@ -910,7 +924,7 @@ fn observe(
                 ),
             }
             cache.put(session_key.to_string(), current);
-            None
+            (None, true)
         }
         Some(previous) => {
             let dims = drift_dims(&previous, &current);
@@ -938,7 +952,7 @@ fn observe(
                 // Stable (append-only growth included). No event.
                 // Update LRU recency by reinserting.
                 cache.put(session_key.to_string(), current);
-                None
+                (None, false)
             } else {
                 match origin {
                     Origin::Inbound => tracing::warn!(
@@ -981,7 +995,7 @@ fn observe(
                     ),
                 }
                 cache.put(session_key.to_string(), current);
-                Some(dims)
+                (Some(dims), false)
             }
         }
     }
@@ -1778,6 +1792,30 @@ mod tests {
         let cache = state.cache.lock().unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.peek("session-A"), Some(&h));
+    }
+
+    #[test]
+    fn birth_flag_marks_first_sight_only() {
+        // `dims.is_none()` is NOT birth (stable turns also return None) —
+        // pin the dedicated signal seeding decisions must use.
+        let state = make_state();
+        let h1 = compute_structural_hash(
+            &anthropic_body("sys-A", json!([]), vec!["m1"]),
+            ApiKind::Anthropic,
+        );
+        let h2 = compute_structural_hash(
+            &anthropic_body("sys-B", json!([]), vec!["m1"]),
+            ApiKind::Anthropic,
+        );
+        let (dims, birth) = observe_drift_with_birth(&state, "sess", h1);
+        assert_eq!(dims, None);
+        assert!(birth, "first sight reports birth");
+        let (dims, birth) = observe_drift_with_birth(&state, "sess", h1);
+        assert_eq!(dims, None);
+        assert!(!birth, "stable turn: no dims AND no birth");
+        let (dims, birth) = observe_drift_with_birth(&state, "sess", h2);
+        assert!(dims.is_some(), "drifted turn reports dims");
+        assert!(!birth, "drifted turn is not a birth");
     }
 
     #[test]

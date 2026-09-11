@@ -101,6 +101,36 @@ fn recall_injections_counter(registry: &Registry) -> &'static IntCounter {
     })
 }
 
+fn gate_seeded_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            METRIC_OFFLOAD_GATE_SEEDED_TOTAL,
+            METRIC_OFFLOAD_GATE_SEEDED_TOTAL_HELP,
+        )
+        .expect("offload_gate_seeded_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("offload_gate_seeded_total registers exactly once");
+        c
+    })
+}
+
+fn gate_seed_refused_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL,
+            METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL_HELP,
+        )
+        .expect("offload_gate_seed_refused_live_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("offload_gate_seed_refused_live_total registers exactly once");
+        c
+    })
+}
+
 fn search_queries_counter(registry: &Registry) -> &'static IntCounter {
     static COUNTER: OnceLock<IntCounter> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -205,6 +235,20 @@ pub fn observe_recall_injection() {
     recall_injections_counter(super::prometheus::registry()).inc();
 }
 
+/// Record a cross-session gate seeding. Called from `ctx_offload.rs`
+/// (`seed_newborn_session`) when a newborn session inherits its lineage's
+/// conversions.
+pub fn observe_gate_seeded() {
+    gate_seeded_counter(super::prometheus::registry()).inc();
+}
+
+/// Record a refused seeding (gate already knew the session). The refusal is
+/// the safe outcome; a rising rate alongside zero seedings means the birth
+/// signal is misfiring and deserves a look.
+pub fn observe_gate_seed_refused() {
+    gate_seed_refused_counter(super::prometheus::registry()).inc();
+}
+
 fn injection_clipped_bytes_counter(registry: &Registry) -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -273,6 +317,14 @@ pub fn recall_injections_get(registry: &Registry) -> u64 {
     recall_injections_counter(registry).get()
 }
 
+pub fn gate_seeded_get(registry: &Registry) -> u64 {
+    gate_seeded_counter(registry).get()
+}
+
+pub fn gate_seed_refused_get(registry: &Registry) -> u64 {
+    gate_seed_refused_counter(registry).get()
+}
+
 pub fn search_queries_get(registry: &Registry) -> u64 {
     search_queries_counter(registry).get()
 }
@@ -317,6 +369,14 @@ mod tests {
         let before_inj = recall_injections_get(reg);
         observe_recall_injection();
         assert_eq!(recall_injections_get(reg), before_inj + 1);
+
+        let before_seed = gate_seeded_get(reg);
+        observe_gate_seeded();
+        assert_eq!(gate_seeded_get(reg), before_seed + 1);
+
+        let before_ref = gate_seed_refused_get(reg);
+        observe_gate_seed_refused();
+        assert_eq!(gate_seed_refused_get(reg), before_ref + 1);
 
         let before_q = search_queries_get(reg);
         observe_search_query();

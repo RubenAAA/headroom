@@ -1104,6 +1104,7 @@ mod tests {
             min_bytes: 50_000,
             stale_margin: 0,
             stale_window: 0,
+            cross_session_seed: false,
         };
         let out =
             crate::compression::ctx_offload::offload_anthropic_request(&mut parsed, &cfg, None);

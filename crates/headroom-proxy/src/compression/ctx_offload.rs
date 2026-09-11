@@ -54,15 +54,21 @@
 //! on already-small digests, which is harmless. Both-on is the default posture.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::http::HeaderMap;
 use headroom_core::ccr::compute_key;
 use headroom_core::tokenizer::get_tokenizer;
 use headroom_core::transforms::{compress_block_for_offload, DEFAULT_MODEL};
 use lru::LruCache;
 use serde_json::Value;
+
+use crate::cache_stabilization::drift_detector::{
+    model_free_lineage_key, session_key_log_prefix, ApiKind,
+};
 
 /// Static per-request offload settings (I3: never changes mid-session).
 #[derive(Debug, Clone)]
@@ -159,6 +165,13 @@ pub struct CtxOffloadConfig {
     /// module. Widening it moves `tokens_after` up fast (the last 8 messages are
     /// already 3,699 tokens) and the payback with it.
     pub stale_window: usize,
+    /// Seed a newborn session's gate from the same conversation's prior
+    /// session (model switch, resume), so its frozen history converts on
+    /// first sight instead of stalling Deferred until a boundary. Off by
+    /// default; see `--ctx-offload-cross-session-seed`. Has no effect on
+    /// live sessions (seeding refuses anything the gate already knows) and
+    /// none on wire bytes when no donor exists.
+    pub cross_session_seed: bool,
 }
 
 /// One offloaded block. Its CCR original is stored inline by
@@ -609,7 +622,64 @@ impl OffloadGate {
             })
             .unwrap_or_default()
     }
+}
 
+/// Shared wiring for cross-session gate seeding (P2): call on the drift
+/// first-sight path for a newborn session, before that session's first gate
+/// lookup in the same request (S1a ordering — the drift call sites run before
+/// offload on both the Claude and routed paths).
+///
+/// Records the birth under the session's cross-model lineage, then tries
+/// that lineage's donor sessions in birth order until one seeds (first
+/// non-empty wins) or the gate refuses (already known — benign). No donor,
+/// or no lineage (explicit session id, messageless body), is a silent no-op:
+/// the session warms exactly as it does today.
+///
+/// The caller gates this on `CtxOffloadConfig.cross_session_seed`; the
+/// helper itself is unconditional so unit tests can drive the mechanism
+/// without config plumbing.
+pub fn seed_newborn_session(
+    gate: &OffloadGate,
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+    body: &Value,
+    kind: ApiKind,
+    session_key: &str,
+    request_id: &str,
+) {
+    let Some(lineage) = model_free_lineage_key(headers, client_addr, body, kind) else {
+        return;
+    };
+    gate.note_session_birth(&lineage, session_key);
+    for donor in gate.seed_candidates(&lineage, session_key) {
+        match gate.seed_if_absent(&donor, session_key) {
+            SeedOutcome::Seeded { count } => {
+                tracing::info!(
+                    event = "offload_gate_session_seeded",
+                    request_id = %request_id,
+                    session_key_hash = %session_key_log_prefix(session_key),
+                    donor_session_key_hash = %session_key_log_prefix(&donor),
+                    conversions = count,
+                    "newborn session inherited its lineage's offload conversions; \
+                     known blocks convert on first sight"
+                );
+                crate::observability::ctx_metrics::observe_gate_seeded();
+                return;
+            }
+            SeedOutcome::RefusedLive => {
+                // The gate learned this session between birth detection and
+                // seeding (concurrent double birth, or surviving gate state
+                // after a drift-eviction rebirth). Either way there is nothing
+                // left to do — and nothing safe to merge.
+                crate::observability::ctx_metrics::observe_gate_seed_refused();
+                return;
+            }
+            SeedOutcome::DonorEmpty => continue,
+        }
+    }
+}
+
+impl OffloadGate {
     /// Copy the donor's conversions onto `session`, which has just adopted the
     /// donor's forwarded prefix (see `SessionReplayStore`).
     ///
@@ -1288,6 +1358,7 @@ mod tests {
             min_bytes: min,
             stale_margin: 0,
             stale_window: 0,
+            cross_session_seed: false,
         }
     }
 
@@ -1410,6 +1481,7 @@ mod tests {
                 min_bytes: 200,
                 stale_margin: 0,
                 stale_window: 0,
+                cross_session_seed: false,
             };
             let out = offload_anthropic_request(&mut parsed, &config, None);
             assert_eq!(out.blocks_offloaded, 1, "{tool} must offload");
@@ -1440,6 +1512,7 @@ mod tests {
             min_bytes: 200,
             stale_margin,
             stale_window: 0,
+            cross_session_seed: false,
         }
     }
 
@@ -1478,6 +1551,7 @@ mod tests {
             min_bytes: 200,
             stale_margin: 4,
             stale_window: 0,
+            cross_session_seed: false,
         };
         let out = offload_anthropic_request(&mut parsed, &config, None);
         assert_eq!(out.blocks_offloaded, 0, "WebFetch must stay byte-faithful");
@@ -1691,6 +1765,7 @@ mod tests {
             min_bytes: 200,
             stale_margin,
             stale_window,
+            cross_session_seed: false,
         }
     }
 
@@ -2637,6 +2712,72 @@ mod tests {
                 .len(),
             SEED_MAX_HASHES
         );
+    }
+
+    #[test]
+    fn seed_newborn_session_wires_lineage_to_first_sight_conversion() {
+        // End-to-end at the helper level, exactly as the Claude/routed drift
+        // first-sight paths call it: donor birth recorded, newborn seeded
+        // from the same lineage under a different model, steady-state turn
+        // converts on first sight.
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::cache_stabilization::drift_detector::{model_free_lineage_key, ApiKind};
+
+        let gate = OffloadGate::new(8);
+        let body = "ERROR: disk full\n".repeat(50);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer shared-workspace-token".parse().unwrap(),
+        );
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 4242);
+
+        // Donor lineage converts on a boundary under its own session.
+        let opus = req_frozen(&body);
+        let mut donor = opus.clone();
+        let donor_policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess-opus",
+            rebuild_boundary: true,
+        };
+        assert_eq!(
+            offload_anthropic_request(&mut donor, &cfg(200), Some(&donor_policy)).blocks_offloaded,
+            1
+        );
+        let donor_digest = frozen_result_text(&donor);
+
+        // Newborn lineage: different model, same opener + credential.
+        let mut sonnet = opus.clone();
+        sonnet["model"] = serde_json::json!("sonnet-small");
+
+        // What the drift first-sight path does for the donor at its birth,
+        // then what it does for the newborn: record + seed attempt.
+        let donor_lineage =
+            model_free_lineage_key(&headers, &addr, &opus, ApiKind::Anthropic).expect("lineage");
+        gate.note_session_birth(&donor_lineage, "sess-opus");
+        seed_newborn_session(
+            &gate,
+            &headers,
+            &addr,
+            &sonnet,
+            ApiKind::Anthropic,
+            "sess-sonnet",
+            "req-1",
+        );
+
+        // Steady-state turn on the new session converts on first sight with
+        // the donor's exact bytes.
+        let mut fresh = sonnet.clone();
+        let policy = OffloadPolicy {
+            gate: &gate,
+            session_key: "sess-sonnet",
+            rebuild_boundary: false,
+        };
+        let out = offload_anthropic_request(&mut fresh, &cfg(200), Some(&policy));
+        assert_eq!(out.blocks_offloaded, 1, "seeded lineage converts on sight");
+        assert_eq!(out.blocks_deferred, 0);
+        assert_eq!(frozen_result_text(&fresh), donor_digest);
     }
 
     #[test]

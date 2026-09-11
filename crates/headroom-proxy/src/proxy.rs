@@ -20,8 +20,8 @@ use http_body_util::BodyExt;
 use crate::cache_stabilization;
 use crate::cache_stabilization::beta_sticky::BetaProvider;
 use crate::cache_stabilization::drift_detector::{
-    compute_structural_hash, derive_session_key, observe_drift, stream_lane_key, ApiKind,
-    DriftState,
+    compute_structural_hash, derive_session_key, observe_drift_with_birth, stream_lane_key,
+    ApiKind, DriftState,
 };
 use crate::cache_stabilization::prefix_replay::{SessionReplayStore, REPLAY_STORE_CAPACITY};
 use crate::compression;
@@ -528,6 +528,7 @@ impl AppState {
                                 min_bytes: config.ctx_offload_min_bytes,
                                 stale_margin: config.ctx_offload_stale_messages,
                                 stale_window: config.ctx_offload_stale_window,
+                                cross_session_seed: config.ctx_offload_cross_session_seed,
                             },
                             store: Arc::new(store),
                             // Under the offload store's own directory, so it needs
@@ -3917,8 +3918,35 @@ pub(crate) async fn forward_http(
                 if let (Some(original), Some(slot)) = (previewed, parsed.get_mut("system")) {
                     *slot = original;
                 }
-                let drift_dims = observe_drift(&state.drift_state, &request_lane_key, hash);
+                let (drift_dims, lane_birth) =
+                    observe_drift_with_birth(&state.drift_state, &request_lane_key, hash);
                 rebuild_boundary = drift_dims.is_some();
+
+                // Cross-session gate seeding: a newborn lane whose SESSION the
+                // gate never saw (model switch, resume) inherits the same
+                // conversation's conversions, so known blocks convert on
+                // first sight instead of stalling Deferred. Known-session new
+                // lanes (same session, new system) hit the shared gate and
+                // refuse inside `seed_if_absent` — benign. Runs before the
+                // offload policy below reads the gate (S1a ordering), on the
+                // client's restored body, and only when flagged on.
+                if lane_birth {
+                    if let (Some(runtime), Some(headers)) =
+                        (state.ctx_offload.as_ref(), headers_snapshot.as_ref())
+                    {
+                        if runtime.config.cross_session_seed {
+                            crate::compression::ctx_offload::seed_newborn_session(
+                                &runtime.gate,
+                                headers,
+                                &client_addr,
+                                &parsed,
+                                kind,
+                                &request_session_key,
+                                &request_id,
+                            );
+                        }
+                    }
+                }
 
                 // The hot zone changed, so every prefix this lane had
                 // cached shares a preamble the provider no longer holds —

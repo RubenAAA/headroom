@@ -284,6 +284,24 @@ pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL_HELP: &str =
     "CTX-5/6: count of recall/resume blocks injected into the first user \
      message of a conversation (CTX-4 injection engine).";
 
+// ---------- offload_gate_seeded_total ----------
+
+pub const METRIC_OFFLOAD_GATE_SEEDED_TOTAL: &str = "offload_gate_seeded_total";
+pub const METRIC_OFFLOAD_GATE_SEEDED_TOTAL_HELP: &str =
+    "CTX-3: newborn sessions whose offload gate was seeded from the same \
+     conversation's prior session (model switch, resume). Seeded sessions \
+     convert known blocks on first sight instead of stalling Deferred.";
+
+// ---------- offload_gate_seed_refused_live_total ----------
+
+pub const METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL: &str =
+    "offload_gate_seed_refused_live_total";
+pub const METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL_HELP: &str =
+    "CTX-3: seeding attempts refused because the gate already knew the \
+     session (live session, drift-eviction rebirth with surviving gate \
+     state, or concurrent double birth). Refusal is the safe outcome — \
+     merging into a live session would shift its prefix.";
+
 // ---------- ctx_injection_clipped_bytes_total ----------
 
 pub const METRIC_CTX_INJECTION_CLIPPED_BYTES_TOTAL: &str = "ctx_injection_clipped_bytes_total";

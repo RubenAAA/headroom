@@ -61,7 +61,7 @@ pub(crate) async fn apply_ctx_request_transforms(
 ) -> CtxTransformReport {
     let mut report = CtxTransformReport::default();
     use crate::cache_stabilization::drift_detector::{
-        compute_structural_hash, derive_session_key_with_model, observe_drift, ApiKind,
+        compute_structural_hash, derive_session_key_with_model, observe_drift_with_birth, ApiKind,
     };
 
     // PR-E5: volatile-content detector. Pure observer — one WARN per finding
@@ -104,8 +104,28 @@ pub(crate) async fn apply_ctx_request_transforms(
     // on the session (tenant-scoped recall is shared on purpose).
     let lane_key = crate::cache_stabilization::drift_detector::stream_lane_key(&session_key, &hash);
     report.lane_key = lane_key.clone();
-    let drift_dims = observe_drift(&state.drift_state, &lane_key, hash);
+    let (drift_dims, lane_birth) = observe_drift_with_birth(&state.drift_state, &lane_key, hash);
     let rebuild_boundary = drift_dims.is_some();
+
+    // Cross-session gate seeding: same contract as the Claude path (see
+    // `proxy.rs` drift block) — newborn lane, gate-unknown session inherits
+    // its lineage's conversions before the offload policy below reads the
+    // gate. `parsed` is still the client's pre-transform body here.
+    if lane_birth {
+        if let Some(runtime) = state.ctx_offload.as_ref() {
+            if runtime.config.cross_session_seed {
+                crate::compression::ctx_offload::seed_newborn_session(
+                    &runtime.gate,
+                    headers,
+                    client_addr,
+                    parsed,
+                    ApiKind::Anthropic,
+                    &session_key,
+                    request_id,
+                );
+            }
+        }
+    }
 
     // CTX-7: park conversation identity + drift dims under the request id so
     // the response side can classify this turn's billed usage against the

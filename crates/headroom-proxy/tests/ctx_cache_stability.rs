@@ -35,6 +35,7 @@ fn cfg() -> CtxOffloadConfig {
         min_bytes: MIN_BYTES,
         stale_margin: 0,
         stale_window: 0,
+        cross_session_seed: false,
     }
 }
 
@@ -370,6 +371,7 @@ fn a_stale_margin_never_rewrites_a_settled_prefix() {
         // allowed to rewrite the tail, and does so in
         // `the_stale_window_confines_its_rewrite_to_the_tail`.
         stale_window: 0,
+        cross_session_seed: false,
     };
     // A conversation of Read results — the tool the offload stage stopped
     // excluding — so every block here is a conversion candidate and the
@@ -450,6 +452,7 @@ fn the_stale_window_confines_its_rewrite_to_the_tail() {
         min_bytes: MIN_BYTES,
         stale_margin: MARGIN,
         stale_window: WINDOW,
+        cross_session_seed: false,
     };
     let mut history: Vec<Value> = vec![json!({"role":"user","content":"start the task"})];
     let mut snapshots = Vec::new();

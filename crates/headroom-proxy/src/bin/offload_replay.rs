@@ -196,6 +196,7 @@ fn main() {
         min_bytes,
         stale_margin,
         stale_window,
+        cross_session_seed: false,
     };
     // The gate keys its offloaded-hash sets by session, so one instance covers
     // every session — the same instance the proxy shares across requests. Built
