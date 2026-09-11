@@ -4668,16 +4668,19 @@ pub(crate) async fn forward_http(
                                     compression::CompressibleEndpoint::AnthropicMessages => {
                                         serde_json::json!({
                                             "name": "headroom_retrieve",
-                                            "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. The hash is provided in compression markers like [N items compressed... hash=abc123].",
+                                            "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` from a compression marker like [N items compressed... hash=abc123], or `query` with keywords to search previously offloaded content. Exactly one of the two.",
                                             "input_schema": {
                                                 "type": "object",
                                                 "properties": {
                                                     "hash": {
                                                         "type": "string",
                                                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                                                    },
+                                                    "query": {
+                                                        "type": "string",
+                                                        "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."
                                                     }
-                                                },
-                                                "required": ["hash"]
+                                                }
                                             }
                                         })
                                     }
@@ -4686,16 +4689,19 @@ pub(crate) async fn forward_http(
                                             "type": "function",
                                             "function": {
                                                 "name": "headroom_retrieve",
-                                                "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. The hash is provided in compression markers like [N items compressed... hash=abc123].",
+                                                "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` from a compression marker like [N items compressed... hash=abc123], or `query` with keywords to search previously offloaded content. Exactly one of the two.",
                                                 "parameters": {
                                                     "type": "object",
                                                     "properties": {
                                                         "hash": {
                                                             "type": "string",
                                                             "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                                                        },
+                                                        "query": {
+                                                            "type": "string",
+                                                            "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."
                                                         }
-                                                    },
-                                                    "required": ["hash"]
+                                                    }
                                                 }
                                             }
                                         })
@@ -10503,6 +10509,82 @@ pub(crate) async fn handle_ccr_response(
         // Fetch original content for each CCR call.
         let mut results: Vec<CcrToolResult> = Vec::new();
         for call in &ccr_calls {
+            // Keyword-search path: the model called without a marker hash.
+            // None of the hash machinery below applies (no plausibility
+            // gate, no cold tier — the index IS the store here). Searches
+            // the current project's content index only: the sweep-everything
+            // fallback is a miss-recovery tool, not a search scope.
+            if call.hash_key.is_empty() {
+                if let Some(query) = call.query.clone() {
+                    let project = resolve_ctx_project(Some(outgoing_headers), &current_request);
+                    tracing::info!(
+                        request_id = %request_id,
+                        round = rounds + 1,
+                        query = %query.chars().take(80).collect::<String>(),
+                        event = "ccr_retrieval_call",
+                        "ccr: model asked by query"
+                    );
+                    // sqlite reads block: same blocking pool as the cold
+                    // tier, so the tokio worker driving this turn never
+                    // stalls on a search.
+                    let hits = match stores {
+                        Some(stores) => {
+                            let stores = std::sync::Arc::clone(stores);
+                            let query_for_search = query.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let Some(store) = stores.content(&project) else {
+                                    return Vec::new();
+                                };
+                                store
+                                    .search(
+                                        std::slice::from_ref(&query_for_search),
+                                        &headroom_core::ctx::SearchOpts {
+                                            limit: 3,
+                                            source: None,
+                                            content_type: None,
+                                            sort: headroom_core::ctx::SortMode::Relevance,
+                                        },
+                                    )
+                                    .unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                    crate::observability::ctx_metrics::observe_retrieval(!hits.is_empty());
+                    if hits.is_empty() {
+                        results.push(CcrToolResult {
+                            tool_call_id: call.tool_call_id.clone(),
+                            content: format!(
+                                "Error: no indexed content matched query '{query}'. \
+                                 Try different keywords, or a hash from a compression marker."
+                            ),
+                            success: false,
+                            items_retrieved: 0,
+                        });
+                    } else {
+                        let mut content =
+                            format!("Top {} indexed match(es) for query '{query}':", hits.len());
+                        for hit in &hits {
+                            content.push_str(&format!("\n\n### {}\n{}", hit.title, hit.content));
+                        }
+                        let content = match redact.as_ref() {
+                            Some(r) => crate::redact::redact_string(r, &content),
+                            None => content,
+                        };
+                        results.push(CcrToolResult {
+                            tool_call_id: call.tool_call_id.clone(),
+                            content,
+                            success: true,
+                            items_retrieved: hits.len(),
+                        });
+                    }
+                    continue;
+                }
+                // Empty hash and no query: fall through to the hash path,
+                // which reports it as malformed (existing behavior).
+            }
             // One line per asked hash: sizes repeat-hash waste and names the
             // misses a store-side fix would have to cover.
             tracing::info!(
@@ -11995,6 +12077,108 @@ mod tests {
         // The returned body's own usage stays out of it — the caller adds that.
         assert_eq!(parsed["usage"]["input_tokens"], 7_777);
         assert_ne!(round_usage.input_tokens, 4_000 + 7_777);
+    }
+
+    /// Query path: a `headroom_retrieve` call with `query` and no `hash`
+    /// searches the current project's content index and answers inline.
+    #[tokio::test]
+    async fn handle_ccr_response_anthropic_query_searches_content_index() {
+        use headroom_core::ccr::backends::InMemoryCcrStore;
+        use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Content index with one block containing a distinctive phrase.
+        let dir = tempfile::tempdir().unwrap();
+        let stores = std::sync::Arc::new(crate::ctx::projects::ProjectStores::new(
+            dir.path().to_path_buf(),
+        ));
+        stores
+            .content("testproj")
+            .expect("content store opens")
+            .index_content(
+                "notes",
+                "the needle phrase lives here among ordinary words",
+                &headroom_core::ctx::IndexOpts {
+                    plain_text_lines: Some(50),
+                    ..Default::default()
+                },
+            )
+            .expect("indexing works");
+
+        let server = MockServer::start().await;
+        let final_body = serde_json::json!({
+            "id": "msg_2", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "model": "m", "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 3}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(final_body))
+            .mount(&server)
+            .await;
+
+        let forwarded_request = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        );
+        let upstream_reply = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": CCR_TOOL_NAME,
+                     "input": {"query": "needle phrase"}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 100, "output_tokens": 10}
+            }))
+            .unwrap(),
+        );
+
+        let config = Config::for_test(server.uri().parse().unwrap());
+        let upstream_url: url::Url = format!("{}/v1/messages", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-headroom-project-id",
+            http::HeaderValue::from_static("testproj"),
+        );
+        // The hot CCR store stays empty: the answer must come from the
+        // content index, proving the query path does not need a hash.
+        let ccr_store = InMemoryCcrStore::new();
+
+        let (body, round_usage) = handle_ccr_response(
+            &upstream_reply,
+            &forwarded_request,
+            &upstream_url,
+            &client,
+            &ccr_store as &dyn headroom_core::ccr::CcrStore,
+            Some(&stores),
+            &config,
+            "req-test",
+            &headers,
+            "anthropic",
+            None,
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["content"][0]["text"], "done");
+        assert_eq!(round_usage.rounds, 1);
+
+        // The continuation carried the indexed content back upstream.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let sent_str = serde_json::to_string(&sent).unwrap();
+        assert!(
+            sent_str.contains("needle phrase lives here"),
+            "continuation must carry the indexed hit: {sent_str}"
+        );
     }
 
     /// A streamed continuation response folds back into a turn: backends that

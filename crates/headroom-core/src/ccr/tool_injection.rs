@@ -73,11 +73,17 @@ fn marker_retrieve_more() -> &'static Regex {
 pub fn create_ccr_tool_definition(provider: &str) -> Value {
     let description = "Retrieve original uncompressed content that was compressed to save tokens. \
                        Use this when you need more data than what's shown in compressed tool results. \
-                       The hash is provided in compression markers like [N items compressed... hash=abc123].";
+                       Provide `hash` from a compression marker like [N items compressed... hash=abc123], \
+                       or `query` with keywords to search previously offloaded content. Exactly one of the two.";
 
     let hash_param = json!({
         "type": "string",
         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+    });
+
+    let query_param = json!({
+        "type": "string",
+        "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."
     });
 
     match provider {
@@ -89,9 +95,9 @@ pub fn create_ccr_tool_definition(provider: &str) -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "hash": hash_param
-                    },
-                    "required": ["hash"]
+                        "hash": hash_param,
+                        "query": query_param
+                    }
                 }
             }
         }),
@@ -101,9 +107,9 @@ pub fn create_ccr_tool_definition(provider: &str) -> Value {
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "hash": hash_param
-                },
-                "required": ["hash"]
+                    "hash": hash_param,
+                    "query": query_param
+                }
             }
         }),
         "google" => json!({
@@ -116,9 +122,12 @@ pub fn create_ccr_tool_definition(provider: &str) -> Value {
                     "hash": {
                         "type": "string",
                         "description": "Hash key from the compression marker"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword query to search previously offloaded content"
                     }
-                },
-                "required": ["hash"]
+                }
             }
         }),
         _ => json!({
@@ -129,9 +138,9 @@ pub fn create_ccr_tool_definition(provider: &str) -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "hash": hash_param
-                    },
-                    "required": ["hash"]
+                        "hash": hash_param,
+                        "query": query_param
+                    }
                 }
             }
         }),
@@ -427,6 +436,41 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
     Some(hash_key.to_string())
 }
 
+/// Bound on a `headroom_retrieve` keyword query. FTS tokenizes the input, so
+/// cost stays flat, but an unbounded tool argument is still an invitation to
+/// paste a transcript; overlong queries fall back to "not a CCR call" and the
+/// model gets the usual unresolved-call error it can act on.
+pub const MAX_CCR_QUERY_LEN: usize = 2000;
+
+/// Parse a `headroom_retrieve` keyword-query call.
+///
+/// Returns the trimmed query, or None when this is not a query call (wrong
+/// tool name, no `query` string, empty, or overlong). Hash calls never reach
+/// here with a valid hash — the hash path runs first — but a call carrying
+/// both resolves by hash, so this deliberately does not exclude one.
+pub fn parse_tool_call_query(tool_call: &Value, provider: &str) -> Option<String> {
+    let (name, input_data) = name_and_input(tool_call, provider)?;
+
+    if name != CCR_TOOL_NAME {
+        return None;
+    }
+
+    let query = input_data.get("query")?.as_str()?.trim();
+    if query.is_empty() {
+        return None;
+    }
+    if query.chars().count() > MAX_CCR_QUERY_LEN {
+        tracing::warn!(
+            provider,
+            query_len = query.chars().count(),
+            "CCR tool call query exceeds the length bound; ignoring"
+        );
+        return None;
+    }
+
+    Some(query.to_string())
+}
+
 // ─── PR-B7 Sticky-on ───────────────────────────────────────────────────
 
 /// Determine whether the CCR tool definition should be injected into
@@ -481,6 +525,11 @@ mod tests {
         assert!(def.get("description").is_some());
         assert!(def.get("input_schema").is_some());
         assert!(def.get("function").is_none()); // No function wrapper
+                                                // Both retrieval modes declared; neither required (exactly one).
+        let props = &def["input_schema"]["properties"];
+        assert!(props.get("hash").is_some());
+        assert!(props.get("query").is_some());
+        assert!(def["input_schema"].get("required").is_none());
     }
 
     #[test]

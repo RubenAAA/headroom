@@ -8,7 +8,7 @@
 
 use serde_json::{json, Value};
 
-use super::tool_injection::{parse_tool_call, raw_ccr_hash, CCR_TOOL_NAME};
+use super::tool_injection::{parse_tool_call, parse_tool_call_query, raw_ccr_hash, CCR_TOOL_NAME};
 
 // ─── Residual-CCR classification ─────────────────────────────────────────
 //
@@ -33,6 +33,9 @@ pub const RESIDUAL_CCR_ERROR: &str = "error";
 pub struct CcrToolCall {
     pub tool_call_id: String,
     pub hash_key: String,
+    /// Keyword query when the model called without a marker hash. Empty
+    /// `hash_key` + `Some(query)` is the query path; `None` is the hash path.
+    pub query: Option<String>,
 }
 
 /// Result of handling a CCR tool call.
@@ -383,7 +386,15 @@ impl CCRResponseHandler {
                 }
                 ccr_calls.push(CcrToolCall {
                     tool_call_id,
-                    hash_key,
+                    hash_key: hash_key.clone(),
+                    // Hash path wins when both are present. An empty hash
+                    // (raw fallback on a hashless call) plus a query string
+                    // is the keyword-search path; otherwise None.
+                    query: if hash_key.is_empty() {
+                        parse_tool_call_query(&tc, provider)
+                    } else {
+                        None
+                    },
                 });
             } else {
                 other_calls.push(tc);
@@ -1184,6 +1195,60 @@ mod tests {
         let (ccr, other) = handler.parse_ccr_tool_calls(&response, "anthropic");
         assert_eq!(ccr.len(), 1);
         assert_eq!(ccr[0].hash_key, "");
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn parse_ccr_tool_calls_query_without_hash() {
+        let response = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "tu_q", "name": CCR_TOOL_NAME,
+                 "input": {"query": "provider squad retry logic"}}
+            ]
+        });
+        let handler = CCRResponseHandler::new(None);
+        let (ccr, other) = handler.parse_ccr_tool_calls(&response, "anthropic");
+        assert_eq!(ccr.len(), 1);
+        assert_eq!(ccr[0].hash_key, "");
+        assert_eq!(ccr[0].query.as_deref(), Some("provider squad retry logic"));
+        assert_eq!(ccr[0].tool_call_id, "tu_q");
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn parse_ccr_tool_calls_hash_wins_over_query() {
+        let response = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "tu_both", "name": CCR_TOOL_NAME,
+                 "input": {"hash": "abc123def456abc123def456", "query": "ignored"}}
+            ]
+        });
+        let handler = CCRResponseHandler::new(None);
+        let (ccr, other) = handler.parse_ccr_tool_calls(&response, "anthropic");
+        assert_eq!(ccr.len(), 1);
+        assert_eq!(ccr[0].hash_key, "abc123def456abc123def456");
+        assert_eq!(ccr[0].query, None);
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn parse_ccr_tool_calls_overlong_query_stays_malformed() {
+        let long = "q".repeat(crate::ccr::tool_injection::MAX_CCR_QUERY_LEN + 1);
+        let response = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "tu_long", "name": CCR_TOOL_NAME,
+                 "input": {"query": long}}
+            ]
+        });
+        let handler = CCRResponseHandler::new(None);
+        let (ccr, other) = handler.parse_ccr_tool_calls(&response, "anthropic");
+        assert_eq!(
+            ccr.len(),
+            1,
+            "must still be answered, not handed to the client"
+        );
+        assert_eq!(ccr[0].hash_key, "");
+        assert_eq!(ccr[0].query, None);
         assert!(other.is_empty());
     }
 

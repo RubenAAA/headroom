@@ -315,16 +315,19 @@ pub(crate) async fn apply_ctx_request_transforms(
             if !already_has {
                 tools.push(json!({
                     "name": "headroom_retrieve",
-                    "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. The hash is provided in compression markers like [N items compressed... hash=abc123].",
+                    "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` from a compression marker like [N items compressed... hash=abc123], or `query` with keywords to search previously offloaded content. Exactly one of the two.",
                     "input_schema": {
                         "type": "object",
                         "properties": {
                             "hash": {
                                 "type": "string",
                                 "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."
                             }
-                        },
-                        "required": ["hash"]
+                        }
                     }
                 }));
                 report.transforms_applied.push("ccr_tool".to_string());
