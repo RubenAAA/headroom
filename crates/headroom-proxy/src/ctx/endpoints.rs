@@ -314,6 +314,12 @@ struct StatsResponse {
     retrieval_hits: u64,
     retrieval_misses: u64,
     ccr_entries: usize,
+    /// Newborn sessions seeded from their lineage's prior session (model
+    /// switch, resume). Zero until `--ctx-offload-cross-session-seed` runs
+    /// through a switch — the canary watch field alongside the log event.
+    gate_seeded: u64,
+    /// Seeding attempts refused because the gate already knew the session.
+    gate_seed_refused: u64,
 }
 
 async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, StatusCode> {
@@ -337,6 +343,8 @@ async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsRespons
     let search_queries = crate::observability::ctx_metrics::search_queries_get(registry);
     let retrieval_hits = crate::observability::ctx_metrics::retrieval_hits_get(registry);
     let retrieval_misses = crate::observability::ctx_metrics::retrieval_misses_get(registry);
+    let gate_seeded = crate::observability::ctx_metrics::gate_seeded_get(registry);
+    let gate_seed_refused = crate::observability::ctx_metrics::gate_seed_refused_get(registry);
 
     Ok(Json(StatsResponse {
         offloaded_bytes,
@@ -349,6 +357,8 @@ async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsRespons
         retrieval_hits,
         retrieval_misses,
         ccr_entries,
+        gate_seeded,
+        gate_seed_refused,
     }))
 }
 

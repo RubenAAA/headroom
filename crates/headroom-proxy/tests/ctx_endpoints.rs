@@ -83,6 +83,13 @@ async fn stats_returns_counters() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body.get("offloaded_bytes").is_some());
     assert!(body.get("ccr_entries").is_some());
+    // Seeding counters ride the same response; zero on a fresh proxy, but
+    // the fields must exist so the canary has something to watch.
+    assert_eq!(body.get("gate_seeded").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(
+        body.get("gate_seed_refused").and_then(|v| v.as_u64()),
+        Some(0)
+    );
     proxy.shutdown().await;
 }
 
