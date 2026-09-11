@@ -1758,6 +1758,37 @@ mod tests {
     }
 
     #[test]
+    fn use_feedback_hints_false_matches_true_on_triggering_fixture() {
+        // Parity fixture for the disabled path (ideas/rust-use-feedback-hints-verify).
+        // Feedback is stubbed at Stage 3c.1 — it never produces hints — so the
+        // flag must be behavior-preserving today: true and false crush
+        // byte-identical. Re-check when the Stage 3c.2 feedback integration
+        // lands; a divergence there is expected, not a regression.
+        let mut input = String::from("[");
+        for i in 0..30 {
+            if i > 0 {
+                input.push(',');
+            }
+            input.push_str(r#"{"status":"ok"}"#);
+        }
+        input.push(']');
+        let on = SmartCrusher::without_compaction(SmartCrusherConfig {
+            use_feedback_hints: true,
+            ..Default::default()
+        });
+        let off = SmartCrusher::without_compaction(SmartCrusherConfig {
+            use_feedback_hints: false,
+            ..Default::default()
+        });
+        let r_on = on.crush(&input, "", 1.0);
+        let r_off = off.crush(&input, "", 1.0);
+        assert!(r_on.was_modified, "fixture must trigger compression");
+        assert_eq!(r_off.compressed, r_on.compressed);
+        assert_eq!(r_off.strategy, r_on.strategy);
+        assert_eq!(r_off.was_modified, r_on.was_modified);
+    }
+
+    #[test]
     fn crush_serializes_with_python_safe_format() {
         let c = crusher();
         // SmartCrusher uses Python's `safe_json_dumps`: compact
