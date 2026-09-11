@@ -119,6 +119,23 @@ raised to match. The stricter verbatim exclusion, for results that break on any
 byte change, still applies at every distance. `ctx_offloaded_blocks_by_tool_total{tool}`
 breaks offloaded blocks down by source tool.
 
+### Cross-session seeding (`--ctx-offload-cross-session-seed`, off by default)
+
+A model switch mints a fresh session key — identity folds in the model because
+provider cache lineages are per-model anyway — so the new lineage's offload
+gate starts empty and its frozen history stalls `Deferred` until a rebuild
+boundary. With this flag on, a newborn session inherits its lineage's
+converted-hash set (same credential and same opening message, any model) and
+converts known blocks on first sight with byte-identical digests. The win is
+context bytes on the new lineage, not cache hits: a switch starts a cold
+lineage regardless. Seeding installs only into sessions the gate never saw;
+live sessions refuse, and drift/replay/boundary state stays fully qualified,
+so no cached prefix is ever rewritten. Retrieval needs nothing — the CCR store
+is already global by hash. Watch `offload_gate_session_seeded` (and
+`offload_gate_seeded_total` / `offload_gate_seed_refused_live_total`, also on
+`/ctx/stats` as `gate_seeded` / `gate_seed_refused`) on the first turn after a
+model switch.
+
 ### Phase 4: Context Tracker
 
 Across multiple turns, the Context Tracker:
