@@ -364,6 +364,31 @@ struct PersistedGate {
     hashes: Vec<String>,
 }
 
+/// The cross-session lineage index, as written to disk. Without this, a
+/// restart keeps every session's converted set (gate files) but forgets
+/// which sessions share a lineage — and a post-restart model switch would
+/// cold-start despite a warm donor on disk. Entries mirror the in-memory
+/// index 1:1; a lineage whose sessions all miss is simply never chosen.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedLineages {
+    saved_at_unix: u64,
+    entries: Vec<PersistedLineage>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedLineage {
+    branch: String,
+    first_message_hash: String,
+    sessions: Vec<String>,
+}
+
+/// Where the lineage index lives. Deliberately NOT a session hash: the sweep
+/// keys staleness off mtime, and every birth rewrites this file, so it ages
+/// exactly like the gate files it points at.
+fn lineages_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("lineages.json")
+}
+
 /// How stale a persisted set may be and still be honoured.
 ///
 /// Two bounds, and this sits between them. Below: an hour, after which the
@@ -457,8 +482,69 @@ impl OffloadGate {
             stale_files_removed = swept,
             "persisting offload conversions across restarts"
         );
-        gate.persist_dir = Some(Arc::new(dir));
+        gate.persist_dir = Some(Arc::new(dir.clone()));
+        gate.rehydrate_lineages(&dir);
         gate
+    }
+
+    /// Load the lineage index written by [`Self::note_session_birth`]. Same
+    /// freshness rule as gate files; a stale or unreadable index is an empty
+    /// one (safe fallback: sessions warm as they do today).
+    fn rehydrate_lineages(&self, dir: &std::path::Path) {
+        let restored: usize = std::fs::read(lineages_path(dir))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PersistedLineages>(&bytes).ok())
+            .filter(|g| {
+                gate_unix_now().saturating_sub(g.saved_at_unix) <= GATE_PERSIST_MAX_AGE.as_secs()
+            })
+            .map(|g| {
+                let mut lineages = self.lineages.lock().unwrap_or_else(|p| p.into_inner());
+                let mut n = 0;
+                for e in g.entries {
+                    let mut sessions: VecDeque<String> = e.sessions.into_iter().collect();
+                    sessions.truncate(SEED_LINEAGE_CAP);
+                    if !sessions.is_empty() {
+                        lineages.put((e.branch, e.first_message_hash), sessions);
+                        n += 1;
+                    }
+                }
+                n
+            })
+            .unwrap_or(0);
+        if restored > 0 {
+            tracing::info!(
+                event = "offload_gate_lineages_rehydrated",
+                lineages = restored,
+                "restored cross-session lineage index recorded before this process started"
+            );
+        }
+    }
+
+    /// Snapshot the lineage index for persistence. Cloned under the lock,
+    /// written outside it; the file is tiny (bounded entries × bounded
+    /// sessions) and births are rare.
+    fn persist_lineages(&self, dir: &std::path::Path) {
+        let snapshot: Vec<PersistedLineage> = self
+            .lineages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(
+                |((branch, first_message_hash), sessions)| PersistedLineage {
+                    branch: branch.clone(),
+                    first_message_hash: first_message_hash.clone(),
+                    sessions: sessions.iter().cloned().collect(),
+                },
+            )
+            .collect();
+        let snapshot = PersistedLineages {
+            saved_at_unix: gate_unix_now(),
+            entries: snapshot,
+        };
+        let _ = std::fs::write(
+            lineages_path(dir),
+            serde_json::to_vec(&snapshot).unwrap_or_default(),
+        );
     }
 
     /// Read this session's set into memory if it is not already there.
@@ -603,6 +689,13 @@ impl OffloadGate {
         entry.push_front(session.to_string());
         entry.truncate(SEED_LINEAGE_CAP);
         lineages.put(lineage.clone(), entry);
+        drop(lineages);
+        // No lock nesting (unlike `record`, which serializes writers): the
+        // snapshot is taken above and written below, so lock order cannot
+        // invert no matter who else holds what.
+        if let Some(dir) = self.persist_dir.as_deref() {
+            self.persist_lineages(dir);
+        }
     }
 
     /// Birth-ordered candidate donors for `lineage`, excluding `exclude`.
