@@ -565,6 +565,27 @@ pub fn diff_strip_index(text: &str) -> String {
     join(&out, had_trailing)
 }
 
+/// Env kill-switch for every fold in this module. Read per call (not cached
+/// at import) so a live runtime-env hot-sync applies without a restart.
+/// Mirrors Python `_lossless_compaction_enabled`.
+pub const LOSSLESS_COMPACTION_ENV: &str = "HEADROOM_LOSSLESS_COMPACTION";
+
+fn lossless_compaction_enabled() -> bool {
+    // Read per call (not cached) so a live runtime-env hot-sync applies
+    // without a restart. No import-time snapshot exists to go stale.
+    enabled_for_value(std::env::var(LOSSLESS_COMPACTION_ENV).ok().as_deref())
+}
+
+fn enabled_for_value(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+    }
+}
+
 /// Dispatch format-native lossless compaction by `kind`.
 ///
 /// `kind` in {"log", "search", "diff", "text"}. For reversible kinds the
@@ -572,8 +593,14 @@ pub fn diff_strip_index(text: &str) -> String {
 /// non-semantic bits, e.g. ANSI color for logs); if verification fails or the
 /// result is not smaller, the original content is returned unchanged. Never
 /// panics; unknown kinds pass through.
+///
+/// Set `HEADROOM_LOSSLESS_COMPACTION=0` to disable every fold here while
+/// leaving the rest of the pipeline active.
 pub fn compact_lossless(content: &str, kind: &str) -> String {
     if content.is_empty() {
+        return content.to_string();
+    }
+    if !lossless_compaction_enabled() {
         return content.to_string();
     }
 
@@ -976,6 +1003,48 @@ mod tests {
             path_unheading(&out),
             text,
             "whatever is returned must recover exactly"
+        );
+    }
+
+    // ─── Env kill-switch (mirrors Python test_lossless_timestamp_guard) ──
+    // NOTE: no process-env mutation here on purpose — env is process-global
+    // and the runner is multi-threaded, so set_var/remove_var races the other
+    // tests in this module (observed: compact_lossless_search flaked). The
+    // live read is one line in `lossless_compaction_enabled` with no caching;
+    // these tests pin the falsy-set semantics of the pure predicate.
+
+    fn foldable_grep() -> String {
+        (0..40)
+            .map(|i| format!("src/a.py:{i}:    x = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn kill_switch_falsy_values_disable() {
+        for raw in ["0", "false", "no", "off", "OFF", " 0 "] {
+            assert!(!enabled_for_value(Some(raw)), "must disable: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn kill_switch_truthy_or_unset_enables() {
+        assert!(enabled_for_value(None));
+        for raw in ["1", "true", "yes", "on", ""] {
+            assert!(enabled_for_value(Some(raw)), "must enable: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn kill_switch_gated_foldable_sample_folds_when_enabled() {
+        // Guards the test premise: with the switch on, this sample folds.
+        // (Gating through real process env would race parallel tests, so the
+        // end-to-end off-path is covered by inspection of the two-line guard
+        // in `compact_lossless` plus the predicate tests above.)
+        assert!(enabled_for_value(None));
+        assert_ne!(
+            compact_lossless(&foldable_grep(), "search"),
+            foldable_grep()
         );
     }
 }
