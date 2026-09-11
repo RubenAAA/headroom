@@ -625,6 +625,17 @@ HEADROOM_FLAGS=(
   # 7 days; the gate's own staleness window is 24h
   --ctx-offload-ttl-seconds 604800
 
+  # OFF (default). Seeds a newborn session's offload gate from the same
+  # conversation's prior session, so a model switch (or resume) converts
+  # known frozen blocks on first sight instead of stalling Deferred until
+  # a boundary. Same-credential + same-opener donors only; live sessions
+  # are never merged into. The win is context bytes on the new lineage,
+  # not cache hits (a model switch starts a cold lineage regardless).
+  # Canary: HEADROOM_PROXY_CTX_OFFLOAD_CROSS_SESSION_SEED=true, then watch
+  # `offload_gate_session_seeded` vs `ctx_offload_accounting{deferred}`
+  # on the first turn after a model switch.
+  # --ctx-offload-cross-session-seed true
+
   # Protection knobs — all off, all untried
   --protect-recent false
   --protect-analysis-context false

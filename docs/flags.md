@@ -512,6 +512,13 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --ctx-offload-cross-session-seed <CTX_OFFLOAD_CROSS_SESSION_SEED>
+          CTX-3: seed a newborn session's offload gate from the same conversation's prior session (model switch, resume), so its frozen history converts on first sight instead of stalling Deferred until a rebuild boundary. Only effective with `--ctx-offload`. Off by default: it changes newborn-session wire bytes (raw → digest from request 1, which is the entire point), and only same-credential, same-opener sessions can donate. Live sessions are never merged into — seeding refuses anything the gate already knows
+          
+          [env: HEADROOM_PROXY_CTX_OFFLOAD_CROSS_SESSION_SEED=]
+          [default: false]
+          [possible values: true, false]
+
       --ctx-drop-prior-thinking <CTX_DROP_PRIOR_THINKING>
           Drop `thinking` blocks from every assistant message but the last, on rebuild boundaries and history arrivals only — the turns where the prefix is written fresh anyway. The replay store keeps the stripped bytes on every steady turn after, so no cached prefix is ever rewritten. The last assistant message is never touched: its thinking must stay while a tool loop is open
           
