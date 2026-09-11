@@ -1531,6 +1531,11 @@ pub struct CliArgs {
 
     // ─── Compression tuning ──────────────────────────────────────────────
     /// Minimum token count before a message is eligible for compression.
+    ///
+    /// NO-OP (2026-09-11): the live SmartCrusher path uses its own defaults
+    /// (200) and never reads this value — see ideas/dead-crush-flags.md.
+    /// Kept as a declared flag so existing flag files keep parsing; setting
+    /// it changes nothing until it is wired or removed.
     #[arg(
         long = "min-tokens-to-crush",
         env = "HEADROOM_MIN_TOKENS_TO_CRUSH",
@@ -1539,6 +1544,9 @@ pub struct CliArgs {
     pub min_tokens_to_crush: usize,
 
     /// Max items to retain after SmartCrusher processing.
+    ///
+    /// NO-OP (2026-09-11): same as above — the live path uses its own
+    /// default (15). See ideas/dead-crush-flags.md.
     #[arg(
         long = "max-items-after-crush",
         env = "HEADROOM_MAX_ITEMS_AFTER_CRUSH",
