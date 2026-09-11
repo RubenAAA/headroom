@@ -97,6 +97,15 @@ generated from that output. Regenerate it when you add a flag.
   `install.sh` reads it.
 - `docs/` is reference material. `docs/notes/` is working notes, some stale. Do
   not treat notes as a spec.
+- Before touching proxy behaviour or chasing a saving, read
+  `@docs/notes/learnings/README.md` and the relevant `docs/notes/learnings/*.md`.
+  One file per durable finding; refuted ideas stay to stop retests. Numbers are
+  scoped to their window — do not quote across windows.
+- When asked for optimizations/improvements, triage via
+  `@docs/notes/ideas/README.md`: root = open, `implemented/` = shipped (names
+  commit/flag, do not redo), `rejected/` = measured and declined with the killing
+  number (do not retry without new evidence). When an idea ships or dies, move
+  the file, don't duplicate it.
 
 `crates/headroom-proxy/src/cache_stabilization/` holds the rewrites that stop the
 client invalidating its own cached prefix: TTL forcing, stable tool order, roster
