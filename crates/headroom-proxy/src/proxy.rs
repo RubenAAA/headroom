@@ -3630,6 +3630,11 @@ pub(crate) async fn forward_http(
 
         stage_timer.record("buffer", body_read_start.elapsed().as_secs_f64() * 1000.0);
 
+        // Plan 2 step 1: `parse` gap starts where the buffer stage ends.
+        // Recorded unconditionally after the ctx block closes below, so an
+        // early return between here and there yields a null placeholder.
+        let parse_gap_start = Instant::now();
+
         // Save the original buffer for semantic cache key computation.
         // CTX transforms and compression may modify `buffered`; the
         // cache key must reflect the original request.
@@ -4897,6 +4902,11 @@ pub(crate) async fn forward_http(
             buffered
         };
 
+        // Plan 2 step 1: `parse` gap ends where the ctx block closes. Covers
+        // buffer end through ctx/memory transforms; subtract `memory` to
+        // isolate repeated parses. Unconditional so the stage always reports.
+        stage_timer.record("parse", parse_gap_start.elapsed().as_secs_f64() * 1000.0);
+
         // Phase 3: refine the ingestion `gate_decision` now that the body is
         // parsed and `has_messages` is known. The header/config inputs are
         // unchanged from the gate (bypass + master switch already routed
@@ -5461,6 +5471,9 @@ pub(crate) async fn forward_http(
         // path emits a structured `e4_skipped` event so cache-hit
         // dashboards can attribute miss rates to gating reasons
         // rather than guessing.
+        // Plan 2 step 1: `rewrite` gap starts before the router/prune/image
+        // chain. Recorded unconditionally after the match below.
+        let rewrite_start = Instant::now();
         let body_to_send = match endpoint {
             compression::CompressibleEndpoint::OpenAiChatCompletions
             | compression::CompressibleEndpoint::OpenAiResponses => {
@@ -5521,6 +5534,10 @@ pub(crate) async fn forward_http(
                 }
             }
         };
+
+        // Plan 2 step 1: `rewrite` gap ends here. Anthropic-arm-only content
+        // runs inside the match above; other arms report a small number.
+        stage_timer.record("rewrite", rewrite_start.elapsed().as_secs_f64() * 1000.0);
 
         // Tool schema compaction. Runs last, once tools are final for every
         // endpoint (routing, sanitising, pruning and CCR injection are all
@@ -5659,6 +5676,10 @@ pub(crate) async fn forward_http(
         }
 
         cache_stabilization::capture::maybe_capture_outbound(&body_to_send, &request_id);
+
+        // Plan 2 step 1: `post` gap starts where the footprint stage ends.
+        // Recorded unconditionally just before `pre_forward` below.
+        let post_start = Instant::now();
 
         // Context-editing: when injecting `context_management` directives we
         // must also advertise the beta so the upstream honours them.
@@ -5929,6 +5950,8 @@ pub(crate) async fn forward_http(
         // Everything headroom did before the bytes leave. This is the number
         // that has to be reconstructed from log-line gaps when it is missing,
         // and the one a latency complaint is about.
+        // Plan 2 step 1: `post` gap ends here (footprint end to pre_forward).
+        stage_timer.record("post", post_start.elapsed().as_secs_f64() * 1000.0);
         stage_timer.record("pre_forward", start.elapsed().as_secs_f64() * 1000.0);
 
         retry_body = Some(body_to_send.clone());
@@ -7027,10 +7050,13 @@ pub(crate) async fn forward_http(
         &stage_timer,
         &[
             "buffer",
+            "parse",
             "memory",
             "compression",
             "replay",
+            "rewrite",
             "footprint",
+            "post",
             "pre_forward",
             "upstream",
         ],
