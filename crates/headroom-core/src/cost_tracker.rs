@@ -176,6 +176,11 @@ pub fn merge_cost_stats(
 #[derive(Default, Clone)]
 pub struct TokenRecord {
     pub tokens_saved: i64,
+    /// Tool-schema tokens that never entered context, additive to
+    /// `tokens_saved`. Excluded from the cache-mix tier buckets below (never
+    /// billed in any tier) but folded into token totals and list-priced
+    /// savings like any removed input token.
+    pub tool_schema_saved: i64,
     pub tokens_sent: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
@@ -192,6 +197,10 @@ pub struct TokenRecord {
 #[derive(Default)]
 struct PerModel {
     tokens_saved: HashMap<String, i64>,
+    /// Tool-schema tokens folded into `tokens_saved`, kept split for the
+    /// message/tool audit trail. Never billed in any cache tier, so excluded
+    /// from the `saved_write`/`saved_list` buckets below.
+    tool_schema_saved: HashMap<String, i64>,
     tokens_sent: HashMap<String, i64>,
     requests: HashMap<String, i64>,
     cache_read: HashMap<String, i64>,
@@ -364,7 +373,13 @@ impl CostTracker {
 
         let mut inner = self.inner.lock().unwrap();
         let m = &mut inner.m;
-        *m.tokens_saved.entry(model.to_string()).or_default() += tokens_saved;
+        // Headline: tool-schema tokens never entered context. Folded into
+        // the saved counters and list-priced savings like any removed input;
+        // excluded from the tier buckets below (never billed in any tier).
+        let tool_schema_saved = rec.tool_schema_saved.max(0);
+        let headline_saved = tokens_saved.saturating_add(tool_schema_saved);
+        *m.tokens_saved.entry(model.to_string()).or_default() += headline_saved;
+        *m.tool_schema_saved.entry(model.to_string()).or_default() += tool_schema_saved;
         *m.tokens_sent.entry(model.to_string()).or_default() += rec.tokens_sent;
         *m.requests.entry(model.to_string()).or_default() += 1;
         *m.cache_read.entry(model.to_string()).or_default() += rec.cache_read_tokens;
@@ -481,6 +496,7 @@ impl CostTracker {
         let mut total_saved = 0i64;
         for model in &models {
             let saved = *m.tokens_saved.get(*model).unwrap_or(&0);
+            let tool = *m.tool_schema_saved.get(*model).unwrap_or(&0);
             let sent = *m.tokens_sent.get(*model).unwrap_or(&0);
             let reqs = *m.requests.get(*model).unwrap_or(&0);
             total_saved += saved;
@@ -494,6 +510,8 @@ impl CostTracker {
                 json!({
                     "requests": reqs,
                     "tokens_saved": saved,
+                    "message_tokens_saved": saved - tool,
+                    "tool_schema_saved": tool,
                     "tokens_sent": sent,
                     "cache_write_5m_tokens": m.cache_write_5m.get(*model).copied().unwrap_or(0),
                     "cache_write_1h_tokens": m.cache_write_1h.get(*model).copied().unwrap_or(0),

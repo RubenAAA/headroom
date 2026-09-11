@@ -216,11 +216,15 @@ pub fn check_required_agents(
 
     let mut messages = Vec::new();
     for agent in required_agents {
+        // Headline gate: message compression plus tool-schema tokens that
+        // never entered context. WILL read higher than the old message-only
+        // gate on tool-heavy traffic — that is the semantics change, not a
+        // no-op: the gate now credits the full saving.
         let (before, saved) = records
             .iter()
             .filter(|r| &client_of(r) == agent)
             .fold((0i64, 0i64), |(b, s), r| {
-                (b + r.tokens_before, s + r.tokens_saved)
+                (b + r.headline_before(), s + r.headline_saved())
             });
         let measured = if before > 0 {
             saved as f64 / before as f64 * 100.0
@@ -298,7 +302,7 @@ fn perf_line(
     format!(
         "{timestamp} - headroom.proxy - INFO - [{request_id}] PERF \
          model={model} msgs=3 tok_before={before} tok_after={after} \
-         tok_saved={saved} cache_read=0 cache_write=0 cache_hit_pct=0 \
+         tok_saved={saved} tool_saved=0 total_saved={saved} cache_read=0 cache_write=0 cache_hit_pct=0 \
          opt_ms=1 transforms=agent90_smoke client={client}"
     )
 }

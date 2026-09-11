@@ -188,7 +188,16 @@ impl RequestOutcome {
     /// Dollar counterfactual for this turn's removed input, using the rate
     /// class selected by [`Self::compression_savings_cost_basis`].
     pub fn compression_savings_cost_usd(&self) -> f64 {
-        if self.tokens_saved <= 0 {
+        self.compression_savings_cost_usd_for(self.tokens_saved)
+    }
+
+    /// Same counterfactual priced on an explicit saved-token count. Callers
+    /// booking headline totals (message savings plus additive legs such as
+    /// tool-schema deferral, which the message count never saw) price the
+    /// count they book, keeping the token and dollar columns on one basis.
+    /// The cache-aware rate selection is unchanged.
+    pub fn compression_savings_cost_usd_for(&self, tokens_saved: i64) -> f64 {
+        if tokens_saved <= 0 {
             return 0.0;
         }
         let fallback = crate::savings_ledger::DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN;
@@ -199,7 +208,7 @@ impl RequestOutcome {
             Some(pricing) => pricing.input_cost_per_token,
             None => fallback,
         };
-        self.tokens_saved as f64 * rate
+        tokens_saved as f64 * rate
     }
 
     /// Tokens the forwarded request grew by, if it ended up larger.
@@ -560,12 +569,16 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
     sink.record_request(booked_outcome); // 1
                                          // Durable savings ledger, immediately after the in-memory tracker — the
                                          // same position Python writes it from inside `record_request`. Gated on a
-                                         // real saving so uncompressed requests never touch the disk.
+                                         // real saving so uncompressed requests never touch the disk. The gate is
+                                         // the headline (message + tool-schema tags): a pure-deferral turn books
+                                         // even when message compression saved nothing.
                                          // A rerouted turn also books here even when it compressed nothing: what it
                                          // saved is the bill it never sent to the client's model, and that is worth
                                          // more than any compression delta. The ledger helper still ignores a
                                          // zero-token compression saving, so the disk write stays gated as before.
-    if outcome.tokens_saved > 0 || outcome.routed_from_model.is_some() {
+    if crate::tool_schema_savings::headline_tokens_saved(outcome.tokens_saved, &outcome.tags) > 0
+        || outcome.routed_from_model.is_some()
+    {
         sink.record_savings_ledger(outcome);
     }
     sink.record_tokens(booked_outcome); // 2
@@ -584,10 +597,17 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
     } else {
         String::new()
     };
+    // Headline: message compression plus tool-schema tokens that never
+    // entered context (upstream `tool_saved` / `total_saved`).
+    // `tok_saved` keeps its name and position so old parsers and dashboards
+    // scraping it are unaffected; unknown `k=v` keys are ignored by them.
+    let tool_saved = crate::tool_schema_savings::tool_schema_saved_from_tags(&outcome.tags);
+    let total_saved =
+        crate::tool_schema_savings::headline_tokens_saved(outcome.tokens_saved, &outcome.tags);
     tracing::info!(
         target: "headroom.proxy",
         "[{}] PERF model={} msgs={} tok_before={} tok_after={} tok_saved={} \
-         {}tok_inflated={} \
+         {}tok_inflated={} tool_saved={} total_saved={} \
          cache_read={} cache_write={} cache_hit_pct={} opt_ms={:.0} total_ms={:.0} \
          tok_out={} ttfb_ms={:.0} transforms={}{}",
         outcome.request_id,
@@ -598,6 +618,8 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
         outcome.tokens_saved,
         novel_part,
         outcome.tokens_inflated(),
+        tool_saved,
+        total_saved,
         outcome.cache_read_tokens,
         outcome.cache_write_tokens,
         outcome.cache_hit_pct(),
@@ -661,6 +683,26 @@ mod tests {
         assert_eq!(outcome.compression_savings_cost_basis(), "fresh_input");
         // 1,000 saved tokens at Opus 5's fresh-input rate of $5/MTok.
         assert!((outcome.compression_savings_cost_usd() - 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compression_savings_for_prices_headline_count_at_same_basis() {
+        let outcome = RequestOutcome {
+            model: "claude-opus-5".into(),
+            tokens_saved: 1_000,
+            optimized_tokens: 2_176,
+            cache_read_tokens: 480_000,
+            cache_write_tokens: 1_013,
+            uncached_input_tokens: 2,
+            ..Default::default()
+        };
+
+        // Headline count (message savings + deferral leg) priced at the same
+        // cache-read basis: 50,000 tokens at $0.50/MTok.
+        assert!((outcome.compression_savings_cost_usd_for(50_000) - 0.025).abs() < 1e-12);
+        // Non-positive counts price to zero, matching the message path.
+        assert_eq!(outcome.compression_savings_cost_usd_for(0), 0.0);
+        assert_eq!(outcome.compression_savings_cost_usd_for(-5), 0.0);
     }
 
     #[test]

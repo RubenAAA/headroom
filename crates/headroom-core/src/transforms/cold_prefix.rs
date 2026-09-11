@@ -102,6 +102,158 @@ fn anthropic_family(model: &str) -> Option<&'static str> {
         .find(|fam| m.contains(fam))
 }
 
+/// Env var gating cold-prefix recompaction. Default off (unset/empty):
+/// recompaction rewrites the prefix, so it stays opt-in even though the
+/// gate only fires when the cache is already dead.
+pub const COLD_RECOMPACT_ENV: &str = "HEADROOM_COLD_RECOMPACT";
+
+/// Whether cold recompaction is enabled for `HEADROOM_COLD_RECOMPACT`.
+/// Pure over the env value so tests don't mutate the process environment.
+/// Truthy set mirrors upstream exactly (`1`/`true`/`yes` — notably NOT
+/// `on`/`auto`, unlike the tool-search gate).
+pub fn cold_recompact_enabled_in(raw: Option<&str>) -> bool {
+    matches!(
+        raw.unwrap_or("").trim().to_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// Whether cold recompaction is enabled (reads [`COLD_RECOMPACT_ENV`]).
+pub fn cold_recompact_enabled() -> bool {
+    cold_recompact_enabled_in(std::env::var(COLD_RECOMPACT_ENV).ok().as_deref())
+}
+
+/// Cold-recompact decision for the proxy's replay fork. Pure over inputs so
+/// the gate is unit-testable without a tracker or clock.
+///
+/// - `None` TTL means prompt caching is disabled for this turn: with no
+///   cache there is nothing to bust, so every turn is recompactable
+///   (matches upstream `_cc_ttl is None or ...`).
+/// - `None` idle (unknown session, e.g. first turn) is warm by
+///   construction: conservative, never assume cold.
+pub fn should_cold_recompact(idle_secs: Option<f64>, ttl_secs: Option<u32>) -> bool {
+    let Some(ttl) = ttl_secs else {
+        return true;
+    };
+    let Some(idle) = idle_secs else {
+        return false;
+    };
+    !idle.is_nan() && idle > ttl as f64 + DEFAULT_MARGIN_SECONDS
+}
+
+/// Spark/Responses reasoning summaries: droppable advisory text.
+////// Two shapes, both unsigned (never provider-signed, unlike Claude's
+/// `thinking`/`redacted_thinking` blocks, which are left strictly alone):
+///
+/// * Responses API: `{"type": "reasoning", "summary": [{"type":
+///   "summary_text", "text": "..."}]}` — summary text is advisory; the item
+///   shell (id, encrypted content) stays so references resolve.
+/// * Anthropic-translated: `{"type": "thinking", "thinking": "..."}` with NO
+///   `signature` field — proxy-synthesized or summary-translated. Signed
+///   thinking blocks keep their text: the signature binds it.
+///
+/// On a cold turn the cache is dead, so dropping stale reasoning saves
+/// tokens with nothing to bust. Warm turns never reach this (the gate
+/// decides), which is what makes touching lossy content safe here.
+pub fn has_spark_reasoning_summary(messages: &[Value]) -> bool {
+    messages.iter().any(|m| {
+        let Some(content) = m.get("content").and_then(Value::as_array) else {
+            return false;
+        };
+        content
+            .iter()
+            .any(|b| reasoning_summary_texts(b).next().is_some() || unsigned_thinking(b).is_some())
+    })
+}
+
+/// Iterator over mutable summary-text slots in one block, if any.
+fn reasoning_summary_texts(block: &Value) -> impl Iterator<Item = &str> {
+    let summary = (block.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .then(|| block.get("summary"))
+        .flatten()
+        .and_then(Value::as_array);
+    summary
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// The `thinking` text of an UNSIGNED thinking block, if droppable.
+/// `redacted_thinking` and signed `thinking` blocks return `None` always.
+fn unsigned_thinking(block: &Value) -> Option<&str> {
+    if block.get("type").and_then(Value::as_str) != Some("thinking") {
+        return None;
+    }
+    if block.get("signature").is_some() {
+        return None;
+    }
+    let text = block.get("thinking").and_then(Value::as_str)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// Drop Spark/Responses reasoning summaries in place. Returns the messages
+/// plus the number of blocks stripped. Fail-open: unparseable shapes pass
+/// through; a message left with no content blocks keeps its last block
+/// rather than going out empty.
+pub fn strip_spark_reasoning_summaries(messages: Vec<Value>) -> (Vec<Value>, usize) {
+    let mut stripped = 0usize;
+    let out: Vec<Value> = messages
+        .into_iter()
+        .map(|mut m| {
+            let Some(content) = m.get_mut("content").and_then(|c| c.as_array_mut()) else {
+                return m;
+            };
+            // Pass 1: clear Responses summary text slots.
+            for block in content.iter_mut() {
+                let has_text = reasoning_summary_texts(block).next().is_some();
+                if !has_text {
+                    continue;
+                }
+                if let Some(parts) = block.get_mut("summary").and_then(|s| s.as_array_mut()) {
+                    for part in parts.iter_mut() {
+                        if let Some(obj) = part.as_object_mut() {
+                            if obj.get("text").and_then(Value::as_str).is_some() {
+                                obj.insert("text".to_string(), Value::String(String::new()));
+                                stripped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            // Pass 2: drop unsigned thinking blocks, keeping at least one
+            // block per message so nothing goes out empty.
+            let total = content.len();
+            let droppable = content
+                .iter()
+                .filter(|b| unsigned_thinking(b).is_some())
+                .count();
+            let mut to_drop = if droppable == total {
+                droppable.saturating_sub(1)
+            } else {
+                droppable
+            };
+            if to_drop > 0 {
+                let mut kept: Vec<Value> = Vec::with_capacity(total);
+                for block in content.drain(..) {
+                    if to_drop > 0 && unsigned_thinking(&block).is_some() {
+                        to_drop -= 1;
+                        stripped += 1;
+                    } else {
+                        kept.push(block);
+                    }
+                }
+                *content = kept;
+            }
+            m
+        })
+        .collect();
+    (out, stripped)
+}
+
 /// Collect explicit `cache_control.ttl` strings from a client request.
 ///
 /// Anthropic prompt caching: `{"type":"ephemeral"}` is the 5m default;
@@ -589,5 +741,96 @@ mod tests {
         let (out, transforms) = cold_recompact_messages(&[], None);
         assert!(out.is_empty());
         assert!(transforms.is_empty());
+    }
+
+    #[test]
+    fn recompact_gate_defaults_off() {
+        assert!(!cold_recompact_enabled_in(None));
+        assert!(!cold_recompact_enabled_in(Some("")));
+        for v in ["1", "true", "YES", " yes "] {
+            assert!(cold_recompact_enabled_in(Some(v)), "{v}");
+        }
+        // Notably NOT on/auto: mirrors upstream exactly.
+        for v in ["0", "false", "no", "off", "on", "auto"] {
+            assert!(!cold_recompact_enabled_in(Some(v)), "{v}");
+        }
+    }
+
+    #[test]
+    fn spark_reasoning_summary_detected() {
+        let messages = vec![json!({"role": "assistant", "content": [
+            {"type": "reasoning", "id": "rs_1", "summary": [
+                {"type": "summary_text", "text": "considered three approaches"},
+            ]},
+        ]})];
+        assert!(has_spark_reasoning_summary(&messages));
+        // Signed Claude thinking is NOT a Spark summary.
+        let signed = vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": "abc"},
+        ]})];
+        assert!(!has_spark_reasoning_summary(&signed));
+        // Empty summary text is nothing to strip.
+        let empty = vec![json!({"role": "assistant", "content": [
+            {"type": "reasoning", "id": "rs_1", "summary": [
+                {"type": "summary_text", "text": "  "},
+            ]},
+        ]})];
+        assert!(!has_spark_reasoning_summary(&empty));
+    }
+
+    #[test]
+    fn spark_strip_clears_summaries_keeps_shell() {
+        let messages = vec![json!({"role": "assistant", "content": [
+            {"type": "reasoning", "id": "rs_1",
+             "encrypted_content": "opaque",
+             "summary": [{"type": "summary_text", "text": "stale reasoning"}]},
+            {"type": "text", "text": "answer"},
+        ]})];
+        let (out, stripped) = strip_spark_reasoning_summaries(messages);
+        assert_eq!(stripped, 1);
+        assert_eq!(out[0]["content"][0]["text"], Value::Null);
+        assert_eq!(out[0]["content"][0]["summary"][0]["text"], json!(""));
+        assert_eq!(out[0]["content"][0]["id"], json!("rs_1"));
+        assert_eq!(out[0]["content"][0]["encrypted_content"], json!("opaque"));
+    }
+
+    #[test]
+    fn spark_strip_drops_unsigned_thinking_keeps_signed() {
+        let messages = vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "synthesized, safe to drop"},
+            {"type": "thinking", "thinking": "provider-bound", "signature": "sig"},
+            {"type": "text", "text": "answer"},
+        ]})];
+        let (out, stripped) = strip_spark_reasoning_summaries(messages);
+        assert_eq!(stripped, 1);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["signature"], json!("sig"));
+    }
+
+    #[test]
+    fn spark_strip_never_empties_a_message() {
+        let messages = vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "only block"},
+        ]})];
+        let (out, stripped) = strip_spark_reasoning_summaries(messages);
+        assert_eq!(stripped, 0);
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recompact_decision_follows_ttl_and_idle() {
+        // Disabled caching (no TTL): nothing to bust, always recompactable.
+        assert!(should_cold_recompact(Some(10.0), None));
+        // Unknown session: conservative warm, never assume cold.
+        assert!(!should_cold_recompact(None, Some(300)));
+        // Idle past TTL + margin: cold.
+        assert!(should_cold_recompact(Some(400.0), Some(300)));
+        // Within TTL + margin: warm (strictly greater; margin default 60s).
+        assert!(!should_cold_recompact(Some(10.0), Some(300)));
+        assert!(!should_cold_recompact(Some(360.0), Some(300)));
+        assert!(should_cold_recompact(Some(361.0), Some(300)));
+        // Garbage idle: warm.
+        assert!(!should_cold_recompact(Some(f64::NAN), Some(300)));
     }
 }

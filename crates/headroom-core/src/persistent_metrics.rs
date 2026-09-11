@@ -673,6 +673,10 @@ pub struct RecordRequest {
     pub attempted_input_tokens: i64,
     /// Input tokens compression removed.
     pub tokens_saved: i64,
+    /// Tool-schema tokens that never entered context, additive to
+    /// `tokens_saved`. Folded into token totals; cost legs price it like any
+    /// removed input token.
+    pub tool_schema_saved: i64,
     /// Whether the request hit the prefix cache.
     pub cached: bool,
     /// Whether to count the stack label; `false` when the caller already did.
@@ -707,6 +711,7 @@ impl Default for RecordRequest {
             output_tokens: 0,
             attempted_input_tokens: 0,
             tokens_saved: 0,
+            tool_schema_saved: 0,
             cached: false,
             // Python's default is `record_stack=True`.
             record_stack: true,
@@ -1138,6 +1143,10 @@ impl PersistentMetricsState {
         let output_delta = clamp_int(request.output_tokens);
         let attempted_delta = clamp_int(request.attempted_input_tokens);
         let saved_delta = clamp_int(request.tokens_saved);
+        // Headline: tool-schema tokens never entered context, so they add to
+        // the saving without changing any denominator they never belonged to.
+        let tool_delta = clamp_int(request.tool_schema_saved);
+        let headline_delta = saved_delta.saturating_add(tool_delta);
         let provider_label = label(request.provider.as_deref());
         let stack_label = label(request.stack.as_deref());
 
@@ -1157,7 +1166,7 @@ impl PersistentMetricsState {
         tokens.input += input_delta;
         tokens.output += output_delta;
         tokens.attempted_input += attempted_delta;
-        tokens.saved += saved_delta;
+        tokens.saved += headline_delta;
 
         let cache = &mut self.state.prefix_cache;
         cache.requests += 1;
@@ -1195,7 +1204,7 @@ impl PersistentMetricsState {
             input_delta,
             output_delta,
             attempted_delta,
-            saved_delta,
+            headline_delta,
         );
     }
 

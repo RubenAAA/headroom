@@ -48,6 +48,12 @@ export DEEPSEEK_API_KEY="sk-your-deepseek-key-here"
 
 ## 3. Start the proxy
 
+> **Which proxy?** The commands below use the Python `headroom proxy` CLI. On
+> the Rust proxy (`headroom-proxy`) replace `--openai-api-url <URL>` with the
+> required `--upstream <URL>` (dashboard auto-labels the host the same way);
+> output shaping is `--output-shaper` (`HEADROOM_OUTPUT_SHAPER` also works) —
+> run `headroom-proxy --help` for the flag list.
+
 ```bash
 headroom proxy \
   --port 8787 \

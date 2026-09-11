@@ -324,6 +324,10 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_HOST` | Proxy bind host | `127.0.0.1` |
 | `HEADROOM_PORT` | Proxy bind port | `8787` |
 | `HEADROOM_MODE` | Proxy optimization mode: `token` or `cache` | `cache` |
+| `HEADROOM_TOOL_SEARCH` | Defer non-core tool schemas behind a tool-search tool on first-party Anthropic routes (`0` opts out; read per request, no restart needed) | `1` |
+| `HEADROOM_COLD_RECOMPACT` | Recompact the whole prefix (lossless folds, Spark reasoning-summary strip) instead of byte-replaying it when the lane has been idle past the request's real cache TTL. Default off (`1`/`true`/`yes` opts in); warm lanes are byte-identical either way | -- |
+| `HEADROOM_PROVIDER_NAME` | Rust proxy: display name for the OpenAI-compatible upstream in `/stats` (e.g. `OpenRouter`). Overrides hostname detection from the configured upstream URL; routing and pricing are unaffected. flag: `--provider-name` | -- |
+| `HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` | CIDRs authorized for sensitive `/stats` metadata (per-request rows, project names) and remote dashboards. Loopback callers always pass; empty (default) authorizes loopback only. Malformed entries fail startup loudly. Separate from the gateway list; also requires same-origin provenance when browsers send it | -- |
 | `HEADROOM_WORKERS` | Uvicorn worker count | `1` |
 | `HEADROOM_LIMIT_CONCURRENCY` | Maximum concurrent connections before 503 | `1000` |
 | `HEADROOM_MAX_CONNECTIONS` | Maximum upstream HTTP connections | `500` |
@@ -357,11 +361,11 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_PROXY_BETA_HEADER_STICKY` | Rust proxy: same per-conversation beta-token union as `HEADROOM_BETA_HEADER_STICKY`, applied to `anthropic-beta` / `openai-beta` on the intercepted `/v1/messages`, `/v1/chat/completions`, and `/v1/responses` routes. Requires the compression interceptor (`HEADROOM_PROXY_COMPRESSION=1`) — with it off the Rust proxy is a strict byte-pipe and this flag has no effect (startup warns). Unlike the Python tracker (keyed on model + system prompt), sessions are keyed per conversation, shared with the cache-drift detector — parallel conversations never inherit each other's tokens. `enabled` default; `disabled` forwards the client value verbatim and keeps no state. Tracker capacity is fixed at 1000 sessions. | `enabled` |
 | `HEADROOM_MODEL_ROUTER_ENABLED` | Enable cost-aware model routing. `1`/`true`/`yes`/`on`/`enabled` turns it on and requires `HEADROOM_MODEL_ROUTES`. See [Cost-aware model routing](/docs/configuration#cost-aware-model-routing). | `off` |
 | `HEADROOM_MODEL_ROUTES` | JSON array of ordered routing rules for cost-aware model routing (schema below). | -- |
-| `HEADROOM_THINKING_COMPACT` | Compact plain-text reasoning that models re-send every turn (Kimi/GLM/DeepSeek `reasoning_content` / inline `<think>`): Kompress it on warm turns, drop it on cold turns. No-op for Claude/Codex/OpenAI (encrypted reasoning). See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
-| `HEADROOM_THINKING_COMPACT_KEEP_LAST` | Most-recent assistant turns whose reasoning is left intact (the active reasoning the model still uses). Only applies with `HEADROOM_THINKING_COMPACT`. | `1` |
-| `HEADROOM_COLD_RECOMPACT` | On a confirmed-cold turn (idle past the real cache TTL), recompact the whole prefix — cross-turn dedupe + superseded-read drop + lossless folds — instead of forwarding a byte-identical prefix to a dead cache. Warm turns unchanged. Pair with `HEADROOM_DEDUPE`. See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
-| `HEADROOM_DEDUPE` | Whole-conversation verbatim cross-turn dedup in the router (cache-safe, information-preserving via retrieval markers). Superseded-read drop + lossless folds run without it; this adds verbatim dedup. | `off` |
-| `HEADROOM_CACHE_TTL_LEARN` | Append per-turn cache-outcome observations (provider, model, idle, hit/miss) to `cache_ttl_observations.jsonl` for the offline `headroom-cache-ttl` learner. Observation-only (no request-behavior change); respects `HEADROOM_STATELESS`; the log is size-bounded. | `off` |
+| `HEADROOM_THINKING_COMPACT` | **Python proxy only** (not wired in the Rust proxy — the `thinking_compactor` transform exists in `headroom-core` but no request path calls it). Compact plain-text reasoning that models re-send every turn (Kimi/GLM/DeepSeek `reasoning_content` / inline `<think>`): Kompress it on warm turns, drop it on cold turns. No-op for Claude/Codex/OpenAI (encrypted reasoning). See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
+| `HEADROOM_THINKING_COMPACT_KEEP_LAST` | Most-recent assistant turns whose reasoning is left intact (the active reasoning the model still uses). Only applies with `HEADROOM_THINKING_COMPACT` (Python proxy only). | `1` |
+| `HEADROOM_COLD_RECOMPACT` | On a confirmed-cold turn (idle past the real cache TTL), recompact the whole prefix — cross-turn dedupe + superseded-read drop + lossless folds — instead of forwarding a byte-identical prefix to a dead cache. Warm turns unchanged. Python proxy: pair with `HEADROOM_DEDUPE`. Rust proxy: supported — the dedupe pass runs inside the recompact step, so no second flag is needed. See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
+| `HEADROOM_DEDUPE` | **Python proxy only** (no Rust equivalent — the Rust cold-recompact pass includes verbatim cross-turn dedupe internally when `HEADROOM_COLD_RECOMPACT=1`). Whole-conversation verbatim cross-turn dedup in the router (cache-safe, information-preserving via retrieval markers). Superseded-read drop + lossless folds run without it; this adds verbatim dedup. | `off` |
+| `HEADROOM_CACHE_TTL_LEARN` | **Python proxy only** (the Rust proxy uses conservative static TTLs; there is no Rust estimator — see cold-detection notes below). Append per-turn cache-outcome observations (provider, model, idle, hit/miss) to `cache_ttl_observations.jsonl` for the offline `headroom-cache-ttl` learner. Observation-only (no request-behavior change); respects `HEADROOM_STATELESS`; the log is size-bounded. | `off` |
 | `HEADROOM_KOMPRESS_ENDPOINT` / `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | Offload ML compression (Kompress) to a remote endpoint instead of the local ONNX model — used by reasoning compaction and the router when set. | -- |
 | `HEADROOM_1M_MODEL` | Fallback model that `headroom wrap claude --1m` targets when neither `--model` nor `ANTHROPIC_MODEL` is set. Accepts the id with or without the `[1m]` suffix (added when absent); an explicit `--model` / `ANTHROPIC_MODEL` always wins. See [Claude 1M context window](#claude-1m-context-window-headroom-wrap-claude---1m). | `claude-opus-5` |
 
@@ -372,15 +376,20 @@ For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide varia
 Two related optimizations target tokens that agent harnesses re-send every turn:
 model **reasoning** (re-billed as input on Kimi/GLM/DeepSeek and on Claude 4.6+),
 and the **prefix** itself once its prompt cache has lapsed. All flags below are
-**off by default** — the base proxy is unchanged until you opt in.
+**off by default** — the base proxy is unchanged until you opt in. Port status:
+this section was written for the Python proxy; in the Rust proxy only
+`HEADROOM_COLD_RECOMPACT` is wired (the recompact pass includes the dedupe
+internally, and the Spark reasoning-summary strip always runs on cold turns).
+`HEADROOM_THINKING_COMPACT`, `HEADROOM_DEDUPE`, and `HEADROOM_CACHE_TTL_LEARN`
+are Python-only — setting them has no effect on the Rust proxy.
 
 **What to set for what:**
 
 | Goal | Set | Notes |
 |------|-----|-------|
-| Shrink Kimi/GLM/DeepSeek reasoning re-sent each turn | `HEADROOM_THINKING_COMPACT=1` (+ `HEADROOM_KOMPRESS_ENDPOINT` for the best ratio) | Warm turns Kompress the reasoning; cold turns drop it. No-op for Claude/Codex/OpenAI (their reasoning is an encrypted handle, already cheap on resend). |
-| Recompact a dead-cache prefix instead of re-sending it whole | `HEADROOM_COLD_RECOMPACT=1` (+ `HEADROOM_DEDUPE=1`) | Fires only when the cache has genuinely lapsed. Works in both `cache` and `token` mode. |
-| Learn each provider's real cache TTL | `HEADROOM_CACHE_TTL_LEARN=1`, then run the `headroom-cache-ttl` estimator periodically | Sharpens cold detection for providers that don't expose a TTL (Kimi/OpenAI). |
+| Shrink Kimi/GLM/DeepSeek reasoning re-sent each turn | `HEADROOM_THINKING_COMPACT=1` (+ `HEADROOM_KOMPRESS_ENDPOINT` for the best ratio) | Python proxy only — no-op on the Rust proxy. Warm turns Kompress the reasoning; cold turns drop it. No-op for Claude/Codex/OpenAI (their reasoning is an encrypted handle, already cheap on resend). |
+| Recompact a dead-cache prefix instead of re-sending it whole | `HEADROOM_COLD_RECOMPACT=1` (Python: + `HEADROOM_DEDUPE=1`; Rust: the dedupe runs inside the recompact pass) | Fires only when the cache has genuinely lapsed. Works in both `cache` and `token` mode. |
+| Learn each provider's real cache TTL | `HEADROOM_CACHE_TTL_LEARN=1`, then run the `headroom-cache-ttl` estimator periodically | Python tooling only — the Rust proxy uses conservative static TTLs. Sharpens cold detection for providers that don't expose a TTL (Kimi/OpenAI). |
 
 **How cold detection knows the TTL.** A wrong "cold" call would recompact a
 *warm* prefix and bust the cache, so the TTL must be right:

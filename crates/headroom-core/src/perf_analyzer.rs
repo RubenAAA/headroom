@@ -120,6 +120,10 @@ pub struct PerfRecord {
     pub tokens_before: i64,
     pub tokens_after: i64,
     pub tokens_saved: i64,
+    /// Tool-schema tokens that never entered context (deferral/hook shrink),
+    /// additive to `tokens_saved`. Parsed from `tool_saved=`; absent on old
+    /// lines, which default to 0 and reproduce current sums exactly.
+    pub tool_saved: i64,
     pub cache_read: i64,
     pub cache_write: i64,
     pub cache_hit_pct: i64,
@@ -129,6 +133,21 @@ pub struct PerfRecord {
     pub tokens_out: i64,
     pub ttfb_ms: f64,
     pub stages: HashMap<String, f64>,
+}
+
+impl PerfRecord {
+    /// Single "tokens saved" figure: message compression plus tool-schema
+    /// tokens that never entered context. Mirrors
+    /// `tool_schema_savings::headline_tokens_saved` over the parsed fields.
+    pub fn headline_saved(&self) -> i64 {
+        self.tokens_saved.saturating_add(self.tool_saved).max(0)
+    }
+
+    /// Headline denominator: tool tokens were never in `tokens_before`, so
+    /// the percent must move the denominator with the numerator.
+    pub fn headline_before(&self) -> i64 {
+        self.tokens_before.saturating_add(self.tool_saved).max(0)
+    }
 }
 
 /// A parsed content_router summary line.
@@ -320,6 +339,7 @@ impl Parser {
                 tokens_before: int("tok_before"),
                 tokens_after: int("tok_after"),
                 tokens_saved: int("tok_saved"),
+                tool_saved: int("tool_saved"),
                 cache_read: int("cache_read"),
                 cache_write: int("cache_write"),
                 cache_hit_pct: int("cache_hit_pct"),
@@ -993,9 +1013,14 @@ pub fn format_report(report: &PerfReport, cli: Option<&CliFiltering>) -> String 
     if !records.is_empty() {
         let total_before: i64 = records.iter().map(|r| r.tokens_before).sum();
         let total_after: i64 = records.iter().map(|r| r.tokens_after).sum();
-        let total_saved: i64 = records.iter().map(|r| r.tokens_saved).sum();
-        let pct = if total_before > 0 {
-            total_saved as f64 / total_before as f64 * 100.0
+        // Headline: message compression plus tool-schema tokens that never
+        // entered context. The denominator moves with the numerator — tool
+        // tokens were never in `tokens_before`.
+        let total_saved: i64 = records.iter().map(|r| r.headline_saved()).sum();
+        let total_tool: i64 = records.iter().map(|r| r.tool_saved).sum();
+        let headline_before: i64 = records.iter().map(|r| r.headline_before()).sum();
+        let pct = if headline_before > 0 {
+            total_saved as f64 / headline_before as f64 * 100.0
         } else {
             0.0
         };
@@ -1007,6 +1032,14 @@ pub fn format_report(report: &PerfReport, cli: Option<&CliFiltering>) -> String 
             commafy(total_after)
         ));
         lines.push(format!("Total saved:  {} tokens", commafy(total_saved)));
+        if total_tool > 0 {
+            let total_msg = total_saved - total_tool;
+            lines.push(format!(
+                "  · messages {} / · tool schemas {}",
+                commafy(total_msg),
+                commafy(total_tool)
+            ));
+        }
         lines.push(String::new());
 
         let mut by_model: std::collections::BTreeMap<&str, Vec<&PerfRecord>> = Default::default();
@@ -1016,8 +1049,8 @@ pub fn format_report(report: &PerfReport, cli: Option<&CliFiltering>) -> String 
         lines.push("Per-Model Breakdown".to_string());
         lines.push("-".repeat(40));
         for (model, model_recs) in &by_model {
-            let m_saved: i64 = model_recs.iter().map(|r| r.tokens_saved).sum();
-            let m_before: i64 = model_recs.iter().map(|r| r.tokens_before).sum();
+            let m_saved: i64 = model_recs.iter().map(|r| r.headline_saved()).sum();
+            let m_before: i64 = model_recs.iter().map(|r| r.headline_before()).sum();
             let m_pct = if m_before > 0 {
                 m_saved as f64 / m_before as f64 * 100.0
             } else {
@@ -1292,6 +1325,7 @@ pub const PERF_RECORD_FIELDS: &[&str] = &[
     "tokens_before",
     "tokens_after",
     "tokens_saved",
+    "tool_saved",
     "cache_read",
     "cache_write",
     "cache_hit_pct",
@@ -1309,7 +1343,12 @@ pub fn build_perf_summary(report: &PerfReport, cli: Option<&CliFiltering>) -> se
     let records = &report.perf_records;
     let total_before: i64 = records.iter().map(|r| r.tokens_before).sum();
     let total_after: i64 = records.iter().map(|r| r.tokens_after).sum();
-    let total_saved: i64 = records.iter().map(|r| r.tokens_saved).sum();
+    let total_msg_saved: i64 = records.iter().map(|r| r.tokens_saved).sum();
+    let total_tool_saved: i64 = records.iter().map(|r| r.tool_saved).sum();
+    // Headline (upstream `total_tokens_saved`): message compression plus
+    // tool-schema tokens that never entered context.
+    let total_saved: i64 = records.iter().map(|r| r.headline_saved()).sum();
+    let headline_before: i64 = records.iter().map(|r| r.headline_before()).sum();
 
     let total_cr: i64 = records.iter().map(|r| r.cache_read).sum();
     let total_cw: i64 = records.iter().map(|r| r.cache_write).sum();
@@ -1330,14 +1369,19 @@ pub fn build_perf_summary(report: &PerfReport, cli: Option<&CliFiltering>) -> se
         .map(|(model, recs)| {
             let m_before: i64 = recs.iter().map(|r| r.tokens_before).sum();
             let m_after: i64 = recs.iter().map(|r| r.tokens_after).sum();
-            let m_saved: i64 = recs.iter().map(|r| r.tokens_saved).sum();
+            let m_msg_saved: i64 = recs.iter().map(|r| r.tokens_saved).sum();
+            let m_tool_saved: i64 = recs.iter().map(|r| r.tool_saved).sum();
+            let m_saved: i64 = recs.iter().map(|r| r.headline_saved()).sum();
+            let m_headline_before: i64 = recs.iter().map(|r| r.headline_before()).sum();
             serde_json::json!({
                 "model": model,
                 "requests": recs.len(),
                 "tokens_before": m_before,
                 "tokens_after": m_after,
                 "tokens_saved": m_saved,
-                "savings_pct": pct(m_saved, m_before),
+                "message_tokens_saved": m_msg_saved,
+                "tool_tokens_saved": m_tool_saved,
+                "savings_pct": pct(m_saved, m_headline_before),
                 "list_price_per_mtok": get_list_price(model),
             })
         })
@@ -1379,7 +1423,10 @@ pub fn build_perf_summary(report: &PerfReport, cli: Option<&CliFiltering>) -> se
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
         "tokens_saved": total_saved,
-        "savings_pct": pct(total_saved, total_before),
+        "message_tokens_saved": total_msg_saved,
+        "tool_tokens_saved": total_tool_saved,
+        "total_tokens_saved": total_saved,
+        "savings_pct": pct(total_saved, headline_before),
         "cache_read_tokens": total_cr,
         "cache_write_tokens": total_cw,
         "cache_hit_pct": cache_hit_pct,
@@ -1439,12 +1486,35 @@ mod tests {
         assert_eq!(r.tokens_before, 1000);
         assert_eq!(r.tokens_after, 80);
         assert_eq!(r.tokens_saved, 920);
+        // Old lines carry no tool_saved: default 0 reproduces old sums.
+        assert_eq!(r.tool_saved, 0);
+        assert_eq!(r.headline_saved(), 920);
+        assert_eq!(r.headline_before(), 1000);
         assert_eq!(r.transforms, vec!["agent90_smoke".to_string()]);
         assert!(report.window_all_data);
         assert_eq!(
             report.oldest_kept_ts.as_deref(),
             Some("2026-06-10 10:00:00,000")
         );
+    }
+
+    #[test]
+    fn parse_perf_line_with_tool_saved() {
+        let line = "2026-06-10 10:00:00,000 - headroom.proxy - INFO - [rid] PERF model=m \
+            msgs=1 tok_before=100 tok_after=50 tok_saved=50 tok_inflated=0 tool_saved=30 total_saved=80 \
+            cache_read=0 cache_write=0 cache_hit_pct=0 opt_ms=1 total_ms=2 tok_out=3 ttfb_ms=4 transforms=none";
+        let report = parse_lines(&[line], 0.0);
+        assert_eq!(report.perf_records.len(), 1);
+        let r = &report.perf_records[0];
+        assert_eq!(r.tokens_saved, 50);
+        assert_eq!(r.tool_saved, 30);
+        assert_eq!(r.headline_saved(), 80);
+        assert_eq!(r.headline_before(), 130);
+        let summary = build_perf_summary(&report, None);
+        assert_eq!(summary["tokens_saved"], 80);
+        assert_eq!(summary["message_tokens_saved"], 50);
+        assert_eq!(summary["tool_tokens_saved"], 30);
+        assert_eq!(summary["total_tokens_saved"], 80);
     }
 
     #[test]

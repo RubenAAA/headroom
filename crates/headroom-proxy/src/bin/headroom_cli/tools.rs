@@ -539,7 +539,18 @@ pub fn exec_tool(tool: &str, args: Vec<OsString>) -> Result<(), Error> {
     }
     #[cfg(not(unix))]
     {
-        let status = Command::new(&path).args(args).status()?;
+        let mut cmd = Command::new(&path);
+        cmd.args(args);
+        // Windows: hide the child's console window (see cursor/agent.rs).
+        // DETACHED_PROCESS must NOT be used: it makes CREATE_NO_WINDOW a
+        // no-op and the tool pops up a visible window.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            // 0x0800_0000 == CREATE_NO_WINDOW.
+            cmd.creation_flags(0x0800_0000);
+        }
+        let status = cmd.status()?;
         std::process::exit(status.code().unwrap_or(1));
     }
 }

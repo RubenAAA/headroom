@@ -30,6 +30,7 @@ pub mod subscription;
 pub mod thinking_tokens;
 pub mod tokenizer;
 pub mod tool_exclusion;
+pub mod tool_schema_savings;
 pub mod transforms;
 pub mod turn_id;
 pub mod waste_signals;

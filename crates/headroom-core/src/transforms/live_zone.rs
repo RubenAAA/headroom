@@ -653,6 +653,42 @@ pub fn set_kompress_enabled(enabled: bool) {
     KOMPRESS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Kompress readiness for health reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KompressStatus {
+    /// Flag off: the model is never loaded, plain text passes through.
+    Disabled,
+    /// Flag on but no loaded model (still warming, uncached, or the cached
+    /// load failed): plain text passes through. Soft state — never fails
+    /// readiness (mirrors upstream excluding Kompress from overall `ready`).
+    Deferred,
+    /// Model cached and loaded: Kompress serves plain-text blocks.
+    Loaded,
+}
+
+impl std::fmt::Display for KompressStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KompressStatus::Disabled => write!(f, "disabled"),
+            KompressStatus::Deferred => write!(f, "deferred"),
+            KompressStatus::Loaded => write!(f, "loaded"),
+        }
+    }
+}
+
+/// Non-loading, non-blocking Kompress status. Reads the same statics the
+/// request path reads, so the answer matches serving behavior by
+/// construction. Never triggers a load.
+pub fn kompress_status() -> KompressStatus {
+    if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
+        return KompressStatus::Disabled;
+    }
+    match KOMPRESS_INSTANCE.get() {
+        Some(Some(_)) => KompressStatus::Loaded,
+        _ => KompressStatus::Deferred,
+    }
+}
+
 // Loaded Kompress singleton. Populated **only** by `warm_live_zone_compressors`
 // (an off-request-path startup call) — never by `kompress()` on the request
 // path. The model is a ~261 MB ONNX session whose load can be slow (and on the

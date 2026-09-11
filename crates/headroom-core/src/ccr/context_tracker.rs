@@ -17,6 +17,47 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
+/// Return true for Claude Code `/compact` continuation summaries.
+///
+/// Claude Code can carry a previous session forward by injecting a compact
+/// conversation summary into a fresh session. Those summaries are already
+/// context; tracking them for proactive expansion re-adds stale session
+/// state to later turns. Deliberately narrow so ordinary tool output that
+/// happens to mention "summary" remains eligible. Port of upstream
+/// `looks_like_claude_code_compact_summary`.
+pub fn looks_like_compact_summary(texts: &[&str]) -> bool {
+    let combined = texts
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if combined.is_empty() {
+        return false;
+    }
+    let normalized = combined
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let has_summary = normalized.contains("summary") || normalized.contains("summarized");
+    if normalized.contains("this session is being continued from a previous conversation")
+        && has_summary
+    {
+        return true;
+    }
+    if normalized.contains("conversation is summarized below")
+        && (normalized.contains("ran out of context")
+            || normalized.contains("previous conversation"))
+    {
+        return true;
+    }
+    normalized.contains("/compact")
+        && normalized.contains("claude")
+        && has_summary
+        && (normalized.contains("conversation") || normalized.contains("session"))
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────
 
 /// Represents a piece of compressed context from the conversation.
@@ -1022,5 +1063,32 @@ mod tests {
 
         let stats = tracker.get_stats();
         assert!(!stats.enabled);
+    }
+
+    // ── compact-summary detector ────────────────────────────────
+
+    #[test]
+    fn compact_continuation_summary_detected() {
+        assert!(looks_like_compact_summary(&[
+            "This session is being continued from a previous conversation. Summary: did X."
+        ]));
+        assert!(looks_like_compact_summary(&[
+            "Conversation is summarized below after we ran out of context. Summary follows."
+        ]));
+        assert!(looks_like_compact_summary(&[
+            "/compact claude session summary of the conversation so far"
+        ]));
+    }
+
+    #[test]
+    fn ordinary_mentions_of_summary_not_detected() {
+        assert!(!looks_like_compact_summary(&[]));
+        assert!(!looks_like_compact_summary(&[""]));
+        assert!(!looks_like_compact_summary(&[
+            "summarize the test output above"
+        ]));
+        assert!(!looks_like_compact_summary(&[
+            "the summary field is missing from the response"
+        ]));
     }
 }

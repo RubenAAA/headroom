@@ -157,6 +157,18 @@ pub(crate) async fn spawn(binary: &str, turn: &AgentTurn) -> Result<RunningTurn,
         // task for output that belongs in the log anyway.
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    // Windows: hide the agent's console window. DETACHED_PROCESS must NOT be
+    // used here — per the Win32 docs it makes CREATE_NO_WINDOW a no-op, so a
+    // detached console child pops up a visible window (upstream #2521, fixed
+    // in Python by 045f3dfe with CREATE_NO_WINDOW instead).
+    // `creation_flags` is an inherent tokio method on Windows (it ORs onto
+    // the std command tokio wraps), so no trait import is needed.
+    #[cfg(windows)]
+    {
+        // 0x0800_0000 == CREATE_NO_WINDOW: the child gets its own invisible
+        // console and stays detached from the parent's.
+        cmd.creation_flags(0x0800_0000);
+    }
 
     let mut child = cmd.spawn()?;
 

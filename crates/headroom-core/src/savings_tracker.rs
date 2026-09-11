@@ -366,6 +366,12 @@ struct Lifetime {
     /// `#[serde(default)]` so older state files still load.
     #[serde(default)]
     offload_savings_usd: f64,
+    /// Lifetime cumulative cache reads and their savings (see `d1258055`:
+    /// history points in cache mode). `#[serde(default)]` so older files load.
+    #[serde(default)]
+    cache_read_tokens: i64,
+    #[serde(default)]
+    cache_savings_usd: f64,
 }
 
 impl Default for Lifetime {
@@ -379,6 +385,8 @@ impl Default for Lifetime {
             output_tokens_saved: 0,
             output_savings_usd: 0.0,
             offload_savings_usd: 0.0,
+            cache_read_tokens: 0,
+            cache_savings_usd: 0.0,
         }
     }
 }
@@ -443,8 +451,18 @@ struct HistoryEntry {
     model: String,
     total_tokens_saved: i64,
     compression_savings_usd: f64,
+    /// Lifetime cumulative cache reads/savings at this point. `#[serde(default)]`
+    /// so history written before cache-mode history gating existed still loads.
+    #[serde(default)]
+    cache_read_tokens: i64,
+    #[serde(default)]
+    cache_savings_usd: f64,
     total_input_tokens: i64,
     total_input_cost_usd: f64,
+    #[serde(default)]
+    output_tokens_saved: i64,
+    #[serde(default)]
+    output_savings_usd: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -516,6 +534,11 @@ pub struct RequestRecord<'a> {
     pub model: &'a str,
     pub input_tokens: i64,
     pub tokens_saved: i64,
+    /// Tool-schema tokens that never entered context (deferral/hook shrink),
+    /// additive to `tokens_saved`. Carried separately so accumulators fold a
+    /// headline without losing the split; never the compaction delta (already
+    /// inside `tokens_saved`).
+    pub tool_schema_saved: i64,
     /// Request-scoped pricing counterfactual for `tokens_saved`. `None` keeps
     /// the legacy fresh-input estimate for callers without cache placement.
     pub compression_savings_cost_usd: Option<f64>,
@@ -661,8 +684,12 @@ impl SavingsTracker {
             model: normalize_model(Some(model)),
             total_tokens_saved: st.lifetime.tokens_saved,
             compression_savings_usd: st.lifetime.compression_savings_usd,
+            cache_read_tokens: st.lifetime.cache_read_tokens,
+            cache_savings_usd: st.lifetime.cache_savings_usd,
             total_input_tokens: st.lifetime.total_input_tokens,
             total_input_cost_usd: st.lifetime.total_input_cost_usd,
+            output_tokens_saved: st.lifetime.output_tokens_saved,
+            output_savings_usd: st.lifetime.output_savings_usd,
         };
         Self::push_history(&mut st, entry);
         self.trim_history(&mut st, ts);
@@ -674,11 +701,19 @@ impl SavingsTracker {
     pub fn record_request(&self, rec: &RequestRecord) -> bool {
         let ts = rec.timestamp.unwrap_or_else(utc_now);
         let delta_tokens_saved = coerce_int(rec.tokens_saved);
+        // Headline leg: tool-schema tokens never entered context. Folded
+        // into token totals and priced with the same list-price
+        // counterfactual as message savings (removed input is removed
+        // input); excluded from cache-mix tier buckets downstream, which
+        // price only billed tiers.
+        let delta_tool_schema_saved = coerce_int(rec.tool_schema_saved);
+        let delta_headline_saved = delta_tokens_saved.saturating_add(delta_tool_schema_saved);
         let delta_input_tokens = coerce_int(rec.input_tokens);
         let delta_savings_usd = rec
             .compression_savings_cost_usd
             .map(|cost| cost.max(0.0))
-            .unwrap_or_else(|| estimate_compression_savings_usd(rec.model, delta_tokens_saved));
+            .unwrap_or_else(|| estimate_compression_savings_usd(rec.model, delta_tokens_saved))
+            + estimate_compression_savings_usd(rec.model, delta_tool_schema_saved);
         // Output-shaping savings, priced at the OUTPUT rate and accumulated
         // separately — folding them into `tokens_saved` would mix an
         // output-side count into an input-side figure and misprice both.
@@ -723,7 +758,7 @@ impl SavingsTracker {
         let session_cost_delta = round_n((next_cost - prev_cost).max(0.0), 6);
 
         st.lifetime.requests += 1;
-        st.lifetime.tokens_saved += delta_tokens_saved;
+        st.lifetime.tokens_saved += delta_headline_saved;
         st.lifetime.compression_savings_usd =
             round_n(st.lifetime.compression_savings_usd + delta_savings_usd, 6);
         st.lifetime.total_input_tokens = next_tokens;
@@ -735,6 +770,13 @@ impl SavingsTracker {
             st.lifetime.offload_savings_usd + delta_offload_savings_usd,
             6,
         );
+        // Lifetime cumulative cache reads/savings feed the history points
+        // below (Python `d1258055`). Cache-mode turns compress nothing, so
+        // without these the history — and `/stats-history` charts — go blind
+        // on exactly the turns cache mode exists for.
+        st.lifetime.cache_read_tokens += coerce_int(rec.cache_read_tokens).max(0);
+        st.lifetime.cache_savings_usd =
+            round_n(st.lifetime.cache_savings_usd + delta_cache_savings_usd, 6);
 
         // Display-session rollover on inactivity.
         let expired = match st
@@ -754,7 +796,7 @@ impl SavingsTracker {
         }
         let s = &mut st.display_session;
         s.requests += 1;
-        s.tokens_saved += delta_tokens_saved;
+        s.tokens_saved += delta_headline_saved;
         s.compression_savings_usd = round_n(s.compression_savings_usd + delta_savings_usd, 6);
         s.cache_savings_usd = round_n(s.cache_savings_usd + delta_cache_savings_usd, 6);
         s.offload_savings_usd = round_n(s.offload_savings_usd + delta_offload_savings_usd, 6);
@@ -774,21 +816,34 @@ impl SavingsTracker {
             &mut st,
             rec.project,
             ts,
-            delta_tokens_saved,
+            delta_headline_saved,
             delta_savings_usd,
             delta_input_tokens,
             delta_input_cost_usd,
         );
 
-        if delta_tokens_saved > 0 {
+        // In cache mode headroom's own compression (`tokens_saved`) is
+        // near-always 0 by design — the frozen prefix is byte-replayed, not
+        // compressed. Gating on `tokens_saved` alone silently dropped every
+        // history point on those turns even though real cache-read and
+        // output-shaping savings occurred. Append whenever any savings
+        // mechanism produced a saving (mirrors Python `d1258055`).
+        if delta_headline_saved > 0
+            || coerce_int(rec.cache_read_tokens).max(0) > 0
+            || delta_output_tokens_saved > 0
+        {
             let entry = HistoryEntry {
                 timestamp: to_utc_iso(ts),
                 provider: normalize_provider(rec.provider),
                 model: normalize_model(Some(rec.model)),
                 total_tokens_saved: st.lifetime.tokens_saved,
                 compression_savings_usd: st.lifetime.compression_savings_usd,
+                cache_read_tokens: st.lifetime.cache_read_tokens,
+                cache_savings_usd: st.lifetime.cache_savings_usd,
                 total_input_tokens: st.lifetime.total_input_tokens,
                 total_input_cost_usd: st.lifetime.total_input_cost_usd,
+                output_tokens_saved: st.lifetime.output_tokens_saved,
+                output_savings_usd: st.lifetime.output_savings_usd,
             };
             Self::push_history(&mut st, entry);
             self.trim_history(&mut st, ts);
@@ -807,6 +862,7 @@ impl SavingsTracker {
                 output_tokens: coerce_int(rec.output_tokens),
                 attempted_input_tokens: coerce_int(rec.attempted_input_tokens),
                 tokens_saved: delta_tokens_saved,
+                tool_schema_saved: coerce_int(rec.tool_schema_saved).max(0),
                 cached: rec.cached,
                 record_stack: true,
                 cache_read_tokens: coerce_int(rec.cache_read_tokens),
@@ -1466,6 +1522,18 @@ impl SavingsTracker {
                 .and_then(Value::as_f64)
                 .map(coerce_float)
                 .unwrap_or(0.0),
+            // Absent from state files written before cache-mode history
+            // gating; default to zero rather than rejecting the file.
+            cache_read_tokens: lr
+                .and_then(|l| l.get("cache_read_tokens"))
+                .and_then(Value::as_i64)
+                .map(coerce_int)
+                .unwrap_or(0),
+            cache_savings_usd: lr
+                .and_then(|l| l.get("cache_savings_usd"))
+                .and_then(Value::as_f64)
+                .map(coerce_float)
+                .unwrap_or(0.0),
         };
         if let Some(last) = history.last() {
             lifetime.tokens_saved = lifetime.tokens_saved.max(last.total_tokens_saved);
@@ -1653,6 +1721,8 @@ fn lifetime_value(l: &Lifetime) -> Value {
         "output_tokens_saved": l.output_tokens_saved,
         "output_savings_usd": l.output_savings_usd,
         "offload_savings_usd": l.offload_savings_usd,
+        "cache_read_tokens": l.cache_read_tokens,
+        "cache_savings_usd": l.cache_savings_usd,
     })
 }
 
@@ -1730,8 +1800,12 @@ fn history_entry_value(e: &HistoryEntry) -> Value {
         "model": e.model,
         "total_tokens_saved": e.total_tokens_saved,
         "compression_savings_usd": e.compression_savings_usd,
+        "cache_read_tokens": e.cache_read_tokens,
+        "cache_savings_usd": e.cache_savings_usd,
         "total_input_tokens": e.total_input_tokens,
         "total_input_cost_usd": e.total_input_cost_usd,
+        "output_tokens_saved": e.output_tokens_saved,
+        "output_savings_usd": e.output_savings_usd,
     })
 }
 
@@ -1754,64 +1828,92 @@ fn projects_persist_value(projects: &BTreeMap<String, ProjectEntry>) -> Value {
 }
 
 fn normalize_history_entry(entry: &Value) -> Option<HistoryEntry> {
-    let (timestamp, provider, model, tts, csu, tit, tic) = if let Some(obj) = entry.as_object() {
-        (
-            parse_timestamp(obj.get("timestamp").and_then(Value::as_str).unwrap_or(""))?,
-            normalize_provider(obj.get("provider").and_then(Value::as_str)),
-            normalize_model(obj.get("model").and_then(Value::as_str)),
-            obj.get("total_tokens_saved")
-                .and_then(Value::as_i64)
-                .map(coerce_int)
-                .unwrap_or(0),
-            obj.get("compression_savings_usd")
-                .and_then(Value::as_f64)
-                .map(coerce_float)
-                .unwrap_or(0.0),
-            obj.get("total_input_tokens")
-                .and_then(Value::as_i64)
-                .map(coerce_int)
-                .unwrap_or(0),
-            obj.get("total_input_cost_usd")
-                .and_then(Value::as_f64)
-                .map(coerce_float)
-                .unwrap_or(0.0),
-        )
-    } else if let Some(arr) = entry.as_array() {
-        if arr.len() < 2 {
+    let (timestamp, provider, model, tts, csu, crt, crs, tit, tic, ots, osu) =
+        if let Some(obj) = entry.as_object() {
+            (
+                parse_timestamp(obj.get("timestamp").and_then(Value::as_str).unwrap_or(""))?,
+                normalize_provider(obj.get("provider").and_then(Value::as_str)),
+                normalize_model(obj.get("model").and_then(Value::as_str)),
+                obj.get("total_tokens_saved")
+                    .and_then(Value::as_i64)
+                    .map(coerce_int)
+                    .unwrap_or(0),
+                obj.get("compression_savings_usd")
+                    .and_then(Value::as_f64)
+                    .map(coerce_float)
+                    .unwrap_or(0.0),
+                // Older history points predate cache-mode history gating and omit
+                // these keys entirely; default to 0/0.0 rather than dropping the
+                // entry, matching how every other field here handles legacy shapes.
+                obj.get("cache_read_tokens")
+                    .and_then(Value::as_i64)
+                    .map(coerce_int)
+                    .unwrap_or(0),
+                obj.get("cache_savings_usd")
+                    .and_then(Value::as_f64)
+                    .map(coerce_float)
+                    .unwrap_or(0.0),
+                obj.get("total_input_tokens")
+                    .and_then(Value::as_i64)
+                    .map(coerce_int)
+                    .unwrap_or(0),
+                obj.get("total_input_cost_usd")
+                    .and_then(Value::as_f64)
+                    .map(coerce_float)
+                    .unwrap_or(0.0),
+                obj.get("output_tokens_saved")
+                    .and_then(Value::as_i64)
+                    .map(coerce_int)
+                    .unwrap_or(0),
+                obj.get("output_savings_usd")
+                    .and_then(Value::as_f64)
+                    .map(coerce_float)
+                    .unwrap_or(0.0),
+            )
+        } else if let Some(arr) = entry.as_array() {
+            if arr.len() < 2 {
+                return None;
+            }
+            (
+                parse_timestamp(arr[0].as_str().unwrap_or(""))?,
+                PROVIDER_UNKNOWN.to_string(),
+                MODEL_UNKNOWN.to_string(),
+                arr.get(1)
+                    .and_then(Value::as_i64)
+                    .map(coerce_int)
+                    .unwrap_or(0),
+                arr.get(2)
+                    .and_then(Value::as_f64)
+                    .map(coerce_float)
+                    .unwrap_or(0.0),
+                0,
+                0.0,
+                arr.get(3)
+                    .and_then(Value::as_i64)
+                    .map(coerce_int)
+                    .unwrap_or(0),
+                arr.get(4)
+                    .and_then(Value::as_f64)
+                    .map(coerce_float)
+                    .unwrap_or(0.0),
+                0,
+                0.0,
+            )
+        } else {
             return None;
-        }
-        (
-            parse_timestamp(arr[0].as_str().unwrap_or(""))?,
-            PROVIDER_UNKNOWN.to_string(),
-            MODEL_UNKNOWN.to_string(),
-            arr.get(1)
-                .and_then(Value::as_i64)
-                .map(coerce_int)
-                .unwrap_or(0),
-            arr.get(2)
-                .and_then(Value::as_f64)
-                .map(coerce_float)
-                .unwrap_or(0.0),
-            arr.get(3)
-                .and_then(Value::as_i64)
-                .map(coerce_int)
-                .unwrap_or(0),
-            arr.get(4)
-                .and_then(Value::as_f64)
-                .map(coerce_float)
-                .unwrap_or(0.0),
-        )
-    } else {
-        return None;
-    };
+        };
     Some(HistoryEntry {
         timestamp: to_utc_iso(timestamp),
         provider,
         model,
         total_tokens_saved: tts,
         compression_savings_usd: round_n(csu, 6),
+        cache_read_tokens: crt,
+        cache_savings_usd: round_n(crs, 6),
         total_input_tokens: tit,
         total_input_cost_usd: round_n(tic, 6),
+        output_tokens_saved: ots,
+        output_savings_usd: round_n(osu, 6),
     })
 }
 
@@ -2452,6 +2554,37 @@ mod tests {
         assert_eq!(snap["history"].as_array().unwrap().len(), 1);
         assert_eq!(snap["projects"]["proj-a"]["tokens_saved"], json!(1000));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn cache_only_turn_appends_history_point() {
+        // Cache mode compresses nothing by design (`tokens_saved` 0), so the
+        // old tokens-only gate dropped every history point on exactly the
+        // turns cache mode exists for (Python `d1258055`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let t = tracker(&path);
+        assert!(t.record_request(&RequestRecord {
+            model: "claude-sonnet-4",
+            input_tokens: 50_000,
+            tokens_saved: 0,
+            cache_read_tokens: 50_000,
+            cached: true,
+            ..Default::default()
+        }));
+        let snap = t.snapshot();
+        let history = snap["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["cache_read_tokens"], json!(50_000));
+        assert_eq!(snap["lifetime"]["cache_read_tokens"], json!(50_000));
+
+        // A turn with no savings from any mechanism still appends nothing.
+        assert!(t.record_request(&RequestRecord {
+            model: "claude-sonnet-4",
+            input_tokens: 100,
+            ..Default::default()
+        }));
+        assert_eq!(t.snapshot()["history"].as_array().unwrap().len(), 1);
     }
 
     #[test]

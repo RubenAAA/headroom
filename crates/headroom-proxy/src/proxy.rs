@@ -28,7 +28,7 @@ use crate::compression;
 use crate::config::Config;
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
-use crate::health::{healthz, healthz_upstream, rollout_status};
+use crate::health::{health, healthz, healthz_upstream, livez, readyz, rollout_status};
 use crate::websocket::ws_handler;
 // Phase F PR-F1: imported as `classify_auth_mode` to make the call
 // site self-documenting. `AuthMode` is re-exported under the same
@@ -198,6 +198,11 @@ pub struct AppState {
     pub compression_feedback: Option<Arc<crate::compression_feedback::CompressionFeedback>>,
     /// Trusted gateway CIDRs for X-Forwarded-For resolution.
     pub trusted_gateway_cidrs: Vec<crate::forwarded_headers::IpCidr>,
+    /// Dashboard client CIDRs authorized for sensitive stats metadata.
+    /// Separate from the gateway list by design (see
+    /// `forwarded_headers::TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV`); empty by
+    /// default, which authorizes loopback callers only.
+    pub trusted_dashboard_client_cidrs: Vec<crate::forwarded_headers::IpCidr>,
     /// Background compressor for deferred off-path compression jobs.
     pub background_compressor: Option<Arc<crate::background_compression::BackgroundCompressor>>,
     /// Fail-closed action for compression failures on WebSocket frames.
@@ -805,10 +810,29 @@ impl AppState {
             compression_feedback: Some(Arc::new(
                 crate::compression_feedback::CompressionFeedback::new(true),
             )),
-            trusted_gateway_cidrs: std::env::var("HEADROOM_TRUSTED_GATEWAY_CIDRS")
-                .ok()
-                .and_then(|v| crate::forwarded_headers::load_trusted_gateway_cidrs(&v).ok())
-                .unwrap_or_default(),
+            // Canonical name matches upstream (`HEADROOM_PROXY_…`) and the
+            // module const; the legacy `HEADROOM_TRUSTED_GATEWAY_CIDRS`
+            // spelling is honored as a fallback so an existing export keeps
+            // working. Was reading only the legacy name before, which
+            // disagreed with both the const and upstream.
+            trusted_gateway_cidrs: std::env::var(
+                crate::forwarded_headers::TRUSTED_GATEWAY_CIDRS_ENV,
+            )
+            .or_else(|_| std::env::var("HEADROOM_TRUSTED_GATEWAY_CIDRS"))
+            .ok()
+            .and_then(|v| crate::forwarded_headers::load_trusted_gateway_cidrs(&v).ok())
+            .unwrap_or_default(),
+            // Fail loudly on a malformed dashboard allow-list: silently
+            // yielding an empty list would turn a typo into "remote
+            // dashboards stop working" with no signal (or worse, an
+            // operator "fix" that widens access elsewhere).
+            trusted_dashboard_client_cidrs: match std::env::var(
+                crate::forwarded_headers::TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV,
+            ) {
+                Err(_) => Vec::new(),
+                Ok(raw) => crate::forwarded_headers::load_trusted_dashboard_client_cidrs(&raw)
+                    .map_err(crate::error::ProxyError::Config)?,
+            },
             background_compressor: std::env::var("HEADROOM_BACKGROUND_COMPRESSION")
                 .ok()
                 .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -933,6 +957,11 @@ impl ProxyOutcomeSink {
 impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
     fn record_request(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
         let billed_input_tokens = provider_billed_input_tokens(outcome);
+        // Headline leg: tool-schema tokens never entered context (deferral /
+        // hook shrink), additive to `tokens_saved`. Zero on turns without
+        // deferral, so every existing number reproduces exactly there.
+        let tool_schema_saved =
+            crate::tool_schema_savings::tool_schema_saved_from_tags(&outcome.tags).max(0);
         let rec = headroom_core::savings_tracker::RequestRecord {
             model: &outcome.model,
             // `original_tokens` is a savings baseline. Cost and usage must
@@ -940,6 +969,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             // transform, as reported in the response usage breakdown.
             input_tokens: billed_input_tokens,
             tokens_saved: outcome.tokens_saved,
+            tool_schema_saved,
             compression_savings_cost_usd: Some(outcome.compression_savings_cost_usd()),
             provider: Some(&outcome.provider),
             project: outcome.project.as_deref(),
@@ -999,6 +1029,11 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             outcome.overhead_ms,
             outcome.ttfb_ms,
         );
+        // Split counter for the headline leg; `tokens_saved_total` above
+        // keeps its meaning so existing PromQL is unaffected.
+        crate::observability::proxy_counters::record_tool_schema_saved(
+            tool_schema_saved.max(0) as u64
+        );
 
         if let Some(signals) = &outcome.waste_signals {
             for (signal, tokens) in signals {
@@ -1015,6 +1050,10 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
     fn record_tokens(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
         let rec = headroom_core::cost_tracker::TokenRecord {
             tokens_saved: outcome.tokens_saved,
+            tool_schema_saved: crate::tool_schema_savings::tool_schema_saved_from_tags(
+                &outcome.tags,
+            )
+            .max(0),
             tokens_sent: provider_billed_input_tokens(outcome),
             cache_read_tokens: outcome.cache_read_tokens,
             cache_write_tokens: outcome.cache_write_tokens,
@@ -1073,10 +1112,17 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // in `asyncio.to_thread`. Fire-and-forget: a ledger write must never
         // delay or fail a served request.
         let forwarded = outcome.optimized_tokens;
-        let saved = outcome.tokens_saved;
+        // Headline: deferral/hook-shrink tags are additive savings the
+        // message count never saw. The ledger helper gates on `> 0` itself,
+        // so this stays a no-op for turns without savings.
+        let saved =
+            crate::tool_schema_savings::headline_tokens_saved(outcome.tokens_saved, &outcome.tags);
         let model = outcome.model.clone();
         let client = outcome.client.clone();
-        let priced_cost = outcome.compression_savings_cost_usd();
+        // Price the booked (headline) count, not the message-only count, so
+        // the ledger's token and dollar columns share one basis. The
+        // cache-aware rate selection is unchanged.
+        let priced_cost = outcome.compression_savings_cost_usd_for(saved);
         let priced_basis = outcome.compression_savings_cost_basis().to_string();
         let pricing = headroom_core::pricing::lookup(&model);
         let fresh_rate = pricing
@@ -1256,10 +1302,10 @@ struct OffloadSavings {
     saved_usd: f64,
 }
 
-/// Build the axum app. `/healthz` and `/healthz/upstream` are intercepted;
-/// everything else hits the catch-all forwarder. WebSocket upgrades are
-/// handled inside the catch-all handler when an `Upgrade: websocket` header
-/// is present.
+/// Build the axum app. `/healthz`, `/healthz/upstream`, `/livez`, `/readyz`,
+/// and `/health` are intercepted; everything else hits the catch-all
+/// forwarder. WebSocket upgrades are handled inside the catch-all handler
+/// when an `Upgrade: websocket` header is present.
 pub fn build_app(state: AppState) -> Router {
     // Point `headroom-core`'s Kompress size gate at the Prometheus counter.
     // The core crate has no dependency on this one, so it reports through a
@@ -1272,6 +1318,12 @@ pub fn build_app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/healthz/upstream", get(healthz_upstream))
+        // Orchestrator probes (port of upstream `/livez` + `/readyz`).
+        // Auth-exempt like `/healthz`, and mounted (not forwarded): before
+        // this they fell through to the catch-all and leaked upstream.
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .route("/health", get(health))
         .route("/rollout/status", get(rollout_status))
         // PR-D3: Prometheus scrape endpoint. Renders the global
         // registry in text format. The handler is stateless — no
@@ -1309,6 +1361,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/stats-history",
             get(crate::handlers::stats::handle_stats_history),
+        )
+        .route(
+            "/stats-lifetime",
+            get(crate::handlers::stats::handle_stats_lifetime),
         )
         // PR-C2: explicit POST route for /v1/chat/completions. The
         // handler buffers the body and re-injects it into
@@ -1996,6 +2052,18 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
         );
         return false;
     }
+    // Compact-continuation summaries are already context; expanding them
+    // re-adds stale session state to later turns (port of upstream skipping
+    // proactive tracking for `looks_like_claude_code_compact_summary`).
+    if headroom_core::ccr::context_tracker::looks_like_compact_summary(&[user_query]) {
+        tracing::info!(
+            request_id = %request_id,
+            event = "ccr_expansion_evaluation",
+            outcome = "compact_summary",
+            "ccr: skipping proactive expansion for a compact-continuation summary"
+        );
+        return false;
+    }
     let Some(tracker) = state.ccr_context_tracker.as_ref() else {
         tracing::info!(
             request_id = %request_id,
@@ -2280,6 +2348,189 @@ pub(crate) fn maybe_prune_tools(
             bytes::Bytes::from(bytes)
         }
         Err(_) => body,
+    }
+}
+
+/// Attribution recorded when the tool-search stage rewrote `tools[]`.
+pub(crate) struct ToolSearchAttribution {
+    pub deferred_tools: usize,
+    pub deferred_tokens: i64,
+    pub stripped_third_party: usize,
+}
+
+/// Server-side tool-search deferral (+ third-party search-tool strip) for
+/// Anthropic `/v1/messages`.
+///
+/// Port of the tools stages in upstream `handlers/anthropic.py`: on
+/// third-party Anthropic-compatible upstreams, strip client-originated
+/// first-party search tools (they reject that shape); on first-party
+/// Anthropic with `HEADROOM_TOOL_SEARCH` on (default), defer non-core
+/// schemas behind an injected search tool so they stop billing context.
+///
+/// Runs after pruning (which settles the tool set); compaction and the
+/// cache-control stages below then see the final array, breakpoint move
+/// included. Forwards the original bytes untouched on any parse/serialize
+/// failure or when nothing changed, so no-op turns stay byte-identical.
+pub(crate) fn maybe_inject_tool_search(
+    body: bytes::Bytes,
+    upstream_base_url: &str,
+    model: &str,
+    request_id: &str,
+    enabled: bool,
+) -> (bytes::Bytes, Option<ToolSearchAttribution>) {
+    use crate::tool_search_deferral as tsd;
+
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return (body, None),
+    };
+    let Some(tools) = value.get("tools").and_then(|t| t.as_array()).cloned() else {
+        return (body, None);
+    };
+    let custom = tsd::is_custom_anthropic_base_url(Some(upstream_base_url));
+
+    // Third-party routes reject the first-party search shape: strip
+    // client-originated search tools. Not env-gated — a poisoned transcript
+    // must recover even with injection off.
+    let mut tools_vec = tools;
+    let mut stripped_third_party = 0usize;
+    if custom {
+        let strip = tsd::strip_for_third_party_upstream(tools_vec);
+        stripped_third_party = strip.removed;
+        tools_vec = strip.tools;
+    }
+
+    // Deferral injection: first-party only, env-gated. The input array is
+    // handed back unchanged when injection doesn't apply.
+    let mut deferred_tools = 0usize;
+    let mut deferred_tokens = 0i64;
+    if !custom && enabled {
+        let inject = tsd::inject_deferral(tools_vec);
+        if inject.changed {
+            deferred_tools = inject.deferred.len();
+            let deferred_json = serde_json::to_string(&inject.deferred).unwrap_or_default();
+            deferred_tokens =
+                headroom_core::tokenizer::get_tokenizer(model).count_text(&deferred_json) as i64;
+            tracing::info!(
+                event = "tool_search_deferral",
+                request_id = %request_id,
+                deferred_tools = deferred_tools,
+                deferred_tokens = deferred_tokens,
+                "deferred non-core tool schemas behind the search tool"
+            );
+        }
+        tools_vec = inject.tools;
+    }
+
+    if stripped_third_party == 0 && deferred_tools == 0 {
+        return (body, None);
+    }
+    value["tools"] = serde_json::Value::Array(tools_vec);
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => (
+            bytes::Bytes::from(bytes),
+            Some(ToolSearchAttribution {
+                deferred_tools,
+                deferred_tokens,
+                stripped_third_party,
+            }),
+        ),
+        Err(_) => (body, None),
+    }
+}
+
+/// Tool-search history repair (upstream #2805). Drops `server_tool_use` /
+/// `tool_search_tool_result` blocks the final tools array cannot support:
+/// side-requests replaying a transcript against a smaller tools array, or
+/// transcripts poisoned while deferral was on.
+///
+/// Unconditional and last: runs after turn hooks (which may rewrite tools)
+/// and after every other tools/messages mutator, validating against the
+/// final outbound array. Returns the removed-block count; zero means the
+/// original bytes are forwarded untouched.
+pub(crate) fn maybe_repair_tool_search_history(
+    body: bytes::Bytes,
+    request_id: &str,
+) -> (bytes::Bytes, usize) {
+    use crate::tool_search_deferral as tsd;
+
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return (body, 0),
+    };
+    let tools: Vec<serde_json::Value> = value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let messages: Vec<serde_json::Value> = match value.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m.clone(),
+        None => return (body, 0),
+    };
+    let repair = tsd::strip_unsupported_blocks(messages, &tools);
+    if repair.removed == 0 {
+        return (body, 0);
+    }
+    value["messages"] = serde_json::Value::Array(repair.messages);
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::info!(
+                event = "tool_search_history_repair",
+                request_id = %request_id,
+                removed_blocks = repair.removed,
+                "dropped tool-search history blocks the tools array cannot support"
+            );
+            (bytes::Bytes::from(bytes), repair.removed)
+        }
+        Err(_) => (body, 0),
+    }
+}
+
+/// CCR retrieve history repair (upstream #2814). Neutralizes
+/// `headroom_retrieve` history references the outbound tools array cannot
+/// support: a side-request forwarded without declaring the tool would
+/// otherwise 400 on the historical `tool_use`.
+///
+/// Runs beside the tool-search repair, after both normal CCR injection and
+/// turn hooks, validating against the final outbound tools array.
+/// Neutralize-in-place (never drops messages) so user/assistant alternation
+/// survives. Returns the neutralized-block count; zero means the original
+/// bytes are forwarded untouched.
+pub(crate) fn maybe_repair_ccr_retrieve_history(
+    body: bytes::Bytes,
+    request_id: &str,
+) -> (bytes::Bytes, usize) {
+    use crate::ccr_retrieve_repair as ccr;
+
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return (body, 0),
+    };
+    let tools: Vec<serde_json::Value> = value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let messages: Vec<serde_json::Value> = match value.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m.clone(),
+        None => return (body, 0),
+    };
+    let repair = ccr::strip_unsupported_ccr_blocks(messages, &tools);
+    if repair.neutralized == 0 {
+        return (body, 0);
+    }
+    value["messages"] = serde_json::Value::Array(repair.messages);
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::info!(
+                event = "ccr_retrieve_history_repair",
+                request_id = %request_id,
+                neutralized_blocks = repair.neutralized,
+                "neutralized headroom_retrieve history blocks the tools array does not declare"
+            );
+            (bytes::Bytes::from(bytes), repair.neutralized)
+        }
+        Err(_) => (body, 0),
     }
 }
 
@@ -5430,17 +5681,65 @@ pub(crate) async fn forward_http(
             // every session into one replay slot.
             (Some(original_messages), Some(_headers)) => {
                 let session_key = request_lane_key.clone();
-                apply_prefix_replay(
-                    &state.replay_store,
-                    &session_key,
-                    &request_id,
-                    original_messages,
-                    body_to_send,
-                    Some(&state.usage_observer),
-                    state.started_at.elapsed().as_secs(),
-                    state.config.cache_tail_breakpoints as usize,
-                    state.config.strip_system_cache_breakpoints,
-                )
+                // Cold-prefix fork (upstream `HEADROOM_COLD_RECOMPACT`,
+                // default off): a lane idle past its real TTL holds a dead
+                // prefix, so the byte-identical splice below preserves
+                // nothing — skip it, recompacing losslessly instead in
+                // cache mode. Warm lanes (and the default flag) fall
+                // through to the normal replay untouched. Recompaction runs
+                // on the post-compression messages, so compression savings
+                // are kept and only lossless whole-prefix folds add on top.
+                let cold_fork = (|| {
+                    use headroom_core::transforms::cold_prefix as cp;
+                    if !cp::cold_recompact_enabled() {
+                        return None;
+                    }
+                    let mut parsed: serde_json::Value =
+                        serde_json::from_slice(&body_to_send).ok()?;
+                    let messages = parsed.get("messages")?.as_array()?.clone();
+                    let system = parsed.get("system").cloned();
+                    let model = outcome_ctx
+                        .as_ref()
+                        .map(|ctx| ctx.model.as_str())
+                        .unwrap_or("");
+                    let fork = maybe_cold_fork(
+                        true,
+                        crate::modes::is_cache_mode(Some(&state.config.mode)),
+                        model,
+                        &messages,
+                        system.as_ref(),
+                        state.replay_store.idle_seconds(&session_key),
+                        state.ccr_store(),
+                    )?;
+                    tracing::info!(
+                        event = "cold_prefix_recompaction",
+                        request_id = %request_id,
+                        cc_cache_ttl = %fork.ttl_desc,
+                        idle_secs = format!("{:.0}", fork.idle_secs),
+                        "cold-prefix recompaction: cache lapsed — recompacting whole prefix"
+                    );
+                    if let Some(ctx) = outcome_ctx.as_mut() {
+                        ctx.transforms_applied
+                            .extend(fork.transforms.iter().cloned());
+                    }
+                    parsed["messages"] = serde_json::Value::Array(fork.messages);
+                    serde_json::to_vec(&parsed).ok().map(bytes::Bytes::from)
+                })();
+                if let Some(bytes) = cold_fork {
+                    bytes
+                } else {
+                    apply_prefix_replay(
+                        &state.replay_store,
+                        &session_key,
+                        &request_id,
+                        original_messages,
+                        body_to_send,
+                        Some(&state.usage_observer),
+                        state.started_at.elapsed().as_secs(),
+                        state.config.cache_tail_breakpoints as usize,
+                        state.config.strip_system_cache_breakpoints,
+                    )
+                }
             }
             _ => body_to_send,
         };
@@ -5527,6 +5826,47 @@ pub(crate) async fn forward_http(
                     body_to_send
                 } else {
                     maybe_prune_tools(body_to_send, &state.config.tool_prune_policy, &request_id)
+                };
+                // Server-side tool-search deferral (+ third-party strip).
+                // After pruning (settles the tool set); compaction and the
+                // cache-control stages below then see the final array.
+                let body_to_send = {
+                    let model = outcome_ctx
+                        .as_ref()
+                        .map(|ctx| ctx.model.as_str())
+                        .unwrap_or("");
+                    let (bytes, attribution) = maybe_inject_tool_search(
+                        body_to_send,
+                        selected_upstream.base.as_str(),
+                        model,
+                        &request_id,
+                        crate::tool_search_deferral::tool_search_enabled(),
+                    );
+                    if let Some(attr) = attribution {
+                        if let Some(ctx) = outcome_ctx.as_mut() {
+                            if attr.deferred_tools > 0 {
+                                ctx.tags.insert(
+                                    "tool_search_deferred_tools".to_string(),
+                                    attr.deferred_tools.to_string(),
+                                );
+                                ctx.tags.insert(
+                                    "tool_search_deferred_tokens".to_string(),
+                                    attr.deferred_tokens.to_string(),
+                                );
+                                ctx.transforms_applied.push(format!(
+                                    "router:tool_search_deferral:{}tools:{}tok",
+                                    attr.deferred_tools, attr.deferred_tokens
+                                ));
+                            }
+                            if attr.stripped_third_party > 0 {
+                                ctx.tags.insert(
+                                    "third_party_tool_search_stripped".to_string(),
+                                    attr.stripped_third_party.to_string(),
+                                );
+                            }
+                        }
+                    }
+                    bytes
                 };
                 let body_to_send = if state.config.image_optimize {
                     maybe_optimize_images(body_to_send, &request_id)
@@ -5721,11 +6061,29 @@ pub(crate) async fn forward_http(
         // Turn hooks: pre-send `on_request` seam. Inert (byte-identical)
         // unless a hook is registered — the empty-registry check avoids
         // touching the body at all, matching Python's "inert unless a hook is
-        // registered" contract.
+        // registered" contract. A hook that shrinks the tool array is
+        // deferral-shaped (removes schemas counting never saw), so its
+        // saving lands in tags, additive to `tokens_saved`.
         let body_to_send = if crate::turn_hooks::registered_turn_hooks().is_empty() {
             body_to_send
         } else {
-            apply_request_hooks(body_to_send, endpoint, &request_id)
+            let (bytes, tools_saved) = apply_request_hooks(body_to_send, endpoint, &request_id);
+            if tools_saved > 0 {
+                if let Some(ctx) = outcome_ctx.as_mut() {
+                    let entry = ctx
+                        .tags
+                        .entry("turn_hook_tools_saved_tokens".to_string())
+                        .or_insert_with(|| "0".to_string());
+                    *entry = entry
+                        .parse::<i64>()
+                        .unwrap_or(0)
+                        .saturating_add(tools_saved)
+                        .to_string();
+                    ctx.transforms_applied
+                        .push(format!("turn_hook:tools:{tools_saved}tok"));
+                }
+            }
+            bytes
         };
 
         // Signed reasoning blocks, checked after every stage that can rewrite
@@ -5755,6 +6113,45 @@ pub(crate) async fn forward_http(
                 state.config.force_1h_cache_ttl && auth_mode != AuthMode::Payg,
                 &request_id,
             )
+        } else {
+            body_to_send
+        };
+
+        // Tool-search history repair. Last tools/messages mutator: runs
+        // after turn hooks and the TTL ordering, validating message history
+        // against the final tools array.
+        let body_to_send = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) {
+            let (bytes, removed) = maybe_repair_tool_search_history(body_to_send, &request_id);
+            if removed > 0 {
+                if let Some(ctx) = outcome_ctx.as_mut() {
+                    ctx.transforms_applied
+                        .push(format!("router:tool_search_repair:{removed}blocks"));
+                }
+            }
+            bytes
+        } else {
+            body_to_send
+        };
+
+        // CCR retrieve history repair (upstream #2814). Beside the
+        // tool-search repair, after both normal CCR injection and turn
+        // hooks: a side-request that does not declare `headroom_retrieve`
+        // cannot retain historical references the upstream would reject.
+        let body_to_send = if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::AnthropicMessages
+        ) {
+            let (bytes, neutralized) = maybe_repair_ccr_retrieve_history(body_to_send, &request_id);
+            if neutralized > 0 {
+                if let Some(ctx) = outcome_ctx.as_mut() {
+                    ctx.transforms_applied
+                        .push(format!("router:ccr_retrieve_repair:{neutralized}blocks"));
+                }
+            }
+            bytes
         } else {
             body_to_send
         };
@@ -5963,6 +6360,13 @@ pub(crate) async fn forward_http(
         retry_body = Some(body_to_send.clone());
         forwarded_body = retry_body.clone();
 
+        // A surviving client `content-encoding` with re-serialized JSON
+        // makes the upstream gunzip plaintext. Strip it here (buffered
+        // branch only — the streaming passthrough below keeps headers
+        // byte-faithful, and opaque non-JSON bytes keep the header inside
+        // the helper).
+        let send_headers = crate::headers::headers_for_json_body(&outgoing_headers, &body_to_send);
+
         // Forward the request with retry on transient errors (429, 529, 5xx).
         let max_attempts = if state.config.retry_enabled {
             state.config.retry_max_attempts.max(1)
@@ -5988,7 +6392,7 @@ pub(crate) async fn forward_http(
                 attempts_made = i64::from(attempt + 1);
                 let resp = upstream_client
                     .request(reqwest_method.clone(), upstream_url.clone())
-                    .headers(outgoing_headers.clone())
+                    .headers(send_headers.clone())
                     .body(body_to_send.clone())
                     .send()
                     .await;
@@ -8096,6 +8500,254 @@ fn check_outbound_tool_pairing(
 }
 
 #[cfg(test)]
+mod cold_fork_tests {
+    use super::*;
+
+    fn msgs() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"role": "user", "content": "hi"})]
+    }
+
+    #[test]
+    fn disabled_flag_never_forks() {
+        assert!(maybe_cold_fork(
+            false,
+            true,
+            "claude-opus-5",
+            &msgs(),
+            None,
+            Some(99999.0),
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unknown_session_is_warm() {
+        // No idle reading (first turn): conservative warm, replay untouched.
+        assert!(maybe_cold_fork(true, true, "claude-opus-5", &msgs(), None, None, None).is_none());
+    }
+
+    #[test]
+    fn warm_lane_is_untouched() {
+        assert!(
+            maybe_cold_fork(true, true, "claude-opus-5", &msgs(), None, Some(10.0), None).is_none()
+        );
+    }
+
+    #[test]
+    fn cold_lane_recompacts_in_cache_mode() {
+        let fork = maybe_cold_fork(
+            true,
+            true,
+            "claude-opus-5",
+            &msgs(),
+            None,
+            Some(99999.0),
+            None,
+        )
+        .expect("idle-past-TTL lane must fork");
+        assert_eq!(fork.ttl_desc, "300s");
+        // Trivial messages: lossless passes fold nothing, input survives.
+        assert_eq!(fork.messages, msgs());
+    }
+}
+
+#[cfg(test)]
+mod tool_search_wiring_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool(name: &str) -> serde_json::Value {
+        json!({"name": name, "input_schema": {"type": "object"}})
+    }
+
+    fn fourteen_tools() -> Vec<serde_json::Value> {
+        [
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Task",
+            "WebFetch",
+            "Slack_post",
+            "Linear_get",
+            "Sentry_get",
+            "Notion_read",
+            "Snowflake_q",
+            "PagerDuty_get",
+        ]
+        .iter()
+        .map(|n| tool(n))
+        .collect()
+    }
+
+    fn body_with(tools: Vec<serde_json::Value>, messages: serde_json::Value) -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-opus-5",
+                "max_tokens": 64,
+                "messages": messages,
+                "tools": tools,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn injection_fires_on_first_party_wire_bytes() {
+        let body = body_with(fourteen_tools(), json!([{"role": "user", "content": "hi"}]));
+        let (out, attr) = maybe_inject_tool_search(
+            body,
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            "req-test",
+            true,
+        );
+        let attr = attr.expect("14 first-party tools must defer");
+        assert_eq!(attr.deferred_tools, 6);
+        assert!(attr.deferred_tokens > 0);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["name"], json!("tool_search_tool_regex"));
+        assert_eq!(tools.len(), 15);
+    }
+
+    #[test]
+    fn injection_disabled_is_byte_identical() {
+        let body = body_with(fourteen_tools(), json!([{"role": "user", "content": "hi"}]));
+        let (out, attr) = maybe_inject_tool_search(
+            body.clone(),
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            "req-test",
+            false,
+        );
+        assert!(attr.is_none());
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn small_tool_array_is_byte_identical() {
+        let body = body_with(
+            vec![tool("read"), tool("write")],
+            json!([{"role": "user", "content": "hi"}]),
+        );
+        let (out, attr) = maybe_inject_tool_search(
+            body.clone(),
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            "req-test",
+            true,
+        );
+        assert!(attr.is_none());
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn third_party_strips_search_tools_and_skips_injection() {
+        let mut tools = fourteen_tools();
+        tools.push(
+            json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
+        );
+        let body = body_with(tools, json!([{"role": "user", "content": "hi"}]));
+        let (out, attr) = maybe_inject_tool_search(
+            body,
+            "https://gateway.internal/v1",
+            "claude-opus-5",
+            "req-test",
+            true,
+        );
+        let attr = attr.expect("strip must report");
+        assert_eq!(attr.stripped_third_party, 1);
+        assert_eq!(attr.deferred_tools, 0);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tools"].as_array().unwrap().len(), 14);
+    }
+
+    #[test]
+    fn repair_is_byte_identical_without_search_blocks() {
+        let body = body_with(fourteen_tools(), json!([{"role": "user", "content": "hi"}]));
+        let (out, removed) = maybe_repair_tool_search_history(body.clone(), "req-test");
+        assert_eq!(removed, 0);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn repair_drops_unsupported_pairs() {
+        let body = body_with(
+            vec![tool("read")],
+            json!([{
+                "role": "assistant",
+                "content": [
+                    {"type": "server_tool_use", "id": "srv_1", "name": "tool_search_tool_regex"},
+                    {"type": "tool_search_tool_result", "tool_use_id": "srv_1",
+                     "content": [{"type": "tool_reference", "tool_name": "Slack_post"}]},
+                ],
+            }]),
+        );
+        let (out, removed) = maybe_repair_tool_search_history(body, "req-test");
+        assert_eq!(removed, 2);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ccr_repair_declared_tool_is_byte_identical() {
+        let mut tools = vec![tool("read")];
+        tools.push(tool("headroom_retrieve"));
+        let body = body_with(
+            tools,
+            json!([{
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "r1", "name": "headroom_retrieve",
+                     "input": {"hash": "abc"}},
+                ],
+            }]),
+        );
+        let (out, neutralized) = maybe_repair_ccr_retrieve_history(body.clone(), "req-test");
+        assert_eq!(neutralized, 0);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn ccr_repair_neutralizes_undeclared_pair_in_place() {
+        let body = body_with(
+            vec![tool("read")],
+            json!([
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "looking it up"},
+                    {"type": "tool_use", "id": "r1", "name": "headroom_retrieve",
+                     "input": {"hash": "abc"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "r1",
+                     "content": "the original content"},
+                ]},
+            ]),
+        );
+        let (out, neutralized) = maybe_repair_ccr_retrieve_history(body, "req-test");
+        assert_eq!(neutralized, 2);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // Alternation safety: same messages, same roles, text in place.
+        let messages = v["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], json!("assistant"));
+        assert_eq!(messages[1]["role"], json!("user"));
+        assert_eq!(
+            messages[0]["content"][1]["text"],
+            json!("[headroom_retrieve call omitted: tool not available this turn]")
+        );
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            json!("the original content")
+        );
+    }
+}
+
+#[cfg(test)]
 mod outbound_tool_pairing_tests {
     use super::*;
     use serde_json::json;
@@ -8387,6 +9039,77 @@ where
 /// through this exact code rather than a parallel implementation — the whole
 /// value of the stage is that the replayed bytes are byte-identical, which a
 /// second implementation would be one refactor away from breaking.
+/// Cold-prefix fork decision output.
+pub(crate) struct ColdFork {
+    pub messages: Vec<serde_json::Value>,
+    pub transforms: Vec<String>,
+    pub ttl_desc: String,
+    pub idle_secs: f64,
+}
+
+/// Cold-prefix fork (port of upstream `HEADROOM_COLD_RECOMPACT`).
+///
+/// When the lane has been idle past the request's real cache TTL, the
+/// provider cache is dead and the byte-identical splice preserves nothing.
+/// Returns `Some` only when the operator opted in AND the turn is cold;
+/// warm lanes (and the default-off flag) return `None` so the caller runs
+/// the normal replay with byte-identical behavior.
+///
+/// The caller skips the overlay replay on `Some` (both modes — a dead
+/// splice helps nothing); `messages` already carries the lossless
+/// whole-prefix recompaction in cache mode, and the untouched originals in
+/// token mode (whose recompression already ran with no frozen prefix to
+/// preserve).
+pub(crate) fn maybe_cold_fork(
+    enabled: bool,
+    cache_mode: bool,
+    model: &str,
+    messages: &[serde_json::Value],
+    system: Option<&serde_json::Value>,
+    idle_secs: Option<f64>,
+    ccr_store: Option<std::sync::Arc<dyn headroom_core::ccr::CcrStore>>,
+) -> Option<ColdFork> {
+    use headroom_core::transforms::cold_prefix as cp;
+    if !enabled {
+        return None;
+    }
+    // Authoritative request-level tier (not a guess): the same value that
+    // would drive net-cost pricing. `None` = caching disabled = nothing to
+    // bust = every turn recompactable.
+    let ttl = cp::anthropic_cache_ttl_seconds(model, messages, system);
+    if !cp::should_cold_recompact(idle_secs, ttl) {
+        return None;
+    }
+    let idle = idle_secs.unwrap_or(0.0);
+    // Cache mode: lossless whole-prefix recompaction, then the Spark
+    // reasoning-summary strip (unsigned advisory text only — signed
+    // thinking and redacted blocks are untouchable). Token mode skips the
+    // dead splice without rewriting: its recompression already ran with no
+    // frozen prefix to preserve.
+    let (messages, mut transforms) = if cache_mode {
+        cp::cold_recompact_messages(messages, ccr_store)
+    } else {
+        (messages.to_vec(), Vec::new())
+    };
+    let (messages, transforms) = if cache_mode {
+        let (stripped, n) = cp::strip_spark_reasoning_summaries(messages);
+        if n > 0 {
+            transforms.push(format!("cold:spark_summary:{n}blocks"));
+        }
+        (stripped, transforms)
+    } else {
+        (messages, transforms)
+    };
+    Some(ColdFork {
+        messages,
+        transforms,
+        ttl_desc: ttl
+            .map(|t| format!("{t}s"))
+            .unwrap_or_else(|| "disabled".to_string()),
+        idle_secs: idle,
+    })
+}
+
 pub(crate) fn apply_prefix_replay(
     store: &SessionReplayStore,
     session_key: &str,
@@ -10057,17 +10780,19 @@ impl TurnHookUsage {
 
 /// Pre-send `on_request` seam. Parses the outbound body, lets registered hooks
 /// inspect/mutate `messages`/`tools`, and re-serializes only if a hook changed
-/// them. Returns the body unchanged on any parse/serialize failure. Callers
-/// MUST gate on a non-empty registry so the empty-registry path is a
-/// byte-identical no-op (this fn re-serializes and would perturb bytes).
-fn apply_request_hooks(
+/// them. Returns the body unchanged on any parse/serialize failure, plus the
+/// tool-schema tokens hooks removed (measured on the final tools object, so
+/// in-place shrinks count; growth clamps to zero). Callers MUST gate on a
+/// non-empty registry so the empty-registry path is a byte-identical no-op
+/// (this fn re-serializes and would perturb bytes).
+pub(crate) fn apply_request_hooks(
     body: bytes::Bytes,
     endpoint: compression::CompressibleEndpoint,
     request_id: &str,
-) -> bytes::Bytes {
+) -> (bytes::Bytes, i64) {
     let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return body,
+        Err(_) => return (body, 0),
     };
     let model = parsed
         .get("model")
@@ -10081,6 +10806,21 @@ fn apply_request_hooks(
         .unwrap_or_default();
     let tools = parsed.get("tools").cloned();
 
+    // A hook may shrink the tool array either by replacing it or in place,
+    // so the baseline is counted BEFORE the hooks run and the saving off the
+    // FINAL tools object. Deferral-shaped (removes schemas counting never
+    // saw), hence a tag rather than a fold — mirrors upstream
+    // `handlers/anthropic.py` + the OpenAI chat path.
+    let tok = headroom_core::tokenizer::get_tokenizer(&model);
+    let count_tools = |t: &Option<serde_json::Value>| -> i64 {
+        match t {
+            Some(v) => serde_json::to_string(v)
+                .map(|s| tok.count_text(&s) as i64)
+                .unwrap_or(0),
+            None => 0,
+        }
+    };
+
     let mut ctx = crate::turn_hooks::TurnContext {
         provider: turn_hook_provider(endpoint).to_string(),
         model,
@@ -10088,7 +10828,9 @@ fn apply_request_hooks(
         tools,
         config: None,
     };
+    let tools_before = count_tools(&ctx.tools);
     crate::turn_hooks::run_request_hooks(&mut ctx);
+    let tools_saved = tools_before.saturating_sub(count_tools(&ctx.tools));
 
     // Write mutated messages/tools back onto the body.
     if let Some(obj) = parsed.as_object_mut() {
@@ -10106,10 +10848,10 @@ fn apply_request_hooks(
         }
     }
     match serde_json::to_vec(&parsed) {
-        Ok(v) => bytes::Bytes::from(v),
+        Ok(v) => (bytes::Bytes::from(v), tools_saved),
         Err(e) => {
             tracing::warn!(request_id = %request_id, error = %e, "turn hooks: re-serialize failed; forwarding original body");
-            body
+            (body, 0)
         }
     }
 }
@@ -10890,7 +11632,10 @@ pub(crate) async fn handle_ccr_response(
                     CCR_CONTINUATION_SEND_TIMEOUT,
                     client
                         .post(upstream_url.clone())
-                        .headers(outgoing_headers.clone())
+                        .headers(crate::headers::headers_for_json_body(
+                            outgoing_headers,
+                            &body,
+                        ))
                         .body(body)
                         .send(),
                 )
@@ -11405,7 +12150,10 @@ pub(crate) async fn handle_memory_response(
         let resp = loop {
             match client
                 .post(upstream_url.clone())
-                .headers(outgoing_headers.clone())
+                .headers(crate::headers::headers_for_json_body(
+                    outgoing_headers,
+                    &continuation_body,
+                ))
                 .body(continuation_body.clone())
                 .send()
                 .await

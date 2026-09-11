@@ -6,6 +6,7 @@ pub mod background_compression;
 pub mod bedrock;
 pub mod body;
 pub mod cache_stabilization;
+pub mod ccr_retrieve_repair;
 pub mod cc_switch_reconciler;
 pub mod codex;
 pub mod codex_rate_limits;
@@ -17,6 +18,7 @@ pub mod compression_quarantine;
 pub mod config;
 pub mod ctx;
 pub mod cursor;
+pub mod display_provider;
 pub mod debug_introspection;
 pub mod error;
 pub mod forwarded_headers;
@@ -55,6 +57,10 @@ pub mod subscription;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tile_optimizer;
+/// Tool-schema savings attribution (re-exported from core so the PERF
+/// emitter, the analyzer, and the proxy stats surfaces share one definition).
+pub use headroom_core::tool_schema_savings;
+pub mod tool_search_deferral;
 pub mod tool_schema_compaction;
 pub mod turn_hooks;
 pub mod upstream_guard;

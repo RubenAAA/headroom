@@ -694,10 +694,13 @@ struct CodexWsOutcomeSink {
 
 impl OutcomeSink for CodexWsOutcomeSink {
     fn record_request(&self, outcome: &RequestOutcome) {
+        let tool_schema_saved =
+            crate::tool_schema_savings::tool_schema_saved_from_tags(&outcome.tags).max(0);
         let rec = headroom_core::savings_tracker::RequestRecord {
             model: &outcome.model,
             input_tokens: outcome.original_tokens,
             tokens_saved: outcome.tokens_saved,
+            tool_schema_saved,
             compression_savings_cost_usd: Some(outcome.compression_savings_cost_usd()),
             provider: Some(&outcome.provider),
             project: outcome.project.as_deref(),
@@ -727,6 +730,10 @@ impl OutcomeSink for CodexWsOutcomeSink {
     fn record_tokens(&self, outcome: &RequestOutcome) {
         let rec = headroom_core::cost_tracker::TokenRecord {
             tokens_saved: outcome.tokens_saved,
+            tool_schema_saved: crate::tool_schema_savings::tool_schema_saved_from_tags(
+                &outcome.tags,
+            )
+            .max(0),
             tokens_sent: outcome.original_tokens,
             cache_read_tokens: outcome.cache_read_tokens,
             cache_write_tokens: outcome.cache_write_tokens,

@@ -89,6 +89,7 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
         probe_recorder: None,
         compression_feedback: None,
         trusted_gateway_cidrs: vec![],
+        trusted_dashboard_client_cidrs: vec![],
         background_compressor: None,
         compression_failure_action: crate::compression_failure::CompressionFailureAction {
             refuse: false,

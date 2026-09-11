@@ -169,6 +169,32 @@ fn tokens_saved() -> &'static IntCounter {
     })
 }
 
+/// Tool-schema tokens that never entered context (deferral/hook shrink).
+/// Kept separate from `headroom_tokens_saved_total`: monotonic counters
+/// can't be versioned, so the existing counter keeps its meaning and
+/// dashboards sum both for the headline.
+fn tokens_saved_tool_schema() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            "headroom_tool_schema_saved_total",
+            "Tool-schema tokens kept out of context by deferral",
+        )
+        .expect("headroom_tool_schema_saved_total is well-formed");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("headroom_tool_schema_saved_total registers once");
+        c
+    })
+}
+
+/// Record tool-schema savings for a completed request.
+pub fn record_tool_schema_saved(saved_tokens: u64) {
+    if saved_tokens > 0 {
+        tokens_saved_tool_schema().inc_by(saved_tokens);
+    }
+}
+
 // ─── Compression counters ───────────────────────────────────────────────
 
 fn compressions_by_strategy() -> &'static IntCounterVec {

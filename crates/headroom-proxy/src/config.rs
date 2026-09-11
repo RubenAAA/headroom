@@ -1340,11 +1340,19 @@ pub struct CliArgs {
     #[arg(long = "codex-auth-file", env = "HEADROOM_PROXY_CODEX_AUTH_FILE")]
     pub codex_auth_file: Option<String>,
 
-    /// Proxy run mode: "token" (prioritize compression) or "cache"
-    /// (prioritize provider prefix cache stability). Aliases like
-    /// "token_headroom", "cost_savings" are normalized automatically.
-    #[arg(long = "mode", env = "HEADROOM_MODE", default_value = "token")]
+    /// Proxy run mode: "cache" (prioritize provider prefix cache
+    /// stability, the default) or "token" (prioritize compression).
+    /// Aliases like "token_headroom", "cost_savings" are normalized
+    /// automatically.
+    #[arg(long = "mode", env = "HEADROOM_MODE", default_value = "cache")]
     pub mode: String,
+
+    /// Display name for the OpenAI-compatible upstream shown on the
+    /// dashboard and in `/stats` (e.g. 'OpenRouter'). Overrides hostname
+    /// detection from the configured upstream URL. Internal routing and
+    /// pricing are unaffected. Port of upstream `--provider-name`.
+    #[arg(long = "provider-name", env = "HEADROOM_PROVIDER_NAME")]
+    pub provider_name: Option<String>,
 
     /// Master switch for output-token shaping. When enabled, the proxy
     /// appends verbosity steering to system prompts.
@@ -2348,6 +2356,9 @@ pub struct Config {
     /// (prioritize provider prefix cache stability). Normalized via
     /// `modes::normalize_proxy_mode`.
     pub mode: String,
+    /// Dashboard display name for the OpenAI-compatible upstream.
+    /// Display only; see the `--provider-name` flag docs.
+    pub provider_name: Option<String>,
     /// Master switch for output-token shaping (verbosity steering).
     /// Env-driven via HEADROOM_OUTPUT_SHAPER.
     pub output_shaper_enabled: bool,
@@ -2648,6 +2659,7 @@ impl Config {
                 Some(&args.mode),
                 crate::modes::PROXY_MODE_TOKEN,
             ),
+            provider_name: args.provider_name.clone(),
             output_shaper_enabled: args.output_shaper_enabled,
             verbosity_level: args.verbosity_level.max(0).min(4),
             max_injection_bytes: args.max_injection_bytes,
@@ -2857,7 +2869,13 @@ impl Config {
             local_upstream: None,
             model_routes: Vec::new(),
             codex_auth_file: None,
-            mode: crate::modes::PROXY_MODE_TOKEN.to_string(),
+            provider_name: None,
+            // Cache by default, matching `headroom proxy` upstream: cache mode
+            // freezes prior turns so the provider prefix cache is never
+            // busted; token mode rewrites history for max compression.
+            // Port of upstream b121223e (install defaulted to token and
+            // actively overrode the good server default).
+            mode: crate::modes::PROXY_MODE_CACHE.to_string(),
             output_shaper_enabled: false,
             verbosity_level: 2,
             max_injection_bytes: crate::injection_budget::DEFAULT_MAX_INJECTION_BYTES,
@@ -3002,6 +3020,52 @@ mod upstream_write_timeout_tests {
     fn for_test_carries_the_python_default() {
         let config = Config::for_test("http://127.0.0.1:9".parse().unwrap());
         assert_eq!(config.upstream_write_timeout, Duration::from_secs(150));
+    }
+
+    #[test]
+    fn mode_defaults_to_cache_matching_proxy() {
+        // Port of upstream tests/test_install/test_proxy_mode_default.py
+        // (b121223e): install/deploy defaulted to token while `headroom
+        // proxy` resolves to cache, so installing Headroom actively overrode
+        // the good server default with the cache-busting one. The Rust proxy
+        // is the only entry point here, so pin its own default instead.
+        let args = parse(&[]);
+        assert_eq!(args.mode, "cache");
+        let config = Config::from_cli(args);
+        assert_eq!(config.mode, crate::modes::PROXY_MODE_CACHE);
+    }
+
+    #[test]
+    fn for_test_uses_the_cache_default() {
+        let config = Config::for_test("http://127.0.0.1:9".parse().unwrap());
+        assert_eq!(config.mode, crate::modes::PROXY_MODE_CACHE);
+    }
+
+    #[test]
+    fn explicit_token_mode_is_still_reachable() {
+        // Changing the default must not take the choice away: --mode token
+        // stays available for maximum compression at the cost of
+        // prefix-cache busts.
+        let config = Config::from_cli(parse(&["--mode", "token"]));
+        assert_eq!(config.mode, crate::modes::PROXY_MODE_TOKEN);
+    }
+
+    #[test]
+    fn mode_aliases_still_normalize() {
+        let cache = Config::from_cli(parse(&["--mode", "cost_savings"]));
+        assert_eq!(cache.mode, crate::modes::PROXY_MODE_CACHE);
+        let token = Config::from_cli(parse(&["--mode", "token_headroom"]));
+        assert_eq!(token.mode, crate::modes::PROXY_MODE_TOKEN);
+    }
+
+    #[test]
+    fn provider_name_defaults_to_none_and_passes_through() {
+        // Port of upstream `--provider-name`: display-only override, unset
+        // by default so hostname detection (or the raw label) applies.
+        let config = Config::from_cli(parse(&[]));
+        assert_eq!(config.provider_name, None);
+        let config = Config::from_cli(parse(&["--provider-name", "OpenRouter"]));
+        assert_eq!(config.provider_name.as_deref(), Some("OpenRouter"));
     }
 
     #[test]

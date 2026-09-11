@@ -283,6 +283,38 @@ pub fn build_forward_request_headers(
     out
 }
 
+/// Drop `content-encoding` when the outbound body is plain JSON.
+///
+/// The pipeline re-serializes bodies it parsed; forwarding the client's
+/// `content-encoding` (e.g. gzip) with re-serialized plain JSON makes the
+/// upstream gunzip plaintext and fail the request. Bodies that were never
+/// parsed (opaque bytes — actual gzip passthrough) keep the header, so this
+/// keys off the bytes, not the parse history: JSON opens with `{`/`[` after
+/// whitespace, gzip opens with `0x1f 0x8b`. Port of upstream `4cb33cd9`.
+/// Streaming passthrough never calls this (byte-faithful by contract).
+pub fn strip_content_encoding_for_plain_json(headers: &mut HeaderMap, body: &[u8]) {
+    use http::header::CONTENT_ENCODING;
+    if !headers.contains_key(CONTENT_ENCODING) {
+        return;
+    }
+    let plain_json = body
+        .iter()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| b == b'{' || b == b'[');
+    if plain_json {
+        headers.remove(CONTENT_ENCODING);
+    }
+}
+
+/// Clone outbound headers for a proxy-built JSON body (continuations,
+/// retries of re-serialized turns): same `content-encoding` rule as above.
+pub fn headers_for_json_body(headers: &HeaderMap, body: &[u8]) -> HeaderMap {
+    let mut out = headers.clone();
+    strip_content_encoding_for_plain_json(&mut out, body);
+    out
+}
+
 /// Filter the upstream response headers before passing to the client.
 pub fn filter_response_headers(incoming: &HeaderMap) -> HeaderMap {
     let connection_listed = connection_listed_headers(incoming);
@@ -549,5 +581,54 @@ mod tests {
     #[test]
     fn test_merge_helper_no_double_inject_when_already_present() {
         assert_eq!(merge_anthropic_beta(Some("a,b"), &["b"]), "a,b");
+    }
+
+    // ── content-encoding strip ────────────────────────────────────
+
+    fn encoded_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        h.insert("x-keep", HeaderValue::from_static("yes"));
+        h
+    }
+
+    #[test]
+    fn strips_encoding_for_plain_json_body() {
+        let mut h = encoded_headers();
+        strip_content_encoding_for_plain_json(&mut h, br#"  {"model":"x"}"#);
+        assert!(!h.contains_key(http::header::CONTENT_ENCODING));
+        assert!(h.contains_key("x-keep"));
+    }
+
+    #[test]
+    fn keeps_encoding_for_opaque_bytes() {
+        // Gzipped bytes open with 0x1f 0x8b, never with JSON.
+        let mut h = encoded_headers();
+        strip_content_encoding_for_plain_json(&mut h, &[0x1f, 0x8b, 0x08, 0x00]);
+        assert!(h.contains_key(http::header::CONTENT_ENCODING));
+
+        // Empty body: nothing proves JSON, keep the header.
+        let mut h = encoded_headers();
+        strip_content_encoding_for_plain_json(&mut h, b"   ");
+        assert!(h.contains_key(http::header::CONTENT_ENCODING));
+    }
+
+    #[test]
+    fn no_header_is_noop() {
+        let mut h = HeaderMap::new();
+        strip_content_encoding_for_plain_json(&mut h, br#"{"a":1}"#);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn headers_for_json_body_clones_and_strips() {
+        let h = encoded_headers();
+        let out = headers_for_json_body(&h, br#"{"a":1}"#);
+        assert!(!out.contains_key(http::header::CONTENT_ENCODING));
+        // Input untouched.
+        assert!(h.contains_key(http::header::CONTENT_ENCODING));
     }
 }

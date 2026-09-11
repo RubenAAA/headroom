@@ -38,6 +38,16 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 
 ## CLI options
 
+> **Which proxy?** This table documents the Python `headroom proxy` CLI. The
+> production Rust proxy (`headroom-proxy`, launched with `cclaude`) takes
+> different flags — run `headroom-proxy --help` for the authoritative list.
+> Known divergences: the Rust proxy has no `--openai-api-url` (point it at a
+> custom OpenAI-compatible upstream with the required `--upstream` base URL,
+> per-model `--extra-model-route "name*=URL:openai"`, or the per-request
+> `x-headroom-base-url` header) and no `--backend` / `--workers` /
+> `--no-optimize` / `--learn`. `--provider-name` exists in both; on the Rust
+> proxy the auto-detection reads the configured `--upstream` URL.
+
 ### Core
 
 | Option | Default | Description |
@@ -56,8 +66,8 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 | `--log-file` | None | Path to JSONL log file |
 | `--log-messages` | `false` | Store full request/response content for the live feed |
 | `--budget` | None | Daily budget limit in USD |
-| `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL |
-| `--provider-name` | Detected from `--openai-api-url` | Display name for the OpenAI-compatible upstream on the dashboard (e.g. `OpenRouter`). Well-known hosts (OpenRouter, Groq, Together, Azure OpenAI, …) are detected automatically; this overrides them. Routing and pricing are unaffected. |
+| `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL (**Python proxy only** — the Rust proxy uses `--upstream` / `--extra-model-route` / `x-headroom-base-url`; see note under [CLI options](#cli-options)) |
+| `--provider-name` | Detected from the upstream URL | Display name for the OpenAI-compatible upstream on the dashboard (e.g. `OpenRouter`). Well-known hosts (OpenRouter, Groq, Together, Azure OpenAI, …) are detected automatically; this overrides them. Routing and pricing are unaffected. |
 | `--anthropic-api-url` | Anthropic default | Custom Anthropic API URL |
 | `--gemini-api-url` | Gemini default | Custom Gemini API URL |
 | `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
@@ -254,6 +264,8 @@ By default Headroom stores originals so the model can recover them via `headroom
 | `--lossless` / `HEADROOM_LOSSLESS` | `false` | Format-native lossless compaction only — no CCR marker, no retrieval tool. |
 | `--no-ccr-proactive-expansion` | expansion on | Stop proactively re-expanding compressed content when the model appears to need it. |
 
+Claude Code `/compact` continuation summaries are already context, so they never trigger proactive expansion (expanding them would re-add stale session state). Logged as `ccr_expansion_evaluation` with `outcome="compact_summary"`.
+
 ### File-read handling
 
 Coding agents re-read the same files repeatedly; these control how stale reads are handled without busting the prefix cache.
@@ -284,6 +296,12 @@ Defers large tool schemas so they don't sit in every request. See [MCP](/docs/mc
 |---|---|---|
 | `HEADROOM_TOOL_SEARCH` | proxy (server-side) | Defer MCP/system tool schemas behind a `search_tools` tool. **On by default** for Anthropic requests carrying enough tools to be worth it; set `HEADROOM_TOOL_SEARCH=0` to opt out. |
 | `ENABLE_TOOL_SEARCH` | client (Claude Code) | Keep Claude Code's own deferred tool-loading active behind a custom base URL ([issue #746](https://github.com/headroomlabs-ai/headroom/issues/746)). Set automatically by `headroom wrap`. |
+
+Deferred turns leave `server_tool_use` / `tool_search_tool_result` blocks in the transcript; side-requests replaying it against a smaller tools array (Stop-hook evaluator, `/compact`) get those blocks repaired automatically so the upstream never 400s.
+
+### Cold-prefix recompaction
+
+When a lane has been idle past the request's real cache TTL, the provider cache is already dead — replaying the prefix byte-identically preserves nothing. With `HEADROOM_COLD_RECOMPACT=1`, the proxy instead skips the splice and, in cache mode, runs lossless whole-prefix folds plus a Spark reasoning-summary strip (unsigned advisory text only; signed thinking and redacted blocks are untouchable). Default off; warm lanes are byte-identical either way.
 
 ### Cost-aware model routing
 
@@ -352,6 +370,10 @@ Live session statistics plus durable `persistent_savings` totals. Stored at `~/.
 curl http://localhost:8787/stats
 ```
 
+Saved-token figures are headlines: message compression plus tool-schema tokens kept out of context by deferral (`tool_search` block below shows the deferral share). Per-request rows stay message-only by design and carry the additive `tool_schema_saved_tokens` alongside. `by_provider` breaks the recent window down by dashboard display provider (OpenAI-compatible hosts auto-labeled, `--provider-name` overriding).
+
+`recent_requests` (per-request ids, models, errors) is served to loopback callers and explicitly granted dashboard CIDRs only (`HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS` plus same-origin provenance); network callers still get every aggregate. `POST /stats/reset` is loopback + same-origin only.
+
 ### `GET /stats-history`
 
 Durable history with hourly, daily, weekly, and monthly rollups. Powers the `/dashboard` view.
@@ -359,6 +381,23 @@ Durable history with hourly, daily, weekly, and monthly rollups. Powers the `/da
 ```bash
 curl http://localhost:8787/stats-history
 curl "http://localhost:8787/stats-history?format=csv&series=weekly"
+```
+
+### `GET /stats-lifetime`
+
+Persisted lifetime aggregates. Project names stay loopback-only (or an explicit dashboard-CIDR grant); aggregates are served to everyone.
+
+```bash
+curl http://localhost:8787/stats-lifetime
+```
+
+### `GET /livez`, `/readyz`, `/health`
+
+Orchestrator probes. `/livez` answers when the process is up; `/readyz` reports readiness with the Kompress soft component listed but excluded from the verdict (a deferred model only degrades plain-text compression to passthrough); `/health` adds the running config (mode, upstream URL).
+
+```bash
+curl http://localhost:8787/livez
+curl http://localhost:8787/readyz
 ```
 
 ### `GET /metrics`
@@ -376,6 +415,7 @@ headroom_persistent_savings_tokens_saved_total 5678900
 headroom_compression_ratio_bucket{le="0.5"} 890
 headroom_latency_seconds_bucket{le="0.01"} 800
 headroom_cache_hits_total 456
+headroom_tool_schema_saved_total 123456
 ```
 
 `headroom_tokens_saved_total` is the runtime counter for the current proxy process. Use `headroom_persistent_savings_tokens_saved_total` for durable lifetime savings that match `/stats.persistent_savings`.

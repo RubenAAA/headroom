@@ -3058,6 +3058,18 @@ impl SessionReplayStore {
         self.recent_adoptions.lock().ok()?.pop(session_key)
     }
 
+    /// Seconds since this session's last recorded turn, if it has a tracker.
+    /// Backs the cold-prefix gate: provider caches lapse on idle time, so a
+    /// lane idle past TTL holds a dead prefix. `None` for unknown sessions
+    /// (first turn) — callers must treat that as warm, never cold: there is
+    /// no baseline to compare against, and an unknown is not evidence.
+    pub fn idle_seconds(&self, session_key: &str) -> Option<f64> {
+        let guard = self.trackers.lock().ok()?;
+        guard
+            .peek(session_key)
+            .map(|t| t.last_activity.elapsed().as_secs_f64())
+    }
+
     /// Run `hook` whenever a session adopts another session's prefix.
     pub fn set_adoption_hook(&mut self, hook: AdoptionHook) {
         self.adoption_hook = Some(hook);

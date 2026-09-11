@@ -16,3 +16,9 @@
   green). Remaining: slice #2 per-bucket output rollup (dashboard-only value),
   slice #3 tool-schema aggregation (no Rust producer exists — feature build,
   conflicts with keep-layers-separate; likely reject).
+- **Update 2026-09-11 (2):** slice #3 premise changed — a Rust tool-schema
+  producer now exists (`tool_schema_savings.rs`: `TOOL_SCHEMA_SAVINGS_TAGS`,
+  headline totals through tracker / cost / ledger / `/stats`, ledger `$`
+  priced on the headline count at the cache-aware rate). Slice #3 counts as
+  shipped. Remaining: slice #2 per-bucket output rollup (dashboard-only
+  value).

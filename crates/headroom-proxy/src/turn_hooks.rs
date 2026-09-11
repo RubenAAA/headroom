@@ -228,6 +228,70 @@ mod tests {
         clear_turn_hooks();
     }
 
+    // ── request-seam tool-shrink attribution ──────────────────────────
+
+    #[test]
+    fn apply_request_hooks_reports_tool_shrink_tokens() {
+        use crate::compression::CompressibleEndpoint;
+        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_turn_hooks();
+
+        struct Shrink;
+        impl TurnHook for Shrink {
+            fn name(&self) -> &str {
+                "shrink"
+            }
+            fn on_request(&self, ctx: &mut TurnContext) {
+                if let Some(Value::Array(tools)) = &mut ctx.tools {
+                    tools.retain(|t| t.get("name").and_then(Value::as_str) != Some("drop_me"));
+                }
+            }
+        }
+
+        register_turn_hook(Arc::new(Shrink));
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-x",
+                "messages": [],
+                "tools": [
+                    {"name": "keep", "description": "stays resident for the turn"},
+                    {"name": "drop_me", "description": "a long schema the hook removes from context entirely"},
+                ],
+            }))
+            .unwrap(),
+        );
+        let (out, saved) = crate::proxy::apply_request_hooks(
+            body,
+            CompressibleEndpoint::AnthropicMessages,
+            "req-test",
+        );
+        assert!(saved > 0, "removed schema must count, got {saved}");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tools"].as_array().unwrap().len(), 1);
+        clear_turn_hooks();
+    }
+
+    #[test]
+    fn apply_request_hooks_reports_zero_without_hooks() {
+        use crate::compression::CompressibleEndpoint;
+        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_turn_hooks();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-x",
+                "messages": [],
+                "tools": [{"name": "keep"}],
+            }))
+            .unwrap(),
+        );
+        let (_, saved) = crate::proxy::apply_request_hooks(
+            body,
+            CompressibleEndpoint::AnthropicMessages,
+            "req-test",
+        );
+        assert_eq!(saved, 0);
+    }
+
     // ── on_response replacement + re-drive loop ────────────────────────
 
     #[tokio::test]

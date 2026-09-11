@@ -1,8 +1,10 @@
-//! Trusted-gateway gate for `X-Forwarded-*` headers.
+//! Trusted-gateway gate for `X-Forwarded-*` headers, plus the dashboard
+//! remote-access gate.
 //!
 //! Pure validation and parsing functions for CIDR allow-lists and IP
-//! normalization. The request-dependent `resolve_client_ip` and
-//! `trusted_forwarded_headers` stay in Python.
+//! normalization, client-IP resolution behind trusted gateways, and the
+//! same-origin + CIDR check that authorizes sensitive dashboard metadata
+//! for non-loopback callers.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -217,6 +219,111 @@ pub fn resolve_client_ip(
     peer_addr.unwrap_or("unknown").to_string()
 }
 
+/// A normalized HTTP(S) origin: (scheme, host, port).
+fn normalized_http_origin(value: &str) -> Option<(String, String, u16)> {
+    let url = url::Url::parse(value.trim()).ok()?;
+    let scheme = url.scheme().to_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = url.host_str()?.to_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let port = url
+        .port()
+        .unwrap_or(if scheme == "http" { 80 } else { 443 });
+    Some((scheme, host, port))
+}
+
+/// Accept no browser provenance, otherwise require same-origin headers.
+///
+/// Native CLI clients usually send neither `Origin` nor `Referer`, so
+/// absence remains valid. If either is present it must identify this exact
+/// scheme/host/port, so a victim's browser cannot be used to read sensitive
+/// metadata cross-origin. Port of upstream
+/// `_request_has_same_origin_or_no_provenance`.
+pub fn has_same_origin_or_no_provenance(
+    host_header: &str,
+    origin: Option<&str>,
+    referer: Option<&str>,
+    scheme: &str,
+) -> bool {
+    let expected = match normalized_http_origin(&format!("{scheme}://{host_header}")) {
+        Some(o) => o,
+        None => return false,
+    };
+    for header_value in [origin, referer].into_iter().flatten() {
+        if header_value.is_empty() {
+            continue;
+        }
+        if normalized_http_origin(header_value) != Some(expected.clone()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Authorize sensitive dashboard metadata without widening admin access.
+///
+/// Loopback callers (plus trusted-gateway peers, the containerized-dashboard
+/// case) pass outright. Anyone else must clear three gates: an IP-literal
+/// `Host:` (DNS-rebinding defence), same-origin-or-no-provenance, and a
+/// client IP inside the operator-configured dashboard CIDRs (strict-secure
+/// default: empty list allows nothing). Port of upstream
+/// `_request_can_view_dashboard_metadata`.
+pub fn can_view_dashboard_metadata(
+    peer_host: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    gateway_cidrs: &[IpCidr],
+    dashboard_cidrs: &[IpCidr],
+) -> bool {
+    use crate::loopback_guard::{
+        is_ip_literal_host_header, is_loopback_host, is_loopback_host_header,
+    };
+
+    let host_header = headers.get("host").and_then(|v| v.to_str().ok());
+
+    // Loopback by peer IP and Host header, or gateway-equivalent peer.
+    // The Host-header gate always applies (DNS-rebinding defence).
+    if is_loopback_host_header(host_header) {
+        if is_loopback_host(peer_host) {
+            return true;
+        }
+        if peer_is_trusted_gateway(peer_host, gateway_cidrs) {
+            return true;
+        }
+    }
+
+    let Some(host_header) = host_header.filter(|h| !h.trim().is_empty()) else {
+        return false;
+    };
+    if !is_ip_literal_host_header(Some(host_header)) {
+        return false;
+    }
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    // Scheme behind a TLS terminator comes from the forwarded proto, but
+    // only when the peer is a trusted gateway; otherwise only XFF-trusted
+    // input would be attacker-controlled. Direct peers serve plain HTTP.
+    let scheme = if peer_is_trusted_gateway(peer_host, gateway_cidrs) {
+        header_str("x-forwarded-proto").unwrap_or("http")
+    } else {
+        "http"
+    };
+    if !has_same_origin_or_no_provenance(
+        host_header,
+        header_str("origin"),
+        header_str("referer"),
+        scheme,
+    ) {
+        return false;
+    }
+    peer_is_trusted_gateway(
+        Some(resolve_client_ip(peer_host, headers, gateway_cidrs).as_str()),
+        dashboard_cidrs,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +520,108 @@ mod tests {
             TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV,
             TRUSTED_GATEWAY_CIDRS_ENV
         );
+    }
+
+    // ── same-origin ───────────────────────────────────────────────
+
+    #[test]
+    fn no_provenance_is_valid() {
+        assert!(has_same_origin_or_no_provenance(
+            "10.0.0.5:8787",
+            None,
+            None,
+            "http"
+        ));
+    }
+
+    #[test]
+    fn matching_origin_and_referer_pass() {
+        assert!(has_same_origin_or_no_provenance(
+            "10.0.0.5:8787",
+            Some("http://10.0.0.5:8787/"),
+            Some("http://10.0.0.5:8787/stats"),
+            "http"
+        ));
+    }
+
+    #[test]
+    fn cross_origin_fails() {
+        assert!(!has_same_origin_or_no_provenance(
+            "10.0.0.5:8787",
+            Some("https://attacker.example/"),
+            None,
+            "http"
+        ));
+        assert!(!has_same_origin_or_no_provenance(
+            "10.0.0.5:8787",
+            None,
+            Some("http://10.0.0.5:9999/"),
+            "http"
+        ));
+    }
+
+    // ── dashboard gate ────────────────────────────────────────────
+
+    fn dashboard_headers(host: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", host.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn loopback_views_without_grant() {
+        assert!(can_view_dashboard_metadata(
+            Some("127.0.0.1"),
+            &dashboard_headers("127.0.0.1:8787"),
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn remote_without_grant_is_denied() {
+        assert!(!can_view_dashboard_metadata(
+            Some("203.0.113.7"),
+            &dashboard_headers("10.0.0.5:8787"),
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn remote_with_cidr_grant_views() {
+        let dashboard = load_trusted_dashboard_client_cidrs("203.0.113.0/24").unwrap();
+        assert!(can_view_dashboard_metadata(
+            Some("203.0.113.7"),
+            &dashboard_headers("10.0.0.5:8787"),
+            &[],
+            &dashboard,
+        ));
+    }
+
+    #[test]
+    fn grant_does_not_survive_cross_origin() {
+        let dashboard = load_trusted_dashboard_client_cidrs("203.0.113.0/24").unwrap();
+        let mut headers = dashboard_headers("10.0.0.5:8787");
+        headers.insert("origin", "https://attacker.example".parse().unwrap());
+        assert!(!can_view_dashboard_metadata(
+            Some("203.0.113.7"),
+            &headers,
+            &[],
+            &dashboard,
+        ));
+    }
+
+    #[test]
+    fn grant_does_not_survive_hostname_host() {
+        // DNS-rebinding defence: the Host must be an IP literal even with a
+        // CIDR grant.
+        let dashboard = load_trusted_dashboard_client_cidrs("203.0.113.0/24").unwrap();
+        assert!(!can_view_dashboard_metadata(
+            Some("203.0.113.7"),
+            &dashboard_headers("dashboard.internal"),
+            &[],
+            &dashboard,
+        ));
     }
 }

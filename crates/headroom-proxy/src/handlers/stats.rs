@@ -6,20 +6,92 @@
 //! external subsystem dependencies.
 
 use axum::body::Body;
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use crate::proxy::AppState;
 
 // ── /stats ──
 
-pub async fn handle_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn handle_stats(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
     let cost_stats = state.cost_tracker.stats();
     let savings_preview = state.savings_tracker.stats_preview(20);
-    let recent = state.request_logger.get_recent(100);
+    // Per-request metadata (ids, providers, models, errors) is sensitive:
+    // loopback callers see recent rows; network callers only with an
+    // explicit dashboard-CIDR grant plus same-origin provenance. Aggregates
+    // below are served to everyone (port of upstream's `include_sensitive`
+    // split). Per-row tool-schema component (upstream `server.py:4180`):
+    // rows stay message-only by design (`tokens_saved` untouched); the
+    // additive deferral/hook-shrink share rides alongside so readers can
+    // headline without guessing.
+    let can_view = crate::forwarded_headers::can_view_dashboard_metadata(
+        Some(addr.ip().to_string()).as_deref(),
+        &headers,
+        &state.trusted_gateway_cidrs,
+        &state.trusted_dashboard_client_cidrs,
+    );
+    let recent: Vec<serde_json::Value> = if can_view {
+        state
+            .request_logger
+            .get_recent(100)
+            .into_iter()
+            .map(|entry| {
+                let tool = crate::tool_schema_savings::tool_schema_saved_from_tags(&entry.tags);
+                let headline = crate::tool_schema_savings::headline_tokens_saved(
+                    entry.tokens_saved,
+                    &entry.tags,
+                );
+                let mut row = serde_json::to_value(&entry).unwrap_or(serde_json::Value::Null);
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("tool_schema_saved_tokens".to_string(), tool.into());
+                    obj.insert("headline_tokens_saved".to_string(), headline.into());
+                }
+                row
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // One bounded window for the display aggregations below, mirroring
+    // upstream's single `get_recent(10_000)` pass over the request log.
+    let window = state.request_logger.get_recent(10_000);
+
+    // Requests per display provider. OpenAI-compatible upstreams are
+    // relabeled (e.g. `OpenRouter`); display only — the stored metrics key
+    // stays the internal provider (upstream issue #1533).
+    let mut provider_tallies: HashMap<String, i64> = HashMap::new();
+    for entry in &window {
+        *provider_tallies.entry(entry.provider.clone()).or_default() += 1;
+    }
+    let by_provider = crate::display_provider::remap_provider_counts(
+        &provider_tallies,
+        Some(state.config.upstream.as_str()),
+        state.config.provider_name.as_deref(),
+    );
+
+    // Tool-schema deferral savings: tool-definition tokens kept out of the
+    // model's context by deferring heavy schemas until needed. Attributed to
+    // Headroom only, additive to `tokens_saved` — see
+    // `tool_schema_savings`. Aggregated over the same window.
+    let mut tool_schema_tokens: i64 = 0;
+    let mut tool_schema_requests: i64 = 0;
+    for entry in &window {
+        let saved = crate::tool_schema_savings::tool_schema_saved_from_tags(&entry.tags);
+        if saved > 0 {
+            tool_schema_tokens = tool_schema_tokens.saturating_add(saved);
+            tool_schema_requests += 1;
+        }
+    }
 
     Json(serde_json::json!({
         "cost": cost_stats,
@@ -43,6 +115,17 @@ pub async fn handle_stats(State(state): State<AppState>) -> Json<serde_json::Val
         "proxy_overhead": state.savings_tracker.proxy_overhead_report(),
         "recent_requests": recent,
         "total_logged": state.request_logger.len(),
+        // Requests per dashboard display provider over the recent window.
+        "by_provider": by_provider,
+        // Tool-definition tokens kept out of context by schema deferral,
+        // over the recent window. Counted only when Headroom performed the
+        // deferral.
+        "tool_search": serde_json::json!({
+            "tokens": tool_schema_tokens,
+            "tokens_saved": tool_schema_tokens,
+            "requests": tool_schema_requests,
+            "window": window.len(),
+        }),
         // Per-language AST-compression pauses. Empty on a healthy install;
         // non-empty is the explanation for a savings drop in one language.
         "code_syntax_breaker": headroom_core::transforms::code_compressor::syntax_breaker_status(),
@@ -113,9 +196,65 @@ pub async fn handle_spark_context(State(state): State<AppState>) -> Json<serde_j
 
 // ── /stats/reset ──
 
-pub async fn handle_stats_reset(State(state): State<AppState>) -> Response {
+/// Resettable state is operator territory: loopback callers only (invisible
+/// 404 otherwise, mirroring the `/debug/*` middleware), and same-origin when
+/// browser provenance headers are present. Port of upstream's
+/// `Depends(_require_loopback), Depends(_require_same_origin)`.
+pub async fn handle_stats_reset(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    use crate::loopback_guard::{is_loopback_host, is_loopback_host_header};
+
+    let peer = addr.ip().to_string();
+    let host = headers.get("host").and_then(|v| v.to_str().ok());
+    if !is_loopback_host(Some(peer.as_str())) || !is_loopback_host_header(host) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if !crate::forwarded_headers::has_same_origin_or_no_provenance(
+        host.unwrap_or_default(),
+        header_str("origin"),
+        header_str("referer"),
+        "http",
+    ) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     state.cost_tracker.reset_runtime();
     (StatusCode::OK, Json(serde_json::json!({"status": "reset"}))).into_response()
+}
+
+// ── /stats-lifetime ──
+
+/// Persisted lifetime aggregates. Project names are directory-derived and
+/// stay loopback/grant-only; aggregates are served to everyone. Port of
+/// upstream `/stats-lifetime` (which additionally nulls a persistence error
+/// field Rust does not have).
+pub async fn handle_stats_lifetime(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    let snap = state.savings_tracker.snapshot();
+    let can_view = crate::forwarded_headers::can_view_dashboard_metadata(
+        Some(addr.ip().to_string()).as_deref(),
+        &headers,
+        &state.trusted_gateway_cidrs,
+        &state.trusted_dashboard_client_cidrs,
+    );
+    let mut payload = serde_json::json!({
+        "lifetime": snap.get("lifetime").cloned().unwrap_or(serde_json::Value::Null),
+        "storage_path": snap.get("storage_path").cloned().unwrap_or(serde_json::Value::Null),
+        "schema_version": snap.get("schema_version").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    if can_view {
+        payload["projects"] = snap
+            .get("projects")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    }
+    Json(payload)
 }
 
 // ── /stats-history ──

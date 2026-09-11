@@ -1,4 +1,7 @@
 # Proxy Server Documentation
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
+
 
 The Headroom proxy server is a production-ready HTTP server that applies context optimization to all requests passing through it.
 
@@ -76,7 +79,7 @@ When configured, Headroom emits OTLP traces for the shared compression pipeline 
 | `--budget` | None | Daily budget limit in USD |
 | `--code-aware` / `--no-code-aware` | disabled | Enable or disable AST-based code compression. Requires `headroom-ai[code]` (env: HEADROOM_CODE_AWARE_ENABLED=1 to enable) |
 | `--anthropic-api-url` | `https://api.anthropic.com` | Custom Anthropic API URL endpoint |
-| `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL endpoint |
+| `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL endpoint (**Python proxy only** — Rust uses `--upstream` / `--extra-model-route` / `x-headroom-base-url`; see note above) |
 | `--anthropic-extra-headers` | unset | JSON object of extra headers merged into (and overriding) forwarded Anthropic requests, e.g. `'{"Api-Key": "..."}'` |
 | `--openai-extra-headers` | unset | JSON object of extra headers merged into (and overriding) forwarded OpenAI requests |
 

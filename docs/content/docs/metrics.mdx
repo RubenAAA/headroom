@@ -360,6 +360,7 @@ Env: `HEADROOM_BUDGET_ESTIMATED_BASIS`. `headroom doctor` reports the estimated 
 | Metric | What It Tells You | Target |
 |--------|-------------------|--------|
 | `headroom_tokens_saved_total` | Runtime tokens saved since this proxy process started | Higher is better |
+| `headroom_tool_schema_saved_total` | Runtime tool-schema tokens kept out of context by deferral (the additive share of the headline; dashboards sum both) | Higher is better |
 | `headroom_persistent_savings_tokens_saved_total` | Durable lifetime tokens saved from `/stats.persistent_savings` | Higher is better |
 | `headroom_overhead_ms_sum` / `headroom_overhead_ms_count` | Mean latency Headroom itself adds (there are no percentile buckets — see the callout above) | Low is better |
 | `headroom_provider_cache_hit_requests_total` / `headroom_provider_cache_requests_total` | Cache effectiveness, by provider | >20% is good |
