@@ -8,8 +8,37 @@
 #
 # Rolls back to the previous binary if the new one fails to come up, so a bad
 # build cannot leave every session stranded.
+#
+# SAFETY — what a restart costs and how this script limits it:
+#
+# 1. In-flight turns. SIGTERM starts the proxy's graceful drain
+#    (--graceful-shutdown-timeout, 30s); turns still generating past that die
+#    mid-SSE, truncated, with upstream tokens already paid for. So this script
+#    polls /debug/inflight and waits for zero (bounded by --wait-secs, default
+#    120s) BEFORE signalling. --force skips the wait.
+#
+# 2. Connection-refused window. Between the old listener closing and the new
+#    one binding, connects get ECONNREFUSED. Sub-second; Claude Code retries.
+#    The new binary is staged before SIGTERM so the gap is bind-time only.
+#
+# 3. Per-process pins re-latch. In-memory holds (working-dir, role sentence,
+#    billing pin) do not survive a restart; prefix replay is disk-backed and
+#    does. Restarting re-latches pins and can re-cache a prefix — so restart
+#    less, and never to fix a pin artifact.
+#
+# Usage: restart-headroom.sh [--force] [--wait-secs=N]
 
 set -uo pipefail
+
+FORCE=0
+WAIT_SECS=120
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --wait-secs=*) WAIT_SECS="${arg#--wait-secs=}" ;;
+    *) echo "restart-headroom: unknown arg '$arg' (usage: restart-headroom.sh [--force] [--wait-secs=N])" >&2; exit 2 ;;
+  esac
+done
 
 NEW_BIN="${HEADROOM_REPO:-$HOME/headroom}/target/release/headroom-proxy"
 LIVE_BIN="$HOME/.local/bin/headroom-proxy"
@@ -54,12 +83,31 @@ listener_pid() {
 
 listening() { [ -n "$(listener_pid)" ]; }
 
+# The VPN-exit watcher survives proxy restarts on its own — it tails the log
+# path with `tail -F` (never an fd that goes stale) and keeps its cooldown
+# stamp in a file — so restarts must NOT kill it. But a reboot or a stray
+# pkill leaves nothing watching, and on 2026-09-10 six stacked instances were
+# found tripping over each other's flock. Hence ensure-one, called wherever
+# this script leaves a proxy listening.
+ensure_watcher() {
+  local watch="$HOME/.local/bin/zen-rotate-watch.sh"
+  [ -x "$watch" ] || return 0
+  # Bracket trick: pgrep -f would otherwise match this script's own command
+  # line, which quotes the pattern.
+  if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+    return 0
+  fi
+  setsid nohup "$watch" >>"$HOME/zen-rotate-watch.log" 2>&1 </dev/null &
+  disown
+  log "watcher (re)started"
+}
+
 # Keep this flag set in step with the `cclaude` command line. A proxy already
 # listening on 8787 is REUSED, and flags only apply to the process that starts
 # one — so whatever is set here is what actually runs, and anything missing is
 # silently not in effect.
 start_proxy() {
-  cd "$WORKDIR" || exit 1
+  cd "$WORKDIR" || { log "start_proxy: cd $WORKDIR failed; not starting"; exit 1; }
   # Capture writes whole request bodies to disk — a debugging tool, armed by
   # HEADROOM_CAPTURE_DIR. The proxy inherits that variable from whoever ran this
   # script, so removing an assignment here would not turn it off; `env -u` does.
@@ -100,8 +148,47 @@ start_proxy() {
   disown
 }
 
-# Give the caller's in-flight reply a moment to finish before the port drops.
+# Give the caller's own in-flight reply a moment to land before the port
+# drops: killing the proxy kills the session that launched this script, and
+# that reply has to get out first.
 sleep 5
+
+# Turns currently in flight, or -1 when the endpoint is unreachable
+# (old proxy binary, proxy down, or transient curl failure).
+inflight() {
+  local n
+  n=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/debug/inflight" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("in_flight", -1))' 2>/dev/null) \
+    || n="-1"
+  printf '%s' "$n"
+}
+
+# Wait for in-flight turns to finish BEFORE signalling the old proxy, so the
+# graceful drain (30s) is a backstop, not the plan. Bounded: after WAIT_SECS
+# the restart goes ahead anyway and stragglers die truncated. Returns 0 on a
+# clean drain (or drain-blind), 1 when stragglers remain.
+wait_for_drain() {
+  if [[ "$FORCE" == "1" ]]; then
+    log "drain: --force given, skipping inflight wait"
+    return 0
+  fi
+  local deadline=$(( $(date +%s) + WAIT_SECS )) n
+  n=$(inflight)
+  if [[ "$n" == "-1" ]]; then
+    log "drain: no inflight endpoint (old proxy); proceeding without drain"
+    return 0
+  fi
+  while (( $(date +%s) < deadline )); do
+    if [[ "$n" == "0" ]]; then
+      log "drain: no turns in flight, proceeding"
+      return 0
+    fi
+    sleep 2
+    n=$(inflight)
+  done
+  log "drain: timed out with in_flight=${n:-unknown}; restarting anyway"
+  return 1
+}
 
 log "=== restart begin ==="
 
@@ -112,6 +199,10 @@ fi
 
 OLD_PID=$(listener_pid)
 log "current listener pid=${OLD_PID:-none}"
+
+if [[ -n "${OLD_PID:-}" ]]; then
+  wait_for_drain || log "restarting with turns still in flight; stragglers will truncate"
+fi
 
 # Keep the outgoing binary so a failed start can be undone.
 if [[ -f "$LIVE_BIN" ]]; then
@@ -145,6 +236,7 @@ done
 if listening; then
   NEW_PID=$(listener_pid)
   log "OK: proxy listening on $PORT (pid=${NEW_PID:-unknown})"
+  ensure_watcher
   log "=== restart done ==="
   exit 0
 fi
@@ -158,6 +250,7 @@ if [[ -f "$BACKUP" ]]; then
   done
   listening && log "rollback OK: previous binary is serving again" \
             || log "ROLLBACK FAILED: proxy is DOWN, start it by hand"
+  listening && ensure_watcher
 else
   log "no backup available; proxy is DOWN"
 fi

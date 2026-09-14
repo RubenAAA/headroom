@@ -50,11 +50,15 @@ armed_by_invocation() {
 }
 
 mr_in_transcript() {
-  grep -oE 'merge_requests/[0-9]+|MR![0-9]+|!\[0-9]+' "$TRANSCRIPT" 2>/dev/null |
+  # FINDING-046: the third alternative was `!\[0-9]+` (literal "[0-9]")
+  # which never matches `!554` — the backslash must go.
+  grep -oE 'merge_requests/[0-9]+|MR![0-9]+|![0-9]+' "$TRANSCRIPT" 2>/dev/null |
     grep -oE '[0-9]+' | tail -1
 }
 
-POSTER="$HOME"/headroom/contrib/spark-poster
+# FINDING-046: honor HEADROOM_REPO like statusline-with-cache.sh and
+# restart-headroom.sh do; $HOME/headroom is only the fallback.
+POSTER="${HEADROOM_REPO:-$HOME/headroom}/contrib/spark-poster"
 
 # ── which review command armed this session ──
 #
@@ -331,8 +335,13 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   # filing with a filing verb, the ticket worker owns it and review stands
   # down — both would otherwise spawn (disjoint state dirs, no mutual
   # exclusion). Mirrors ticket-gate's trigger so the split stays aligned: if
-  # ticket-gate would fire, review-gate must not. `issue` deliberately
-  # excluded: ordinary review prose says "this issue" without filing anything.
+  # ticket-gate would fire, review-gate must not. FINDING-046: the mirrors
+  # are intentionally not identical — review excludes `issue` (ordinary
+  # review prose says "this issue" without filing anything) and the Russian
+  # verbs (review diverts on Russian post/answer words, ticket on Russian
+  # file/create words), so "создай тикет" fires ticket only and "запости
+  # ответы" fires review only; "post the ticket" matches both and ticket
+  # wins by this stand-down.
   if echo "$PROMPT" | grep -qE 'file|create|open|submit|raise|post' &&
      echo "$PROMPT" | grep -qE 'ticket|youtrack'; then
     INTENT=""

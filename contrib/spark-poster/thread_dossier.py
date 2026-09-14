@@ -131,8 +131,15 @@ def dossier(d, first_review, head=None):
         log = git("log", "--oneline", f"--since={first_review}", head, "--", path)
         out += ["", f"--- COMMITS TOUCHING {path} SINCE REVIEW ---",
                 log.strip() or "(none)"]
-        if line:
-            lo, hi = max(1, int(line) - CONTEXT), int(line) + CONTEXT
+        # FINDING-047: GitLab line fields are ints when present, but a
+        # defensive int() broke the whole batch on one malformed thread.
+        # Non-numeric anchors keep the commits list and skip the snippet.
+        try:
+            lineno = int(line) if line else 0
+        except (TypeError, ValueError):
+            lineno = 0
+        if lineno:
+            lo, hi = max(1, lineno - CONTEXT), lineno + CONTEXT
             lines = git("show", f"{head}:{path}").splitlines()
             out += ["", f"--- {path} @ {head} lines {lo}-{hi} ---"]
             out += [f"{i + 1:6d}| {lines[i]}"

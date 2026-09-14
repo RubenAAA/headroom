@@ -11,7 +11,7 @@ TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ] && exit 0
 OUTDIR="$HOME/.local/state/spark-review"
-TICKET_WORKER="$HOME/headroom/contrib/spark-poster/ticket_file.py"
+TICKET_WORKER="${HEADROOM_REPO:-$HOME/headroom}/contrib/spark-poster/ticket_file.py"
 mkdir -p "$OUTDIR" 2>/dev/null
 
 # ── no arming: the phrases below are explicit enough to act on directly ──

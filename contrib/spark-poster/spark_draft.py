@@ -88,6 +88,15 @@ see in the evidence. Never claim a change you cannot point to. If the
 reviewer is right and nothing has changed yet, say so plainly and say what
 you will do -- do not argue the thread closed.
 
+An AUTHOR VERDICTS section after the evidence holds the author's decided
+position from the session that armed this run. Where it covers this thread,
+your job is to transfer that position onto the thread: state the verdict,
+give the author's reason and what was checked, and set resolve accordingly.
+Do not re-litigate, contradict, or soften a rejection into a promise to
+fix. A claim the author checked and rejected closes the point -- resolve
+true, with the check as the reason. Threads no verdict covers you decide
+from the evidence as above.
+
 Answer in the language the reviewer's note is written in.
 
 Output ONLY a JSON object, no prose around it:
@@ -338,6 +347,21 @@ def main():
     os.makedirs(OUTDIR, exist_ok=True)
     path = os.path.join(OUTDIR, f"{session}.draft.json")
 
+    # Fix mode only: the author's decided positions from the arming session
+    # (checked-and-rejected claims included). The worker never saw the
+    # session, so without this a deliberately un-fixed thread reads as
+    # "valid point, unaddressed". Short tail on purpose: this block is
+    # copied into every thread's evidence, so it multiplies by batch size.
+    author = ""
+    if mode == "fix-mr-comments" and transcript:
+        tail = read_findings(transcript, 12000)
+        if tail and tail.strip():
+            author = ("\n\n===== AUTHOR VERDICTS: decided positions to transfer "
+                      "onto the threads, not to re-litigate =====\n"
+                      "(tail of the arming session; verdict statements near the "
+                      "end matter most, tool noise is not evidence)\n"
+                      + tail.strip())
+
     def flush():
         """Write what we have. The loop below can die on any thread --
         per-thread timeout, supervisor timeout, SIGKILL -- and a draft
@@ -360,7 +384,7 @@ def main():
     groups = [mine[i:i + BATCH] for i in range(0, len(mine), BATCH)]
     print(f"  {len(mine)} threads in {len(groups)} batch call(s)", file=sys.stderr)
     for group in groups:
-        items = [(d["id"], td.dossier(d, first_review, head)) for d in group]
+        items = [(d["id"], td.dossier(d, first_review, head) + author) for d in group]
         ids = [did for did, _ in items]
         out, diag = _call(batch_prompt(task, items), BATCH_TIMEOUT)
         batch = parse_batch(out, ids) if out is not None else {}

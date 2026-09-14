@@ -1,15 +1,74 @@
 #!/usr/bin/env bash
-# Watch headroom-proxy.log for Zen/Spark rate limits; rotate the NordVPN exit
+# Watch headroom-proxy.log for Zen/Spark rate limits; rotate the VPN exit
 # and leave a notice for the sleeping sessions, then keep watching.
 #
-# Start once from a shell in the `nordvpn` group (it runs forever):
+# Works with whatever VPN the operator already pays for — the provider is
+# auto-detected, or pinned explicitly. No supported VPN is also fine: the
+# watcher still runs (429 detection + cooldown + notices) and just skips
+# the reconnect step.
+#
+# Configuration (all optional, environment only):
+#   VPN_PROVIDER        auto (default) | nordvpn | mullvad | expressvpn |
+#                       protonvpn | surfshark | pia | tailscale |
+#                       wireguard | openvpn | custom | none
+#                       `auto` probes for a known CLI, in that order, and
+#                       falls back to `none`. HEADROOM_VPN_PROVIDER is
+#                       honoured as a fallback name for the same setting.
+#   VPN_LOCATIONS       space-separated location list, overriding the
+#                       provider default below. Names are provider-flavoured:
+#                       NordVPN Title_Case, Mullvad/Proton 2-letter codes,
+#                       PIA region ids, Tailscale exit-node names/IPs,
+#                       wg-quick/openvpn config basenames (no suffix).
+#   VPN_CONFIG_DIR      *.conf / *.ovpn directory for wireguard/openvpn
+#                       (default ~/.config/headroom/vpn).
+#   VPN_CONNECT_CMD     template for `custom`: `%s` is replaced with the
+#                       location, otherwise the location is appended as an
+#                       argument. Required when VPN_PROVIDER=custom.
+#   VPN_CONNECT_TIMEOUT connect timeout in seconds (default 120).
+#   VPN_SETTLE_SECS     sleep after connect before checking egress (default 8).
+#
+# Provider notes (log in / set up the VPN app first, outside this script):
+#   nordvpn    `nordvpn connect <Country>`; needs the `nordvpn` group +
+#              fresh shell, and `nordvpn allowlist add subnet 127.0.0.0/8`
+#              + reconnect so tunneled loopback to the proxy keeps working.
+#   mullvad    `mullvad relay set location <cc> && mullvad connect`
+#              (2-letter codes, e.g. `se`). Daemon via the Mullvad app.
+#   expressvpn `expressvpnctl connect ["<Location>"]` (v14+; legacy `expressvpn`
+#              binary also tried). `expressvpnctl get regions` lists exact
+#              names for VPN_LOCATIONS; default re-connects (`smart`), which
+#              usually moves egress on its own.
+#   protonvpn  new `protonvpn connect --country <CC>` preferred, legacy
+#              `protonvpn-cli connect --cc <CC>` (needs sudo) as fallback.
+#   surfshark  legacy `surfshark-vpn attack` quick-connect only — it takes no
+#              location argument, so rotation just re-establishes the tunnel.
+#              For country control use wireguard below with downloaded .confs.
+#   pia        `piactl set region <id> && piactl connect`; needs the PIA
+#              daemon running. Regions auto-listed via `piactl get regions`,
+#              or pin them with VPN_LOCATIONS.
+#   tailscale  `tailscale set --exit-node=<name|ip>`; exit nodes are yours,
+#              so set VPN_LOCATIONS to their names/IPs
+#              (`tailscale exit-node list` to enumerate).
+#   wireguard  cycles `*.conf` in VPN_CONFIG_DIR via `wg-quick down/up`
+#              (usually needs sudo — see VPN_CONNECT_CMD/custom if yours
+#              differs). VPN_LOCATIONS pins a subset of basenames.
+#   openvpn    cycles `*.ovpn` in VPN_CONFIG_DIR (`openvpn --config … --daemon`,
+#              old tunnel killed first; auth/certs stay in your configs).
+#   custom     runs VPN_CONNECT_CMD per location, e.g.
+#              `VPN_CONNECT_CMD='sudo wg-quick up %s'`.
+#   none       no VPN: rotations become wait-out-the-cooldown + notices.
+#
+# Start once (it runs forever):
 #   setsid nohup "$HOME/.local/bin/zen-rotate-watch.sh" >>"$HOME/zen-rotate-watch.log" 2>&1 &
 # Stop:  pkill -f zen-rotate-watch
 # Follow: tail -f ~/zen-rotate-watch.log
 #
-# Manual rotation (same drain + notices as the automatic path — never run bare
-# `nordvpn connect` while turns are in flight; it RSTs every active stream):
-#   zen-rotate-watch.sh --rotate-now [country]
+# Manual rotation (same drain + notices as the automatic path — never
+# reconnect bare-handed while turns are in flight; it RSTs every stream):
+#   zen-rotate-watch.sh --rotate-now [location]
+#
+# Introspection:
+#   zen-rotate-watch.sh --list-providers   # supported provider names
+#   zen-rotate-watch.sh --detect-provider  # what `auto` would pick here
 #
 # Trigger 1: `local_model_upstream_error` with `"status":429` — the exact line
 # the proxy emits when Zen refuses a routed turn (12h wait included).
@@ -17,10 +76,10 @@
 # limiting requests`, polled in recent spark transcripts. The proxy log only
 # shows what arrived while the tail was running; the transcript poll catches
 # a refusal the log trigger missed.
-# Rotation cycles the country list — reshuffled and recycled until api.ipify.org
-# reports a different egress, bounded by ROTATE_DEADLINE_SECS rather than by
-# list exhaustion (countries are reusable; giving up after one pass through
-# the list would strand us on a congested exit). No proxy restart, ever:
+# Rotation cycles the provider's location list — reshuffled and recycled until
+# api.ipify.org reports a different egress, bounded by ROTATE_DEADLINE_SECS
+# rather than by list exhaustion (locations are reusable; giving up after one
+# pass through the list would strand us on a congested exit). No proxy restart, ever:
 # restarting wipes in-memory session state
 # and forces fleet-wide recaches plus a burst of errors — far worse than a
 # few corpse-RST turns served from the old pool until it ages out (~25 s,
@@ -46,7 +105,8 @@ LOG="$HOME/headroom-proxy.log"
 WATCHLOG="$HOME/zen-rotate-watch.log"
 STAMP="$HOME/.zen-rotate.last"
 COUNTRIES=(
-# Europe (NordVPN names; Turkey not Turkiye).
+# Europe (NordVPN names; Turkey not Turkiye). Default location list for the
+# nordvpn provider; other providers bring their own defaults below.
 Albania Andorra Armenia Austria Azerbaijan Belgium Bosnia_And_Herzegovina
 Bulgaria Cayman_Islands Cyprus Croatia Czech_Republic Denmark Estonia Finland
 France Georgia Germany Greece Hungary Iceland Ireland Isle_Of_Man Italy Jersey
@@ -57,6 +117,172 @@ Slovenia Spain Sweden Switzerland Ukraine United_Kingdom
 Bahrain Iraq Israel Jordan Kuwait Lebanon Qatar Turkey United_Arab_Emirates
 Yemen
 )
+# Same geography as COUNTRIES, as 2-letter codes for the mullvad and protonvpn
+# providers (Mullvad takes lowercase, Proton takes either case).
+MULLVAD_COUNTRIES=(al ad am at az be ba bg cy hr cz dk ee fi fr ge de gr hu
+is ie it lv li lt lu mt md mc me nl mk no pl pt ro rs sk si es se ch ua gb
+bh iq il jo kw lb qa tr ae ye)
+# PIA fallback when `piactl get regions` is unavailable (region ids vary by
+# account/server list — prefer VPN_LOCATIONS with your own).
+PIA_REGIONS=(us-east us-west us-central uk-london nl netherlands de-berlin
+france switzerland sweden norway spain italy poland czech austria)
+# ── VPN provider layer ─────────────────────────────────────────────────
+# VPN_PROVIDER selects the backend (default `auto`). HEADROOM_VPN_PROVIDER is
+# honoured as an alias so the setting matches the HEADROOM_* convention.
+VPN_PROVIDER="${VPN_PROVIDER:-${HEADROOM_VPN_PROVIDER:-auto}}"
+VPN_CONFIG_DIR="${VPN_CONFIG_DIR:-$HOME/.config/headroom/vpn}"
+VPN_CONNECT_TIMEOUT="${VPN_CONNECT_TIMEOUT:-120}"
+VPN_SETTLE_SECS="${VPN_SETTLE_SECS:-8}"
+VPN_IFACE_STATE="$HOME/.zen-rotate.iface"
+VPN_OVPN_PID="$HOME/.zen-rotate.ovpn.pid"
+
+SUPPORTED_PROVIDERS="nordvpn mullvad expressvpn protonvpn surfshark pia tailscale wireguard openvpn custom none"
+
+# What `auto` would pick on this machine: first known CLI on PATH, else none.
+detect_vpn_provider() {
+  if command -v nordvpn >/dev/null 2>&1; then echo nordvpn
+  elif command -v mullvad >/dev/null 2>&1; then echo mullvad
+  elif command -v expressvpnctl >/dev/null 2>&1 || command -v expressvpn >/dev/null 2>&1; then echo expressvpn
+  elif command -v protonvpn >/dev/null 2>&1 || command -v protonvpn-cli >/dev/null 2>&1; then echo protonvpn
+  elif command -v surfshark-vpn >/dev/null 2>&1 || command -v surfshark >/dev/null 2>&1; then echo surfshark
+  elif command -v piactl >/dev/null 2>&1; then echo pia
+  elif command -v tailscale >/dev/null 2>&1; then echo tailscale
+  elif command -v wg-quick >/dev/null 2>&1; then echo wireguard
+  elif command -v openvpn >/dev/null 2>&1; then echo openvpn
+  else echo none
+  fi
+}
+
+# Effective provider: explicit VPN_PROVIDER wins, otherwise whatever `auto`
+# detects on this machine (`command -v` probes — cheap enough to run per call).
+vpn_provider() {
+  if [[ "$VPN_PROVIDER" == "auto" ]]; then
+    detect_vpn_provider
+  else
+    printf '%s' "$VPN_PROVIDER"
+  fi
+}
+
+# Connect the VPN to $1 (a location in the provider's flavour). Returns 0 on
+# apparent success — egress movement is verified separately by the caller.
+vpn_connect() {
+  local loc="$1" provider
+  provider=$(vpn_provider)
+  case "$provider" in
+    nordvpn)
+      timeout "$VPN_CONNECT_TIMEOUT" nordvpn connect "$loc" >>"$WATCHLOG" 2>&1 ;;
+    mullvad)
+      timeout "$VPN_CONNECT_TIMEOUT" mullvad relay set location "$loc" >>"$WATCHLOG" 2>&1 || return 1
+      timeout "$VPN_CONNECT_TIMEOUT" mullvad connect >>"$WATCHLOG" 2>&1 ;;
+    expressvpn)
+      if command -v expressvpnctl >/dev/null 2>&1; then
+        if [[ -z "$loc" || "$loc" == "smart" ]]; then
+          timeout "$VPN_CONNECT_TIMEOUT" expressvpnctl connect >>"$WATCHLOG" 2>&1
+        else
+          timeout "$VPN_CONNECT_TIMEOUT" expressvpnctl connect "$loc" >>"$WATCHLOG" 2>&1
+        fi
+      else
+        if [[ -z "$loc" || "$loc" == "smart" ]]; then
+          timeout "$VPN_CONNECT_TIMEOUT" expressvpn connect >>"$WATCHLOG" 2>&1
+        else
+          timeout "$VPN_CONNECT_TIMEOUT" expressvpn connect "$loc" >>"$WATCHLOG" 2>&1
+        fi
+      fi ;;
+    protonvpn)
+      if command -v protonvpn >/dev/null 2>&1; then
+        timeout "$VPN_CONNECT_TIMEOUT" protonvpn connect --country "$loc" >>"$WATCHLOG" 2>&1
+      else
+        timeout "$VPN_CONNECT_TIMEOUT" sudo protonvpn-cli connect --cc "$loc" >>"$WATCHLOG" 2>&1
+      fi ;;
+    surfshark)
+      # Legacy CLI takes no location argument: cycle the tunnel and hope the
+      # exit moves. Country control needs the wireguard provider instead.
+      if command -v surfshark-vpn >/dev/null 2>&1; then
+        timeout "$VPN_CONNECT_TIMEOUT" sudo surfshark-vpn down >>"$WATCHLOG" 2>&1 || true
+        timeout "$VPN_CONNECT_TIMEOUT" sudo surfshark-vpn attack >>"$WATCHLOG" 2>&1
+      else
+        timeout "$VPN_CONNECT_TIMEOUT" sudo surfshark attack >>"$WATCHLOG" 2>&1
+      fi ;;
+    pia)
+      timeout "$VPN_CONNECT_TIMEOUT" piactl set region "$loc" >>"$WATCHLOG" 2>&1 || return 1
+      timeout "$VPN_CONNECT_TIMEOUT" piactl connect >>"$WATCHLOG" 2>&1 ;;
+    tailscale)
+      timeout "$VPN_CONNECT_TIMEOUT" sudo tailscale set --exit-node="$loc" >>"$WATCHLOG" 2>&1 ;;
+    wireguard)
+      local cur=""
+      [[ -f "$VPN_IFACE_STATE" ]] && cur=$(cat "$VPN_IFACE_STATE" 2>/dev/null || true)
+      if [[ -n "$cur" && "$cur" != "$loc" ]]; then
+        timeout "$VPN_CONNECT_TIMEOUT" sudo wg-quick down "$cur" >>"$WATCHLOG" 2>&1 || true
+      fi
+      timeout "$VPN_CONNECT_TIMEOUT" sudo wg-quick up "$loc" >>"$WATCHLOG" 2>&1 || return 1
+      printf '%s' "$loc" >"$VPN_IFACE_STATE" ;;
+    openvpn)
+      if [[ -f "$VPN_OVPN_PID" ]]; then
+        kill "$(cat "$VPN_OVPN_PID" 2>/dev/null || echo none)" 2>/dev/null || true
+        rm -f "$VPN_OVPN_PID"
+        sleep 2
+      fi
+      pkill -f "openvpn.*--config $VPN_CONFIG_DIR" 2>/dev/null || true
+      timeout "$VPN_CONNECT_TIMEOUT" sudo openvpn --config "$VPN_CONFIG_DIR/$loc.ovpn" --daemon --writepid "$VPN_OVPN_PID" >>"$WATCHLOG" 2>&1 ;;
+    custom)
+      if [[ -z "${VPN_CONNECT_CMD:-}" ]]; then
+        log "custom provider needs VPN_CONNECT_CMD (e.g. VPN_CONNECT_CMD='sudo wg-quick up %s')"
+        return 1
+      fi
+      if [[ "$VPN_CONNECT_CMD" == *"%s"* ]]; then
+        timeout "$VPN_CONNECT_TIMEOUT" bash -c "${VPN_CONNECT_CMD//\%s/$loc}" >>"$WATCHLOG" 2>&1
+      else
+        timeout "$VPN_CONNECT_TIMEOUT" bash -c "$VPN_CONNECT_CMD \"\$0\"" "$loc" >>"$WATCHLOG" 2>&1
+      fi ;;
+    none)
+      log "no VPN provider configured; skipping reconnect (waiting out the cooldown)"
+      return 1 ;;
+    *)
+      log "unknown VPN_PROVIDER='$provider' (see --list-providers); skipping reconnect"
+      return 1 ;;
+  esac
+}
+
+# Location candidates for the active provider: explicit VPN_LOCATIONS wins,
+# then provider defaults / local discovery. Prints one location per line.
+vpn_locations() {
+  local provider
+  provider=$(vpn_provider)
+  if [[ -n "${VPN_LOCATIONS:-}" ]]; then
+    # shellcheck disable=SC2086: VPN_LOCATIONS is intentionally space-split.
+    printf '%s\n' $VPN_LOCATIONS
+    return 0
+  fi
+  case "$provider" in
+    nordvpn|custom) printf '%s\n' "${COUNTRIES[@]}" ;;
+    mullvad) printf '%s\n' "${MULLVAD_COUNTRIES[@]}" ;;
+    expressvpn) printf 'smart\n' ;;
+    protonvpn) printf '%s\n' "${MULLVAD_COUNTRIES[@]}" | tr '[:lower:]' '[:upper:]' ;;
+    surfshark) printf 'quick\n' ;;
+    pia)
+      if command -v piactl >/dev/null 2>&1; then
+        piactl get regions 2>/dev/null | tr ', ' '\n\n' | grep -v '^$' || printf '%s\n' "${PIA_REGIONS[@]}"
+      else
+        printf '%s\n' "${PIA_REGIONS[@]}"
+      fi ;;
+    tailscale)
+      if command -v tailscale >/dev/null 2>&1; then
+        tailscale exit-node list 2>/dev/null | awk 'NR>1 {print $2}' | grep -v '^$' || true
+      fi ;;
+    wireguard)
+      shopt -s nullglob
+      local f
+      for f in "$VPN_CONFIG_DIR"/*.conf; do basename "$f" .conf; done
+      shopt -u nullglob ;;
+    openvpn)
+      shopt -s nullglob
+      local f
+      for f in "$VPN_CONFIG_DIR"/*.ovpn; do basename "$f" .ovpn; done
+      shopt -u nullglob ;;
+    none) return 1 ;;
+    *) return 1 ;;
+  esac
+}
 COOLDOWN_SECS=120
 # Proactive cycling: rotate on a schedule, not just on rate limits, so the
 # exit moves before a bucket fills — at a moment we choose, drained, instead
@@ -79,6 +305,14 @@ SPARK_MODEL="claude-muse-spark"
 POLL_SECS=30
 HIT_WINDOW_SECS=180
 HIT_MARKER="temporarily limiting requests"
+# Tunnel-sickness trigger: bursts of fresh-connect/send failures in the proxy
+# log mean the egress path itself is degrading — 2026-09-14 13:01 showed
+# send failures plus mid-stream RSTs minutes before the rate-limit rotation
+# fired. Distinctive lines only: decode-error retries happen on ordinary
+# provider blips and must not rotate the exit. Fires at threshold, then
+# suppresses until the window slides past so one burst rotates once.
+TRANSPORT_BURST_THRESHOLD=3
+TRANSPORT_STAMP="$HOME/.zen-rotate.transport-last"
 # Where rotation notices land: per-session files next to the review state the
 # hooks already use. `rotation-notice.sh` (UserPromptSubmit) relays an
 # unreported one on the session's next prompt, then marks it reported.
@@ -116,10 +350,20 @@ PY
 }
 
 # Record a rotation where sessions will find it: one small JSON file per
-# recently-active spark session. $1 = reason (rate-limit|proactive|manual),
-# $2/$3 = egress before/after. Never billed, never loads a context.
+# recently-active spark session. $1 = reason
+# (rate-limit|egress-degraded|proactive|manual), $2/$3 = egress
+# before/after, $4 = optional message override (default assumes the exit
+# actually moved). Never billed, never loads a context.
 write_notices() {
   local reason="$1" before="$2" after="$3" ts sid f
+  local message
+  if [[ -n "${4:-}" ]]; then
+    message="$4"
+  elif [[ "$reason" == "egress-degraded" ]]; then
+    message="VPN exit rotated ($before -> $after): fresh connections were failing on the old exit. Retry your last failed request. If the connection dropped mid-response and a tool call was discarded, re-issue it -- nothing ran."
+  else
+    message="VPN exit rotated ($before -> $after): upstream rate limits clear. Retry your last failed request. If the connection dropped mid-response and a tool call was discarded, re-issue it -- nothing ran."
+  fi
   ts=$(date +%s)
   mkdir -p "$NOTICE_DIR" 2>/dev/null || return 0
   for sid in $(notice_sessions); do
@@ -129,7 +373,7 @@ write_notices() {
     rm -f "$NOTICE_DIR/$sid.rotation.reported"
     cat >"$f" <<EOF
 {"ts": $ts, "reason": "$reason", "egress_before": "$before", "egress_after": "$after",
- "message": "VPN exit rotated ($before -> $after): upstream rate limits clear. Retry your last failed request. If the connection dropped mid-response and a tool call was discarded, re-issue it -- nothing ran."}
+ "message": "$message"}
 EOF
   done
   log "rotation notices written (reason=$reason, egress=$before->$after)"
@@ -152,21 +396,29 @@ inflight() {
 }
 
 # Wait for in-flight turns to land before killing the tunnel: a rotation
-# RSTs every active stream by design. Bounded — after DRAIN_SECS the
-# rotation goes ahead anyway and the stragglers die truncated (the proxy
-# closes those turns marked, and the resume prompt covers re-issue).
-# Returns 0 on a clean drain (or drain-blind), 1 when stragglers remain.
+# RSTs every active stream by design. Progress-aware: while the count keeps
+# falling, turns are landing and the deadline extends (bounded) — only a
+# stalled count dies on schedule. 2026-09-14 13:08 killed a live turn after
+# a flat 90s; the proxy closes those turns marked, but not killing them is
+# strictly better. Returns 0 on a clean drain (or drain-blind), 1 when
+# stragglers remain.
 DRAIN_SECS=90
+# Extra drain granted each time the count falls, and the hard ceiling on all
+# extensions: a landing trickle gets room, a stuck turn still dies on time.
+DRAIN_PROGRESS_EXTEND_SECS=30
+DRAIN_MAX_EXTEND_SECS=180
 drain() {
   local deadline=$(( $(date +%s) + DRAIN_SECS ))
+  local max_deadline=$(( $(date +%s) + DRAIN_SECS + DRAIN_MAX_EXTEND_SECS ))
   # First read decides: no endpoint (old proxy binary, pre-drain support)
   # means drain-blind — rotate at once rather than burning the timeout.
-  local n
+  local n last_n
   n=$(inflight)
   if [[ "$n" == "-1" ]]; then
     log "drain: no inflight endpoint (old proxy); rotating without drain"
     return 0
   fi
+  last_n="$n"
   while (( $(date +%s) < deadline )); do
     if [[ "$n" == "0" ]]; then
       log "drain: no turns in flight, rotating"
@@ -174,29 +426,49 @@ drain() {
     fi
     sleep 2
     n=$(inflight)
+    # Progress short of completion: turns are landing, so give the rest more
+    # room — bounded by max_deadline so a trickle never holds the rotation
+    # hostage. A non-numeric read (endpoint hiccup) neither extends nor kills.
+    if [[ "$n" =~ ^[0-9]+$ && "$last_n" =~ ^[0-9]+$ ]] && (( n < last_n )); then
+      if (( $(date +%s) + DRAIN_PROGRESS_EXTEND_SECS < max_deadline )); then
+        deadline=$(( $(date +%s) + DRAIN_PROGRESS_EXTEND_SECS ))
+      else
+        deadline=$max_deadline
+      fi
+      log "drain: $last_n -> $n in flight, turns landing; extended deadline"
+    fi
+    last_n="$n"
   done
   log "drain: timed out with in_flight=${n:-unknown}; rotating anyway"
   return 1
 }
 
-# Cycle reshuffled countries — recycled, not one pass — until the egress
-# moves or ROTATE_DEADLINE_SECS elapse. Prints the winning country.
+# Cycle reshuffled locations — recycled, not one pass — until the egress
+# moves or ROTATE_DEADLINE_SECS elapse. Prints the winning location.
 # Returns 1 when nothing moved (dead VPN path): loud failure, not a spin.
 rotate_until_moved() {
   local before="$1" deadline=$(( $(date +%s) + ROTATE_DEADLINE_SECS ))
-  local c after
+  local c after locs
+  locs=$(vpn_locations) || {
+    log "no locations for provider '$(vpn_provider)' — set VPN_LOCATIONS (see header)"
+    return 1
+  }
+  [[ -n "$locs" ]] || {
+    log "empty location list for provider '$(vpn_provider)' — set VPN_LOCATIONS (see header)"
+    return 1
+  }
   while (( $(date +%s) < deadline )); do
-    for c in $(shuf -e "${COUNTRIES[@]}"); do
+    for c in $(printf '%s\n' "$locs" | shuf); do
       (( $(date +%s) < deadline )) || break
-      timeout 120 nordvpn connect "$c" >>"$WATCHLOG" 2>&1 || continue
-      sleep 8
+      vpn_connect "$c" || continue
+      sleep "$VPN_SETTLE_SECS"
       after=$(egress)
       if [[ -n "$after" && "$after" != unknown && "$after" != "$before" ]]; then
         log "rotated via $c: $before -> $after"
         printf '%s' "$c"
         return 0
       fi
-      log "egress still $after after $c, trying next country"
+      log "egress still $after after $c, trying next location"
     done
   done
   log "rotation FAILED: egress still $before after ${ROTATE_DEADLINE_SECS}s of trying"
@@ -208,10 +480,11 @@ rotate_until_moved() {
 #   scheduled — proactive (hourly tick): notify only stragglers the drain
 #               could not save; a clean drain notifies nobody.
 #   manual    — explicit operator request: bypasses the cooldown, always
-#               notifies. Optional $2 pins the country (falls back to cycling
-#               when the pin misses).
+#               notifies. Optional $2 pins the location (falls back to cycling
+#               when the pin misses). Optional $3 overrides the notice reason
+#               (default: the mode, with auto mapped to rate-limit).
 rotate() {
-  local mode="${1:-auto}" pin="${2:-}"
+  local mode="${1:-auto}" pin="${2:-}" reason_override="${3:-}"
   (
     flock -n 9 || {
       log "rotation already in progress, skipping ($mode request)"
@@ -225,33 +498,93 @@ rotate() {
         exit 0
       fi
     fi
-    date +%s >"$STAMP"
+    # STAMP is written only after a reconnect completes below, so the
+    # cooldown protects the new exit rather than the drain window.
+    # No VPN backend: nothing to reconnect, but the 429 still happened —
+    # record the event, tell sessions to wait out the upstream window, move on.
+    if [[ "$(vpn_provider)" == "none" ]]; then
+      before=$(egress)
+      log "$mode rotation requested (egress=$before) but VPN_PROVIDER=none; no reconnect to attempt"
+      if [[ "$mode" != "scheduled" ]]; then
+        reason="$mode"
+        [ "$mode" = "auto" ] && reason="rate-limit"
+        write_notices "$reason" "$before" "$before" \
+          "Upstream rate limit hit and no VPN is configured (egress still $before): nothing to rotate. Wait out the upstream retry window, then retry your last failed request. Set VPN_PROVIDER (zen-rotate-watch.sh --list-providers) for automatic exit rotation."
+      else
+        log "clean proactive tick with no VPN; nothing died, no notices written"
+      fi
+      date +%s >"$STAMP"
+      log "done ($mode rotation, no VPN)"
+      exit 0
+    fi
     before=$(egress)
-    log "$mode rotation requested (egress=$before); draining..."
+    log "$mode rotation requested (provider=$(vpn_provider), egress=$before); draining..."
     drained_clean=1
     drain || drained_clean=0
     if [[ -n "$pin" ]]; then
-      timeout 120 nordvpn connect "$pin" >>"$WATCHLOG" 2>&1
-      sleep 8
+      vpn_connect "$pin"
+      sleep "$VPN_SETTLE_SECS"
       after=$(egress)
       if [[ -n "$after" && "$after" != unknown && "$after" != "$before" ]]; then
         log "rotated via $pin: $before -> $after"
       else
-        log "pinned country $pin did not move egress (still $after); cycling..."
+        log "pinned location $pin did not move egress (still $after); cycling..."
         rotate_until_moved "$before" >/dev/null || exit 1
       fi
     else
       rotate_until_moved "$before" >/dev/null || exit 1
     fi
+    date +%s >"$STAMP"
     if [[ "$mode" == "scheduled" && "$drained_clean" == "1" ]]; then
       log "clean proactive rotation; nothing died, no notices written"
     else
-      reason="$mode"
-      [ "$mode" = "auto" ] && reason="rate-limit"
+      reason="${reason_override:-$mode}"
+      if [[ -z "$reason_override" && "$mode" == "auto" ]]; then
+        reason="rate-limit"
+      fi
       write_notices "$reason" "$before" "$(egress)"
     fi
     log "done ($mode rotation)"
   ) 9>"$STAMP.flock"
+}
+
+# Fresh-connect/send failures in the recent proxy-log tail: the tunnel-side
+# counterpart to Trigger1's 429 watch. Prints the in-window count (0 when
+# quiet or the log is missing). Scans only the tail — the log is tens of MB
+# and this runs every POLL_SECS.
+poll_transport() {
+  [ -f "$LOG" ] || { echo 0; return 0; }
+  tail -n 2000 "$LOG" 2>/dev/null | python3 -c '
+import json, sys, time
+cutoff = time.time() - int(sys.argv[1])
+n = 0
+for line in sys.stdin:
+    if "retry of a dropped stream failed to send" not in line \
+            and "failed to connect to local model upstream" not in line:
+        continue
+    try:
+        ts = json.loads(line).get("timestamp", "")
+        import datetime
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        continue
+    if t >= cutoff:
+        n += 1
+print(n)' "$HIT_WINDOW_SECS" 2>/dev/null || echo 0
+}
+
+# True (once) when a transport burst may fire: suppresses refires until the
+# window slides past the last firing, so one burst rotates once. The rotation
+# cooldown still guards the actual rotate call.
+transport_fire_due() {
+  local last now
+  now=$(date +%s)
+  last=$(cat "$TRANSPORT_STAMP" 2>/dev/null || echo 0)
+  if (( now - last > HIT_WINDOW_SECS )); then
+    date +%s >"$TRANSPORT_STAMP" 2>/dev/null
+    return 0
+  fi
+  return 1
 }
 
 # Transcript files recently appended with the session-visible rate-limit
@@ -271,13 +604,14 @@ poll_transcripts() {
   done
 }
 
-log "watcher started (pid $$)"
+main() {
+log "watcher started (pid $$, provider=$(vpn_provider))"
 if [[ "${1:-}" == "--rotate-now" ]]; then
   # Manual rotation with the same protection as the automatic path: drain
   # in-flight turns first (bounded), then rotate once, then wake sessions.
   # Explicit operator intent bypasses the 120 s auto-throttle but keeps the
   # flock, so a concurrent automatic rotation still serialises. Optional
-  # second arg pins the country instead of cycling the list.
+  # second arg pins the location instead of cycling the list.
   if rotate manual "${2:-}"; then
     exit 0
   else
@@ -298,6 +632,10 @@ tail -n0 -F "$LOG" 2>/dev/null | while true; do
     log "rate-limit message in session transcript; rotating..."
     rotate auto
     next_proactive_at=$(schedule_next)
+  elif [ "$(poll_transport)" -ge "$TRANSPORT_BURST_THRESHOLD" ] && transport_fire_due; then
+    log "egress send-failure burst in proxy log; rotating..."
+    rotate auto "" "egress-degraded"
+    next_proactive_at=$(schedule_next)
   fi
   if (( $(date +%s) >= next_proactive_at )); then
     n=$(inflight)
@@ -311,3 +649,15 @@ tail -n0 -F "$LOG" 2>/dev/null | while true; do
     fi
   fi
 done
+}
+
+# Introspection flags run without starting the watcher. Everything else is
+# wrapped in main() so the file can also be sourced (e.g. in tests) to
+# exercise detect_vpn_provider / vpn_connect / vpn_locations in isolation.
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+  case "${1:-}" in
+    --list-providers) printf '%s\n' $SUPPORTED_PROVIDERS; exit 0 ;;
+    --detect-provider) detect_vpn_provider; exit 0 ;;
+    *) main "$@" ;;
+  esac
+fi

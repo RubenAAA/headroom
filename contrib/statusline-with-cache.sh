@@ -30,13 +30,13 @@ fi
 perf=$("$here/statusline-cache-perf.sh")
 
 line="$base"
+[ -n "$spark" ] && line="$line | $spark"
 # Healthy cache percentage belongs on the performance line; keep alert text on
 # the main line so recache warnings still take priority.
 if [[ "$cache" != cache\ ✓\ * ]]; then
   [ -n "$cache" ] && line="$line | $cache"
 fi
 [ -n "$codex" ] && line="$line | $codex"
-[ -n "$spark" ] && line="$line | $spark"
 printf '%s\n' "$line"
 [ -n "$perf" ] && printf '%s\n' "$perf"
 # Claude Code drops the statusline when the command exits non-zero; the last

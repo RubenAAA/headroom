@@ -523,19 +523,23 @@ HEADROOM_FLAGS=(
   # or: opencode auth login  (if you prefer the auth file, export the env var from it)
   --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=OPENCODE_API_KEY
 
-  # Weaker, faster sibling for the spinner sidecar: 1.2 reasons ~250 tokens
-  # to 1.3's ~500-1000 on the same summary and answers in ~5s against ~12s,
-  # measured 2026-09-06. Same free tier via OPENCODE_API_KEY.
-  --extra-model-route claude-muse-spark-1.2=https://opencode.ai/zen/v1:openai:muse-spark-1.2-contributor-free:auth=OPENCODE_API_KEY
+  # Weaker, faster sibling for the spinner sidecar was 1.2 (~250 tokens
+  # vs 1.3's ~500-1000, measured 2026-09-06) until Zen retired
+  # muse-spark-1.2-contributor-free: every sidecar call 404s since
+  # 2026-09-14 (635/635 failures, `not_found_error model:
+  # claude-muse-spark-1.2`), each burning one wasted call before the Haiku
+  # fallback. The 1.2 route below stays only so an explicit request for it
+  # fails at Zen with its own error rather than mismatching a route table
+  # entry; nothing selects it anymore.
 
   # Spinner sidecar offload: answer Claude Code's 4-word status summaries on
-  # the free tier instead of Haiku. The sidecar tries the route above first
-  # with one bounded attempt (see --sidecar-route-timeout below) and falls
-  # back to the direct Haiku path on any failure, so the worst case is
+  # the free tier instead of Haiku. The sidecar tries the 1.3 route above
+  # first with one bounded attempt (see --sidecar-route-timeout below) and
+  # falls back to the direct Haiku path on any failure, so the worst case is
   # today's behavior plus one short wasted call. Offload rate is visible as
   # `routed: true` on the sidecar_detected log lines. Revert by deleting
   # this line: the default is Haiku.
-  --sidecar-model claude-muse-spark-1.2
+  --sidecar-model claude-muse-spark-1.3
 
   # ─── Defaults, written out ──────────────────────────────────────────
   #
@@ -571,6 +575,8 @@ HEADROOM_FLAGS=(
   # working on real paths. Map lives in process memory only. Local artifacts
   # (logs, sessions DB) still see real text; this guards the wire, not the disk.
   --redact-sensitive true
+  # Path masking is a separate switch: off, so paths go out in the clear.
+  --redact-paths false
 
   # Compression pipeline
   #
@@ -664,6 +670,11 @@ HEADROOM_FLAGS=(
   --retry-max-attempts 3
   --retry-base-delay-ms 1000
   --retry-max-delay-ms 30000
+  # Max concurrent Zen sends. 2026-09-14: 40 parallel Zen 429s/hour and a
+  # 7-wide subagent burst that truncated every turn the same millisecond.
+  # Past the cap turns wait (bounded by --retry-max-delay-ms) instead of
+  # firing into a shedding upstream. 0 disables.
+  --retry-zen-max-inflight 4
   --upstream-timeout 600s
   --upstream-connect-timeout 10s
   # Idle keepalive pool TTL. Short for rotation safety: a VPN exit change

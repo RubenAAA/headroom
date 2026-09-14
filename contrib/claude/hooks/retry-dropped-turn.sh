@@ -27,7 +27,14 @@ TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || exit 0
 
 TAIL=$(tail -n 30 "$TRANSCRIPT" 2>/dev/null) || exit 0
-if printf '%s' "$TAIL" | grep -qF 'dropped mid-response'; then
+# Match the literal proxy-injected marker (TRUNCATION_MARKER in
+# crates/headroom-proxy/src/sse/stream_finisher.rs), not the bare words —
+# those also appear in this script's own comments and in docs, so a Read/grep
+# of this file (or a reply quoting it) landing in the last 30 lines used to
+# self-trigger a false "dropped" retry.
+MSG=""
+TAIL_INSTR=""
+if printf '%s' "$TAIL" | grep -qF '[truncated: the connection to the API dropped mid-response'; then
   if printf '%s' "$TAIL" | grep -qF 'did NOT run'; then
     MSG="The API connection dropped mid-response and a pending tool call was discarded without running"
     TAIL_INSTR="Check the transcript first: if that call already ran since the drop, do not re-issue it. Otherwise re-issue the discarded tool call now; do not ask, do not narrate."
@@ -35,17 +42,35 @@ if printf '%s' "$TAIL" | grep -qF 'dropped mid-response'; then
     MSG="The API connection dropped mid-response and the reply was cut off"
     TAIL_INSTR="Continue from where the reply was cut off; do not repeat tool calls that already ran — check the transcript first, then continue."
   fi
-  COUNT=$(cat "$STATE_DIR/$SESSION" 2>/dev/null || echo 0)
-  case "$COUNT" in '' | *[!0-9]*) COUNT=0 ;; esac
-  if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
-    rm -f "$STATE_DIR/$SESSION"
-    exit 0
-  fi
-  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
-  echo $((COUNT + 1)) >"$STATE_DIR/$SESSION" 2>/dev/null || exit 0
-  echo "$MSG (retry $((COUNT + 1))/$MAX_RETRIES). $TAIL_INSTR" >&2
-  exit 2
+elif API_ERR_LINES=$(printf '%s\n' "$TAIL" | grep -F '"isApiErrorMessage":true') && [ -n "$API_ERR_LINES" ] && printf '%s' "$API_ERR_LINES" | grep -qiE 'status (429|5[0-9][0-9])|rate.?limit|overloaded|upstream.*(error|unavailable|timeout)|service unavailable|internal server error'; then
+  # A completed upstream error (Zen 429 after the hold budget, 5xx, transport
+  # failure) also kills the turn as far as the agent loop is concerned — e.g.
+  # a headroom_retrieve continuation that gets rate-limited on the free Zen
+  # route. Same treatment as a dropped turn: re-enter rather than stall.
+  # Gated on Claude Code's own isApiErrorMessage flag, not a bare text scan,
+  # so tool output or prose that merely mentions these words (e.g. reading
+  # this script, or proxy source discussing rate limits) can't be mistaken
+  # for a real error that ended the turn.
+  MSG="The upstream request failed and the turn ended on an error"
+  TAIL_INSTR="Check the transcript first: re-issue whatever was in flight when the error hit (tool call or reply), without repeating work that already ran; if the error text names rate limiting, wait a few seconds before retrying — do not ask, do not narrate."
 fi
 
-rm -f "$STATE_DIR/$SESSION"
-exit 0
+# Both branches share the circuit breaker: without it, the elif-only reset
+# added alongside the upstream-error branch left the dropped-connection case
+# (the original, more common trigger) setting MSG but never actually
+# blocking the stop.
+if [ -z "$MSG" ]; then
+  rm -f "$STATE_DIR/$SESSION"
+  exit 0
+fi
+
+COUNT=$(cat "$STATE_DIR/$SESSION" 2>/dev/null || echo 0)
+case "$COUNT" in '' | *[!0-9]*) COUNT=0 ;; esac
+if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
+  rm -f "$STATE_DIR/$SESSION"
+  exit 0
+fi
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+echo $((COUNT + 1)) >"$STATE_DIR/$SESSION" 2>/dev/null || exit 0
+echo "$MSG (retry $((COUNT + 1))/$MAX_RETRIES). $TAIL_INSTR" >&2
+exit 2

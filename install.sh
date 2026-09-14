@@ -238,6 +238,27 @@ fi
 ln -sfn claude-launcher "$BIN_DIR/cclaude"
 say "cclaude -> claude-launcher"
 
+# ── VPN rotation ────────────────────────────────────────────────────────
+# zen-rotate-watch.sh rotates the VPN exit on upstream rate limits. The
+# provider is auto-detected at watcher start (VPN_PROVIDER=auto), so this
+# only reports what a fresh clone would pick here — never fatal.
+step "VPN rotation"
+if _vpn_provider=$(bash "$CONTRIB/zen-rotate-watch.sh" --detect-provider 2>/dev/null); then
+    if [ "$_vpn_provider" = "none" ]; then
+        say "no supported VPN CLI found — the watcher still runs (429 detection"
+        say "  + notices) and just skips the reconnect step. To enable rotation:"
+        say "  install your VPN's CLI, or set VPN_PROVIDER=custom with VPN_CONNECT_CMD"
+        say "  (providers: $(bash "$CONTRIB/zen-rotate-watch.sh" --list-providers 2>/dev/null | tr '\n' ' '))"
+    else
+        say "VPN provider for exit rotation: $_vpn_provider (auto-detected)"
+        say "  override with VPN_PROVIDER; start the watcher with:"
+        say "  setsid nohup \"\$HOME/.local/bin/zen-rotate-watch.sh\" >>\"\$HOME/zen-rotate-watch.log\" 2>&1 &"
+    fi
+else
+    say "could not probe VPN providers — rotation defaults to no-op mode until configured"
+fi
+unset _vpn_provider
+
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) say "WARNING: $BIN_DIR is not on your PATH — add it to your shell profile" ;;
@@ -331,6 +352,10 @@ step "Hooks"
 mkdir -p "$CLAUDE_DIR/hooks"
 for src in "$CONTRIB"/claude/hooks/*.sh; do
     dst="$CLAUDE_DIR/hooks/$(basename "$src")"
+    # Belt-and-braces: the checkout file must be executable itself, because
+    # --link symlinks it directly (rotation-notice.sh shipped 644 and failed
+    # with "Permission denied" on every prompt until chmodded).
+    chmod +x "$src"
     if [ "$LINK" = 1 ]; then
         [ -e "$dst" ] && [ ! -L "$dst" ] && mv "$dst" "$dst.bak" \
             && say "moved the old $dst to $dst.bak"
@@ -386,6 +411,18 @@ const WANT = [
   // .agents/SHARED-WORKTREE-PROTOCOL.md, but only while another agent is
   // live in the same toplevel. Alone in the repo it passes everything.
   ["PreToolUse",       "Bash",                "shared-worktree-guard.sh", 5],
+  // Peer awareness: one-time notice when other agent sessions share this
+  // repo (live processes, recent transcripts, extra worktrees). Silent
+  // when alone; never blocks.
+  ["SessionStart",     null,                  "peer-awareness.sh",  10],
+  // Mid-session watch: the same script on every prompt, throttled
+  // internally (10 min), reporting only peers that joined since the last
+  // scan — SessionStart alone never sees a newcomer that arrives midway.
+  ["UserPromptSubmit", null,                  "peer-awareness.sh",  10],
+  // Stale branch: one-time notice when the checkout trails its origin
+  // counterpart. Pure git, no forge CLI, so GitHub and GitLab behave the
+  // same. Silent when up to date; never blocks, never fetches.
+  ["SessionStart",     null,                  "stale-branch.sh",    10],
 ];
 
 function load(f) { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return {}; } }
@@ -447,7 +484,7 @@ if (pruneFile && pruneFile !== file) {
     [ -n "$HOOK_PRUNE" ] &&
         say "sessions outside $HOOKS_INTO no longer run the review hooks"
 else
-    say "node not found — add the review-gate.sh / ticket-gate.sh / session-map-log.sh entries in $HOOK_SETTINGS by hand"
+    say "node not found — add the review-gate.sh / ticket-gate.sh / session-map-log.sh / peer-awareness.sh / stale-branch.sh entries in $HOOK_SETTINGS by hand"
 fi
 
 # ── CLAUDE.md ─────────────────────────────────────────────────────────────

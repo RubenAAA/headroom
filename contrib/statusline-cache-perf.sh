@@ -217,8 +217,15 @@ if [ -n "$vs_stock" ]; then
   line="$line | vs stock ${vs_txt}"
 fi
 if [ -n "$cr" ]; then
-    read -r steady crude _uncached <<<"$cr"
+    read -r steady crude uncached <<<"$cr"
     line="$line | c/r $(color_le "$steady" 0.01) steady, $(color_le "$crude" 0.01) crude"
+    # FINDING-045: share_txt was computed and printed by the python block
+    # but dropped here. Uncached share is the one c/r cannot see (fresh
+    # input re-sent every turn looks healthy on c/r while owning the bill),
+    # so surface it: lower is better, warn above 50%.
+    case "$uncached" in ''|-|*[!0-9]*) ;; # non-numeric passes through plain
+      *) line="$line uncached ${uncached}%" ;;
+    esac
 fi
 # Last, because it is the one number that is not about the proxy at all: the
 # three above say how well the cache is working, this says how much of the

@@ -47,7 +47,13 @@ fi
 
 if grep -qE '^[[:space:]]*export GITLAB_TOKEN=' "$BASHRC"; then
   cp -n "$BASHRC" "$BASHRC.pre-spark-poster"
-  sed -i -E 's|^([[:space:]]*export GITLAB_TOKEN=.*)$|# moved to ~/.config/spark-poster/token by contrib/spark-poster/install-credential.sh\n#\1|' "$BASHRC"
+  # FINDING-047: bare `sed -i` is GNU-only; macOS needs `-i ''`. One-shot
+  # installer, runs on both, so branch on `uname`.
+  if [ "$(uname)" = "Darwin" ]; then
+    sed -i '' -E 's|^([[:space:]]*export GITLAB_TOKEN=.*)$|# moved to ~/.config/spark-poster/token by contrib/spark-poster/install-credential.sh\n#\1|' "$BASHRC"
+  else
+    sed -i -E 's|^([[:space:]]*export GITLAB_TOKEN=.*)$|# moved to ~/.config/spark-poster/token by contrib/spark-poster/install-credential.sh\n#\1|' "$BASHRC"
+  fi
   echo "commented the export in $BASHRC (backup: $BASHRC.pre-spark-poster)"
 else
   echo "no active export in $BASHRC; nothing to comment"

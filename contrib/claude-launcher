@@ -129,6 +129,22 @@ if [ "$use_qwen" -eq 1 ]; then
 fi
 
 # ── headroom proxy (start if requested and not up; else reuse) ────────────
+# The VPN-exit watcher survives proxy restarts on its own (tail -F + a
+# file-backed cooldown stamp), so nothing here ever kills it — but after a
+# reboot nothing is watching either. Ensure exactly one instance whenever a
+# proxy is up for this session to use.
+ensure_watcher() {
+    local watch="$HOME/.local/bin/zen-rotate-watch.sh"
+    [ -x "$watch" ] || return 0
+    # Bracket trick: pgrep -f would otherwise match this shell's own command
+    # line, which quotes the pattern.
+    if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+        return 0
+    fi
+    setsid nohup "$watch" >>"$HOME/zen-rotate-watch.log" 2>&1 </dev/null &
+    disown
+    echo "headroom: started VPN-exit watcher (log: $HOME/zen-rotate-watch.log)"
+}
 if [ "$use_context" -eq 1 ]; then
     if curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
         echo "headroom: reusing running proxy at $PROXY_URL"
@@ -203,6 +219,7 @@ if [ "$use_context" -eq 1 ]; then
             exit 1
         fi
     fi
+    ensure_watcher
 fi
 
 # ── assemble env and exec claude ──────────────────────────────────────────
