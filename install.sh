@@ -370,7 +370,13 @@ const WANT = [
   // VPN-rotation notices: the watcher leaves per-session files, this relays
   // each once on the next prompt. Informational, never blocks.
   ["UserPromptSubmit", null,                  "rotation-notice.sh",  5],
+  // Session map: records session id -> transcript path so the review worker
+  // can find the turns it was handed. Read-only observer, never blocks.
   ["SessionStart",     null,                  "session-map-log.sh", 5],
+  // Shared-worktree guard: blocks the destructive git commands banned by
+  // .agents/SHARED-WORKTREE-PROTOCOL.md, but only while another agent is
+  // live in the same toplevel. Alone in the repo it passes everything.
+  ["PreToolUse",       "Bash",                "shared-worktree-guard.sh", 5],
 ];
 
 function load(f) { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return {}; } }
