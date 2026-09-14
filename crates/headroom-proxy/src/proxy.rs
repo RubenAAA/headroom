@@ -6545,7 +6545,18 @@ pub(crate) async fn forward_http(
         // branch only — the streaming passthrough below keeps headers
         // byte-faithful, and opaque non-JSON bytes keep the header inside
         // the helper).
-        let send_headers = crate::headers::headers_for_json_body(&outgoing_headers, &body_to_send);
+        let mut send_headers =
+            crate::headers::headers_for_json_body(&outgoing_headers, &body_to_send);
+        // Buffered CCR flipped this `/v1/responses` turn to a non-streaming
+        // upstream call, but the client's `Accept: text/event-stream`
+        // survives the clone above. Ask for JSON: the buffered arm below
+        // resynthesizes SSE for the client from the JSON body.
+        if buffered_responses_ccr {
+            send_headers.insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("application/json"),
+            );
+        }
 
         // Forward the request with retry on transient errors (429, 529, 5xx).
         let max_attempts = if state.config.retry_enabled {
