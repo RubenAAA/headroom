@@ -1481,18 +1481,21 @@ pub struct CliArgs {
     pub retry_zen_hold_enabled: bool,
 
     /// Max time (ms) a Zen 429 is held while the VPN exit rotates before
-    /// the proxy gives up and returns it. Default `150000` (150s).
+    /// the proxy gives up and returns it. Default `0`: no limit, hold until
+    /// Zen answers something other than 429.
     ///
-    /// Covers the watcher cooldown (120s) plus drain (up to 90s, usually
-    /// far less — the drain exits as soon as in-flight turns land) with
-    /// margin. Observed Zen bursts cluster at 15–30s, so most holds
-    /// recover long before the budget; the tail is for rotation + a slow
-    /// drain overlapping. `0` disables the wait (hold returns the 429 at
-    /// once — same as `--retry-zen-hold false`).
+    /// A returned 429 kills the Claude Code turn and every subagent under
+    /// it, so a bounded hold only helps when the bound is never reached.
+    /// The old 150s default (watcher cooldown 120s + drain + margin) ran
+    /// out five times on 2026-09-14 while Zen stayed limited past one
+    /// rotation. A client that stops waiting closes the connection, which
+    /// drops the hold, so an unbounded hold cannot outlive its request.
+    /// Set a positive value to restore the bounded behaviour; to skip the
+    /// hold entirely use `--retry-zen-hold false`.
     #[arg(
         long = "retry-zen-hold-budget-ms",
         env = "HEADROOM_RETRY_ZEN_HOLD_BUDGET_MS",
-        default_value_t = 150_000
+        default_value_t = 0
     )]
     pub retry_zen_hold_budget_ms: u32,
 
@@ -2999,7 +3002,7 @@ impl Config {
             retry_enabled: true,
             retry_max_attempts: 3,
             retry_zen_hold_enabled: true,
-            retry_zen_hold_budget_ms: 150_000,
+            retry_zen_hold_budget_ms: 0,
             retry_zen_max_inflight: 4,
             retry_overload_max_attempts: 6,
             retry_stream_hold_bytes: 2048,

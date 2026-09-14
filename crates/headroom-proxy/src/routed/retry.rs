@@ -13,52 +13,56 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
 
-/// True when the serialized outbound body carries evidence the prefix-replay
-/// stage rewrote it: an Anthropic `messages` array plus at least one
-/// `cache_control` marker. Without that evidence a 413 retry would just
-/// re-send the identical body — the refusal is the turn's own size, and the
-/// extra round trip buys nothing.
+/// The transcript array on the translated wire shape: `messages` on Chat
+/// Completions, `input` on Responses. Translation drops the Anthropic
+/// `cache_control` markers (neither translator carries them), so replay
+/// evidence on the wire is the shape of the array itself, not a marker.
+fn wire_transcript(body: &Value) -> Option<&Vec<Value>> {
+    body.get("messages")
+        .or_else(|| body.get("input"))
+        .and_then(|m| m.as_array())
+}
+
+/// True when the translated outbound body is big enough that a 413 retry
+/// without the cached head is worth one round trip: at least two transcript
+/// entries, so dropping the head leaves a non-empty tail. With zero or one
+/// entries there is no prefix to strip — the refusal is the turn's own size,
+/// and a re-send would just repeat it.
 fn prepared_replay_applies(body: &Bytes) -> bool {
     let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
-    let Some(messages) = parsed.get("messages").and_then(|m| m.as_array()) else {
-        return false;
-    };
-    messages.iter().any(|m| {
-        m.get("content")
-            .and_then(|c| c.as_array())
-            .is_some_and(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
-            || m.get("cache_control").is_some()
-    })
+    wire_transcript(&parsed).is_some_and(|t| t.len() > 1)
 }
 
-/// Strip the replay prefix from an already-serialized outbound body: drop the
-/// leading messages up to the last `cache_control` marker, keeping the tail
-/// the provider has not cached yet. Returns the original body unchanged when
-/// it carries no replay evidence, so a non-replay 413 never pays for a
-/// pointless re-send.
+/// Strip the replay prefix from an already-serialized translated body: drop
+/// the first transcript entry — the cached head the provider already holds —
+/// and resend the tail. The remaining entries keep their order and content,
+/// so the turn reads as a continuation, not a new turn. Returns the original
+/// body unchanged when there is no head to drop, so a single-entry 413 never
+/// pays for a pointless re-send.
 fn strip_replay_prefix(body: &Bytes) -> Bytes {
     let Ok(mut parsed) = serde_json::from_slice::<Value>(body) else {
         return body.clone();
     };
-    let Some(messages) = parsed.get("messages").and_then(|m| m.as_array()).cloned() else {
-        return body.clone();
-    };
-    let last_marker = messages.iter().rposition(|m| {
-        m.get("content")
-            .and_then(|c| c.as_array())
-            .is_some_and(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
-            || m.get("cache_control").is_some()
-    });
-    let Some(idx) = last_marker else {
-        return body.clone();
-    };
-    let tail: Vec<Value> = messages.into_iter().skip(idx + 1).collect();
-    if tail.is_empty() {
+    let transcript_len = wire_transcript(&parsed).map(Vec::len).unwrap_or(0);
+    if transcript_len < 2 {
         return body.clone();
     }
-    parsed["messages"] = Value::Array(tail);
+    let key = if parsed.get("messages").is_some() {
+        "messages"
+    } else {
+        "input"
+    };
+    let stripped_len = if let Some(items) = parsed.get_mut(key).and_then(|m| m.as_array_mut()) {
+        items.remove(0);
+        items.len()
+    } else {
+        return body.clone();
+    };
+    if stripped_len == 0 {
+        return body.clone();
+    }
     serde_json::to_vec(&parsed)
         .map(Bytes::from)
         .unwrap_or_else(|_| body.clone())
@@ -249,15 +253,11 @@ pub(crate) async fn send_with_retry(
                 // line re-arms the watcher).
                 // 413 replay-strip: the replay prefix pins the outbound body at
                 // the session maximum, so a body the gateway refuses is retried
-                // once with the prefix stripped. The already-computed
-                // compressed body is untouched — the shape on the wire stays
-                // byte-identical except for the replayed prefix bytes — so
-                // this turns a turn-kill into a cache miss, not a new turn.
-                // Any error arm downstream still books the outcome once.
-                if status.as_u16() == 413
-                    && attempt >= max_attempts
-                    && prepared_replay_applies(&body)
-                {
+                // once with the cached head dropped. The tail keeps its order
+                // and content, so the turn reads as a continuation that cache-
+                // misses the head — not a new turn. Any error arm downstream
+                // still books the outcome once.
+                if status.as_u16() == 413 && prepared_replay_applies(&body) {
                     drop(r);
                     let stripped = strip_replay_prefix(&body);
                     match state
@@ -493,6 +493,59 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2, "one 429 then recovery");
     }
 
+    /// The default budget (0) holds through a long run of 429s instead of
+    /// giving up: 40 refusals at 1ms slices would have outrun any small
+    /// positive budget, and the client sees only the eventual 200.
+    #[tokio::test]
+    async fn zen_hold_default_budget_never_gives_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = hits_clone.fetch_add(1, Ordering::SeqCst);
+                if n < 40 {
+                    wiremock::ResponseTemplate::new(429)
+                        .insert_header("retry-after", "12123")
+                        .set_body_string("rate limited")
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#)
+                }
+            })
+            .mount(&mock)
+            .await;
+        let upstream: url::Url = mock.uri().parse().unwrap();
+        let mut config = crate::config::Config::for_test(upstream);
+        config.retry_enabled = true;
+        config.retry_max_attempts = 1;
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 1;
+        config.retry_zen_hold_enabled = true;
+        config.retry_zen_hold_budget_ms = 0;
+        let state = AppState::new(config).expect("app state");
+        let send = send_with_retry(
+            &state,
+            &mock.uri(),
+            HeaderMap::new(),
+            Bytes::from("{}"),
+            "test-zen-hold-unbounded",
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("hold must recover into Ok");
+        assert_eq!(send.resp.status(), 200, "the 429 never reaches the caller");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            41,
+            "forty refusals then recovery"
+        );
+    }
+
     /// A Zen 429 carrying a Retry-After far past the cap still reaches the
     /// hold. Zen sends ~53568 (14.9h read as seconds) as a constant while the
     /// route keeps serving, so the header must not short-circuit the hold —
@@ -690,6 +743,7 @@ mod tests {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let pinned = body
                     .get("messages")
+                    .or_else(|| body.get("input"))
                     .and_then(|m| m.as_array())
                     .is_some_and(|a| a.len() > 1);
                 if n == 0 {
@@ -705,11 +759,17 @@ mod tests {
         let upstream: url::Url = mock.uri().parse().unwrap();
         let mut config = crate::config::Config::for_test(upstream);
         config.retry_enabled = true;
-        config.retry_max_attempts = 1;
         config.prefix_replay = true;
+        assert_eq!(
+            config.retry_max_attempts, 3,
+            "regression must exercise the default retry budget"
+        );
         let state = AppState::new(config).expect("app state");
+        // Translated wire shape: no Anthropic `cache_control` markers survive
+        // translation, so the pinned body is a two-entry transcript and the
+        // retry must arrive as its one-entry tail.
         let pinned = Bytes::from(
-            r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"cached","cache_control":{"type":"ephemeral"}}]},{"role":"user","content":"fresh"}]}"#,
+            r#"{"model":"m","input":[{"type":"message","role":"user","content":"cached head"},{"type":"message","role":"user","content":"fresh tail"}]}"#,
         );
         let send = send_with_retry(
             &state,

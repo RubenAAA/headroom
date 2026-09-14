@@ -47,12 +47,13 @@ for working on Headroom. The maintainer does.
   `~/.claude/settings.json`. The first is always generated, never symlinked,
   since the checkout path is baked into it.
 
-So `--link` covers the launcher, restart script, flag file and usage dump.
-Binaries are always copied, so a Rust change needs a rebuild plus
-`restart-headroom.sh`. A `git pull` leaves every installed copy stale;
-`update-headroom.sh` (in `~/.local/bin` after install) pulls, reinstalls in
-the last install's mode, and restarts the proxy — the one command for
-colleagues tracking this checkout. The script warns if `~/.local/bin` is off `PATH`. Verify:
+Under `--link`, the contrib scripts, hooks, flag file and usage dump are
+symlinked into the checkout. Binaries are always copied and the main statusline
+is always generated, so those still need reinstalling after relevant changes.
+In copy mode a `git pull` leaves every installed copy stale. `update-headroom.sh`
+(installed in `~/.local/bin`) pulls, infers link mode from the flags-file symlink
+unless overridden with `--link`/`--copy`, reinstalls, and restarts the proxy. The
+script warns if `~/.local/bin` is off `PATH`. Verify:
 
 ```bash
 cclaude                                # NOT claude: starts the proxy, then execs claude through it

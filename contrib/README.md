@@ -29,8 +29,8 @@ exactly like the usage dump on its own.
 
 | File | Role |
 | --- | --- |
-| `statusline-with-cache.sh` | The entry point. Chains the usage dump with the re-cache watchdog and the segments below. Always generated, never symlinked, since the checkout path is baked in. |
-| `statusline-usage-dump.sh` | Produces the base line — model, context, plan usage — and caches what it was handed in `/tmp/claude-usage-latest.json`. Works alone if you point `settings.json` straight at it. |
+| `statusline-with-cache.sh` | The entry point. Chains the usage dump with the re-cache watchdog and the segments below. Folds `|`-separated segments onto new lines to fit the terminal width (tty, else COLUMNS, else 80), so nothing is cut. Always generated, never symlinked, since the checkout path is baked in. |
+| `statusline-usage-dump.sh` | Produces the base line — model, context, plan usage — and caches what it was handed in `/tmp/claude-usage-latest.json`. The model shows short, without the `claude-` prefix. Works alone if you point `settings.json` straight at it. |
 | `statusline-cache-health.sh` | Re-cache watchdog: warns when the prompt cache is being thrown away. |
 | `statusline-cache-perf.sh` | Recent cache hit rate. |
 | `statusline-codex-limits.sh` | Codex quota left. |

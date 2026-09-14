@@ -29,6 +29,85 @@ if [[ "$base" != *ctx:* ]]; then
 fi
 perf=$("$here/statusline-cache-perf.sh")
 
+# Fold a `|`-separated line so no segment is cut by the terminal edge.
+# Width comes from the tty when there is one; statusline commands run without
+# one, so fall back to COLUMNS and then 80. Segments are never split — each
+# moves whole to the next line, joined with ` | ` while it fits.
+# Newlines in the input (the base line carries its own dir: line) are kept:
+# each line folds on its own.
+# ANSI colors are kept for display but excluded from the width count.
+fold_line() {
+  local line=$1 cols=${2:-0}
+  [ "$cols" -le 0 ] 2>/dev/null && cols=$(stty size 2>/dev/null </dev/tty | awk '{print $2}')
+  [ -z "$cols" ] && cols=${COLUMNS:-80}
+  case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+  local raw seg out="" cur="" curlen=0 s plain slen
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    local IFS='|'
+    # shellcheck disable=SC2206
+    segs=($raw)
+    out=""; cur=""; curlen=0
+    for s in "${segs[@]}"; do
+      s=$(printf '%s' "$s" | sed 's/^ *//;s/ *$//')
+      [ -z "$s" ] && continue
+      plain=$(printf '%s' "$s" | sed "s/$(printf '\033')\[[0-9;]*m//g")
+      slen=${#plain}
+      if [ "$curlen" -eq 0 ]; then
+        if [ "$slen" -gt "$cols" ]; then
+          # One segment wider than the terminal: wrap word-wise so
+          # nothing is cut. ANSI codes hold no spaces, so splitting
+          # on spaces never breaks them.
+          local w wplain wlen
+          local IFS=$' \t\n'
+          for w in $s; do
+            wplain=$(printf '%s' "$w" | sed "s/$(printf '\033')\[[0-9;]*m//g")
+            wlen=${#wplain}
+            if [ "$curlen" -eq 0 ]; then
+              cur="$w"; curlen=$wlen
+            elif [ $((curlen + 1 + wlen)) -le "$cols" ]; then
+              cur="$cur $w"; curlen=$((curlen + 1 + wlen))
+            else
+              out="$out$cur
+"
+              cur="$w"; curlen=$wlen
+            fi
+          done
+        else
+          cur="$s"; curlen=$slen
+        fi
+      elif [ $((curlen + 3 + slen)) -le "$cols" ]; then
+        cur="$cur | $s"; curlen=$((curlen + 3 + slen))
+      elif [ "$slen" -gt "$cols" ]; then
+        # Segment wider than the terminal on a non-empty line: flush
+        # the line, then wrap the segment word-wise so nothing is cut.
+        out="$out$cur
+"
+        cur=""; curlen=0
+        local w wplain wlen
+        local IFS=$' \t\n'
+        for w in $s; do
+          wplain=$(printf '%s' "$w" | sed "s/$(printf '\033')\[[0-9;]*m//g")
+          wlen=${#wplain}
+          if [ "$curlen" -eq 0 ]; then
+            cur="$w"; curlen=$wlen
+          elif [ $((curlen + 1 + wlen)) -le "$cols" ]; then
+            cur="$cur $w"; curlen=$((curlen + 1 + wlen))
+          else
+            out="$out$cur
+"
+            cur="$w"; curlen=$wlen
+          fi
+        done
+      else
+        out="$out$cur
+"
+        cur="$s"; curlen=$slen
+      fi
+    done
+    [ -n "$cur" ] && printf '%s\n' "$out$cur"
+  done <<<"$line"
+}
+
 line="$base"
 [ -n "$spark" ] && line="$line | $spark"
 # Healthy cache percentage belongs on the performance line; keep alert text on
@@ -37,8 +116,8 @@ if [[ "$cache" != cache\ ✓\ * ]]; then
   [ -n "$cache" ] && line="$line | $cache"
 fi
 [ -n "$codex" ] && line="$line | $codex"
-printf '%s\n' "$line"
-[ -n "$perf" ] && printf '%s\n' "$perf"
+fold_line "$line"
+[ -n "$perf" ] && fold_line "$perf"
 # Claude Code drops the statusline when the command exits non-zero; the last
 # test above returns 1 whenever the perf line is empty.
 exit 0

@@ -158,7 +158,7 @@ sleep 5
 inflight() {
   local n
   n=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/debug/inflight" 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("in_flight", -1))' 2>/dev/null) \
+    | python3 -c 'import json,sys; j=json.load(sys.stdin); print(max(0, j.get("in_flight", -1) - j.get("zen_held", 0)) if "in_flight" in j else -1)' 2>/dev/null) \
     || n="-1"
   printf '%s' "$n"
 }

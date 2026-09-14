@@ -86,7 +86,17 @@ if [ -n "$cwd" ]; then
   dir_line="dir:${cwd#"$HOME"/}"
 fi
 
+# Session model, short: Claude Code hands the full id (`claude-opus-4-8`);
+# the `claude-` prefix carries no information, so drop it for width.
+# Prefer .id (plain); display_name sometimes carries ANSI styling.
+model_id=$(echo "$input" | jq -r '.model.id // empty')
+[ -z "$model_id" ] && model_id=$(echo "$input" | jq -r '.model.display_name // empty' | sed "s/$(printf '\033')\[[0-9;]*m//g")
+model_short=${model_id#claude-}
+
 parts=()
+if [ -n "$model_short" ] && [ "$model_short" != "null" ]; then
+  parts+=("model:$model_short")
+fi
 if [ -n "$five_pct" ]; then
   r=$(fmt_reset "$five_reset")
   s="5h:$(printf '%.0f' "$five_pct")%${stale}"

@@ -105,6 +105,7 @@ while IFS= read -r seg; do
     checkout|restore)
       dashdash=0
       paths=()
+      positional=()
       skip=0
       for a in "${args[@]}"; do
         if [ "$skip" = 1 ]; then skip=0; continue; fi
@@ -113,10 +114,26 @@ while IFS= read -r seg; do
           --) dashdash=1 ;;
           -s|--source|-b|-B|--orphan|-t|--track) skip=1 ;;
           -*) ;;
-          .|:/|'*'|"$TOPLEVEL"|"$TOPLEVEL"/) paths+=("$a") ;;
-          *) [ "$sub" = restore ] && paths+=("$a") ;;
+          *) positional+=("$a") ;;
         esac
       done
+      if [ "$dashdash" = 0 ] && [ ${#positional[@]} -gt 0 ]; then
+        if [ "$sub" = restore ]; then
+          # `git restore` has no branch-switch form: every positional is a
+          # pathspec, whether or not the optional `--` separator is present.
+          paths+=("${positional[@]}")
+        elif git -C "$CWD" rev-parse --verify --quiet "${positional[0]}^{commit}" >/dev/null 2>&1; then
+          # Checkout's first positional is a branch/tree-ish when it resolves
+          # as one. Any remaining positionals are pathspecs (`git checkout
+          # HEAD file`) even without `--`.
+          [ ${#positional[@]} -gt 1 ] && paths+=("${positional[@]:1}")
+        else
+          # No branch/tree-ish by this name, so Git interprets the arguments
+          # as pathspecs (`git checkout file`). The old parser ignored this
+          # form and let a single-file destructive checkout past the guard.
+          paths+=("${positional[@]}")
+        fi
+      fi
       wide=0
       for p in "${paths[@]}"; do
         case "$p" in

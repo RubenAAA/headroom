@@ -124,7 +124,9 @@ pub async fn handle_messages(
     // because the whole point is that it leaves no per-conversation state for
     // the next real turn to be measured against. See `crate::sidecar`.
     if crate::sidecar::is_describe_action_sidecar(&parsed) {
-        if let Some(resp) = handle_sidecar(&state, &headers, &uri, &parsed, &request_id).await {
+        if let Some(resp) =
+            handle_sidecar(&state, &headers, &client_addr, &uri, &parsed, &request_id).await
+        {
             return resp;
         }
     }

@@ -732,6 +732,31 @@ Options:
           [env: HEADROOM_RETRY_MAX_ATTEMPTS=]
           [default: 3]
 
+      --retry-zen-hold <RETRY_ZEN_HOLD_ENABLED>
+          Hold a Zen (opencode.ai) 429 past the fast retry budget instead of returning it. Default `true`.
+          
+          A Zen 429 kills the Claude Code turn (and its subagents) the moment it arrives, but it is also the signal `zen-rotate-watch.sh` rotates the VPN exit on (cooldown 120s, drain up to 90s). With the hold on, the proxy waits — bounded by `--retry-zen-hold-budget-ms` — so the turn lands on the fresh exit instead of dying before the rotation.
+          
+          [env: HEADROOM_RETRY_ZEN_HOLD=]
+          [default: true]
+          [possible values: true, false]
+
+      --retry-zen-hold-budget-ms <RETRY_ZEN_HOLD_BUDGET_MS>
+          Max time (ms) a Zen 429 is held while the VPN exit rotates before the proxy gives up and returns it. Default `0`: no limit, hold until Zen answers something other than 429.
+          
+          A returned 429 kills the Claude Code turn and every subagent under it, so a bounded hold only helps when the bound is never reached. The old 150s default (watcher cooldown 120s + drain + margin) ran out five times on 2026-09-14 while Zen stayed limited past one rotation. A client that stops waiting closes the connection, which drops the hold, so an unbounded hold cannot outlive its request. Set a positive value to restore the bounded behaviour; to skip the hold entirely use `--retry-zen-hold false`.
+          
+          [env: HEADROOM_RETRY_ZEN_HOLD_BUDGET_MS=]
+          [default: 0]
+
+      --retry-zen-max-inflight <RETRY_ZEN_MAX_INFLIGHT>
+          Max concurrent Zen (opencode.ai) sends. Default `4`. `0` disables.
+          
+          Zen 429s arrive in herds: 2026-09-14 saw 40 parallel 429s in one hour and a 7-wide subagent burst that truncated every turn in the same millisecond. Turns past the cap wait (bounded by `--retry-max-delay-ms`, then proceed without a slot) instead of firing into an upstream that is already shedding load.
+          
+          [env: HEADROOM_RETRY_ZEN_MAX_INFLIGHT=]
+          [default: 4]
+
       --retry-overload-max-attempts <RETRY_OVERLOAD_MAX_ATTEMPTS>
           Attempts for a 200 response whose SSE body opens with an error event. Default `6`.
           
@@ -766,14 +791,6 @@ Options:
           [env: HEADROOM_RETRY_MAX_DELAY_MS=]
           [default: 30000]
 
-      --retry-zen-max-inflight <RETRY_ZEN_MAX_INFLIGHT>
-          Max concurrent Zen (opencode.ai) sends. Default `4`. `0` disables.
-          
-          Zen 429s arrive in herds: 2026-09-14 saw 40 parallel 429s in one hour and a 7-wide subagent burst that truncated every turn in the same millisecond. Turns past the cap wait (bounded by `--retry-max-delay-ms`, then proceed without a slot) instead of firing into an upstream that is already shedding load.
-          
-          [env: HEADROOM_RETRY_ZEN_MAX_INFLIGHT=]
-          [default: 4]
-
       --cost-tracking <COST_TRACKING_ENABLED>
           Enable cost tracking for upstream requests. Default `true`
           
@@ -793,13 +810,17 @@ Options:
           [default: daily]
 
       --min-tokens-to-crush <MIN_TOKENS_TO_CRUSH>
-          Minimum token count before a message is eligible for compression
+          Minimum token count before a message is eligible for compression.
+          
+          NO-OP (2026-09-11): the live SmartCrusher path uses its own defaults (200) and never reads this value — see ideas/dead-crush-flags.md. Kept as a declared flag so existing flag files keep parsing; setting it changes nothing until it is wired or removed.
           
           [env: HEADROOM_MIN_TOKENS_TO_CRUSH=]
           [default: 200]
 
       --max-items-after-crush <MAX_ITEMS_AFTER_CRUSH>
-          Max items to retain after SmartCrusher processing
+          Max items to retain after SmartCrusher processing.
+          
+          NO-OP (2026-09-11): same as above — the live path uses its own default (15). See ideas/dead-crush-flags.md.
           
           [env: HEADROOM_MAX_ITEMS_AFTER_CRUSH=]
           [default: 15]
@@ -929,6 +950,8 @@ Options:
           
           Defaults to Python's `DEFAULT_EXCLUDE_TOOLS`: file and search results are what the model is most likely to need verbatim, and the `all_messages` path compresses without storing an original to retrieve, so a summarized file read cannot be undone. Pass `--exclude-tools ""` to compress them anyway.
           
+          Honored on all three live-zone paths — Anthropic `/v1/messages`, OpenAI Chat Completions, and OpenAI Responses (FINDING-017 fixed): an excluded tool's output never reaches a lossy compressor (verbatim/byte-exact members pass through untouched, others get the reversible lossless fold only).
+          
           [env: HEADROOM_EXCLUDE_TOOLS=]
           [default: Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve]
 
@@ -939,14 +962,18 @@ Options:
           [default: ""]
 
       --read-lifecycle <READ_LIFECYCLE>
-          Enable read lifecycle tracking
+          Enable read lifecycle tracking.
+          
+          NO-OP (2026-09-14, FINDING-019): nothing on the live proxy path reads this — `ReadLifecycleManager::apply` runs only inside `cold_recompact_messages` (cold-prefix fork, always-on, ignores the flag) and `classify()` for retrieval-time stale warnings. Wiring the flag into the Anthropic handler like Python does (content_router.py pre-process) changes forwarded bytes and needs an A/B, not a silent change. Kept declared so existing flag files keep parsing.
           
           [env: HEADROOM_READ_LIFECYCLE=]
           [default: false]
           [possible values: true, false]
 
       --read-maturation <READ_MATURATION>
-          Enable read maturation (hold fresh reads out of prefix cache)
+          Enable read maturation (hold fresh reads out of prefix cache).
+          
+          NO-OP (2026-09-14, FINDING-019): `ReadMaturationManager` and `relocate_cache_breakpoint` have zero proxy callers — the Python handler wiring (anthropic.py:2290) was never ported. Same status as `--read-lifecycle` above: kept declared for flag-file compat, wiring needs an A/B first.
           
           [env: HEADROOM_READ_MATURATION=]
           [default: false]

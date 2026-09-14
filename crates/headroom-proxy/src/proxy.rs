@@ -1684,8 +1684,13 @@ pub fn build_app(state: AppState) -> Router {
                 "/debug/inflight",
                 get(
                     |axum::extract::State(_state): axum::extract::State<AppState>| async {
+                        // `zen_held` turns are parked in the Zen 429 hold: no
+                        // generation is running for them, so the rotation
+                        // watcher's drain must not wait on them (they are
+                        // waiting on it).
                         axum::response::Json(serde_json::json!({
                             "in_flight": InflightGuard::count_global(),
+                            "zen_held": crate::routed::zen_hold::held_count(),
                         }))
                     },
                 ),
@@ -4121,10 +4126,8 @@ pub(crate) async fn forward_http(
         // session owns the transcript. Runs before compression so the
         // flipped body is what every downstream stage (fingerprint,
         // replay store, compressor, wire bytes) sees.
-        if matches!(
-            endpoint,
-            compression::CompressibleEndpoint::OpenAiResponses
-        ) && state.config.ccr_handle_responses
+        if matches!(endpoint, compression::CompressibleEndpoint::OpenAiResponses)
+            && state.config.ccr_handle_responses
         {
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
                 let stream = parsed
@@ -11419,6 +11422,15 @@ fn extend_or_push(
 /// a JSON body never changes shape no matter its content type; the fold only
 /// runs when plain parsing already failed. Returns `None` when the body is
 /// neither, and the caller ends the round as it always has.
+/// True when a body opens like an SSE stream (`event:` or `data:` field,
+/// after any leading blank lines), for responses that carry no Content-Type.
+fn looks_like_sse(body: &[u8]) -> bool {
+    let head = &body[..body.len().min(64)];
+    let head = std::string::String::from_utf8_lossy(head);
+    let first = head.trim_start_matches(['\r', '\n']);
+    first.starts_with("event:") || first.starts_with("data:")
+}
+
 fn continuation_turn_from_body(
     body: &bytes::Bytes,
     content_type: Option<&str>,
@@ -11430,7 +11442,15 @@ fn continuation_turn_from_body(
     if provider != "openai_responses" {
         return None;
     }
-    let is_sse = content_type.is_some_and(|ct| ct.contains("text/event-stream"));
+    // A missing Content-Type is not "not SSE": on 2026-09-14 eleven
+    // continuations on the gpt-5.6 Responses route came back with no
+    // Content-Type at all and a 150-180 KB non-JSON body, and refusing the
+    // fold here replaced the whole turn with the retrieval-failure note.
+    // Sniff the body when the header is absent; a wrong header still wins.
+    let is_sse = match content_type.map(str::trim).filter(|ct| !ct.is_empty()) {
+        Some(ct) => ct.contains("text/event-stream"),
+        None => looks_like_sse(body),
+    };
     if !is_sse {
         return None;
     }
@@ -11557,6 +11577,10 @@ pub(crate) async fn handle_ccr_response(
 
     let max_rounds = config.ccr_max_retrieval_rounds;
     let mut rounds = 0;
+    // Last successfully fetched retrieval content, kept across rounds for
+    // fallback (a): if a later round's upstream continuation dies, the turn
+    // still resolves with what the store already returned.
+    let mut last_fetched: Vec<headroom_core::ccr::response_handler::CcrToolResult> = Vec::new();
 
     loop {
         if rounds >= max_rounds {
@@ -11864,6 +11888,13 @@ pub(crate) async fn handle_ccr_response(
             }
         }
 
+        // Snapshot successes for fallback (a): `results` is rebuilt each
+        // round, but the splice site below is outside the loop.
+        last_fetched = results
+            .iter()
+            .filter(|r| r.success && !r.content.is_empty())
+            .cloned()
+            .collect();
         // Build continuation messages: append assistant message + tool results.
         //
         // Some providers return sentinel-keyed shapes (a wrapper dict holding a
@@ -11914,11 +11945,17 @@ pub(crate) async fn handle_ccr_response(
             }
         };
 
+        // Shape facts for timeout triage (c): three header-timeouts with
+        // zero bytes smell like a malformed or enormous rebuilt body rather
+        // than a network blip, and the old log could not distinguish those.
+        // `results_chars` bounds the fetched-content contribution; the
+        // request JSON itself is measured serialized below.
         tracing::info!(
             request_id = %request_id,
             round = rounds + 1,
             max_rounds = max_rounds,
             results_count = results.len(),
+            results_chars = results.iter().map(|r| r.content.len()).sum::<usize>(),
             "ccr: sending continuation request"
         );
 
@@ -11973,6 +12010,7 @@ pub(crate) async fn handle_ccr_response(
                             request_id = %request_id,
                             attempt = attempt,
                             timeout_secs = CCR_CONTINUATION_SEND_TIMEOUT.as_secs(),
+                            continuation_body_bytes = continuation_body.len(),
                             "ccr: continuation timed out waiting for response headers; retrying"
                         );
                         Err(None)
@@ -12084,6 +12122,9 @@ pub(crate) async fn handle_ccr_response(
                                 request_id = %request_id,
                                 body_bytes = bytes.len(),
                                 content_type = %content_type,
+                                body_head = %String::from_utf8_lossy(
+                                    &bytes[..bytes.len().min(200)]
+                                ),
                                 "ccr: failed to parse continuation response"
                             );
                             break;
@@ -12121,14 +12162,53 @@ pub(crate) async fn handle_ccr_response(
             // ends on a call nothing will ever answer. Say so in the turn
             // instead, which is what the streamed path already does.
             let (residual, _) = handler.parse_ccr_tool_calls(&current_response, provider);
+            // Fallback (a): the store lookup already succeeded this round —
+            // `results` holds the fetched content — and only the upstream
+            // re-send died. Serve what we hold instead of a failure text:
+            // the turn resolves instead of stalling on an unanswered call.
+            // Capped: an unbounded splice just moves the blowup client-side.
+            const CCR_FALLBACK_MAX_CHARS: usize = 24_000;
             let notes: Vec<_> = residual
                 .iter()
-                .map(|call| headroom_core::ccr::response_handler::CcrToolResult {
-                    tool_call_id: call.tool_call_id.clone(),
-                    content: "The proxy could not complete a context retrieval for this turn."
-                        .to_string(),
-                    success: false,
-                    items_retrieved: 0,
+                .map(|call| {
+                    let fallback = last_fetched.iter().find(|r| {
+                        r.tool_call_id == call.tool_call_id && r.success && !r.content.is_empty()
+                    });
+                    match fallback {
+                        Some(hit) => {
+                            let truncated = hit.content.chars().count() > CCR_FALLBACK_MAX_CHARS;
+                            let content = if truncated {
+                                let kept: String =
+                                    hit.content.chars().take(CCR_FALLBACK_MAX_CHARS).collect();
+                                format!(
+                                    "{kept}\n\n[truncated: retrieved content exceeded \
+                                     {CCR_FALLBACK_MAX_CHARS} characters]"
+                                )
+                            } else {
+                                hit.content.clone()
+                            };
+                            tracing::info!(
+                                request_id = %request_id,
+                                tool_call_id = %call.tool_call_id,
+                                truncated,
+                                "ccr: serving store-fetched content after continuation failure",
+                            );
+                            headroom_core::ccr::response_handler::CcrToolResult {
+                                tool_call_id: call.tool_call_id.clone(),
+                                content,
+                                success: true,
+                                items_retrieved: hit.items_retrieved,
+                            }
+                        }
+                        None => headroom_core::ccr::response_handler::CcrToolResult {
+                            tool_call_id: call.tool_call_id.clone(),
+                            content:
+                                "The proxy could not complete a context retrieval for this turn."
+                                    .to_string(),
+                            success: false,
+                            items_retrieved: 0,
+                        },
+                    }
                 })
                 .collect();
             let spliced =
@@ -12449,6 +12529,14 @@ pub(crate) async fn handle_memory_response(
             rounds + 1,
         );
 
+        // The spliced `output[]` carries the model's own reasoning items,
+        // `id` and `encrypted_content` included. The translate and sidecar
+        // paths strip those for Zen (quirks.rs) because a rotation between
+        // rounds invalidates the blob; this path replays the same items and
+        // needs the same strip.
+        crate::routed::quirks::classify_upstream(upstream_url, false)
+            .strip_unreplayable_reasoning(&mut current_request);
+
         let Ok(continuation_body) = serde_json::to_vec(&current_request) else {
             break;
         };
@@ -12494,12 +12582,17 @@ pub(crate) async fn handle_memory_response(
                         continue;
                     }
                     let detail = r.text().await.unwrap_or_default();
+                    // A 400 names the item it rejected as `input[N]` (or
+                    // `messages[N]`); log that item's shape so the next
+                    // schema mismatch is diagnosable from the log alone.
+                    let rejected = rejected_item_summary(&detail, &current_request, items_field);
                     tracing::warn!(
                         request_id = %request_id,
                         status = %status,
                         attempt,
                         round = rounds + 1,
                         detail = %first_bytes(&detail, 600),
+                        rejected_item = %rejected,
                         "memory: upstream returned error during continuation"
                     );
                     break None;
@@ -12886,11 +12979,68 @@ mod memory_trace_tests {
 /// Anthropic wants one user turn holding every `tool_result` block; the OpenAI
 /// shapes want one entry per result, so those go behind a sentinel key that
 /// [`extend_or_push`] expands.
+/// The item an upstream 400 points at (`input[N]` / `messages[N]` in the
+/// error text), with string values cut to 80 chars, or `-` when the error
+/// names no index or the index is out of range.
+fn rejected_item_summary(detail: &str, request: &serde_json::Value, items_field: &str) -> String {
+    let idx = detail
+        .find(&format!("{items_field}["))
+        .map(|start| start + items_field.len() + 1)
+        .and_then(|start| {
+            let digits: String = detail[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse::<usize>().ok()
+        });
+    let Some(item) = idx.and_then(|i| request.get(items_field)?.get(i)) else {
+        return "-".to_string();
+    };
+    fn shorten(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::String(s) if s.chars().count() > 80 => {
+                serde_json::Value::String(format!("{}…", s.chars().take(80).collect::<String>()))
+            }
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.iter().map(shorten).collect())
+            }
+            serde_json::Value::Object(o) => {
+                serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), shorten(v))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    format!("{}[{}]={}", items_field, idx.unwrap_or(0), shorten(item))
+}
+
 fn memory_results_message(results: &[serde_json::Value], provider: &str) -> serde_json::Value {
     match provider {
         "anthropic" => serde_json::json!({"role": "user", "content": results}),
         "openai_responses" => {
-            serde_json::json!({"_openai_responses_tool_results": results})
+            // The adapter reads Responses `function_call` items but formats
+            // every OpenAI result in Chat shape (`role: tool`). A Chat item
+            // in a Responses `input` is a 400: Zen answered `input[N] did
+            // not match any supported type` 22 times and `Invalid value:
+            // 'tool'` twice on 2026-09-14, and the memory round was lost
+            // each time. Reshape here, where the wire format is known.
+            let items: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    match (
+                        r.get("role").and_then(|v| v.as_str()),
+                        r.get("tool_call_id"),
+                    ) {
+                        (Some("tool"), Some(id)) => {
+                            crate::memory::tool_adapter::format_responses_tool_result(
+                                id.as_str().unwrap_or(""),
+                                r.get("content").and_then(|c| c.as_str()).unwrap_or(""),
+                            )
+                        }
+                        _ => r.clone(),
+                    }
+                })
+                .collect();
+            serde_json::json!({"_openai_responses_tool_results": items})
         }
         _ => serde_json::json!({"_memory_tool_results": results}),
     }
@@ -13363,6 +13513,24 @@ mod tests {
                 .is_none(),
             "non-SSE garbage has no fold to try"
         );
+
+        // No Content-Type at all: sniff the body instead of refusing.
+        let v = continuation_turn_from_body(&sse, None, "openai_responses")
+            .expect("SSE-shaped body with no Content-Type still folds");
+        assert_eq!(v["output"][0]["content"][0]["text"], "hi");
+        let v = continuation_turn_from_body(&sse, Some(""), "openai_responses")
+            .expect("empty Content-Type counts as absent");
+        assert_eq!(v["output"][0]["content"][0]["text"], "hi");
+        assert!(
+            continuation_turn_from_body(&sse, Some("application/json"), "openai_responses")
+                .is_none(),
+            "a wrong Content-Type still wins over the sniff"
+        );
+        assert!(
+            continuation_turn_from_body(&bytes::Bytes::from("<html>"), None, "openai_responses")
+                .is_none(),
+            "non-SSE body with no Content-Type has no fold to try"
+        );
     }
 
     /// All retrievals failed: the loop must answer the errors in place
@@ -13465,6 +13633,49 @@ mod tests {
         .await;
         assert!(round_usage.is_empty());
         assert_eq!(round_usage.input_tokens, 0);
+    }
+
+    #[test]
+    fn memory_results_message_reshapes_chat_results_for_responses() {
+        let results = vec![
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":1}"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "call_2", "output": "x"}),
+        ];
+        let msg = memory_results_message(&results, "openai_responses");
+        let items = msg["_openai_responses_tool_results"].as_array().unwrap();
+        assert_eq!(
+            items[0],
+            serde_json::json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"ok\":1}"}),
+            "Chat-shaped result becomes a Responses function_call_output"
+        );
+        assert_eq!(items[1], results[1], "already-Responses items pass through");
+
+        let chat = memory_results_message(&results[..1], "openai");
+        assert_eq!(
+            chat["_memory_tool_results"][0]["role"], "tool",
+            "Chat provider keeps the Chat shape"
+        );
+    }
+
+    #[test]
+    fn rejected_item_summary_names_the_item_the_400_points_at() {
+        let request = serde_json::json!({"input": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "c", "content": "x".repeat(200)},
+        ]});
+        let detail = r#"{"error":{"param":"input[1]","message":"`input[1]` did not match any supported type"}}"#;
+        let out = rejected_item_summary(detail, &request, "input");
+        assert!(out.starts_with("input[1]={"), "{out}");
+        assert!(out.contains("\"role\":\"tool\""), "{out}");
+        assert!(out.len() < 200, "long strings are cut: {out}");
+        assert_eq!(
+            rejected_item_summary("no index here", &request, "input"),
+            "-"
+        );
+        assert_eq!(
+            rejected_item_summary("input[9] bad", &request, "input"),
+            "-"
+        );
     }
 
     #[test]

@@ -71,7 +71,10 @@
 #   zen-rotate-watch.sh --detect-provider  # what `auto` would pick here
 #
 # Trigger 1: `local_model_upstream_error` with `"status":429` — the exact line
-# the proxy emits when Zen refuses a routed turn (12h wait included).
+# the proxy emits when Zen refuses a routed turn (12h wait included) — or
+# `zen_hold_waiting`, the line the proxy emits while it holds that refusal
+# instead of returning it (the hold is unbounded by default, so this is the
+# only 429 signal in the log while the hold is on).
 # Trigger 2: the session-visible form of the same refusal, `temporarily
 # limiting requests`, polled in recent spark transcripts. The proxy log only
 # shows what arrived while the tail was running; the transcript poll catches
@@ -388,10 +391,13 @@ schedule_next() {
 
 # Turns currently in flight, or -1 when the endpoint is unreachable
 # (old proxy binary, proxy down, or transient curl/python failure).
+# Turns parked in the proxy's Zen 429 hold (`zen_held`) are waiting for this
+# rotation, not generating, so they are subtracted: draining on them stalled
+# the 2026-09-14 rotation for 4m40s while the holds ran out and returned 429s.
 inflight() {
   local n
   n=$(curl -s --max-time 5 "http://127.0.0.1:8787/debug/inflight" 2>/dev/null \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("in_flight", -1))' 2>/dev/null) || n=-1
+    | python3 -c 'import json,sys; j=json.load(sys.stdin); print(max(0, j.get("in_flight", -1) - j.get("zen_held", 0)) if "in_flight" in j else -1)' 2>/dev/null) || n=-1
   printf '%s' "$n"
 }
 
@@ -627,6 +633,13 @@ tail -n0 -F "$LOG" 2>/dev/null | while true; do
         rotate auto
         next_proactive_at=$(schedule_next)
       fi
+    elif printf '%s' "$line" | grep -q '"event":"zen_hold_waiting"'; then
+      # The proxy holds a Zen 429 instead of returning it (unbounded by
+      # default), so the `local_model_upstream_error` line above no longer
+      # appears while a hold is on. Every hold probe that still sees 429
+      # asks for a rotation; the cooldown collapses the burst into one.
+      rotate auto
+      next_proactive_at=$(schedule_next)
     fi
   elif [ -n "$(poll_transcripts)" ]; then
     log "rate-limit message in session transcript; rotating..."

@@ -93,11 +93,29 @@ add_peer() {
 
 # ── 1. live claude processes in the same toplevel ──
 if [ -d /proc ]; then
+  # Build one self identity for every process-based detector below. The hook's
+  # immediate parent is not guaranteed to be Claude (a shell/launcher may sit
+  # between them), so excluding only $$ and $PPID can report this session's
+  # own Claude process as a peer. The nearest Claude ancestor is also the root
+  # used later to exclude this session's test-runner descendants.
+  MINE=" "
+  MYROOT=""
+  _a=$$
+  _depth=0
+  while [ -n "$_a" ] && [ "$_a" != "0" ] && [ "$_a" != "1" ] && [ "$_depth" -lt 20 ]; do
+    MINE="$MINE$_a "
+    if [ -z "$MYROOT" ] && [ -r "/proc/$_a/cmdline" ] \
+      && tr '\0' ' ' <"/proc/$_a/cmdline" 2>/dev/null | grep -qE '(^|/)claude( |$)'; then
+      MYROOT=$_a
+    fi
+    _depth=$((_depth + 1))
+    _a=$(awk '{print $4}' "/proc/$_a/stat" 2>/dev/null) || break
+  done
+
   # pgrep is not everywhere; ps + grep is. The bracket trick keeps grep
   # itself out of the list without a second filter process.
   for pid in $(ps -eo pid,args 2>/dev/null | grep '[c]laude' | awk '{print $1}'); do
-    [ "$pid" = "$$" ] && continue
-    [ "$pid" = "$PPID" ] && continue
+    case "$MINE" in *" $pid "*) continue ;; esac
     # Race: pid may exit between ps and read; -r check keeps the
     # shell's own redirection error off stderr.
     [ -r "/proc/$pid/cmdline" ] || continue
@@ -230,20 +248,6 @@ echo "$now" >"$LASTCHECK" 2>/dev/null || true
 # Best-effort and advisory only: never blocks, silent when nothing runs.
 _n=$(wc -l <"$SCAN_TMP" 2>/dev/null | tr -d ' ') || _n=0
 if [ "$_n" -lt "$MAX_PEERS" ] && [ -d /proc ]; then
-  # My session root: nearest ancestor running the `claude` CLI. Everything
-  # under it (my test runs, my hooks, my greps) is mine, never a peer's.
-  MYROOT=""
-  _a=$PPID
-  _depth=0
-  while [ -n "$_a" ] && [ "$_a" != "0" ] && [ "$_depth" -lt 20 ]; do
-    _depth=$((_depth + 1))
-    if [ -r "/proc/$_a/cmdline" ] && tr '\0' ' ' <"/proc/$_a/cmdline" 2>/dev/null | grep -qE '(^|/)claude( |$)'; then
-      MYROOT=$_a
-      break
-    fi
-    _a=$(ps -o ppid= -p "$_a" 2>/dev/null | tr -d ' ')
-  done
-
   # Runner match on the joined command line. Leading (^|[/ ]) and trailing
   # ([ /]|$) boundaries keep `jest` out of `suggests` and `go test` out of
   # `mongo test`; plain advisory output tolerates the residue.

@@ -10,8 +10,12 @@
 //! So instead of returning the 429, the proxy holds the request: sleep in
 //! [`crate::proxy::backoff_ms`]-shaped slices capped by `retry_max_delay_ms`,
 //! re-POST-ing the buffered body between sleeps, until the upstream answers
-//! non-429 or `retry_zen_hold_budget_ms` elapses. The default budget (150s)
-//! covers watcher cooldown + drain + margin.
+//! non-429. By default (`retry_zen_hold_budget_ms` = 0) there is no budget:
+//! on 2026-09-14 the 150s budget ran out five times while Zen kept
+//! answering 429 past one rotation, and each time the 429 reached the client
+//! and killed the turn. A client that gives up drops this future, so an
+//! unbounded hold cannot outlive the request it serves. A positive budget
+//! restores the bounded behaviour.
 //!
 //! Duplication risk is nil: a 429 means the upstream refused the turn, so no
 //! generation happened and re-sending is free. The hold sits inside
@@ -21,6 +25,33 @@
 use crate::proxy::AppState;
 use axum::http::HeaderMap;
 use bytes::Bytes;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Turns currently parked in the hold. Exposed on `/debug/inflight` as
+/// `zen_held` so `zen-rotate-watch.sh` can subtract them from `in_flight`
+/// before draining: a held turn has nothing generating and is itself waiting
+/// for the rotation, so draining on it only stalls the rotation until the
+/// drain's own deadline (4m40s on 2026-09-14, twice the old hold budget).
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn held_count() -> usize {
+    HELD.load(Ordering::SeqCst)
+}
+
+struct HeldGuard;
+
+impl HeldGuard {
+    fn enter() -> Self {
+        HELD.fetch_add(1, Ordering::SeqCst);
+        HeldGuard
+    }
+}
+
+impl Drop for HeldGuard {
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// What the hold hands back to the retry loop: the last response (recovered
 /// or still-429) plus the headers as last sent and the attempt count, so
@@ -38,10 +69,10 @@ pub(crate) struct HeldSend {
 /// response is non-429) or the hold budget elapsed while still limited (the
 /// still-429 response then flows through the normal error path, and the
 /// `local_model_upstream_error` line it logs re-arms the watcher).
-/// Returns `None` when waiting on is pointless: the budget already elapsed
-/// before the first probe, or a non-retryable transport error arrived
-/// mid-hold. The caller answers `None` with one honest re-send rather than
-/// the stale 429. A long `Retry-After` is not a reason to stop — Zen sends a
+/// Returns `None` only when a positive budget elapsed while still limited.
+/// Transport errors of any kind keep the hold going: they are what a VPN
+/// restart looks like from here. The caller answers `None` with one honest
+/// re-send rather than the stale 429. A long `Retry-After` is not a reason to stop — Zen sends a
 /// constant one (see the still-limited arm below).
 pub(crate) async fn hold_for_rotation(
     state: &AppState,
@@ -51,9 +82,17 @@ pub(crate) async fn hold_for_rotation(
     attempts_so_far: u32,
     request_id: &str,
 ) -> Option<HeldSend> {
-    let budget_ms = u64::from(state.config.retry_zen_hold_budget_ms.max(1));
+    // `0` is the default and means no budget: hold until Zen answers
+    // something other than 429. A spent budget hands the 429 to the client,
+    // which kills the turn and every subagent under it — the thing the hold
+    // exists to prevent. A positive budget is kept for tests and operators
+    // who want the old bounded behaviour.
+    let budget_ms = match state.config.retry_zen_hold_budget_ms {
+        0 => u64::MAX,
+        ms => u64::from(ms),
+    };
     let started = std::time::Instant::now();
-    let mut headers = headers;
+    let _held = HeldGuard::enter();
     let mut attempts_made = attempts_so_far;
     loop {
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -135,11 +174,11 @@ pub(crate) async fn hold_for_rotation(
                     .and_then(|v| v.to_str().ok())
                     .and_then(headroom_core::retry::retry_after_ms_uncapped)
                 {
-                    if wait > budget_ms as f64 {
+                    if wait > state.config.retry_max_delay_ms as f64 {
                         tracing::warn!(
                             event = "zen_hold_retry_after_ignored",
                             retry_after_ms = wait,
-                            hold_budget_ms = budget_ms,
+                            probe_cap_ms = state.config.retry_max_delay_ms,
                             request_id = %request_id,
                             "upstream Retry-After outruns the rotation hold; ignoring it (Zen sends a constant) and holding on"
                         );
@@ -162,24 +201,18 @@ pub(crate) async fn hold_for_rotation(
                 continue;
             }
             Err(e) => {
-                // Non-retryable build/decode error: no wait will fix it.
-                // Hand back a 502-shaped answer via the caller's transport
-                // path by returning None — but None means "return the 429",
-                // so instead synthesize here: the caller can't build it.
-                // Simplest honest answer: keep holding is wrong, returning
-                // the stale 429 hides the real error. Log and break out by
-                // spending the budget: fall through to the spent arm.
+                // Anything else (decode, redirect, builder) is also seen
+                // while the VPN restarts under us. Giving up here handed the
+                // client the stale 429 and killed the turn; hold on instead
+                // and let the next probe decide.
                 tracing::warn!(
                     event = "zen_hold_fatal_transport",
                     error = %e,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
                     request_id = %request_id,
-                    "non-retryable error during the hold; giving up the hold"
+                    "non-retryable transport error during the hold; holding on"
                 );
-                crate::observability::record_upstream_retry_exhausted(
-                    "local_model",
-                    crate::observability::retry_reason::ZEN_HOLD,
-                );
-                return None;
+                continue;
             }
         }
     }

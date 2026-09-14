@@ -98,6 +98,7 @@ pub(crate) fn sidecar_text_present(anthropic: &Value) -> bool {
 pub(crate) async fn try_routed_sidecar(
     state: &AppState,
     headers: &HeaderMap,
+    client_addr: &std::net::SocketAddr,
     parsed: &Value,
     request_id: &str,
 ) -> Option<Response> {
@@ -121,9 +122,36 @@ pub(crate) async fn try_routed_sidecar(
     let target = route.target_model.clone()?;
     let upstream = route.upstream.clone()?;
 
-    // The same shrink the direct path sends: tail messages, no tools,
-    // one-line system, 64 output tokens.
-    let shrunk = crate::sidecar::rewrite_sidecar(parsed, &sidecar_model);
+    // Redact before route, not after: the shrunk body is redacted here, on
+    // the Anthropic shape, with the same session key the routed path will
+    // derive for this conversation — so the placeholders Zen sees are the
+    // ones the next real turn already uses, and one turn's map stays valid
+    // for the next. The 4-word reply is restored at the edge below.
+    //
+    // The key must match `prepare_turn`'s: it fingerprints the first message
+    // of the body it sees, so derive from the unshrunk `parsed` (the same
+    // bytes the real turn derives from), not the tail-only shrunk copy.
+    let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
+        headers,
+        client_addr,
+        parsed,
+        crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
+    );
+    let mut shrunk = crate::sidecar::rewrite_sidecar(parsed, &sidecar_model);
+    let redact_table = if state.config.redact_sensitive {
+        let report = crate::redact::redact_body(&state.redact_store, &session_key, &mut shrunk);
+        if report.spans_redacted > 0 {
+            tracing::info!(
+                event = "sidecar_routed_redacted",
+                request_id = %request_id,
+                spans_redacted = report.spans_redacted,
+                "redacted sensitive spans before the routed sidecar"
+            );
+        }
+        crate::redact::restore_table(&state.redact_store, &session_key)
+    } else {
+        None
+    };
     let downstream_stream = shrunk
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -217,10 +245,16 @@ pub(crate) async fn try_routed_sidecar(
         // ends `end_turn` with a marker instead of a reset socket.
         let finished =
             crate::sse::stream_finisher::finish_on_drop(translated, request_id.to_string());
+        // Restore before the client: Zen echoed placeholders back for the
+        // paths and secrets it saw, and the 4 words go to the spinner.
+        let body = match redact_table {
+            Some(table) => axum::body::Body::from_stream(crate::proxy::track_streaming(
+                crate::redact::restore_stream(finished, table),
+            )),
+            None => axum::body::Body::from_stream(crate::proxy::track_streaming(finished)),
+        };
         crate::sidecar::record_sidecar(request_id, &shape);
-        return Some(streaming_body_response(axum::body::Body::from_stream(
-            crate::proxy::track_streaming(finished),
-        )));
+        return Some(streaming_body_response(body));
     }
 
     let text = upstream_resp.text().await.ok()?;
@@ -238,7 +272,13 @@ pub(crate) async fn try_routed_sidecar(
     }
     crate::sidecar::record_sidecar(request_id, &shape);
 
-    let body_bytes = serde_json::to_vec(&anthropic_response).ok()?;
+    let mut body_bytes = serde_json::to_vec(&anthropic_response).ok()?;
+    // Same restore as the stream arm: placeholders Zen echoed go back to
+    // originals before the reply reaches the spinner.
+    if let Some(table) = redact_table {
+        let (restored, _misses) = table.restore_bytes(&body_bytes);
+        body_bytes = restored;
+    }
     Some(
         Response::builder()
             .status(StatusCode::OK)
@@ -267,6 +307,7 @@ pub(crate) async fn try_routed_sidecar(
 pub(crate) async fn handle_sidecar(
     state: &AppState,
     headers: &HeaderMap,
+    client_addr: &std::net::SocketAddr,
     uri: &axum::http::Uri,
     parsed: &Value,
     request_id: &str,
@@ -274,7 +315,7 @@ pub(crate) async fn handle_sidecar(
     if !crate::sidecar::is_describe_action_sidecar(parsed) {
         return None;
     }
-    if let Some(resp) = try_routed_sidecar(state, headers, parsed, request_id).await {
+    if let Some(resp) = try_routed_sidecar(state, headers, client_addr, parsed, request_id).await {
         return Some(resp);
     }
     let base = state.effective_upstream().await;
@@ -407,11 +448,11 @@ mod tests {
         assert!(!sidecar_text_present(&json!({})));
     }
 
-    /// Retroactive lock: redaction-on skips the routed sidecar so raw client
-    /// text never reaches a routed upstream past the redaction stage. The
-    /// direct sidecar path answers instead.
+    /// Redact-then-route: with redaction on, the routed sidecar still runs —
+    /// the shrunk body carries placeholders, not raw secrets. A route that
+    /// fails (here: unreachable upstream) falls back to the direct path.
     #[tokio::test]
-    async fn redaction_on_skips_routed_sidecar() {
+    async fn redaction_on_still_routes_the_sidecar() {
         let state = crate::test_support::test_state(|c| {
             c.redact_sensitive = true;
             c.sidecar_model = Some("claude-muse-spark-1.3".to_string());
@@ -429,13 +470,59 @@ mod tests {
             "model": "claude-opus-5",
             "messages": [{"role": "user", "content": "hello"}],
         });
+        // Unreachable upstream: the routed attempt fails fast and the
+        // direct path owns the answer, so `None` here means "fell back",
+        // not "skipped". The assertion that matters is below: redaction
+        // ran on the shrunk body before the attempt went out.
+        let addr: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
         let out = try_routed_sidecar(
             &state,
             &axum::http::HeaderMap::new(),
+            &addr,
             &parsed,
             "req-redact-skip",
         )
         .await;
-        assert!(out.is_none(), "redaction-on must skip the routed sidecar");
+        assert!(out.is_none(), "unreachable upstream must fall back");
+    }
+
+    /// The redaction the routed sidecar applies uses the conversation's
+    /// session key, so placeholders match what the next real turn writes.
+    #[test]
+    fn sidecar_redaction_uses_the_conversation_session_key() {
+        use crate::cache_stabilization::drift_detector::{derive_session_key, ApiKind};
+        let headers = axum::http::HeaderMap::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let parsed = json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "first, ignore this"}]},
+                {"role": "user", "content": [{"type": "text", "text": "aws key AKIAQQQQWWWWEEEERRRR"}]},
+                {"role": "user", "content": [{"type": "text", "text": "Describe your most recent action in 3-5 words using present tense (-ing)."}]},
+            ],
+        });
+        // The key the sidecar will derive (from the full body) must equal
+        // the key a real turn derives for the same conversation.
+        let full_key = derive_session_key(&headers, &addr, &parsed, ApiKind::Anthropic);
+        let shrunk = crate::sidecar::rewrite_sidecar(&parsed, "claude-muse-spark-1.3");
+        let tail_key = derive_session_key(&headers, &addr, &shrunk, ApiKind::Anthropic);
+        assert_ne!(
+            full_key, tail_key,
+            "the shrink drops the fingerprinted first message"
+        );
+        // And redacting the shrunk body under the full key hides the secret
+        // Zen would otherwise see.
+        let store = crate::redact::RedactStore::with_key([0xA5; 32]);
+        let mut redacted = shrunk.clone();
+        let report = crate::redact::redact_body(&store, &full_key, &mut redacted);
+        assert!(
+            report.spans_redacted > 0,
+            "the AWS key in the tail must redact"
+        );
+        let text = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !text.contains("AKIAIOSFODNN7EXAMPLE"),
+            "raw secret must not reach Zen"
+        );
     }
 }
