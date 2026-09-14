@@ -174,8 +174,10 @@ impl UpstreamKind {
     /// transcript and is resent on every following turn, so one rotation
     /// dead-ends the conversation — observed 2026-09-14, four turns in a row,
     /// three minutes after a rotation. Ask Zen for no blob and replay none:
-    /// the model still gets the assistant text, and only the cross-turn chain
-    /// of thought is lost.
+    /// strip `id` and `encrypted_content` but keep the item's `summary` (a
+    /// no-id item with a summary is still accepted — probed 2026-09-14). The
+    /// model still gets the assistant text and the visible chain of thought;
+    /// only the encrypted replay itself is lost.
     ///
     /// The other providers keep the replay. Codex and Cursor are reached from
     /// one stable identity, where handing the items back is what makes a
@@ -185,7 +187,20 @@ impl UpstreamKind {
             return;
         }
         if let Some(items) = openai_body.get_mut("input").and_then(|v| v.as_array_mut()) {
-            items.retain(|item| item.get("type").and_then(|t| t.as_str()) != Some("reasoning"));
+            for item in items.iter_mut() {
+                if item.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
+                    continue;
+                }
+                // Drop the caller-bound `id` + `encrypted_content` (Zen 400s
+                // on those past a rotation) but keep `summary`: probed
+                // 2026-09-14, a no-id item with a summary is still accepted,
+                // so the visible chain of thought survives even though the
+                // replay does not.
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("id");
+                    obj.remove("encrypted_content");
+                }
+            }
         }
         if let Some(obj) = openai_body.as_object_mut() {
             obj.remove("include");
@@ -290,16 +305,21 @@ mod tests {
     }
 
     /// Zen invalidates its own reasoning blobs on every exit rotation, so the
-    /// replay goes out stripped and nothing asks for a fresh blob.
+    /// replay goes out with the caller-bound `id` + `encrypted_content`
+    /// stripped — the item (and any `summary` it carries) stays, and nothing
+    /// asks for a fresh blob.
     #[test]
     fn zen_strips_the_reasoning_replay() {
         let mut body = responses_body_with_reasoning();
         UpstreamKind::OpenCodeZen.strip_unreplayable_reasoning(&mut body);
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2);
-        assert!(input
+        assert_eq!(input.len(), 3);
+        let reasoning = input
             .iter()
-            .all(|i| i["type"] != serde_json::json!("reasoning")));
+            .find(|i| i["type"] == serde_json::json!("reasoning"))
+            .expect("reasoning item survives, stripped");
+        assert!(reasoning.get("id").is_none());
+        assert!(reasoning.get("encrypted_content").is_none());
         assert!(body.get("include").is_none());
     }
 

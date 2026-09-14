@@ -164,7 +164,8 @@ mod tests {
 
     /// Zen rotates its exit IP on every 429, which invalidates the reasoning
     /// blobs it issued earlier in the same conversation. The translated body
-    /// must carry none of them, and must not ask for a new one.
+    /// must carry none of the caller-bound envelope (`id` + `encrypted_content`),
+    /// must not ask for a new one, but keeps the visible summary text.
     #[test]
     fn zen_route_sends_no_encrypted_reasoning() {
         use crate::handlers::reasoning_signature::{encode_reasoning_signature, ReasoningReplay};
@@ -206,7 +207,19 @@ mod tests {
             "req-zen",
         )
         .expect("translates");
-        assert_eq!(reasoning_items(&out), 0);
+        assert_eq!(reasoning_items(&out), 1);
+        let reasoning = out.openai_body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == json!("reasoning"))
+            .expect("reasoning item survives, stripped");
+        assert!(reasoning.get("id").is_none());
+        assert!(reasoning.get("encrypted_content").is_none());
+        assert_eq!(
+            reasoning["summary"],
+            json!([{ "type": "summary_text", "text": "..." }])
+        );
         assert!(out.openai_body.get("include").is_none());
 
         // Same conversation on a stable-identity upstream: replay intact.

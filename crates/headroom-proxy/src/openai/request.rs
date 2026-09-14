@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 
 use headroom_core::parser::extract_tool_result_text;
 
-use crate::handlers::reasoning_signature::{decode_reasoning_signature, reasoning_input_item};
+use crate::handlers::reasoning_signature::{
+    decode_reasoning_signature, reasoning_input_item_with_summary,
+};
 
 pub(crate) fn anthropic_to_openai_request(
     anthropic: &Value,
@@ -578,7 +580,8 @@ fn translate_assistant_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
                     }));
                     text_parts.clear();
                 }
-                out.push(reasoning_input_item(replay));
+                let thinking_text = block.get("thinking").and_then(|v| v.as_str());
+                out.push(reasoning_input_item_with_summary(replay, thinking_text));
             }
             _ => {}
         }

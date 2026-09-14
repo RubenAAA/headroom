@@ -1576,7 +1576,10 @@ mod tests {
         assert_eq!(input[0]["type"], "reasoning");
         assert_eq!(input[0]["id"], "rs_1");
         assert_eq!(input[0]["encrypted_content"], "ENC_BLOB");
-        assert_eq!(input[0]["summary"], json!([]));
+        assert_eq!(
+            input[0]["summary"],
+            json!([{ "type": "summary_text", "text": "weighing it" }])
+        );
         // Reasoning has to stay ahead of the call it preceded.
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["call_id"], "call_1");
