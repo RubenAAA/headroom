@@ -12,6 +12,7 @@
 //! * **No blocking I/O.** Only reads already-materialized state.
 //! * **No privacy leaks.** No request bodies, no frame locals.
 
+use crate::cache_stabilization::usage_observer::ActiveConversation;
 use crate::warmup::WarmupRegistry;
 use crate::ws_session_registry::WebSocketSessionRegistry;
 
@@ -96,6 +97,21 @@ pub fn serialize_ws_sessions_debug(ws_sessions: &WebSocketSessionRegistry) -> se
     serde_json::json!(ws_sessions.snapshot())
 }
 
+/// Serialize debug info for /debug/active-conversations.
+///
+/// One entry per turn still in flight, oldest first. `conversation` is the
+/// observer's opaque usage key; `project` is the canonical project directory
+/// (absent when the turn never resolved one). Loopback-only, like the rest
+/// of `/debug/*` — project paths never leave the machine.
+pub fn serialize_active_conversations_debug(
+    conversations: Vec<ActiveConversation>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "count": conversations.len(),
+        "conversations": conversations,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +178,27 @@ mod tests {
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["session_id"], "s1");
+    }
+
+    #[test]
+    fn serialize_active_conversations_debug_shape() {
+        let value = serialize_active_conversations_debug(vec![
+            ActiveConversation {
+                conversation: "abc123".into(),
+                project: Some("/repo/a".into()),
+                age_secs: 3,
+            },
+            ActiveConversation {
+                conversation: "def456".into(),
+                project: None,
+                age_secs: 0,
+            },
+        ]);
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["conversations"][0]["conversation"], "abc123");
+        assert_eq!(value["conversations"][0]["project"], "/repo/a");
+        assert_eq!(value["conversations"][0]["age_secs"], 3);
+        assert!(value["conversations"][1]["project"].is_null());
     }
 
     #[test]

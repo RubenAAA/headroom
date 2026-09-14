@@ -21,6 +21,7 @@ pub(crate) fn build_routed_outcome_context(
     parsed: &Value,
     headers: &HeaderMap,
     target_model: Option<&str>,
+    is_responses: bool,
     body_model: &str,
     report: CtxTransformReport,
     overhead_ms: f64,
@@ -28,6 +29,7 @@ pub(crate) fn build_routed_outcome_context(
     request_id: String,
     replay_store: Option<crate::cache_stabilization::prefix_replay::SessionReplayStore>,
     forwarded_tokens_estimate: i64,
+    outbound_bytes: u64,
 ) -> Option<RoutedOutcomeContext> {
     // Resolve the project the same way the Claude path does, so routed turns
     // land in the same per-project buckets rather than an "unknown" pile.
@@ -59,7 +61,7 @@ pub(crate) fn build_routed_outcome_context(
         // `/model` — booking that would price OpenAI tokens off the `claude-`
         // row in the pricing table.
         model: target_model.unwrap_or(body_model).to_string(),
-        provider: if target_model.is_some() {
+        provider: if is_responses {
             "openai_responses".to_string()
         } else {
             "openai_chat".to_string()
@@ -79,6 +81,7 @@ pub(crate) fn build_routed_outcome_context(
         started_at,
         overhead_ms,
         forwarded_tokens_estimate,
+        outbound_bytes,
         upstream_attempts: 1,
         // Filled in by the handler, which is where the routing decision is.
         reroute: None,
@@ -131,6 +134,11 @@ pub(crate) struct RoutedOutcomeContext {
     pub(crate) overhead_ms: f64,
     /// Request-side estimate used when an error body carries no usage block.
     pub(crate) forwarded_tokens_estimate: i64,
+    /// Exact outbound body bytes serialized for the upstream on this attempt.
+    /// Powers the measured 413 diagnosis: the client prints a canned 32MB
+    /// note for any 413, so the error arms report this instead of letting
+    /// the user hunt for images that were never there.
+    pub(crate) outbound_bytes: u64,
     pub(crate) upstream_attempts: i64,
     /// `Some` when the prefix-replay stage parked this turn. The store needs
     /// the response's cache-token counts to decide how much of the prefix the
@@ -288,6 +296,97 @@ pub(crate) fn book_routed_outcome_with_ccr(
     headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
 }
 
+/// Book a `translate==false` passthrough turn (C7 flip B).
+///
+/// Passthrough forwards bytes verbatim — no transforms, no savings — but the
+/// spend is real, and unbooked it is invisible to `/stats`, the cost tracker,
+/// and the dashboard. Usage is read-only: the response body is never mutated.
+/// The funnel classifies ≥500 as failed, so error responses book as failures,
+/// never as served turns. Provider label matches `forward_http`'s Anthropic
+/// wire-format label.
+pub(crate) fn book_passthrough_outcome(
+    sink: &crate::proxy::ProxyOutcomeSink,
+    request_id: &str,
+    body_model: &str,
+    status_code: i64,
+    usage: Option<&Value>,
+    started_at: std::time::Instant,
+) {
+    // Same read as round folding (`crate::proxy::usage_counts`): both wire
+    // shapes under one max-convention, so passthrough books what the funnel
+    // would book for the same body.
+    let (input_tokens, output_tokens, cached) =
+        usage.map(crate::proxy::usage_counts).unwrap_or((0, 0, 0));
+    let outcome = headroom_core::request_outcome::RequestOutcome {
+        request_id: request_id.to_string(),
+        provider: "anthropic".to_string(),
+        model: body_model.to_string(),
+        status_code,
+        upstream_attempts: 1,
+        provider_input_tokens: usage.map(|_| input_tokens),
+        provider_output_tokens: usage.map(|_| output_tokens),
+        original_tokens: input_tokens,
+        optimized_tokens: input_tokens,
+        output_tokens,
+        attempted_input_tokens: input_tokens,
+        cache_read_tokens: cached,
+        uncached_input_tokens: (input_tokens - cached).max(0),
+        total_latency_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+    headroom_core::request_outcome::emit_request_outcome(sink, &outcome);
+}
+
+/// Book a Cursor-agent turn (C7 flip A).
+///
+/// Cursor runs a subprocess, not HTTP, so it never touched the outcome
+/// funnel — its spend was real but invisible. Counts come from the CLI's own
+/// terminal `result` event (per-invocation, overwritten per result, so one
+/// booking per HTTP turn cannot double-count across resumes). Booked under
+/// the true cursor model id, never the client-facing alias: unknown ids
+/// price at the generic fallback rate, which the dashboard must read as
+/// approximate, not as phantom precision.
+///
+/// Zero-count turns (a paused response, which carries no `result` yet) are
+/// skipped: there is nothing billed to record, and the resume's booking
+/// covers the invocation that actually ran. Failures book as failed so they
+/// never feed the save rate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn book_cursor_outcome(
+    sink: &crate::proxy::ProxyOutcomeSink,
+    request_id: &str,
+    cursor_model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    failed: bool,
+    started_at: std::time::Instant,
+) {
+    if input_tokens <= 0 && output_tokens <= 0 {
+        return;
+    }
+    let outcome = headroom_core::request_outcome::RequestOutcome {
+        request_id: request_id.to_string(),
+        provider: "cursor".to_string(),
+        model: cursor_model.to_string(),
+        status_code: if failed { 500 } else { 200 },
+        upstream_attempts: 1,
+        provider_input_tokens: Some(input_tokens),
+        provider_output_tokens: Some(output_tokens),
+        original_tokens: input_tokens,
+        optimized_tokens: input_tokens,
+        output_tokens,
+        attempted_input_tokens: input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        uncached_input_tokens: (input_tokens - cache_read_tokens).max(0),
+        total_latency_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+    headroom_core::request_outcome::emit_request_outcome(sink, &outcome);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +428,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             overhead_ms: 0.0,
             forwarded_tokens_estimate: 7,
+            outbound_bytes: 0,
             upstream_attempts: 1,
             replay_store: None,
             session_key: "sess-test".to_string(),
@@ -422,5 +522,175 @@ mod tests {
             "second turn adds only what is novel: {lifetime}"
         );
         headroom_core::conversation_savings::reset_conversation_ledger();
+    }
+
+    /// C6 usage-preservation lock: the booked model is the UPSTREAM model,
+    /// never the client-facing alias. The alias is deliberately named
+    /// `claude-*` for gateway discovery; pricing resolves by name prefix, so
+    /// booking it would silently bill OpenAI tokens at Sonnet rates. The
+    /// provider label must match the wire shape on both arms.
+    #[test]
+    fn outcome_books_upstream_model_and_wire_provider() {
+        let state = crate::test_support::test_state(|_| {});
+        let parsed = json!({
+            "model": "claude-codex-5.5",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let report = crate::routed::transforms::CtxTransformReport::default();
+        let headers = axum::http::HeaderMap::new();
+        let now = std::time::Instant::now();
+
+        let responses = build_routed_outcome_context(
+            &state,
+            &parsed,
+            &headers,
+            Some("gpt-5.5"),
+            true,
+            "claude-codex-5.5",
+            report,
+            0.0,
+            now,
+            "req-test".to_string(),
+            None,
+            7,
+            0,
+        )
+        .expect("context builds");
+        assert_eq!(responses.model, "gpt-5.5");
+        assert_eq!(responses.provider, "openai_responses");
+
+        let report = crate::routed::transforms::CtxTransformReport::default();
+        let chat = build_routed_outcome_context(
+            &state,
+            &parsed,
+            &headers,
+            None,
+            false,
+            "codex-5.5",
+            report,
+            0.0,
+            now,
+            "req-test".to_string(),
+            None,
+            7,
+            0,
+        )
+        .expect("context builds");
+        assert_eq!(chat.model, "codex-5.5");
+        assert_eq!(chat.provider, "openai_chat");
+    }
+
+    /// C7 flip B: a passthrough turn books its upstream usage verbatim —
+    /// no transforms, no savings, but real spend. A 5xx books as failed,
+    /// never as served.
+    #[test]
+    fn passthrough_turn_books_upstream_usage() {
+        use crate::test_support::EventCapture;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let logger = std::sync::Arc::new(crate::request_logger::RequestLogger::new(None));
+        let sink = std::sync::Arc::new(crate::proxy::ProxyOutcomeSink {
+            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
+            )),
+            savings_tracker: std::sync::Arc::new(
+                headroom_core::savings_tracker::SavingsTracker::new(
+                    Some(dir.path().join("savings.json")),
+                    false,
+                ),
+            ),
+            request_logger: logger.clone(),
+        });
+        let capture = EventCapture::default();
+        let lines = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            book_passthrough_outcome(
+                &sink,
+                "req-pass",
+                "claude-passthrough",
+                200,
+                Some(&json!({"input_tokens": 1234, "output_tokens": 56})),
+                std::time::Instant::now(),
+            );
+            book_passthrough_outcome(
+                &sink,
+                "req-pass-err",
+                "claude-passthrough",
+                502,
+                None,
+                std::time::Instant::now(),
+            );
+        });
+
+        let entries = logger.get_recent(10);
+        assert_eq!(entries.len(), 1, "only the served turn logs: {entries:?}");
+        assert_eq!(entries[0].input_tokens_optimized, 1234);
+        assert_eq!(entries[0].output_tokens, 56);
+        assert_eq!(entries[0].provider, "anthropic");
+        assert_eq!(entries[0].model, "claude-passthrough");
+        let joined = lines.lock().unwrap().join("\n");
+        assert!(
+            !joined.contains("model_route_served"),
+            "passthrough is not a reroute and emits no served line: {joined}"
+        );
+    }
+
+    /// C7 flip A: a cursor turn books its CLI-reported counts under the true
+    /// cursor model id. Zero-count turns (paused responses carry no `result`
+    /// yet) book nothing; failed turns book as failed, never as served.
+    #[test]
+    fn cursor_turn_books_cli_reported_counts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let logger = std::sync::Arc::new(crate::request_logger::RequestLogger::new(None));
+        let sink = std::sync::Arc::new(crate::proxy::ProxyOutcomeSink {
+            cost_tracker: std::sync::Arc::new(headroom_core::cost_tracker::CostTracker::new(
+                None, "monthly",
+            )),
+            savings_tracker: std::sync::Arc::new(
+                headroom_core::savings_tracker::SavingsTracker::new(
+                    Some(dir.path().join("savings.json")),
+                    false,
+                ),
+            ),
+            request_logger: logger.clone(),
+        });
+        let started = std::time::Instant::now();
+        book_cursor_outcome(
+            &sink,
+            "req-cur",
+            "grok-4.6-high",
+            17882,
+            250,
+            27136,
+            0,
+            false,
+            started,
+        );
+        // A paused response reports nothing; the resume's booking covers the
+        // invocation that actually ran.
+        book_cursor_outcome(
+            &sink,
+            "req-cur-paused",
+            "grok-4.6-high",
+            0,
+            0,
+            0,
+            0,
+            false,
+            started,
+        );
+
+        let entries = logger.get_recent(10);
+        assert_eq!(
+            entries.len(),
+            1,
+            "the zero-count turn books nothing: {entries:?}"
+        );
+        assert_eq!(entries[0].input_tokens_optimized, 17882);
+        assert_eq!(entries[0].output_tokens, 250);
+        assert_eq!(entries[0].provider, "cursor");
+        assert_eq!(entries[0].model, "grok-4.6-high");
     }
 }

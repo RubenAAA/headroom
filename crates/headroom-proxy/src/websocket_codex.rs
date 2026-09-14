@@ -307,7 +307,9 @@ struct ResponsesUsage {
 
 /// Port of `openai.py::_extract_responses_usage` (L656-687): non-zero only
 /// for `response.completed`; reads `response.usage` (falling back to a
-/// top-level `usage`); cache-write inferred as `max(input - cached, 0)`.
+/// top-level `usage`); the uncached span `max(input - cached, 0)` is kept
+/// in `uncached_tokens` only — `cache_write_tokens` stays 0 because the
+/// write leg is inferred, not billed (FINDING-025).
 fn extract_responses_usage(event: &Value) -> ResponsesUsage {
     if event.get("type").and_then(Value::as_str) != Some("response.completed") {
         return ResponsesUsage::default();
@@ -327,11 +329,16 @@ fn extract_responses_usage(event: &Value) -> ResponsesUsage {
         .get("input_tokens_details")
         .filter(|v| v.is_object())
         .and_then(|d| d.get("cached_tokens")));
+    // FINDING-025: cache-write is inferred (not billed) here — the write
+    // leg is zeroed downstream via cache_inferred=true, so record it as 0
+    // and keep the span in uncached only. Storing the same span in both
+    // fields double-counts every summed consumer (add_usage totals,
+    // cost-tracker cache_write buckets, /cache-health).
     ResponsesUsage {
         input_tokens,
         output_tokens,
         cache_read_tokens: cached,
-        cache_write_tokens: (input_tokens - cached).max(0),
+        cache_write_tokens: 0,
         uncached_tokens: (input_tokens - cached).max(0),
     }
 }
@@ -362,6 +369,7 @@ fn compress_response_create_frame(
     mode: CompressionMode,
     auth_mode: AuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> FrameCompression {
     let Ok(mut parsed) = serde_json::from_str::<Value>(raw) else {
         return FrameCompression::Passthrough { reason: "non_json" };
@@ -397,9 +405,19 @@ fn compress_response_create_frame(
             }
         }
     };
-    let bytes_before = raw.len();
-    match compression::compress_openai_responses_request(&inner_bytes, mode, auth_mode, request_id)
-    {
+    // FINDING-026: inner-payload bytes, not the outer envelope — the
+    // sibling token counts are inner-only, and both legs feed the same
+    // log line, so the two denominators must cover the same span. The
+    // envelope (type/response wrapper keys) never compresses; including
+    // it would understate the byte ratio against the token ratio.
+    let bytes_before = inner_bytes.len();
+    match compression::compress_openai_responses_request(
+        &inner_bytes,
+        mode,
+        auth_mode,
+        request_id,
+        exclude_tools,
+    ) {
         Outcome::Compressed {
             body,
             tokens_before,
@@ -442,7 +460,10 @@ fn compress_response_create_frame(
                     }
                 }
             };
-            let bytes_after = text.len();
+            // FINDING-026 (both legs): after-bytes are the compressed
+            // inner payload, matching bytes_before above — not the
+            // re-wrapped envelope text.
+            let bytes_after = body.len();
             FrameCompression::Compressed {
                 text,
                 tokens_before,
@@ -860,6 +881,11 @@ fn emit_per_turn_outcome(ctx: &SessionCtx, totals: &mut SessionTotals) {
         cache_read_tokens: cache_read_delta.max(0),
         cache_write_tokens: cache_write_delta.max(0),
         uncached_input_tokens: uncached_delta.max(0),
+        // The WS usage extractor infers (not bills) cache-write as
+        // max(input - cached, 0) while also reporting the same span as
+        // uncached (see extract_responses_usage). Mark inferred so the cost
+        // tracker zeroes the write leg and bills input once (FINDING-025).
+        cache_inferred: true,
         total_latency_ms,
         overhead_ms: overhead_delta.max(0.0),
         ttfb_ms,
@@ -1247,9 +1273,10 @@ async fn compress_frame_bounded(
     mode: CompressionMode,
     auth_mode: AuthMode,
     request_id: String,
+    exclude_tools: Vec<String>,
 ) -> CompressAttempt {
     let handle = tokio::task::spawn_blocking(move || {
-        compress_response_create_frame(&raw, mode, auth_mode, &request_id)
+        compress_response_create_frame(&raw, mode, auth_mode, &request_id, &exclude_tools)
     });
     match tokio::time::timeout(compression_timeout(), handle).await {
         Ok(Ok(result)) => CompressAttempt::Done(result),
@@ -1510,6 +1537,7 @@ async fn run_codex_session_inner(
             ctx.mode,
             ctx.auth_mode,
             ctx.request_id.clone(),
+            ctx.state.config.exclude_tools.clone(),
         )
         .await;
         let elapsed_ms = comp_started.elapsed().as_secs_f64() * 1000.0;
@@ -1643,6 +1671,7 @@ async fn run_codex_session_inner(
         let bypass = ctx.bypass;
         let mode = ctx.mode;
         let auth_mode = ctx.auth_mode;
+        let exclude_tools = ctx.state.config.exclude_tools.clone();
         tokio::spawn(async move {
             let mut had_error = false;
             loop {
@@ -1687,11 +1716,13 @@ async fn run_codex_session_inner(
                                 }
                                 let out = if is_create && !bypass {
                                     let comp_started = Instant::now();
+                                    let exclude_tools = exclude_tools.clone();
                                     match compress_frame_bounded(
                                         text.clone(),
                                         mode,
                                         auth_mode,
                                         request_id.clone(),
+                                        exclude_tools,
                                     )
                                     .await
                                     {
@@ -2052,7 +2083,7 @@ async fn ws_http_fallback(
             if line.is_empty() {
                 continue;
             }
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = line.strip_prefix("data:").map(str::trim_start) {
                 if data == "[DONE]" {
                     continue;
                 }
@@ -2350,7 +2381,8 @@ mod tests {
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 25);
         assert_eq!(u.cache_read_tokens, 60);
-        assert_eq!(u.cache_write_tokens, 40);
+        // FINDING-025: inferred write leg is 0 (billed once via uncached).
+        assert_eq!(u.cache_write_tokens, 0);
         assert_eq!(u.uncached_tokens, 40);
     }
 
@@ -2379,6 +2411,7 @@ mod tests {
             CompressionMode::LiveZone,
             AuthMode::Payg,
             RID,
+            &[],
         );
         assert!(matches!(
             out,
@@ -2389,8 +2422,13 @@ mod tests {
     #[test]
     fn frame_not_response_create_passthrough() {
         let raw = json!({"type": "session.update", "x": 1}).to_string();
-        let out =
-            compress_response_create_frame(&raw, CompressionMode::LiveZone, AuthMode::Payg, RID);
+        let out = compress_response_create_frame(
+            &raw,
+            CompressionMode::LiveZone,
+            AuthMode::Payg,
+            RID,
+            &[],
+        );
         assert!(matches!(
             out,
             FrameCompression::Passthrough {
@@ -2402,8 +2440,13 @@ mod tests {
     #[test]
     fn frame_invalid_inner_payload_passthrough() {
         let raw = json!({"type": "response.create", "response": "nope"}).to_string();
-        let out =
-            compress_response_create_frame(&raw, CompressionMode::LiveZone, AuthMode::Payg, RID);
+        let out = compress_response_create_frame(
+            &raw,
+            CompressionMode::LiveZone,
+            AuthMode::Payg,
+            RID,
+            &[],
+        );
         assert!(matches!(
             out,
             FrameCompression::Passthrough {
@@ -2419,7 +2462,8 @@ mod tests {
             "response": {"model": "gpt-x", "input": [{"type": "message", "role": "user", "content": "hi"}]}
         })
         .to_string();
-        let out = compress_response_create_frame(&raw, CompressionMode::Off, AuthMode::Payg, RID);
+        let out =
+            compress_response_create_frame(&raw, CompressionMode::Off, AuthMode::Payg, RID, &[]);
         assert!(matches!(
             out,
             FrameCompression::Passthrough {
@@ -2449,13 +2493,20 @@ mod tests {
     fn frame_wrapped_envelope_compresses_and_rewraps() {
         let raw =
             json!({"type": "response.create", "response": big_compressible_inner()}).to_string();
-        let out =
-            compress_response_create_frame(&raw, CompressionMode::LiveZone, AuthMode::Payg, RID);
+        let out = compress_response_create_frame(
+            &raw,
+            CompressionMode::LiveZone,
+            AuthMode::Payg,
+            RID,
+            &[],
+        );
         match out {
             FrameCompression::Compressed {
                 text,
                 tokens_before,
                 tokens_after,
+                bytes_before,
+                bytes_after,
                 ..
             } => {
                 assert!(tokens_after < tokens_before);
@@ -2465,6 +2516,13 @@ mod tests {
                 assert!(parsed["response"].is_object());
                 assert_eq!(parsed["response"]["model"], "gpt-5.4-codex");
                 assert!(text.len() < raw.len());
+                // FINDING-026: byte legs are inner-payload spans, not the
+                // outer envelope — the compressed output's inner payload
+                // must equal bytes_after, and both legs sit inside raw/text.
+                let inner_len = serde_json::to_vec(&parsed["response"]).unwrap().len();
+                assert!(bytes_before < raw.len());
+                assert_eq!(bytes_after, inner_len);
+                assert!(bytes_after < text.len());
             }
             other => panic!("expected Compressed, got {other:?}"),
         }
@@ -2487,8 +2545,13 @@ mod tests {
             }),
         );
         let raw = json!({"type": "response.create", "response": inner}).to_string();
-        let out =
-            compress_response_create_frame(&raw, CompressionMode::LiveZone, AuthMode::Payg, RID);
+        let out = compress_response_create_frame(
+            &raw,
+            CompressionMode::LiveZone,
+            AuthMode::Payg,
+            RID,
+            &[],
+        );
         let FrameCompression::Compressed { text, .. } = out else {
             panic!("expected compressed frame, got {out:?}");
         };
@@ -2512,8 +2575,13 @@ mod tests {
             .unwrap()
             .insert("type".to_string(), json!("response.create"));
         let raw = bare.to_string();
-        let out =
-            compress_response_create_frame(&raw, CompressionMode::LiveZone, AuthMode::Payg, RID);
+        let out = compress_response_create_frame(
+            &raw,
+            CompressionMode::LiveZone,
+            AuthMode::Payg,
+            RID,
+            &[],
+        );
         match out {
             FrameCompression::Compressed { text, .. } => {
                 let parsed: Value = serde_json::from_str(&text).unwrap();

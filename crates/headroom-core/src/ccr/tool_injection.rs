@@ -73,12 +73,14 @@ fn marker_retrieve_more() -> &'static Regex {
 pub fn create_ccr_tool_definition(provider: &str) -> Value {
     let description = "Retrieve original uncompressed content that was compressed to save tokens. \
                        Use this when you need more data than what's shown in compressed tool results. \
-                       Provide `hash` from a compression marker like [N items compressed... hash=abc123], \
-                       or `query` with keywords to search previously offloaded content. Exactly one of the two.";
+                       Provide `hash` copied exactly from a <<ccr:...>> compression marker \
+                       (24 lowercase hex characters, e.g. <<ccr:7f6e11a407235b972da63df8>>) — never invent \
+                       or shorten a hash — or `query` with keywords to search previously offloaded content. \
+                       Exactly one of the two.";
 
     let hash_param = json!({
         "type": "string",
-        "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+        "description": "Hash key copied exactly from a <<ccr:...>> compression marker (24 lowercase hex chars, e.g. '7f6e11a407235b972da63df8' from <<ccr:7f6e11a407235b972da63df8>>). Never invent or truncate a hash."
     });
 
     let query_param = json!({

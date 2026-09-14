@@ -17,4 +17,5 @@ pub mod gemini;
 pub mod local_model;
 pub mod reasoning_signature;
 pub mod responses;
+pub mod route_resolve;
 pub mod stats;

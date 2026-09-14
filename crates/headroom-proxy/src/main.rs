@@ -123,6 +123,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let mut state = AppState::new(config.clone())?;
+    // Process-global redaction switch, set once here rather than in
+    // `AppState::new`: states are rebuilt in tests several per process, and
+    // per-construction writes race. Production builds exactly one state, so
+    // once here carries the same value with none of the flicker.
+    headroom_proxy::redact::set_redact_paths(config.redact_paths);
 
     // PR-D1: resolve AWS credentials at startup via the `aws-config`
     // default chain. Loaded once so per-request signing is cheap.

@@ -35,14 +35,21 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// files one for one — the earlier capture was gone before anyone read it.
 /// Ordering still comes from the `seq` field inside the envelope, so this only
 /// has to make names unique.
-fn run_id() -> u64 {
-    static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *RUN.get_or_init(|| {
-        std::time::SystemTime::now()
+/// FINDING-035: seconds-resolution + SEQ-reset meant a restart within the
+/// same second overwrote the previous run's corpus file-for-file. Nanos
+/// still collide in principle (two processes in the same nanosecond), so
+/// the pid disambiguates — same-second, same-nanosecond restarts of one
+/// binary can't share a pid.
+fn run_id() -> String {
+    static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{nanos}-{}", std::process::id())
     })
+    .clone()
 }
 
 /// Append `parsed` to the capture corpus when `HEADROOM_CAPTURE_DIR` is set.
@@ -57,6 +64,16 @@ fn run_id() -> u64 {
 /// of the J0 capture hang). The request thread only clones the body once and
 /// spawns; write failures are logged at WARN off-thread and swallowed: capture
 /// must never break — or slow — a live request.
+///
+/// # Thread budget (FINDING-035)
+///
+/// One `thread::spawn` per captured request is unbounded in principle. In
+/// practice this path is env-gated diagnostics (off unless the operator sets
+/// `HEADROOM_CAPTURE_DIR` for a simulator run), each thread exits after one
+/// small write, and the sibling production observer (`ctx::observer`) already
+/// owns the bounded-queue design — duplicating it here would double the
+/// machinery for a debug-only path. If capture ever becomes always-on,
+/// route it through that queue instead of spawning here.
 pub fn maybe_capture(parsed: &Value, endpoint: &str, session_key: &str, request_id: &str) {
     let dir = match std::env::var("HEADROOM_CAPTURE_DIR") {
         Ok(d) if !d.is_empty() => d,

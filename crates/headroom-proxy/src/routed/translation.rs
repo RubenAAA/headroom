@@ -5,7 +5,10 @@
 //! URL. The one cache-stabilization stage whose natural home is the
 //! post-translation body.
 
-use crate::openai::request::{anthropic_to_openai_request, anthropic_to_openai_responses_request};
+use crate::openai::request::{
+    anthropic_to_openai_request, anthropic_to_openai_responses_request, shape_for, RouteShape,
+};
+use crate::routed::quirks::classify_upstream;
 use crate::routed::response_arms::apply_target_model_override;
 use crate::routed::transforms::apply_bytes_stage;
 use axum::body::Body;
@@ -18,6 +21,10 @@ pub(crate) struct TranslatedRequest {
     pub openai_body: Value,
     pub upstream_url: String,
     pub downstream_is_stream: bool,
+    /// The wire shape, decided once by [`shape_for`]. Downstream consumers
+    /// (buffered-arm pick, CCR shape flag, outcome provider label) match on
+    /// this instead of re-deriving it from `target_model`.
+    pub is_responses: bool,
 }
 
 /// Translate the prepared body and resolve where to send it. `Err` is the
@@ -36,18 +43,20 @@ pub(crate) fn translate_routed_request(
     body_model: &str,
     request_id: &str,
 ) -> Result<TranslatedRequest, Response> {
-    // Translation path: Anthropic → OpenAI.
-    let openai_body = match if target_model.is_some() {
-        anthropic_to_openai_responses_request(parsed, false)
-    } else {
-        anthropic_to_openai_request(parsed, true, true)
-    } {
-        Ok(v) => apply_target_model_override(
-            v,
-            target_model,
-            target_model.is_some(),
-            target_model.is_some(),
-        ),
+    // Translation path: Anthropic → OpenAI. The shape is decided once here;
+    // everything below matches on it.
+    let shape = shape_for(target_model);
+    let is_responses = shape == RouteShape::Responses;
+    let translated = match shape {
+        RouteShape::Responses => anthropic_to_openai_responses_request(parsed, false),
+        RouteShape::Chat => anthropic_to_openai_request(parsed, true, true),
+    };
+    let openai_body = match translated {
+        Ok(v) => {
+            let mut v = apply_target_model_override(v, target_model, is_responses, is_responses);
+            classify_upstream(upstream, is_chatgpt_auth).strip_unreplayable_reasoning(&mut v);
+            v
+        }
         Err(e) => {
             tracing::warn!(
                 event = "local_model_translate_error",
@@ -76,14 +85,14 @@ pub(crate) fn translate_routed_request(
     apply_bytes_stage(&mut openai_body, |body| {
         crate::proxy::maybe_inject_openai_prompt_cache_key(
             body,
-            if target_model.is_some() {
+            if is_responses {
                 crate::cache_stabilization::openai_cache_key::OpenAiShape::Responses
             } else {
                 crate::cache_stabilization::openai_cache_key::OpenAiShape::ChatCompletions
             },
             headroom_core::auth_mode::classify(headers),
             request_id,
-            if target_model.is_some() {
+            if is_responses {
                 "/v1/responses"
             } else {
                 "/v1/chat/completions"
@@ -95,25 +104,31 @@ pub(crate) fn translate_routed_request(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let upstream_is_stream = is_stream || target_model.is_some();
+    let upstream_is_stream = is_stream || is_responses;
     let downstream_is_stream = is_stream;
 
-    // Upstream may be configured either as the API root (e.g.
-    // `https://api.openai.com`) or already including `/v1` (e.g.
-    // `https://api.openai.com/v1`, per the --extra-model-route example in
-    // config.rs) — strip a trailing `/v1` so we don't double it up into
-    // `.../v1/v1/chat/completions`, which OpenAI 404s on.
-    let upstream_base = upstream.as_str().trim_end_matches('/');
-    let upstream_url = if target_model.is_some() {
-        if is_chatgpt_auth && upstream.host_str() == Some("api.openai.com") {
-            "https://chatgpt.com/backend-api/codex/responses".to_string()
-        } else {
-            let base = upstream_base.trim_end_matches("/v1");
-            format!("{base}/v1/responses")
+    // Endpoint selection is the provider quirk (P6): ChatGPT-subscription
+    // Codex traffic speaks the Codex endpoint, everything else appends one
+    // `/v1/...` path onto the stripped base. The sniff lives in
+    // `routed::quirks`; this keeps only the per-occurrence misroute alarm.
+    let kind = crate::routed::quirks::classify_upstream(upstream, is_chatgpt_auth);
+    let upstream_url = match shape {
+        RouteShape::Responses => kind.responses_url(upstream),
+        RouteShape::Chat => {
+            if kind.warn_ambiguous_codex() {
+                // Ambiguous Codex route: translate without a target on a
+                // codex-bound upstream speaks chat-completions today (the
+                // startup `warn_on_ambiguous_codex_routes` also fires). Loud
+                // per occurrence so dashboards see a misroute, not just logs.
+                tracing::warn!(
+                    event = "model_route_ambiguous_codex",
+                    request_id = %request_id,
+                    model = %body_model,
+                    "translate route on api.openai.com has no target model; serving chat-completions"
+                );
+            }
+            kind.chat_url(upstream)
         }
-    } else {
-        let base = upstream_base.trim_end_matches("/v1");
-        format!("{base}/v1/chat/completions")
     };
 
     tracing::info!(
@@ -129,5 +144,197 @@ pub(crate) fn translate_routed_request(
         openai_body,
         upstream_url,
         downstream_is_stream,
+        is_responses,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn anthropic_body(model: &str, stream: bool) -> Value {
+        json!({
+            "model": model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream,
+        })
+    }
+
+    /// Zen rotates its exit IP on every 429, which invalidates the reasoning
+    /// blobs it issued earlier in the same conversation. The translated body
+    /// must carry none of them, and must not ask for a new one.
+    #[test]
+    fn zen_route_sends_no_encrypted_reasoning() {
+        use crate::handlers::reasoning_signature::{encode_reasoning_signature, ReasoningReplay};
+
+        let signature = encode_reasoning_signature(&ReasoningReplay {
+            id: "rs_1".to_string(),
+            encrypted_content: "STALE".to_string(),
+        })
+        .expect("encodes");
+        let parsed = json!({
+            "model": "claude-muse-spark-1.3",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "...", "signature": signature},
+                    {"type": "text", "text": "there"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ],
+        });
+        let reasoning_items = |out: &TranslatedRequest| {
+            out.openai_body["input"]
+                .as_array()
+                .expect("input array")
+                .iter()
+                .filter(|i| i["type"] == json!("reasoning"))
+                .count()
+        };
+
+        let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("muse-spark-1.3-contributor-free"),
+            &zen,
+            false,
+            "claude-muse-spark-1.3",
+            "req-zen",
+        )
+        .expect("translates");
+        assert_eq!(reasoning_items(&out), 0);
+        assert!(out.openai_body.get("include").is_none());
+
+        // Same conversation on a stable-identity upstream: replay intact.
+        let openai: url::Url = "https://api.openai.com/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("gpt-5.5"),
+            &openai,
+            false,
+            "claude-codex-5.5",
+            "req-openai",
+        )
+        .expect("translates");
+        assert_eq!(reasoning_items(&out), 1);
+        assert_eq!(
+            out.openai_body["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+    }
+
+    /// Retroactive lock: Responses shape forces upstream streaming while
+    /// downstream follows the client. A non-stream client on a target route
+    /// still sends `stream:true` upstream but answers buffered.
+    #[test]
+    fn responses_target_forces_upstream_stream_only() {
+        let parsed = anthropic_body("claude-codex-5.5", false);
+        let upstream: url::Url = "https://api.openai.com/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("gpt-5.5"),
+            &upstream,
+            false,
+            "claude-codex-5.5",
+            "req-test",
+        )
+        .expect("translates");
+        assert_eq!(out.downstream_is_stream, false);
+        assert_eq!(
+            out.openai_body.get("stream").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            out.upstream_url.ends_with("/v1/responses"),
+            "{}",
+            out.upstream_url
+        );
+    }
+
+    /// Chat shape keeps the client flag on both sides and targets chat.
+    #[test]
+    fn chat_shape_preserves_client_stream_flag() {
+        let parsed = anthropic_body("codex-5.5", false);
+        let upstream: url::Url = "https://api.openai.com/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            None,
+            &upstream,
+            false,
+            "codex-5.5",
+            "req-test",
+        )
+        .expect("translates");
+        assert_eq!(out.downstream_is_stream, false);
+        assert!(
+            out.upstream_url.ends_with("/v1/chat/completions"),
+            "{}",
+            out.upstream_url
+        );
+    }
+
+    /// C3 decision table: ChatGPT-auth + api.openai.com + target goes to the
+    /// Codex responses endpoint, not the generic one.
+    #[test]
+    fn chatgpt_auth_target_uses_codex_endpoint() {
+        let parsed = anthropic_body("claude-codex-5.5", false);
+        let upstream: url::Url = "https://api.openai.com/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("gpt-5.5"),
+            &upstream,
+            true,
+            "claude-codex-5.5",
+            "req-test",
+        )
+        .expect("translates");
+        assert_eq!(
+            out.upstream_url,
+            crate::codex::codex_endpoint(),
+            "the ChatGPT arm must stay on the single endpoint fn"
+        );
+    }
+
+    /// C3 verify: the ambiguous case (translate on api.openai.com with no
+    /// target) serves chat AND fires a per-occurrence warn, so dashboards see
+    /// a misroute instead of only the startup log.
+    #[test]
+    fn ambiguous_codex_route_warns_per_occurrence() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = crate::test_support::EventCapture::default();
+        let lines = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            let parsed = anthropic_body("codex-5.5", false);
+            let upstream: url::Url = "https://api.openai.com/v1".parse().unwrap();
+            let out = translate_routed_request(
+                &parsed,
+                &HeaderMap::new(),
+                None,
+                &upstream,
+                true,
+                "codex-5.5",
+                "req-amb",
+            )
+            .expect("translates");
+            assert!(
+                out.upstream_url.ends_with("/v1/chat/completions"),
+                "{}",
+                out.upstream_url
+            );
+        });
+        let joined = lines.lock().unwrap().join("\n");
+        assert!(
+            joined.contains("model_route_ambiguous_codex"),
+            "alarm must fire per occurrence: {joined}"
+        );
+    }
 }

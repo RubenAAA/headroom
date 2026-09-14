@@ -24,8 +24,16 @@
 //! ```
 //!
 //! Every original line is reconstructible from `template + variants`,
-//! so this is **lossless** — no CCR retrieval needed. The win is the
-//! template prefix (often 30+ chars) emitted once instead of N times.
+//! so this is **lossless at the token level** — no CCR retrieval needed.
+//! The win is the template prefix (often 30+ chars) emitted once instead
+//! of N times. Two known normalizations, both load-bearing for the
+//! "lossless" claim: (1) lines are `split_whitespace`-tokenized, so
+//! intra-line whitespace runs collapse to single spaces on reconstruction
+//! (FINDING-040 — byte-lossy for aligned columns, token-lossless
+//! otherwise); (2) a wildcard position matches anything on extend, so a
+//! run absorbs any equal-token-count line once 40% of positions agree —
+//! the `min_constant_tokens = 2` floor and the never-inflate fallback are
+//! what keep a degenerate all-wildcard template from paying.
 //!
 //! Order is preserved: only *consecutive* runs collapse, so the
 //! temporal flow of the log stays intact for the LLM.
@@ -54,7 +62,10 @@
 //! - `min_run = 3` — needs 3+ in a row before collapsing.
 //! - `similarity_threshold = 0.4` — Drain's published default; 40%
 //!   positional match required (catches `<TS> INFO worker-<N>` style
-//!   lines where 3 of 6 tokens are constants).
+//!   lines where 3 of 6 tokens are constants). Note the wildcard arm:
+//!   an already-wild position counts as a match, so similarity only
+//!   falls as *new* positions vary — a run never ejects a line for
+//!   varying where an earlier line already varied.
 //! - `min_constant_tokens = 2` — at least 2 anchor tokens, otherwise
 //!   the "template" is just `<*> <*> <*>` and carries no signal.
 //!

@@ -28,6 +28,8 @@
 pub mod endpoints;
 pub mod extract;
 pub mod fetch;
+pub mod fetch_blocks;
+pub mod fetch_pages;
 pub mod identity;
 pub mod inject;
 pub mod observer;

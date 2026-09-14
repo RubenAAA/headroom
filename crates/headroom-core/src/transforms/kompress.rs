@@ -460,8 +460,11 @@ impl Kompress {
 
         let mut kept_ids: BTreeSet<usize> = BTreeSet::new();
         let mut chunk_start = 0usize;
+        // chunk_words is caller-configurable; a zero value would make no
+        // progress below (end == chunk_start, += 0). Clamp to 1.
+        let stride = self.config.chunk_words.max(1);
         while chunk_start < n_words {
-            let end = (chunk_start + self.config.chunk_words).min(n_words);
+            let end = (chunk_start + stride).min(n_words);
             let chunk_words = &words[chunk_start..end];
             match self.score_chunk(chunk_words) {
                 Ok(word_scores) => {
@@ -480,7 +483,7 @@ impl Kompress {
                     return self.passthrough(content, n_words);
                 }
             }
-            chunk_start += self.config.chunk_words;
+            chunk_start += stride;
         }
 
         if kept_ids.is_empty() {

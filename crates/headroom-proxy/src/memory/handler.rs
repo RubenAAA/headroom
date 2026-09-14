@@ -240,6 +240,26 @@ impl MemoryHandler {
         }
     }
 
+    /// Inject memory tools in the flat Responses-API shape (FINDING-020).
+    /// Chat-shaped defs are malformed in a Responses `tools[]` array, so
+    /// the shared [`inject_memory_tools`] path cannot serve `/v1/responses`.
+    pub fn inject_responses_memory_tools(&self, tools: Option<&[Value]>) -> (Vec<Value>, bool) {
+        if !self.config.inject_tools {
+            return (tools.map(|t| t.to_vec()).unwrap_or_default(), false);
+        }
+        let existing: Vec<Value> = tools.map(|t| t.to_vec()).unwrap_or_default();
+        let (updated, _beta_headers) = tool_adapter::inject_responses_tools(
+            &Value::Array(existing.clone()),
+            &self.tool_config(),
+        );
+        if let Some(arr) = updated.as_array() {
+            let was_injected = arr.len() > existing.len();
+            (arr.clone(), was_injected)
+        } else {
+            (existing, false)
+        }
+    }
+
     pub fn get_beta_headers(&self) -> HashMap<String, String> {
         if self.config.use_native_tool && self.config.inject_tools {
             let mut h = HashMap::new();

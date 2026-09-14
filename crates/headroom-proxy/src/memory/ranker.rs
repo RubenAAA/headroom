@@ -115,14 +115,14 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// Parse a timestamp string (ISO-8601 or epoch seconds) into epoch seconds.
+/// Parse a timestamp string holding epoch seconds into epoch seconds.
+/// Anything else (including ISO-8601) returns None.
 pub fn parse_timestamp(value: &str) -> Option<f64> {
     // Try parsing as f64 (epoch seconds)
     if let Ok(secs) = value.parse::<f64>() {
         return Some(secs);
     }
-    // Try ISO-8601 by converting to epoch via simple heuristics
-    // For now, just return None for unparsable strings
+    // Unparsable strings (ISO-8601 included) read as None.
     None
 }
 

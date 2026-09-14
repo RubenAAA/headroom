@@ -41,7 +41,9 @@ use headroom_core::ccr::tool_injection::create_ccr_tool_definition;
 use headroom_core::ccr::{BatchContext, BatchRequestContext, BatchResultProcessor, CcrStore};
 use serde_json::{json, Map, Value};
 
-use crate::cache_stabilization::tool_def_normalize::sort_tools_deterministically;
+use crate::cache_stabilization::tool_def_normalize::{
+    any_tool_has_cache_control, sort_tools_deterministically,
+};
 use crate::compression::live_zone_anthropic::{compress_anthropic_request, Outcome};
 use crate::config::CompressionMode;
 use crate::error::ProxyError;
@@ -295,7 +297,15 @@ fn compress_batch_item(
     new_params.insert("messages".to_string(), Value::Array(optimized_messages));
 
     let mut final_tools = original_tools.clone().unwrap_or_default();
-    sort_tools_deterministically(&mut final_tools);
+    // Mirror the request path (live_zone_anthropic::normalize_tool_definitions):
+    // E1 tool sort runs on PAYG only, and is skipped when any tool carries
+    // a customer cache_control marker (sorting would move the marker and
+    // change cache scope). MINOR-072: the outer sort previously ran ungated.
+    let marker_present = any_tool_has_cache_control(&final_tools);
+    let payg = matches!(auth_mode, AuthMode::Payg);
+    if payg && !marker_present {
+        sort_tools_deterministically(&mut final_tools);
+    }
     if state.config.ccr_inject_tool && tokens_saved > 0 {
         let already_has = final_tools
             .iter()
@@ -304,7 +314,6 @@ fn compress_batch_item(
             final_tools.push(create_ccr_tool_definition("anthropic"));
         }
     }
-    sort_tools_deterministically(&mut final_tools);
 
     let tools_changed = match &original_tools {
         Some(orig) => &final_tools != orig,
@@ -701,15 +710,20 @@ async fn run_anthropic_continuation(
                     success: true,
                     items_retrieved: 1,
                 },
-                None => CcrToolResult {
-                    tool_call_id: call.tool_call_id.clone(),
-                    content: format!(
-                        "Error: CCR content not found for hash '{}'. The compressed data may have been evicted.",
-                        call.hash_key
-                    ),
-                    success: false,
-                    items_retrieved: 0,
-                },
+                None => {
+                    use headroom_core::ccr::response_handler as ccr_rh;
+                    let content = if ccr_rh::is_plausible_ccr_hash(&call.hash_key) {
+                        ccr_rh::missing_ccr_content_note(&call.hash_key)
+                    } else {
+                        ccr_rh::malformed_ccr_hash_note(&call.hash_key)
+                    };
+                    CcrToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        content,
+                        success: false,
+                        items_retrieved: 0,
+                    }
+                }
             };
             results_vec.push(tool_result);
         }

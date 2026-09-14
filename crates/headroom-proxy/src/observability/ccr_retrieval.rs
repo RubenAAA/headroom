@@ -13,9 +13,11 @@
 //!
 //! Neither showed up in `ctx_retrieval_hits_total`, which counts the store
 //! lookup and not whether the content ever reached the model. `outcome` here
-//! is the terminal fate of the call: `continuation`, `spliced_mixed`, and
-//! `spliced_failed` (all-failed splice, fell through to continuation) mean
-//! the model was answered, `unresolved` means it was not.
+//! is the terminal fate of the call: `continuation`, `spliced_mixed`,
+//! `spliced_failed` (all-failed splice, fell through to continuation), and
+//! `spliced_salvaged` (fetched, then the continuation died in delivery, so
+//! the fetched content was spliced as text) mean the model was answered,
+//! `unresolved` means it was not.
 use std::sync::OnceLock;
 
 use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
@@ -33,6 +35,10 @@ pub const OUTCOME_SPLICED_MIXED: &str = "spliced_mixed";
 /// Answered as text, because every retrieval failed and a continuation
 /// would pay a full-prefix round to deliver errors the model can read free.
 pub const OUTCOME_SPLICED_FAILED: &str = "spliced_failed";
+/// Answered as text from content fetched on an earlier round, because the
+/// continuation died in delivery (timeouts, refused attempts) after the
+/// fetch had already succeeded.
+pub const OUTCOME_SPLICED_SALVAGED: &str = "spliced_salvaged";
 /// Not answered: out of rounds, upstream refused, or an unsupported shape.
 pub const OUTCOME_UNRESOLVED: &str = "unresolved";
 

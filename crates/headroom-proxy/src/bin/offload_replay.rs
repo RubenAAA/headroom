@@ -50,8 +50,13 @@ struct Totals {
 }
 
 /// Anything that would leave a path if it appeared in a request id.
+/// FINDING-033: `:` also folds to `_`, so `a/b` and `a:b` share a stem —
+/// disambiguate by hashing the raw id into the stem. Same input still maps
+/// to the same filename (deterministic), distinct inputs never collide.
 fn sanitize(component: &str) -> String {
-    component
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let stem: String = component
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -60,7 +65,10 @@ fn sanitize(component: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    let mut h = DefaultHasher::new();
+    component.hash(&mut h);
+    format!("{stem}-{:016x}", h.finish())
 }
 
 /// Write one turn as the two files `cachesim.py compare` joins on.
@@ -150,18 +158,26 @@ fn main() {
     }
 
     let mut sessions: BTreeMap<String, Vec<Turn>> = BTreeMap::new();
+    // FINDING-033: the "failure aborts" contract covers writes
+    // (dump_pair panics). Ingest skips are intentional — a capture dir
+    // mixes endpoints and non-JSON sidecars — but they must be counted,
+    // not silent, or a half-empty corpus prices without complaint.
+    let mut skipped: usize = 0;
     for entry in std::fs::read_dir(&dir).expect("read capture dir").flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {
+            skipped += 1;
             continue;
         };
         let Ok(envelope) = serde_json::from_slice::<Value>(&bytes) else {
+            skipped += 1;
             continue;
         };
         if envelope.get("endpoint").and_then(Value::as_str) != Some("anthropic") {
+            skipped += 1;
             continue;
         }
         let session = envelope
@@ -192,11 +208,21 @@ fn main() {
         std::process::exit(1);
     }
 
+    // FINDING-033: the flag defaults to false (config.rs diagnostic
+    // default; CLI flag off unless the operator opts in), and the replay
+    // previously hardcoded false with no comment — matching the default by
+    // accident. Honour the operator's env so a replay of a seeded capture
+    // prices what the gate actually did: seeded sessions donate across
+    // sessions, unseeded ones don't, and the comparison is meaningless if
+    // the replay disagrees with production.
+    let cross_session_seed = std::env::var("HEADROOM_PROXY_CTX_OFFLOAD_CROSS_SESSION_SEED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let config = CtxOffloadConfig {
         min_bytes,
         stale_margin,
         stale_window,
-        cross_session_seed: false,
+        cross_session_seed,
     };
     // The gate keys its offloaded-hash sets by session, so one instance covers
     // every session — the same instance the proxy shares across requests. Built
@@ -255,6 +281,10 @@ fn main() {
     );
     println!("rebuild_boundary from the live drift detector (not assumed)");
     println!("sessions            {:>10}", sessions.len());
+    println!(
+        "files skipped       {:>10}  (non-anthropic / unreadable — excluded by design)",
+        skipped
+    );
     println!("turns               {:>10}", totals.turns);
     println!("boundary turns      {:>10}", totals.boundaries);
     println!("blocks_offloaded    {:>10}", totals.blocks_offloaded);

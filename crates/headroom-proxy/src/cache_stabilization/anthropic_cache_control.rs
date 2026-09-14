@@ -46,7 +46,7 @@
 //!
 //! Anthropic's `cache_control` semantics: a marker on a block caches
 //! *that block + everything before it* in the canonical request
-//! order (`system → tools → messages`). Each cached prefix lasts
+//! order (`tools → system → messages`). Each cached prefix lasts
 //! 5 minutes. A request may carry up to **4** markers (Anthropic's
 //! hard limit).
 //!
@@ -144,19 +144,22 @@ impl SkipReason {
 /// the full mutating path (e.g. when it wants to log a different
 /// `reason` field on its own gate).
 ///
-/// The walker inspects the three places Anthropic's request schema
+/// The walker inspects the four places Anthropic's request schema
 /// allows `cache_control`:
 ///
+/// - `body.tools[]` — top-level on each tool definition.
 /// - `body.system` — when it's an array of content blocks (string
 ///   form cannot carry a marker).
-/// - `body.messages[].content` — when it's an array of blocks.
-/// - `body.tools[]` — top-level on each tool definition.
+/// - `body.messages[]` — a message-level marker is legal alongside
+///   block-level ones.
+/// - `body.messages[].content[]` — blocks, plus the blocks nested in
+///   a `tool_result` block's `content[]` (mirrors ttl_order's walk).
 ///
-/// We do **not** descend into arbitrary nested objects. The only
-/// shape Anthropic recognises `cache_control` on is the documented
-/// surface above; descending into tool `input_schema` etc. would
-/// false-positive on customer JSON Schemas that happen to mention
-/// the field name as a property key.
+/// We do **not** descend into arbitrary nested objects beyond that.
+/// The only shapes Anthropic recognises `cache_control` on are the
+/// documented surface above; descending into tool `input_schema` etc.
+/// would false-positive on customer JSON Schemas that happen to
+/// mention the field name as a property key.
 pub fn any_anthropic_cache_control(body: &Value) -> bool {
     // ── system: string OR array of blocks ─────────────────────────
     // Only the array form can carry markers — string form is
@@ -169,13 +172,27 @@ pub fn any_anthropic_cache_control(body: &Value) -> bool {
         }
     }
 
-    // ── messages[].content: string OR array of blocks ─────────────
+    // ── messages[]: message-level, block-level, + nested tool_result ──
+    // FINDING-034: previously missed message-level markers and markers
+    // nested in tool_result.content[] (which ttl_order.rs walks) — a body
+    // carrying those would get a second marker auto-placed.
     if let Some(Value::Array(messages)) = body.get("messages") {
         for msg in messages {
+            if block_has_cache_control(msg) {
+                return true;
+            }
             if let Some(Value::Array(blocks)) = msg.get("content") {
                 for block in blocks {
                     if block_has_cache_control(block) {
                         return true;
+                    }
+                    // Nested tool_result content blocks.
+                    if let Some(Value::Array(subs)) = block.get("content") {
+                        for sub in subs {
+                            if block_has_cache_control(sub) {
+                                return true;
+                            }
+                        }
                     }
                 }
             }
@@ -647,6 +664,31 @@ mod tests {
             "messages": [],
         });
         assert!(any_anthropic_cache_control(&body_with_marker));
+    }
+
+    #[test]
+    fn any_marker_walker_sees_message_level_and_nested_tool_result() {
+        // FINDING-034: message-level + nested tool_result.content[]
+        // markers must gate auto-placement like block-level ones do.
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "hi", "cache_control": {"type": "ephemeral"}}
+            ],
+        });
+        assert!(any_anthropic_cache_control(&body));
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t",
+                    "content": [
+                        {"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}
+                    ]
+                }]
+            }],
+        });
+        assert!(any_anthropic_cache_control(&body));
     }
 
     #[test]

@@ -266,6 +266,11 @@ struct FetchResponse {
     bytes: usize,
     cached: bool,
     age: Option<String>,
+    /// Which rung of the fetch ladder answered (or `cache-hit`).
+    rung: String,
+    /// One line of extraction accounting, or `None` when nothing was
+    /// classified (cache hit, JSON/text passthrough).
+    extraction: Option<String>,
 }
 
 async fn handle_fetch(
@@ -291,6 +296,8 @@ async fn handle_fetch(
         bytes: result.bytes,
         cached: result.cached,
         age: result.age,
+        rung: result.rung,
+        extraction: result.extraction,
     }))
 }
 

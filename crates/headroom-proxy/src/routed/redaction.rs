@@ -63,6 +63,10 @@ pub(crate) fn restore_buffered(
 /// Wrap a translated SSE stream with placeholder restore. Chunk-boundary
 /// safe: a token split across two chunks still restores. `None` passes the
 /// stream through untouched.
+///
+/// Both arms are `track_streaming`-wrapped so `GET /debug/inflight` stays
+/// nonzero until the last byte: the pipeline guard already dropped when this
+/// `Body` is built.
 pub(crate) fn restore_streaming<S, E>(
     table: Option<crate::redact::RestoreTable>,
     request_id: &str,
@@ -73,14 +77,16 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
     let Some(table) = table else {
-        return axum::body::Body::from_stream(stream);
+        return axum::body::Body::from_stream(crate::proxy::track_streaming(stream));
     };
     tracing::info!(
         event = "routed_redact_stream",
         request_id = %request_id,
         "restoring placeholders on the routed stream"
     );
-    axum::body::Body::from_stream(crate::redact::restore_stream(stream, table))
+    axum::body::Body::from_stream(crate::proxy::track_streaming(
+        crate::redact::restore_stream(stream, table),
+    ))
 }
 
 /// Snapshot this turn's restore table, if it redacted. Taken before `outcome`

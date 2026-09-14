@@ -239,8 +239,10 @@ static HTML_STRUCTURAL_TAGS: LazyLock<Regex> = LazyLock::new(|| {
 /// 4. HTML (≥ 0.7 confidence required)
 /// 5. Search results (≥ 0.6 confidence required)
 /// 6. Build / log output (≥ 0.5 confidence required)
-/// 7. Source code (≥ 0.5 confidence required)
-/// 8. Fallback to `PlainText` confidence 0.5
+/// 7. Tabular (≥ 0.6 confidence required; runs after search/log so those claim content first)
+/// 8. Structured config (≥ 0.6 confidence required; runs after tabular, before code)
+/// 9. Source code (≥ 0.5 confidence required)
+/// 10. Fallback to `PlainText` confidence 0.5
 pub fn detect_content_type(content: &str) -> DetectionResult {
     if content.is_empty() || content.trim().is_empty() {
         return DetectionResult::plain_text(0.0);

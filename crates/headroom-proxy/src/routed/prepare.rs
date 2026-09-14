@@ -182,6 +182,17 @@ pub(crate) async fn prepare_turn(
         });
     }
 
+    // Image optimization on the Anthropic-shaped body, before translation:
+    // the spark path never passes through forward_http's closing sequence,
+    // so without this base64 accumulates until the upstream's byte cap
+    // rejects the turn. Same single implementation as the Claude path, and
+    // idempotent across both via the hash-memoized optimizer.
+    if state.config.image_optimize {
+        apply_bytes_stage(&mut parsed, |body| {
+            crate::proxy::maybe_optimize_images(body, request_id)
+        });
+    }
+
     // Two stages from the Claude path's closing sequence are deliberately
     // absent, because they do not apply rather than because they were missed:
     //

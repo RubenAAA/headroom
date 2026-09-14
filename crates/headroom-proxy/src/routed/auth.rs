@@ -4,86 +4,52 @@
 //! once per request), declares itself anonymous (`none`), or inherits the
 //! Codex headers the process was started with.
 
-use crate::codex::{derive_session_uuid, resolve_codex_routing_headers, turn_state_map};
+use crate::codex::resolve_codex_routing_headers;
+use crate::routed::quirks::classify_upstream;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use serde_json::Value;
 
-/// Pick the upstream credential for a matched route, returning the headers and
-/// whether they carry ChatGPT auth.
+/// The single upstream-header constructor (C4). Credential selection plus
+/// the OpenCode sniff, so the main path and the routed sidecar cannot drift
+/// into building different header sets for the same route kind.
 ///
-/// Codex headers are built from process-wide config — the auth file, the
-/// `codex_cli_rs` originator, the ChatGPT bearer token — so they are only
-/// right for a route actually bound for Codex. A route naming its own
-/// credential says it is not, and gets that credential instead. A route naming
-/// none keeps the old behavior, which is what makes this opt-in.
-pub(crate) fn upstream_auth_headers(
+/// Credential semantics: Codex headers come from process-wide config and are
+/// only right for a Codex-bound route; a route naming its own credential says
+/// it is not, and gets that credential instead. A route naming none keeps the
+/// old behavior, which is what makes this opt-in.
+///
+/// Turn-state is deliberately NOT part of this: `UpstreamKind` session
+/// headers run main-path-only after translation (the sidecar is a stateless
+/// one-shot with no session to correlate), and turn-state capture stays with
+/// response handling. That seam is named here so a future merge has to cross
+/// it explicitly.
+pub(crate) fn auth_headers(
     auth_env: Option<&str>,
     client_headers: &HeaderMap,
     codex_auth_file: Option<&str>,
-) -> Result<(HeaderMap, bool), Response> {
-    match auth_env {
-        Some(var) => Ok((route_auth_headers(var)?, false)),
-        None => Ok(resolve_codex_routing_headers(
-            client_headers,
-            codex_auth_file,
-        )),
-    }
-}
-
-/// Inject the headers OpenCode Zen requires for its free tier.
-///
-/// Direct `curl https://opencode.ai/zen/v1/responses` with only
-/// `Authorization: Bearer $OPENCODE_API_KEY` now returns
-/// `MissingSessionID: OpenCode's free tier can only be used in OpenCode`
-/// (2026-09-07). The OpenCode CLI always sends `x-opencode-session` (and
-/// friends) — see `LLMRequestPrep.prepare` in the bundled
-/// `chunk-*.js` (`x-opencode-session`, `x-opencode-request`,
-/// `x-opencode-client`, `User-Agent: opencode/…`). Without the session
-/// header the free models are gated, even with a valid key.
-pub(crate) fn inject_opencode_headers(
-    headers: &mut HeaderMap,
+    upstream: &url::Url,
     request_id: &str,
     session_key: Option<&str>,
-) {
-    // `ses_` + 64 hex, like OpenCode's `ses_[0-9a-f]{64}`. Derive from the
-    // request_id UUID so retries within the same logical request share the
-    // same session, but different requests don't collide.
-    let raw = request_id.replace('-', "");
-    let mut hex = String::with_capacity(64);
-    while hex.len() < 64 {
-        hex.push_str(&raw);
-    }
-    hex.truncate(64);
-    let session = format!("ses_{hex}");
-    if let Ok(v) = http::HeaderValue::from_str(&session) {
-        headers.insert(http::HeaderName::from_static("x-opencode-session"), v);
-    }
-    if let Ok(v) = http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
-        headers.insert(http::HeaderName::from_static("x-opencode-request"), v);
-    }
-    headers.insert(
-        http::HeaderName::from_static("x-opencode-client"),
-        http::HeaderValue::from_static("opencode"),
+) -> Result<(HeaderMap, bool), Response> {
+    let (mut headers, is_chatgpt_auth) = match auth_env {
+        Some(var) => (route_auth_headers(var)?, false),
+        None => resolve_codex_routing_headers(client_headers, codex_auth_file),
+    };
+    // Provider-gated extras (P6): the OpenCode Zen sniff lives in
+    // `routed::quirks`, not inline here.
+    classify_upstream(upstream, is_chatgpt_auth).inject_extra_headers(
+        &mut headers,
+        request_id,
+        session_key,
     );
-    headers.insert(
-        http::header::USER_AGENT,
-        http::HeaderValue::from_static("opencode/1.18.29"),
-    );
-    if let Some(sk) = session_key {
-        // Best-effort project correlation; not required for the gate, but
-        // mirrors what OpenCode sends (`x-opencode-project`).
-        if let Ok(v) = http::HeaderValue::from_str(sk) {
-            headers.insert(http::HeaderName::from_static("x-opencode-project"), v);
-        }
-    }
+    Ok((headers, is_chatgpt_auth))
 }
 
 /// Build upstream headers for a route that carries its own credential.
 ///
 /// `var` is the name of an environment variable, not a token — see
-/// [`crate::config::ModelRoute::auth_env`]. It is read here, once per request,
+/// [`crate::config::ProviderRoute::auth_env`]. It is read here, once per request,
 /// so an operator can rotate the token by restarting the shell that exports
 /// it without touching the route table.
 ///
@@ -139,56 +105,6 @@ pub(crate) fn route_auth_headers(var: &str) -> Result<HeaderMap, Response> {
         .map_err(|_| deny(format!("${var} is not usable as an Authorization header")))?;
     upstream_headers.insert(http::header::AUTHORIZATION, value);
     Ok(upstream_headers)
-}
-
-/// Session correlation headers and turn-state echo, mirroring the real
-/// Codex client (codex-api/src/requests/headers.rs, client.rs). Returns the
-/// session key the turn is correlated under, if the translated body carried
-/// one.
-pub(crate) fn apply_codex_session_headers(
-    headers: &mut HeaderMap,
-    parsed: &Value,
-    is_chatgpt_auth: bool,
-) -> Option<String> {
-    let session_key = parsed
-        .get("metadata")
-        .and_then(|m| m.get("user_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    if is_chatgpt_auth {
-        if let Some(key) = &session_key {
-            let session_uuid = derive_session_uuid(key);
-            if let Ok(val) = http::HeaderValue::from_str(&session_uuid) {
-                headers.insert("session-id", val.clone());
-                headers.insert("thread-id", val);
-            }
-            let stored = turn_state_map()
-                .lock()
-                .ok()
-                .and_then(|m| m.get(key).cloned());
-            if let Some(ts) = stored {
-                if let Ok(val) = http::HeaderValue::from_str(&ts) {
-                    headers.insert("x-codex-turn-state", val);
-                }
-            }
-        }
-    }
-    session_key
-}
-
-/// Capture the turn-state token for sticky routing on follow-up requests.
-pub(crate) fn capture_turn_state(upstream_resp: &reqwest::Response, session_key: Option<&str>) {
-    if let Some(key) = session_key {
-        if let Some(ts) = upstream_resp
-            .headers()
-            .get("x-codex-turn-state")
-            .and_then(|v| v.to_str().ok())
-        {
-            if let Ok(mut map) = turn_state_map().lock() {
-                map.insert(key.to_string(), ts.to_string());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -265,6 +181,24 @@ mod tests {
         h.get(name).and_then(|v| v.to_str().ok()).map(String::from)
     }
 
+    /// The unified constructor against a neutral upstream, so these snapshots
+    /// pin exactly what the main path and the sidecar both send.
+    fn auth_for_test(
+        auth_env: Option<&str>,
+        caller: &HeaderMap,
+        codex_auth_file: Option<&str>,
+    ) -> Result<(HeaderMap, bool), Response> {
+        let upstream: url::Url = "https://api.x.ai/v1".parse().expect("valid url");
+        super::auth_headers(
+            auth_env,
+            caller,
+            codex_auth_file,
+            &upstream,
+            "req-test",
+            None,
+        )
+    }
+
     /// The bug this exists to stop: with `--codex-auth-file` set, an xAI route
     /// used to be handed the ChatGPT bearer token and the Codex originator and
     /// send both to `api.x.ai`.
@@ -275,7 +209,7 @@ mod tests {
         let auth_path = dir.path().join("auth.json");
         std::env::set_var("HEADROOM_TEST_ROUTE_KEY", "xai-route-token");
 
-        let (h, is_chatgpt) = upstream_auth_headers(
+        let (h, is_chatgpt) = auth_for_test(
             Some("HEADROOM_TEST_ROUTE_KEY"),
             &HeaderMap::new(),
             auth_path.to_str(),
@@ -301,7 +235,7 @@ mod tests {
         let (dir, codex_token) = codex_auth();
         let auth_path = dir.path().join("auth.json");
 
-        let (h, is_chatgpt) = upstream_auth_headers(None, &HeaderMap::new(), auth_path.to_str())
+        let (h, is_chatgpt) = auth_for_test(None, &HeaderMap::new(), auth_path.to_str())
             .expect("codex headers never fail");
 
         assert!(is_chatgpt);
@@ -324,7 +258,7 @@ mod tests {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("HEADROOM_TEST_MISSING_KEY");
 
-        let err = upstream_auth_headers(Some("HEADROOM_TEST_MISSING_KEY"), &HeaderMap::new(), None)
+        let err = auth_for_test(Some("HEADROOM_TEST_MISSING_KEY"), &HeaderMap::new(), None)
             .expect_err("unset variable");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -335,7 +269,7 @@ mod tests {
     fn an_empty_variable_is_reported_too() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HEADROOM_TEST_EMPTY_KEY", "   ");
-        let err = upstream_auth_headers(Some("HEADROOM_TEST_EMPTY_KEY"), &HeaderMap::new(), None)
+        let err = auth_for_test(Some("HEADROOM_TEST_EMPTY_KEY"), &HeaderMap::new(), None)
             .expect_err("empty variable");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         std::env::remove_var("HEADROOM_TEST_EMPTY_KEY");
@@ -347,9 +281,8 @@ mod tests {
     fn a_trailing_newline_is_trimmed_off_the_token() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HEADROOM_TEST_NEWLINE_KEY", "xai-token\n");
-        let (h, _) =
-            upstream_auth_headers(Some("HEADROOM_TEST_NEWLINE_KEY"), &HeaderMap::new(), None)
-                .expect("trimmed");
+        let (h, _) = auth_for_test(Some("HEADROOM_TEST_NEWLINE_KEY"), &HeaderMap::new(), None)
+            .expect("trimmed");
         assert_eq!(
             header(&h, "authorization").as_deref(),
             Some("Bearer xai-token")
@@ -379,7 +312,7 @@ mod tests {
             "acct-caller".parse().expect("valid header"),
         );
 
-        let (h, is_chatgpt) = upstream_auth_headers(Some("none"), &caller, auth_path.to_str())
+        let (h, is_chatgpt) = auth_for_test(Some("none"), &caller, auth_path.to_str())
             .expect("none is always usable");
 
         assert!(!is_chatgpt, "no credential is not ChatGPT auth");
@@ -391,5 +324,28 @@ mod tests {
             header(&h, "content-type").as_deref(),
             Some("application/json")
         );
+    }
+
+    /// C4 snapshot: an `opencode.ai` upstream gains the Zen session headers
+    /// through the same constructor — previously an inline sniff duplicated
+    /// at both call sites, now asserted in one place.
+    #[test]
+    fn opencode_upstream_gains_session_headers() {
+        let upstream: url::Url = "https://opencode.ai/zen/v1".parse().expect("valid url");
+        let (h, _) = super::auth_headers(None, &HeaderMap::new(), None, &upstream, "req-1", None)
+            .expect("no credential needed");
+        let session = header(&h, "x-opencode-session");
+        assert!(
+            session.is_some_and(|s| s.starts_with("ses_")),
+            "zen gate needs the session header: {h:?}"
+        );
+        assert!(header(&h, "x-opencode-request").is_some());
+        assert_eq!(header(&h, "x-opencode-client").as_deref(), Some("opencode"));
+
+        // And a non-OpenCode upstream gains none of them.
+        let plain: url::Url = "https://api.x.ai/v1".parse().expect("valid url");
+        let (p, _) = super::auth_headers(None, &HeaderMap::new(), None, &plain, "req-1", None)
+            .expect("no credential needed");
+        assert_eq!(header(&p, "x-opencode-session"), None);
     }
 }

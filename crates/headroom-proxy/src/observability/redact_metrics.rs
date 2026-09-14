@@ -15,6 +15,15 @@ const METRIC_RESTORE_MISSES_TOTAL_HELP: &str =
     "Placeholders that reached the client unresolved, by any session's map.";
 
 fn restore_misses_counter(registry: &Registry) -> &'static IntCounter {
+    // FINDING-037: the `registry` parameter is advisory-only — the counter
+    // binds to whichever registry is passed on FIRST call and ignores later
+    // ones. That matches every other observability module (ctx_metrics,
+    // replay_alternates, tail_breakpoint share the shape) and is sound in
+    // production because there is exactly one registry
+    // (`prometheus::registry()`, itself a OnceLock global). Tests pass the
+    // global too. A truly per-registry counter would need a map keyed by
+    // registry address; nobody needs it — the parameter exists so the
+    // `_get` reader mirrors the module's observe/get pair convention.
     static COUNTER: OnceLock<IntCounter> = OnceLock::new();
     COUNTER.get_or_init(|| {
         let c = IntCounter::new(

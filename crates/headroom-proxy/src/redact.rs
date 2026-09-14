@@ -90,6 +90,20 @@ const EMAIL_KIND: &str = "EMAIL";
 /// project structure it needs to reason with.
 const HOME_TOKEN: &str = "__HR_HOME__";
 
+/// `--redact-paths`. Gates the path scanner alone: secrets and emails answer
+/// to `--redact-sensitive` and ignore this. Process-wide because the
+/// redaction entry points carry a session handle, not a config.
+static REDACT_PATHS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once at startup from the parsed config.
+pub fn set_redact_paths(on: bool) {
+    REDACT_PATHS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn redact_paths_enabled() -> bool {
+    REDACT_PATHS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What the path scanner found.
 enum PathHit {
     /// Redact the whole span into an opaque token.
@@ -476,6 +490,8 @@ struct BodyRedactor<'a> {
     session_key: String,
     home: Option<String>,
     spans: usize,
+    /// `--redact-paths`. Secrets and emails do not consult it.
+    paths: bool,
 }
 
 impl<'a> BodyRedactor<'a> {
@@ -496,6 +512,7 @@ impl<'a> BodyRedactor<'a> {
                 .or_else(|| std::env::var("HOME").ok())
                 .filter(|h| h.starts_with('/')),
             spans: 0,
+            paths: redact_paths_enabled(),
         }
     }
 
@@ -572,7 +589,7 @@ impl<'a> BodyRedactor<'a> {
                 out.push_str(&token);
                 count += 1;
                 i += len;
-            } else if let Some(hit) = self.match_path(bytes, i) {
+            } else if let Some(hit) = self.match_path(bytes, i).filter(|_| self.paths) {
                 match hit {
                     PathHit::Opaque(len) => {
                         let original = &text[i..i + len];
@@ -1312,7 +1329,12 @@ pub fn restore_response(seam: Option<Seam>, response: Response) -> Response {
     };
     let (parts, body) = response.into_parts();
     let restored = restore_stream(body.into_data_stream(), table);
-    Response::from_parts(parts, axum::body::Body::from_stream(restored))
+    // Keep the drain check nonzero until the last byte when this is a stream.
+    // Buffered one-shot bodies hold the slot only until the client reads them.
+    Response::from_parts(
+        parts,
+        axum::body::Body::from_stream(crate::proxy::track_streaming(restored)),
+    )
 }
 
 /// One shared helper for every route that forwards a buffered client body.
@@ -1720,6 +1742,11 @@ mod tests {
     /// creates the machine's real key file, so a test run would leave state on
     /// the box and its results would depend on what a previous run wrote.
     fn store() -> RedactStore {
+        // The suite below was written when path masking was unconditional, so
+        // it runs with `--redact-paths` on. The off case is covered by
+        // `paths_stay_clear_when_redact_paths_is_off`, which forces the field
+        // on its own redactor rather than touching this process-wide switch.
+        set_redact_paths(true);
         RedactStore::with_key([0xA5; 32])
     }
 
@@ -1766,6 +1793,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/home/alice/work/notes.md"));
+    }
+
+    /// `--redact-paths` off: secrets and emails still go, paths stay clear.
+    /// Forces the field instead of the process switch so the test is immune
+    /// to whatever a parallel test set.
+    #[test]
+    fn paths_stay_clear_when_redact_paths_is_off() {
+        let s = store();
+        let mut r = BodyRedactor::with_home(&s, "sess-noppaths", Some(TEST_HOME));
+        r.paths = false;
+        let (out, count) = r.redact_text(
+            "key sk-abcdefghij1234567890 mail dev@example.com file /home/testuser/a/b.rs and /home/alice/work/notes.md",
+        );
+        assert_eq!(count, 2, "secret and email only: {out}");
+        assert!(out.contains("__HR_SECRET_"), "got: {out}");
+        assert!(out.contains("__HR_EMAIL_"), "got: {out}");
+        assert!(out.contains("/home/testuser/a/b.rs"), "got: {out}");
+        assert!(out.contains("/home/alice/work/notes.md"), "got: {out}");
     }
 
     #[test]

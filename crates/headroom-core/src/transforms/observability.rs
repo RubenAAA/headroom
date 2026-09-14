@@ -97,9 +97,12 @@ impl CompressionObserver for MetricsObserver {
         _original_tokens: usize,
         _compressed_tokens: usize,
     ) {
-        // MetricsObserver needs mutable self for counters, but trait takes &self.
-        // In production, PrometheusMetrics uses interior mutability (AtomicUsize).
-        // For tests, use TestObserver instead.
+        // FINDING-015: intentionally a no-op. This observer is dead code —
+        // zero callers repo-wide (the live path uses proxy_counters and the
+        // smart_crusher Observer trait instead). The counters above never
+        // move; kept only so existing constructions still compile. Do not
+        // wire new callers here — delete the struct when its constructions
+        // are gone.
     }
 }
 
@@ -111,8 +114,9 @@ pub struct TestObserver {
 
 impl CompressionObserver for TestObserver {
     fn record_compression(&self, strategy: &str, original_tokens: usize, compressed_tokens: usize) {
-        // Would need RefCell for &self; in practice tests use owned mutation.
-        // This is a placeholder — real test usage constructs calls directly.
+        // Test-only stub (see FINDING-015 note on MetricsObserver above):
+        // `&self` cannot push into `calls` without a RefCell, so tests
+        // construct expected calls directly instead of going through this.
         let _ = (strategy, original_tokens, compressed_tokens);
     }
 }

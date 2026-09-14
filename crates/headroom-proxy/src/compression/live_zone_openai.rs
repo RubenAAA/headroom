@@ -31,7 +31,9 @@
 use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
-use headroom_core::transforms::{compress_openai_chat_live_zone, LiveZoneError, LiveZoneOutcome};
+use headroom_core::transforms::{
+    compress_openai_chat_live_zone_with_config, LiveZoneError, LiveZoneOutcome,
+};
 use serde_json::Value;
 
 use crate::cache_stabilization::tool_def_normalize::{
@@ -59,6 +61,7 @@ pub fn compress_openai_chat_request(
     mode: CompressionMode,
     auth_mode: RequestAuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> Outcome {
     if matches!(mode, CompressionMode::Off) {
         tracing::info!(
@@ -133,7 +136,16 @@ pub fn compress_openai_chat_request(
     // F2.1 c2/6: forward F1's classified auth_mode into the dispatcher
     // instead of the hard-coded `Payg`. See live_zone_anthropic.rs for
     // the rationale — same wiring on the OpenAI chat path.
-    match compress_openai_chat_live_zone(&dispatch_body, auth_mode.into(), model) {
+    let dispatch_config = headroom_core::transforms::live_zone::DispatchConfig {
+        exclude_tools: exclude_tools.to_vec(),
+        ..Default::default()
+    };
+    match compress_openai_chat_live_zone_with_config(
+        &dispatch_body,
+        auth_mode.into(),
+        model,
+        &dispatch_config,
+    ) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             tracing::info!(
                 event = "compression_decision",
@@ -455,6 +467,7 @@ mod tests {
             CompressionMode::Off,
             RequestAuthMode::Payg,
             "req-1",
+            &[],
         );
         assert!(matches!(
             out,
@@ -472,6 +485,7 @@ mod tests {
             CompressionMode::LiveZone,
             RequestAuthMode::Payg,
             "req-2",
+            &[],
         );
         assert!(matches!(
             out,
@@ -489,6 +503,7 @@ mod tests {
             CompressionMode::LiveZone,
             RequestAuthMode::Payg,
             "req-3",
+            &[],
         );
         assert!(matches!(
             out,
@@ -509,6 +524,7 @@ mod tests {
             CompressionMode::LiveZone,
             RequestAuthMode::Payg,
             "req-4",
+            &[],
         );
         assert!(matches!(out, Outcome::NoCompression));
     }
@@ -528,6 +544,7 @@ mod tests {
             CompressionMode::LiveZone,
             RequestAuthMode::Payg,
             "req-e1",
+            &[],
         );
         match out {
             Outcome::Compressed {
@@ -555,6 +572,7 @@ mod tests {
             CompressionMode::LiveZone,
             RequestAuthMode::OAuth,
             "req-e1-oauth",
+            &[],
         );
         assert!(matches!(out, Outcome::NoCompression));
     }

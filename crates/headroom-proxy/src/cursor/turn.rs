@@ -46,6 +46,20 @@ impl Conversation {
         self.running.translator.begin_response();
     }
 
+    /// Latest reported usage plus whether the turn failed, for outcome
+    /// booking. Per-response counts: overwritten by each `result` event, so
+    /// booking once per HTTP turn never double-counts across resumes. Zeros
+    /// until the first result lands — a paused turn has nothing billable yet,
+    /// and the booking layer skips zero-count turns.
+    pub(crate) fn booking_snapshot(&self) -> (super::translate::Usage, bool) {
+        let translator = &self.running.translator;
+        let failed = matches!(
+            translator.outcome,
+            Some(super::translate::Outcome::Error(_))
+        );
+        (translator.usage.clone(), failed)
+    }
+
     pub(crate) fn new(
         session: Arc<Session>,
         inbox: UnboundedReceiver<ParkedCall>,

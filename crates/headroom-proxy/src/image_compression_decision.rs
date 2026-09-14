@@ -23,13 +23,24 @@ pub struct ImageCompressionDecision {
 /// Return True when inbound headers request full Headroom passthrough.
 ///
 /// Checks `x-headroom-bypass: true` or `x-headroom-mode: passthrough`.
+/// Keys match case-insensitively: callers build this map from both
+/// lowercased sources (`header_map_to_lowercase_strings`) and raw header
+/// names, so `X-Headroom-Bypass` must hit like `x-headroom-bypass`
+/// (FINDING-029 — the canonical `headers::headroom_bypass_enabled`
+/// takes a HeaderMap and never has this problem).
 pub fn headroom_bypass_enabled(headers: &HashMap<String, String>) -> bool {
-    let bypass = headers
-        .get("x-headroom-bypass")
+    let get = |name: &str| {
+        headers.get(name).or_else(|| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        })
+    };
+    let bypass = get("x-headroom-bypass")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let passthrough = headers
-        .get("x-headroom-mode")
+    let passthrough = get("x-headroom-mode")
         .map(|v| v.trim().eq_ignore_ascii_case("passthrough"))
         .unwrap_or(false);
     bypass || passthrough
@@ -182,6 +193,23 @@ mod tests {
             tags.get("image_skip_reason").map(|s| s.as_str()),
             Some("bypass_header")
         );
+    }
+
+    /// FINDING-029: header names arrive in both lowercased and raw
+    /// form depending on the caller — a non-lowercased key must not
+    /// miss the bypass.
+    #[test]
+    fn bypass_key_matches_case_insensitively() {
+        let headers = HashMap::from([("X-Headroom-Bypass".to_string(), "true".to_string())]);
+        assert!(headroom_bypass_enabled(&headers));
+        let headers = HashMap::from([("X-Headroom-Mode".to_string(), "passthrough".to_string())]);
+        assert!(headroom_bypass_enabled(&headers));
+        let d = ImageCompressionDecision::decide(
+            &HashMap::from([("X-Headroom-Bypass".to_string(), "true".to_string())]),
+            true,
+            true,
+        );
+        assert!(!d.should_compress);
     }
 
     #[test]

@@ -419,7 +419,7 @@ pub(crate) async fn forward_vertex_request(
             Err(e)
         }
     });
-    let body = Body::from_stream(resp_stream);
+    let body = Body::from_stream(crate::proxy::track_streaming(resp_stream));
 
     let mut response = Response::builder().status(status);
     if let Some(h) = response.headers_mut() {

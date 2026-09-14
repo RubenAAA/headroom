@@ -211,13 +211,10 @@ impl ToolSignature {
     /// deterministic structure hash from sorted (field_name, field_type) pairs.
     pub fn from_items(items: &[Value]) -> Self {
         if items.is_empty() {
-            // Generate unique hash for empty outputs
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let structure_hash = create_content_signature("empty", &ts.to_string(), None);
+            // FINDING-013: fixed sentinel, not wall-clock — the hash is
+            // documented deterministic ("persists to disk"), so every
+            // empty output must map to one signature.
+            let structure_hash = create_content_signature("empty", "", None);
             return Self {
                 structure_hash,
                 field_count: 0,
@@ -3230,6 +3227,14 @@ mod tests {
         let json = json!({"key": "value"});
         let sig1 = ToolSignature::from_items(&[json.clone()]);
         let sig2 = ToolSignature::from_items(&[json.clone()]);
+        assert_eq!(sig1.structure_hash, sig2.structure_hash);
+    }
+
+    #[test]
+    fn tool_signature_empty_is_deterministic() {
+        // FINDING-013: empty input used to mint a wall-clock hash.
+        let sig1 = ToolSignature::from_items(&[]);
+        let sig2 = ToolSignature::from_items(&[]);
         assert_eq!(sig1.structure_hash, sig2.structure_hash);
     }
 

@@ -219,6 +219,26 @@ pub fn openai_tools() -> Vec<Value> {
     ]
 }
 
+/// Responses-API (`/v1/responses`) memory tools: the flat
+/// `{"type":"function","name","description","parameters"}` shape the
+/// Responses `tools[]` array takes, derived from [`openai_tools`] so the
+/// two stay in sync (FINDING-020: Chat-shaped defs injected here were
+/// malformed and the model could never call them).
+pub fn responses_tools() -> Vec<Value> {
+    openai_tools()
+        .iter()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            Some(serde_json::json!({
+                "type": "function",
+                "name": f.get("name").cloned().unwrap_or(Value::Null),
+                "description": f.get("description").cloned().unwrap_or(Value::Null),
+                "parameters": f.get("parameters").cloned().unwrap_or(Value::Object(serde_json::Map::new())),
+            }))
+        })
+        .collect()
+}
+
 /// Gemini function-calling memory tools.
 pub fn gemini_tools() -> Vec<Value> {
     vec![
@@ -383,6 +403,24 @@ pub fn inject_tools(
     (Value::Array(tools_arr), beta_headers)
 }
 
+/// Inject memory tools in the flat Responses-API shape (see
+/// [`responses_tools`]). Dedup reuses [`get_existing_tool_names`], which
+/// already reads the flat `name` field.
+pub fn inject_responses_tools(tools: &Value, config: &MemoryToolAdapterConfig) -> (Value, Value) {
+    if !config.inject_tools {
+        return (tools.clone(), serde_json::json!({}));
+    }
+    let mut tools_arr = tools.as_array().cloned().unwrap_or_default();
+    let existing_names = get_existing_tool_names(&tools_arr);
+    for schema in responses_tools() {
+        let name = schema.get("name").and_then(Value::as_str).unwrap_or("");
+        if !existing_names.contains(name) {
+            tools_arr.push(schema);
+        }
+    }
+    (Value::Array(tools_arr), serde_json::json!({}))
+}
+
 /// Extract existing tool names from a tools array.
 fn get_existing_tool_names(tools: &[Value]) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -529,8 +567,17 @@ pub fn get_tool_name(tool_call: &Value, provider: Provider) -> String {
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+            .map(str::to_string)
+            // Responses `function_call` items carry a flat `name`
+            // (FINDING-020); without this fallback every Responses memory
+            // call read as "" and `has_memory_tool_calls` never fired.
+            .or_else(|| {
+                tool_call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default(),
         Provider::Gemini => tool_call
             .get("functionCall")
             .and_then(|fc| fc.get("name"))
@@ -562,6 +609,15 @@ pub fn get_tool_id(tool_call: &Value, provider: Provider) -> String {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        Provider::Openai => tool_call
+            // Responses `function_call` items link results via `call_id`
+            // (FINDING-020); Chat items have no `call_id`, so preferring
+            // it first is safe for both shapes.
+            .get("call_id")
+            .and_then(Value::as_str)
+            .or_else(|| tool_call.get("id").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string(),
         _ => tool_call
             .get("id")
             .and_then(Value::as_str)
@@ -578,12 +634,24 @@ pub fn get_tool_input(tool_call: &Value, provider: Provider) -> Value {
             .cloned()
             .unwrap_or(Value::Object(serde_json::Map::new())),
         Provider::Openai => {
-            let args_str = tool_call
+            if let Some(args_str) = tool_call
                 .get("function")
                 .and_then(|f| f.get("arguments"))
                 .and_then(Value::as_str)
-                .unwrap_or("{}");
-            serde_json::from_str(args_str).unwrap_or(Value::Object(serde_json::Map::new()))
+            {
+                return serde_json::from_str(args_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+            }
+            // Responses `function_call` items carry flat `arguments`
+            // (a JSON string on the wire; tolerate an object).
+            // FINDING-020.
+            match tool_call.get("arguments") {
+                Some(Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or(Value::Object(serde_json::Map::new()))
+                }
+                Some(v @ Value::Object(_)) => v.clone(),
+                _ => Value::Object(serde_json::Map::new()),
+            }
         }
         Provider::Gemini => tool_call
             .get("functionCall")
@@ -626,6 +694,18 @@ pub fn format_tool_result(tool_id: &str, content: &str, provider: Provider) -> V
             },
         }),
     }
+}
+
+/// Format a memory tool result as a Responses-API `function_call_output`
+/// item for splicing into a continuation's `input[]` array (FINDING-020).
+/// The Chat-shaped `{role: "tool", ...}` item the shared executor returns
+/// is not a valid Responses input item and upstream rejects the turn.
+pub fn format_responses_tool_result(call_id: &str, output: &str) -> Value {
+    serde_json::json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output,
+    })
 }
 
 /// Get beta headers required for the provider.
@@ -759,6 +839,42 @@ mod tests {
         });
         let calls = extract_tool_calls(&r, Provider::Openai);
         assert_eq!(calls.len(), 1);
+    }
+
+    /// FINDING-020: flat Responses `function_call` items must round-trip
+    /// through detection, naming, id, and input — previously name/id/input
+    /// all read empty and memory was dead on Responses.
+    #[test]
+    fn responses_function_call_items_are_memory_calls() {
+        let r = json!({
+            "output": [
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                 "name": "memory_search", "arguments": "{\"query\":\"hi\"}"}
+            ]
+        });
+        assert!(has_memory_tool_calls(&r, Provider::Openai));
+        let calls = extract_tool_calls(&r, Provider::Openai);
+        assert_eq!(get_tool_name(&calls[0], Provider::Openai), "memory_search");
+        assert_eq!(get_tool_id(&calls[0], Provider::Openai), "call_1");
+        assert_eq!(get_tool_input(&calls[0], Provider::Openai)["query"], "hi");
+        let out = format_responses_tool_result("call_1", "found it");
+        assert_eq!(out["type"], "function_call_output");
+        assert_eq!(out["call_id"], "call_1");
+        assert_eq!(out["output"], "found it");
+    }
+
+    #[test]
+    fn responses_tools_are_flat_function_defs() {
+        let defs = responses_tools();
+        assert_eq!(defs.len(), openai_tools().len());
+        for d in &defs {
+            assert_eq!(d["type"], "function");
+            assert!(d["name"].is_string());
+            assert!(d["parameters"].is_object());
+            assert!(d.get("function").is_none());
+        }
+        let (updated, _) = inject_responses_tools(&json!([]), &MemoryToolAdapterConfig::default());
+        assert_eq!(updated.as_array().unwrap().len(), defs.len());
     }
 
     // --- get_tool_name ---

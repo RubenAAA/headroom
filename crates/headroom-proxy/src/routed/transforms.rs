@@ -132,32 +132,49 @@ pub(crate) async fn apply_ctx_request_transforms(
     // conversation's previous turn. This is what feeds the re-cache watchdog
     // that `scripts/statusline-cache-health.sh` renders — without it the cache
     // segment simply has nothing to say about routed turns.
+    //
+    // Spark turns never park: they bill from a different cache universe (no
+    // Anthropic write/TTL telemetry, translated prefix, separate per-model
+    // lineage), so scoring them against the Anthropic footprint reads as a
+    // bust on nearly every turn and drags the fleet hit rate down for no
+    // reason. Spark has its own `/spark-context` segment instead.
+    let body_model_is_spark = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.to_lowercase().contains("spark"));
     let conversation_key =
         crate::cache_stabilization::usage_observer::conversation_key(parsed, &lane_key);
     report.conversation_key = conversation_key.clone();
-    state.usage_observer.begin_request(
-        request_id,
-        conversation_key,
-        Some(session_key.as_str()),
-        drift_dims,
-        Some(
-            crate::cache_stabilization::usage_observer::prefix_fingerprint_with_model(
-                parsed,
-                identity_model,
+    if !body_model_is_spark {
+        state.usage_observer.begin_request(
+            request_id,
+            conversation_key,
+            Some(session_key.as_str()),
+            drift_dims,
+            Some(
+                crate::cache_stabilization::usage_observer::prefix_fingerprint_with_model(
+                    parsed,
+                    identity_model,
+                ),
             ),
-        ),
-    );
-    // Same tier read as the Claude path: `parsed` is pre-transform here, so
-    // this is what the client asked for, before translation reshapes it.
-    state.usage_observer.note_client_cache_ttl(
-        request_id,
-        crate::cache_stabilization::cache_ttl::client_ttl_shape(parsed),
-    );
+        );
+        // Same tier read as the Claude path: `parsed` is pre-transform here, so
+        // this is what the client asked for, before translation reshapes it.
+        state.usage_observer.note_client_cache_ttl(
+            request_id,
+            crate::cache_stabilization::cache_ttl::client_ttl_shape(parsed),
+        );
+    }
 
     // CTX-2: passive session capture. Read-only — clones the body onto a
     // detached worker; never mutates and never blocks.
     // Which project's ctx stores this turn is captured into and recalled from.
     let ctx_project = crate::proxy::resolve_ctx_project(Some(headers), parsed);
+    // Presence for /debug/active-conversations: same project dir the ctx
+    // stores shard on, parked under the request id.
+    state
+        .usage_observer
+        .note_project(request_id, ctx_project.clone());
     if let Some(observer) = state.ctx_observer.as_ref() {
         observer.observe(parsed, &session_key, &ctx_project);
     }
@@ -315,13 +332,13 @@ pub(crate) async fn apply_ctx_request_transforms(
             if !already_has {
                 tools.push(json!({
                     "name": "headroom_retrieve",
-                    "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` from a compression marker like [N items compressed... hash=abc123], or `query` with keywords to search previously offloaded content. Exactly one of the two.",
+                    "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` copied exactly from a <<ccr:...>> compression marker (24 lowercase hex characters, e.g. <<ccr:7f6e11a407235b972da63df8>>) — never invent or shorten a hash — or `query` with keywords to search previously offloaded content. Exactly one of the two.",
                     "input_schema": {
                         "type": "object",
                         "properties": {
                             "hash": {
                                 "type": "string",
-                                "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                                "description": "Hash key copied exactly from a <<ccr:...>> compression marker (24 lowercase hex chars, e.g. '7f6e11a407235b972da63df8' from <<ccr:7f6e11a407235b972da63df8>>). Never invent or truncate a hash."
                             },
                             "query": {
                                 "type": "string",

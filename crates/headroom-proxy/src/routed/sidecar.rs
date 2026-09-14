@@ -7,7 +7,8 @@ use crate::openai::request::anthropic_to_openai_responses_request;
 use crate::openai::response::responses_stream_to_turn;
 use crate::openai::stream::translate_openai_stream_to_anthropic;
 use crate::proxy::AppState;
-use crate::routed::auth::{inject_opencode_headers, upstream_auth_headers};
+use crate::routed::auth::auth_headers;
+use crate::routed::quirks::classify_upstream;
 use crate::routed::response_arms::{apply_target_model_override, streaming_body_response};
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -22,9 +23,9 @@ use serde_json::{json, Value};
 /// subprocess route cannot serve a translated sidecar; the sidecar keeps its
 /// direct path for those, exactly as before.
 pub(crate) fn sidecar_responses_route<'a>(
-    routes: &'a [crate::config::ModelRoute],
+    routes: &'a [crate::config::ProviderRoute],
     sidecar_model: &str,
-) -> Option<&'a crate::config::ModelRoute> {
+) -> Option<&'a crate::config::ProviderRoute> {
     routes.iter().find(|r| {
         r.matches(sidecar_model)
             && r.translate
@@ -134,23 +135,23 @@ pub(crate) async fn try_routed_sidecar(
     // below.
     let mut openai_body = anthropic_to_openai_responses_request(&shrunk, false).ok()?;
     openai_body = apply_target_model_override(openai_body, Some(&target), true, true);
+    classify_upstream(&upstream, false).strip_unreplayable_reasoning(&mut openai_body);
     shape_sidecar_request(&mut openai_body);
     let openai_bytes = serde_json::to_vec(&openai_body).ok()?;
 
-    let (mut upstream_headers, _) = upstream_auth_headers(
+    let (upstream_headers, _) = auth_headers(
         route.auth_env.as_deref(),
         headers,
         state.config.codex_auth_file.as_deref(),
+        &upstream,
+        request_id,
+        // Stateless one-shot: the request_id-derived session is sufficient.
+        None,
     )
     .ok()?;
-    if upstream.host_str() == Some("opencode.ai") {
-        // `session_key` is not material here — the sidecar is a stateless
-        // one-shot, so the request_id-derived session is sufficient.
-        inject_opencode_headers(&mut upstream_headers, request_id, None);
-    }
 
-    let base = upstream.as_str().trim_end_matches('/');
-    let upstream_url = format!("{}/v1/responses", base.trim_end_matches("/v1"));
+    let base = crate::routed::quirks::strip_v1_base(&upstream);
+    let upstream_url = format!("{base}/v1/responses");
 
     tracing::info!(
         event = "sidecar_routed_attempt",
@@ -208,6 +209,9 @@ pub(crate) async fn try_routed_sidecar(
             crate::codex_rate_limits::CodexRateLimitStore::new(),
             false,
             None,
+            // Sidecars never book: the direct path they fall back to owns
+            // the turn's outcome, and a routed attempt must not book twice.
+            None,
         );
         // Same close-on-drop as the main routed path: a mid-response death
         // ends `end_turn` with a marker instead of a reset socket.
@@ -215,7 +219,7 @@ pub(crate) async fn try_routed_sidecar(
             crate::sse::stream_finisher::finish_on_drop(translated, request_id.to_string());
         crate::sidecar::record_sidecar(request_id, &shape);
         return Some(streaming_body_response(axum::body::Body::from_stream(
-            finished,
+            crate::proxy::track_streaming(finished),
         )));
     }
 
@@ -313,8 +317,8 @@ mod tests {
             target: Option<&str>,
             cursor: Option<&str>,
             upstream: Option<&str>,
-        ) -> crate::config::ModelRoute {
-            crate::config::ModelRoute {
+        ) -> crate::config::ProviderRoute {
+            crate::config::ProviderRoute {
                 model_prefix: prefix.to_string(),
                 prefix_match: false,
                 upstream: upstream.map(|u| url::Url::parse(u).expect("valid url")),
@@ -401,5 +405,37 @@ mod tests {
         ));
         assert!(!sidecar_text_present(&json!({"content": []})));
         assert!(!sidecar_text_present(&json!({})));
+    }
+
+    /// Retroactive lock: redaction-on skips the routed sidecar so raw client
+    /// text never reaches a routed upstream past the redaction stage. The
+    /// direct sidecar path answers instead.
+    #[tokio::test]
+    async fn redaction_on_skips_routed_sidecar() {
+        let state = crate::test_support::test_state(|c| {
+            c.redact_sensitive = true;
+            c.sidecar_model = Some("claude-muse-spark-1.3".to_string());
+            c.model_routes = vec![crate::config::ProviderRoute {
+                model_prefix: "claude-muse-spark-1.3".to_string(),
+                prefix_match: false,
+                upstream: Some("https://opencode.ai/zen/v1".parse().unwrap()),
+                translate: true,
+                cursor_agent: None,
+                target_model: Some("muse-spark-1.3-contributor-free".to_string()),
+                auth_env: None,
+            }];
+        });
+        let parsed = json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let out = try_routed_sidecar(
+            &state,
+            &axum::http::HeaderMap::new(),
+            &parsed,
+            "req-redact-skip",
+        )
+        .await;
+        assert!(out.is_none(), "redaction-on must skip the routed sidecar");
     }
 }

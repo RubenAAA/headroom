@@ -163,24 +163,28 @@ fn extract_file_prefix(line: &str) -> Option<&str> {
             0
         };
 
-    let mut i = scan_start;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b':' || b == b'-' {
-            // Saw a separator. Need the next chars to be digits, then
-            // another matching separator.
-            let sep = b;
-            let mut j = i + 1;
-            let digit_start = j;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
+    // FINDING-041: two passes, colon first. A single left-to-right scan
+    // matches `-2-` inside `file-2-backup.py:42:` and returns "file".
+    // The `:` form is authoritative grep output; `-` is only the ripgrep
+    // context-line fallback, so it must not shadow a later colon match.
+    for &sep in &[b':', b'-'] {
+        let mut i = scan_start;
+        while i < bytes.len() {
+            if bytes[i] == sep {
+                // Saw a separator. Need the next chars to be digits, then
+                // another matching separator.
+                let mut j = i + 1;
+                let digit_start = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > digit_start && j < bytes.len() && bytes[j] == sep {
+                    // Found `<file><sep><digits><sep>`. File prefix is [0..i].
+                    return Some(&line[..i]);
+                }
             }
-            if j > digit_start && j < bytes.len() && bytes[j] == sep {
-                // Found `<file><sep><digits><sep>`. File prefix is [0..i].
-                return Some(&line[..i]);
-            }
+            i += 1;
         }
-        i += 1;
     }
     None
 }
@@ -235,6 +239,16 @@ mod tests {
         assert_eq!(
             extract_file_prefix(r"C:\Users\foo\bar.py:42:line"),
             Some(r"C:\Users\foo\bar.py")
+        );
+    }
+
+    #[test]
+    fn extract_file_prefix_prefers_colon_over_hyphen_digit() {
+        // FINDING-041: `file-2-backup.py:42:` must cluster under the full
+        // filename, not "file" from the `-2-` hyphen match.
+        assert_eq!(
+            extract_file_prefix("file-2-backup.py:42:content"),
+            Some("file-2-backup.py")
         );
     }
 

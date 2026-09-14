@@ -427,6 +427,9 @@ pub fn compress_batch_with_router(
     compressor: &dyn Compressor,
     tokenizer: &dyn TokenCounter,
 ) -> Vec<(serde_json::Value, UnitCompressionResult)> {
+    if batch.entries.is_empty() {
+        return passthrough_batch_results(batch, tokenizer, ROUTER_NO_CHANGE, None);
+    }
     let nonce = batch_nonce(batch);
     let (batch_texts, marker_blocks) = protect_ccr_markers(batch, &nonce);
     let envelope = batch_envelope(batch, &nonce, &batch_texts);

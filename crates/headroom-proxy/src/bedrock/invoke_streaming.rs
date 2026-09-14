@@ -400,7 +400,7 @@ pub async fn handle_invoke_streaming(
         let stream = upstream_resp
             .bytes_stream()
             .map(|r| r.map_err(std::io::Error::other));
-        let body_out = Body::from_stream(stream);
+        let body_out = Body::from_stream(crate::proxy::track_streaming(stream));
         return finish(status, resp_headers, body_out, &request_id, seam);
     }
     // Always drop the upstream content-length: in passthrough mode
@@ -433,7 +433,7 @@ pub async fn handle_invoke_streaming(
                     resp_headers.insert(http::header::CONTENT_TYPE, v);
                 }
             }
-            let body_out = Body::from_stream(upstream_stream);
+            let body_out = Body::from_stream(crate::proxy::track_streaming(upstream_stream));
             finish(status, resp_headers, body_out, &request_id, seam)
         }
         OutputMode::Sse => {
@@ -453,7 +453,7 @@ pub async fn handle_invoke_streaming(
                 region.clone(),
             );
             let translated = tee_to_anthropic_state(translated, request_id.clone());
-            let body_out = Body::from_stream(translated);
+            let body_out = Body::from_stream(crate::proxy::track_streaming(translated));
             finish(status, resp_headers, body_out, &request_id, seam)
         }
     }

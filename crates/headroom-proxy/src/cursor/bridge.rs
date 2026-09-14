@@ -898,4 +898,24 @@ mod tests {
         );
         bridge.close("conv").await;
     }
+
+    /// Retroactive lock for `2dc8a574`: total-miss turns shut the orphan down
+    /// and error past 3 consecutive misses instead of re-parking forever.
+    #[tokio::test]
+    async fn mismatch_strikes_count_and_clear() {
+        assert_eq!(
+            MAX_CONSECUTIVE_MISMATCHES, 3,
+            "handler errors past 3; changing this changes the breaker"
+        );
+        let bridge = Bridge::new();
+        assert_eq!(bridge.mismatch_strike("k").await, 1);
+        assert_eq!(bridge.mismatch_strike("k").await, 2);
+        assert_eq!(bridge.mismatch_strike("k").await, 3);
+        bridge.clear_mismatches("k").await;
+        assert_eq!(
+            bridge.mismatch_strike("k").await,
+            1,
+            "a delivered result (or result-free turn) resets the run"
+        );
+    }
 }

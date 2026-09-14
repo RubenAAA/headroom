@@ -40,7 +40,7 @@ fn is_touch_tool(name: &str) -> bool {
 /// Configuration for Read maturation.
 #[derive(Debug, Clone)]
 pub struct ReadMaturationConfig {
-    /// Enabled by default while the mechanism is validated in pilots.
+    /// Disabled by default; enable explicitly while the mechanism is validated in pilots.
     pub enabled: bool,
     /// Mature a held Read once its FILE has had no activity for this many assistant turns.
     pub quiesce_turns: usize,

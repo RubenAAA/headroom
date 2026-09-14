@@ -186,7 +186,7 @@ impl InjectEngine {
     fn cache_get(&self, conv_id: &str) -> Option<Decision> {
         self.cache
             .lock()
-            .expect("inject cache poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(conv_id)
             .cloned()
     }
@@ -194,7 +194,7 @@ impl InjectEngine {
     fn cache_put(&self, conv_id: &str, decision: Decision) {
         self.cache
             .lock()
-            .expect("inject cache poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .put(conv_id.to_string(), decision);
     }
 

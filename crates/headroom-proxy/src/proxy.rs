@@ -1663,10 +1663,23 @@ pub fn build_app(state: AppState) -> Router {
             ))
         }
 
+        async fn debug_active_conversations(
+            axum::extract::State(state): axum::extract::State<AppState>,
+        ) -> axum::response::Json<serde_json::Value> {
+            let conversations = state.usage_observer.active_conversations();
+            axum::response::Json(
+                crate::debug_introspection::serialize_active_conversations_debug(conversations),
+            )
+        }
+
         let debug_router = Router::new()
             .route("/debug/tasks", get(debug_tasks))
             .route("/debug/ws-sessions", get(debug_ws_sessions))
             .route("/debug/warmup", get(debug_warmup))
+            .route(
+                "/debug/active-conversations",
+                get(debug_active_conversations),
+            )
             .route(
                 "/debug/inflight",
                 get(
@@ -3040,6 +3053,28 @@ fn hold_role_sentence_value(
 /// no upstream call, only a parse.
 pub(crate) const MAX_RESOLVER_ALTERNATIONS: usize = 4;
 
+/// Read one upstream `usage` block in any wire shape booking accepts.
+/// Responses reports `input_tokens`/`output_tokens`, Chat Completions
+/// reports `prompt_tokens`/`completion_tokens`, Anthropic carries
+/// `cache_read_input_tokens` directly. Max-convention throughout: a body
+/// carrying both takes the larger, never the sum — matching the outcome
+/// funnel. Shared by round folding and passthrough booking so the two
+/// cannot drift into reading different numbers off the same block.
+pub(crate) fn usage_counts(usage: &serde_json::Value) -> (i64, i64, i64) {
+    let get = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    let input = get("input_tokens").max(get("prompt_tokens"));
+    let output = get("output_tokens").max(get("completion_tokens"));
+    let cached = get("cache_read_input_tokens").max(
+        usage
+            .get("input_tokens_details")
+            .or_else(|| usage.get("prompt_tokens_details"))
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+    );
+    (input, output, cached)
+}
+
 /// Upstream usage from CCR continuation rounds the client never sees.
 ///
 /// `handle_ccr_response` resolves a `headroom_retrieve` call server-side by
@@ -3066,7 +3101,7 @@ pub(crate) struct CcrRoundUsage {
 
 impl CcrRoundUsage {
     /// Fold in one response's `usage` block.
-    fn add_response(&mut self, response: &serde_json::Value) {
+    pub(crate) fn add_response(&mut self, response: &serde_json::Value) {
         let Some(usage) = response.get("usage") else {
             return;
         };
@@ -3076,15 +3111,23 @@ impl CcrRoundUsage {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0)
         };
+        // Both wire shapes (see `usage_counts`): Responses reports
+        // `input_tokens`/`output_tokens`, Chat Completions reports
+        // `prompt_tokens`/`completion_tokens`. Same max-convention as the
+        // outcome funnel (`book_routed_outcome_with_ccr`); a body carrying
+        // both takes the larger, never the sum. Cache reads keep the direct
+        // Anthropic key as a fallback: older usage blocks carry no details
+        // section.
+        let (input, output, cached) = usage_counts(usage);
         if self.rounds == 0 {
-            self.client_input_tokens = get("input_tokens").max(0) as u64;
-            self.client_cache_read_tokens = get("cache_read_input_tokens").max(0) as u64;
+            self.client_input_tokens = input.max(0) as u64;
+            self.client_cache_read_tokens = cached.max(0) as u64;
             self.client_cache_write_tokens = get("cache_creation_input_tokens").max(0) as u64;
         }
         self.rounds += 1;
-        self.input_tokens += get("input_tokens");
-        self.output_tokens += get("output_tokens");
-        self.cache_read_tokens += get("cache_read_input_tokens");
+        self.input_tokens += input;
+        self.output_tokens += output;
+        self.cache_read_tokens += cached;
         self.cache_write_tokens += get("cache_creation_input_tokens");
     }
 
@@ -3435,6 +3478,66 @@ pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str
 /// and a busy proxy read the same.
 static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// SSE bodies actively streaming to the client, after the `Response` was
+/// dispatched and the pipeline `InflightGuard` already dropped. Held by
+/// `TrackedStream` below, so `GET /debug/inflight` sees streaming turns and
+/// the rotation drain defers instead of RSTing them.
+static STREAMING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Holds one slot in `STREAMING` for the life of an SSE body. Created when a
+/// streaming `Response` is built, dropped when the body ends or is dropped
+/// (client gone, rotation RST, upstream error).
+pub(crate) struct StreamingGuard;
+
+impl StreamingGuard {
+    pub(crate) fn enter() -> Self {
+        STREAMING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        STREAMING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// A stream that keeps one `STREAMING` slot alive until it ends or is
+    /// dropped. Wrap every SSE body before `Body::from_stream` so the drain
+    /// check covers bytes that flow after the pipeline guard drops.
+    pub(crate) struct TrackedStream<S> {
+        _guard: StreamingGuard,
+        #[pin]
+        inner: S,
+    }
+}
+
+impl<S> TrackedStream<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            _guard: StreamingGuard::enter(),
+            inner,
+        }
+    }
+}
+
+impl<S: futures_util::Stream> futures_util::Stream for TrackedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
+}
+
+/// Wrap an SSE stream so `GET /debug/inflight` counts it until the last byte.
+pub(crate) fn track_streaming<S>(inner: S) -> TrackedStream<S> {
+    TrackedStream::new(inner)
+}
+
 /// Holds one slot in `INFLIGHT` from `forward_http` entry to any exit,
 /// including `?` returns.
 pub(crate) struct InflightGuard;
@@ -3451,14 +3554,13 @@ impl InflightGuard {
     }
 
     /// Process-wide in-flight requests, for the rotation drain check
-    /// (`GET /debug/inflight`). Covers `forward_http` and the routed
-    /// `handle_messages` path — both hold a guard until the response is
-    /// dispatched (headers-wait, buffered/CCR/fallback), NOT for streamed
-    /// body bytes, which flow after the guard drops. The drain can therefore
-    /// read 0 mid-stream: bounded straggler risk the 90 s timeout accepts,
-    /// not a guarantee of silence.
+    /// (`GET /debug/inflight`). Covers the pipeline guards (`forward_http`
+    /// and routed `handle_messages`, held until the response is dispatched)
+    /// plus `STREAMING` bodies actively flowing to the client. A streaming
+    /// turn therefore reads nonzero from headers until the last byte.
     pub(crate) fn count_global() -> usize {
         INFLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+            + STREAMING.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -3824,6 +3926,11 @@ pub(crate) async fn forward_http(
     // branch, which never builds a forwarded body; callers fall back to the
     // original there, which is what it was.
     let mut forwarded_body: Option<bytes::Bytes> = None;
+    // Set inside the intercept arm when a streaming `/v1/responses` request
+    // offering `headroom_retrieve` is flipped to a buffered upstream call so
+    // CCR can resolve (see `openai_buffered_ccr`); read after the upstream
+    // responds to resynthesize SSE for the client. `false` on passthrough.
+    let mut buffered_responses_ccr = false;
     let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
         let max = state.config.compression_max_body_bytes as usize;
@@ -3998,13 +4105,55 @@ pub(crate) async fn forward_http(
         // we are paying to keep. This has to run here, ahead of the fingerprint
         // below and the prefix-replay capture further down, so every stage sees
         // the pinned form and stores the bytes we will actually forward.
-        let buffered = match endpoint {
+        let mut buffered = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => {
                 cache_stabilization::billing_header::pin_billing_header_in_body(buffered)
             }
             compression::CompressibleEndpoint::OpenAiChatCompletions
             | compression::CompressibleEndpoint::OpenAiResponses => buffered,
         };
+
+        // Buffered CCR: a streaming `/v1/responses` turn offering
+        // `headroom_retrieve` goes upstream buffered (`stream: false`)
+        // so the buffered arm downstream can resolve retrieval
+        // server-side and resynthesize SSE for the client.
+        // ChatGPT-OAuth sessions stay streaming — their server-side
+        // session owns the transcript. Runs before compression so the
+        // flipped body is what every downstream stage (fingerprint,
+        // replay store, compressor, wire bytes) sees.
+        if matches!(
+            endpoint,
+            compression::CompressibleEndpoint::OpenAiResponses
+        ) && state.config.ccr_handle_responses
+        {
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
+                let stream = parsed
+                    .get("stream")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let is_chatgpt = headers_snapshot
+                    .as_ref()
+                    .is_some_and(crate::openai_buffered_ccr::caller_is_chatgpt_auth);
+                if crate::openai_buffered_ccr::should_buffer_openai_responses_stream_ccr(
+                    stream,
+                    true,
+                    parsed.get("tools"),
+                    is_chatgpt,
+                ) {
+                    let mut flipped = parsed.clone();
+                    flipped["stream"] = serde_json::Value::Bool(false);
+                    if let Ok(rewritten) = serde_json::to_vec(&flipped) {
+                        buffered = bytes::Bytes::from(rewritten);
+                        buffered_responses_ccr = true;
+                        tracing::info!(
+                            request_id = %request_id,
+                            event = "buffered_responses_ccr_flip",
+                            "streaming /v1/responses with headroom_retrieve flipped to buffered upstream call",
+                        );
+                    }
+                }
+            }
+        }
 
         // PR-E5 + PR-E6: cache-stabilization observability hooks.
         // Both run READ-ONLY against the buffered body and emit
@@ -4248,6 +4397,13 @@ pub(crate) async fn forward_http(
                     Some(cache_stabilization::usage_observer::prefix_fingerprint(
                         &parsed,
                     )),
+                );
+                // Presence for /debug/active-conversations: the canonical
+                // project dir parks alongside the usage identity, before the
+                // shed check below can pop the entry.
+                state.usage_observer.note_project(
+                    &request_id,
+                    resolve_ctx_project(headers_snapshot.as_ref(), &parsed),
                 );
                 // Price the stock arm at the tier the client actually bought:
                 // `parsed` still carries its own markers here, before the
@@ -4561,6 +4717,12 @@ pub(crate) async fn forward_http(
         // the replay store carries the stripped bytes forward for every
         // message it has seen. Its own block, not part of the ctx pipeline
         // below: entering that one injects the retrieval tool.
+        //
+        // And not on every boundary either (savings-ideas-2.md §4.2): the
+        // drop rewrites the head, so it runs only where the head is
+        // rewritten anyway — rebuild boundary, no tracker, or agreement
+        // ending at index 0/1. A tail divergence keeps its head thinking;
+        // only the tail is re-billed either way.
         let buffered = if state.config.ctx_drop_prior_thinking
             && offload_boundary
             && matches!(
@@ -4570,7 +4732,14 @@ pub(crate) async fn forward_http(
             && buffered
                 .windows(b"thinking".len())
                 .any(|w| w == b"thinking")
-        {
+            && crate::compression::prior_thinking::thinking_drop_is_free(
+                rebuild_boundary,
+                replay_original_messages.as_deref().and_then(|messages| {
+                    state
+                        .replay_store
+                        .forwarded_agreement_len(&request_lane_key, messages)
+                }),
+            ) {
             match serde_json::from_slice::<serde_json::Value>(&buffered) {
                 Ok(mut value) => {
                     let dropped =
@@ -5287,6 +5456,7 @@ pub(crate) async fn forward_http(
                             state.config.compression_mode,
                             auth_mode,
                             &request_id,
+                            &state.config.exclude_tools,
                         );
                         // Cross-turn verbatim de-dup post-pass over
                         // `role == "tool"` message content (no-op unless
@@ -5341,6 +5511,7 @@ pub(crate) async fn forward_http(
                         state.config.compression_mode,
                         auth_mode,
                         &request_id,
+                        &state.config.exclude_tools,
                     )
                 }
             }
@@ -6441,8 +6612,14 @@ pub(crate) async fn forward_http(
                                 } else {
                                     "backoff"
                                 };
-                                let delay_ms =
-                                    retry_after.unwrap_or_else(|| backoff_ms(&state, attempt));
+                                // Shared selection (C5): header wins, else the
+                                // backoff below. No outer clamp here — unlike
+                                // the routed loop, this path sleeps the raw
+                                // value, so it stays as written.
+                                let delay_ms = headroom_core::retry::next_delay_ms(
+                                    retry_after_uncapped,
+                                    backoff_ms(&state, attempt),
+                                );
                                 tracing::warn!(
                                     request_id = %request_id,
                                     status = status,
@@ -6772,6 +6949,61 @@ pub(crate) async fn forward_http(
     } else {
         Box::pin(upstream_body)
     };
+    // #2613 edge, port of `_openai_responses_from_sse`: some
+    // OpenAI-compatible upstreams answer a `stream: false` request with a
+    // valid 200 SSE body. When this request was buffered for Responses CCR,
+    // collect that stream and reassemble the terminal JSON so the buffered
+    // arm below still resolves retrieval. Without a terminal event the
+    // collected bytes stream through unchanged (previous behaviour,
+    // error included).
+    let mut upstream_body = upstream_body;
+    let (mut is_sse, mut sse_kind) = (is_sse, sse_kind);
+    if buffered_responses_ccr && is_sse && status.is_success() {
+        use futures_util::StreamExt as _;
+        let mut collected = bytes::BytesMut::new();
+        let mut first_err: Option<reqwest::Error> = None;
+        {
+            let mut s = &mut upstream_body;
+            while let Some(chunk) = s.next().await {
+                match chunk {
+                    Ok(b) => collected.extend_from_slice(&b),
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        let reassembled: Option<bytes::Bytes> = if first_err.is_none() {
+            // Whole stream collected cleanly: reassemble the terminal JSON
+            // when one is present.
+            crate::openai_buffered_ccr::responses_completed_from_sse(&String::from_utf8_lossy(
+                &collected,
+            ))
+            .and_then(|completed| serde_json::to_vec(&completed).ok())
+            .map(bytes::Bytes::from)
+        } else {
+            None
+        };
+        if let Some(json_bytes) = reassembled {
+            tracing::info!(
+                request_id = %request_id,
+                event = "buffered_responses_ccr_sse_answer",
+                "upstream answered stream:false with SSE; reassembled terminal JSON for buffered handling"
+            );
+            upstream_body = Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                json_bytes,
+            )]));
+            is_sse = false;
+            sse_kind = SseStreamKind::None;
+        } else {
+            let mut items: Vec<reqwest::Result<bytes::Bytes>> = vec![Ok(collected.freeze())];
+            if let Some(e) = first_err {
+                items.push(Err(e));
+            }
+            upstream_body = Box::pin(futures_util::stream::iter(items));
+        }
+    }
     // What every continuation round below appends to: the bytes the provider
     // saw and cached, falling back to the client's own body on the passthrough
     // branch, which forwards nothing of its own.
@@ -6807,6 +7039,8 @@ pub(crate) async fn forward_http(
             .await,
             // Anthropic path: redaction lives on routed translate paths only.
             redact: None,
+            // Anthropic path: the caller folds the returned handle itself.
+            rounds_sink: None,
         };
         let (stream, usage) = crate::sse::ccr_stream::rewrite_anthropic_stream(upstream_body, ctx);
         (Box::pin(stream), Some(usage))
@@ -7343,7 +7577,77 @@ pub(crate) async fn forward_http(
                     }
                 }
 
-                Body::from(body_bytes)
+                if buffered_responses_ccr {
+                    // The client asked for a stream but upstream was called
+                    // buffered so CCR could resolve. Resynthesize SSE — or
+                    // fail closed, never handing the client an unanswerable
+                    // `headroom_retrieve` call.
+                    match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                        Ok(json) => {
+                            let unresolved =
+                                headroom_core::ccr::response_handler::CCRResponseHandler::new(None)
+                                    .has_ccr_tool_calls(&json, "openai_responses");
+                            if unresolved {
+                                // Handling above did not fully resolve the
+                                // retrieve call (max rounds, or mixed with a
+                                // client tool call). Fail closed rather than
+                                // stream a call the client cannot act on.
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    event = "buffered_responses_ccr_unresolved",
+                                    "buffered streaming Responses reply still contains headroom_retrieve after handling; failing closed"
+                                );
+                                status = StatusCode::BAD_GATEWAY;
+                                resp_headers.remove(http::header::CONTENT_TYPE);
+                                resp_headers.remove(http::header::CONTENT_LENGTH);
+                                resp_headers.insert(
+                                    http::header::CONTENT_TYPE,
+                                    http::HeaderValue::from_static("text/event-stream"),
+                                );
+                                Body::from(crate::openai_buffered_ccr::openai_sse_error_event(
+                                    "server_error",
+                                    "Unable to safely complete streamed CCR retrieval.",
+                                ))
+                            } else {
+                                resp_headers.remove(http::header::CONTENT_TYPE);
+                                resp_headers.remove(http::header::CONTENT_LENGTH);
+                                resp_headers.insert(
+                                    http::header::CONTENT_TYPE,
+                                    http::HeaderValue::from_static("text/event-stream"),
+                                );
+                                let frames =
+                                    crate::openai_buffered_ccr::responses_json_to_sse(&json);
+                                let mut out = bytes::BytesMut::with_capacity(
+                                    frames.iter().map(|f| f.len()).sum(),
+                                );
+                                for f in &frames {
+                                    out.extend_from_slice(f);
+                                }
+                                Body::from(out.freeze())
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                event = "buffered_responses_ccr_malformed",
+                                body_bytes = body_bytes.len(),
+                                "rejecting malformed buffered Responses 200 reply"
+                            );
+                            status = StatusCode::BAD_GATEWAY;
+                            resp_headers.remove(http::header::CONTENT_TYPE);
+                            resp_headers.remove(http::header::CONTENT_LENGTH);
+                            resp_headers.insert(
+                                http::header::CONTENT_TYPE,
+                                http::HeaderValue::from_static("application/json"),
+                            );
+                            Body::from(crate::openai_buffered_ccr::openai_json_error_body(
+                                crate::openai_buffered_ccr::GENERIC_FAILURE_MESSAGE,
+                            ))
+                        }
+                    }
+                } else {
+                    Body::from(body_bytes)
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -7413,12 +7717,14 @@ pub(crate) async fn forward_http(
         // properly — marked as truncated — so a dead connection costs one
         // short answer instead of the session. It runs above the telemetry
         // tee, so accounting still books the turn as the incomplete one it was.
-        Body::from_stream(crate::sse::stream_finisher::finish_on_drop(
-            resp_stream,
-            request_id.clone(),
+        // `track_streaming` keeps the drain check nonzero until the last byte:
+        // without it the pipeline guard already dropped and a rotation reads
+        // idle mid-stream.
+        Body::from_stream(track_streaming(
+            crate::sse::stream_finisher::finish_on_drop(resp_stream, request_id.clone()),
         ))
     } else {
-        Body::from_stream(resp_stream)
+        Body::from_stream(track_streaming(resp_stream))
     };
 
     // One observation per upstream response, whatever its status. The refusal

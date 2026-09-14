@@ -3398,6 +3398,28 @@ pub fn compress_openai_chat_live_zone(
     _auth_mode: AuthMode,
     model: &str,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_openai_chat_live_zone_with_config(
+        body_raw,
+        _auth_mode,
+        model,
+        &DispatchConfig::default(),
+    )
+}
+
+/// [`compress_openai_chat_live_zone`] with an operator [`DispatchConfig`].
+///
+/// Honors `--exclude-tools` on tool outputs with the same guard lattice as
+/// the Anthropic planner ([`collect_tool_guards`] minus the CCR and
+/// protected-read arms, which have no OpenAI-path equivalent): verbatim- or
+/// byte-exact-listed tools pass through untouched, other excluded tools get
+/// the reversible lossless fold only. Unresolvable `tool_call_id`s fail open
+/// (normal compression), matching the Anthropic planner's unknown-id path.
+pub fn compress_openai_chat_live_zone_with_config(
+    body_raw: &[u8],
+    _auth_mode: AuthMode,
+    model: &str,
+    dispatch_config: &DispatchConfig,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
         .get("messages")
@@ -3467,8 +3489,10 @@ pub fn compress_openai_chat_live_zone(
     // message can be attributed to the tool that produced it. A byte-exact
     // file read (Read/read/read_file/Skill/skill) must reach the model as
     // the bytes the file holds — the Anthropic planner's `ByteExact` guard
-    // on the same names. This path never consulted `--exclude-tools`, so
-    // the builtin set (not the operator list) is the gate here.
+    // on the same names. Operator `--exclude-tools` rides the same map with
+    // the same lattice as `collect_tool_guards` (verbatim/byte-exact →
+    // untouched, other excluded → lossless fold only); unresolvable ids
+    // fail open, matching the Anthropic unknown-id path.
     let tool_name_by_call_id: HashMap<&str, &str> = messages
         .iter()
         .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
@@ -3484,23 +3508,52 @@ pub fn compress_openai_chat_live_zone(
         .collect();
 
     for (msg_idx, slot) in all_slots {
-        let byte_exact_tool_output = slot.block_type == "tool_content"
-            && messages
+        // Operator + builtin guard for tool outputs only (user prose has no
+        // tool attribution and always takes the normal path below). Lattice
+        // mirrors `collect_tool_guards` minus the CCR/protected-read arms,
+        // which have no OpenAI-path equivalent; unresolvable ids fail open,
+        // matching the Anthropic unknown-id path.
+        if slot.block_type == "tool_content" {
+            let tool_name = messages
                 .get(msg_idx)
                 .and_then(|m| m.get("tool_call_id"))
                 .and_then(Value::as_str)
                 .and_then(|id| tool_name_by_call_id.get(id))
-                .is_some_and(|name| is_byte_exact_excluded(name));
-        if byte_exact_tool_output {
-            block_outcomes.push(BlockOutcome {
-                message_index: msg_idx,
-                block_index: slot.block_index,
-                block_type: slot.block_type,
-                action: BlockAction::Excluded {
-                    reason: ExclusionReason::ExcludedTool,
-                },
+                .copied();
+            let excluded = tool_name.is_some_and(|name| {
+                is_tool_excluded(
+                    name,
+                    dispatch_config.exclude_tools.iter().map(String::as_str),
+                )
             });
-            continue;
+            let verbatim = tool_name.is_some_and(|name| is_verbatim_excluded(name));
+            let byte_exact = tool_name.is_some_and(|name| is_byte_exact_excluded(name));
+            // Builtin byte-exact always holds (pre-existing behavior);
+            // operator exclusion adds verbatim/byte-exact passthrough.
+            if byte_exact || (excluded && verbatim) {
+                block_outcomes.push(BlockOutcome {
+                    message_index: msg_idx,
+                    block_index: slot.block_index,
+                    block_type: slot.block_type,
+                    action: BlockAction::Excluded {
+                        reason: ExclusionReason::ExcludedTool,
+                    },
+                });
+                continue;
+            }
+            // Other excluded tools: reversible lossless fold only.
+            if excluded {
+                block_outcomes.push(compact_one_block_lossless(
+                    &slot.content_text,
+                    slot.content_byte_range,
+                    msg_idx,
+                    slot.block_index,
+                    slot.block_type,
+                    tokenizer.as_ref(),
+                    &mut replacements,
+                ));
+                continue;
+            }
         }
         let detected = detect_content_type(&slot.content_text);
         let outcome = compress_one_block(
@@ -3900,6 +3953,148 @@ mod openai_chat_tests {
             }
         }
     }
+
+    fn excluded_config(exclude: &[&str]) -> DispatchConfig {
+        DispatchConfig {
+            exclude_tools: exclude.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Operator `--exclude-tools` reaches the OpenAI chat path: an excluded
+    /// tool's output must not reach a lossy compressor (lossless fold only),
+    /// while the same payload without the exclusion compresses lossily.
+    #[test]
+    fn excluded_tool_output_is_lossless_only() {
+        let payload = format!(
+            "2024-01-01 12:00:00 INFO  worker: starting up\n{}",
+            "2024-01-01 12:00:01 WARN  worker: retrying connection\n".repeat(200)
+        );
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "running",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                "function": {"name": "Bash", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": payload},
+            ]
+        }));
+        // Control first: no exclusion → lossy log compressor.
+        let lossy = compress_openai_chat_live_zone_with_config(
+            &b,
+            AuthMode::Payg,
+            "gpt-4o",
+            &excluded_config(&[]),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &lossy,
+                LiveZoneOutcome::Modified { manifest, .. }
+                    if manifest.block_outcomes.iter().any(|o| matches!(
+                        o.action,
+                        BlockAction::Compressed {
+                            strategy: STRATEGY_LOG_COMPRESSOR,
+                            ..
+                        }
+                    ))
+            ),
+            "control: got {:?}",
+            lossy
+        );
+        let out = compress_openai_chat_live_zone_with_config(
+            &b,
+            AuthMode::Payg,
+            "gpt-4o",
+            &excluded_config(&["Bash"]),
+        )
+        .unwrap();
+        match &out {
+            LiveZoneOutcome::Modified { manifest, .. } => {
+                assert!(
+                    manifest.block_outcomes.iter().any(|o| matches!(
+                        o.action,
+                        BlockAction::Compressed {
+                            strategy: STRATEGY_EXCLUDED_TOOL_LOSSLESS,
+                            ..
+                        }
+                    )),
+                    "got {:?}",
+                    manifest
+                        .block_outcomes
+                        .iter()
+                        .map(|o| &o.action)
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    manifest.block_outcomes.iter().all(|o| !matches!(
+                        o.action,
+                        BlockAction::Compressed {
+                            strategy: STRATEGY_LOG_COMPRESSOR,
+                            ..
+                        }
+                    )),
+                    "lossy compressor must not touch excluded output: {:?}",
+                    manifest
+                        .block_outcomes
+                        .iter()
+                        .map(|o| &o.action)
+                        .collect::<Vec<_>>()
+                );
+            }
+            LiveZoneOutcome::NoChange { manifest } => {
+                // Also acceptable: nothing lossy ran. The fold may decline
+                // (e.g. tokenizer gate) while still recording Excluded.
+                assert!(
+                    manifest.block_outcomes.iter().all(|o| !matches!(
+                        o.action,
+                        BlockAction::Compressed {
+                            strategy: STRATEGY_LOG_COMPRESSOR,
+                            ..
+                        }
+                    )),
+                    "got {:?}",
+                    manifest
+                        .block_outcomes
+                        .iter()
+                        .map(|o| &o.action)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// Empty exclusion list is byte-identical to the default path (the
+    /// pre-existing `compress_openai_chat_live_zone` contract).
+    #[test]
+    fn empty_exclude_list_matches_default_path() {
+        let payload = format!(
+            "2024-01-01 12:00:00 INFO  worker: starting up\n{}",
+            "2024-01-01 12:00:01 WARN  worker: retrying connection\n".repeat(200)
+        );
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "running",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                "function": {"name": "Bash", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": payload},
+            ]
+        }));
+        let a = compress_openai_chat_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        let c = compress_openai_chat_live_zone_with_config(
+            &b,
+            AuthMode::Payg,
+            "gpt-4o",
+            &excluded_config(&[]),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{c:?}"),
+            "empty config must match the default path"
+        );
+    }
 }
 
 // ─── OpenAI Responses live-zone dispatcher (Phase C PR-C3) ────────────
@@ -3970,6 +4165,28 @@ pub fn compress_openai_responses_live_zone(
     _auth_mode: AuthMode,
     model: &str,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_openai_responses_live_zone_with_config(
+        body_raw,
+        _auth_mode,
+        model,
+        &DispatchConfig::default(),
+    )
+}
+
+/// [`compress_openai_responses_live_zone`] with an operator [`DispatchConfig`].
+///
+/// Honors `--exclude-tools` on `*_output` items with the same guard lattice
+/// as the Anthropic planner (minus the CCR/protected-read arms, which have
+/// no Responses-path equivalent). Attribution is direct — `function_call`
+/// items carry `call_id` + `name` together, so no cross-message resolution
+/// is needed; outputs whose `call_id` matches no call item fail open,
+/// matching the Anthropic unknown-id path.
+pub fn compress_openai_responses_live_zone_with_config(
+    body_raw: &[u8],
+    _auth_mode: AuthMode,
+    model: &str,
+    dispatch_config: &DispatchConfig,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
 
     // Responses uses `input`. We accept both `input` and `messages`
@@ -4008,11 +4225,18 @@ pub fn compress_openai_responses_live_zone(
     // and no fold may rewrite them. This path has no fold step, so one
     // passthrough covers both.
     let mut byte_exact_tool_call_ids: HashSet<&str> = HashSet::new();
+    // Operator `--exclude-tools` attribution. `function_call` items carry
+    // `call_id` + `name` together, so outputs resolve directly — no
+    // cross-message scan needed. Outputs whose `call_id` matches no call
+    // item fail open (normal compression), matching the Anthropic
+    // unknown-id path.
+    let mut call_name_by_id: HashMap<&str, &str> = HashMap::new();
     for item in items {
         let type_tag = item.get("type").and_then(Value::as_str).unwrap_or("");
         if type_tag == "function_call" {
             let name = item.get("name").and_then(Value::as_str).unwrap_or("");
             if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                call_name_by_id.insert(call_id, name);
                 if name == "headroom_retrieve" || name.ends_with("__headroom_retrieve") {
                     headroom_retrieve_call_ids.insert(call_id);
                 }
@@ -4042,7 +4266,10 @@ pub fn compress_openai_responses_live_zone(
     }
 
     let mut output_candidates: Vec<(usize, &str)> = Vec::new();
-    let latest_message: Option<usize> = None;
+    // FINDING-012: previously hardcoded None, so documented latest-message
+    // compression never ran. Track the last `message` item per spec PR-C3
+    // (latest `message` text content); output items above stay live too.
+    let mut latest_message: Option<usize> = None;
 
     for (idx, item) in items.iter().enumerate() {
         let type_tag = item.get("type").and_then(Value::as_str).unwrap_or("");
@@ -4054,6 +4281,12 @@ pub fn compress_openai_responses_live_zone(
                 }
                 output_candidates.push((idx, type_tag));
             }
+            "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
+                // Only user-role messages are eligible (assistant `message`
+                // items are never planned — see assistant_message_not_in_live_zone).
+                latest_message = Some(idx);
+            }
+            "message" => {}
             _ => {}
         }
     }
@@ -4170,12 +4403,41 @@ pub fn compress_openai_responses_live_zone(
             block_outcomes.push(BlockOutcome {
                 message_index: msg_idx,
                 block_index: slot.block_index,
-                block_type: slot.block_type.clone(),
+                block_type: slot.block_type,
                 action: BlockAction::Excluded {
                     reason: ExclusionReason::ExcludedTool,
                 },
             });
             continue;
+        }
+        // Operator `--exclude-tools` on output items (message slots have no
+        // tool attribution and skip this): verbatim/byte-exact members were
+        // already passed through above; other excluded tools get the
+        // reversible lossless fold only. Unresolvable `call_id`s fail open.
+        if slot.is_output_item {
+            let excluded = items
+                .get(msg_idx)
+                .and_then(|item| item.get("call_id"))
+                .and_then(Value::as_str)
+                .and_then(|id| call_name_by_id.get(id))
+                .is_some_and(|name| {
+                    is_tool_excluded(
+                        name,
+                        dispatch_config.exclude_tools.iter().map(String::as_str),
+                    )
+                });
+            if excluded {
+                block_outcomes.push(compact_one_block_lossless(
+                    &slot.content_text,
+                    slot.content_byte_range,
+                    msg_idx,
+                    slot.block_index,
+                    slot.block_type,
+                    tokenizer.as_ref(),
+                    &mut replacements,
+                ));
+                continue;
+            }
         }
         let detected = detect_content_type(&slot.content_text);
         let outcome = compress_one_block(
@@ -4644,8 +4906,100 @@ mod openai_responses_tests {
         }
     }
 
+    fn excluded_responses_config(exclude: &[&str]) -> DispatchConfig {
+        DispatchConfig {
+            exclude_tools: exclude.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Operator `--exclude-tools` reaches the Responses path: an excluded
+    /// call's output must not reach a lossy compressor. Attribution is
+    /// direct (`function_call` carries `call_id` + `name` together).
     #[test]
-    fn message_user_content_not_in_live_zone() {
+    fn excluded_function_call_output_is_lossless_only() {
+        let mut log = String::new();
+        for i in 0..400 {
+            log.push_str(&format!(
+                "[2024-01-01 00:00:00] INFO compile.rs:42 building module foo_{i}\n"
+            ));
+        }
+        let b = body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "Bash", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": log}
+            ]
+        }));
+        let out = compress_openai_responses_live_zone_with_config(
+            &b,
+            AuthMode::Payg,
+            "gpt-4o",
+            &excluded_responses_config(&["Bash"]),
+        )
+        .unwrap();
+        let manifest = match &out {
+            LiveZoneOutcome::Modified { manifest, .. } | LiveZoneOutcome::NoChange { manifest } => {
+                manifest
+            }
+        };
+        assert!(
+            manifest.block_outcomes.iter().all(|o| !matches!(
+                o.action,
+                BlockAction::Compressed { strategy, .. } if strategy != STRATEGY_EXCLUDED_TOOL_LOSSLESS
+            )),
+            "lossy compressor must not touch excluded output: {:?}",
+            manifest.block_outcomes.iter().map(|o| &o.action).collect::<Vec<_>>()
+        );
+    }
+
+    /// Outputs whose `call_id` matches no `function_call` item fail open
+    /// (normal compression), matching the Anthropic unknown-id path.
+    #[test]
+    fn orphan_output_call_id_fails_open() {
+        let mut log = String::new();
+        for i in 0..400 {
+            log.push_str(&format!(
+                "[2024-01-01 00:00:00] INFO compile.rs:42 building module foo_{i}\n"
+            ));
+        }
+        let b = body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call_output", "call_id": "ghost", "output": log}
+            ]
+        }));
+        let out = compress_openai_responses_live_zone_with_config(
+            &b,
+            AuthMode::Payg,
+            "gpt-4o",
+            &excluded_responses_config(&["Bash"]),
+        )
+        .unwrap();
+        let manifest = match &out {
+            LiveZoneOutcome::Modified { manifest, .. } | LiveZoneOutcome::NoChange { manifest } => {
+                manifest
+            }
+        };
+        assert!(
+            manifest.block_outcomes.iter().any(|o| matches!(
+                o.action,
+                BlockAction::Compressed { .. } | BlockAction::RejectedNotSmaller { .. }
+            )),
+            "orphan output must still compress: {:?}",
+            manifest
+                .block_outcomes
+                .iter()
+                .map(|o| &o.action)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn message_user_tiny_content_below_threshold() {
+        // FINDING-012: the latest user `message` IS a live-zone candidate
+        // (spec PR-C3); tiny content simply yields a BelowByteThreshold
+        // NoChange rather than compression.
         let b = body(json!({
             "model": "gpt-4o",
             "input": [
@@ -4656,7 +5010,13 @@ mod openai_responses_tests {
         let out = compress_openai_responses_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
         match &out {
             LiveZoneOutcome::NoChange { manifest } => {
-                assert!(manifest.block_outcomes.is_empty());
+                assert_eq!(manifest.latest_user_message_index, Some(0));
+                assert!(manifest.block_outcomes.iter().all(|o| matches!(
+                    o.action,
+                    BlockAction::BelowByteThreshold { .. }
+                        | BlockAction::RejectedNotSmaller { .. }
+                        | BlockAction::NoCompressionApplied { .. }
+                )));
             }
             _ => panic!("expected NoChange"),
         }

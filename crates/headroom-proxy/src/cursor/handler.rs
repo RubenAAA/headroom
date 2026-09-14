@@ -79,8 +79,17 @@ pub(crate) async fn handle(
     parsed: &Value,
     session_key: &str,
     cursor_model: &str,
+    request_id: &str,
 ) -> Response {
     let key = crate::ctx::identity::conversation_key(parsed, session_key);
+    // Owned booking context: the driver task outlives this handler on
+    // disconnects, so everything it needs crosses the spawn boundary.
+    let booking = CursorBooking {
+        request_id: request_id.to_string(),
+        model: cursor_model.to_string(),
+        started_at: std::time::Instant::now(),
+        sink: std::sync::Arc::new(crate::proxy::ProxyOutcomeSink::from_state(&state)),
+    };
 
     // A turn carrying tool results is the continuation of a conversation that
     // is parked mid-tool: its agent is alive and blocked inside an MCP request.
@@ -139,7 +148,14 @@ pub(crate) async fn handle(
                     if let Some(tools) = parsed.get("tools").and_then(Value::as_array) {
                         session.set_tools(tools.clone()).await;
                     }
-                    return drive(state.clone(), key, driver, wants_stream(parsed)).await;
+                    return drive(
+                        state.clone(),
+                        key,
+                        booking.clone(),
+                        driver,
+                        wants_stream(parsed),
+                    )
+                    .await;
                 }
             }
             (session_opt, driver_opt) => {
@@ -227,7 +243,37 @@ pub(crate) async fn handle(
     };
 
     let convo = Conversation::new(session, inbox, running, workspace);
-    drive(state, key, convo, wants_stream(parsed)).await
+    drive(state, key, booking, convo, wants_stream(parsed)).await
+}
+
+/// What completion booking needs, captured at turn start. The driver task
+/// outlives the request handler when the client disconnects, so everything
+/// crosses the spawn boundary owned.
+#[derive(Clone)]
+struct CursorBooking {
+    request_id: String,
+    model: String,
+    started_at: std::time::Instant,
+    sink: std::sync::Arc<crate::proxy::ProxyOutcomeSink>,
+}
+
+/// Book one HTTP turn from the agent's latest reported counts. Skipped
+/// inside the funnel when the turn reported nothing (a paused response
+/// carries no `result` yet); the resume's booking covers the invocation
+/// that actually ran. Failed turns book as failed, never as served.
+fn book_cursor_turn(booking: &CursorBooking, convo: &Conversation) {
+    let (usage, failed) = convo.booking_snapshot();
+    crate::routed::outcome::book_cursor_outcome(
+        &booking.sink,
+        &booking.request_id,
+        &booking.model,
+        usage.input_tokens as i64,
+        usage.output_tokens as i64,
+        usage.cache_read_input_tokens as i64,
+        usage.cache_creation_input_tokens as i64,
+        failed,
+        booking.started_at,
+    );
 }
 
 /// Stream one response off a driver, and decide what becomes of the driver when
@@ -248,11 +294,17 @@ fn wants_stream(parsed: &Value) -> bool {
         .unwrap_or(false)
 }
 
-async fn drive(state: AppState, key: String, convo: Conversation, stream: bool) -> Response {
+async fn drive(
+    state: AppState,
+    key: String,
+    booking: CursorBooking,
+    convo: Conversation,
+    stream: bool,
+) -> Response {
     if stream {
-        stream_driver(state, key, convo)
+        stream_driver(state, key, booking, convo)
     } else {
-        collect_driver(state, key, convo).await
+        collect_driver(state, key, booking, convo).await
     }
 }
 
@@ -262,9 +314,14 @@ async fn drive(state: AppState, key: String, convo: Conversation, stream: bool) 
 /// same parking on a tool call — and the frames are folded back into a message
 /// here rather than written to the wire. Driving it differently would mean two
 /// transports to keep honest.
-async fn collect_driver(state: AppState, key: String, convo: Conversation) -> Response {
+async fn collect_driver(
+    state: AppState,
+    key: String,
+    booking: CursorBooking,
+    convo: Conversation,
+) -> Response {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
-    spawn_driver(state, key, convo, tx);
+    spawn_driver(state, key, booking, convo, tx);
 
     let mut frames = Vec::new();
     while let Some(frame) = rx.recv().await {
@@ -394,6 +451,7 @@ fn append_str(block: &mut Value, field: &str, add: Option<&Value>) {
 fn spawn_driver(
     state: AppState,
     key: String,
+    booking: CursorBooking,
     mut convo: Conversation,
     tx: tokio::sync::mpsc::Sender<Result<String, std::io::Error>>,
 ) {
@@ -404,6 +462,7 @@ fn spawn_driver(
                 Step::Emit(frames) => {
                     for frame in frames {
                         if tx.send(Ok(frame)).await.is_err() {
+                            book_cursor_turn(&booking, &convo);
                             convo.shutdown().await;
                             bridge.close(&key).await;
                             return;
@@ -414,13 +473,16 @@ fn spawn_driver(
                     for frame in frames {
                         let _ = tx.send(Ok(frame)).await;
                     }
-                    // The response ends here; the conversation does not. The
-                    // agent stays alive, blocked inside its MCP call, until a
-                    // request arrives carrying the tool result.
+                    // The response ends here; the conversation does not. Book
+                    // whatever this invocation reported (usually nothing yet —
+                    // skipped) and park the agent for the resume, whose End
+                    // books that invocation's counts.
+                    book_cursor_turn(&booking, &convo);
                     bridge.park_driver(&key, convo).await;
                     return;
                 }
                 Step::End => {
+                    book_cursor_turn(&booking, &convo);
                     convo.shutdown().await;
                     bridge.close(&key).await;
                     return;
@@ -430,11 +492,19 @@ fn spawn_driver(
     });
 }
 
-fn stream_driver(state: AppState, key: String, convo: Conversation) -> Response {
+fn stream_driver(
+    state: AppState,
+    key: String,
+    booking: CursorBooking,
+    convo: Conversation,
+) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(16);
-    spawn_driver(state, key, convo, tx);
+    spawn_driver(state, key, booking, convo, tx);
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    // Keep the drain check nonzero until the client has the last byte: the
+    // pipeline guard already dropped when this `Response` is built.
+    let stream = crate::proxy::track_streaming(stream);
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")

@@ -200,6 +200,7 @@ impl RolloutSnapshot {
             .expect("every registered feature has a decision")
     }
 
+    /// `_explicit` is reserved and currently ignored.
     pub fn is_enabled(&self, feature: Feature, _explicit: bool) -> bool {
         self.decision(feature).enabled
     }

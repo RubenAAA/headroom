@@ -87,7 +87,13 @@ impl OffloadTransform for ProseFieldOffload {
                 "prose compression not worth it",
             ));
         };
-        store.put(&key, content);
+        if !store.put(&key, content) {
+            tracing::warn!(
+                target = "ccr.prose_field",
+                hash = %key,
+                "ccr_put_failed; marker will point at an unretrievable hash"
+            );
+        }
         Ok(OffloadOutput::from_lengths(content.len(), output, key))
     }
 

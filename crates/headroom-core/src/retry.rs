@@ -83,6 +83,21 @@ pub fn retry_after_exceeds_cap(header_value: &str, max_ms: u64) -> bool {
     retry_after_ms_uncapped(header_value).is_some_and(|ms| ms > max_ms as f64)
 }
 
+/// Shared delay selection for the proxy's retry loops (C5): a present
+/// `Retry-After` wins (ceiled to whole milliseconds, clamped to `u64`), else
+/// the caller's already-computed backoff passes through untouched.
+///
+/// Deliberately narrow: the loops keep their own attempt indexing, cap
+/// handling, budgets, and labels, which differ on purpose (the routed loop
+/// clamps the total to its cap; `forward_http` does not). Extracting only the
+/// textually-identical selection keeps re-sent bytes identical on both paths
+/// while giving the shared formula one home and one unit test.
+pub fn next_delay_ms(retry_after_uncapped: Option<f64>, backoff_ms: u64) -> u64 {
+    retry_after_uncapped
+        .map(|delay| delay.ceil().min(u64::MAX as f64) as u64)
+        .unwrap_or(backoff_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +155,26 @@ mod tests {
         assert!(retry_after_exceeds_cap("31", 30_000));
         assert!(!retry_after_exceeds_cap("30", 30_000));
         assert!(!retry_after_exceeds_cap("garbage", 30_000));
+    }
+
+    #[test]
+    fn next_delay_prefers_header_ceiled() {
+        assert_eq!(next_delay_ms(Some(2000.0), 111), 2000);
+        assert_eq!(next_delay_ms(Some(1500.4), 111), 1501);
+        assert_eq!(next_delay_ms(Some(0.0), 111), 0);
+    }
+
+    #[test]
+    fn next_delay_absent_header_passes_backoff_through() {
+        assert_eq!(next_delay_ms(None, 111), 111);
+    }
+
+    #[test]
+    fn next_delay_clamps_header_to_u64_without_applying_any_cap() {
+        // Over-cap values pass through here: the loops' exceeds-cap
+        // early-exit owns cap enforcement, and must see the raw value.
+        assert_eq!(next_delay_ms(Some(1e30), 111), u64::MAX);
+        assert_eq!(next_delay_ms(Some(99_999_999.0), 111), 99_999_999);
     }
 
     #[test]

@@ -162,14 +162,23 @@ impl CategoryAutomaton {
 
     /// Highest-priority category whose keyword appears as a *whole word*
     /// in `line`, or `None` if nothing matched.
+    ///
+    /// Scans every match and returns the max-`priority_for` category —
+    /// an early low-priority hit (e.g. `todo`) must not shadow a later
+    /// `error` on the same line.
     fn first_word_match(&self, line: &str) -> Option<ImportanceCategory> {
         let bytes = line.as_bytes();
+        let mut best: Option<(ImportanceCategory, f32)> = None;
         for m in self.automaton.find_iter(line) {
             if is_word_boundary(bytes, m.start(), m.end()) {
-                return Some(self.categories[m.pattern().as_usize()]);
+                let cat = self.categories[m.pattern().as_usize()];
+                let p = priority_for(cat);
+                if best.is_none_or(|(_, bp)| p > bp) {
+                    best = Some((cat, p));
+                }
             }
         }
-        None
+        best.map(|(cat, _)| cat)
     }
 }
 
@@ -402,6 +411,14 @@ mod tests {
         // "panic" inside a normal English word.
         let s = detect("the panicker showed up late", ImportanceContext::Search);
         assert!(!s.is_match());
+    }
+
+    #[test]
+    fn later_error_outranks_earlier_todo() {
+        // FINDING-039: doc promises highest-priority, so a later `error`
+        // must beat an earlier `todo` on the same line.
+        let s = detect("todo: fix the error handler", ImportanceContext::Search);
+        assert_eq!(s.category, Some(ImportanceCategory::Error));
     }
 
     #[test]

@@ -11,8 +11,11 @@ use serde_json::Value;
 /// Frozen messages must not be modified — they are already cache-written
 /// by the provider. Returns `(frozen, mutable)`.
 pub fn split_frozen(messages: &[Value], frozen_message_count: usize) -> (&[Value], &[Value]) {
-    if frozen_message_count == 0 || frozen_message_count >= messages.len() {
+    if frozen_message_count == 0 {
         return (&[], messages);
+    }
+    if frozen_message_count >= messages.len() {
+        return (messages, &[]);
     }
     messages.split_at(frozen_message_count)
 }
@@ -88,16 +91,16 @@ mod tests {
     fn split_frozen_all() {
         let msgs = vec![json!("a"), json!("b")];
         let (frozen, mutable) = split_frozen(&msgs, 2);
-        assert!(frozen.is_empty());
-        assert_eq!(mutable, &msgs);
+        assert_eq!(frozen, &msgs);
+        assert!(mutable.is_empty());
     }
 
     #[test]
     fn split_frozen_beyond_len() {
         let msgs = vec![json!("a")];
         let (frozen, mutable) = split_frozen(&msgs, 100);
-        assert!(frozen.is_empty());
-        assert_eq!(mutable, &msgs);
+        assert_eq!(frozen, &msgs);
+        assert!(mutable.is_empty());
     }
 
     #[test]

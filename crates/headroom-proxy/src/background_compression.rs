@@ -9,6 +9,7 @@
 //! and cache store are injected via traits.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex};
@@ -36,6 +37,12 @@ pub struct BackgroundCompressor {
     tx: mpsc::Sender<CompressionJob>,
     pending: Arc<Mutex<HashSet<String>>>,
     stats: Arc<Mutex<BackgroundStats>>,
+    /// Receiver parked here until the first `enqueue` spawns the drain.
+    /// `new()` must stay callable outside a Tokio runtime (MINOR-055:
+    /// the old eager `tokio::spawn` panicked there); the drain starts
+    /// lazily where a runtime is guaranteed.
+    rx: std::sync::Mutex<Option<mpsc::Receiver<CompressionJob>>>,
+    drain_started: AtomicBool,
     /// The bound the channel was built with, kept for a queue-depth report
     /// that does not exist yet.
     #[allow(dead_code)]
@@ -48,24 +55,52 @@ impl BackgroundCompressor {
         let pending = Arc::new(Mutex::new(HashSet::new()));
         let stats = Arc::new(Mutex::new(BackgroundStats::default()));
 
-        let pending_clone = pending.clone();
-        let stats_clone = stats.clone();
-
-        tokio::spawn(async move {
-            Self::drain_loop(rx, pending_clone, stats_clone).await;
-        });
-
         Self {
             tx,
             pending,
             stats,
+            rx: std::sync::Mutex::new(Some(rx)),
+            drain_started: AtomicBool::new(false),
             max_queue,
         }
     }
 
+    /// Start the drain loop once, on first use. Returns false when there
+    /// is no Tokio runtime to spawn onto — the caller (`enqueue`) then
+    /// reports the job dropped, the same as a full queue, instead of
+    /// panicking.
+    fn ensure_drain(&self) -> bool {
+        if self.drain_started.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+        let rx = self.rx.lock().ok().and_then(|mut g| g.take());
+        let Some(rx) = rx else {
+            return false;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime: park the receiver back and allow a later call
+            // (possibly from a runtime) to retry the spawn.
+            if let Ok(mut g) = self.rx.lock() {
+                *g = Some(rx);
+            }
+            self.drain_started.store(false, Ordering::SeqCst);
+            return false;
+        };
+        let pending_clone = self.pending.clone();
+        let stats_clone = self.stats.clone();
+        handle.spawn(async move {
+            Self::drain_loop(rx, pending_clone, stats_clone).await;
+        });
+        true
+    }
+
     /// Queue a compression job. Returns false (and drops) if the key is
-    /// already in flight or the queue is full.
+    /// already in flight, the queue is full, or no async runtime exists
+    /// to drain the queue (see `ensure_drain`).
     pub async fn enqueue(&self, job: CompressionJob) -> bool {
+        if !self.ensure_drain() {
+            return false;
+        }
         let key = job.key.clone();
 
         // Claim the slot BEFORE the job is observable
@@ -164,6 +199,14 @@ mod tests {
 
         assert!(compressor.enqueue(job1).await);
         assert!(!compressor.enqueue(job2).await);
+    }
+
+    /// MINOR-055: construction must not require a Tokio runtime (the old
+    /// eager spawn panicked here). Plain #[test] has no runtime.
+    #[test]
+    fn new_outside_runtime_does_not_panic() {
+        let compressor = BackgroundCompressor::new(10);
+        assert!(!compressor.drain_started.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

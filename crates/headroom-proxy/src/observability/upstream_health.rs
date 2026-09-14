@@ -173,6 +173,15 @@ pub fn observe_rejection_reason(status: u16, error_type: &str, error_message: &s
 ///
 /// Called for every response the proxy gets back, because a rejection count
 /// without a total is the number that let this go unnoticed.
+///
+/// FINDING-038: `rejections_total` counts every non-2xx (429, 5xx
+/// included) while the alert window pushes only `is_proxy_fault` (4xx
+/// minus 429). That split is intentional, not an overcount: the counter
+/// is the raw denominator material (per-status labels keep 429/5xx
+/// separable, and the HELP text says exactly this), while the alert must
+/// fire only on the proxy's own faults. Summing the counter across
+/// statuses is not the alert rate — divide the 4xx-minus-429 labels for
+/// that.
 pub fn observe_upstream_response(status: u16) {
     let registry = super::prometheus::registry();
     responses_total(registry).inc();

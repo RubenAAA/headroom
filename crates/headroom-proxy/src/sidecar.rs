@@ -620,7 +620,9 @@ async fn forward(
         // declared no longer describes what the client will read.
         out.remove(axum::http::header::CONTENT_LENGTH);
     }
-    match builder.body(Body::from_stream(upstream_resp.bytes_stream())) {
+    match builder.body(Body::from_stream(crate::proxy::track_streaming(
+        upstream_resp.bytes_stream(),
+    ))) {
         Ok(response) => Some(response),
         Err(e) => fall_back(request_id, None, &format!("building sidecar response: {e}")),
     }

@@ -21,6 +21,13 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
+/// The Responses endpoint ChatGPT-auth Codex traffic speaks. A ChatGPT
+/// subscription is fingerprinted upstream, so Codex routes addressed at
+/// `api.openai.com` go here instead of the generic `/v1/responses`.
+pub(crate) fn codex_endpoint() -> &'static str {
+    "https://chatgpt.com/backend-api/codex/responses"
+}
+
 /// Resolve a file that lives alongside auth.json in the codex home dir.
 pub(crate) fn codex_home_sibling(
     auth_file: Option<&str>,
@@ -160,7 +167,20 @@ pub(crate) async fn refresh_codex_token(
     }
     parsed["last_refresh"] = json!(chrono::Utc::now().to_rfc3339());
     if let Ok(serialized) = serde_json::to_string_pretty(&parsed) {
-        if let Err(e) = std::fs::write(auth_file, serialized) {
+        // Write temp-in-same-dir + rename so a crash mid-write cannot leave a
+        // truncated auth file behind (same filesystem => atomic rename).
+        let persist_result = (|| -> std::io::Result<()> {
+            let parent = std::path::Path::new(auth_file)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty());
+            let mut tmp =
+                tempfile::NamedTempFile::new_in(parent.unwrap_or(std::path::Path::new(".")))?;
+            use std::io::Write as _;
+            tmp.write_all(serialized.as_bytes())?;
+            tmp.persist(auth_file).map(|_| ()).map_err(|e| e.error)?;
+            Ok(())
+        })();
+        if let Err(e) = persist_result {
             tracing::warn!(
                 event = "codex_token_persist_failed",
                 error = %e,

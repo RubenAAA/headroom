@@ -10,6 +10,47 @@ use crate::handlers::reasoning_signature::{encode_reasoning_signature, PendingRe
 use crate::routed::outcome::{book_routed_outcome, RoutedOutcomeContext};
 use serde_json::{json, Value};
 
+/// First-round provider usage captured for a turn whose booking waits
+/// downstream. Written when usage arrives and at every outcome emission, so
+/// the completion guard books exactly what an immediate booking would have.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeferredFirstRound {
+    pub usage: Option<Value>,
+    pub output_tokens: i64,
+    pub ttfb_ms: f64,
+    /// Provisional 200 until a terminal event records the real code; a usage
+    /// chunk never arrives after a terminal event (the `terminated` flag
+    /// guards it), so the provisional value cannot clobber a real one.
+    pub status_code: i64,
+}
+
+/// Defers a streamed turn's booking to the completion guard in
+/// `routed::response_arms`, which folds continuation rounds in. The
+/// translator keeps `outcome` for everything else — usage observation,
+/// replay completion, TTFB, quota warnings — only the book call moves.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeferredCcrBooking {
+    /// Continuation rounds, populated by the rewriter task after the
+    /// translator's `[DONE]`. Shared, never moved.
+    pub rounds: std::sync::Arc<std::sync::Mutex<crate::proxy::CcrRoundUsage>>,
+    /// First-round usage snapshot, written by the translator as it streams.
+    pub first: std::sync::Arc<std::sync::Mutex<DeferredFirstRound>>,
+}
+
+impl DeferredCcrBooking {
+    pub(crate) fn new() -> Self {
+        Self {
+            rounds: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::proxy::CcrRoundUsage::default(),
+            )),
+            first: std::sync::Arc::new(std::sync::Mutex::new(DeferredFirstRound {
+                status_code: 200,
+                ..Default::default()
+            })),
+        }
+    }
+}
+
 /// Safety net for turns that never reach a terminal event — a client
 /// disconnect, or an upstream that drops the connection mid-stream. Those
 /// tokens were still spent and still cost money, and the Claude path books
@@ -71,6 +112,14 @@ pub(crate) struct StreamTranslator {
     /// currently streaming. `arguments.done` carries the whole arguments and
     /// replays them when no delta did.
     saw_arg_delta: bool,
+    /// Whether visible thinking text reached the client for the reasoning item
+    /// currently streaming. A reasoning item that streamed no summary text
+    /// carries nothing a human can read — only the replay envelope — so on
+    /// upstreams that discard reasoning anyway (Zen/spark, see
+    /// `strip_unreplayable_reasoning`) emitting its block is pure noise: an
+    /// empty thinking box in the transcript plus prefix churn the provider
+    /// never sees. The `output_item.done` arm reads this to decide.
+    saw_thinking_text: bool,
     /// Set once the turn was closed early (`abort_terminal`): any straggler
     /// frames after a transport error must not reopen it.
     terminated: bool,
@@ -88,6 +137,10 @@ pub(crate) struct StreamTranslator {
     /// Where to book the turn once usage arrives. `None` in unit tests, which
     /// assert on translated events rather than metrics.
     outcome: Option<RoutedOutcomeContext>,
+    /// When set, `emit_outcome` records into `first` instead of booking: the
+    /// rewriter downstream owns the single booking, with rounds folded in.
+    /// Everything else `outcome` drives stays live.
+    deferred_ccr: Option<DeferredCcrBooking>,
     /// Guards against booking one turn twice. A stream can carry a terminal
     /// event *and* a trailing `[DONE]`, and the buffered fallback can fire on
     /// top of that.
@@ -180,12 +233,14 @@ impl StreamTranslator {
             saw_text_delta: false,
             saw_refusal_delta: false,
             saw_arg_delta: false,
+            saw_thinking_text: false,
             terminated: false,
             pending_reasoning: PendingReasoning::default(),
             codex_limits: None,
             codex_rate_limits_seen: false,
             codex_rate_limits_finished: false,
             outcome: None,
+            deferred_ccr: None,
             outcome_emitted: false,
             observation_completed: false,
             ttfb_ms: 0.0,
@@ -229,6 +284,52 @@ impl StreamTranslator {
         self
     }
 
+    /// Hand booking downstream: the completion guard books once, with
+    /// continuation rounds folded in. Observation, replay, TTFB, and quota
+    /// paths keep working off `outcome` unchanged.
+    fn with_deferred_ccr(mut self, deferred: DeferredCcrBooking) -> Self {
+        self.deferred_ccr = Some(deferred);
+        self
+    }
+
+    /// Snapshot first-round usage for the deferred booking. Written when
+    /// usage arrives (status provisional) and overwritten at every outcome
+    /// emission with the terminal status code. The output fallback follows
+    /// the provider-wins rule below, so the guard books what the buffered
+    /// arm would book for the same usage.
+    fn record_deferred_first(&self, usage: Option<&Value>, status_code: i64) {
+        let Some(deferred) = self.deferred_ccr.as_ref() else {
+            return;
+        };
+        if let Ok(mut first) = deferred.first.lock() {
+            *first = DeferredFirstRound {
+                usage: usage.cloned(),
+                output_tokens: Self::output_fallback(usage, self.total_output_tokens),
+                ttfb_ms: self.ttfb_ms,
+                status_code,
+            };
+        }
+    }
+
+    /// Output fallback for booking: the provider's own count wins whenever
+    /// it reported one (matching the buffered arms, which pass a
+    /// shape-derived fallback the reported numbers already cover). The
+    /// translator's running count survives only for provider-silent turns —
+    /// dropped streams whose usage block never arrived — where it is the
+    /// only number there is.
+    fn output_fallback(usage: Option<&Value>, counted: u64) -> i64 {
+        let reported = usage.and_then(|u| {
+            u.get("output_tokens")
+                .or_else(|| u.get("completion_tokens"))
+                .and_then(|v| v.as_i64())
+        });
+        if reported.is_some() {
+            0
+        } else {
+            counted as i64
+        }
+    }
+
     /// Close out the CTX-7 usage observation parked at request time.
     ///
     /// `begin_request` leaves a pending entry keyed by request id; without a
@@ -245,6 +346,19 @@ impl StreamTranslator {
         let Some(ctx) = self.outcome.as_ref() else {
             return;
         };
+        // Spark bills from a different cache universe than the Anthropic
+        // footprint this observer scores (translated prefix, no write/TTL
+        // telemetry, separate per-model lineage). Booking it here reads as a
+        // bust on nearly every turn and drags the fleet hit rate down for no
+        // reason, so Spark stays out of cache health entirely — the request
+        // side already skips parking it, and this guard covers any turn that
+        // parked through another path. Spend is still booked through the
+        // outcome funnel; only the cache-health signal skips it.
+        if self.model.to_lowercase().contains("spark") || ctx.model.to_lowercase().contains("spark")
+        {
+            self.observation_completed = true;
+            return;
+        }
         let Some(observer) = ctx.usage_observer.as_ref() else {
             return;
         };
@@ -345,11 +459,18 @@ impl StreamTranslator {
         let Some(ctx) = self.outcome.as_ref() else {
             return;
         };
+        // Deferred turns book downstream with rounds folded in; record the
+        // terminal numbers here and disarm, so Drop cannot book a second time.
+        if self.deferred_ccr.is_some() {
+            self.record_deferred_first(usage, status_code);
+            self.outcome_emitted = true;
+            return;
+        }
         self.outcome_emitted = true;
         book_routed_outcome(
             ctx,
             usage,
-            self.total_output_tokens as i64,
+            Self::output_fallback(usage, self.total_output_tokens),
             self.ttfb_ms,
             status_code,
         );
@@ -432,6 +553,9 @@ impl StreamTranslator {
             }
             if !usage.is_null() {
                 self.last_usage = Some(usage.clone());
+                // Snapshot for a deferred booking while the numbers are hot;
+                // the terminal emission below overwrites with its status code.
+                self.record_deferred_first(Some(usage), 200);
             }
         }
 
@@ -576,6 +700,7 @@ impl StreamTranslator {
                     if !delta.is_empty() {
                         self.open_block(OpenBlock::Thinking, &mut events);
                         events.push(self.emit_thinking_delta(delta));
+                        self.saw_thinking_text = true;
                     }
                 }
             }
@@ -613,6 +738,9 @@ impl StreamTranslator {
                     if let Some(item) = item {
                         self.pending_reasoning.capture(item);
                     }
+                    // Per item, not per stream: the `.done` arm judges each
+                    // item on its own visible thinking (see `saw_thinking_text`).
+                    self.saw_thinking_text = false;
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -706,13 +834,29 @@ impl StreamTranslator {
                         .as_ref()
                         .and_then(encode_reasoning_signature);
                     self.pending_reasoning.reset();
+                    // Judged on this item's own visible thinking, then consumed:
+                    // a later silent item must not inherit an earlier one's.
+                    let visible_thinking = self.saw_thinking_text;
+                    self.saw_thinking_text = false;
                     if let Some(signature) = signature {
-                        // Reasoning summaries can be off entirely, in which case
-                        // no block was ever opened. Open an empty one rather
-                        // than drop the only copy of the item.
-                        self.open_block(OpenBlock::Thinking, &mut events);
-                        events.push(self.emit_signature_delta(&signature));
-                        self.close_block(&mut events);
+                        // Zen discards reasoning server-side and we strip it
+                        // client-side next turn (`strip_unreplayable_reasoning`),
+                        // so on spark a reasoning item with no visible summary
+                        // text would emit a thinking block holding nothing but
+                        // our opaque envelope: an empty thinking box in the
+                        // transcript plus prefix churn the provider never sees.
+                        // Skip the block; visible thinking still streams, and
+                        // replay-preserving upstreams (codex) are untouched.
+                        let silent_on_unreplayable =
+                            !visible_thinking && self.model.to_lowercase().contains("spark");
+                        if !silent_on_unreplayable {
+                            // Reasoning summaries can be off entirely, in which case
+                            // no block was ever opened. Open an empty one rather
+                            // than drop the only copy of the item.
+                            self.open_block(OpenBlock::Thinking, &mut events);
+                            events.push(self.emit_signature_delta(&signature));
+                            self.close_block(&mut events);
+                        }
                     }
                 }
             }
@@ -1011,13 +1155,24 @@ pub(crate) fn translate_openai_stream_to_anthropic(
     codex_limits: crate::codex_rate_limits::CodexRateLimitStore,
     quota_seen_in_headers: bool,
     outcome: Option<RoutedOutcomeContext>,
+    deferred_ccr: Option<DeferredCcrBooking>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
-    use futures_util::StreamExt;
-
-    let translator = StreamTranslator::new(model)
+    let mut translator = StreamTranslator::new(model)
         .with_codex_limits(codex_limits)
         .with_initial_rate_limits_seen(quota_seen_in_headers)
         .with_outcome(outcome);
+    if let Some(deferred) = deferred_ccr {
+        translator = translator.with_deferred_ccr(deferred);
+    }
+
+    translate_with_translator(stream, translator)
+}
+
+fn translate_with_translator(
+    stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    translator: StreamTranslator,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    use futures_util::StreamExt;
 
     futures_util::stream::unfold(
         TranslateState {
@@ -1132,6 +1287,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             overhead_ms: 1.5,
             forwarded_tokens_estimate: 777,
+            outbound_bytes: 0,
             upstream_attempts: 1,
             redact_store: None,
             conversation_key: None,
@@ -1453,6 +1609,80 @@ mod tests {
         assert_eq!(out["input"][0]["encrypted_content"], "ENC_2");
     }
 
+    /// Zen discards reasoning server-side and the proxy strips it client-side
+    /// next turn, so on spark a reasoning item with no visible summary text
+    /// must not emit a thinking block holding nothing but the opaque envelope:
+    /// it renders as an empty thinking box and churns the prefix the provider
+    /// never sees. The turn still terminates cleanly.
+    #[test]
+    fn spark_silent_reasoning_item_emits_no_thinking_block() {
+        let mut t = StreamTranslator::new("muse-spark-1.3-contributor-free".to_string());
+        let sse = drive(
+            &mut t,
+            &[
+                (
+                    "response.output_item.added",
+                    r#"{"item":{"type":"reasoning","id":"rs_s","summary":[]}}"#,
+                ),
+                (
+                    "response.output_item.done",
+                    r#"{"item":{"type":"reasoning","id":"rs_s","summary":[],"encrypted_content":"ENC_S"}}"#,
+                ),
+                ("response.output_text.delta", r#"{"delta":"the answer"}"#),
+                (
+                    "response.completed",
+                    r#"{"response":{"usage":{"input_tokens":5,"output_tokens":9}}}"#,
+                ),
+            ],
+        );
+        assert!(
+            !sse.contains(r#""type":"thinking""#),
+            "silent spark reasoning leaked a thinking block: {sse}"
+        );
+        assert!(
+            signature_from_stream(&sse).is_none(),
+            "silent spark reasoning minted an unreplayable signature"
+        );
+        assert!(sse.contains(r#""text":"the answer""#));
+        assert!(sse.contains(r#""stop_reason":"end_turn""#));
+        assert!(sse.contains("message_stop"));
+    }
+
+    /// The skip is per reasoning item, not per turn: an item whose summaries
+    /// did stream keeps its signature block even on spark, while a later
+    /// silent item is still dropped.
+    #[test]
+    fn spark_reasoning_with_visible_summaries_keeps_its_block() {
+        let mut t = StreamTranslator::new("muse-spark-1.3-contributor-free".to_string());
+        let sse = drive(
+            &mut t,
+            &[
+                (
+                    "response.reasoning_summary_text.delta",
+                    r#"{"delta":"weighing it"}"#,
+                ),
+                (
+                    "response.output_item.done",
+                    r#"{"item":{"type":"reasoning","id":"rs_v","summary":[],"encrypted_content":"ENC_V"}}"#,
+                ),
+                (
+                    "response.output_item.done",
+                    r#"{"item":{"type":"reasoning","id":"rs_q","summary":[],"encrypted_content":"ENC_Q"}}"#,
+                ),
+            ],
+        );
+        assert!(sse.contains(r#""thinking":"weighing it""#));
+        assert!(
+            signature_from_stream(&sse).is_some(),
+            "visible thinking lost its signature block"
+        );
+        assert_eq!(
+            sse.matches(r#""type":"thinking","thinking":"""#).count(),
+            1,
+            "the silent second item must not open another thinking block: {sse}"
+        );
+    }
+
     /// A turn cut off at the token ceiling must say so, even when it completed
     /// and even when it had started a tool call.
     #[test]
@@ -1618,6 +1848,42 @@ mod tests {
         assert_eq!(logger.get_recent(10).len(), 1);
     }
 
+    /// A deferred turn records first-round usage for the completion guard but
+    /// never books: not at the terminal event, not at drop. The guard owns
+    /// the single booking, with continuation rounds folded in.
+    #[test]
+    fn deferred_ccr_turn_records_without_booking() {
+        let (mut t, logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        let deferred = DeferredCcrBooking::new();
+        t = t.with_deferred_ccr(deferred.clone());
+        t.process_frame(
+            Some("response.completed"),
+            &json!({"response": {"usage": {"input_tokens": 100, "output_tokens": 20}}}).to_string(),
+        );
+        assert_eq!(
+            logger.get_recent(10).len(),
+            0,
+            "booking waits for the completion guard"
+        );
+        let first = deferred.first.lock().unwrap().clone();
+        assert_eq!(
+            first
+                .usage
+                .as_ref()
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_i64()),
+            Some(100),
+            "first-round usage must survive for the guard: {first:?}"
+        );
+        assert_eq!(first.status_code, 200);
+        drop(t);
+        assert_eq!(
+            logger.get_recent(10).len(),
+            0,
+            "drop must not book a deferred turn either"
+        );
+    }
+
     /// A turn cut off before any terminal event still spent tokens, and the
     /// Claude path books those too.
     #[test]
@@ -1668,6 +1934,34 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].input_tokens_optimized, 700);
         assert_eq!(entries[0].output_tokens, 20);
+    }
+
+    /// Provider-wins parity with the buffered arms: text and tool deltas
+    /// before the usage chunk must not inflate the booked output past what
+    /// the provider reported. The translator's running count survives only
+    /// for provider-silent turns.
+    #[test]
+    fn booked_output_trusts_provider_over_translator_count() {
+        let (mut t, logger, _cost) = translator_with_outcome("qwen-local", 0);
+        for frame in [
+            json!({"choices": [{"delta": {"content": "VISIBLE_PREFIX"}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1"}]}}]}),
+            json!({
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 500, "completion_tokens": 9}
+            }),
+        ] {
+            t.process_frame(None, &frame.to_string());
+        }
+        t.process_frame(None, "[DONE]");
+
+        let entries = logger.get_recent(10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].input_tokens_optimized, 500);
+        assert_eq!(
+            entries[0].output_tokens, 9,
+            "provider-reported 9, not the translator count: {entries:?}"
+        );
     }
 
     /// Unit tests elsewhere in this file build translators with no outcome
@@ -1890,6 +2184,7 @@ mod tests {
             crate::codex_rate_limits::CodexRateLimitStore::new(),
             false,
             None,
+            None,
         );
         let out: Vec<String> = translated
             .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
@@ -1942,6 +2237,7 @@ mod tests {
             "muse-spark-1.3".to_string(),
             crate::codex_rate_limits::CodexRateLimitStore::new(),
             false,
+            None,
             None,
         );
         let out: Vec<String> = translated

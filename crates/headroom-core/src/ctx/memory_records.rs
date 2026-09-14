@@ -255,8 +255,19 @@ impl MemoryRecordStore {
 
     /// Remove every record for `user_id`, returning how many went.
     pub fn delete_user(&self, user_id: &str) -> rusqlite::Result<usize> {
-        self.conn()
-            .execute("DELETE FROM memories WHERE user_id = ?1", params![user_id])
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        // Edges first (FINDING-009): otherwise `memory_entities` rows
+        // outlive their records and `memories_for_entities` keeps
+        // returning ids that `get` cannot resolve (tolerated via
+        // load-None skip, but a storage leak + wasted scan).
+        tx.execute(
+            "DELETE FROM memory_entities WHERE memory_id IN (SELECT id FROM memories WHERE user_id = ?1)",
+            params![user_id],
+        )?;
+        let removed = tx.execute("DELETE FROM memories WHERE user_id = ?1", params![user_id])?;
+        tx.commit()?;
+        Ok(removed)
     }
 }
 
@@ -310,5 +321,24 @@ mod tests {
         assert_eq!(s.delete_user("alice").unwrap(), 2);
         assert_eq!(s.ids_for_user("alice").unwrap().len(), 0);
         assert_eq!(s.ids_for_user("bob").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_user_clears_entity_edges() {
+        // FINDING-009: edges must not outlive their records.
+        let s = store();
+        s.put("m1", "alice", r#"{"content":"hello"}"#).unwrap();
+        s.set_entities("m1", &["acme".to_string()]).unwrap();
+        assert_eq!(
+            s.memories_for_entities(&["acme".to_string()])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(s.delete_user("alice").unwrap(), 1);
+        assert!(s
+            .memories_for_entities(&["acme".to_string()])
+            .unwrap()
+            .is_empty());
     }
 }

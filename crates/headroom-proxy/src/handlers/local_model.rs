@@ -7,20 +7,15 @@
 //! `sidecar`, `auth`, `ccr`, `redaction`).
 
 use crate::proxy::{forward_http, AppState};
-use crate::routed::auth::{
-    apply_codex_session_headers, capture_turn_state, inject_opencode_headers, upstream_auth_headers,
-};
 use crate::routed::ccr::RoutedCcr;
 use crate::routed::outcome::{build_routed_outcome_context, RerouteOrigin};
 use crate::routed::prepare::prepare_turn;
+use crate::routed::quirks::{classify_upstream, UpstreamKind};
 use crate::routed::response_arms::{
-    handle_buffered_response, handle_buffered_responses_response, handle_passthrough,
-    handle_routed_error_response, handle_streaming_response,
+    fold_buffered, handle_passthrough, handle_routed_error_response, handle_streaming_response,
 };
 use crate::routed::retry::send_with_retry;
-use crate::routed::routing::{
-    apply_model_routing, dispatch_route_fallback, find_route_target, RouteTarget,
-};
+use crate::routed::routing::{apply_model_routing, dispatch_route_fallback, RouteTarget};
 use crate::routed::sidecar::handle_sidecar;
 use crate::routed::translation::translate_routed_request;
 use axum::body::Body;
@@ -98,8 +93,9 @@ pub async fn handle_messages(
     // count toward the process in-flight total (`GET /debug/inflight`)
     // exactly like `forward_http` turns, so rotation drain sees them. This
     // covers headers-wait, buffered bodies, CCR continuations, and fallback
-    // re-dispatch — but NOT streamed body bytes, which flow after the
-    // `Response` is built. Overcounts briefly when delegating to
+    // re-dispatch. Streamed body bytes are covered separately: every SSE body
+    // is `track_streaming`-wrapped before `Body::from_stream`, so the drain
+    // stays nonzero until the last byte. Overcounts briefly when delegating to
     // `forward_http` (both guards held) — conservative is the safe direction
     // for a drain check.
     let _inflight = crate::proxy::InflightGuard::enter();
@@ -154,58 +150,53 @@ pub async fn handle_messages(
         .to_string();
     let body_model = body_model.as_str();
 
-    // A `cursor:` route runs Cursor's agent CLI rather than an HTTP upstream.
-    // Checked before the URL matching below, which has nothing to match on: a
-    // subprocess transport has no upstream URL.
-    let cursor_model = state
-        .config
-        .model_routes
-        .iter()
-        .find(|r| r.matches(body_model))
-        .and_then(|r| {
-            // The effort travels per request, so the model id is resolved here
-            // rather than at parse time.
-            r.resolve_cursor_agent(crate::output_shaper::requested_effort(&parsed))
-        });
-
-    if let Some(ref cursor_model) = cursor_model {
-        let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
-            &headers,
-            &client_addr,
-            &parsed,
-            crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
-        );
-        return crate::cursor::handler::handle(state, &parsed, &session_key, cursor_model).await;
-    }
-
-    let target = match find_route_target(&state.config, body_model) {
-        Some(t) => t,
-        None => {
-            // No route matched — delegate to standard forwarder.
-            let mut builder = Request::builder().method(method).uri(uri);
-            if let Some(hs) = builder.headers_mut() {
-                *hs = headers;
+    // Route resolution (C2): cursor beats URL, first-match wins. The
+    // cost-router rewrite above already ran, so this sees the post-rewrite id.
+    let target =
+        match crate::handlers::route_resolve::resolve_route(&state.config, &parsed, body_model) {
+            crate::handlers::route_resolve::RouteDecision::Cursor { cursor_model } => {
+                let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
+                    &headers,
+                    &client_addr,
+                    &parsed,
+                    crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
+                );
+                return crate::cursor::handler::handle(
+                    state,
+                    &parsed,
+                    &session_key,
+                    &cursor_model,
+                    &request_id,
+                )
+                .await;
             }
-            let req = match builder.body(Body::from(body)) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(
-                        event = "handler_error",
-                        handler = "messages_local_model",
-                        error = %e,
-                        "failed to reconstruct request"
-                    );
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from("internal handler error"))
-                        .expect("static response");
+            crate::handlers::route_resolve::RouteDecision::Route { target } => target,
+            crate::handlers::route_resolve::RouteDecision::NoMatch => {
+                // No route matched — delegate to standard forwarder.
+                let mut builder = Request::builder().method(method).uri(uri);
+                if let Some(hs) = builder.headers_mut() {
+                    *hs = headers;
                 }
-            };
-            return forward_http(state, client_addr, req)
-                .await
-                .unwrap_or_else(|e| e.into_response());
-        }
-    };
+                let req = match builder.body(Body::from(body)) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(
+                            event = "handler_error",
+                            handler = "messages_local_model",
+                            error = %e,
+                            "failed to reconstruct request"
+                        );
+                        return Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::from("internal handler error"))
+                            .expect("static response");
+                    }
+                };
+                return forward_http(state, client_addr, req)
+                    .await
+                    .unwrap_or_else(|e| e.into_response());
+            }
+        };
     let RouteTarget {
         upstream,
         translate,
@@ -213,26 +204,27 @@ pub async fn handle_messages(
         auth_env,
     } = target;
 
-    let (mut upstream_headers, is_chatgpt_auth) = match upstream_auth_headers(
+    let (upstream_headers, is_chatgpt_auth) = match crate::routed::auth::auth_headers(
         auth_env.as_deref(),
         &headers,
         state.config.codex_auth_file.as_deref(),
+        &upstream,
+        &request_id,
+        None,
     ) {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    if upstream.host_str() == Some("opencode.ai") {
-        inject_opencode_headers(&mut upstream_headers, &request_id, None);
-    }
 
     if !translate {
         return handle_passthrough(
-            &state.client,
+            &state,
             &upstream,
             &uri,
             upstream_headers,
             body,
             body_model,
+            &request_id,
         )
         .await;
     }
@@ -267,6 +259,9 @@ pub async fn handle_messages(
     let openai_body = translated.openai_body;
     let upstream_url = translated.upstream_url;
     let downstream_is_stream = translated.downstream_is_stream;
+    // The wire shape, decided once in translation. Arm pick and CCR shape
+    // below match on this, never on `target_model`.
+    let is_responses = translated.is_responses;
 
     // Book this turn through the same outcome funnel `forward_http` uses, so
     // routed spend shows up in /stats, /stats-history, and the dashboard
@@ -302,6 +297,7 @@ pub async fn handle_messages(
         &parsed,
         &headers,
         target_model.as_deref(),
+        is_responses,
         body_model,
         prepared.ctx_report,
         prepared.overhead_ms,
@@ -312,6 +308,7 @@ pub async fn handle_messages(
         // keeps the flag-off path from cloning a handle it will never use.
         prepared.replay_parked.then(|| state.replay_store.clone()),
         forwarded_tokens_estimate,
+        openai_body_vec.len() as u64,
     );
     // `build_routed_outcome_context` leaves this `None` because it cannot see
     // the routing decision; this is the handler that made it. Without it the
@@ -358,11 +355,16 @@ pub async fn handle_messages(
     let mut upstream_headers = upstream_headers;
 
     // Session correlation headers and turn-state echo, mirroring the real
-    // Codex client (codex-api/src/requests/headers.rs, client.rs).
-    let session_key = apply_codex_session_headers(&mut upstream_headers, &parsed, is_chatgpt_auth);
+    // Codex client (codex-api/src/requests/headers.rs, client.rs). The
+    // provider quirk (P6): only the ChatGPT subscription mutates headers.
+    let quirks = classify_upstream(&upstream, is_chatgpt_auth);
+    let session_key = quirks.apply_session_headers(&mut upstream_headers, &parsed);
 
     // Send with retry: refresh the OAuth token once on 401, back off on
-    // 429/5xx/transport errors (honoring Retry-After), like the Codex CLI.
+    // 429/5xx/transport errors (honoring Retry-After), like the Codex CLI —
+    // plus the Zen rate-limit hold, so a 429 outlives the VPN rotation
+    // instead of killing the turn.
+    let is_zen = matches!(quirks, UpstreamKind::OpenCodeZen);
     let send = send_with_retry(
         &state,
         &upstream_url,
@@ -371,17 +373,28 @@ pub async fn handle_messages(
         &request_id,
         session_key.as_deref(),
         is_chatgpt_auth,
+        is_zen,
     )
     .await;
-    let (upstream_resp, upstream_headers, attempt) = match send {
-        Ok(send) => (send.resp, send.headers, send.attempts),
+    let (upstream_resp, upstream_headers, attempt, replay_stripped_bytes) = match send {
+        Ok(send) => (
+            send.resp,
+            send.headers,
+            send.attempts,
+            send.retried_without_replay,
+        ),
         Err(resp) => return resp,
     };
+    if let (Some(ctx), Some(stripped)) = (outcome_ctx.as_mut(), replay_stripped_bytes) {
+        // The 413 retry below re-sent without the replay prefix: the refused
+        // byte count is this smaller body, not the first attempt's.
+        ctx.outbound_bytes = stripped;
+    }
     if let Some(ctx) = outcome_ctx.as_mut() {
         ctx.upstream_attempts = i64::from(attempt.max(1));
     }
 
-    capture_turn_state(&upstream_resp, session_key.as_deref());
+    quirks.capture_turn_state(&upstream_resp, session_key.as_deref());
 
     let upstream_status = upstream_resp.status();
 
@@ -393,7 +406,7 @@ pub async fn handle_messages(
         upstream_headers,
         openai_body_bytes.clone(),
         &request_id,
-        target_model.is_some(),
+        is_responses,
         &prepared.redact_session_key,
     )
     .await;
@@ -460,17 +473,16 @@ pub async fn handle_messages(
             ccr,
         )
         .await
-    } else if target_model.is_some() {
-        handle_buffered_responses_response(
+    } else {
+        fold_buffered(
             upstream_resp,
             &parsed,
             upstream_status,
+            is_responses,
             outcome_ctx,
             ccr,
         )
         .await
-    } else {
-        handle_buffered_response(upstream_resp, &parsed, upstream_status, outcome_ctx, ccr).await
     }
 }
 

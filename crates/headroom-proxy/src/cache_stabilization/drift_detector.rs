@@ -2096,6 +2096,61 @@ mod tests {
         assert_ne!(bare, with_ua);
     }
 
+    /// C8 frozen vector: byte-exact session-key output for a fixed input.
+    /// Any derivation change fails loudly here and forces versioned keys +
+    /// dual-read migration — silent drift invalidates every stored session
+    /// at once (fleet-wide hit-rate cliff, zero errors). Do NOT update the
+    /// literal to match new code; version the keys instead.
+    #[test]
+    fn session_key_ip_fallback_vector_is_frozen() {
+        let addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 5555);
+        let bare = derive_session_key(&HeaderMap::new(), &addr, &json!({}), ApiKind::Anthropic);
+        assert_eq!(bare, "ip:10.0.0.3:-");
+    }
+
+    /// C8 frozen vector: the lane key folds the system hash into the
+    /// session key, so same-opener streams on different systems stop
+    /// overwriting each other's drift baseline.
+    #[test]
+    fn stream_lane_key_vector_is_frozen() {
+        let body = anthropic_body("sys-lane", json!([]), vec!["m1"]);
+        let hash = compute_structural_hash(&body, ApiKind::Anthropic);
+        let lane = stream_lane_key("ip:10.0.0.3:-", &hash);
+        assert_eq!(lane, "ip:10.0.0.3:-\u{1f}a2c1cfc3ffc873c7");
+        // The separator is the control char no session-key arm emits.
+        assert!(lane.starts_with("ip:10.0.0.3:-\u{1f}"));
+        assert_eq!(lane_session_part(&lane), "ip:10.0.0.3:-");
+        // A system flip is a lane switch, not an invalidation.
+        let flipped = anthropic_body("sys-other", json!([]), vec!["m1"]);
+        let flipped_hash = compute_structural_hash(&flipped, ApiKind::Anthropic);
+        assert_ne!(stream_lane_key("ip:10.0.0.3:-", &flipped_hash), lane);
+    }
+
+    /// C8 frozen vector: the cross-model lineage key is (identity branch,
+    /// full message hash) with no model folded in, so a model switch finds
+    /// its donor session.
+    #[test]
+    fn model_free_lineage_key_vector_is_frozen() {
+        let addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 5555);
+        let body = anthropic_body("sys-any", json!([]), vec!["opener"]);
+        let lineage = model_free_lineage_key(&HeaderMap::new(), &addr, &body, ApiKind::Anthropic);
+        let (branch, msg_hash) = lineage.expect("ip identity with messages");
+        assert_eq!(branch, "ip:10.0.0.3");
+        assert_eq!(
+            msg_hash,
+            "d9c8804af9d1726f18855e942e68dd1c1fc55de54671f7367f438bdfc7cff92d"
+        );
+        assert_eq!(
+            msg_hash.len(),
+            64,
+            "full hash, not the 8-hex session prefix"
+        );
+        // An explicitly pinned session is already shared: no lineage lookup.
+        let mut pinned = HeaderMap::new();
+        pinned.insert("x-headroom-session-id", "operator-session".parse().unwrap());
+        assert!(model_free_lineage_key(&pinned, &addr, &body, ApiKind::Anthropic).is_none());
+    }
+
     #[test]
     fn openai_chat_extracts_first_system_message() {
         let body = json!({

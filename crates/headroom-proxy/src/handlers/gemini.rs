@@ -234,13 +234,14 @@ fn compress_messages(
     mode: CompressionMode,
     auth_mode: AuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> Option<(Vec<Value>, usize, usize)> {
     let wrapper = json!({
         "model": model,
         "messages": messages,
     });
     let body = Bytes::from(serde_json::to_vec(&wrapper).ok()?);
-    match compress_openai_chat_request(&body, mode, auth_mode, request_id) {
+    match compress_openai_chat_request(&body, mode, auth_mode, request_id, exclude_tools) {
         Outcome::Compressed {
             body,
             tokens_before,
@@ -385,6 +386,7 @@ impl GeminiRequest {
                 state.config.compression_mode,
                 auth_mode,
                 request_id,
+                &state.config.exclude_tools,
             ) {
                 optimized_messages = compressed;
                 tokens_saved = before.saturating_sub(after);
@@ -999,9 +1001,9 @@ async fn forward_streaming(
         );
     }
 
-    // Stream the response body
+    // Stream the response body. Tracked so the rotation drain sees it.
     let stream = resp.bytes_stream();
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(crate::proxy::track_streaming(stream));
 
     let mut builder = Response::builder().status(status);
     {

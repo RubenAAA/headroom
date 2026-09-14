@@ -5,8 +5,9 @@
 //! Rewrites every `cache_control` marker in an Anthropic request body to carry
 //! `"ttl": "1h"`, so the provider holds the cached prefix for an hour instead of
 //! the five-minute default. Markers are found wherever Anthropic accepts them:
-//! on `tools[]` entries, on `system[]` blocks, and on `messages[].content[]`
-//! blocks.
+//! on `tools[]` entries, on `system[]` blocks, on `messages[]` (message level),
+//! and on `messages[].content[]` blocks including those nested in a
+//! `tool_result` block's `content[]`.
 //!
 //! Nothing else about the marker changes — `type` stays `ephemeral`, and a
 //! marker that already says `1h` is left alone so the common case moves no
@@ -191,6 +192,16 @@ pub fn tail_5m_prefix_1h(body: &mut Value) -> bool {
                     if let Some(marker) = block.get_mut("cache_control") {
                         changed |= pin_marker_to(marker, tail_ttl);
                     }
+                    // FINDING-034: markers nested in a tool_result block's
+                    // content[] sit behind this block in Anthropic's read
+                    // order, so they take the tail tier like the block does.
+                    if let Some(inner) = block.get_mut("content").and_then(Value::as_array_mut) {
+                        for sub in inner {
+                            if let Some(marker) = sub.get_mut("cache_control") {
+                                changed |= pin_marker_to(marker, tail_ttl);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -212,6 +223,11 @@ const ANCHOR_EVERY_TURNS: usize = 10;
 /// next input or tool result — so the message count is a turn counter that
 /// lives in the request rather than in the proxy. Growth that is not exactly
 /// two only moves an anchor a turn early or late, which the flat curve absorbs.
+///
+/// FINDING-036: `(0/2) % 10 == 0` is true, so an empty/missing `messages`
+/// array "anchors" — harmless, because with no markers the tail loop pins
+/// nothing and `changed` stays false, so the body goes out byte-equal. The
+/// same holds for a 1-message body (counts as turn 0). No guard needed.
 fn is_anchor_turn(body: &Value) -> bool {
     let count = body
         .get("messages")
@@ -253,6 +269,16 @@ pub fn force_1h_ttl(body: &mut Value) -> bool {
                 for block in blocks {
                     if let Some(marker) = block.get_mut("cache_control") {
                         changed |= pin_marker(marker);
+                    }
+                    // FINDING-034/036: markers nested in a tool_result
+                    // block's content[] are real markers in Anthropic's
+                    // read order — pin them like their parent block.
+                    if let Some(inner) = block.get_mut("content").and_then(Value::as_array_mut) {
+                        for sub in inner {
+                            if let Some(marker) = sub.get_mut("cache_control") {
+                                changed |= pin_marker(marker);
+                            }
+                        }
                     }
                 }
             }
@@ -321,6 +347,17 @@ impl StockTtl {
 }
 
 /// Read the TTL shape off the client's own markers, before any rewrite.
+///
+/// FINDING-036: the scan is deliberately global — it also descends into
+/// tool `input_schema` (unlike `any_anthropic_cache_control`, which must
+/// not, since it gates marker placement). A customer JSON Schema that
+/// mentions `"type": "ephemeral"` + `"ttl": "1h"` as property keys would
+/// false-positive here, but the only consumer is usage-observer tier
+/// telemetry (`note_client_cache_ttl`), never a forwarding decision — a
+/// miscategorized stock arm costs a dashboard label, not a rejected
+/// request. Scoping the scan to marker positions would trade a real
+/// maintenance burden (four position lists to keep in step) for accuracy
+/// nobody acts on.
 pub fn client_ttl_shape(body: &Value) -> ClientTtl {
     fn scan(node: &Value, seen: &mut (bool, bool)) {
         match node {
@@ -383,12 +420,23 @@ mod tests {
             ],
             "messages": [{
                 "role": "user",
-                "content": [{"type": "text", "text": "u", "cache_control": {"type": "ephemeral"}}]
+                "content": [
+                    {"type": "text", "text": "u", "cache_control": {"type": "ephemeral"}},
+                    {"type": "tool_result", "tool_use_id": "t", "content": [
+                        {"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}
+                    ]}
+                ],
+                "cache_control": {"type": "ephemeral"}
             }]
         });
         assert!(force_1h_ttl(&mut body));
         assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(body["system"][1]["cache_control"]["ttl"], "1h");
+        assert_eq!(body["messages"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(
+            body["messages"][0]["content"][1]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"]["ttl"],
             "1h"

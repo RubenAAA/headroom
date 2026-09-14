@@ -72,7 +72,16 @@ pub fn conversation_key(parsed: &Value, session_key: &str) -> String {
         }
         _ => {}
     }
-    if let Some(first) = parsed.get("messages").and_then(|m| m.get(0)) {
+    if let Some(first) = parsed
+        .get("messages")
+        .and_then(|m| m.get(0))
+        // Responses `/v1/responses` bodies carry items under `input`
+        // (canonical) or the legacy `messages` alias — never Anthropic
+        // `messages`. Without this fallback every Responses conversation
+        // under one session+system hashed identically and merged into a
+        // single conversation (FINDING-022).
+        .or_else(|| parsed.get("input").and_then(|m| m.get(0)))
+    {
         // Third churning input, and the one the list above named but the code
         // did not act on: the client's cache breakpoint sits on the last
         // message, so on turn 1 it sits on `messages[0]` and on turn 2 it has
@@ -111,10 +120,13 @@ fn hash_stable_lines(hasher: &mut Sha256, text: &str) {
     }
 }
 
-/// Number of messages in the request body (`messages.len()`), 0 if absent.
+/// Number of messages in the request body (`messages.len()`, falling back
+/// to the Responses `input` array when `messages` is absent), 0 if neither.
+/// (FINDING-022: Responses requests previously counted 0 every turn.)
 pub fn message_count(parsed: &Value) -> u64 {
     parsed
         .get("messages")
+        .or_else(|| parsed.get("input"))
         .and_then(Value::as_array)
         .map(|a| a.len() as u64)
         .unwrap_or(0)
@@ -346,6 +358,33 @@ mod tests {
         // Different session key → different key.
         assert_ne!(conversation_key(&a, "sk"), conversation_key(&a, "other"));
         assert_eq!(conversation_key(&a, "sk").len(), 16);
+    }
+
+    /// FINDING-022: canonical-`input` Responses conversations must neither
+    /// merge with each other nor count zero messages.
+    #[test]
+    fn responses_input_conversations_are_distinct_and_counted() {
+        let a = json!({"system": "sys", "input": [
+            {"type": "message", "role": "user", "content": "hello"},
+        ]});
+        let a2 = json!({"system": "sys", "input": [
+            {"type": "message", "role": "user", "content": "hello"},
+            {"type": "message", "role": "assistant", "content": "hi"},
+        ]});
+        let b = json!({"system": "sys", "input": [
+            {"type": "message", "role": "user", "content": "different"},
+        ]});
+        // Same first input item → same key; different first item → split.
+        assert_eq!(conversation_key(&a, "sk"), conversation_key(&a2, "sk"));
+        assert_ne!(conversation_key(&a, "sk"), conversation_key(&b, "sk"));
+        // And they must not merge with a messageless body either.
+        assert_ne!(
+            conversation_key(&a, "sk"),
+            conversation_key(&json!({"system": "sys"}), "sk")
+        );
+        assert_eq!(message_count(&a), 1);
+        assert_eq!(message_count(&a2), 2);
+        assert_eq!(message_count(&json!({"system": "sys"})), 0);
     }
 
     /// A system block as the client sends it: an array of text blocks, the last

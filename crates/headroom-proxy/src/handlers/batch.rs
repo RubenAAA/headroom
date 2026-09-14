@@ -159,13 +159,14 @@ fn compress_messages(
     mode: CompressionMode,
     auth_mode: AuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> Option<(Vec<Value>, usize, usize)> {
     let wrapper = json!({
         "model": model,
         "messages": messages,
     });
     let body = Bytes::from(serde_json::to_vec(&wrapper).ok()?);
-    match compress_openai_chat_request(&body, mode, auth_mode, request_id) {
+    match compress_openai_chat_request(&body, mode, auth_mode, request_id, exclude_tools) {
         Outcome::Compressed {
             body,
             tokens_before,
@@ -198,11 +199,12 @@ fn compress_openai_body_value(
     mode: CompressionMode,
     auth_mode: AuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> Option<(usize, usize)> {
     let messages = body.get("messages").and_then(Value::as_array)?.clone();
     let model = body.get("model").and_then(Value::as_str).unwrap_or("gpt-4");
     let (compressed_messages, before, after) =
-        compress_messages(&messages, model, mode, auth_mode, request_id)?;
+        compress_messages(&messages, model, mode, auth_mode, request_id, exclude_tools)?;
     body.as_object_mut()?
         .insert("messages".to_string(), Value::Array(compressed_messages));
     Some((before, after))
@@ -231,6 +233,7 @@ fn compress_batch_jsonl_with_options(
     mode: CompressionMode,
     auth_mode: AuthMode,
     request_id: &str,
+    exclude_tools: &[String],
 ) -> (Vec<String>, BatchJsonlStats) {
     let mut stats = BatchJsonlStats::default();
     let mut compressed_lines = Vec::new();
@@ -270,7 +273,7 @@ fn compress_batch_jsonl_with_options(
         }
 
         let line_request_id = format!("{request_id}:line:{idx}");
-        match compress_openai_body_value(body, mode, auth_mode, &line_request_id) {
+        match compress_openai_body_value(body, mode, auth_mode, &line_request_id, exclude_tools) {
             Some((before, after)) if after <= before => {
                 stats.total_original_tokens += before;
                 stats.total_compressed_tokens += after;
@@ -308,6 +311,7 @@ pub fn compress_batch_jsonl(content: &str) -> (Vec<String>, BatchJsonlStats) {
         CompressionMode::LiveZone,
         AuthMode::Payg,
         "batch-jsonl",
+        &[],
     )
 }
 
@@ -410,6 +414,7 @@ pub async fn google_batch_create(
             state.config.compression_mode,
             auth_mode,
             &item_request_id,
+            &state.config.exclude_tools,
         ) else {
             compressed_requests.push(batch_req.clone());
             continue;
@@ -611,6 +616,7 @@ pub async fn openai_batch_create(
         state.config.compression_mode,
         auth_mode,
         "openai-batch",
+        &state.config.exclude_tools,
     );
     if stats.total_requests == 0 {
         return error_response(

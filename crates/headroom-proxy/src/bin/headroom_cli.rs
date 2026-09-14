@@ -833,7 +833,7 @@ fn cmd_perf(hours: f64, raw: bool, output_format: &str) -> Result<(), Box<dyn st
     if raw {
         for r in &report.perf_records {
             println!(
-                "{} {} model={} msgs={} before={} after={} saved={} cache_read={} \
+                "{} {} model={} msgs={} before={} after={} saved={} toolsaved={} cache_read={} \
                  cache_write={} cache_hit={}% opt={:.0}ms",
                 r.timestamp,
                 r.request_id,
@@ -841,7 +841,8 @@ fn cmd_perf(hours: f64, raw: bool, output_format: &str) -> Result<(), Box<dyn st
                 r.num_messages,
                 r.tokens_before,
                 r.tokens_after,
-                r.tokens_saved,
+                r.headline_saved(),
+                r.tool_saved,
                 r.cache_read,
                 r.cache_write,
                 r.cache_hit_pct,

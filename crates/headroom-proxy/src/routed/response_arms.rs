@@ -1,7 +1,7 @@
 //! Request shaping and response arms for the routed paths.
 
 use crate::openai::response::{openai_to_anthropic_response, responses_stream_to_turn};
-use crate::openai::stream::translate_openai_stream_to_anthropic;
+use crate::openai::stream::{translate_openai_stream_to_anthropic, DeferredCcrBooking};
 use crate::routed::ccr::{resolve_routed_proxy_tools, RoutedCcr};
 use crate::routed::outcome::{
     book_routed_outcome, book_routed_outcome_with_ccr, RoutedOutcomeContext,
@@ -11,6 +11,34 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
+
+/// Shared resolve-then-book envelope for the buffered arms (C6): CCR
+/// continuations resolve first — their rounds are billed too, so booking the
+/// first round's usage as the turn's would under-report the retrieval — then
+/// the turn books once off the resolved body's usage. The arms differ only in
+/// how the body was parsed and translated, never in this ordering.
+async fn resolve_and_book(
+    body: Value,
+    ccr: Option<RoutedCcr>,
+    outcome: Option<&RoutedOutcomeContext>,
+    output_tokens: i64,
+) -> Value {
+    let (resolved, ccr_rounds) = match ccr {
+        Some(ccr) => resolve_routed_proxy_tools(&body, &ccr).await,
+        None => (body, crate::proxy::CcrRoundUsage::default()),
+    };
+    if let Some(ctx) = outcome {
+        book_routed_outcome_with_ccr(
+            ctx,
+            resolved.get("usage"),
+            output_tokens,
+            0.0,
+            200,
+            ccr_rounds,
+        );
+    }
+    resolved
+}
 
 pub(crate) fn apply_target_model_override(
     mut body: Value,
@@ -53,13 +81,40 @@ pub(crate) async fn handle_routed_error_response(
     let body_text =
         String::from_utf8_lossy(&restore_buffered(outcome.as_ref(), body_text.into_bytes()))
             .into_owned();
+    // A 413 from Zen is a measured fact about the outbound body, not the
+    // canned "32MB of images" note the client prints for any 413: its zod
+    // error parse fails on Zen's plain-text body, so it falls back to blaming
+    // attachments that were never there.
+    let outbound_bytes = outcome.as_ref().map(|ctx| ctx.outbound_bytes);
     tracing::warn!(
         event = "local_model_upstream_error",
         status = upstream_status.as_u16(),
-        body = %body_text,
+        body = %body_text.chars().take(200).collect::<String>(),
+        body_len = body_text.len(),
         retry_after_preserved = retry_after.is_some(),
+        outbound_bytes = outbound_bytes.unwrap_or(0),
         "local model upstream returned error"
     );
+    if upstream_status == StatusCode::PAYLOAD_TOO_LARGE {
+        let bytes = outbound_bytes.unwrap_or(0);
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "request_too_large",
+                "message": format!(
+                    "Upstream refused the request body ({} bytes, {:.1}MB): no images or attachments were sent. Run /compact or drop tool results to shrink the turn.",
+                    bytes,
+                    bytes as f64 / 1_048_576.0,
+                ),
+            }
+        })
+        .to_string();
+        return Response::builder()
+            .status(upstream_status)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("static response");
+    }
     let mut response = Response::builder().status(upstream_status);
     if let Some(value) = retry_after {
         response = response.header(http::header::RETRY_AFTER, value);
@@ -99,12 +154,37 @@ pub(crate) async fn read_routed_body(
         if let Some(ctx) = outcome {
             book_routed_outcome(ctx, None, 0, 0.0, status.as_u16() as i64);
         }
+        // Same measured 413 as the explicit error arm above: the buffered
+        // fold reaches non-OK statuses through here, not through
+        // `handle_routed_error_response`.
+        let outbound_bytes = outcome.map(|ctx| ctx.outbound_bytes).unwrap_or(0);
         tracing::warn!(
             event = "local_model_upstream_error",
             status = status.as_u16(),
-            body = %body_text,
+            body = %body_text.chars().take(200).collect::<String>(),
+            body_len = body_text.len(),
+            outbound_bytes,
             "local model upstream returned error"
         );
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            let body = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "request_too_large",
+                    "message": format!(
+                        "Upstream refused the request body ({} bytes, {:.1}MB): no images or attachments were sent. Run /compact or drop tool results to shrink the turn.",
+                        outbound_bytes,
+                        outbound_bytes as f64 / 1_048_576.0,
+                    ),
+                }
+            })
+            .to_string();
+            return Err(Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("static response"));
+        }
         return Err(Response::builder()
             .status(status)
             .body(Body::from(body_text))
@@ -124,115 +204,68 @@ pub(crate) async fn read_routed_body(
     })
 }
 
-pub(crate) async fn handle_buffered_response(
+/// One buffered fold for both wire shapes (C6). Parse and translate branch
+/// on the shape decided once in translation; the read, resolve-and-book
+/// envelope, restore, and response envelope are shared. Log strings stay
+/// per-shape so log bytes are unchanged by the merge.
+pub(crate) async fn fold_buffered(
     upstream_resp: reqwest::Response,
     original: &Value,
     upstream_status: StatusCode,
+    is_responses: bool,
     outcome: Option<RoutedOutcomeContext>,
     ccr: Option<RoutedCcr>,
 ) -> Response {
-    let openai_text = match read_routed_body(upstream_resp, upstream_status, outcome.as_ref()).await
-    {
+    let body_text = match read_routed_body(upstream_resp, upstream_status, outcome.as_ref()).await {
         Ok(text) => text,
         Err(response) => return response,
     };
-    let openai_body: Value = match serde_json::from_str(&openai_text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                event = "local_model_response_parse_error",
-                error = %e,
-                "failed to parse OpenAI response JSON"
-            );
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("failed to parse upstream response"))
-                .expect("static response");
+
+    let (parsed_body, output_tokens) = if is_responses {
+        let (turn, tokens) = responses_stream_to_turn(&body_text);
+        (turn, tokens as i64)
+    } else {
+        match serde_json::from_str(&body_text) {
+            Ok(v) => (v, 0),
+            Err(e) => {
+                tracing::warn!(
+                    event = "local_model_response_parse_error",
+                    error = %e,
+                    "failed to parse OpenAI response JSON"
+                );
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from("failed to parse upstream response"))
+                    .expect("static response");
+            }
         }
     };
 
-    // Resolve any `headroom_retrieve` the model asked for, before the outcome
-    // is booked: the continuation rounds are billed too, and booking the first
-    // round's usage as the turn's would under-report the retrieval.
-    let (openai_body, ccr_rounds) = match ccr {
-        Some(ccr) => resolve_routed_proxy_tools(&openai_body, &ccr).await,
-        None => (openai_body, crate::proxy::CcrRoundUsage::default()),
+    let resolved = resolve_and_book(parsed_body, ccr, outcome.as_ref(), output_tokens).await;
+
+    let anthropic_response = if is_responses {
+        crate::sse::ccr_stream::responses_output_as_anthropic_turn(&resolved, original)
+    } else {
+        openai_to_anthropic_response(&resolved, original)
     };
-
-    if let Some(ctx) = outcome.as_ref() {
-        book_routed_outcome_with_ccr(ctx, openai_body.get("usage"), 0, 0.0, 200, ccr_rounds);
-    }
-
-    let anthropic_response = openai_to_anthropic_response(&openai_body, original);
 
     let mut body_bytes = match serde_json::to_vec(&anthropic_response) {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(
-                event = "local_model_serialize_error",
-                error = %e,
-                "failed to serialize Anthropic response"
-            );
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("serialization error"))
-                .expect("static response");
-        }
-    };
-    body_bytes = restore_buffered(outcome.as_ref(), body_bytes);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(Body::from(body_bytes))
-        .expect("static response")
-}
-
-pub(crate) async fn handle_buffered_responses_response(
-    upstream_resp: reqwest::Response,
-    original: &Value,
-    upstream_status: StatusCode,
-    outcome: Option<RoutedOutcomeContext>,
-    ccr: Option<RoutedCcr>,
-) -> Response {
-    let responses_text =
-        match read_routed_body(upstream_resp, upstream_status, outcome.as_ref()).await {
-            Ok(text) => text,
-            Err(response) => return response,
-        };
-
-    let (responses_turn, output_tokens) = responses_stream_to_turn(&responses_text);
-
-    // Resolve before the outcome is booked: continuation rounds are billed
-    // too, and booking the first round's usage as the turn's would under-report
-    // the retrieval. Same ordering as the chat arm.
-    let (resolved, ccr_rounds) = match ccr {
-        Some(ccr) => resolve_routed_proxy_tools(&responses_turn, &ccr).await,
-        None => (responses_turn, crate::proxy::CcrRoundUsage::default()),
-    };
-
-    if let Some(ctx) = outcome.as_ref() {
-        book_routed_outcome_with_ccr(
-            ctx,
-            resolved.get("usage"),
-            output_tokens as i64,
-            0.0,
-            200,
-            ccr_rounds,
-        );
-    }
-
-    let anthropic_response =
-        crate::sse::ccr_stream::responses_output_as_anthropic_turn(&resolved, original);
-
-    let mut body_bytes = match serde_json::to_vec(&anthropic_response) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(
-                event = "local_model_serialize_error",
-                error = %e,
-                "failed to serialize Anthropic responses translation"
-            );
+            // Log text stays per-shape so log bytes are unchanged by the merge.
+            if is_responses {
+                tracing::warn!(
+                    event = "local_model_serialize_error",
+                    error = %e,
+                    "failed to serialize Anthropic responses translation"
+                );
+            } else {
+                tracing::warn!(
+                    event = "local_model_serialize_error",
+                    error = %e,
+                    "failed to serialize Anthropic response"
+                );
+            }
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from("serialization error"))
@@ -251,6 +284,111 @@ pub(crate) async fn handle_buffered_responses_response(
 // ---------------------------------------------------------------------------
 // Streaming response translation: OpenAI SSE → Anthropic SSE
 // ---------------------------------------------------------------------------
+
+/// Completion booking for streamed CCR turns.
+///
+/// The translator records first-round usage but never books when deferral is
+/// attached; the rewriter populates continuation rounds asynchronously. This
+/// guard books exactly once — first-round usage plus rounds, through the same
+/// funnel the buffered arms use — when the finished stream is exhausted, or
+/// from `Drop` when the client disconnects first. The second of those is a
+/// no-op, so a turn is never booked twice.
+struct StreamedCcrBooking {
+    outcome: Option<RoutedOutcomeContext>,
+    deferred: DeferredCcrBooking,
+    booked: bool,
+}
+
+impl StreamedCcrBooking {
+    fn book(&mut self) {
+        if self.booked {
+            return;
+        }
+        self.booked = true;
+        let Some(ctx) = self.outcome.take() else {
+            return;
+        };
+        let first = self
+            .deferred
+            .first
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let rounds = self
+            .deferred
+            .rounds
+            .lock()
+            .ok()
+            .map(|guard| *guard)
+            .unwrap_or_default();
+        book_routed_outcome_with_ccr(
+            &ctx,
+            first.usage.as_ref(),
+            first.output_tokens,
+            first.ttfb_ms,
+            first.status_code,
+            rounds,
+        );
+    }
+}
+
+struct BookingStream {
+    inner: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+    >,
+    guard: StreamedCcrBooking,
+}
+
+impl futures_util::Stream for BookingStream {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `BookingStream` is `Unpin` (every field is), so full access is safe.
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(None) => {
+                this.guard.book();
+                std::task::Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for BookingStream {
+    fn drop(&mut self) {
+        self.guard.book();
+    }
+}
+
+/// Wrap a finished routed stream so a CCR turn books exactly once, with
+/// continuation rounds folded in. Non-CCR turns (either argument `None`)
+/// pass through untouched — same bytes, same timing, no extra allocation
+/// beyond the box the caller already holds.
+fn with_ccr_booking(
+    stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+    >,
+    deferred: &Option<DeferredCcrBooking>,
+    outcome: &Option<RoutedOutcomeContext>,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+{
+    match (deferred.clone(), outcome.clone()) {
+        (Some(d), Some(ctx)) => Box::pin(BookingStream {
+            inner: stream,
+            guard: StreamedCcrBooking {
+                outcome: Some(ctx),
+                deferred: d,
+                booked: false,
+            },
+        }),
+        _ => stream,
+    }
+}
 
 pub(crate) async fn handle_streaming_response(
     upstream_resp: reqwest::Response,
@@ -277,12 +415,20 @@ pub(crate) async fn handle_streaming_response(
         .map(|c| c.request_id.clone())
         .unwrap_or_default();
     let redact_table = redact_table_for(outcome.as_ref());
+    // CCR turns defer booking to the completion guard below, which folds
+    // continuation rounds in. The translator keeps a clone for observation,
+    // replay, TTFB, and quota only — it must not book.
+    let deferred = ccr
+        .as_ref()
+        .map(|_| crate::openai::stream::DeferredCcrBooking::new());
+    let guard_outcome = deferred.as_ref().and(outcome.clone());
     let translated_stream = translate_openai_stream_to_anthropic(
         stream,
         original_model,
         codex_limits,
         quota_seen_in_headers,
         outcome,
+        deferred.clone(),
     );
 
     // The translator has already put the turn into the Anthropic event
@@ -324,9 +470,13 @@ pub(crate) async fn handle_streaming_response(
                         return streaming_body_response(restore_streaming(
                             redact_table,
                             &request_id,
-                            crate::sse::stream_finisher::finish_on_drop(
-                                translated_stream,
-                                request_id.clone(),
+                            with_ccr_booking(
+                                Box::pin(crate::sse::stream_finisher::finish_on_drop(
+                                    translated_stream,
+                                    request_id.clone(),
+                                )),
+                                &deferred,
+                                &guard_outcome,
                             ),
                         ));
                     }
@@ -360,14 +510,26 @@ pub(crate) async fn handle_streaming_response(
                 // Continuations inherit the turn's redaction (see
                 // `RoutedCcr::redact`).
                 redact: ccr.redact,
+                // Booking-owned handle: the rewriter populates it and the
+                // completion guard books it together with first-round usage.
+                rounds_sink: deferred.as_ref().map(|d| d.rounds.clone()),
             };
-            let (rewritten, _usage) =
+            let (rewritten, usage_handle) =
                 crate::sse::ccr_stream::rewrite_anthropic_stream(translated_stream, ctx);
+            debug_assert!(
+                deferred
+                    .as_ref()
+                    .is_some_and(|d| std::sync::Arc::ptr_eq(&usage_handle, &d.rounds)),
+                "rewriter must populate the booking-owned handle"
+            );
             Box::pin(rewritten)
         }
         None => Box::pin(translated_stream),
     };
     let finished = crate::sse::stream_finisher::finish_on_drop(inner, request_id.clone());
+    // CCR turns book once here, with rounds folded in; every other turn
+    // passes through exactly as before.
+    let finished = with_ccr_booking(Box::pin(finished), &deferred, &guard_outcome);
     let body = restore_streaming(redact_table, &request_id, finished);
 
     streaming_body_response(body)
@@ -387,14 +549,21 @@ pub(crate) fn streaming_body_response(body: axum::body::Body) -> Response {
 /// Forward a no-translation route's Anthropic body straight to its upstream
 /// and hand the upstream's reply back, dropping the hop-by-hop headers the
 /// client must not see.
+///
+/// Bytes stay verbatim — the C7 passthrough row promises no transforms — but
+/// the turn books through the shared funnel (C7 flip B): the spend is real
+/// and unbooked passthrough traffic is invisible to `/stats`. Booking reads
+/// the response usage read-only and never touches the bytes.
 pub(crate) async fn handle_passthrough(
-    client: &reqwest::Client,
+    state: &crate::proxy::AppState,
     upstream: &url::Url,
     uri: &axum::http::Uri,
     headers: HeaderMap,
     body: bytes::Bytes,
     body_model: &str,
+    request_id: &str,
 ) -> Response {
+    let started_at = std::time::Instant::now();
     // No translation needed — forward Anthropic format directly to the upstream.
     let upstream_url = format!("{}{}", upstream.as_str().trim_end_matches('/'), uri.path());
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
@@ -407,7 +576,8 @@ pub(crate) async fn handle_passthrough(
         "routing to upstream without translation"
     );
 
-    let resp = match client
+    let resp = match state
+        .client
         .post(&full_url)
         .headers(headers)
         .body(body)
@@ -422,6 +592,14 @@ pub(crate) async fn handle_passthrough(
                 upstream = %full_url,
                 "failed to connect to upstream"
             );
+            crate::routed::outcome::book_passthrough_outcome(
+                &crate::proxy::ProxyOutcomeSink::from_state(state),
+                request_id,
+                body_model,
+                StatusCode::BAD_GATEWAY.as_u16() as i64,
+                None,
+                started_at,
+            );
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!("upstream error: {e}")))
@@ -432,6 +610,17 @@ pub(crate) async fn handle_passthrough(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
     let body_bytes = resp.bytes().await.unwrap_or_default();
+
+    // Read-only: usage for booking only, bytes forwarded untouched.
+    let parsed: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+    crate::routed::outcome::book_passthrough_outcome(
+        &crate::proxy::ProxyOutcomeSink::from_state(state),
+        request_id,
+        body_model,
+        status.as_u16() as i64,
+        parsed.as_ref().and_then(|v| v.get("usage")),
+        started_at,
+    );
 
     let mut response = Response::builder().status(status);
     for (name, value) in resp_headers.iter() {
@@ -448,6 +637,25 @@ pub(crate) async fn handle_passthrough(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Process-global isolation for booking tests: a `None`-path tracker and
+    /// the ledger resolve the developer's live files, and every booking test
+    /// would append test turns to real lifetime totals. Same pattern as the
+    /// translator tests.
+    fn redirect_test_savings() {
+        static LEDGER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let path = LEDGER.get_or_init(|| {
+            let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
+            dir.path().join("savings_events.jsonl")
+        });
+        std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path);
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let path = DIR.get_or_init(|| {
+            let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
+            dir.path().join("proxy_savings.json")
+        });
+        std::env::set_var("HEADROOM_SAVINGS_PATH", path);
+    }
 
     /// Translator wired to real trackers, so a test can assert on what the
     /// outcome funnel recorded rather than on the events it emitted.
@@ -480,5 +688,73 @@ mod tests {
         let body = json!({"model": "claude-codex-5.5", "input": "hi", "stream": false});
         let output = apply_target_model_override(body, Some("gpt-5.5"), false, true);
         assert_eq!(output["stream"], true);
+    }
+
+    /// The completion guard books first-round usage plus continuation rounds
+    /// through one funnel call, exactly once — at exhaustion and at drop.
+    /// First round reports 100 in / 20 out; one continuation round spent
+    /// 1000 in / 50 out. The booked turn must carry 1100 in / 70 out: the
+    /// spend the old code dropped on the floor.
+    #[tokio::test]
+    async fn ccr_completion_guard_books_rounds_exactly_once() {
+        use futures_util::StreamExt as _;
+
+        redirect_test_savings();
+        let state = crate::test_support::test_state(|_| {});
+        let logger = state.request_logger.clone();
+        let parsed = json!({
+            "model": "routed-test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let ctx = crate::routed::outcome::build_routed_outcome_context(
+            &state,
+            &parsed,
+            &axum::http::HeaderMap::new(),
+            Some("gpt-5.5"),
+            true,
+            "routed-test-model",
+            crate::routed::transforms::CtxTransformReport::default(),
+            0.0,
+            std::time::Instant::now(),
+            "req-guard-test".to_string(),
+            None,
+            7,
+            0,
+        )
+        .expect("context builds");
+
+        let deferred = crate::openai::stream::DeferredCcrBooking::new();
+        *deferred.first.lock().unwrap() = crate::openai::stream::DeferredFirstRound {
+            usage: Some(json!({"input_tokens": 100, "output_tokens": 20})),
+            output_tokens: 7,
+            ttfb_ms: 1.0,
+            status_code: 200,
+        };
+        *deferred.rounds.lock().unwrap() = crate::proxy::CcrRoundUsage {
+            rounds: 1,
+            input_tokens: 1000,
+            output_tokens: 50,
+            ..Default::default()
+        };
+
+        let inner = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from(
+            "data: done\n\n",
+        ))]);
+        let stream = BookingStream {
+            inner: Box::pin(inner),
+            guard: StreamedCcrBooking {
+                outcome: Some(ctx),
+                deferred,
+                booked: false,
+            },
+        };
+        let collected: Vec<_> = stream.collect().await;
+        assert_eq!(collected.len(), 1, "bytes still flow through the guard");
+        drop(collected);
+
+        let entries = logger.get_recent(10);
+        assert_eq!(entries.len(), 1, "one turn books once: {entries:?}");
+        assert_eq!(entries[0].input_tokens_optimized, 1100);
+        assert_eq!(entries[0].output_tokens, 70);
     }
 }

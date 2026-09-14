@@ -3,6 +3,7 @@
 //! save/read, fingerprint). The proxy-side auth resolution (keychain, gh CLI
 //! discovery, token exchange) is not ported here.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,17 +40,26 @@ pub fn oauth_domain(domain: &str) -> String {
         .or_else(|| raw.strip_prefix("http://"))
         .unwrap_or(raw)
         .trim_end_matches('/');
-    let host = stripped
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next_back()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    // FINDING-032: strip userinfo, then a bracketed IPv6 host (with an
+    // optional :port), then path — naive `.split(':').next()` turned
+    // `[::1]:8443` into `[`.
+    let after_at = stripped.rsplit('@').next().unwrap_or("");
+    let no_path = after_at.split('/').next().unwrap_or("");
+    let host = if let Some(rest) = no_path.strip_prefix('[') {
+        // Bracketed IPv6: host is everything up to `]`; `:port` follows.
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => rest,
+        }
+    } else if no_path.matches(':').count() > 1 {
+        // Bare IPv6 without brackets — no port form is valid here, so
+        // splitting would corrupt it; keep whole.
+        no_path
+    } else {
+        // Host or host:port — drop the port.
+        no_path.split(':').next().unwrap_or("")
+    };
+    let host = host.to_lowercase();
     if host.is_empty() {
         DEFAULT_GITHUB_HOST.to_string()
     } else {
@@ -67,6 +77,9 @@ pub struct DeviceAuth {
 }
 
 fn post_json(url: &str, body: &Value) -> Result<Value, Error> {
+    // FINDING-032: surface the server's error message — without
+    // error_for_status the caller saw only a JSON-decode failure on a
+    // 4xx/5xx HTML or error-JSON body.
     let resp = headroom_proxy::ssl_context::blocking_client_builder()
         .timeout(Duration::from_secs(10))
         .build()?
@@ -74,7 +87,8 @@ fn post_json(url: &str, body: &Value) -> Result<Value, Error> {
         .header("Accept", "application/json")
         .header("User-Agent", USER_AGENT)
         .json(body)
-        .send()?;
+        .send()?
+        .error_for_status()?;
     Ok(resp.json()?)
 }
 
@@ -206,11 +220,25 @@ pub fn save_oauth_token(token: &str, domain: &str) -> Result<PathBuf, Error> {
         "refresh": token,
         "type": "oauth",
     });
-    std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&body)?))?;
+    // FINDING-032 (TOCTOU): create with 0600 atomically — write-then-chmod
+    // leaves the token world-readable under a standard 022 umask until the
+    // chmod lands. OpenOptions with `.create_new()` also avoids clobbering
+    // an existing token file's permissions on re-save.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        opts.mode(0o600);
+        opts.open(&path)?
+            .write_all(format!("{}\n", serde_json::to_string_pretty(&body)?).as_bytes())?;
+        // Re-saving must tighten, not just create: an existing file keeps
+        // its old mode through open().
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&body)?))?;
     }
     Ok(path)
 }
@@ -253,6 +281,10 @@ mod tests {
             "ghe.example.com"
         );
         assert_eq!(oauth_domain("ghe.example.com:8443"), "ghe.example.com");
+        // FINDING-032: bracketed + bare IPv6 must survive intact.
+        assert_eq!(oauth_domain("[::1]:8443"), "::1");
+        assert_eq!(oauth_domain("http://[::1]:8443/"), "::1");
+        assert_eq!(oauth_domain("::1"), "::1");
     }
 
     #[test]

@@ -725,6 +725,12 @@ pub fn first_turn_reason(
 #[derive(Debug, Clone)]
 struct PendingRequest {
     conversation_key: String,
+    /// Canonical project directory for this turn (see
+    /// [`crate::proxy::resolve_ctx_project`]), filled by [`UsageObserver::note_project`]
+    /// right after [`UsageObserver::begin_request`] parks the entry. `None`
+    /// when the caller never resolved one — the endpoint reports those turns
+    /// without a project rather than dropping them.
+    project: Option<String>,
     /// See [`FirstTurnContext`]. `None` when the handler never filled it in.
     first_turn: Option<FirstTurnContext>,
     /// See [`PrefixAdoption`]. Set on the forward path, after `begin_request`.
@@ -1340,6 +1346,21 @@ struct Inner {
     last_event: Option<RecacheEvent>,
 }
 
+/// One conversation with a turn currently in flight, for the loopback
+/// `/debug/active-conversations` endpoint.
+///
+/// `conversation` is the same opaque 16-hex usage key the observer tracks
+/// everywhere else — it joins to nothing outside this process.
+/// `project` is the canonical project directory the turn resolved to
+/// (or the shared unresolved bucket); full local paths stay behind the
+/// loopback guard with the rest of the `/debug/*` surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActiveConversation {
+    pub conversation: String,
+    pub project: Option<String>,
+    pub age_secs: u64,
+}
+
 /// Shared observer, one per proxy process (lives on `AppState`).
 pub struct UsageObserver {
     /// TTL the forwarded body actually pins, used to tell a legitimate cache
@@ -1513,6 +1534,7 @@ impl UsageObserver {
                 began: now,
                 concurrent_with_in_flight,
                 conversation_key,
+                project: None,
                 first_turn: None,
                 adoption: None,
                 session_key_hash: session_key.map(super::drift_detector::session_key_log_prefix),
@@ -1535,6 +1557,45 @@ impl UsageObserver {
                 inner.abandoned_requests_total += 1;
             }
         }
+    }
+
+    /// Attach the resolved project directory to an already-parked turn.
+    ///
+    /// Split from [`begin_request`](Self::begin_request) so that method's
+    /// signature — and its hundred-odd test call sites — stays put: project
+    /// resolution needs the headers plus the parsed body, which the two
+    /// production callers have in hand right after parking. No entry (shed,
+    /// completed, or unknown id) is a silent no-op, never a panic.
+    pub fn note_project(&self, request_id: &str, project: String) {
+        let mut inner = self.lock();
+        if let Some(entry) = inner.pending.get_mut(request_id) {
+            entry.project = Some(project);
+        }
+    }
+
+    /// Snapshot every turn still in flight: parked, under the horizon, and
+    /// not yet completed. Sorted oldest-first so the longest-running turn
+    /// leads. Pure read under one lock; the endpoint formats it.
+    pub fn active_conversations(&self) -> Vec<ActiveConversation> {
+        let inner = self.lock();
+        let now = Instant::now();
+        let mut out: Vec<ActiveConversation> = inner
+            .pending
+            .iter()
+            .filter_map(|(_, p)| {
+                let age = now.duration_since(p.began);
+                if age >= IN_FLIGHT_HORIZON {
+                    return None;
+                }
+                Some(ActiveConversation {
+                    conversation: p.conversation_key.clone(),
+                    project: p.project.clone(),
+                    age_secs: age.as_secs(),
+                })
+            })
+            .collect();
+        out.sort_by_key(|c| std::cmp::Reverse(c.age_secs));
+        out
     }
 
     /// Shed this turn when its conversation already has more than `cap` turns
@@ -1924,6 +1985,18 @@ impl UsageObserver {
             let billed_fresh_equivalents = billed_input as f64
                 + (billed_cache_read as f64 * 0.1)
                 + (billed_cache_write as f64 * 1.25);
+            // Hidden continuation rounds, split out so the ledger joins to
+            // `ccr_continuation_usage` without recomputing the difference:
+            // billed totals minus the client baseline `complete` was given.
+            // Zero on the common single-round path. Existing fields stay as
+            // they are.
+            let (rounds_input_tokens, rounds_cache_read_tokens) =
+                pending.billed_totals.map_or((0, 0), |(bi, bcr, _)| {
+                    (
+                        bi.saturating_sub(input_tokens),
+                        bcr.saturating_sub(cache_read_input_tokens),
+                    )
+                });
             // Same window as the hit rate above, and the same reason: the
             // statusline needs it per render and cannot afford to re-read the
             // log. Kept here rather than beside the hit rate because the
@@ -1948,6 +2021,10 @@ impl UsageObserver {
                 input_tokens = billed_input,
                 cache_read_input_tokens = billed_cache_read,
                 cache_creation_input_tokens = billed_cache_write,
+                // Hidden-round split: billed totals minus the client baseline,
+                // so the ledger joins to `ccr_continuation_usage` directly.
+                rounds_input_tokens = rounds_input_tokens,
+                rounds_cache_read_tokens = rounds_cache_read_tokens,
                 // Which TTL the provider actually billed the write at. The
                 // proxy asks for the 1-hour tier on the prefix, but asking is
                 // not granting, and the flat creation count above cannot tell
@@ -2927,6 +3004,72 @@ mod tests {
     use super::*;
     use crate::observability::proxy_counters::cache_miss_attribution_for_test;
 
+    /// Ten alternating user/assistant messages: past the fingerprint fixed
+    /// depth (8), so `body` is comparable and `stable` covers the first 9.
+    fn ten_turn_body() -> serde_json::Value {
+        let messages: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("message-{i}"),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "model": "claude-opus-4-6",
+            "system": "you are a test",
+            "tools": [],
+            "messages": messages,
+        })
+    }
+
+    /// C8 frozen vector: the watchdog conversation key folds the session
+    /// key and the first message only — a growing tail must not re-key.
+    #[test]
+    fn conversation_key_vector_is_frozen() {
+        let key = conversation_key(&ten_turn_body(), "ip:10.0.0.3:-");
+        assert_eq!(key, "8f2d781234961e29");
+        assert_eq!(key.len(), 16, "8 bytes hex");
+        // A new latest message leaves the key alone (only msg0 is folded).
+        let mut grown = ten_turn_body();
+        grown["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(serde_json::json!({"role": "user", "content": "message-10"}));
+        assert_eq!(conversation_key(&grown, "ip:10.0.0.3:-"), key);
+        // A rewritten opener re-keys.
+        let mut rewritten = ten_turn_body();
+        rewritten["messages"][0]["content"] = serde_json::json!("a different opener");
+        assert_ne!(conversation_key(&rewritten, "ip:10.0.0.3:-"), key);
+    }
+
+    /// C8 frozen vector: the prefix fingerprint's head/body/stable split
+    /// for a fixed body, with the documented comparability depths.
+    #[test]
+    fn prefix_fingerprint_vector_is_frozen() {
+        let fp = prefix_fingerprint(&ten_turn_body());
+        assert_eq!(fp.head, "0d053f35d9401183");
+        assert_eq!(fp.body, "7c4b1d729536c4b7");
+        assert_eq!(fp.stable, "d6e9603c54bc03e2");
+        assert_eq!(fp.stable_msgs, 9, "every message except the live tail");
+        // Below the fixed depth the body reports incomparable, never stale.
+        let short = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "system": "you are a test",
+            "tools": [],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let short_fp = prefix_fingerprint(&short);
+        assert!(short_fp.body.is_empty(), "not comparable yet");
+        assert_eq!(short_fp.stable_msgs, 0, "single message is all tail");
+        // A system change moves the head and leaves the body alone.
+        let mut resys = ten_turn_body();
+        resys["system"] = serde_json::json!("you are a different test");
+        let resys_fp = prefix_fingerprint(&resys);
+        assert_ne!(resys_fp.head, fp.head);
+        assert_eq!(resys_fp.body, fp.body);
+    }
+
     /// Eviction and never-seen used to be the same observation, so a turn
     /// that came back after its conversation fell out of the map was booked
     /// a first turn and its cache write went uncounted, silently.
@@ -3326,6 +3469,48 @@ mod tests {
             1,
             "a completed request is taken by `complete`, never swept"
         );
+    }
+
+    /// /debug/active-conversations: parked turns show with their project,
+    /// completed turns leave, and noting a project for an unknown id is silent.
+    #[test]
+    fn active_conversations_reports_in_flight_with_project() {
+        let obs = UsageObserver::new();
+        obs.begin_request("r1", "conv-a".into(), None, None, None);
+        obs.note_project("r1", "/repo/a".into());
+        obs.begin_request("r2", "conv-b".into(), None, None, None);
+
+        let active = obs.active_conversations();
+        assert_eq!(active.len(), 2);
+        let a = active
+            .iter()
+            .find(|c| c.conversation == "conv-a")
+            .expect("conv-a present");
+        assert_eq!(a.project.as_deref(), Some("/repo/a"));
+        let b = active
+            .iter()
+            .find(|c| c.conversation == "conv-b")
+            .expect("conv-b present");
+        assert_eq!(b.project, None, "un-noted turns report without a project");
+
+        // Unknown ids never panic and never create entries.
+        obs.note_project("nope", "/repo/x".into());
+        assert_eq!(obs.active_conversations().len(), 2);
+
+        obs.complete("r1", 10, 0, 0, None);
+        let active = obs.active_conversations();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].conversation, "conv-b");
+    }
+
+    /// Past the horizon a parked turn is no longer in flight, so the endpoint
+    /// stops reporting it even before the next arrival sweeps it.
+    #[test]
+    fn active_conversations_hides_past_horizon_turns() {
+        let obs = UsageObserver::new();
+        obs.begin_request("old", "conv-old".into(), None, None, None);
+        obs.age_pending("old", IN_FLIGHT_HORIZON);
+        assert!(obs.active_conversations().is_empty());
     }
 
     /// The concurrency cap sheds only past the cap, pops the shed turn so it
@@ -4368,6 +4553,9 @@ mod prefix_on_recache_event_tests {
             .unwrap_or_else(|| panic!("no ledger event; captured:\n{joined}"));
         assert!(line.contains("cache_read_input_tokens=350000"), "{line}");
         assert!(line.contains("input_tokens=20"), "{line}");
+        // Hidden-round split: billed totals minus the client baseline.
+        assert!(line.contains("rounds_input_tokens=10"), "{line}");
+        assert!(line.contains("rounds_cache_read_tokens=150000"), "{line}");
         // 20 + 350000*0.1 + 4000*1.25 = 40020
         assert!(line.contains("billed_fresh_equivalents=40020"), "{line}");
     }

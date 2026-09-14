@@ -879,6 +879,18 @@ pub struct CliArgs {
     )]
     pub redact_sensitive: bool,
 
+    /// Mask filesystem paths as part of `--redact-sensitive`. Independent of
+    /// the secret and email masking, which `--redact-sensitive` governs on its
+    /// own. Default `false`: paths carry project structure the model needs,
+    /// and masking them costs more comprehension than it buys.
+    #[arg(
+        long = "redact-paths",
+        env = "HEADROOM_PROXY_REDACT_PATHS",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub redact_paths: bool,
+
     /// B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached
     /// prefix survives idle gaps past the 5-minute default. Anthropic only,
     /// and skipped on PAYG — a 1h write is priced at 2× base input against
@@ -1452,6 +1464,52 @@ pub struct CliArgs {
     )]
     pub retry_max_attempts: u32,
 
+    /// Hold a Zen (opencode.ai) 429 past the fast retry budget instead of
+    /// returning it. Default `true`.
+    ///
+    /// A Zen 429 kills the Claude Code turn (and its subagents) the moment
+    /// it arrives, but it is also the signal `zen-rotate-watch.sh` rotates
+    /// the VPN exit on (cooldown 120s, drain up to 90s). With the hold on,
+    /// the proxy waits — bounded by `--retry-zen-hold-budget-ms` — so the
+    /// turn lands on the fresh exit instead of dying before the rotation.
+    #[arg(
+        long = "retry-zen-hold",
+        env = "HEADROOM_RETRY_ZEN_HOLD",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub retry_zen_hold_enabled: bool,
+
+    /// Max time (ms) a Zen 429 is held while the VPN exit rotates before
+    /// the proxy gives up and returns it. Default `150000` (150s).
+    ///
+    /// Covers the watcher cooldown (120s) plus drain (up to 90s, usually
+    /// far less — the drain exits as soon as in-flight turns land) with
+    /// margin. Observed Zen bursts cluster at 15–30s, so most holds
+    /// recover long before the budget; the tail is for rotation + a slow
+    /// drain overlapping. `0` disables the wait (hold returns the 429 at
+    /// once — same as `--retry-zen-hold false`).
+    #[arg(
+        long = "retry-zen-hold-budget-ms",
+        env = "HEADROOM_RETRY_ZEN_HOLD_BUDGET_MS",
+        default_value_t = 150_000
+    )]
+    pub retry_zen_hold_budget_ms: u32,
+
+    /// Max concurrent Zen (opencode.ai) sends. Default `4`. `0` disables.
+    ///
+    /// Zen 429s arrive in herds: 2026-09-14 saw 40 parallel 429s in one hour
+    /// and a 7-wide subagent burst that truncated every turn in the same
+    /// millisecond. Turns past the cap wait (bounded by
+    /// `--retry-max-delay-ms`, then proceed without a slot) instead of
+    /// firing into an upstream that is already shedding load.
+    #[arg(
+        long = "retry-zen-max-inflight",
+        env = "HEADROOM_RETRY_ZEN_MAX_INFLIGHT",
+        default_value_t = 4
+    )]
+    pub retry_zen_max_inflight: usize,
+
     /// Attempts for a 200 response whose SSE body opens with an error event.
     /// Default `6`.
     ///
@@ -1618,7 +1676,7 @@ pub struct CliArgs {
     /// that only a `SavingsProfile` ever writes and nothing reads, and
     /// `live_zone::DispatchConfig` declares one that is neither read nor
     /// written. `skip_user_messages`, which the doc comments say this overrides,
-    /// is itself only declared and defaulted. See [[features-on-but-inert]].
+    /// is itself only declared and defaulted.
     #[arg(long = "compress-user-messages", env = "HEADROOM_COMPRESS_USER_MESSAGES", default_value_t = true, action = clap::ArgAction::Set)]
     pub compress_user_messages: bool,
 
@@ -1669,6 +1727,12 @@ pub struct CliArgs {
     /// `all_messages` path compresses without storing an original to retrieve,
     /// so a summarized file read cannot be undone. Pass `--exclude-tools ""`
     /// to compress them anyway.
+    ///
+    /// Honored on all three live-zone paths — Anthropic `/v1/messages`,
+    /// OpenAI Chat Completions, and OpenAI Responses (FINDING-017 fixed):
+    /// an excluded tool's output never reaches a lossy compressor
+    /// (verbatim/byte-exact members pass through untouched, others get the
+    /// reversible lossless fold only).
     #[arg(
         long = "exclude-tools",
         env = "HEADROOM_EXCLUDE_TOOLS",
@@ -1686,10 +1750,24 @@ pub struct CliArgs {
 
     // ─── Read lifecycle ──────────────────────────────────────────────────
     /// Enable read lifecycle tracking.
+    ///
+    /// NO-OP (2026-09-14, FINDING-019): nothing on the live proxy path
+    /// reads this — `ReadLifecycleManager::apply` runs only inside
+    /// `cold_recompact_messages` (cold-prefix fork, always-on, ignores the
+    /// flag) and `classify()` for retrieval-time stale warnings. Wiring the
+    /// flag into the Anthropic handler like Python does (content_router.py
+    /// pre-process) changes forwarded bytes and needs an A/B, not a silent
+    /// change. Kept declared so existing flag files keep parsing.
     #[arg(long = "read-lifecycle", env = "HEADROOM_READ_LIFECYCLE", default_value_t = false, action = clap::ArgAction::Set)]
     pub read_lifecycle: bool,
 
     /// Enable read maturation (hold fresh reads out of prefix cache).
+    ///
+    /// NO-OP (2026-09-14, FINDING-019): `ReadMaturationManager` and
+    /// `relocate_cache_breakpoint` have zero proxy callers — the Python
+    /// handler wiring (anthropic.py:2290) was never ported. Same status as
+    /// `--read-lifecycle` above: kept declared for flag-file compat,
+    /// wiring needs an A/B first.
     #[arg(long = "read-maturation", env = "HEADROOM_READ_MATURATION", default_value_t = false, action = clap::ArgAction::Set)]
     pub read_maturation: bool,
 
@@ -1824,7 +1902,7 @@ fn parse_prune_policy(
 
 /// A model-to-upstream routing rule.
 #[derive(Debug, Clone)]
-pub struct ModelRoute {
+pub struct ProviderRoute {
     /// Model name prefix to match (exact match, or trailing `*` for prefix).
     pub model_prefix: String,
     /// Whether this is a prefix match (model_prefix ends with `*`).
@@ -1840,7 +1918,7 @@ pub struct ModelRoute {
     /// A `{effort}` in the id is replaced per request with the level the
     /// client asked for, so `cursor-grok-4.6-{effort}` lets one alias cover
     /// every tier and `/effort` drive it. See
-    /// [`ModelRoute::resolve_cursor_agent`].
+    /// [`ProviderRoute::resolve_cursor_agent`].
     pub cursor_agent: Option<String>,
     /// When set, overrides the `model` field sent to the upstream after
     /// translation. Lets `model_prefix` be a discoverable id (e.g.
@@ -1867,34 +1945,16 @@ pub struct ModelRoute {
     pub auth_env: Option<String>,
 }
 
-/// The placeholder a cursor route uses to take its effort from the request.
-pub const EFFORT_PLACEHOLDER: &str = "{effort}";
-
-/// Cursor's own tier names, which are also Claude Code's `/effort` levels.
-const CURSOR_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
-
-impl ModelRoute {
+impl ProviderRoute {
     /// The Cursor model id to run, with `{effort}` filled in.
     ///
-    /// `effort` is what the client asked for. Cursor's tiers happen to be
-    /// spelled exactly like Claude Code's levels, so the two line up without a
-    /// table; `max` is the one level Claude Code has and Cursor does not, and
-    /// it lands on `xhigh` rather than naming a model that does not exist.
-    ///
-    /// Falls back to `high` — Cursor's plain "Grok 4.6", the tier the id
-    /// without a suffix means — when the client named nothing usable. A
-    /// missing effort should not silently demote the model.
+    /// Provider quirk (P6): the mapping itself lives in
+    /// [`crate::routed::quirks::resolve_cursor_model`]; this stays so the
+    /// route's other callers (`route_resolve`, `count_tokens`, config
+    /// snapshots) keep one call shape.
     pub fn resolve_cursor_agent(&self, effort: Option<&str>) -> Option<String> {
         let id = self.cursor_agent.as_deref()?;
-        if !id.contains(EFFORT_PLACEHOLDER) {
-            return Some(id.to_string());
-        }
-        let level = match effort {
-            Some("max") => "xhigh",
-            Some(e) if CURSOR_EFFORTS.contains(&e) => e,
-            _ => "high",
-        };
-        Some(id.replace(EFFORT_PLACEHOLDER, level))
+        Some(crate::routed::quirks::resolve_cursor_model(id, effort))
     }
 
     pub fn matches(&self, model: &str) -> bool {
@@ -1907,7 +1967,7 @@ impl ModelRoute {
 }
 
 /// Parse `MODEL_NAME=UPSTREAM_URL[:translate[:TARGET_MODEL_ID]]` or
-/// `MODEL_NAME=cursor:MODEL_ID` into a `ModelRoute`. `TARGET_MODEL_ID` lets
+/// `MODEL_NAME=cursor:MODEL_ID` into a `ProviderRoute`. `TARGET_MODEL_ID` lets
 /// `MODEL_NAME` be a discoverable id (e.g. `claude-codex-5.5`, to satisfy
 /// Claude Code's gateway-discovery filter) while the real upstream model id
 /// (e.g. `gpt-5.5`) differs.
@@ -1929,12 +1989,23 @@ pub fn parse_bedrock_model_map(raw: Option<&str>) -> HashMap<String, String> {
             continue;
         }
         let Some((name, target)) = pair.split_once('=') else {
+            let preview: String = pair.chars().take(64).collect();
+            tracing::warn!(
+                pair = %preview,
+                "ignoring malformed HEADROOM_BEDROCK_MODEL_MAP entry (expected name=target)"
+            );
             continue;
         };
         let name = name.trim();
         let target = target.trim();
         if !name.is_empty() && !target.is_empty() {
             overrides.insert(name.to_string(), target.to_string());
+        } else {
+            let preview: String = pair.chars().take(64).collect();
+            tracing::warn!(
+                pair = %preview,
+                "ignoring malformed HEADROOM_BEDROCK_MODEL_MAP entry (empty name or target)"
+            );
         }
     }
     overrides
@@ -1955,7 +2026,7 @@ pub fn parse_bedrock_model_map(raw: Option<&str>) -> HashMap<String, String> {
 ///
 /// Only warns when Codex auth is actually configured, so operators legitimately
 /// pointing a route at a chat-completions backend are not nagged.
-fn is_ambiguous_codex_route(route: &ModelRoute) -> bool {
+fn is_ambiguous_codex_route(route: &ProviderRoute) -> bool {
     // A route carrying its own credential is not Codex-bound, so it never sees
     // the ChatGPT bearer token this warning is about.
     route.auth_env.is_none()
@@ -1968,7 +2039,7 @@ fn is_ambiguous_codex_route(route: &ModelRoute) -> bool {
             .is_some_and(|h| h == "api.openai.com")
 }
 
-pub fn warn_on_ambiguous_codex_routes(routes: &[ModelRoute], codex_auth_file: Option<&str>) {
+pub fn warn_on_ambiguous_codex_routes(routes: &[ProviderRoute], codex_auth_file: Option<&str>) {
     if codex_auth_file.is_none() {
         return;
     }
@@ -1994,7 +2065,7 @@ pub fn warn_on_ambiguous_codex_routes(routes: &[ModelRoute], codex_auth_file: Op
 /// go to the first route, which looks identical to the route working. Writing
 /// three variants of one model under the same name is the easy version of this
 /// mistake, and the symptom is that switching models does nothing.
-pub fn warn_on_shadowed_routes(routes: &[ModelRoute]) {
+pub fn warn_on_shadowed_routes(routes: &[ProviderRoute]) {
     for (model, shadowed_by) in shadowed_routes(routes) {
         tracing::warn!(
             model = %model,
@@ -2007,7 +2078,7 @@ pub fn warn_on_shadowed_routes(routes: &[ModelRoute]) {
 }
 
 /// Pairs of `(unreachable route, the earlier route that swallows it)`.
-fn shadowed_routes(routes: &[ModelRoute]) -> Vec<(&str, &str)> {
+fn shadowed_routes(routes: &[ProviderRoute]) -> Vec<(&str, &str)> {
     routes
         .iter()
         .enumerate()
@@ -2069,7 +2140,7 @@ fn split_auth_env(rest: &str) -> Result<(&str, Option<String>), String> {
     Ok((&rest[..idx], Some(name.to_string())))
 }
 
-fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
+fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
     let (model, rest) = spec.split_once('=').ok_or_else(|| {
         format!(
             "expected MODEL=URL[:translate[:TARGET_ID]][:auth=ENV_VAR] or \
@@ -2081,7 +2152,7 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
 
     // `cursor:MODEL_ID` selects the subprocess transport, which has no URL.
     if let Some(cursor_model) = rest.strip_prefix("cursor:") {
-        return Ok(ModelRoute {
+        return Ok(ProviderRoute {
             model_prefix: model,
             prefix_match,
             upstream: None,
@@ -2122,7 +2193,7 @@ fn parse_model_route(spec: &str) -> Result<ModelRoute, String> {
         .parse()
         .map_err(|e| format!("invalid URL '{url_str}': {e}"))?;
 
-    Ok(ModelRoute {
+    Ok(ProviderRoute {
         model_prefix: model,
         prefix_match,
         upstream: Some(upstream),
@@ -2260,6 +2331,8 @@ pub struct Config {
     /// Reversible redaction of paths/secrets/emails on routed paths. Off by
     /// default; see the flag docs on the CLI side.
     pub redact_sensitive: bool,
+    /// Mask filesystem paths when redaction runs. Default `false`.
+    pub redact_paths: bool,
     /// B1: pin `cache_control.ttl` to `1h`. Non-PAYG only. Default `false`.
     pub force_1h_cache_ttl: bool,
     /// 1h on the tools and system prefix, 5m on the message tail. Takes
@@ -2347,7 +2420,7 @@ pub struct Config {
     pub sidecar_route_timeout: Duration,
     /// Additional model routes from `--extra-model-route` flags.
     /// Evaluated after `local_model` (exact match takes priority).
-    pub model_routes: Vec<ModelRoute>,
+    pub model_routes: Vec<ProviderRoute>,
     /// Path to Codex auth JSON file. When set, the proxy reads the
     /// access_token from this file and uses it as a Bearer token for
     /// OpenAI upstream requests. Re-read on each request for refresh.
@@ -2408,6 +2481,9 @@ pub struct Config {
     pub retry_enabled: bool,
     /// Max retry attempts per upstream call.
     pub retry_max_attempts: u32,
+    pub retry_zen_hold_enabled: bool,
+    pub retry_zen_hold_budget_ms: u32,
+    pub retry_zen_max_inflight: usize,
     pub retry_overload_max_attempts: u32,
     /// Bytes held back before a streamed response counts as committed.
     pub retry_stream_hold_bytes: usize,
@@ -2583,6 +2659,7 @@ impl Config {
             cache_pin_tool_roster: args.cache_pin_tool_roster,
             max_conversation_concurrency: args.max_conversation_concurrency,
             redact_sensitive: args.redact_sensitive,
+            redact_paths: args.redact_paths,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
             respect_client_5m_ttl: args.respect_client_5m_ttl,
@@ -2703,6 +2780,9 @@ impl Config {
             ccr_max_retrieval_rounds: args.ccr_max_retrieval_rounds,
             retry_enabled: args.retry_enabled,
             retry_max_attempts: args.retry_max_attempts,
+            retry_zen_hold_enabled: args.retry_zen_hold_enabled,
+            retry_zen_hold_budget_ms: args.retry_zen_hold_budget_ms,
+            retry_zen_max_inflight: args.retry_zen_max_inflight,
             retry_overload_max_attempts: args.retry_overload_max_attempts,
             retry_stream_hold_bytes: args.retry_stream_hold_bytes,
             retry_base_delay_ms: args.retry_base_delay_ms,
@@ -2729,13 +2809,12 @@ impl Config {
             accuracy_guard: args.accuracy_guard,
             lossless: args.lossless,
             ccr_inject_marker: args.ccr_inject_marker,
-            exclude_tools: args
-                .exclude_tools
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
+            // FINDING-018: faithful port of Python's merge
+            // (server.py:964-972) — protect_tool_results force-merges
+            // into the exclude set so named tools are never
+            // lossy-compressed, on top of whatever --exclude-tools says.
+            // protect_tool_results is NOT emptied by `--exclude-tools ""`:
+            // explicit protection wins over explicit exclusion-clearing.
             protect_tool_results: args
                 .protect_tool_results
                 .split(',')
@@ -2743,6 +2822,26 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
+            exclude_tools: {
+                let mut merged: Vec<String> = args
+                    .exclude_tools
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                for extra in args
+                    .protect_tool_results
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if !merged.iter().any(|t| t == extra) {
+                        merged.push(extra.to_string());
+                    }
+                }
+                merged
+            },
             read_lifecycle: args.read_lifecycle,
             read_maturation: args.read_maturation,
             stateless: args.stateless,
@@ -2834,6 +2933,7 @@ impl Config {
             cache_pin_tool_roster: false,
             max_conversation_concurrency: 0,
             redact_sensitive: false,
+            redact_paths: false,
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
             respect_client_5m_ttl: false,
@@ -2898,6 +2998,9 @@ impl Config {
             ccr_max_retrieval_rounds: 8,
             retry_enabled: true,
             retry_max_attempts: 3,
+            retry_zen_hold_enabled: true,
+            retry_zen_hold_budget_ms: 150_000,
+            retry_zen_max_inflight: 4,
             retry_overload_max_attempts: 6,
             retry_stream_hold_bytes: 2048,
             retry_base_delay_ms: 1000,
@@ -3186,7 +3289,7 @@ mod model_route_tests {
     #[test]
     fn parse_comma_separated_routes() {
         let input = "MiMo-V2.5=https://api.xiaomimimo.com/anthropic,codex-*=https://api.openai.com/v1:translate";
-        let routes: Vec<ModelRoute> = input
+        let routes: Vec<ProviderRoute> = input
             .split(',')
             .map(|s| parse_model_route(s.trim()).unwrap())
             .collect();
@@ -3315,6 +3418,22 @@ mod ctx_implies_interception_tests {
         assert!(c.exclude_tools.is_empty());
     }
 
+    /// FINDING-018: `--protect-tool-results` merges into the exclude set
+    /// (faithful port of Python server.py:964-972) — and survives an
+    /// explicit `--exclude-tools ""`, since explicit protection wins.
+    #[test]
+    fn protect_tool_results_merges_into_exclude_set() {
+        let c = cfg(&["--protect-tool-results", "Bash,WebFetch"]);
+        for tool in ["Bash", "WebFetch"] {
+            assert!(
+                c.exclude_tools.iter().any(|t| t == tool),
+                "{tool} must be excluded via protect_tool_results"
+            );
+        }
+        let c = cfg(&["--exclude-tools", "", "--protect-tool-results", "Bash"]);
+        assert!(c.exclude_tools.iter().any(|t| t == "Bash"));
+    }
+
     /// Cross-session seeding changes newborn-session wire bytes, so it must
     /// stay off unless explicitly requested — through the flag and the env.
     #[test]
@@ -3394,7 +3513,7 @@ mod ctx_implies_interception_tests {
 mod model_route_keyword_tests {
     use super::*;
 
-    fn route(spec: &str) -> ModelRoute {
+    fn route(spec: &str) -> ProviderRoute {
         parse_model_route(spec).expect("spec parses")
     }
 
@@ -3461,7 +3580,7 @@ mod shadowed_route_tests {
     use super::*;
 
     fn shadowed(specs: &[&str]) -> Vec<(String, String)> {
-        let routes: Vec<ModelRoute> = specs
+        let routes: Vec<ProviderRoute> = specs
             .iter()
             .map(|s| parse_model_route(s).expect("spec parses"))
             .collect();
@@ -3527,7 +3646,7 @@ mod shadowed_route_tests {
 mod ambiguous_codex_route_tests {
     use super::*;
 
-    fn routes(spec: &str) -> Vec<ModelRoute> {
+    fn routes(spec: &str) -> Vec<ProviderRoute> {
         vec![parse_model_route(spec).expect("spec parses")]
     }
 
@@ -3699,7 +3818,7 @@ mod live_flags_file_tests {
 mod cursor_effort_tests {
     use super::*;
 
-    fn route(spec: &str) -> ModelRoute {
+    fn route(spec: &str) -> ProviderRoute {
         parse_model_route(spec).expect("spec parses")
     }
 

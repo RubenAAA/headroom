@@ -88,10 +88,13 @@ impl OutputMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranslateOutcome {
     /// Emit these bytes to the client. For `OutputMode::Sse` this is
-    /// `data: {payload}\n\n`; for `OutputMode::EventStream` it is the
-    /// upstream bytes themselves (we don't ever pass through here —
-    /// passthrough mode is handled by the streaming forwarder, which
-    /// never bothers parsing).
+    /// `event: {type}\ndata: {payload}\n\n` when the payload carries a
+    /// `type` field, else `data: {payload}\n\n` (best-effort — the
+    /// `event:` line is what `AnthropicStreamState` keys on, and without
+    /// it the event is dropped with `sse_unknown_event`); for
+    /// `OutputMode::EventStream` it is the upstream bytes themselves (we
+    /// don't ever pass through here — passthrough mode is handled by the
+    /// streaming forwarder, which never bothers parsing).
     Emit(Bytes),
     /// Skip — the message has no client-facing translation. Used for
     /// `:event-type` values that AWS emits for protocol-internal
@@ -120,7 +123,9 @@ pub enum TranslateError {
 ///
 /// Side-effect-free: emits a `tracing::info!` per `chunk` translation
 /// and `tracing::warn!` for unknown event types. The hot path is
-/// allocation-bounded — one `BytesMut` of `payload.len() + 8`.
+/// allocation-bounded — one `BytesMut` of `payload.len() + extra + 8`,
+/// where `extra` is the `event: {type}\n` prefix (zero when the payload
+/// carries no `type` and the frame is data-only).
 pub fn translate_message(
     message: &EventStreamMessage,
     mode: OutputMode,
@@ -224,14 +229,13 @@ fn payload_to_sse_frame(payload: &[u8]) -> Bytes {
     out.freeze()
 }
 
-/// Extract `type` field from an Anthropic SSE JSON payload. We do a
-/// targeted byte-level scan rather than a full JSON parse so the hot
-/// path is allocation-free in the common case. Falls back to `None`
-/// on any malformed input — never panics.
+/// Extract `type` field from an Anthropic SSE JSON payload.
+/// FINDING-031: the doc previously claimed a "targeted byte-level scan"
+/// while the body did a full `serde_json` parse — the doc lied, not the
+/// code. Parse it is: the JSON is small (typical Anthropic event ~200
+/// bytes), so the parse cost is negligible vs the wire serialisation we
+/// already do. Falls back to `None` on any malformed input — never panics.
 fn extract_anthropic_event_type(payload: &[u8]) -> Option<String> {
-    // Cheap path: parse with serde_json, take `.type` if it's a string.
-    // The JSON is small (typical Anthropic event ~200 bytes), so the
-    // parse cost is negligible vs the wire serialisation we already do.
     let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
     v.get("type")?.as_str().map(|s| s.to_string())
 }

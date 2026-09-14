@@ -396,11 +396,12 @@ pub async fn handle_invoke(
         "bedrock invoke: response forwarded"
     );
 
-    // Stream the response body back without buffering.
+    // Stream the response body back without buffering. Tracked so the
+    // rotation drain sees it until the last byte.
     let stream = upstream_resp
         .bytes_stream()
         .map(|r| r.map_err(std::io::Error::other));
-    let body_out = Body::from_stream(stream);
+    let body_out = Body::from_stream(crate::proxy::track_streaming(stream));
 
     let mut builder = Response::builder().status(status);
     if let Some(h) = builder.headers_mut() {

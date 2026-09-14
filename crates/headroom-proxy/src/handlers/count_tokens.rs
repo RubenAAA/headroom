@@ -27,31 +27,34 @@ use crate::routed::routing::find_route_target;
 /// calibrated counter (`claude-*` → 3.5 chars/token estimator, tiktoken
 /// where a real tokenizer exists).
 ///
-/// Deliberately an estimate, and an undercount at that: per-message framing
-/// and image payloads are not counted. Undercounting delays the client's
-/// compaction decision slightly; overcounting would compact early and throw
-/// away context. The alternative for these models today is a 404, so an
-/// honest approximation strictly wins.
+/// Deliberately an estimate, and a slight undercount at that: per-message
+/// framing is not counted. Image/document payloads ARE weighted (see
+/// `image_block_tokens`): without that the estimate stays flat as screenshots
+/// accumulate, the client never compacts, and the turn dies at the upstream
+/// byte cap. The alternative for these models today is a 404, so an honest
+/// approximation strictly wins.
 pub(crate) fn estimate_input_tokens(parsed: &Value, model: &str) -> u64 {
     let counter = headroom_core::tokenizer::get_tokenizer(model);
     let mut text = String::new();
-    push_content_text(&mut text, &parsed["system"]);
+    let mut image_tokens: u64 = 0;
+    push_content_text(&mut text, &mut image_tokens, &parsed["system"]);
     if let Some(messages) = parsed.get("messages").and_then(|m| m.as_array()) {
         for message in messages {
-            push_content_text(&mut text, &message["content"]);
+            push_content_text(&mut text, &mut image_tokens, &message["content"]);
         }
     }
     // Tool definitions ride every request as input tokens.
     if parsed.get("tools").is_some() {
         text.push_str(&serde_json::to_string(&parsed["tools"]).unwrap_or_default());
     }
-    counter.count_text(&text) as u64
+    counter.count_text(&text) as u64 + image_tokens
 }
 
 /// Append the countable text of an Anthropic `content` value: a plain string,
-/// or an array of blocks. Image/document sources carry no text (pixels are
-/// billed by size, which a text counter cannot see) and are skipped.
-fn push_content_text(out: &mut String, content: &Value) {
+/// or an array of blocks. Image/document blocks carry no text (pixels are
+/// billed by size, which a text counter cannot see) — their weight goes to
+/// `image_tokens` instead of being skipped.
+fn push_content_text(out: &mut String, image_tokens: &mut u64, content: &Value) {
     match content {
         Value::String(s) => out.push_str(s),
         Value::Array(blocks) => {
@@ -66,12 +69,54 @@ fn push_content_text(out: &mut String, content: &Value) {
                         // The JSON the model must reproduce counts.
                         out.push_str(&serde_json::to_string(&block["input"]).unwrap_or_default());
                     }
-                    Some("tool_result") => push_content_text(out, &block["content"]),
+                    Some("tool_result") => push_content_text(out, image_tokens, &block["content"]),
+                    Some("image") | Some("document") => {
+                        *image_tokens += image_block_tokens(block);
+                    }
                     _ => {}
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// Token weight of an image/document block, which carries no countable text.
+///
+/// Anthropic bills images by dimensions ((w*h)/750), not bytes, so base64
+/// length alone cannot size them: read just the image header for dimensions
+/// (no pixel decode) and apply the same formula as
+/// `tile_optimizer::estimate_anthropic_tokens`. When dimensions are
+/// unreadable (unsupported format, URL source, corrupt data) or the block is
+/// a document (PDFs have no pixel dimensions but still ride the request as
+/// base64), fall back to decoded bytes/750 — roughly one byte per pixel.
+fn image_block_tokens(block: &Value) -> u64 {
+    let source = match block.get("source") {
+        Some(s) => s,
+        None => return 0,
+    };
+    // URL sources live upstream; nothing local to weigh.
+    if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
+        return 0;
+    }
+    let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
+    // Tolerate a data: URL prefix though Anthropic sends raw base64.
+    let b64 = data.rsplit(',').next().unwrap_or(data);
+    let decoded_len = b64.len() as u64 * 3 / 4;
+    let bytes = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) {
+        Ok(b) => b,
+        Err(_) => return decoded_len / 750,
+    };
+    if block.get("type").and_then(|t| t.as_str()) != Some("image") {
+        return bytes.len() as u64 / 750;
+    }
+    match image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+    {
+        Some((w, h)) => crate::tile_optimizer::estimate_anthropic_tokens(w, h) as u64,
+        None => bytes.len() as u64 / 750,
     }
 }
 
@@ -198,20 +243,21 @@ mod tests {
     }
 
     #[test]
-    fn estimate_skips_images_without_failing() {
+    fn estimate_weights_images_so_compaction_can_fire() {
         let mut with_image = body();
+        // 1x1 PNG: decodes to real dimensions, weighs (w*h)/750 = 1 token min.
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
         with_image["messages"]
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({
                 "role": "user",
-                "content": [{"type": "image", "source": {"type": "base64", "data": "aGVsbG8="}}],
+                "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png_b64}}],
             }));
         let base = estimate_input_tokens(&body(), "claude-muse-spark-1.3");
-        assert_eq!(
-            estimate_input_tokens(&with_image, "claude-muse-spark-1.3"),
-            base,
-            "pixels are not text and must not move the count"
+        assert!(
+            estimate_input_tokens(&with_image, "claude-muse-spark-1.3") > base,
+            "image bytes must move the count or the client never compacts"
         );
     }
 

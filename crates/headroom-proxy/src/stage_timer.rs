@@ -12,20 +12,21 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// A guard that records its elapsed time when dropped.
-pub struct StageMeasurement {
-    stages: *mut HashMap<String, f64>,
+/// A guard that records its elapsed time into the parent [`StageTimer`]
+/// when dropped. Borrows the timer, so the compiler — not a safety
+/// contract — guarantees the timer outlives every measurement (MINOR-070:
+/// the previous raw-pointer form allowed a use-after-free the borrow
+/// checker could not see).
+pub struct StageMeasurement<'a> {
+    stages: &'a mut HashMap<String, f64>,
     name: String,
     start: Instant,
 }
 
-impl Drop for StageMeasurement {
+impl Drop for StageMeasurement<'_> {
     fn drop(&mut self) {
         let duration_ms = self.start.elapsed().as_secs_f64() * 1000.0;
-        // SAFETY: caller guarantees the parent StageTimer outlives this measurement.
-        unsafe {
-            (*self.stages).insert(self.name.clone(), duration_ms);
-        }
+        self.stages.insert(self.name.clone(), duration_ms);
     }
 }
 
@@ -63,15 +64,11 @@ impl StageTimer {
     }
 
     /// Start timing a named stage. The measurement is recorded when dropped.
-    ///
-    /// # Safety contract
-    /// The returned `StageMeasurement` holds a raw pointer to the internal
-    /// stages map. The caller must ensure the `StageTimer` outlives every
-    /// `StageMeasurement` it produces (guaranteed by the borrow checker when
-    /// used in the natural `let _m = timer.measure("x");` pattern).
-    pub fn measure(&mut self, name: &str) -> StageMeasurement {
+    /// The borrow on `&mut self` ties the guard's lifetime to the timer,
+    /// so an escaped guard is a compile error, not a use-after-free.
+    pub fn measure(&mut self, name: &str) -> StageMeasurement<'_> {
         StageMeasurement {
-            stages: &mut self.stages as *mut HashMap<String, f64>,
+            stages: &mut self.stages,
             name: name.to_string(),
             start: Instant::now(),
         }

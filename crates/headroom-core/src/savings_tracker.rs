@@ -1260,6 +1260,8 @@ impl SavingsTracker {
                 "total_input_tokens",
                 "total_input_cost_usd_delta",
                 "total_input_cost_usd",
+                "output_tokens_saved_delta",
+                "output_savings_usd_delta",
             ]
         };
         let mut buf = String::new();
@@ -1383,6 +1385,8 @@ impl SavingsTracker {
         let mut prev_usd = 0.0f64;
         let mut prev_input_tokens = 0i64;
         let mut prev_input_cost = 0.0f64;
+        let mut prev_output_tokens = 0i64;
+        let mut prev_output_usd = 0.0f64;
 
         for point in history {
             let Some(ts) = parse_timestamp(&point.timestamp) else {
@@ -1394,15 +1398,21 @@ impl SavingsTracker {
             let total_usd = coerce_float(point.compression_savings_usd);
             let total_input_tokens = coerce_int(point.total_input_tokens);
             let total_input_cost = coerce_float(point.total_input_cost_usd);
+            let total_output_tokens = coerce_int(point.output_tokens_saved);
+            let total_output_usd = coerce_float(point.output_savings_usd);
             let delta_tokens = (total_tokens - prev_tokens).max(0);
             let delta_usd = (total_usd - prev_usd).max(0.0);
             let delta_input_tokens = (total_input_tokens - prev_input_tokens).max(0);
             let delta_input_cost = (total_input_cost - prev_input_cost).max(0.0);
+            let delta_output_tokens = (total_output_tokens - prev_output_tokens).max(0);
+            let delta_output_usd = (total_output_usd - prev_output_usd).max(0.0);
 
             prev_tokens = total_tokens;
             prev_usd = total_usd;
             prev_input_tokens = total_input_tokens;
             prev_input_cost = total_input_cost;
+            prev_output_tokens = total_output_tokens;
+            prev_output_usd = total_output_usd;
 
             let entry = agg.entry(key.clone()).or_insert_with(|| {
                 order.push(key.clone());
@@ -1424,6 +1434,9 @@ impl SavingsTracker {
             entry.compression_savings_usd = round_n(total_usd, 6);
             entry.total_input_tokens = total_input_tokens;
             entry.total_input_cost_usd = round_n(total_input_cost, 6);
+            entry.output_tokens_saved_delta += delta_output_tokens;
+            entry.output_savings_usd_delta =
+                round_n(entry.output_savings_usd_delta + delta_output_usd, 6);
 
             if delta_tokens != 0
                 || delta_usd != 0.0
@@ -2132,6 +2145,13 @@ struct RollupEntry {
     total_input_tokens: i64,
     total_input_cost_usd_delta: f64,
     total_input_cost_usd: f64,
+    /// Slice #2: per-bucket output-shaping rollup, mirroring Python
+    /// `_build_rollup` (`output_tokens_saved_delta`,
+    /// `output_savings_usd_delta`). Deltas only — no output totals, same as
+    /// Python. Dashboard-only value; the provider/model splits stay
+    /// input-side, also matching Python.
+    output_tokens_saved_delta: i64,
+    output_savings_usd_delta: f64,
     by_provider: BTreeMap<String, RollupDelta>,
     by_model: BTreeMap<String, RollupDelta>,
 }
@@ -2154,6 +2174,8 @@ impl RollupEntry {
             total_input_tokens,
             total_input_cost_usd_delta: 0.0,
             total_input_cost_usd: total_input_cost,
+            output_tokens_saved_delta: 0,
+            output_savings_usd_delta: 0.0,
             by_provider: BTreeMap::new(),
             by_model: BTreeMap::new(),
         }
@@ -2185,6 +2207,8 @@ impl RollupEntry {
             "total_input_tokens": self.total_input_tokens,
             "total_input_cost_usd_delta": self.total_input_cost_usd_delta,
             "total_input_cost_usd": self.total_input_cost_usd,
+            "output_tokens_saved_delta": self.output_tokens_saved_delta,
+            "output_savings_usd_delta": self.output_savings_usd_delta,
             "by_provider": map_deltas(&self.by_provider),
             "by_model": map_deltas(&self.by_model),
         })
@@ -3153,6 +3177,8 @@ mod tests {
                     "total_input_tokens",
                     "total_input_cost_usd_delta",
                     "total_input_cost_usd",
+                    "output_tokens_saved_delta",
+                    "output_savings_usd_delta",
                     "by_provider",
                     "by_model",
                 ] {
@@ -3224,6 +3250,43 @@ mod tests {
         let snap = t.snapshot();
         assert_eq!(snap["lifetime"]["output_tokens_saved"], json!(0));
         assert_eq!(snap["lifetime"]["output_savings_usd"], json!(0.0));
+    }
+
+    #[test]
+    fn rollup_buckets_carry_output_deltas_like_python() {
+        // Slice #2: per-bucket output rollup mirrors Python `_build_rollup`.
+        // Two shaped requests in one hour bucket accumulate; the clamp
+        // (`max(total - prev, 0)`) means a later shrink never subtracts.
+        let dir = tempfile::tempdir().unwrap();
+        let t = tracker(&dir.path().join("s.json"));
+        assert!(t.record_request(&RequestRecord {
+            model: "claude-sonnet-4",
+            input_tokens: 500,
+            tokens_saved: 1000,
+            output_tokens_saved: 200,
+            ..Default::default()
+        }));
+        assert!(t.record_request(&RequestRecord {
+            model: "claude-sonnet-4",
+            input_tokens: 500,
+            tokens_saved: 1000,
+            output_tokens_saved: 100,
+            ..Default::default()
+        }));
+        let resp = t.history_response("compact");
+        let hourly = resp["series"]["hourly"].as_array().unwrap();
+        assert!(!hourly.is_empty());
+        let bucket = &hourly[0];
+        assert_eq!(bucket["output_tokens_saved_delta"], json!(300));
+        // 300 output tokens at claude-sonnet-4's $15/1M output rate.
+        let usd = bucket["output_savings_usd_delta"].as_f64().unwrap();
+        assert!((usd - 0.0045).abs() < 1e-9, "got {usd}");
+        // Matches the lifetime totals: the rollup must reconcile with them.
+        let snap = t.snapshot();
+        assert_eq!(
+            snap["lifetime"]["output_tokens_saved"],
+            bucket["output_tokens_saved_delta"]
+        );
     }
 
     #[test]

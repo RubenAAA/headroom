@@ -133,10 +133,27 @@ pub fn decode_reasoning_signature(signature: &str) -> Option<ReasoningReplay> {
 
 /// The Responses `input` item a decoded envelope turns back into.
 pub fn reasoning_input_item(replay: ReasoningReplay) -> Value {
+    reasoning_input_item_with_summary(replay, None)
+}
+
+/// Like [`reasoning_input_item`], but carries the visible thinking text as
+/// the item's `summary` so the scratchpad survives even where the encrypted
+/// blob cannot be replayed (Zen invalidates blobs on exit rotation; the
+/// caller strips `id` + `encrypted_content` there and the summary-only item
+/// is still accepted — probed 2026-09-14: unknown-id → 400, no-id with
+/// summary → 200).
+pub fn reasoning_input_item_with_summary(
+    replay: ReasoningReplay,
+    summary_text: Option<&str>,
+) -> Value {
+    let summary = match summary_text.filter(|t| !t.is_empty()) {
+        Some(text) => serde_json::json!([{ "type": "summary_text", "text": text }]),
+        None => serde_json::json!([]),
+    };
     serde_json::json!({
         "type": "reasoning",
         "id": replay.id,
-        "summary": [],
+        "summary": summary,
         "encrypted_content": replay.encrypted_content,
     })
 }

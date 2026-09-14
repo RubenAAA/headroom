@@ -32,6 +32,25 @@ fn is_thinking(block: &Value) -> bool {
     )
 }
 
+/// Whether stripping prior thinking costs nothing on this turn.
+///
+/// The drop rewrites every earlier assistant message, so it is only free
+/// where the provider rewrites the head anyway: a rebuild boundary (from
+/// message 0), no tracker holding anything (`None` — nothing cached to
+/// lose), or agreement ending at the head (divergence index 0/1). On a tail
+/// divergence the provider still holds the head and the drop rewrites it
+/// too — measured 2026-09-11: 12 dropped turns on divergences at index
+/// 13–743 (savings-ideas-2.md §4.2).
+///
+/// Takes the provider-side figure (`forwarded_agreement_len`: what we last
+/// sent is what got cached), not the client-originals one.
+pub fn thinking_drop_is_free(
+    rebuild_boundary: bool,
+    forwarded_agreement_len: Option<usize>,
+) -> bool {
+    rebuild_boundary || forwarded_agreement_len.map_or(true, |n| n <= 1)
+}
+
 /// Remove `thinking` and `redacted_thinking` blocks from every assistant
 /// message before the last one. The last assistant message is never touched,
 /// whatever follows it. A message that would be left with no blocks is left
@@ -174,5 +193,27 @@ mod tests {
         let once = parsed.clone();
         assert_eq!(drop_prior_thinking(&mut parsed), DropOutcome::default());
         assert_eq!(parsed, once);
+    }
+
+    #[test]
+    fn the_gate_allows_a_rebuild_whatever_the_agreement() {
+        assert!(thinking_drop_is_free(true, Some(150)));
+        assert!(thinking_drop_is_free(true, None));
+    }
+
+    #[test]
+    fn the_gate_allows_a_missing_tracker_or_a_head_divergence() {
+        assert!(thinking_drop_is_free(false, None));
+        assert!(thinking_drop_is_free(false, Some(0)));
+        assert!(thinking_drop_is_free(false, Some(1)));
+    }
+
+    #[test]
+    fn the_gate_refuses_a_tail_divergence() {
+        // The 2026-09-11 window dropped thinking on divergences at index
+        // 13–743; every one of these must now hold its head thinking.
+        for n in [2, 13, 64, 150, 743] {
+            assert!(!thinking_drop_is_free(false, Some(n)), "index {n}");
+        }
     }
 }

@@ -3481,8 +3481,6 @@ impl SessionReplayStore {
         ))
     }
 
-    /// Shorten the session TTL so a test can reach the idle path without
-    /// sleeping for the production ten minutes.
     /// Whether this turn's history goes to the provider as a fresh write.
     ///
     /// True when nothing is stored for the session, the stored turn is older

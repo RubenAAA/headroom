@@ -687,7 +687,9 @@ fn parse_diff(lines: &[&str]) -> ParsedDiff {
     let mut current_file: Option<DiffFile> = None;
     let mut current_hunk: Option<DiffHunk> = None;
     let mut pre_diff_lines: Vec<String> = Vec::new();
-    let warnings: Vec<String> = Vec::new();
+    // FINDING-014: was immutable — the documented >4-parent octopus
+    // warning below never fired. Now mutable with the push site.
+    let mut warnings: Vec<String> = Vec::new();
 
     for &line in lines {
         // New file section. Includes regular `diff --git` AND merge-commit
@@ -789,6 +791,20 @@ fn parse_diff(lines: &[&str]) -> ParsedDiff {
                 context_lines: 0,
                 score: 0.0,
             });
+            continue;
+        }
+
+        // FINDING-014: >4-parent octopus hunk headers (5+ `@`s) match no
+        // arm of hunk_header_regex. They used to fall into the content
+        // branch silently; warn so prod monitoring can flag the case.
+        // The `@`-run check must precede the content branch: a header
+        // line starts with `@`, which no content arm consumes, so it
+        // would otherwise vanish without a trace.
+        if line.starts_with("@@@@@") {
+            warnings.push(format!(
+                "unparsed octopus hunk header (>4 parents): {}",
+                line.chars().take(80).collect::<String>()
+            ));
             continue;
         }
 
@@ -1683,6 +1699,22 @@ mod tests {
             "no-newline marker dropped by context trim:\n{}",
             r.compressed
         );
+    }
+
+    /// FINDING-014: >4-parent octopus hunk headers (5+ `@`s) match no arm
+    /// of the hunk regex. They must warn, not vanish silently.
+    #[test]
+    fn octopus_hunk_header_warns() {
+        let lines = [
+            "diff --git a/octo.py b/octo.py",
+            "--- a/octo.py",
+            "+++ b/octo.py",
+            "@@@@@ -1,2 -1,2 -1,2 -1,2 -1,2 +1,2 @@@@@",
+            " +x",
+        ];
+        let parsed = parse_diff(&lines);
+        assert_eq!(parsed.parse_warnings.len(), 1);
+        assert!(parsed.parse_warnings[0].contains("octopus"));
     }
 
     /// Routing-gap test: `diff --combined <path>` (merge-commit header)

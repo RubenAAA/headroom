@@ -63,6 +63,10 @@ pub mod retry_reason {
     pub const STATUS_529: &str = "status_529";
     pub const STATUS_5XX: &str = "status_5xx";
     pub const TRANSPORT: &str = "transport";
+    /// A Zen (opencode.ai) 429 held past the fast budget while the VPN exit
+    /// rotates, plus the budget-spent give-up. One label for the whole hold
+    /// so the dashboard reads "held N, gave up M" without a new path.
+    pub const ZEN_HOLD: &str = "zen_hold";
     /// A 200 response whose SSE body opened with an error event. The HTTP
     /// status says success; the body disagrees.
     pub const IN_BAND_SSE: &str = "in_band_sse";

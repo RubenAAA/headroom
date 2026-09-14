@@ -629,9 +629,10 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
         }
     }
 
-    // Mixed content: text blocks + tool_result blocks.
+    // Mixed content: text blocks + tool_result blocks (+ images/documents).
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_results: Vec<&Value> = Vec::new();
+    let mut image_urls: Vec<String> = Vec::new();
 
     for block in content {
         match block.get("type").and_then(|v| v.as_str()) {
@@ -643,15 +644,43 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
             Some("tool_result") => {
                 tool_results.push(block);
             }
-            _ => {}
+            // FINDING-024: image/document blocks used to vanish here, and an
+            // image-only message emitted nothing at all. Carry images as
+            // OpenAI image_url parts (same decode/re-encode as the Responses
+            // direction); anything unconvertible leaves a placeholder so the
+            // model is told something was there instead of reading a drop
+            // as absent content.
+            Some("image") => match image_block_to_data_url(block) {
+                Some(url) => image_urls.push(url),
+                None => {
+                    text_parts.push("[unsupported content block omitted: image]".to_string());
+                }
+            },
+            Some(other) => {
+                text_parts.push(format!("[unsupported content block omitted: {other}]"));
+            }
+            None => {
+                text_parts.push("[unsupported content block omitted: unknown]".to_string());
+            }
         }
     }
 
-    if !text_parts.is_empty() {
-        out.push(json!({
-            "role": "user",
-            "content": text_parts.join("\n")
-        }));
+    if !text_parts.is_empty() || !image_urls.is_empty() {
+        if image_urls.is_empty() {
+            out.push(json!({
+                "role": "user",
+                "content": text_parts.join("\n")
+            }));
+        } else {
+            let mut parts: Vec<Value> = text_parts
+                .iter()
+                .map(|t| json!({"type": "text", "text": t}))
+                .collect();
+            for url in &image_urls {
+                parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+            }
+            out.push(json!({"role": "user", "content": parts}));
+        }
     }
 
     for tr in tool_results {
@@ -729,6 +758,30 @@ fn translate_assistant_message(msg: &Value, out: &mut Vec<Value>, include_tool_c
 }
 
 // ---------------------------------------------------------------------------
+// Route shape decision (C3): exactly one site derives the wire shape from
+// whether the route carries a target model. A target means the Responses API
+// (`/v1/responses`, `store=false`, forced upstream streaming); no target
+// means Chat Completions, where the client's own flags survive.
+// ---------------------------------------------------------------------------
+
+/// Which OpenAI wire shape a routed turn speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteShape {
+    Responses,
+    Chat,
+}
+
+/// The single shape switch. Every consumer matches on the computed value;
+/// none re-derives it from `target_model`.
+pub(crate) fn shape_for(target_model: Option<&str>) -> RouteShape {
+    if target_model.is_some() {
+        RouteShape::Responses
+    } else {
+        RouteShape::Chat
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Response translation: OpenAI → Anthropic (non-streaming)
 // ---------------------------------------------------------------------------
 
@@ -736,6 +789,45 @@ fn translate_assistant_message(msg: &Value, out: &mut Vec<Value>, include_tool_c
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// FINDING-024: an image-only user message used to emit nothing at all.
+    /// Images now ride as `image_url` parts so the turn survives.
+    #[test]
+    fn chat_user_message_with_only_image_still_emits() {
+        let msg = json!({"role": "user", "content": [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+        ]});
+        let mut out = Vec::new();
+        translate_user_message(&msg, &mut out);
+        assert_eq!(out.len(), 1);
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "image_url");
+        assert!(parts[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    /// FINDING-024: document/unknown blocks leave a placeholder instead of
+    /// vanishing, and text+tool_result behavior is unchanged.
+    #[test]
+    fn chat_user_message_marks_unconvertible_blocks() {
+        let msg = json!({"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "document", "source": {"type": "text", "data": "eA=="}},
+            {"type": "image", "source": {"type": "base64", "media_type": "text/plain", "data": "aGk="}}
+        ]});
+        let mut out = Vec::new();
+        translate_user_message(&msg, &mut out);
+        assert_eq!(out.len(), 1);
+        // No convertible image → legacy single-string form, placeholders inline.
+        let content = out[0]["content"].as_str().unwrap();
+        assert!(content.contains("look"));
+        assert!(content.contains("[unsupported content block omitted: document]"));
+        assert!(content.contains("[unsupported content block omitted: image]"));
+    }
 
     #[test]
     fn anthropic_to_openai_responses_request_serializes_tool_turns() {

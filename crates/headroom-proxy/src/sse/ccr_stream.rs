@@ -48,10 +48,13 @@
 //!
 //! Clients that speak OpenAI natively (`/v1/chat/completions`,
 //! `/v1/responses`) read different event vocabularies, which no rewriter
-//! covers yet. Rather than leave them advertising an unanswerable tool, the
-//! injection site in `proxy.rs` skips those tools when such a client asks for
-//! a stream. They keep the feature on buffered requests, where the buffered
-//! arm resolves it.
+//! covers. Chat streams keep the guard: the injection site in `proxy.rs`
+//! skips those tools when such a client asks for a stream, and they stay
+//! skipped. Responses streams take the buffered path instead
+//! (`openai_buffered_ccr`): upstream is called with `stream: false`, the
+//! buffered arm resolves retrieval, and the final JSON is resynthesized as
+//! SSE — so a Responses client is never handed an unanswerable tool either,
+//! just without a live rewriter.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -117,6 +120,11 @@ pub(crate) struct CcrStreamContext {
     /// [`crate::routed::ccr::RoutedCcr::redact`]). `None` on paths
     /// that never redact, where continuations pass through.
     pub redact: Option<crate::redact::RedactRef>,
+    /// Booking-owned rounds handle for streamed routed turns: when set, the
+    /// rewriter populates this handle (instead of a fresh one) so the
+    /// completion guard books first-round usage and rounds together. `None`
+    /// everywhere else; the returned handle is then the only copy.
+    pub rounds_sink: Option<Arc<Mutex<crate::proxy::CcrRoundUsage>>>,
 }
 
 /// Convert a rebuilt Anthropic assistant turn into the OpenAI
@@ -781,7 +789,10 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
-    let round_usage = Arc::new(Mutex::new(crate::proxy::CcrRoundUsage::default()));
+    let round_usage = ctx
+        .rounds_sink
+        .clone()
+        .unwrap_or_else(|| Arc::new(Mutex::new(crate::proxy::CcrRoundUsage::default())));
     let usage_handle = round_usage.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, E>>(CLIENT_QUEUE_DEPTH);
 
@@ -1046,7 +1057,7 @@ async fn resolve_retrieval(
 
     // The handler reads whatever shape its upstream speaks, so hand it the
     // turn in that shape and translate the answer back.
-    let (turn_for_handler, provider) = match &ctx.shape {
+    let (mut turn_for_handler, provider) = match &ctx.shape {
         CcrShape::Anthropic => (rebuilt.clone(), "anthropic"),
         CcrShape::RoutedChat { .. } => (anthropic_turn_as_openai_response(&rebuilt), "openai"),
         CcrShape::RoutedResponses { .. } => (
@@ -1054,6 +1065,14 @@ async fn resolve_retrieval(
             "openai_responses",
         ),
     };
+    // The rebuilt turn echoes first-response usage, which is already booked
+    // through the first-round path on every streaming arm. Leaving the block
+    // in place makes the resolver count it as a continuation round and the
+    // turn's output books twice. Continuation responses keep their own usage;
+    // only the seed turn is scrubbed.
+    if let Some(obj) = turn_for_handler.as_object_mut() {
+        obj.remove("usage");
+    }
 
     let turn_bytes = match serde_json::to_vec(&turn_for_handler) {
         Ok(b) => Bytes::from(b),
@@ -1124,6 +1143,18 @@ async fn resolve_retrieval(
         if resolved_bytes == before {
             break;
         }
+    }
+
+    // Fold the terminal response's usage: the loop above adds every
+    // superseded response, but the final one returns as the turn and was
+    // never added — yet the provider billed it like every other round.
+    // Without this, single-continuation turns (the common case) book zero
+    // rounds on every streaming path, buffered included in spirit (which
+    // instead reads the final usage block directly). A rebuilt turn with no
+    // continuation behind it carries no usage block, so the add is a no-op
+    // there rather than a double count.
+    if let Ok(final_turn) = serde_json::from_slice::<Value>(&resolved_bytes) {
+        usage.add_response(&final_turn);
     }
 
     if let Ok(mut guard) = round_usage.lock() {

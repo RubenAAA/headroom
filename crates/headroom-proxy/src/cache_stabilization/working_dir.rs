@@ -217,17 +217,24 @@ impl WorkingDirPins {
 }
 
 /// Every working directory named in `system`, in the order they appear.
+///
+/// MINOR-074: the value runs to end-of-line, not end-of-word — paths with
+/// spaces (`/home/my dir`) are legal. The old `is_whitespace` cut read
+/// `/home/my` and then wrote the held value back over just that span,
+/// corrupting the line. Trailing whitespace is trimmed; a bare marker
+/// with nothing after it reads as absent (same as before).
 fn read_dirs(system: &Value) -> Vec<String> {
     let mut out = Vec::new();
     for text in system_texts(system) {
         let mut rest = text;
         while let Some(at) = rest.find(MARKER) {
             rest = &rest[at + MARKER.len()..];
-            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-            if end > 0 {
-                out.push(rest[..end].to_string());
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let dir = rest[..line_end].trim_end().to_string();
+            if !dir.is_empty() {
+                out.push(dir);
             }
-            rest = &rest[end..];
+            rest = &rest[line_end..];
         }
     }
     out
@@ -247,12 +254,15 @@ fn write_dirs(system: &mut Value, held: &[String]) -> bool {
             let after = at + MARKER.len();
             out.push_str(&rest[..after]);
             rest = &rest[after..];
-            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+            // MINOR-074 (both legs): same end-of-line span as read_dirs,
+            // so a held value replaces the whole line value, spaces and all.
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let trimmed_len = rest[..line_end].trim_end().len();
             match next.next() {
-                Some(value) if end > 0 => out.push_str(value),
-                _ => out.push_str(&rest[..end]),
+                Some(value) if trimmed_len > 0 => out.push_str(value),
+                _ => out.push_str(&rest[..line_end]),
             }
-            rest = &rest[end..];
+            rest = &rest[line_end..];
         }
         out.push_str(rest);
         *text = out;
@@ -480,6 +490,17 @@ mod tests {
             b["system"].as_str().unwrap(),
             " - Primary working directory: /repo\n"
         );
+    }
+
+    /// MINOR-074: paths with spaces must round-trip whole — the old
+    /// whitespace cut read `/home/my` and corrupted the line on write.
+    #[test]
+    fn directory_with_spaces_round_trips_whole() {
+        let system = json!([{"type": "text", "text": "Working directory: /home/my dir\nnext"}]);
+        assert_eq!(read_dirs(&system), vec!["/home/my dir"]);
+        let mut system = system;
+        assert!(write_dirs(&mut system, &["/home/my dir".to_string()]));
+        assert_eq!(system[0]["text"], "Working directory: /home/my dir\nnext");
     }
 
     #[test]

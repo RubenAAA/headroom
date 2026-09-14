@@ -23,9 +23,15 @@
 //!    The dispatcher inspects the live zone (latest user message),
 //!    detects per-block content type, dispatches each block to the
 //!    matching compressor (SmartCrusher / LogCompressor /
-//!    SearchCompressor / DiffCompressor), and rewrites the body
-//!    via byte-range surgery so unmodified bytes round-trip
-//!    byte-equal.
+//!    SearchCompressor / DiffCompressor). The core dispatcher writes
+//!    its own output via byte-range surgery so unmodified bytes
+//!    round-trip byte-equal — but note step 0 below: on the rare path
+//!    where a Phase E pass (tool/schema normalization, E3 marker
+//!    placement) mutates the parsed body first, the dispatcher receives
+//!    a re-serialized buffer, so pre-dispatch bytes are normalized JSON
+//!    on that path, not the customer's raw bytes. Post-dispatch the
+//!    surgery invariant holds either way (pinned by
+//!    `byte_fidelity_outside_compressed_block`).
 //! 3. Translate [`LiveZoneOutcome::Modified`] →
 //!    [`Outcome::Compressed`] (caller forwards the new body) or
 //!    [`LiveZoneOutcome::NoChange`] → [`Outcome::NoCompression`]
@@ -305,9 +311,12 @@ pub fn compress_anthropic_request(
             "non-PAYG auth mode; cache_control auto-placement skipped"
         );
     }
-    // Suppress dead-code warnings on the local; we keep the variable
-    // so future telemetry can surface the OAuth/Subscription pass
-    // counts without re-deriving them.
+    // FINDING-030: e3_skipped is load-bearing below — the dispatch
+    // buffer is the original bytes unless a Phase E pass mutated the
+    // parsed body, and e3_applied is one of the two mutation signals.
+    // (e3_skipped itself only distinguishes "E3 ran, no target" from
+    // "E3 gated off", which the e3_no_target / e3_skipped events already
+    // record; it carries no mutation signal and stays telemetry-only.)
     let _ = e3_skipped;
 
     // Re-serialize the parsed value once if any Phase E pass mutated
@@ -761,7 +770,12 @@ mod tests {
 
     #[test]
     fn live_zone_mode_with_valid_body_returns_no_compression_pr_b2() {
-        // PR-B2 invariant: every well-formed body returns NoCompression.
+        // PR-B2 skeleton invariant (kept as a regression pin): a tiny
+        // tool_result-only body has nothing worth compressing, so even
+        // with real compressors wired it still returns NoCompression.
+        // (FINDING-030: the name is historical — PR-B2 itself shipped
+        // the always-NoChange skeleton; this now pins the small-input
+        // behavior, not the skeleton.)
         let body = body_of(serde_json::json!({
             "model": "claude",
             "messages": [

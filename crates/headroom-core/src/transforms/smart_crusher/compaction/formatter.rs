@@ -29,9 +29,24 @@
 //! # Opaque cells
 //!
 //! [`CellValue::OpaqueRef`] renders as a structured marker the model
-//! can recognize: `<<ccr:HASH,KIND,SIZE>>`. This format is fixed across
-//! all built-in formatters so downstream consumers can pattern-match
-//! markers regardless of which formatter produced them.
+//! can recognize: `<<ccr:HASH,KIND,SIZE>>`. The CSV and KV formatters emit
+//! this marker literally; the JSON formatter emits the same three fields
+//! as a structured object (`_hash`/`_size`/`_kind`).
+//!
+//! FINDING-043 — SIZE units differ by formatter, and that is the contract:
+//! JSON `_size` is exact bytes (`usize`); the CSV/KV marker SIZE is
+//! [`humanize_bytes`] output (`512B`, `1.5KB`, `2.0MB`). Consumers must
+//! not compare a marker SIZE against a JSON `_size` numerically.
+//!
+//! `[N]` on a CSV/KV declaration line is the *kept* row count
+//! (`rows.len()`), not the pre-compaction total. The pre-compaction total
+//! travels in `original_count`; when a row budget drops rows, the
+//! declaration line gains ` __dropped:<original_count - kept>` (CSV) /
+//! ` __dropped:<...>` note (KV) under `include_drop_summary`, and JSON
+//! carries `_kept`/`_total` side by side. Note the compactor currently
+//! never drops rows (`original_count == rows.len()` always), so `[N]`
+//! equals the total today — the `__dropped` path exists for a future
+//! budget, and per-bucket `[N]` likewise reports that bucket's kept rows.
 
 use serde_json::{json, Value};
 
@@ -185,8 +200,9 @@ fn opaque_kind_str(k: &OpaqueKind) -> String {
 /// render as `<<ccr:...>>` markers.
 #[derive(Debug, Clone, Default)]
 pub struct CsvSchemaFormatter {
-    /// If true, emit a `__total:N` line when rows were dropped under
-    /// budget. Costs a few bytes; useful for downstream telemetry.
+    /// If true, append ` __dropped:<original_count - kept>` to the
+    /// declaration line when rows were dropped under budget. Costs a few
+    /// bytes; useful for downstream telemetry.
     pub include_drop_summary: bool,
 }
 

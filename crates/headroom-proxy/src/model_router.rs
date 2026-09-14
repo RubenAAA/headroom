@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 /// AND). Conditions left as `None`/empty are ignored. Rules are evaluated
 /// in order and the first match wins.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ModelRoute {
+pub struct CostRule {
     /// Model to route to when this rule matches.
     pub to_model: String,
     /// Match only when estimated input tokens are <= this (cheap for small requests).
@@ -42,7 +42,7 @@ pub struct ModelRoute {
     pub require_no_tools: bool,
     /// Match only when the request declares tools (a proxy for agentic work).
     ///
-    /// The inverse of [`ModelRoute::require_no_tools`] (upstream `ae75ca49`):
+    /// The inverse of [`CostRule::require_no_tools`] (upstream `ae75ca49`):
     /// lets an operator route tool-using turns to a *more* capable model
     /// while keeping plain chat on a cheaper one. Setting both on one rule
     /// makes it unmatchable (an AND of contradictory conditions), which is a
@@ -54,7 +54,7 @@ pub struct ModelRoute {
     pub name: String,
 }
 
-impl ModelRoute {
+impl CostRule {
     /// True when every set condition is satisfied for this request.
     pub fn matches(&self, model: &str, input_tokens: u64, has_tools: bool) -> bool {
         if !self.from_models.is_empty() && !self.from_models.iter().any(|m| m == model) {
@@ -94,7 +94,7 @@ pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ModelRouterConfig {
     pub enabled: bool,
-    pub routes: Vec<ModelRoute>,
+    pub routes: Vec<CostRule>,
     /// How long to skip a target model after a fallback. `None` means
     /// [`DEFAULT_COOLDOWN_SECS`]; `Some(ZERO)` turns cooldowns off, so every
     /// turn re-probes the routed upstream as it did before this existed.
@@ -420,7 +420,7 @@ const ALLOWED_ROUTE_KEYS: [&str; 7] = [
     "name",
 ];
 
-fn parse_routes(routes_raw: Option<&str>) -> Vec<ModelRoute> {
+fn parse_routes(routes_raw: Option<&str>) -> Vec<CostRule> {
     let raw = routes_raw.unwrap_or("");
     if raw.trim().is_empty() {
         return Vec::new();
@@ -452,7 +452,7 @@ struct Invalid;
 /// A silently-broadened rule (e.g. an unparseable `max_input_tokens` treated
 /// as "no cap") could route far more traffic than the operator intended, so
 /// an invalid condition disables just that rule rather than widening it.
-fn route_from_entry(entry: &Value, index: usize) -> Option<ModelRoute> {
+fn route_from_entry(entry: &Value, index: usize) -> Option<CostRule> {
     let Value::Object(map) = entry else {
         tracing::warn!("model route #{index} is not an object; skipping");
         return None;
@@ -540,7 +540,7 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<ModelRoute> {
         Some(v) => py_str(v),
     };
 
-    Some(ModelRoute {
+    Some(CostRule {
         to_model,
         max_input_tokens: max_tokens,
         min_input_tokens: min_tokens,
@@ -740,8 +740,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn route(to_model: &str) -> ModelRoute {
-        ModelRoute {
+    fn route(to_model: &str) -> CostRule {
+        CostRule {
             to_model: to_model.to_string(),
             ..Default::default()
         }
@@ -764,7 +764,7 @@ mod tests {
             enabled: true,
             cooldown: None,
             routes: vec![
-                ModelRoute {
+                CostRule {
                     to_model: "mini".into(),
                     max_input_tokens: Some(100),
                     name: "small".into(),
@@ -803,7 +803,7 @@ mod tests {
         let cfg = ModelRouterConfig {
             enabled: true,
             cooldown: None,
-            routes: vec![ModelRoute {
+            routes: vec![CostRule {
                 to_model: "mini".into(),
                 max_input_tokens: Some(10),
                 ..Default::default()
@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn conditions_are_anded() {
-        let r = ModelRoute {
+        let r = CostRule {
             to_model: "mini".into(),
             max_input_tokens: Some(100),
             min_input_tokens: Some(10),
@@ -863,7 +863,7 @@ mod tests {
     fn require_tools_matches_only_with_tools() {
         // Inverse of `require_no_tools` (upstream `ae75ca49`): route agentic
         // (tool-using) turns to a stronger model, leaving plain chat alone.
-        let r = ModelRoute {
+        let r = CostRule {
             to_model: "strong".into(),
             require_tools: true,
             ..Default::default()
@@ -876,7 +876,7 @@ mod tests {
     fn require_tools_and_require_no_tools_never_matches() {
         // Contradictory conditions on one rule are an AND that can never be
         // true — a harmless operator error, not a crash.
-        let r = ModelRoute {
+        let r = CostRule {
             to_model: "x".into(),
             require_tools: true,
             require_no_tools: true,
@@ -925,7 +925,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(
             cfg.routes,
-            vec![ModelRoute {
+            vec![CostRule {
                 to_model: "gpt-5.4-mini".into(),
                 max_input_tokens: Some(4000),
                 min_input_tokens: Some(10),

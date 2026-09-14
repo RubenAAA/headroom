@@ -26,6 +26,62 @@ pub const RESIDUAL_CCR_SKIPPED_MIXED: &str = "skipped_mixed_tools";
 /// genuine handling/conversion failure.
 pub const RESIDUAL_CCR_ERROR: &str = "error";
 
+// ─── Miss-message helpers ──────────────────────────────────────────────
+//
+// Two distinct misses need two distinct messages. A malformed hash (the model
+// invented or truncated the value — e.g. `3855` against the 24-hex format)
+// was never stored, so "may have been evicted" misleads the model into
+// treating it as terminal and stalling the agentic session. Both messages
+// deliberately avoid an `Error:` prefix and state that the session can
+// continue, with the next action spelled out.
+
+/// Whether `hash` could be a CCR key: the 24-character lowercase hex the
+/// offload path emits. Centralized here so the proxy, batch, and streaming
+/// paths agree on what counts as malformed.
+pub fn is_plausible_ccr_hash(hash: &str) -> bool {
+    hash.len() == 24 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Echo-safe rendering of a model-supplied hash: capped and stripped of
+/// control characters so a pasted transcript cannot ride back into the turn.
+fn display_hash(hash: &str) -> String {
+    const MAX: usize = 64;
+    let cleaned: String = hash
+        .chars()
+        .take(MAX)
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect();
+    if hash.chars().count() > MAX {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
+}
+
+/// Note for a malformed hash: not a store miss, nothing was evicted, the
+/// session continues. Names the expected format and the recovery path.
+pub fn malformed_ccr_hash_note(hash: &str) -> String {
+    let shown = display_hash(hash);
+    format!(
+        "'{shown}' is not a valid CCR hash — valid hashes are 24 lowercase hex characters \
+         copied exactly from a <<ccr:...>> marker in this conversation \
+         (e.g. <<ccr:7f6e11a407235b972da63df8>>). Nothing was evicted and the session \
+         can continue. Re-copy the hash exactly from the marker, or call headroom_retrieve \
+         with 'query' keywords instead. Do not retry this value."
+    )
+}
+
+/// Note for a well-formed hash that is no longer in the store. Also
+/// continue-friendly: no `Error:` prefix, recovery via query or carry on.
+pub fn missing_ccr_content_note(hash: &str) -> String {
+    let shown = display_hash(hash);
+    format!(
+        "CCR content not found for hash '{shown}'. It is no longer in the store (expired). \
+         The session can continue — call headroom_retrieve with 'query' keywords, or continue \
+         without it. Do not retry this hash."
+    )
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────
 
 /// A detected CCR tool call.
@@ -1265,6 +1321,36 @@ mod tests {
             handler.residual_ccr_status(&response, "anthropic"),
             RESIDUAL_CCR_ERROR
         );
+    }
+
+    #[test]
+    fn plausible_hash_gate_accepts_only_24_hex() {
+        assert!(is_plausible_ccr_hash("7f6e11a407235b972da63df8"));
+        assert!(!is_plausible_ccr_hash("3855"));
+        assert!(!is_plausible_ccr_hash("abc123def456abc123def4567"));
+        assert!(!is_plausible_ccr_hash(""));
+    }
+
+    #[test]
+    fn miss_notes_stay_continue_friendly() {
+        // Regression for the stalled agentic session: a malformed hash must
+        // never read as an eviction, and neither note may use the terminal
+        // `Error:` prefix — the turn is spliced in place as end_turn so the
+        // session continues.
+        let malformed = malformed_ccr_hash_note("3855");
+        assert!(malformed.contains("3855"));
+        assert!(malformed.contains("not a valid CCR hash"));
+        assert!(malformed.contains("Nothing was evicted"));
+        assert!(malformed.contains("can continue"));
+        assert!(malformed.contains("Do not retry this value"));
+        assert!(!malformed.contains("may have been evicted"));
+        assert!(!malformed.starts_with("Error:"));
+
+        let missing = missing_ccr_content_note("7f6e11a407235b972da63df8");
+        assert!(missing.contains("7f6e11a407235b972da63df8"));
+        assert!(missing.contains("can continue"));
+        assert!(missing.contains("Do not retry this hash"));
+        assert!(!missing.starts_with("Error:"));
     }
 
     #[test]

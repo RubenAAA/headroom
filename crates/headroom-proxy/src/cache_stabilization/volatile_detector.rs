@@ -1129,4 +1129,15 @@ mod change_suppression_tests {
         );
         assert_eq!(suspicions(&lines), 2, "both are still reported: {lines:?}");
     }
+
+    /// Retroactive lock for `5cfdec5e`: the empty-findings fast path emits
+    /// nothing and touches no state. Divergence is telemetry-only under
+    /// pressure (a skipped empty-entry touch at the 256-entry cap).
+    #[test]
+    fn empty_findings_emit_nothing() {
+        let lines = captured(|| {
+            emit_volatile_warnings(&[], "req-empty", Some("sess"), Some("conv-empty"));
+        });
+        assert!(lines.is_empty(), "no findings means no lines: {lines:?}");
+    }
 }

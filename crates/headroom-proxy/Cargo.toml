@@ -110,6 +110,11 @@ urlencoding = "2"
 # CTX-5: HTML→markdown conversion for ctx fetch (port of Turndown used by
 # the TS context-mode's ctx_fetch_and_index).
 htmd = "0.1"
+# CTX-5 fetch ladder (context-mode `next` P4): the lossless page/block sidecar
+# (`fetch-pages.db`) beside the FTS content DB. Same crate + version +
+# `bundled` feature as headroom-core's CtxStore, so no new SQLite backend
+# enters the dep tree.
+rusqlite = { version = "0.40", features = ["bundled"] }
 # CTX-2: lightweight regex for env-command sanitization in extract.rs.
 regex-lite = "0.1"
 # Phase 0 (body.rs): inbound request-body decompression for byte-faithful

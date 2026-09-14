@@ -225,6 +225,11 @@ fn load_certificates_from_file(
             if line.contains("-----END CERTIFICATE-----") {
                 if let Ok(cert) = reqwest::Certificate::from_pem(current_cert.as_bytes()) {
                     certs.push(cert);
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping unparseable certificate in bundle"
+                    );
                 }
                 in_cert = false;
                 current_cert.clear();
