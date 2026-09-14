@@ -102,3 +102,46 @@ async fn body_size_overflow_with_content_length_header_returns_413_without_consu
     );
     proxy.shutdown().await;
 }
+
+/// A body past axum's 2 MiB default but under `--max-body-bytes` must reach
+/// upstream. Only the Bedrock sub-router carried a `DefaultBodyLimit`, so
+/// `/v1/messages` kept the framework default and answered 413 "Failed to
+/// buffer the request body: length limit exceeded" — which Claude Code
+/// reports to the user as "Request too large (max 32MB). Accumulated images
+/// and attachments...", naming a limit and a cause that have nothing to do
+/// with it. Seen on 2026-09-14 in six sessions, none holding an image.
+#[tokio::test]
+async fn body_over_axum_default_but_under_cap_is_forwarded() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .mount(&upstream)
+        .await;
+
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.max_body_bytes = 32 * 1024 * 1024;
+        c.compression_max_body_bytes = 32 * 1024 * 1024;
+    })
+    .await;
+
+    // 3 MiB of text: over axum's 2 MiB default, well under the cap.
+    let big_text = "A".repeat(3 * 1024 * 1024);
+    let body = format!(
+        r#"{{"model":"claude-3-5-sonnet","messages":[{{"role":"user","content":"{big_text}"}}],"max_tokens":16}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "3 MiB under the cap must be forwarded, not rejected by the 2 MiB default"
+    );
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    proxy.shutdown().await;
+}

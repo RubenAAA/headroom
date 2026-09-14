@@ -1723,6 +1723,15 @@ pub fn build_app(state: AppState) -> Router {
     // catch-all.
     let router = router.layer(axum::middleware::from_fn(track_inbound_request));
 
+    // Raise the body cap for every route, not just Bedrock. axum defaults to
+    // 2 MiB, and a conversation of ~100k tokens serializes past that, so the
+    // proxy answered 413 "Failed to buffer the request body: length limit
+    // exceeded" — which Claude Code reports as "Request too large (max 32MB).
+    // Accumulated images and attachments...", blaming images that do not
+    // exist. Observed 2026-09-14: bodies topping out at 1.90 MB in the log
+    // with nothing bigger ever recorded, and 9 such 413s across 6 sessions.
+    let router = router.layer(DefaultBodyLimit::max(state.config.max_body_bytes as usize));
+
     // Require `HEADROOM_PROXY_TOKEN` from non-loopback callers. Outermost, so
     // one gate covers both transports: a WebSocket upgrade arrives as an
     // ordinary HTTP GET and only becomes a socket inside the handler. A
