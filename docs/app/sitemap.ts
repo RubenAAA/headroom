@@ -12,14 +12,14 @@ import { source } from '@/lib/source';
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://docs.headroomlabs.ai';
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const now = new Date();
-
+  // FINDING-048: no `lastModified: new Date()` — a fresh timestamp on
+  // every build churns all URLs and defeats sitemap caching. Omitted
+  // until per-page mtimes back it; `changeFrequency` carries the hint.
   // Static top-level routes (home page; docs index is covered by the
   // page enumeration below).
   const staticRoutes: MetadataRoute.Sitemap = [
     {
       url: `${SITE_URL}/`,
-      lastModified: now,
       changeFrequency: 'weekly',
       priority: 1.0,
     },
@@ -30,7 +30,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
   // ``/docs/quickstart``; ``page.data`` carries the front-matter.
   const docPages: MetadataRoute.Sitemap = source.getPages().map((page) => ({
     url: `${SITE_URL}${page.url}`,
-    lastModified: now,
     changeFrequency: 'weekly' as const,
     priority: 0.8,
   }));

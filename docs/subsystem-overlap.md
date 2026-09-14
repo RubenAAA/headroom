@@ -37,7 +37,7 @@ fall once both honour it — that is the exclusion working, not offload breaking
 ## Retrieval and storage
 
 One `CcrStore` instance, owned by `OffloadStore` and reached through
-`AppState::ccr_store()` (`proxy.rs:418`). Offload writes each original twice, to
+`AppState::ccr_store()` (`proxy.rs:427`). Offload writes each original twice, to
 two stores, under the same hash:
 
 | store | serves |

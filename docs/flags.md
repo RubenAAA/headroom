@@ -403,6 +403,13 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --redact-paths <REDACT_PATHS>
+          Mask filesystem paths as part of `--redact-sensitive`. Independent of the secret and email masking, which `--redact-sensitive` governs on its own. Default `false`: paths carry project structure the model needs, and masking them costs more comprehension than it buys
+          
+          [env: HEADROOM_PROXY_REDACT_PATHS=]
+          [default: false]
+          [possible values: true, false]
+
       --force-1h-cache-ttl <FORCE_1H_CACHE_TTL>
           B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached prefix survives idle gaps past the 5-minute default. Anthropic only, and skipped on PAYG — a 1h write is priced at 2× base input against 1.25× for 5m, so it is free on a subscription (where writes are token-counted for the usage window) and 60% dearer in dollars on an API key.
           
@@ -650,10 +657,15 @@ Options:
           [env: HEADROOM_PROXY_CODEX_AUTH_FILE=]
 
       --mode <MODE>
-          Proxy run mode: "token" (prioritize compression) or "cache" (prioritize provider prefix cache stability). Aliases like "token_headroom", "cost_savings" are normalized automatically
+          Proxy run mode: "cache" (prioritize provider prefix cache stability, the default) or "token" (prioritize compression). Aliases like "token_headroom", "cost_savings" are normalized automatically
           
           [env: HEADROOM_MODE=]
-          [default: token]
+          [default: cache]
+
+      --provider-name <PROVIDER_NAME>
+          Display name for the OpenAI-compatible upstream shown on the dashboard and in `/stats` (e.g. 'OpenRouter'). Overrides hostname detection from the configured upstream URL. Internal routing and pricing are unaffected. Port of upstream `--provider-name`
+          
+          [env: HEADROOM_PROVIDER_NAME=]
 
       --output-shaper
           Master switch for output-token shaping. When enabled, the proxy appends verbosity steering to system prompts
@@ -753,6 +765,14 @@ Options:
           
           [env: HEADROOM_RETRY_MAX_DELAY_MS=]
           [default: 30000]
+
+      --retry-zen-max-inflight <RETRY_ZEN_MAX_INFLIGHT>
+          Max concurrent Zen (opencode.ai) sends. Default `4`. `0` disables.
+          
+          Zen 429s arrive in herds: 2026-09-14 saw 40 parallel 429s in one hour and a 7-wide subagent burst that truncated every turn in the same millisecond. Turns past the cap wait (bounded by `--retry-max-delay-ms`, then proceed without a slot) instead of firing into an upstream that is already shedding load.
+          
+          [env: HEADROOM_RETRY_ZEN_MAX_INFLIGHT=]
+          [default: 4]
 
       --cost-tracking <COST_TRACKING_ENABLED>
           Enable cost tracking for upstream requests. Default `true`
@@ -855,7 +875,7 @@ Options:
       --compress-user-messages <COMPRESS_USER_MESSAGES>
           Gate compression of user-role messages.
           
-          **Not wired. Setting this changes nothing.** Verified 2026-08-17: the field is read only by the `agent-savings` CLI subcommand, never on a serving path. `content_router::Config` carries a field of the same name that only a `SavingsProfile` ever writes and nothing reads, and `live_zone::DispatchConfig` declares one that is neither read nor written. `skip_user_messages`, which the doc comments say this overrides, is itself only declared and defaulted. See [[features-on-but-inert]].
+          **Not wired. Setting this changes nothing.** Verified 2026-08-17: the field is read only by the `agent-savings` CLI subcommand, never on a serving path. `content_router::Config` carries a field of the same name that only a `SavingsProfile` ever writes and nothing reads, and `live_zone::DispatchConfig` declares one that is neither read nor written. `skip_user_messages`, which the doc comments say this overrides, is itself only declared and defaulted.
           
           [env: HEADROOM_COMPRESS_USER_MESSAGES=]
           [default: true]

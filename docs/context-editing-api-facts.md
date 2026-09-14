@@ -102,5 +102,4 @@ history. That concentration is what makes the marginal invalidation point sit
 near the tail.
 
 These are token counts, not bill deltas. What they leave open is the cache write
-each clear provokes; see the payback arithmetic in [[offload-stale-history]] and
-`docs/measurement.md`.
+each clear provokes; see the payback arithmetic in `docs/measurement.md`.

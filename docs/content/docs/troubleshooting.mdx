@@ -9,17 +9,14 @@ Solutions for common Headroom issues.
 
 ### Proxy will not start
 
-**Symptom**: `headroom proxy` fails or hangs.
+**Symptom**: `headroom-proxy` fails or hangs.
 
 ```bash
 # Check if port is already in use
 lsof -i :8787
 
-# Try a different port
-headroom proxy --port 8788
-
-# Check for missing dependencies
-pip install "headroom-ai[proxy]"
+# Try a different listen address
+headroom-proxy --listen 127.0.0.1:8788 --upstream https://api.anthropic.com
 
 # Run with debug logging
 headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
@@ -61,7 +58,7 @@ proxy's RSS to `~/headroom-rss.log` once a minute.
 
 ```bash
 # Verify proxy is running
-curl http://localhost:8787/health
+curl -s localhost:8787/healthz
 
 # Check if proxy started on a different port
 ps aux | grep headroom
@@ -73,7 +70,7 @@ ps aux | grep headroom
 
 ```bash
 # Check proxy logs for the actual error
-headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
+tail -50 ~/headroom-proxy.log
 
 # Verify API key is set
 echo $OPENAI_API_KEY   # or ANTHROPIC_API_KEY
@@ -122,76 +119,24 @@ net; on timeout detection degrades to non-ML tiers for the process lifetime.
 
 **Diagnosis**:
 
-```python
-stats = client.get_stats()
-print(f"Mode: {stats['config']['mode']}")          # Should be "optimize"
-print(f"SmartCrusher: {stats['transforms']['smart_crusher_enabled']}")
+```bash
+curl -s localhost:8787/cache-health   # hit rates and recent cache events
+headroom savings                       # durable savings over time
 ```
 
 **Common causes**:
 
-- Mode is `audit` (observation only, no modifications)
 - Messages do not contain tool outputs
-- Tool outputs are below the 200-token threshold
+- Tool outputs are below the compression threshold
 - Data is not compressible (high uniqueness, code, grep results)
 
-**Solutions**:
+### Dashboard shows 0 compressed/saved tokens
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-```ts twoslash
-import { compress } from 'headroom-ai';
+**Symptom**: the dashboard compression figures read ~0 even though total token spend looks the same or lower.
 
-// Ensure the proxy is running in optimize mode
-// (default, unless --no-optimize was passed)
-const result = await compress(messages, { model: 'gpt-4o' });
-console.log(`Saved: ${result.tokensSaved} tokens`);
-console.log(`Compressed: ${result.compressed}`);
-```
-</Tab>
-<Tab value="Python">
-```python
-# 1. Ensure mode is "optimize"
-client = HeadroomClient(
-    original_client=OpenAI(),
-    provider=OpenAIProvider(),
-    default_mode="optimize",  # NOT "audit"
-)
+**Cause**: cache-mode savings show up as prefix-cache reads, not per-request compression numbers. Look at the **Prefix Cache Impact** panel and the **Compression vs Cache** tile.
 
-# 2. Or override per-request
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=messages,
-    headroom_mode="optimize",
-)
-
-# 3. Lower the compression threshold
-config = HeadroomConfig()
-config.smart_crusher.min_tokens_to_crush = 100  # Default is 200
-```
-</Tab>
-</Tabs>
-
-### Dashboard shows 0 compressed/saved tokens after upgrading to 0.31.0
-
-**Symptom**: After upgrading from 0.27.0 to 0.31.0, the dashboard's compression / "Tokens Saved" figures read ~0, even though total token spend is the same or **lower** than before.
-
-**Cause**: This is a default-mode change, not a regression. 0.31.0 ships the `coding` savings profile as the out-of-box default, and `coding` runs the proxy in **cache** mode (see [Savings profiles](/docs/proxy#savings-profiles)). Cache mode freezes the provider prefix and compresses only the newest turn *delta* — this deliberately avoids busting the provider's prompt cache. So the **compression** figure is small, and the savings shift to **cheaper prefix-cache reads** (cached input tokens are billed at a fraction of list price). On a short prompt there is little delta to compress, so the compression tile can read ~0 while your actual cost still drops.
-
-**Where the savings show up**: Look at the **Prefix Cache Impact** panel and the **Compression vs Cache** tile on the dashboard — these reflect cache-read savings rather than per-request compression. The headline "Tokens Saved" tile only counts compression, so in cache mode it understates the real benefit.
-
-**To get 0.27.0-style compression numbers back**: run the proxy in token mode, which prioritizes visible compression. Use this to compare or diagnose, not as a permanent setting — `cache` is the default because prefix-cache stability is usually worth more on a real agent workload than a larger headline compression number:
-
-```bash
-# Per run
-headroom proxy --mode token
-
-# Or pick a token-mode profile
-HEADROOM_SAVINGS_PROFILE=balanced headroom proxy   # ~70% target
-HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy   # ~90% target
-```
-
-Trade-off: token mode maximizes visible compression but rewrites prior turns, which can reduce provider prefix-cache hits — so raw compression goes up while cache-read savings go down. Cache mode is the default because, for long coding sessions, preserving the prefix cache usually wins overall.
+**To compare**: `curl -s localhost:8787/cache-health` shows hit rates and recent cache events; `headroom savings` shows durable savings over time.
 
 ## Claude Code context window is larger through the proxy
 
@@ -212,14 +157,14 @@ proxy. The proxy forwards the `tool_reference` blocks correctly, so deferral wor
 end-to-end (both streaming and non-streaming, subscription and API-key auth).
 
 ```bash
-# Easiest: `headroom wrap claude` sets ENABLE_TOOL_SEARCH=true automatically.
-headroom wrap claude
+# Easiest: `cclaude --context` sets ENABLE_TOOL_SEARCH=true automatically.
+cclaude --context
 
 # Choose the mode (true = always defer, the default; auto / auto:N = defer only
 # when tool definitions exceed N% of the budget; false = off):
-headroom wrap claude --tool-search auto
+cclaude --context  # tool-search is flag-driven; see headroom-proxy --help
 
-# Running `claude` manually instead of via wrap? Set it yourself:
+# Running `claude` manually instead of via the launcher? Set it yourself:
 ENABLE_TOOL_SEARCH=true ANTHROPIC_BASE_URL=http://localhost:8787 claude
 ```
 
@@ -265,347 +210,40 @@ This is separate from the OS-level `managed-settings.json` file (macOS `/Library
 
 See [Server-managed settings platform availability](https://code.claude.com/docs/en/server-managed-settings#platform-availability) and [issue #3074](https://github.com/headroomlabs-ai/headroom/issues/3074).
 
-## Compression Too Aggressive
+## Compression too aggressive
 
 **Symptom**: LLM responses are missing information that was in tool outputs.
 
-```python
-# 1. Keep more items
-config = HeadroomConfig()
-config.smart_crusher.max_items_after_crush = 50  # Default: 15
+Compression behavior is flag-driven on `headroom-proxy` — run `headroom-proxy --help` for the knobs (reference in `docs/flags.md`). The implementations live in `crates/headroom-core/src/transforms/`. The old Python knobs (`HeadroomConfig`, `smart_crusher.max_items_after_crush`, `headroom_tool_profiles`) live in the read-only `upstream-python/` mirror.
 
-# 2. Disable SmartCrusher entirely
-config.smart_crusher.enabled = False
-```
-
-<Callout type="warning" title="headroom_tool_profiles has no effect in 0.37.0">
-  `client.chat.completions.create(..., headroom_tool_profiles={...})` is
-  accepted but not currently wired through `TransformPipeline.apply()` --
-  the kwarg is documented in the pipeline's own docstring but never read
-  in its body (`headroom/transforms/pipeline.py`), so passing it changes
-  nothing. There is also no `skip_compression` key on the per-tool
-  compression profile (`CompressionProfile` in `headroom/config.py` only
-  has `bias`, `min_k`, `max_k`) -- passing a plain dict there would raise
-  `AttributeError` if a code path did consume it. Use options 1 and 2
-  above instead.
-</Callout>
-
-## High Latency
+## High latency
 
 **Symptom**: Requests take longer than expected.
 
-**Diagnosis**:
+**Diagnosis**: check the proxy log (`~/headroom-proxy.log`) and the stage timings; `headroom perf` analyzes proxy performance from logs.
 
-```python
-import time
-import logging
+Tuning is flag-driven (`headroom-proxy --help`); the old Python `HeadroomConfig` knobs live in `upstream-python/`.
 
-logging.basicConfig(level=logging.DEBUG)
+## Installation issues
 
-start = time.time()
-response = client.chat.completions.create(...)
-print(f"Total time: {time.time() - start:.2f}s")
-```
+Install with `./install.sh` (see [Installation](/docs/installation)). Prerequisites: git, Rust via rustup, `jq`, `lsof`. If the build fails, check `rust-toolchain.toml` for the pinned toolchain and run `cargo build -p headroom-proxy` directly to see the compiler error. The old Python install path (`pip install headroom-ai`, `pipx`, `uv tool install`, `pyproject.toml`/maturin builds) lives in the read-only `upstream-python/` mirror.
 
-**Solutions**:
+## Provider-specific issues
 
-```python
-# 1. Use BM25 instead of embeddings (faster)
-config = HeadroomConfig()
-config.smart_crusher.relevance.tier = "bm25"
+- **Invalid API key / authentication errors**: the proxy passes your credentials through to the upstream. Verify the key works directly against the provider first, then check the proxy log.
+- **Unknown model warnings**: custom models get inferred limits from naming patterns (see [Configuration](/docs/configuration)); model data lives in `crates/headroom-proxy/data/model_prices_and_context_window.json`. The old Python `model_context_limits` kwarg lives in `upstream-python/`.
 
-# 2. Increase threshold to skip small payloads
-config.smart_crusher.min_tokens_to_crush = 500
+## Debugging techniques
 
-# 3. Disable transforms you don't need
-config.cache_aligner.enabled = False
-# Note: the old rolling-window "drop messages from history" stage was
-# retired (Phase B PR-B1); `HeadroomConfig` has no `rolling_window` field
-# any more (`headroom/config.py`), so there is nothing left to disable there.
-```
-
-## Installation Issues
-
-### pipx installs an older Headroom version
-
-**Symptom**: PyPI shows a newer `headroom-ai` release, but `pipx install` or
-`pipx upgrade` keeps an older version. A pinned install can also fail with
-`No matching distribution found`.
-
-**Cause**: `pipx` resolves packages inside its app virtual environment. If that
-environment uses a Python version that Headroom does not publish wheels for yet,
-pip may skip newer releases and choose the newest compatible build it can use.
-
-Check the interpreter:
-
-```bash
-pipx list
-```
-
-Install with a supported Python explicitly:
-
-```bash
-pipx install --python python3.13 "headroom-ai[all]"
-```
-
-For a pinned release:
-
-```bash
-pipx install --python python3.13 "headroom-ai[all]==0.21.4"
-```
-
-If you already have Headroom installed under `pipx`, uninstall it first or
-reinstall it with the supported interpreter.
-
-### pip install fails with C++ compilation error
-
-**Symptom**: `RuntimeError: Unsupported compiler -- at least C++11 support is needed!`
-
-```bash
-# Linux / Debian-based (including Docker)
-apt-get install -y build-essential && pip install headroom-ai
-
-# macOS (Xcode command line tools)
-xcode-select --install && pip install headroom-ai
-```
-
-For Docker, install and remove build tools in one layer:
-
-```dockerfile
-FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && pip install "headroom-ai[proxy]" \
-    && apt-get purge -y build-essential && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
-```
-
-### ModuleNotFoundError: No module named 'headroom'
-
-```bash
-# Check it is installed in the right environment
-pip show headroom-ai
-
-# If using virtual environment, ensure it is activated
-source venv/bin/activate
-
-# Reinstall
-pip install --upgrade headroom-ai
-```
-
-### Missing optional dependency
-
-```bash
-# For proxy server
-pip install "headroom-ai[proxy]"
-
-# For embedding-based relevance scoring
-pip install "headroom-ai[relevance]"
-
-# For code compression (tree-sitter)
-pip install "headroom-ai[code]"
-
-# For everything
-pip install "headroom-ai[all]"
-```
-
-### Windows: Defender blocks ast-grep-cli (sg.exe) during install
-
-**Symptom**: On Windows, `uv tool install "headroom-ai[all]"` (or `pip install`) fails while installing the `ast-grep-cli` wheel, and Windows Defender flags `sg.exe`:
-
-```text
-error: Failed to install: ast_grep_cli-0.44.1-py3-none-win_amd64.whl (ast-grep-cli==0.44.1)
-Caused by: failed to open file ...\ast_grep_cli-0.44.1.data\scripts\sg.exe:
-The operation did not complete successfully because the file contains a virus
-or potentially unwanted software. (os error 225)
-
-Threat: Trojan:Win64/Lazy!MTB
-```
-
-**Cause**: A known **false positive** in the upstream `ast-grep-cli` wheel's bundled `sg.exe` ([ast-grep/ast-grep#2799](https://github.com/ast-grep/ast-grep/issues/2799)), not a Headroom issue. `ast-grep` is a base dependency, so the block also affects the `[proxy]` extra. Headroom uses `ast-grep` only for optional AST-based Read-output outlining and **runs normally without it** — the only impact is the install-time quarantine.
-
-**Workarounds** (safest first):
-
-1. **Run the proxy in Docker** — no local wheel is installed, so Defender is never triggered. See [Docker install](/docs/docker-install); the image is `ghcr.io/headroomlabs-ai/headroom`.
-
-2. **Restore the file from quarantine and retry** — open **Windows Security → Virus & threat protection → Protection history**, select the `sg.exe` detection, choose **Restore**, then re-run the install command. This changes no persistent settings.
-
-3. **Add a temporary, scoped Defender exclusion during install** (last resort; requires an elevated PowerShell). Only do this if you accept excluding a *known false positive*, and remove the exclusion afterward:
-
-   ```powershell
-   # Scope the exclusion to uv's tools directory, install, then remove it
-   $uvTools = (uv tool dir)
-   Add-MpPreference -ExclusionPath $uvTools
-   uv tool install "headroom-ai[all]"
-   Remove-MpPreference -ExclusionPath $uvTools
-   ```
-
-   Do **not** disable Defender wholesale — keep the exclusion narrow and temporary.
-
-4. **Report the false positive to Microsoft** so a corrected signature ships for everyone: submit `sg.exe` at the [Microsoft Security Intelligence sample submission](https://www.microsoft.com/en-us/wdsi/filesubmission) page.
-
-### uv build errors: "src does not appear to be a Python project"
-
-**Symptom**: `uv tool install "headroom-ai[all]"` fails to build a dependency (commonly `litellm` or `cryptography`) with:
-
-```text
-error: Failed to build: <package>==<version>
-Caused by: `src does not appear to be a Python project, as neither `pyproject.toml`
-nor `setup.py` are present`
-```
-
-or a wheel install fails with `Unknown wheel data type: .DS_Store`.
-
-**Cause**: Corrupted or stale entries in uv's local build/wheel cache, not a Headroom dependency-pin problem. Headroom does not pin exact versions of `litellm` or `cryptography` that would trigger this.
-
-**Fix**: clear uv's cache and reinstall:
-
-```bash
-uv cache clean
-uv tool install "headroom-ai[all]"
-```
-
-To clear the cache for just one package instead:
-
-```bash
-uv cache clean litellm
-```
-
-If the failure is specifically for `ast-grep-cli==0.44.1`, that release is already excluded by Headroom's dependency pin (`ast-grep-cli>=0.30.0,!=0.44.1`) due to a compromised supply-chain build ([ast-grep/ast-grep#2799](https://github.com/ast-grep/ast-grep/issues/2799)) — `uv cache clean` and a plain reinstall should pick up a safe version automatically.
-
-## Provider-Specific Issues
-
-### OpenAI: Invalid API key
-
-```python
-import os
-from openai import OpenAI
-
-api_key = os.environ.get("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("OPENAI_API_KEY not set")
-
-client = HeadroomClient(
-    original_client=OpenAI(api_key=api_key),
-    provider=OpenAIProvider(),
-)
-```
-
-### Anthropic: Authentication error
-
-```python
-import os
-from anthropic import Anthropic
-
-api_key = os.environ.get("ANTHROPIC_API_KEY")
-client = HeadroomClient(
-    original_client=Anthropic(api_key=api_key),
-    provider=AnthropicProvider(),
-)
-```
-
-### Unknown model warnings
-
-```python
-# For custom/fine-tuned models, specify context limit
-client = HeadroomClient(
-    original_client=OpenAI(),
-    provider=OpenAIProvider(),
-    model_context_limits={
-        "ft:gpt-4o-2024-08-06:my-org::abc123": 128000,
-        "my-custom-model": 32000,
-    },
-)
-```
-
-## ValidationError on Setup
-
-```python
-result = client.validate_setup()
-print(result)
-
-# Common issues:
-# {"provider": {"ok": False, "error": "No API key"}}
-#   -> Set OPENAI_API_KEY or pass api_key to OpenAI()
-#
-# {"storage": {"ok": False, "error": "unable to open database"}}
-#   -> Check path permissions, use :memory: for testing
-#
-# {"config": {"ok": False, "error": "Invalid mode"}}
-#   -> Use "audit" or "optimize" only
-```
-
-For testing, use in-memory storage:
-
-```python
-client = HeadroomClient(
-    original_client=OpenAI(),
-    provider=OpenAIProvider(),
-    store_url="sqlite:///:memory:",
-)
-```
-
-## Debugging Techniques
-
-### Enable Full Logging
-
-```python
-import logging
-
-# See everything
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
-
-# Or just Headroom logs
-logging.getLogger("headroom").setLevel(logging.DEBUG)
-```
-
-### Use Simulation to Inspect Transforms
-
-```python
-plan = client.chat.completions.simulate(
-    model="gpt-4o",
-    messages=messages,
-)
-
-print(f"Tokens: {plan.tokens_before} -> {plan.tokens_after}")
-print(f"Transforms: {plan.transforms}")
-print(f"Waste signals: {plan.waste_signals}")
-
-import json
-print(json.dumps(plan.messages_optimized, indent=2))
-```
-
-### Test Transforms Directly
-
-```python
-from headroom import SmartCrusher, Tokenizer, OpenAIProvider
-from headroom.config import SmartCrusherConfig
-import json
-
-config = SmartCrusherConfig()
-crusher = SmartCrusher(config)
-# Tokenizer wraps a provider-specific TokenCounter -- it takes no
-# zero-argument form (headroom/tokenizer.py).
-provider = OpenAIProvider()
-tokenizer = Tokenizer(provider.get_token_counter("gpt-4o"), "gpt-4o")
-
-messages = [
-    {
-        "role": "tool",
-        "content": json.dumps({"items": list(range(100))}),
-        "tool_call_id": "1",
-    }
-]
-
-result = crusher.apply(messages, tokenizer)
-print(f"Tokens: {result.tokens_before} -> {result.tokens_after}")
-```
+- `curl -s localhost:8787/healthz` — proxy liveness ground truth.
+- `curl -s localhost:8787/cache-health` — hit rates and recent cache events.
+- `headroom doctor` — reduced Rust health check for proxy liveness and local ledgers.
+- `headroom perf` — analyze proxy performance from logs.
+- Proxy log at `~/headroom-proxy.log`.
+- The old Python debugging surface (`validate_setup()`, `simulate()`, direct transform tests) lives in the read-only `upstream-python/` mirror.
 
 ## Getting Help
 
-1. Enable debug logging and check the output
-2. Use `simulate()` to see what transforms would apply
-3. Run `validate_setup()` for configuration issues
-4. File an issue at [github.com/headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom/issues) with your Headroom version, Python version, provider, debug log output, and minimal reproduction code
+1. Check the proxy log and the endpoints above
+2. Run `headroom doctor` for configuration issues
+3. File an issue at [github.com/RubenAAA/headroom](https://github.com/RubenAAA/headroom/issues) with your proxy version (`headroom-proxy --help` header), provider, log output, and minimal reproduction

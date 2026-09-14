@@ -99,7 +99,7 @@ Choose the integration mode by where the orchestrator controls message assembly.
 
 | Mode | Use when | Notes |
 |---|---|---|
-| Proxy | You want spawned agents and normal client traffic to pass through a local provider endpoint | Good for `headroom proxy --mode cache` and provider base URL routing |
+| Proxy | You want spawned agents and normal client traffic to pass through a local provider endpoint | Good for proxy mode with provider base URL routing (see [Proxy](/docs/proxy)) |
 | Library | The orchestrator owns message assembly and wants to shape the digest before launch | Best when the caller can decide what becomes stable prefix versus live digest |
 | MCP | Agents need on-demand compression and retrieval tools | Best when `headroom_retrieve` should be available as a tool |
 | Proxy plus MCP | You need traffic shaping and tool-level retrieval together | Useful when both the provider edge and the agent toolset matter |

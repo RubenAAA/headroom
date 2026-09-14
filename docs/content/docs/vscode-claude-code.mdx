@@ -5,10 +5,10 @@ description: Route the official Claude Code extension through Headroom's local c
 
 The official Claude Code extension for VS Code embeds Claude Code. Headroom can
 route its Anthropic API requests through the same local compression proxy used by
-`headroom wrap claude`, without changing your Anthropic sign-in or selected model.
+`cclaude --context`, without changing your Anthropic sign-in or selected model.
 
 <Callout type="info" title="Using Claude Code in a terminal instead?">
-Use `headroom wrap claude`. This page is specifically for Anthropic's official
+Use `cclaude --context`. This page is specifically for Anthropic's official
 Claude Code extension inside VS Code.
 </Callout>
 
@@ -16,7 +16,7 @@ Claude Code extension inside VS Code.
 
 - VS Code 1.98 or newer
 - Anthropic's official Claude Code extension, signed in and working
-- Headroom with proxy dependencies: `pip install "headroom-ai[proxy]"`
+- Headroom installed (`./install.sh`) with the proxy listening on 8787
 - Loopback access to `127.0.0.1` from the VS Code extension host
 
 Confirm that Claude Code works normally in VS Code before adding Headroom. This
@@ -29,8 +29,10 @@ configuration problems.
 2. Start Headroom:
 
 ```bash
-headroom wrap vscode-claude
+cclaude --context
 ```
+
+> The old Python wrapper (`headroom wrap vscode-claude`) lives in the read-only `upstream-python/` mirror. `cclaude --context` starts or reuses the Rust proxy and sets `ANTHROPIC_BASE_URL` for you.
 
 Headroom starts its proxy and adds two entries under `env` in the Claude Code
 user settings file:
@@ -75,7 +77,7 @@ or `%USERPROFILE%\.claude\settings.json` on Windows. `CLAUDE_CONFIG_DIR` is
 respected when set. To target another profile explicitly:
 
 ```bash
-headroom wrap vscode-claude --settings-file /path/to/.claude/settings.json
+cclaude --context
 ```
 
 Use `--no-configure` to print the settings without editing a file.
@@ -88,23 +90,17 @@ for example `--port 8788`, Headroom writes that same port to the settings file.
 
 Press `Ctrl+C` to stop the proxy. The endpoint remains configured so requests
 fail closed rather than silently bypassing Headroom while it is stopped. Restart
-it with `headroom wrap vscode-claude` before using Claude Code again.
+it with `cclaude --context` before using Claude Code again.
 
 Restore the values that existed before Headroom configured the extension:
 
-```bash
-headroom unwrap vscode-claude
-```
+Remove the `env` entries the wrapper added from the Claude Code user settings file (`~/.claude/settings.json` on macOS/Linux).
 
 Headroom records only the two values it owns in a sidecar next to the Claude
 settings file. It refuses malformed settings or conflicting edits rather than
 overwriting them. Unrelated Claude settings are preserved.
 
-If you used `--settings-file` during setup, pass the same option when undoing it:
-
-```bash
-headroom unwrap vscode-claude --settings-file /path/to/.claude/settings.json
-```
+(The old Python unwrapper, `headroom unwrap vscode-claude`, lives in the read-only `upstream-python/` mirror.)
 
 ## Remote development
 

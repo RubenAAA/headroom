@@ -47,7 +47,7 @@ Both compression paths feed the same ledger:
 
 ### Cost basis
 
-Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [litellm](https://docs.headroomlabs.ai/docs/litellm) list pricing where the model is known (proxy traffic). MCP-tool compressions don't know the agent's upstream model, so they record `model="unknown"` and fall back to a blended per-token rate rather than reporting `$0`.
+Cost avoided is the dollar value of the saved **input** tokens. Headroom uses list pricing from `crates/headroom-proxy/data/model_prices_and_context_window.json` where the model is known (proxy traffic). MCP-tool compressions don't know the agent's upstream model, so they record `model="unknown"` and fall back to a blended per-token rate rather than reporting `$0`.
 
 Proxy turns book headline saved tokens — message compression plus tool-schema tokens kept out of context by deferral — priced at the model's input rate (the cache-read rate on cache-heavy turns), so the token and dollar columns share one basis.
 

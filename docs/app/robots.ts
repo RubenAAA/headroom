@@ -37,6 +37,7 @@ export default function robots(): MetadataRoute.Robots {
       { userAgent: '*', allow: '/' },
     ],
     sitemap: `${SITE_URL}/sitemap.xml`,
-    host: SITE_URL,
+    // FINDING-048: no `host` — the MetadataRoute.Robots type no longer
+    // accepts it (deprecated; Google ignores it since 2022).
   };
 }

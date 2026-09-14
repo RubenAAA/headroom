@@ -15,9 +15,11 @@ export async function GET(_req: Request, { params }: RouteContext<'/llms.mdx/doc
   });
 }
 
+// FINDING-048: no `lang` — this route is [[...slug]]-only (no i18n in
+// source.config.ts) and the GET handler reads only `slug`. The extra key
+// produced params Next never matches to a segment.
 export function generateStaticParams() {
   return source.getPages().map((page) => ({
-    lang: page.locale,
     slug: getPageMarkdownUrl(page).segments,
   }));
 }

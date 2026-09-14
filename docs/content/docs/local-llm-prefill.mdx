@@ -7,15 +7,6 @@ Local models do not charge per token, but they still pay for every prompt token 
 
 This workflow measures that effect with the proxy dashboard: run the same task once with optimization disabled, reset the agent state, run it again with optimization enabled, and compare token counts.
 
-> **Which proxy?** The commands below use the Python `headroom proxy` CLI
-> (`--openai-api-url`, `--no-optimize`, `--learn`), which is what this
-> workflow is validated against. On the Rust proxy (`headroom-proxy`) there is
-> no `--openai-api-url` — point it at the local server with the required
-> `--upstream <URL>` (it is a pure passthrough unless `--compression` is
-> passed, which currently covers Anthropic-shaped traffic only). The optimized
-> run below needs the Python proxy until the Rust proxy compresses
-> OpenAI-shaped traffic.
-
 <Callout type="info" title="Community demo">
 Joe Maddalone demonstrated this workflow in [Cut Local LLM Prompt Processing 30% on a Mac with Headroom](https://www.youtube.com/watch?v=j6U_kKiMXgo). His June 2026 demo used an OpenAI-compatible local server, a coding-agent refactor task, `--no-optimize` for the baseline, and the dashboard to compare sessions.
 </Callout>
@@ -26,18 +17,13 @@ Start your local OpenAI-compatible model server first. Examples include MLX/OMLX
 
 For this guide, assume the local server is listening on `http://127.0.0.1:8000`.
 
-```bash
-pip install "headroom-ai[proxy]"
-```
 
 ## 1. Baseline passthrough run
 
 Start Headroom as a transparent proxy with optimization disabled:
 
 ```bash
-headroom proxy \
-  --port 8787 \
-  --openai-api-url http://127.0.0.1:8000 \
+headroom-proxy --listen 127.0.0.1:8787 --upstream http://127.0.0.1:8000 \
   --no-optimize
 ```
 
@@ -76,9 +62,7 @@ For coding-agent tests, a clean git worktree is the simplest reset point.
 Restart Headroom without `--no-optimize`:
 
 ```bash
-headroom proxy \
-  --port 8787 \
-  --openai-api-url http://127.0.0.1:8000
+headroom-proxy --listen 127.0.0.1:8787 --upstream http://127.0.0.1:8000
 ```
 
 Run the same task again with the same `OPENAI_BASE_URL` and prompt. Watch the dashboard's before/after token counts for the session.
@@ -90,9 +74,7 @@ The savings percentage is the prompt-token reduction sent upstream to the local 
 After you have a baseline, you can test learning-enabled runs:
 
 ```bash
-headroom proxy \
-  --port 8787 \
-  --openai-api-url http://127.0.0.1:8000 \
+headroom-proxy --listen 127.0.0.1:8787 --upstream http://127.0.0.1:8000 \
   --learn
 ```
 

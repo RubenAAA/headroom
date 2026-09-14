@@ -1,5 +1,12 @@
 # context-mode → Headroom: enterprise plugin & variant analysis
 
+> **Extracted 2026-09-11:** P1–P5 live in
+> [`notes/ideas/ctx-p*.md`](notes/ideas/) (proposals in full); blockers and
+> follow-ups in [`notes/learnings/`](notes/learnings/) (`elicense-hard-blocker`,
+> `traffic-beats-theory-twice`, `platform-axes-orthogonal`) and
+> [`notes/ideas/ctx-p5-attribution-merge.md`](notes/ideas/ctx-p5-attribution-merge.md).
+> Analysis (§§1–3, 5), variants, and sequencing (§7) stay here.
+
 Analysis date: 2026-07-29. Sources: `/Users/tcms/demo/context-mode` @ v1.0.169, `/Users/tcms/demo/headroom` @ main.
 
 ---
@@ -151,95 +158,15 @@ Headroom's earliest hook.
 
 Ranked by value ÷ effort.
 
-### P1 — `headroom-recall`: FTS5+trigram lossless store as `headroom.memory_text`
+> **Moved to [`notes/ideas/ctx-p1-recall-store.md`](notes/ideas/ctx-p1-recall-store.md)** — P1 proposal in full.
 
-**What:** port `src/store.ts` behind the existing `headroom.memory_text` seam.
+> **Moved to [`notes/ideas/ctx-p2-admission-layer.md`](notes/ideas/ctx-p2-admission-layer.md)** — P2 proposal in full.
 
-**Why this first:** it is the smallest diff onto an *already-existing* contract, and it fixes a real
-product limitation. Today `headroom_retrieve(hash)` requires you to *know the hash* — the tool
-description literally says "hash comes from compression markers like `[N items compressed... hash=abc123]`".
-With an FTS5-backed store you get `retrieve-by-query`: "what did that build log say about OOM"
-instead of "paste hash abc123". The trigram index matters specifically because BM25 tokenization
-loses identifiers and stack frames.
+> **Moved to [`notes/ideas/ctx-p3-policy-pdp.md`](notes/ideas/ctx-p3-policy-pdp.md)** — P3 proposal in full.
 
-Composes rather than replaces: `compress` → return squeezed text + hash → store the *original* in
-FTS5 → rehydrate by hash **or** by query. Also a natural `headroom.ccr_backend` implementation —
-the realignment wants "CCR hardens: persistent backend" (Phase B), and this is one.
+> **Moved to [`notes/ideas/ctx-p4-sandbox.md`](notes/ideas/ctx-p4-sandbox.md)** — P4 proposal in full.
 
-**Enterprise variant:** shared team store, retention/TTL policy, per-project scoping (context-mode
-already has `project-attribution.ts`), audit of every retrieval.
-
-**Effort:** medium. Reimplement in Python/Rust against Headroom's memory interface, or ship the
-node store as a sidecar. Do not port the MCP tool surface — only the store.
-
-### P2 — `headroom-admission`: tool-boundary admission control across 18 hosts
-
-**What:** context-mode's adapter + hook layer, distributed the way `plugins/openclaw` and
-`plugins/opencode` already are (TS package under `plugins/`), reporting savings into Headroom's
-`savings_ledger.py` JSONL and emitting Headroom pipeline events.
-
-**Why:** this is the strategic piece. It gives Headroom:
-- a **pre-wire** enforcement point, upstream of Phase B's live-zone engine, with no cache-bust and
-  no token-validation fallback required;
-- coverage of **18 agent hosts** — the realignment's Phase G wants to "extend wrap CLIs (cline,
-  continue, goose, openhands)"; this is that work already done, and then some;
-- a deployment mode that works under **subscription auth**, where the proxy is a revocation risk.
-
-**Enterprise value — this is the DLP story Headroom cannot currently tell.** A `curl` inside a Bash
-tool call never touches the proxy, so Headroom is blind to it. context-mode blocks
-`curl`/`wget`/`WebFetch`/inline `fetch()`/`requests.get` at the tool boundary and forces network
-egress through `ctx_fetch_and_index`. That converts a token-savings feature into an
-**egress-control** feature — a different budget line and a different buyer.
-
-**Effort:** high, but it's mostly packaging + a reporting bridge, not a rewrite. Keep it TypeScript;
-Phase H retires Python *proxy* code but explicitly preserves "CLI wrappers, RTK installer" — the
-installer layer is the surviving Python, and it can shell out.
-
-### P3 — `headroom-policy` (Enterprise, license-gated): the PDP
-
-**What:** `src/security.ts` as a policy decision point, plus centrally-managed org rulesets.
-
-Two attach points: the hook layer from P2 (tool-level `allow/deny/ask`), and
-`headroom.pipeline_extension` at `PRE_SEND` (prompt-level policy). Feeds `headroom/audit/`.
-
-**Enterprise features that only make sense paid:** central policy service, org-wide allow/deny
-rulesets, project-boundary containment enforcement, shell-escape detection inside sandboxed code,
-tamper-evident audit trail, per-team reporting. Gate it with the ELv2 license key (see §6).
-
-**Effort:** medium. The engine exists and is tested (`tests/security/`, `src/security.ts` 889 lines);
-the work is the control plane.
-
-### P4 — `headroom-sandbox`: Think-in-Code execution
-
-**What:** `executor.ts` exposed as a Headroom MCP tool (`headroom_execute`), 12 languages,
-stdout-only.
-
-**Why:** this is the mechanism behind context-mode's largest measured savings —
-`ctx_execute_file` returns 98% savings across 315 KB of real fixtures (`BENCHMARK.md` Part 1),
-versus 82% for index+search (Part 2). Programming the analysis beats compressing the output.
-
-Must ship *with* P3: the shell-escape scanner is what stops the sandbox being an escape hatch.
-
-**Effort:** medium-high. Runtime isolation is the hard part; `headroom` already has a `sandbox` extra
-in `pyproject.toml` to build on.
-
-### P5 — `headroom-attribution`: counterfactual savings + per-project cost
-
-**What:** port the *methodology* from `session/analytics.ts` — `RealBytesStats`,
-`ThinkInCodeComparison`, `enumerateAdapterDirs`, `project-attribution.ts` — into Headroom's
-`savings_ledger` / `reporting` / `dashboard`.
-
-**Why:** Headroom measures compression deltas (what it squeezed). context-mode measures the
-counterfactual (what never entered). Enterprise buyers want the second number, sliced by team and
-repo. Do **not** port `pricing.ts` — `headroom/pricing/*` already does this with litellm resolution.
-
-**Merge, don't port.** `headroom/audit/reads.py` is already a counterfactual measurement tool over
-the same Claude Code transcript corpus (see §8). It has the better mechanism taxonomy — identical
-repeat, subset containment, write-readback, stale, line-number scaffolding, context residency,
-cache-death windows. `analytics.ts` has the multi-host coverage and per-project attribution it
-lacks. Combine the two rather than adding a third implementation.
-
-**Effort:** low-medium, mostly a metrics-definition merge.
+> **Moved to [`notes/ideas/ctx-p5-attribution-merge.md`](notes/ideas/ctx-p5-attribution-merge.md)** — P5 proposal in full.
 
 ### Variants (packaging, not code)
 
@@ -318,61 +245,11 @@ layers: installers, memory writers, CLI wrappers, and Rust.
 
 All four items flagged as open in the first pass are now resolved.
 
-**`headroom-managed/` is the SaaS arm, and it is unlicensed.**
-`headroom-managed/pyproject.toml`: `name = "headroom-managed"`, `description = "Headroom SaaS
-Platform - Managed context window optimization"`, `version = 0.1.0`. It has `app/auth.py`,
-`app/middleware/`, `app/routes/`, `app/services/`, `app/models.py`, alembic migrations, and a
-`pilot/`. There is **no `license` field and no LICENSE file** — i.e. proprietary by default.
+> **Moved to [`notes/learnings/elicense-hard-blocker.md`](notes/learnings/elicense-hard-blocker.md)** — unlicensed managed arm vs ELv2 hosting clause.
 
-This *sharpens* the §6 blocker rather than easing it. ELv2 forbids providing the software "to third
-parties as a hosted or managed service." The product whose name is literally *Managed* is the one
-place context-mode-derived code cannot go without an explicit commercial grant from the copyright
-holder. Plan the plugin boundary so that `headroom-managed` consumes only Apache-2.0 core
-interfaces, never ELv2 implementations.
+> **Moved to [`notes/learnings/traffic-beats-theory-twice.md`](notes/learnings/traffic-beats-theory-twice.md)** — reads.py measurement role + the two docstring corroborations.
 
-**`headroom/audit/reads.py` does not overlap P3 — and it independently validates the whole thesis.**
-It is a *measurement* tool, not an audit trail: it streams Claude Code `*.jsonl` transcripts to size
-"the addressable bytes for each Read compression mechanism... so defaults are set from traffic, not
-theory." No policy, no tamper-evidence. P3's audit trail remains a gap.
+> **Moved to [`notes/ideas/ctx-p5-attribution-merge.md`](notes/ideas/ctx-p5-attribution-merge.md)** — reads.py vs analytics.ts merge guidance.
 
-Two lines in its docstring are the most useful corroboration in either repo:
+> **Moved to [`notes/learnings/platform-axes-orthogonal.md`](notes/learnings/platform-axes-orthogonal.md)** — authoring-doc gap, missing benchmark results, orthogonal axes.
 
-- *"context residency — how many assistant turns each Read stays in context (the multiplier on its
-  prefix-cache read cost; **the case for compress-before-cache-entry**)"* — Headroom is already
-  arguing, from its own traffic, for moving earlier in the pipeline. context-mode is the terminus of
-  that argument: compress before **context** entry, not merely before cache entry.
-- *"identical repeat — a dedup mechanism for this was prototyped and removed: it measured 0.1% of
-  Read bytes on real traffic."* — Headroom has already empirically established that
-  message-history-level dedup is worthless. The addressable bytes are at the tool boundary, not in
-  history. That is the same conclusion the realignment reached from the cache side, arrived at
-  independently from the traffic side.
-
-It *does* overlap **P5** — `audit/reads.py` and context-mode's `session/analytics.ts` are two
-independent implementations of counterfactual measurement over the same transcript corpus. Merge
-them rather than porting; `audit/reads.py` has the better mechanism taxonomy, `analytics.ts` has
-multi-host coverage and per-project attribution.
-
-**No plugin-authoring docs exist.** `docs/` is a Next.js site (`app/`, `content/`, `components/`);
-`wiki/` has nothing on extension authoring (only `macos-deployment.md` matched). `plugins/headroom-oauth2/SPEC.md`
-remains the de-facto authoring reference — which means whichever plugin lands first sets the house
-style. Worth writing the authoring doc as part of P1.
-
-**Headroom publishes no benchmark results.** `benchmarks/` is 29 runner scripts with no committed
-results artifacts, so no like-for-like number exists to compare against context-mode's 96%. The
-comparison has to be run. The harness is there and is unusually strong on exactly the axis that
-matters: `prefix_cache_benchmark.py`, `cache_bust_trace_report.py`, `cache_validation_bundle.py`,
-`synthetic_token_cache_bust_report.py`, `proxy_mode_benchmark.py`, `agent_cost_benchmark.py`,
-`real_world_agent_benchmark.py`. Use it to *prove* the §1 cache-safety claim empirically rather than
-asserting it — a measured "zero cache-bust events" result is the strongest possible artifact for the
-No-Proxy Edition.
-
-**Bonus finding — the platform axes are orthogonal.**
-`docs/platform-feature-matrix.json` (schema v1, updated 2026-07-06) tracks coverage across
-`["linux", "macos", "windows"]` — Headroom's platform axis is **operating system**. context-mode's
-platform axis is **agent host** (18 of them). Headroom tracks no host-coverage matrix at all. P2
-therefore fills a dimension that does not currently exist in Headroom's own feature accounting,
-which also means it needs a second matrix rather than new rows in this one.
-
-*Process note:* six subagents were dispatched across this analysis and all six stalled at the
-600-second watchdog; one reported "Bash is temporarily unavailable" before dying, so the failures
-were tool-layer, not analytical. Every finding in this document was verified directly.

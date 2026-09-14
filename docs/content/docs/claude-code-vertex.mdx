@@ -35,11 +35,11 @@ No `ANTHROPIC_API_KEY` is needed — Vertex mode uses your Google login.
 ## Run it (one command)
 
 ```bash
-pip install "headroom-ai[proxy]"
-headroom wrap claude
+./install.sh
+cclaude --context
 ```
 
-That's it. Because `CLAUDE_CODE_USE_VERTEX=1` is set, `headroom wrap claude`
+That's it. Because `CLAUDE_CODE_USE_VERTEX=1` is set, `cclaude --context`
 automatically:
 
 1. starts the Headroom proxy,
@@ -81,7 +81,7 @@ If "tokens saved" stays at 0 on large prompts, see Troubleshooting below.
 ## Troubleshooting
 
 - **It still goes straight to Google (no savings).** Make sure `CLAUDE_CODE_USE_VERTEX=1`
-  is exported *in the same shell* before `headroom wrap claude`. The wrapper only
+  is exported *in the same shell* before `cclaude --context`. The launcher only
   switches to Vertex mode when it sees that variable.
 - **Wrong region / 404 from Vertex.** Confirm `CLOUD_ML_REGION` matches a region
   where your Claude model is enabled. `global` is supported and maps to the
@@ -102,7 +102,7 @@ export HEADROOM_REGION=us-east5
 export VERTEXAI_PROJECT=<your-gcp-project>
 export GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json   # or gcloud ADC
 export ANTHROPIC_API_KEY=placeholder          # Claude Code needs *a* key to start
-headroom wrap claude --backend litellm-vertex_ai --region us-east5
+cclaude --context  # with CLAUDE_CODE_USE_VERTEX=1, CLOUD_ML_REGION set
 ```
 
 The native Vertex-mode flow above is recommended — it keeps your existing GCP auth

@@ -15,7 +15,7 @@ Headroom sits between your application and the LLM provider. It intercepts the r
                                v
 +---------------------------------------------------------------+
 |                           HEADROOM                            |
-|    Proxy (FastAPI)   ·   Python compress()   ·   TS compress() |
+|    Proxy (headroom-proxy)   ·   Python mirror (upstream-python/) |
 |                               |                               |
 |                               v                               |
 |        Transform pipeline  ──▶  ContentRouter                 |
@@ -33,15 +33,15 @@ Headroom sits between your application and the LLM provider. It intercepts the r
 
 ## Entry points
 
-Headroom can be used three ways, all feeding the same compression pipeline:
+Headroom is used through the proxy, which feeds the compression pipeline:
 
 | Entry point | How it works | Code changes |
 |-------------|-------------|--------------|
-| **Proxy mode** | Run `headroom proxy` and point your client's base URL at it | Zero — just change the base URL |
-| **SDK mode** | Call `compress()` (Python or TypeScript) on your messages before you send them, or wrap an existing client with `HeadroomClient` for automatic per-call optimization and stats | Minimal — one function call, or a client wrapper |
-| **Integrations** | LangChain, Vercel AI SDK, Agno, Strands, LiteLLM, MCP adapters | Framework-specific setup |
+| **Proxy mode** | Run `headroom-proxy` and point your client's base URL at it | Zero — just change the base URL |
+| **SDK mode (Python mirror)** | The old `compress()` / `HeadroomClient` path in `upstream-python/` | Minimal — one function call, or a client wrapper |
+| **Integrations** | MCP tools at `/mcp/{conversation}`; the old LangChain/Vercel/Agno/Strands/LiteLLM adapters live in `upstream-python/` | Framework-specific setup |
 
-In proxy mode the server is a FastAPI app with per-provider handlers (Anthropic, OpenAI, Gemini, Bedrock) that each run the same compression pipeline before forwarding through the selected [backend](/docs/proxy#cloud-providers).
+In proxy mode the server is the Rust binary (`crates/headroom-proxy`) with per-provider handlers (Anthropic, OpenAI, Gemini, Bedrock) that each run the same compression pipeline before forwarding.
 
 ## The compression pipeline
 
@@ -74,7 +74,7 @@ To avoid recompressing the same content, ContentRouter keeps a **two-tier, TTL-b
 
 ### Rust core
 
-The heaviest compressors run in a native Rust extension — `headroom._core`, built with PyO3 — that the proxy loads at startup. SmartCrusher and the search/log/diff compressors and content detection are Rust-backed; the Python classes you import are thin, API-compatible shims over them. The ML fallback (**Kompress**, a ModernBERT token compressor) runs separately through ONNX Runtime, either locally or offloaded to a remote endpoint (see [Text & Logs](/docs/text-and-logs)).
+The compressors run natively in the Rust workspace (`crates/headroom-core/src/transforms/`, served by `crates/headroom-proxy`). The ML fallback (**Kompress**, a ModernBERT token compressor) runs through ONNX Runtime, either locally or offloaded to a remote endpoint.
 
 ## Compression modes and provider caches
 
@@ -91,7 +91,7 @@ Because prefix caching is where most of the cost savings live on multi-turn work
 | OpenAI | automatic prefix caching | up to ~50% |
 | Google | `CachedContent` API | up to ~75% |
 
-See [Cache Optimization](/docs/cache-optimization) and [Savings Profiles](/docs/proxy#savings-profiles) for how the two modes interact with the built-in profiles.
+See [Cache Optimization](/docs/cache-optimization) for how the two modes interact with the built-in profiles.
 
 ## CCR: Compress-Cache-Retrieve
 

@@ -36,11 +36,11 @@ No `ANTHROPIC_API_KEY` is needed — Foundry mode uses your Azure credentials.
 ## Run it (one command)
 
 ```bash
-pip install "headroom-ai[proxy]"
-headroom wrap claude
+./install.sh
+cclaude --context
 ```
 
-That's it. Because `CLAUDE_CODE_USE_FOUNDRY=1` is set, `headroom wrap claude`
+That's it. Because `CLAUDE_CODE_USE_FOUNDRY=1` is set, `cclaude --context`
 automatically:
 
 1. derives your Azure AI Foundry endpoint from `ANTHROPIC_FOUNDRY_RESOURCE`,
@@ -87,8 +87,7 @@ needed. Either configuration works.
 
 **Headroom says "ANTHROPIC_BASE_URL" instead of "Foundry mode"**
 
-`CLAUDE_CODE_USE_FOUNDRY` is not set in the shell where you ran `headroom wrap
-claude`. Make sure to export it before running, or set it in your shell profile.
+`CLAUDE_CODE_USE_FOUNDRY` is not set in the shell where you ran `cclaude --context`. Make sure to export it before running, or set it in your shell profile.
 
 **Claude Code fails with a 401 / auth error**
 
@@ -100,4 +99,4 @@ works direct but not through Headroom, open an issue with the proxy log.
 
 Check the [dashboard](http://localhost:8787/dashboard) — if requests are flowing
 but savings are 0, content may be below the compression threshold or the Rust
-extension may not be installed (`pip install "headroom-ai[proxy]"` includes it).
+extension may not be installed (`./install.sh` includes it).

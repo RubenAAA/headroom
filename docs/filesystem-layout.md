@@ -32,7 +32,7 @@ explicit argument > per-resource env var > derived from the root > default
 Note: `paths.rs` is a partial port — it carries the roots plus the
 resources the subscription stack and savings ledger need. The
 ctx/memory/ccr rows above resolve through `config.ctx_store_dir` /
-`headroom_core::ctx::default_base_dir` (`proxy.rs:467-471`), not
+`headroom_core::ctx::default_base_dir` (`proxy.rs:480,669`), not
 through `paths.rs` helpers.
 
 ## What is not ours

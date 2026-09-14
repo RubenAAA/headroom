@@ -19,9 +19,10 @@ export async function GET(_req: Request, { params }: RouteContext<'/og/docs/[...
   );
 }
 
+// FINDING-048: no `lang` — this route is [...slug]-only (no i18n in
+// source.config.ts) and the GET handler reads only `slug`.
 export function generateStaticParams() {
   return source.getPages().map((page) => ({
-    lang: page.locale,
     slug: getPageImage(page).segments,
   }));
 }

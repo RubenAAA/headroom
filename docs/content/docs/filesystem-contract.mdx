@@ -77,20 +77,10 @@ Existing installs continue to work unchanged. New installs are encouraged to put
 
 Two helpers give plugins isolated, per-plugin directories under both roots:
 
-### Python
+### Rust (`crates/headroom-core/src/paths.rs`)
 
-```python
-from headroom import paths
-
-cfg_dir = paths.plugin_config_dir("my-plugin")
-# → ~/.headroom/config/plugins/my-plugin
-
-state_dir = paths.plugin_workspace_dir("my-plugin")
-# → ~/.headroom/plugins/my-plugin
-
-cfg_dir.mkdir(parents=True, exist_ok=True)
-(cfg_dir / "settings.json").write_text("{}")
-```
+- `HEADROOM_CONFIG_DIR` — read-mostly configuration
+- `HEADROOM_WORKSPACE_DIR` — read-write state (defaults to `~/.headroom`)
 
 ### npm SDK
 

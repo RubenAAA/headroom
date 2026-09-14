@@ -120,6 +120,69 @@ The miss buckets say whose fault a rebuild was:
 - **`unknown`** — a rebuild with no drift to blame, usually a session reset
   (`/clear`, a subagent finishing). Counted, not charged as waste.
 
+## The ground-truth ledger: what a turn really cost
+
+Everything in `savings_verdict` is produced by the component doing the
+saving — the compressor states what it removed, and the placement test that
+prices it was written to be generous. `turn_cost_ledger` is the exception:
+one line per completed turn, built only from the `usage` blocks the provider
+returned, which is the bill. It is emitted for every completed turn, saving
+or not, so it cannot flatter by selection. A turn cut off mid-stream never
+reaches it, same as the rest of the books.
+
+```
+grep turn_cost_ledger "$PROXY_LOG" | head -1 | jq -R 'split(" ")'
+```
+
+The three usage counters are billed totals across every round the proxy ran,
+not just the client's: `input_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`. On the common single-round path they equal the
+client turn; on a turn where the proxy answered a retrieval itself they
+include the continuation rounds too.
+
+The September fields split that total open:
+
+- **`rounds_input_tokens`, `rounds_cache_read_tokens`** — billed totals minus
+  the client baseline, so the ledger joins to `ccr_continuation_usage`
+  directly. Zero on the single-round path. This is the hidden cost: rounds the
+  client never saw and `savings_verdict` never counts.
+- **`cache_write_5m_tokens`, `cache_write_1h_tokens`** — which TTL the
+  provider actually billed the write at. The proxy asks for the 1-hour tier on
+  the prefix, but asking is not granting, and a 1-hour write costs 2.0x input
+  against the 5-minute tier's 1.25x. `-1` where the provider publishes no
+  breakdown, so "absent" stays distinct from "wrote nothing at that tier".
+- **`output_tokens`** — completion tokens, `-1` where the path that booked
+  the turn never reported an output count.
+- **`billed_fresh_equivalents`** — the bill restated in one comparable unit:
+  uncached input plus reads at 0.1x plus writes at 1.25x. Tokens, not dollars,
+  and priced at the 5-minute write rate whatever the TTL split says — for
+  dollars, price the split with the table in
+  `crates/headroom-core/src/pricing.rs` instead.
+- **`client_request_bytes`, `forwarded_request_bytes`, `compression_mode`** —
+  what the client handed over, what actually went on the wire, and the arm the
+  turn ran under, so on/off runs stay separable.
+
+The reconciliation check: join on `request_id`. `sse stream closed` carries
+the client baseline — the footprint of the request the client sent, which is
+what the next client turn is classified against. `ccr_continuation_usage`
+carries the hidden rounds. The ledger must equal their sum:
+
+```
+ledger.input_tokens == sse.input_tokens + ccr.input_tokens
+ledger.cache_read_input_tokens == sse.cache_read_input_tokens + ccr.cache_read_tokens
+```
+
+If it does not, the books are missing a round, not saving one.
+
+Folding this into the verdict: `savings_verdict` cannot see continuation
+rounds — a config that retrieves more (proactive expansion, ctx offload) bills
+extra turns while reporting the same compression saving. Divide
+`billed_fresh_equivalents` by the bytes the client asked to send and compare
+that cost per unit of work requested between a run with compression on and one
+with it off. That ratio falls only if the proxy genuinely helps, and no
+amount of favourable accounting on our side can move it. Read alone it proves
+nothing; read across a config change it is the number that settles it.
+
 ## Healthy looks like this
 
 - Statusline reads `cache ✓ 90-99%` and shows no `⚠ recache` during steady work.

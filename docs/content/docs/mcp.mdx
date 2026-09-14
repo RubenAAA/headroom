@@ -5,37 +5,21 @@ description: Compression, retrieval, and stats as MCP tools for Claude Code, Cur
 
 Headroom's MCP server exposes compression, retrieval, and observability as tools that any MCP-compatible AI coding tool can call -- Claude Code, Cursor, Codex, and more. No proxy required.
 
-## Installation
+## Setup
+
+The Rust proxy serves MCP tools at `/mcp/{conversation}` (`headroom_compress`, `headroom_retrieve`, `headroom_stats`). Start the proxy, then point your MCP host at it:
 
 ```bash
-# MCP tools only (lightweight)
-pip install "headroom-ai[mcp]"
-
-# Or with the proxy
-pip install "headroom-ai[proxy]"
+headroom-proxy --listen 127.0.0.1:8787 --upstream https://api.anthropic.com
 ```
 
-## Setup for Claude Code
+For automatic compression of **all** traffic, route through the proxy:
 
 ```bash
-# Register with Claude Code (one-time)
-headroom mcp install
-
-# Start Claude Code — it now has headroom tools
-claude
+cclaude --context
 ```
 
-Claude Code can now compress content on demand, retrieve originals, and check session stats.
-
-For automatic compression of **all** traffic, also run the proxy:
-
-```bash
-# Terminal 1
-headroom proxy
-
-# Terminal 2
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
-```
+The old Python path (`pip install "headroom-ai[mcp]"`, `headroom mcp install`) lives in the read-only `upstream-python/` mirror.
 
 ## Tools
 
@@ -102,29 +86,27 @@ Sub-agent stats are aggregated via a shared stats file at `~/.headroom/session_s
 ## CLI commands
 
 ```bash
-# Install (registers with Claude Code)
-headroom mcp install
-headroom mcp install --proxy-url http://host:9000  # Custom proxy URL
-headroom mcp install --force                        # Overwrite existing
+# (Python mirror only; the Rust proxy serves /mcp/{conversation} directly)
+headroom mcp install  # upstream-python/
 
-# Check status
-headroom mcp status
+# Check status (Python mirror)
+headroom mcp status  # upstream-python/
 
 # Uninstall
-headroom mcp uninstall
+headroom mcp uninstall  # upstream-python/
 
 # Debug mode
-headroom mcp serve --debug
+headroom mcp serve --debug  # upstream-python/
 
 # Streamable HTTP mode
-headroom mcp serve --transport http --host 127.0.0.1 --port 8788 --path /mcp
+headroom mcp serve --transport http --host 127.0.0.1 --port 8788 --path /mcp  # upstream-python/
 ```
 
 ## MCP host configuration
 
-For MCP hosts that let you configure a local stdio server, point them at `headroom mcp serve`. If you also run the proxy, pass the proxy URL explicitly so retrieval and stats come from the intended proxy instance.
+For MCP hosts that let you configure a local stdio server, point them at `headroom mcp serve` (Python mirror). If you also run the proxy, pass the proxy URL explicitly so retrieval and stats come from the intended proxy instance.
 
-If you are publishing or consuming Headroom through an MCP registry, use the canonical descriptor at `https://github.com/headroomlabs-ai/headroom/blob/main/server.json`. It captures the package form for `headroom-ai[mcp]` and the current `headroom mcp serve` launch contract in one file.
+If you are publishing or consuming Headroom through an MCP registry, use the canonical descriptor at `server.json` in the repo root. It captures the package form for `headroom-ai[mcp]` (Python mirror) and the MCP launch contract in one file.
 
 ```json
 {
@@ -157,7 +139,7 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 }
 ```
 
-If you need Streamable HTTP instead of stdio, run `headroom mcp serve --transport http` and point your MCP host at that endpoint. The default path is `/mcp`, and the default port is `8788`.
+If you need Streamable HTTP instead of stdio, run `headroom mcp serve --transport http` (Python mirror) and point your MCP host at that endpoint — or use the Rust proxy `/mcp/{conversation}` endpoint directly. The default path is `/mcp`, and the default port is `8788`.
 
 Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. The proxy serves its own API; it does not automatically provide the MCP HTTP transport.
 
@@ -180,10 +162,10 @@ Install Headroom so it's globally on PATH — `uv tool install "headroom-ai[mcp]
 
 | Tool | MCP Support | Setup |
 |------|-------------|-------|
-| Claude Code | Native | `headroom mcp install` |
+| Claude Code | Native | `/mcp/{conversation}` |
 | Cursor | Supported | Add to Cursor MCP settings |
 | Codex | If supported | Configure MCP server |
-| Any MCP host | Yes | Point to `headroom mcp serve` |
+| Any MCP host | Yes | Point to `/mcp/{conversation}` on the proxy |
 
 ## Architecture
 
@@ -201,9 +183,9 @@ The proxy compresses all traffic at the HTTP level (before the LLM sees content)
 
 ## Troubleshooting
 
-**"MCP SDK not installed"** -- Run `pip install "headroom-ai[mcp]"`.
+**"MCP SDK not installed"** -- this error comes from the Python mirror (`upstream-python/`); the Rust proxy needs no MCP SDK install.
 
-**"Proxy not running"** -- Start the proxy with `headroom proxy` in another terminal. Only needed for proxy-backed retrieval.
+**"Proxy not running"** -- Start `headroom-proxy` in another terminal (`cclaude --context` does this for you).
 
 **"Entry not found or expired"** -- Local content expires after 1 hour, proxy content after 30 minutes (configurable via `HEADROOM_CCR_TTL_SECONDS`).
 
@@ -228,7 +210,7 @@ Use these checks when the MCP share looks high:
 - Use `/compact` after large MCP-backed investigation steps so old MCP tool
   results stop occupying the active context window.
 - Prefer the proxy path for automatic compression of normal Claude Code traffic:
-  `headroom proxy` plus `ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude`.
+  `headroom-proxy` plus `cclaude --context`.
 - Disable the MCP server for sessions where you only want proxy-level
   compression and do not need on-demand `headroom_compress` or
   `headroom_retrieve`.

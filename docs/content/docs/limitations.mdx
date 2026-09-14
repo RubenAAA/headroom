@@ -67,7 +67,7 @@ Headroom includes an AST-aware CodeCompressor (tree-sitter, 11 languages: Python
 
 **Where code savings come from**: Headroom compresses code in the live zone — the newest tool outputs and content blocks — with the AST-aware CodeCompressor, while keeping recent and analysis-context code fully intact. It never drops messages from the conversation history or strips function bodies.
 
-**Override**: Set `protect_analysis_context=False` in `ContentRouterConfig` for aggressive code compression. Requires `headroom-ai[code]` for tree-sitter.
+**Override**: the code compressor (`crates/headroom-core/src/transforms/code_compressor.rs`) is tuned conservatively by default; run `headroom-proxy --help` for the related flags.
 
 ## JSON Compression Constraints
 

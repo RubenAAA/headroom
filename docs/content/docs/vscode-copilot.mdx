@@ -15,7 +15,7 @@ extension, terminate TLS, or edit Codex configuration.
 
 - Current stable VS Code with GitHub Copilot enabled and signed in
 - A GitHub account with Copilot access
-- Headroom with proxy dependencies: `pip install "headroom-ai[proxy]"`
+- Headroom installed (`./install.sh`) with the proxy listening on 8787
 - Loopback access to `127.0.0.1` from the VS Code extension host
 
 ## One-time authentication
@@ -37,8 +37,10 @@ token remains in the proxy process and is never written to VS Code settings.
 Run from the project whose savings should receive attribution:
 
 ```bash
-headroom wrap vscode
+cclaude --context
 ```
+
+> The old Python wrapper (`headroom wrap vscode`) lives in the read-only `upstream-python/` mirror.
 
 The command:
 
@@ -85,9 +87,7 @@ unmanaged Copilot endpoint override instead of overwriting them.
 For Insiders, VSCodium, portable installations, a custom `--user-data-dir`, or a
 remote extension host, provide the exact user settings file:
 
-```bash
-headroom wrap vscode --settings-file /path/to/User/settings.json
-```
+(The old Python wrapper flag, `headroom wrap vscode --settings-file`, lives in the read-only `upstream-python/` mirror.)
 
 Use `--no-configure` to print the two settings without editing a file.
 
@@ -123,14 +123,12 @@ with the current Copilot API token on every Copilot-bound request.
 ## Stop and undo
 
 Press `Ctrl+C` to stop the session proxy. The VS Code endpoint setting remains so
-future `headroom wrap vscode` runs need no reconfiguration; while the proxy is
+future runs need no reconfiguration; while the proxy is
 stopped, Copilot requests will fail closed instead of bypassing Headroom.
 
 Remove only Headroom's settings block with:
 
-```bash
-headroom unwrap vscode
-```
+Remove the marked block Headroom added from VS Code `settings.json`.
 
 Use the same `--settings-file` override used during setup. Other VS Code and
 Copilot settings are preserved.
@@ -147,12 +145,12 @@ remote, and profile-specific settings should use `--settings-file` explicitly.
 GitHub.com Enterprise Cloud normally requires no override; Headroom uses the API
 URL advertised during token exchange. For GitHub Enterprise Server/custom domains,
 set `GITHUB_COPILOT_ENTERPRISE_URL` or `GITHUB_COPILOT_ENTERPRISE_DOMAIN` before
-both `copilot-auth login` and `wrap vscode`.
+both `copilot-auth login` and the wrapper setup.
 
 ## Verification and troubleshooting
 
 - `headroom copilot-auth status` should report `logged in`.
-- `http://127.0.0.1:8787/health` should be healthy while the wrapper runs.
+- `http://127.0.0.1:8787/healthz` should return `{"ok":true}` while the proxy runs.
 - The health payload's OpenAI upstream should be the Copilot API endpoint.
 - Select several native models and confirm Headroom metrics show each request.
 - If a model is unavailable, verify the Copilot account entitlement; Headroom

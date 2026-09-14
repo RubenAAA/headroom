@@ -7,38 +7,12 @@ Headroom compresses everything your AI agent reads -- tool outputs, database res
 
 ## Quick preview
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-```ts twoslash
-import { compress } from 'headroom-ai';
-
-const messages = [
-  { role: 'user' as const, content: 'Analyze these results' },
-];
-
-const result = await compress(messages, { model: 'gpt-4o' });
-// compressionRatio is tokensAfter / tokensBefore, so savings is 1 - ratio.
-console.log(`Saved ${result.tokensSaved} tokens (${((1 - result.compressionRatio) * 100).toFixed(0)}%)`);
+```bash
+cclaude --context
 ```
-</Tab>
-<Tab value="Python">
-```python
-from headroom import compress
-from openai import OpenAI
 
-messages = [{"role": "user", "content": "Analyze these results"}]
-
-result = compress(messages, model="gpt-4o")
-
-client = OpenAI()
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=result.messages,
-)
-print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
-```
-</Tab>
-</Tabs>
+Point Claude Code at the local proxy and every turn gets cache stabilization,
+compression, and observability. See [Quickstart](/docs/quickstart).
 
 ## What gets compressed
 
@@ -53,8 +27,7 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 | Images | ML router selects optimal resize/quality tradeoff | varies with image content |
 
 Savings depend heavily on how repetitive the content is -- see
-[Benchmarks](/docs/benchmarks) and the reproducible scenario table below for
-measured numbers on real workloads.
+the reproducible scenario table below for measured numbers on real workloads.
 
 ## Where Headroom fits
 
@@ -101,7 +74,7 @@ seeds (Code search 21%, SRE 56--57%, triage 29--30%, exploration 41--50% over
 five seeds). Savings depend on how repetitive your tool output is, so treat
 these as a shape, not a promise.
 
-See [Benchmarks](/docs/benchmarks) for the wider suite.
+See [Metrics](/docs/metrics) for the live numbers.
 
 ## Key Features
 

@@ -1,256 +1,57 @@
 ---
 title: Quickstart
-description: Get Headroom running in 5 minutes. Install, compress, and send to your LLM with fewer tokens.
+description: Get the Headroom Rust proxy running in 5 minutes. Install, launch through cclaude, verify savings.
 ---
 
-This guide gets you from zero to compressed LLM calls in under 5 minutes.
+Zero to proxied Claude Code in under 5 minutes.
 
 ## 1. Install
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-```bash
-npm install headroom-ai
-```
-</Tab>
-<Tab value="Python">
-```bash
-# CLI/proxy/wrap on your machine
-uv tool install --python 3.13 "headroom-ai[all]"
-
-# Python project or virtualenv
-pip install "headroom-ai[all]"
-```
-</Tab>
-</Tabs>
-
-<Callout type="info" title="TypeScript SDK requires the proxy">
-The TypeScript SDK sends messages to a local Headroom proxy for compression. Start the proxy before using the TS SDK:
+Prerequisites: git, Rust via rustup, plus `jq` and `lsof`.
 
 ```bash
-uv tool install --python 3.13 "headroom-ai[proxy]"
-# or, inside a Python project: pip install "headroom-ai[proxy]"
-headroom proxy --port 8787
+git clone https://github.com/RubenAAA/headroom.git ~/headroom
+cd ~/headroom
+./install.sh
 ```
 
-The proxy runs the compression pipeline (Python) and exposes an HTTP API that the TS SDK calls.
-</Callout>
+This builds the release binaries and installs `headroom-proxy` and `headroom` to `~/.local/bin`, plus the `cclaude` launcher, `restart-headroom.sh`, the flags file (`~/.headroom-flags.sh`), and the status line. `./install.sh --help` lists the options (`--no-build`, `--link`, `--hooks-into DIR`).
 
-## 2. Compress messages
-
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-```ts twoslash
-import { compress } from 'headroom-ai';
-
-const messages = [
-  { role: 'system' as const, content: 'You analyze search results.' },
-  { role: 'user' as const, content: 'Search for Python tutorials.' },
-  {
-    role: 'assistant' as const,
-    content: null,
-    tool_calls: [{
-      id: 'call_1',
-      type: 'function' as const,
-      function: { name: 'search', arguments: '{"q": "python"}' },
-    }],
-  },
-  {
-    role: 'tool' as const,
-    tool_call_id: 'call_1',
-    content: JSON.stringify({
-      results: Array.from({ length: 500 }, (_, i) => ({
-        title: `Result ${i}`,
-        snippet: `Description ${i}`,
-        score: 100 - i,
-      })),
-    }),
-  },
-  { role: 'user' as const, content: 'What are the top 3 results?' },
-];
-
-const result = await compress(messages, {
-  model: 'gpt-4o',
-  baseUrl: 'http://localhost:8787',
-});
-```
-</Tab>
-<Tab value="Python">
-```python
-from headroom import compress
-import json
-
-messages = [
-    {"role": "system", "content": "You analyze search results."},
-    {"role": "user", "content": "Search for Python tutorials."},
-    {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "search", "arguments": '{"q": "python"}'},
-        }],
-    },
-    {
-        "role": "tool",
-        "tool_call_id": "call_1",
-        "content": json.dumps({
-            "results": [
-                {"title": f"Result {i}", "snippet": f"Description {i}", "score": 100 - i}
-                for i in range(500)
-            ]
-        }),
-    },
-    {"role": "user", "content": "What are the top 3 results?"},
-]
-
-result = compress(messages, model="gpt-4o")
-```
-</Tab>
-</Tabs>
-
-## 3. Send to your LLM
-
-Use the compressed messages exactly like the originals:
-
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-```ts twoslash
-import OpenAI from 'openai';
-
-const client = new OpenAI();
-
-// result.messages from the previous step
-const messages: any[] = [];
-
-const response = await client.chat.completions.create({
-  model: 'gpt-4o',
-  messages,
-});
-
-console.log(response.choices[0].message.content);
-```
-</Tab>
-<Tab value="Python">
-```python
-from openai import OpenAI
-
-client = OpenAI()
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=result.messages,
-)
-
-print(response.choices[0].message.content)
-```
-</Tab>
-</Tabs>
-
-## 4. Check your savings
-
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-```ts twoslash
-const result = {
-  tokensBefore: 45000,
-  tokensAfter: 4500,
-  tokensSaved: 40500,
-  // compressionRatio is tokensAfter / tokensBefore, so savings is 1 - ratio.
-  compressionRatio: 0.1,
-  transformsApplied: ['smart_crusher', 'cache_aligner'],
-  messages: [],
-  ccrHashes: [],
-  compressed: true,
-};
-// ---cut---
-console.log(`Tokens before: ${result.tokensBefore}`);
-console.log(`Tokens after:  ${result.tokensAfter}`);
-console.log(`Tokens saved:  ${result.tokensSaved}`);
-console.log(`Compression:   ${((1 - result.compressionRatio) * 100).toFixed(0)}%`);
-console.log(`Transforms:    ${result.transformsApplied.join(', ')}`);
-```
-
-Example output:
-
-```
-Tokens before: 45000
-Tokens after:  4500
-Tokens saved:  40500
-Compression:   90%
-Transforms:    smart_crusher, cache_aligner
-```
-</Tab>
-<Tab value="Python">
-```python
-print(f"Tokens before: {result.tokens_before}")
-print(f"Tokens after:  {result.tokens_after}")
-print(f"Tokens saved:  {result.tokens_saved}")
-print(f"Compression:   {result.compression_ratio:.0%}")
-print(f"Transforms:    {result.transforms_applied}")
-```
-
-Example output:
-
-```
-Tokens before: 45000
-Tokens after:  4500
-Tokens saved:  40500
-Compression:   90%
-Transforms:    ['smart_crusher', 'cache_aligner']
-```
-</Tab>
-</Tabs>
-
-## Alternative: proxy mode (zero code changes)
-
-<Callout type="info" title="Using Claude Code inside VS Code?">
-Run `headroom wrap vscode-claude`, reload the VS Code window once, and keep the
-wrapper running while you use the official Claude Code extension. See the
-[complete VS Code Claude Code guide](/docs/vscode-claude-code) for verification,
-undo steps, custom profiles, and remote development.
-</Callout>
-
-If you do not want to change any code, run Headroom as a proxy and point your existing client at it:
+## 2. Run
 
 ```bash
-# Start the proxy
-headroom proxy --port 8787
-
-# Point Claude Code at it
-ANTHROPIC_BASE_URL=http://localhost:8787 claude
-
-# Or any OpenAI-compatible client
-OPENAI_BASE_URL=http://localhost:8787/v1 your-app
+cclaude --context
 ```
 
-All requests flow through Headroom automatically. Check savings at any time:
+`--context` routes through the proxy: the launcher starts it if nothing listens on 8787 (with the measured flags from `~/.headroom-flags.sh`), sets `ANTHROPIC_BASE_URL`, and execs `claude` with the rest of your arguments.
+
+> Bare `cclaude` without `--context` is plain passthrough, and plain `claude` never touches the proxy. `--context` is what puts the proxy in the path (see `contrib/claude-launcher`).
+
+## 3. Verify
 
 ```bash
-curl http://localhost:8787/stats
-# {"requests_total": 42, "tokens_saved_total": 125000, ...}
+curl -s localhost:8787/healthz
+# {"ok":true,...}
+
+curl -s localhost:8787/cache-health
+# hit rates and recent cache events
+
+headroom doctor
+# proxy liveness + local ledgers
 ```
 
-## What gets compressed
+Do a little work in the session first — ledger-backed commands only show numbers once traffic has flowed.
 
-The biggest savings come from tool outputs -- search results, database rows, log files, API responses. Headroom auto-detects the content type and routes it to the best compressor. No configuration needed.
+## 4. Tune and restart
 
-| Content type | Compressor | Typical savings |
-|---|---|---|
-| JSON arrays | SmartCrusher | varies with array size and redundancy |
-| Source code | CodeCompressor | opt-in; disabled by default |
-| Build/test logs | LogCompressor | varies with log verbosity |
-| Search results | SearchCompressor | varies with result set size |
-| Plain text | Kompress | varies with redundancy |
+The measured settings live in `~/.headroom-flags.sh`, sourced by both the launcher and `restart-headroom.sh`. Edit there, then apply with:
 
-Savings depend heavily on how repetitive the content is -- see
-[Benchmarks](/docs/benchmarks) for measured numbers on real workloads.
+```bash
+restart-headroom.sh
+```
 
-## Next steps
+A running proxy is reused with the flags it started with — editing the file alone changes nothing until restart. Full option list: `headroom-proxy --help`. See [Configuration](/docs/configuration) and [Proxy](/docs/proxy).
 
-<Cards>
-  <Card title="Installation" href="/docs/installation" />
-  <Card title="Proxy Server" href="/docs/proxy" />
-  <Card title="How Compression Works" href="/docs/how-compression-works" />
-  <Card title="Configuration" href="/docs/configuration" />
-</Cards>
+## 5. Python mirror (not the live path)
+
+The `headroom-ai` pip/uv package and the Python SDK live in the read-only `upstream-python/` mirror. They are not built here; they exist so upstream diffs stay readable when porting.

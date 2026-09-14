@@ -1,5 +1,13 @@
 # Headroom Rust Rewrite — Developer Guide
 
+> **Extracted 2026-09-11:** dispositions live in
+> [`ideas/implemented/rust-*.md`](ideas/implemented/) (TOIN reattach, CCR
+> marker knob, fail-loud scorer, persistent backends), open items in
+> [`ideas/rust-*.md`](ideas/) (feedback-hints verify, relevance bridge), and
+> practices in [`learnings/`](learnings/) (telemetry-first, toolchain pin,
+> maturin path, fragmentation, recorder limits). This guide keeps its full
+> text as reference.
+
 This document covers the Rust side of Headroom, which is the default and
 production path. Longer-form design/plan writeups live elsewhere and are not
 versioned in this repo.

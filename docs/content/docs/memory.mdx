@@ -7,29 +7,10 @@ LLMs have two fundamental limitations: context windows overflow with too much hi
 
 This is **temporal compression** -- instead of carrying 10,000 tokens of conversation history, carry 100 tokens of extracted memories.
 
-## Quick Start
+## Quick start
 
-```python
-from openai import OpenAI
-from headroom import with_memory
+Memory runs inside the Rust proxy (`crates/headroom-proxy/src/memory/`: router, ranker, backends, injection). There is no `with_memory` wrapper to install — memory is flag-driven on `headroom-proxy` (run `headroom-proxy --help`). The old Python API (`with_memory`, `HierarchicalMemory`, `MemoryConfig`) lives in the read-only `upstream-python/` mirror.
 
-# One line -- that's it
-client = with_memory(OpenAI(), user_id="alice")
-
-# Use exactly like normal
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "I prefer Python for backend work"}]
-)
-# Memory extracted INLINE -- zero extra latency
-
-# Later, in a new conversation...
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "What language should I use?"}]
-)
-# Response uses the Python preference from memory
-```
 
 ## How It Works
 
@@ -55,34 +36,7 @@ Memories exist at four scope levels, from broadest to narrowest:
 | **Agent** | Current agent in session | Agent-specific context |
 | **Turn** | Single turn only | Ephemeral working memory |
 
-```python
-from openai import OpenAI
-from headroom import with_memory
-
-# Session 1: Morning
-client1 = with_memory(
-    OpenAI(),
-    user_id="bob",
-    session_id="morning-session",
-)
-response = client1.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "I prefer Go for performance-critical code"}]
-)
-# Memory stored at USER level (persists across sessions)
-
-# Session 2: Afternoon (different session, same user)
-client2 = with_memory(
-    OpenAI(),
-    user_id="bob",
-    session_id="afternoon-session",
-)
-response = client2.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "What language for my new microservice?"}]
-)
-# Recalls Go preference from morning session
-```
+> Python example from the old SDK — see `upstream-python/docs/` for the mirror.
 
 ## Memory Categories
 
@@ -105,71 +59,13 @@ used in Headroom's own examples for organization and retrieval:
 
 The `with_memory()` wrapper exposes a `.memory` attribute for direct access:
 
-```python
-client = with_memory(OpenAI(), user_id="alice")
-
-# Search memories (semantic)
-results = client.memory.search("python preferences", top_k=5)
-for memory in results:
-    print(f"{memory.content}")
-
-# Add a memory manually
-client.memory.add(
-    "User is a senior engineer",
-    importance=0.9,
-)
-
-# Get all memories for this user
-all_memories = client.memory.get_all()
-
-# Clear all memories
-client.memory.clear()
-
-# Get stats
-# `stats()` currently returns only {"total": N} -- there is no
-# per-category breakdown (`headroom/memory/wrapper.py:342-348`).
-stats = client.memory.stats()
-print(f"Total memories: {stats['total']}")
-```
+> Python example from the old SDK — see `upstream-python/docs/` for the mirror.
 
 ## Temporal Versioning
 
 When facts change, Headroom creates a **supersession chain** that preserves history:
 
-```python
-from headroom.memory import HierarchicalMemory, MemoryFilter
-
-memory = await HierarchicalMemory.create()
-
-# Original fact
-# `category` is a convention, not a keyword argument -- `add()` has no
-# `category` param (`headroom/memory/core.py`); store it in `metadata`.
-orig = await memory.add(
-    content="User works at Google",
-    user_id="alice",
-    metadata={"category": "fact"},
-)
-
-# User changes jobs -- supersede the old memory
-new = await memory.supersede(
-    old_memory_id=orig.id,
-    new_content="User now works at Anthropic",
-)
-
-# Query current state (excludes superseded by default)
-current = await memory.query(MemoryFilter(
-    user_id="alice",
-    include_superseded=False,
-))
-# Returns only "User now works at Anthropic"
-
-# Get the full chain
-chain = await memory.get_history(new.id)
-# [
-#   Memory(content="User works at Google", is_current=False),
-#   Memory(content="User now works at Anthropic", is_current=True),
-# ]
-```
+> Python example from the old SDK — see `upstream-python/docs/` for the mirror.
 
 This gives you an audit trail, the ability to debug why the LLM made certain decisions, and rollback if needed.
 
@@ -177,30 +73,7 @@ This gives you an audit trail, the ability to debug why the LLM made certain dec
 
 ### Embedder Backends
 
-```python
-from headroom.memory import MemoryConfig, EmbedderBackend
-
-# ONNX embeddings (recommended -- fast, free, private; ~30 MB int8-quantized)
-# Note: EmbedderBackend.LOCAL requires PyTorch (~2 GB); use ONNX instead.
-config = MemoryConfig(
-    embedder_backend=EmbedderBackend.ONNX,
-    embedder_model="BAAI/bge-small-en-v1.5",
-)
-
-# OpenAI embeddings (higher quality, costs money)
-config = MemoryConfig(
-    embedder_backend=EmbedderBackend.OPENAI,
-    openai_api_key="sk-...",
-    embedder_model="text-embedding-3-small",
-)
-
-# Ollama embeddings (local server, many models)
-config = MemoryConfig(
-    embedder_backend=EmbedderBackend.OLLAMA,
-    ollama_base_url="http://localhost:11434",
-    embedder_model="nomic-embed-text",
-)
-```
+> Python example from the old SDK — see `upstream-python/docs/` for the mirror.
 
 ### Embedding Runtime / GPU Offload (Apple Silicon)
 
@@ -213,7 +86,6 @@ On Apple Silicon you can opt in to running the embedder on the **Apple GPU
 responsive. Install the extra and set the env var:
 
 ```bash
-pip install "headroom-ai[pytorch-mps]"   # also works as [pytorch_mps]
 export HEADROOM_EMBEDDER_RUNTIME=pytorch_mps
 ```
 
@@ -236,39 +108,13 @@ Apple GPU instead of the default ONNX CPU embedder. Notes:
 
 Storage uses **SQLite** for CRUD and filtering, **HNSW** for vector similarity search, and **FTS5** for full-text keyword search. All embedded -- no external services required.
 
-```python
-config = MemoryConfig(
-    db_path="memory.db",
-    vector_dimension=384,
-    hnsw_ef_construction=200,
-    hnsw_m=16,
-    hnsw_ef_search=50,
-    cache_enabled=True,
-    cache_max_size=1000,
-)
-```
+> Python example from the old SDK — see `upstream-python/docs/` for the mirror.
 
 ## Provider Compatibility
 
 Memory works with any OpenAI-compatible client:
 
-```python
-from openai import OpenAI
-from headroom import with_memory
-
-# OpenAI
-client = with_memory(OpenAI(), user_id="alice")
-
-# Azure OpenAI
-client = with_memory(
-    OpenAI(base_url="https://your-resource.openai.azure.com/..."),
-    user_id="alice",
-)
-
-# Groq
-from groq import Groq
-client = with_memory(Groq(), user_id="alice")
-```
+> Python example from the old SDK — see `upstream-python/docs/` for the mirror.
 
 ## Performance
 

@@ -1,5 +1,11 @@
 # Testing: GitHub Copilot subscription mode (`headroom wrap copilot --subscription`)
 
+> **Extracted 2026-09-11:** Linux auto-discovery coverage is tracked in
+> [`ideas/copilot-linux-autodiscovery-coverage.md`](ideas/copilot-linux-autodiscovery-coverage.md);
+> routing findings in
+> [`learnings/copilot-*.md`](learnings/) (generic host, enterprise pin,
+> Windows schema gap). This testing guide keeps its full text.
+
 This feature has live coverage on macOS and Windows. Additional Linux secret-store
 coverage is still useful (see [Status](#status)). If you have a GitHub Copilot
 subscription and 10 minutes, please run one of the flows below and
