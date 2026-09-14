@@ -4,12 +4,12 @@
 mod common;
 
 use common::start_proxy_with;
-use headroom_proxy::config::ModelRoute;
+use headroom_proxy::config::ProviderRoute;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn spark_route(upstream: &str) -> ModelRoute {
-    ModelRoute {
+fn spark_route(upstream: &str) -> ProviderRoute {
+    ProviderRoute {
         model_prefix: "claude-muse-spark-1.3".into(),
         prefix_match: false,
         upstream: Some(upstream.parse().unwrap()),
@@ -30,8 +30,8 @@ fn count_body(model: &str) -> serde_json::Value {
     })
 }
 
-fn cursor_route() -> ModelRoute {
-    ModelRoute {
+fn cursor_route() -> ProviderRoute {
+    ProviderRoute {
         model_prefix: "claude-grok-4.6".into(),
         prefix_match: false,
         upstream: None,

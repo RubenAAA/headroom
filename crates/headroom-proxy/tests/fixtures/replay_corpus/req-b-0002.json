@@ -1,0 +1,1 @@
+{"body":{"max_tokens":64,"messages":[{"content":"alpha","role":"user"},{"content":"ack.","role":"assistant"},{"content":"beta","role":"user"}],"model":"claude-sonnet-4-6","system":"you are a helpful assistant"},"endpoint":"anthropic","request_id":"replay-corpus-edited-0000000002","seq":2,"session_key":"replay-corpus-edited","ts_ms":2000.0}

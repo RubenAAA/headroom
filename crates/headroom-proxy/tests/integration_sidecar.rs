@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::start_proxy_with;
-use headroom_proxy::config::ModelRoute;
+use headroom_proxy::config::ProviderRoute;
 use serde_json::{json, Value};
 use url::Url;
 use wiremock::matchers::{method, path};
@@ -364,7 +364,7 @@ async fn the_routed_entry_path_also_shrinks_the_sidecar() {
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
         c.prefix_replay = true;
-        c.model_routes = vec![headroom_proxy::config::ModelRoute {
+        c.model_routes = vec![headroom_proxy::config::ProviderRoute {
             model_prefix: "claude-opus-5".to_string(),
             prefix_match: false,
             upstream: Some(route_upstream.uri().parse().unwrap()),
@@ -773,8 +773,8 @@ async fn mount_zen(upstream: &MockServer) -> Arc<Mutex<Vec<Vec<u8>>>> {
     captured
 }
 
-fn zen_route(zen: &MockServer) -> ModelRoute {
-    ModelRoute {
+fn zen_route(zen: &MockServer) -> ProviderRoute {
+    ProviderRoute {
         model_prefix: "claude-muse-spark-1.2".to_string(),
         prefix_match: false,
         upstream: Some(Url::parse(&zen.uri()).unwrap()),

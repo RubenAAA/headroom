@@ -282,3 +282,249 @@ async fn routed_buffered_turn_resolves_retrieval() {
         "the continuation's answer must reach the client:\n{out}"
     );
 }
+
+/// Streamed CCR booking: the first round reports 500 prompt / 9 completion
+/// and the continuation 900 / 12, and chat-shaped continuation usage counts
+/// like Responses-shaped. The turn must book exactly once carrying 1400 in
+/// and 21 out — the provider's own counts on both legs, matching what the
+/// buffered arm books for the same turn. Booking lands server-side at stream
+/// exhaustion, so the logger is polled rather than read once.
+#[tokio::test]
+async fn routed_streaming_turn_books_continuation_rounds_once() {
+    use std::sync::Mutex;
+
+    use headroom_proxy::request_logger::RequestLogger;
+
+    let dir = TempDir::new().unwrap();
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let logger_holder: Arc<Mutex<Option<Arc<RequestLogger>>>> = Arc::new(Mutex::new(None));
+    let logger_holder2 = logger_holder.clone();
+
+    let (addr, _upstream) = openai_upstream(rounds.clone()).await;
+    let store_dir = dir.path().to_path_buf();
+    let upstream_url = format!("http://{addr}");
+    let proxy = start_proxy_with_state(
+        "http://127.0.0.1:1",
+        move |c| {
+            c.compression = true;
+            c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            c.ctx_offload = true;
+            c.ctx_store_dir = Some(store_dir);
+            c.ccr_handle_responses = true;
+            c.local_model = Some(ROUTED_MODEL.to_string());
+            c.local_upstream = Some(upstream_url.parse().expect("upstream url"));
+        },
+        move |s| {
+            *logger_holder2.lock().unwrap() = Some(s.request_logger.clone());
+            s.ctx_offload
+                .as_ref()
+                .expect("ctx_offload runtime")
+                .store
+                .ccr()
+                .put(HASH, ORIGINAL);
+            s
+        },
+    )
+    .await;
+
+    let body = json!({
+        "model": ROUTED_MODEL,
+        "stream": true,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "what did that say"}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .expect("proxy responds");
+    assert_eq!(resp.status(), 200);
+    let text = String::from_utf8_lossy(&resp.bytes().await.expect("body")).to_string();
+    assert!(
+        text.contains("ANSWER_AFTER_RETRIEVAL"),
+        "the retrieval must resolve first:\n{text}"
+    );
+    assert_eq!(
+        rounds.load(Ordering::SeqCst),
+        1,
+        "the proxy must have run one continuation"
+    );
+
+    let logger = logger_holder
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("logger captured");
+    let mut entries = Vec::new();
+    for _ in 0..100 {
+        entries = logger.get_recent(10);
+        if !entries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        entries.len(),
+        1,
+        "one streamed CCR turn books exactly once: {entries:?}"
+    );
+    assert_eq!(entries[0].provider, "openai_chat");
+    assert_eq!(
+        entries[0].input_tokens_optimized, 1400,
+        "first round 500 + continuation 900: {:?}",
+        entries[0]
+    );
+    assert_eq!(
+        entries[0].output_tokens, 21,
+        "first round 9 + continuation 12, provider counts on both legs: {:?}",
+        entries[0]
+    );
+
+    proxy.shutdown().await;
+}
+
+/// C8 parity gate: the streamed and buffered arms resolve the same
+/// retrieval and deliver the same answer — same continuation run, same
+/// final text, no proxy-tool leak on either.
+///
+/// The two envelopes are NOT byte-identical by design: streaming emits the
+/// pre-retrieval text live (the client already saw it when the tool call
+/// resolves), while the buffered arm renders the resolved turn alone. So
+/// the gate asserts containment — everything the buffered client got, the
+/// streamed client got — rather than string equality. Any future C8 core
+/// extraction must keep this green: same tools run, same answers delivered.
+#[tokio::test]
+async fn streamed_and_buffered_arms_answer_identically() {
+    /// Client-visible text of a buffered Anthropic JSON body.
+    fn buffered_text(body: &serde_json::Value) -> String {
+        body.get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
+    }
+
+    /// Client-visible text reassembled from a streamed SSE body: every text
+    /// delta and every fully-formed text block, in wire order.
+    fn streamed_text(sse: &str) -> String {
+        let mut out = String::new();
+        for chunk in sse.split("\n\n") {
+            for line in chunk.lines() {
+                let Some(payload) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                if payload.trim() == "[DONE]" {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(payload) else {
+                    continue;
+                };
+                if let Some(text) = event
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    out.push_str(text);
+                }
+                if let Some(blocks) = event.get("content").and_then(|c| c.as_array()) {
+                    for block in blocks {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            out.push_str(text);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    async fn drive(stream: bool) -> (String, String) {
+        let dir = TempDir::new().unwrap();
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let (addr, _upstream) = openai_upstream(rounds.clone()).await;
+        let store_dir = dir.path().to_path_buf();
+        let upstream_url = format!("http://{addr}");
+        let proxy = start_proxy_with_state(
+            "http://127.0.0.1:1",
+            move |c| {
+                c.compression = true;
+                c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+                c.ctx_offload = true;
+                c.ctx_store_dir = Some(store_dir);
+                c.ccr_handle_responses = true;
+                c.local_model = Some(ROUTED_MODEL.to_string());
+                c.local_upstream = Some(upstream_url.parse().expect("upstream url"));
+            },
+            |s| {
+                s.ctx_offload
+                    .as_ref()
+                    .expect("ctx_offload runtime")
+                    .store
+                    .ccr()
+                    .put(HASH, ORIGINAL);
+                s
+            },
+        )
+        .await;
+
+        let body = json!({
+            "model": ROUTED_MODEL,
+            "stream": stream,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "what did that say"}]
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/messages", proxy.url()))
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .body(serde_json::to_vec(&body).unwrap())
+            .send()
+            .await
+            .expect("proxy responds");
+        assert_eq!(resp.status(), 200);
+        let text = String::from_utf8_lossy(&resp.bytes().await.expect("body")).to_string();
+        assert_eq!(
+            rounds.load(Ordering::SeqCst),
+            1,
+            "both arms must actually retrieve"
+        );
+        proxy.shutdown().await;
+        if stream {
+            (streamed_text(&text), text)
+        } else {
+            let parsed: serde_json::Value = serde_json::from_str(&text).expect("buffered JSON");
+            (buffered_text(&parsed), text)
+        }
+    }
+
+    let (streamed_answer, streamed_raw) = drive(true).await;
+    let (buffered_answer, buffered_raw) = drive(false).await;
+
+    for (name, raw) in [("streamed", &streamed_raw), ("buffered", &buffered_raw)] {
+        assert!(
+            !raw.contains("headroom_retrieve"),
+            "{name} arm leaked the proxy tool:\n{raw}"
+        );
+    }
+    assert!(
+        !streamed_answer.is_empty() && !buffered_answer.is_empty(),
+        "both arms must answer something (streamed={streamed_answer:?}, buffered={buffered_answer:?})"
+    );
+    assert!(
+        streamed_answer.contains(&buffered_answer as &str),
+        "everything the buffered client got, the streamed client got too \
+         (streamed={streamed_answer:?}, buffered={buffered_answer:?})"
+    );
+    assert!(
+        buffered_answer.contains("ANSWER_AFTER_RETRIEVAL"),
+        "the continuation answer reaches both arms: {buffered_answer:?}"
+    );
+}

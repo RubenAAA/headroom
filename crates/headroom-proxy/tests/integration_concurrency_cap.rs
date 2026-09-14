@@ -10,7 +10,7 @@ mod common;
 use std::time::Duration;
 
 use common::start_proxy_with;
-use headroom_proxy::config::ModelRoute;
+use headroom_proxy::config::ProviderRoute;
 use serde_json::{json, Value};
 use url::Url;
 use wiremock::matchers::{method, path};
@@ -216,7 +216,7 @@ async fn routed_turn_sheds_with_429_past_the_cap() {
 
     let proxy = start_proxy_with(&mock.uri(), |cfg| {
         cfg.max_conversation_concurrency = 2;
-        cfg.model_routes = vec![ModelRoute {
+        cfg.model_routes = vec![ProviderRoute {
             model_prefix: "claude-codex-5.5".to_string(),
             prefix_match: false,
             upstream: Some(upstream_url.clone()),

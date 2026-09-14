@@ -1,0 +1,1 @@
+{"body":{"max_tokens":64,"messages":[{"content":"task one","role":"user"},{"content":"done one.","role":"assistant"},{"content":"task two","role":"user"}],"model":"claude-sonnet-4-6","system":"you are a helpful assistant"},"endpoint":"anthropic","request_id":"replay-corpus-steady-0000000002","seq":2,"session_key":"replay-corpus-steady","ts_ms":2000.0}
