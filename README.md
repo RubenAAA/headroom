@@ -200,7 +200,7 @@ minute, which is what turns "it felt slow before it died" into a growth curve.
 | `crates/headroom-parity` | Checks Rust output against the Python implementation. |
 | `crates/headroom-simulators` | Traffic simulators for benchmarks. |
 | `crates/headroom-py` | A PyO3 extension module, built with maturin rather than cargo. |
-| `contrib/` | The launcher, the restart script, the statuslines, the flag file. `contrib/claude/` holds the subagent definitions and the CLAUDE.md excerpt. |
+| `contrib/` | The launcher, the restart script, the statuslines, the flag file. `contrib/claude/` holds the subagent definitions and the CLAUDE.md excerpt. [File-by-file](contrib/README.md). |
 | `docs/` | Reference docs, including [`flags.md`](docs/flags.md) and [`measurement.md`](docs/measurement.md). |
 | `docs/notes/` | Working notes and measurement logs. Not onboarding material, and parts go stale. |
 

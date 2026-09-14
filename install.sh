@@ -349,6 +349,9 @@ const [file, dir, pruneFile] = process.argv.slice(1);
 // the go-ahead, before the diffs are read and the replies are written, which
 // is the only point where diverting still saves anything.
 const WANT = [
+  // Review and ticket diversion: catch the articulation or the filing before
+  // it is written, hand it to a worker. Both exit 0 on every path except the
+  // diverted attempt, so ordinary work never stalls.
   ["UserPromptSubmit", null,                  "review-gate.sh",    10],
   ["UserPromptSubmit", null,                  "ticket-gate.sh",    10],
   ["PreToolUse",       "Bash",                "review-gate.sh",    10],

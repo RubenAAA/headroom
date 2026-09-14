@@ -94,7 +94,7 @@ generated from that output. Regenerate it when you add a flag.
   `crates/headroom-simulators` drives the benchmarks.
 - `crates/headroom-py` is a PyO3 module built with maturin, not cargo.
 - `contrib/` has the launcher, restart script, statuslines, flag file, and Claude hooks. Only
-  `install.sh` reads it.
+  `install.sh` reads it. File-by-file: `contrib/README.md`.
 - `docs/` is reference material. `docs/notes/` is working notes, some stale. Do
   not treat notes as a spec.
 - Before touching proxy behaviour or chasing a saving, read
