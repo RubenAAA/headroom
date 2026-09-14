@@ -299,6 +299,12 @@ fi
 # the Agent tool (seen 2026-09-09: `codex-terra` not found in a work session).
 step "Agents"
 for agent_dir in "$CLAUDE_DIR/agents" "$HOME/.claude-work/agents" "$HOME/.claude-personal/agents"; do
+# Only the primary config dir is ours to create. The work and personal
+# profiles exist only on machines whose launcher uses them; mkdir -p on all
+# three fabricated two empty config dirs everywhere else.
+if [ "$agent_dir" != "$CLAUDE_DIR/agents" ] && [ ! -d "$(dirname "$agent_dir")" ]; then
+    continue
+fi
 mkdir -p "$agent_dir"
 for src in "$CONTRIB"/claude/agents/*.md; do
     dst="$agent_dir/$(basename "$src")"
