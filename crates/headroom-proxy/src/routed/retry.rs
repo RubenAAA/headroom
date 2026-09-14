@@ -548,6 +548,61 @@ mod tests {
         );
     }
 
+    /// A Zen upstream that never recovers must still terminate: the hold
+    /// gives up once `retry_zen_hold_budget_ms` elapses and returns the
+    /// still-429 response rather than looping forever or firing an
+    /// unbounded number of re-POSTs. This is the volume guard for the
+    /// worst case — a rotation that never lands a fresh exit within budget.
+    #[tokio::test]
+    async fn zen_hold_gives_up_after_budget_when_never_recovering() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                wiremock::ResponseTemplate::new(429).set_body_string("rate limited")
+            })
+            .mount(&mock)
+            .await;
+        let upstream: url::Url = mock.uri().parse().unwrap();
+        let mut config = crate::config::Config::for_test(upstream);
+        config.retry_enabled = true;
+        config.retry_max_attempts = 1;
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 1;
+        config.retry_zen_hold_enabled = true;
+        config.retry_zen_hold_budget_ms = 50;
+        let state = AppState::new(config).expect("app state");
+        let started = std::time::Instant::now();
+        let send = send_with_retry(
+            &state,
+            &mock.uri(),
+            HeaderMap::new(),
+            Bytes::from("{}"),
+            "test-zen-hold-exhaust",
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("still-429 flows through as an Ok response, not an Err");
+        assert_eq!(send.resp.status(), 429, "budget spent, still limited");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must give up near the budget, not hang: took {elapsed:?}"
+        );
+        let hit_count = hits.load(Ordering::SeqCst);
+        assert!(
+            (1..100).contains(&hit_count),
+            "bounded by the budget and the 1ms-floor slice, not a tight loop: {hit_count} hits"
+        );
+    }
+
     /// Non-zen upstreams keep honoring a long Retry-After: no hold owns them,
     /// so the response goes back without burning the retry budget.
     #[tokio::test]
