@@ -110,13 +110,14 @@ limit of four. This matters more than compression does, because a compressor
 that busts the prompt cache costs more than it saves.
 
 **Cache stabilizers.** Small rewrites that stop the client from invalidating its
-own cached prefix. All are off unless a flag turns them on.
+own cached prefix. Several ship on (e.g. `--cache-stable-tool-order`,
+`--cache-tail-breakpoint`); the table marks each default.
 
-| Flag | What it fixes |
-| --- | --- |
-| `--force-1h-cache-ttl` | Marks entries `1h` so the prefix survives an idle gap past the 5-minute default. Skipped on pay-as-you-go, where 1h input costs more. |
-| `--cache-stable-tool-order` | `tools` sits at the head of the cache key, so the first tool whose bytes move invalidates every tool after it plus the system prompt and all history. This replays last turn's order and appends new tools at the end. |
-| `--cache-pin-tool-roster` | Claude Code drops a tool from its roster for one turn and re-adds it next turn. The array is hashed as sent, so that flap alone accounts for about half the recache waste in the log. This puts the tool back where it was. |
+| Flag | Default | What it fixes |
+| --- | --- | --- |
+| `--force-1h-cache-ttl` | off | Marks entries `1h` so the prefix survives an idle gap past the 5-minute default. Skipped on pay-as-you-go, where 1h input costs more. |
+| `--cache-stable-tool-order` | **on** | `tools` sits at the head of the cache key, so the first tool whose bytes move invalidates every tool after it plus the system prompt and all history. This replays last turn's order and appends new tools at the end. |
+| `--cache-pin-tool-roster` | off | Claude Code drops a tool from its roster for one turn and re-adds it next turn. The array is hashed as sent, so that flap alone accounts for about half the recache waste in the log. This puts the tool back where it was. |
 
 **Context capture.** Conversations go to a local store, searchable with
 `headroom ctx search`.
@@ -204,9 +205,9 @@ minute, which is what turns "it felt slow before it died" into a growth curve.
 | `docs/` | Reference docs, including [`flags.md`](docs/flags.md) and [`measurement.md`](docs/measurement.md). |
 | `docs/notes/` | Working notes and measurement logs. Not onboarding material, and parts go stale. |
 
-The Python tree (`headroom/`, `tests/`, `sdk/`, `plugins/`) is upstream's
-original: inert, not part of the Rust build, kept so upstream diffs stay
-readable when porting.
+The Python tree (`upstream-python/`, holding `headroom/`, `tests/`, `sdk/`,
+`plugins/`) is upstream's original: inert, not part of the Rust build, kept
+so upstream diffs stay readable when porting.
 
 ## Building and testing
 

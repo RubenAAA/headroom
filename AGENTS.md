@@ -2,7 +2,8 @@
 
 Headroom is a local reverse proxy between Claude Code and the model API. It
 compresses requests, keeps the provider's prompt cache intact, and routes Codex
-model names to OpenAI in the same session.
+model names to OpenAI in the same session. Supported models and their
+`/model` aliases: @MODELS-SUPPORTED-WITHIN-CLAUDE-CODE-PROXY.md.
 
 **The one rule that matters: after installing, start Claude Code with `cclaude`,
 never `claude`.** Plain `claude` talks straight to the API and the proxy does
@@ -82,7 +83,7 @@ file is `contrib/headroom-flags.sh` in the checkout, so edit either. A running
 proxy is reused as it is, and flags on a later command line are ignored, so a
 change with no restart means you are still measuring the old setting.
 
-All 124 options: `headroom-proxy --help`, or [`docs/flags.md`](docs/flags.md),
+All 131 options (133 with `-h`/`-V`): `headroom-proxy --help`, or [`docs/flags.md`](docs/flags.md),
 generated from that output. Regenerate it when you add a flag.
 
 ## Layout for editing
@@ -111,7 +112,9 @@ generated from that output. Regenerate it when you add a flag.
 client invalidating its own cached prefix: TTL forcing, stable tool order, roster
 pinning, prefix replay, breakpoint placement. Each module doc names the failure
 it exists for. Read it before touching one. These are measured behaviours, not
-preferences, and all are off by default.
+preferences. Several ship on (notably `--cache-stable-tool-order`,
+`--cache-tail-breakpoint`, `--ctx-drop-prior-thinking`); check `--help`
+for the default of the one you touch rather than assuming off.
 
 Integration tests live in `crates/headroom-proxy/tests/`. The pattern is a
 wiremock upstream capturing forwarded bodies, a proxy started against it, and
@@ -138,8 +141,9 @@ setups. `make gc-check` previews, `make gc` forces. See
 
 - Never commit secrets. `~/.headroom-flags.sh` names auth file paths, not keys,
   and lives outside the repo. Keep it there.
-- The Python tree (`headroom/`, `tests/`, `sdk/`, `plugins/`) is a read-only
-  mirror of upstream. It is not built here. It exists so upstream diffs stay
-  readable when porting. Do not edit or reformat it.
+- The Python tree (`upstream-python/`, holding `headroom/`, `tests/`, `sdk/`,
+  `plugins/`) is a read-only mirror of upstream. It is not built here. It
+  exists so upstream diffs stay readable when porting. Do not edit or
+  reformat it.
 - Do not reformat code you are not changing. Match the surrounding style.
 - Do not commit or push unless asked.

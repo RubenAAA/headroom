@@ -232,8 +232,12 @@ jobs:
       # Blocking. Soft-failing this made it useless: RUSTSEC-2026-0258 (h2,
       # unbounded empty DATA frames -> unbounded memory or a panic) was
       # reported by this job for as long as it existed and never turned a run
-      # red, so nobody acted on it. Accepted advisories go in audit.toml with
-      # a written reason rather than being swallowed wholesale here.
+      # red, so nobody acted on it. Accepted advisories go in the
+      # [advisories] section of deny.toml with a written reason rather
+      # than being swallowed wholesale here. (FINDING-008: an earlier
+      # comment named audit.toml; cargo-audit has no such file — its
+      # ignore file is .cargo/audit.toml, and this repo keeps ignores in
+      # deny.toml instead.)
       - name: cargo audit
         run: cargo audit
       - name: cargo deny check licenses

@@ -6,9 +6,8 @@
 useDefault = true
 
 [allowlist]
-description = "Non-secret artifacts: SBOMs, lockfiles, vendored hashes, test/benchmark fixtures, and verified example values."
+description = "Non-secret artifacts: lockfiles, vendored hashes, test/benchmark fixtures, and verified example values."
 paths = [
-  '''sbom/.*''',
   '''.*\.lock$''',
   '''.*package-lock\.json$''',
   '''pnpm-lock\.yaml$''',
@@ -17,11 +16,14 @@ paths = [
   '''(^|/)benchmarks/''',
   '''crates/.*/(tests|benches)/''',
 ]
-# Verified non-secret strings that appear in production source. Kept narrow
+# Verified non-secret strings that appear in the read-only upstream-python/
+# mirror (kept here since gitleaks scans the whole working tree). Kept narrow
 # (exact tokens) so a genuine secret in these files would still be caught.
+# FINDING-044: dropped the dead `sbom/.*` path (no sbom dir in tree) and
+# fixed the stale `headroom/...` prefixes to `upstream-python/headroom/...`.
 regexes = [
-  '''eyJhbGciOiJIUzI1NiIs''',   # example JWT header prefix in a docstring (headroom/config.py)
-  '''sk-ant-dummy''',           # documented placeholder key in the CLI banner (headroom/cli/proxy.py)
-  '''ANTHROPIC_API_KEY=''',     # env-var NAME shown in CLI help text (headroom/cli/proxy.py)
+  '''eyJhbGciOiJIUzI1NiIs''',   # example JWT header prefix in a docstring (upstream-python/headroom/config.py)
+  '''sk-ant-dummy''',           # documented placeholder key in the CLI banner (upstream-python/headroom/cli/proxy.py)
+  '''ANTHROPIC_API_KEY=''',     # env-var NAME shown in CLI help text (upstream-python/headroom/cli/proxy.py)
   '''Iv1\.b507a08c87ecfe98''',  # GitHub Copilot PUBLIC OAuth client_id (not a secret)
 ]

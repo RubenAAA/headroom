@@ -73,10 +73,10 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 ## PR workflow
 
 1. Fork, branch from `main`.
-2. Install **Node 18+** and run `uv sync --extra dev` then `make install-git-hooks` — installs repo pre-commit checks on every commit, commitlint on every commit message, and ci-precheck on every push.
+2. Install the Rust toolchain via rustup (see `rust-toolchain.toml`) plus **Node 18+**, then run `make install-git-hooks` — installs repo pre-commit checks on every commit, commitlint on every commit message, and ci-precheck on every push.
 3. One logical change per PR.
 4. Add tests.
-5. `uv run pytest` · `uv run ruff check .` · `uv run ruff format .`
+5. `cargo test --workspace` · `cargo fmt --check` · `cargo clippy --workspace`
 6. Do **not** edit `CHANGELOG.md` — release-please generates it from your Conventional Commit PR title, so a clear `fix(...)`/`feat(...)` title *is* your changelog entry. A CI guard rejects manual edits.
 7. Open the PR with a clear description + `Real behavior proof` + any spec/justification required, and keep the PR in draft until the `Review Readiness` boxes are complete.
 
@@ -89,18 +89,13 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 ## Development setup
 
 ```bash
-git clone https://github.com/headroomlabs-ai/headroom.git
+git clone https://github.com/RubenAAA/headroom.git
 cd headroom
-python -m venv .venv && source .venv/bin/activate
-node --version  # Node 18+ required for commitlint hooks
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev,relevance,proxy]"
-python -m pytest
+cargo build -p headroom-proxy
+cargo test --workspace
 ```
 
-Headroom uses a `pyproject.toml`/`maturin` build backend. Older `pip`
-versions may fail editable installs by looking for `setup.py`; upgrade `pip`
-first or use `uv sync --extra dev`.
+The workspace is Cargo (`Cargo.toml`; crates in `crates/`: `headroom-core`, `headroom-proxy`, `headroom-simulators`, `headroom-parity`). Useful `make` targets: `make test`, `make test-parity`, `make fmt`, `make fmt-check`, `make build-proxy`, `make install-proxy`, `make ci-precheck`. The old Python package lives in the read-only `upstream-python/` mirror and is not built here.
 
 ### Dev Containers
 
@@ -109,7 +104,7 @@ Two configs ship for VS Code / Codespaces:
 - **`.devcontainer/devcontainer.json`** — Python 3.12, `uv`, Node.js, `gh`.
 - **`.devcontainer/memory-stack/devcontainer.json`** — adds Qdrant + Neo4j sidecars (use `qdrant:6333`, `neo4j://neo4j:7687`).
 
-Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
+Inside, use: `cargo test --workspace`, `cargo fmt --check`, etc.
 
 ## Optional automated review
 
@@ -119,10 +114,9 @@ Enable or disable automatic Copilot review in **Settings → Rules → Rulesets 
 
 ## Coding standards
 
-- [Ruff](https://github.com/astral-sh/ruff) for lint + format, line length 100, PEP 8.
-- Type hints on public functions; Google-style docstrings.
+- `cargo fmt` for format, `cargo clippy --workspace` for lint. Fix new warnings before opening the PR.
 - Cover new behavior + edge cases; aim >80% coverage on new code.
-- Python 3.10+. Optional features go behind extras.
+- Match surrounding style; keep changes surgical (see `AGENTS.md`).
 
 ## Architecture principles
 
