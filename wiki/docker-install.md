@@ -1,5 +1,8 @@
 # Docker-Native Install
 
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
+
 Run Headroom without installing Python or Node.js on the host. The install scripts add a native `headroom` wrapper that keeps **Headroom itself** in Docker while orchestrating the rest of your workflow on the host OS.
 
 ## One-line install

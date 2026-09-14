@@ -1,5 +1,8 @@
 # Transform Reference
 
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
+
 Headroom provides several transforms that work together to optimize LLM context.
 
 ## SmartCrusher

@@ -1,5 +1,8 @@
 # Text Compression Utilities
 
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
+
 For coding tasks, Headroom provides **standalone text compression utilities** that applications can use explicitly. These are **opt-in** — they're not applied automatically, giving you full control over when and how to compress text content.
 
 > **Design Philosophy**: SmartCrusher compresses JSON automatically because it's structure-preserving and safe. Text compression is lossy and context-dependent, so applications should decide when to use it.

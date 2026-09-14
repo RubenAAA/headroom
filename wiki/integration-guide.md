@@ -1,352 +1,96 @@
 # Integration Guide
 
-You don't need to run the Headroom proxy. Headroom is a compression library that works with **any** LLM client, proxy, or framework.
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
 
-## Pick Your Path
+Three ways to put Headroom in the request path. Pick one; they are alternatives, not layers.
 
-| You have... | Use this | Setup |
-|-------------|----------|-------|
-| Any Python app | [`compress()`](#compress-function) | 2 lines |
-| LiteLLM | [LiteLLM callback](#litellm) | 1 line |
-| A Python proxy (FastAPI, custom) | [ASGI middleware](#asgi-middleware) | 1 line |
-| Claude Code / Cursor / Copilot CLI | [Headroom proxy](#proxy) | 1 command or env var |
-| Agno agents | [Agno integration](#agno) | Wrap model |
-| LangChain | [LangChain integration](#langchain) | Wrap model |
-| Non-Python app | [Headroom proxy](#proxy) | HTTP |
-| TypeScript SDK | [`compress()`](#typescript-sdk) | `npm install headroom-ai` |
-| Vercel AI SDK | [`headroomMiddleware()`](#typescript-sdk) | Middleware adapter |
-| OpenAI Node SDK | [`withHeadroom()`](#typescript-sdk) | Client wrapper |
-| Anthropic TS SDK | [`withHeadroom()`](#typescript-sdk) | Client wrapper |
+| You have... | Use this | Details |
+|-------------|----------|---------|
+| Claude Code, Cursor, or any tool that takes a base URL | [Proxy](#1-proxy-start-here) — Rust binary | Point `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` at it |
+| Your own Python app where you own the client object | [SDK mirror](#2-sdk-mirror-in-process-python-and-typescript) — `upstream-python/` | [SDK Guide](sdk.md), [TypeScript SDK](typescript-sdk.md) |
+| An API gateway (e.g. LiteLLM proxy) that should call Headroom over HTTP | [Gateway sidecar](#3-gateway-sidecar-over-http-mirror-only) — mirror-only `POST /v1/compress` | See below; loopback-only by default |
 
 ---
 
-## compress() Function
+## 1. Proxy (start here)
 
-The simplest integration. Works with any LLM client.
-
-```python
-from headroom import compress
-
-# Before sending to your LLM:
-result = compress(messages, model="claude-sonnet-4-5-20250929")
-response = your_client.create(messages=result.messages)  # Fewer tokens, same answer
-
-print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
-```
-
-### With Anthropic SDK
-
-```python
-from anthropic import Anthropic
-from headroom import compress
-
-client = Anthropic()
-messages = [
-    {"role": "user", "content": "What went wrong?"},
-    {"role": "assistant", "content": "Let me check.", "tool_use": [...]},
-    {"role": "user", "content": [{"type": "tool_result", "content": huge_json}]},
-]
-
-compressed = compress(messages, model="claude-sonnet-4-5-20250929")
-response = client.messages.create(
-    model="claude-sonnet-4-5-20250929",
-    messages=compressed.messages,
-    max_tokens=1000,
-)
-```
-
-### With OpenAI SDK
-
-```python
-from openai import OpenAI
-from headroom import compress
-
-client = OpenAI()
-messages = [
-    {"role": "user", "content": "Analyze these results"},
-    {"role": "tool", "content": big_json_output, "tool_call_id": "call_1"},
-]
-
-compressed = compress(messages, model="gpt-4o")
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=compressed.messages,
-)
-```
-
-### With LiteLLM (direct)
-
-```python
-import litellm
-from headroom import compress
-
-messages = [...]
-compressed = compress(messages, model="bedrock/claude-sonnet")
-response = litellm.completion(model="bedrock/claude-sonnet", messages=compressed.messages)
-```
-
-### With any HTTP client
-
-```python
-import httpx
-from headroom import compress
-
-compressed = compress(messages, model="claude-sonnet-4-5-20250929")
-httpx.post(
-    "https://api.anthropic.com/v1/messages",
-    json={
-        "model": "claude-sonnet-4-5-20250929",
-        "messages": compressed.messages,
-    },
-    headers={"X-Api-Key": api_key, "anthropic-version": "2023-06-01"},
-)
-```
-
-### What compress() returns
-
-```python
-result = compress(messages, model="gpt-4o")
-result.messages  # list[dict] — compressed messages, same format as input
-result.tokens_before  # int — original token count
-result.tokens_after  # int — compressed token count
-result.tokens_saved  # int — tokens removed
-result.compression_ratio  # float — 0.0 (no savings) to 1.0 (100% removed)
-result.transforms_applied  # list[str] — what ran (e.g., ["router:smart_crusher:0.35"])
-```
-
----
-
-## LiteLLM
-
-If you're already using LiteLLM as your LLM gateway, add Headroom as a callback:
-
-```python
-import litellm
-from headroom.integrations.litellm_callback import HeadroomCallback
-
-litellm.callbacks = [HeadroomCallback()]
-
-# All calls now compressed automatically
-response = litellm.completion(model="gpt-4o", messages=[...])
-response = litellm.completion(model="bedrock/claude-sonnet", messages=[...])
-response = litellm.completion(model="azure/gpt-4o", messages=[...])
-```
-
-The callback compresses messages in LiteLLM's `pre_call_hook` before they're sent to the provider. Works with all 100+ LiteLLM-supported providers.
-
-### With LiteLLM Proxy
-
-If you run LiteLLM as a proxy server, use the ASGI middleware instead:
-
-```python
-# In your LiteLLM proxy startup
-from litellm.proxy.proxy_server import app
-from headroom.integrations.asgi import CompressionMiddleware
-
-app.add_middleware(CompressionMiddleware)
-```
-
-Or use the callback in your LiteLLM config:
-
-```yaml
-# litellm_config.yaml
-litellm_settings:
-  callbacks: ["headroom.integrations.litellm_callback.HeadroomCallback"]
-```
-
----
-
-## ASGI Middleware
-
-Drop-in middleware for any ASGI application (FastAPI, Starlette, LiteLLM proxy, custom proxies).
-
-```python
-from headroom.integrations.asgi import CompressionMiddleware
-
-# FastAPI
-app = FastAPI()
-app.add_middleware(CompressionMiddleware)
-
-# Starlette
-app = Starlette(routes=[...])
-app.add_middleware(CompressionMiddleware)
-
-# LiteLLM proxy
-from litellm.proxy.proxy_server import app
-
-app.add_middleware(CompressionMiddleware)
-```
-
-The middleware intercepts POST requests to `/v1/messages`, `/v1/chat/completions`, `/v1/responses`, and `/chat/completions`. All other requests pass through untouched.
-
-Response headers include:
-- `x-headroom-compressed: true` — compression was applied
-- `x-headroom-tokens-saved: 1234` — tokens removed
-
----
-
-## Proxy
-
-The Headroom proxy is a standalone HTTP server. Best for non-Python apps or tools that only support base URL configuration (Claude Code, Cursor, GitHub Copilot CLI).
+Run the Rust binary in front of your existing tool. No code changes: the tool keeps speaking its native API and the proxy compresses before forwarding upstream.
 
 ```bash
-pip install "headroom-ai[all]"
-headroom proxy --port 8787
-```
+# Preferred: launcher starts the proxy if down, sets ANTHROPIC_BASE_URL, execs claude
+cclaude
 
-```bash
-# Claude Code
+# By hand: the binary takes --upstream plus --listen
+headroom-proxy --upstream https://api.anthropic.com --listen 127.0.0.1:8787
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
-
-# GitHub Copilot CLI
-headroom wrap copilot -- --model claude-sonnet-4-20250514
-
-# Cursor / Any OpenAI client
-OPENAI_BASE_URL=http://localhost:8787/v1 cursor
 ```
 
-For translated backends, the Copilot wrapper can switch to Headroom's OpenAI-compatible route:
+OpenAI-compatible clients use the `/v1` route on the same port:
 
 ```bash
-headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
+OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 ```
 
-For Copilot's **hosted** API (`--subscription` and the implicit OAuth path), Headroom routes to the generic host `https://api.githubcopilot.com`, which serves the full model set. **Enterprise / data-residency** tenants on a dedicated Copilot host pin it with `GITHUB_COPILOT_API_URL` (e.g. `export GITHUB_COPILOT_API_URL=https://api.<your-host>.githubcopilot.com`); the override flows through to the upstream request. See [`TESTING-copilot-subscription.md`](https://github.com/headroomlabs-ai/headroom/blob/main/TESTING-copilot-subscription.md).
+!!! warning "Always `cclaude`, never bare `claude`"
+    Plain `claude` talks straight to the API and the proxy does nothing. `cclaude` starts the proxy if it is down, sets `ANTHROPIC_BASE_URL`, and execs `claude` with every argument passed through.
 
-### With Cloud Providers
+What the proxy accepts (all verified in `crates/headroom-proxy/src/proxy.rs`):
+
+- `POST /v1/messages` — Anthropic format
+- `POST /v1/chat/completions` — OpenAI format
+- `POST /v1/responses` — OpenAI Responses API format
+
+Health checks:
 
 ```bash
-# AWS Bedrock
-headroom proxy --backend bedrock --region us-east-1
-
-# Google Vertex AI
-headroom proxy --backend vertex_ai --region us-central1
-
-# Azure OpenAI
-headroom proxy --backend azure
-
-# OpenRouter (400+ models)
-OPENROUTER_API_KEY=sk-or-... headroom proxy --backend openrouter
+curl -s localhost:8787/healthz
+curl -s localhost:8787/cache-health
 ```
 
-See [Proxy Documentation](proxy.md) for all options.
+See [Proxy](proxy.md) for operations and [Metrics](metrics.md) for `/metrics` and savings endpoints. Model-to-upstream routing rules (`ModelRoute`: per-model `upstream` with `translate` / `target_model`) exist for routed deployments; that is operator config on the same binary, covered at a high level in [Proxy](proxy.md).
 
 ---
 
-## Agno
+## 2. SDK mirror (in-process Python and TypeScript)
 
-Full integration with the Agno agent framework.
+!!! note "Read-only mirror"
+    Everything in this section lives in `upstream-python/` and is not built here. It exists so upstream diffs stay readable when porting. Do not treat it as the live path.
 
-```python
-from agno.agent import Agent
-from agno.models.anthropic import Claude
-from headroom.integrations.agno import HeadroomAgnoModel
+If you own the client object and want compression inside your process, use the mirror SDK instead of running a proxy:
 
-model = HeadroomAgnoModel(Claude(id="claude-sonnet-4-20250514"))
-agent = Agent(model=model, tools=[your_tools])
-response = agent.run("Investigate the issue")
+- Python: wrap your client — [SDK Guide](sdk.md)
+- TypeScript: `headroom-ai` npm package — [TypeScript SDK](typescript-sdk.md)
+- Agent frameworks: [Agno](agno.md), [LangChain](langchain.md)
+- LiteLLM in-process: `HeadroomCallback` (`upstream-python/headroom/integrations/litellm_callback.py`, via `async_pre_call_hook`) or the ASGI middleware (`upstream-python/headroom/integrations/asgi.py`, intercepts `/v1/messages`, `/v1/chat/completions`, `/v1/responses`, `/chat/completions`)
 
-print(f"Tokens saved: {model.total_tokens_saved}")
-```
+This page does not duplicate those guides; follow the links above for API detail.
 
-See [Agno Guide](agno.md) for hooks, multi-provider, and streaming.
+!!! note "Mirror-only CLI flags"
+    `headroom proxy --backend ...`, `headroom wrap copilot`, and `--backend anyllm`-style options you may see in older docs are Python-mirror CLI surface (`upstream-python/headroom/cli/`). There is no `--backend` on the Rust-live path — the Rust proxy routes with `--upstream` plus route flags.
 
----
+### Copilot subscription note (mirror CLI)
 
-## LangChain
-
-Full integration with LangChain — chat models, memory, retrievers, tool wrappers, and streaming.
-
-```python
-from langchain_openai import ChatOpenAI
-from headroom.integrations import HeadroomChatModel
-
-llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"))
-response = llm.invoke("Hello!")
-```
-
-See [LangChain Guide](langchain.md) for details and known limitations.
+The mirror's `headroom wrap copilot --subscription` flow routes wrapped Copilot traffic through the proxy to GitHub's generic public host, with `GITHUB_COPILOT_API_URL` as the explicit pin for Enterprise / data-residency tenants on a dedicated Copilot host. Test flows and host details live in [testing-copilot-subscription](../docs/notes/testing-copilot-subscription.md).
 
 ---
 
-## TypeScript SDK
+## 3. Gateway sidecar over HTTP (mirror-only)
 
-For Node.js, Next.js, and any TypeScript/JavaScript application.
+!!! warning "Not on the Rust proxy"
+    `POST /v1/compress` exists only on the Python mirror (`upstream-python/headroom/proxy/server.py`). The Rust binary has no `/v1/compress` route — verified by the route table in `crates/headroom-proxy/src/proxy.rs`. Anything below that calls this endpoint assumes the mirror proxy is running.
+
+The mirror proxy exposes a compression-only endpoint: it returns compressed `messages` without ever making a completion request to an LLM provider (no generation, no provider key). The mirror's own code comments name LiteLLM's `headroom` guardrail as the main consumer, and the TypeScript SDK calls it (`upstream-python/sdk/typescript/src/client.ts`).
+
+**Loopback-only by default.** Non-loopback callers get `404`, not `403`. Gateways on another host must opt in:
 
 ```bash
-npm install headroom-ai
+HEADROOM_COMPRESS_ALLOW_REMOTE=1 headroom proxy
 ```
 
-See the [TypeScript SDK Guide](typescript-sdk.md) for full documentation including Vercel AI SDK middleware, OpenAI SDK wrapper, and Anthropic SDK wrapper.
+Two things to get right when calling it from a gateway:
 
----
+1. Send the real model name (including gateway-prefixed forms such as `bedrock/anthropic.claude-3-5-sonnet`) — it selects the tokenizer and context limit.
+2. For multi-turn loops, forward the previously returned messages (not pristine originals) and pin the cached prefix with `config.frozen_message_count`; otherwise re-compression diverges from what the provider cached. Full field contract is in [Proxy](proxy.md).
 
-## OpenClaw
-
-Context compression plugin for [OpenClaw](https://github.com/openclaw/openclaw) agents.
-
-```bash
-headroom wrap openclaw
-```
-
-Configure as context engine:
-```json
-{ "plugins": { "slots": { "contextEngine": "headroom" } } }
-```
-
-Manual install remains available when you are not using the CLI wrapper:
-
-```bash
-pip install "headroom-ai[proxy]"
-openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
-```
-
-The plugin auto-detects a running Headroom proxy or starts one. Compression happens in `assemble()` — zero changes to the agent's behavior.
-
-See the [OpenClaw plugin documentation](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/openclaw) for full setup.
-
----
-
-## Compression Hooks (Advanced)
-
-Customize compression behavior without modifying Headroom's code:
-
-```python
-from headroom import compress, CompressionHooks, CompressContext
-
-
-class MyHooks(CompressionHooks):
-    def pre_compress(self, messages, ctx):
-        # Modify messages before compression (dedup, filter, inject)
-        return messages
-
-    def compute_biases(self, messages, ctx):
-        # Per-message compression aggressiveness
-        # >1.0 = keep more, <1.0 = compress more
-        return {5: 1.5, 6: 0.5}  # Keep message 5, compress message 6
-
-    def post_compress(self, event):
-        # Observe results (logging, analytics, learning)
-        print(f"Saved {event.tokens_saved} tokens")
-
-
-result = compress(messages, model="gpt-4o", hooks=MyHooks())
-```
-
-See [Architecture](ARCHITECTURE.md) for how hooks integrate with the pipeline.
-
----
-
-## FAQ
-
-**Q: Does Headroom change the response format?**
-No. Your LLM returns the same response format. Headroom only modifies the input messages.
-
-**Q: What if compression removes something the LLM needs?**
-Headroom stores originals in CCR (Compress-Cache-Retrieve). The LLM can call `headroom_retrieve` to get full uncompressed content. Compression summaries tell the LLM what's available.
-
-**Q: Does it work with streaming?**
-Yes. Compression happens before the request is sent. Streaming responses are unaffected.
-
-**Q: How much latency does it add?**
-15-200ms depending on content size and type. Small JSON arrays take ~15ms, large tool outputs take 100-200ms. The token savings typically save far more time on the LLM side than compression adds — a 50% token reduction on a Sonnet call saves seconds of generation time. See [Latency Benchmarks](LATENCY_BENCHMARKS.md) for real numbers.
+Leave `config.mode` unset unless you also run the retrieval path: `ccr` mode emits markers that dangle without the `headroom_retrieve` tool.

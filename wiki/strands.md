@@ -1,5 +1,8 @@
 # Strands Integration
 
+!!! note "Python SDK mirror"
+    This page documents the Python SDK, which now lives in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. The production proxy itself is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`).
+
 Headroom integrates with [Strands Agents](https://github.com/strands-agents/sdk-python) to provide automatic context optimization. Two integration patterns: wrap the model, or hook into tool calls.
 
 ---

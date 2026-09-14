@@ -1,950 +1,403 @@
 # CLI Reference
 
-This page is the authoritative reference for the **Python Headroom CLI** exposed by the `headroom` console script.
+!!! note "Live implementation: Rust"
+    The production CLI is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
 
-> **Audit note (2026-09-02):** `headroom --help` on this branch lists 30 top-level
-> commands; this page documents 15 of them and omits `agent-savings`,
-> `audit-reads`, `capture`, `copilot-auth`, `dashboard`, `deploy`, `diff`,
-> `doctor`, `init`, `loc`, `output-savings`, `recover`, `rollout`, `savings`,
-> `sg`, `tools`, and `update` entirely. The `headroom proxy` and
-> `headroom install apply` option tables below are similarly stale — `proxy
-> --help` alone now runs to ~90 options vs. the ~30 documented here. Treat the
-> command list and captured `--help` blocks in this file as historical
-> snapshots, not current reference; verify against `headroom <cmd> --help`
-> before relying on any option in this file. See the audit report for detail.
+This page is the authoritative reference for the **Rust CLIs built in this repo**:
+
+- `headroom` — context-mode client plus local analysis/report commands
+  (`crates/headroom-proxy/src/bin/headroom_cli.rs`).
+- `headroom-proxy` — the transparent reverse proxy
+  (`crates/headroom-proxy/src/main.rs`, options defined in
+  `crates/headroom-proxy/src/config.rs` as `CliArgs`).
+
+Verify anything here against the built binaries:
+
+```bash
+./target/release/headroom --help
+./target/release/headroom <command> --help
+./target/release/headroom <group> <subcommand> --help
+./target/release/headroom-proxy --help
+```
+
+The Python `headroom` console script (`python -m headroom.cli`) is **not**
+built here. It lives in the read-only `upstream-python/` mirror
+(`upstream-python/headroom/cli/`). Python-only command paths are listed under
+[Python-only paths removed](#python-only-paths-removed-from-this-page) and are
+otherwise not documented on this page.
 
 ## Global behavior
 
 ### Entry points
 
-- Console script: `headroom`
-- Python module entrypoint: `python -m headroom.cli`
+| Entry point | Source | Purpose |
+|---|---|---|
+| `headroom` | `crates/headroom-proxy/src/bin/headroom_cli.rs` | Context-mode operations (`ctx`), savings/perf/doctor reports, bundled-tool passthroughs |
+| `headroom-proxy` | `crates/headroom-proxy/src/main.rs` | Run the transparent reverse proxy |
+| `python -m headroom.cli` | `upstream-python/headroom/cli/main.py` (mirror only) | Legacy Python CLI; not built or installed from this tree |
 
 ### Global options
 
-| Option | Scope | Meaning |
-|---|---|---|
-| `--help`, `-?` | root, groups, commands | Show help and exit |
-| `--version`, `-v` | root only | Show the Headroom version and exit |
+`headroom` has one global flag plus help. It takes no `--version` flag
+(`headroom --version` errors); the proxy reports its own version.
 
-> `-v` is a **root-level version alias**. Inside subcommands such as `headroom wrap claude -v`, `-v` keeps its subcommand meaning (`--verbose`), not version.
+| Option | Scope | Default | Meaning |
+|---|---|---|---|
+| `--proxy-url <URL>` | `headroom` root (inherited by `ctx` subcommands) | `http://127.0.0.1:8787` (env: `HEADROOM_PROXY_URL`) | Proxy base URL for `ctx search/get/index/fetch/stats` and the `doctor` health probe |
+| `-h`, `--help` | `headroom` root, groups, commands; `headroom-proxy` | — | Show help and exit |
+| `-V`, `--version` | `headroom-proxy` only | — | Show the proxy version and exit (currently `0.1.0`) |
+
+There is no `-?` help alias and no root `-v`/`--version` on `headroom`.
+There is no `headroom proxy` subcommand: the proxy is the separate
+`headroom-proxy` binary and requires `--upstream`.
 
 ## Command index
 
-| Command | Purpose | Docker-native parity |
+All `headroom` top-level commands (from `headroom --help` on the built binary):
+
+| Command | Purpose | Needs proxy? |
 |---|---|---|
-| `headroom install ...` | Install and manage persistent deployments | **python-native; Docker-native wrapper supports `persistent-docker` lifecycle subset** |
-| `headroom proxy` | Run the Headroom proxy server | **native in container** |
-| `headroom learn` | Learn from past tool-call failures | **native in container** |
-| `headroom perf` | Summarize recent proxy performance | **native in container** |
-| `headroom inspect` | Show original vs compressed content for recent requests | **native in container** |
-| `headroom evals ...` | Run memory evaluation workflows | **native in container** |
-| `headroom memory ...` | Inspect and manage stored memories | **native in container** |
-| `headroom mcp ...` | Install, inspect, remove, or serve MCP integration | **native in container** |
-| `headroom wrap claude` | Start proxy and launch Claude Code | **host-bridged** |
-| `headroom wrap copilot` | Start proxy and launch GitHub Copilot CLI | **python-native only** |
-| `headroom wrap codex` | Start proxy and launch Codex CLI | **host-bridged** |
-| `headroom wrap aider` | Start proxy and launch Aider | **host-bridged** |
-| `headroom wrap cursor` | Start proxy and print Cursor config guidance | **host-bridged** |
-| `headroom wrap openclaw` | Install and configure the OpenClaw plugin | **host-bridged** |
-| `headroom unwrap openclaw` | Disable the Headroom OpenClaw plugin | **host-bridged** |
+| `headroom ctx ...` | Context-mode operations: search/get/index/fetch/stats | yes (except `ctx index -` reads stdin locally, then POSTs) |
+| `headroom agent-savings` | Render or verify Codex/Claude/Cursor token-savings settings | only with `--check-perf` |
+| `headroom capture ...` | Capture/network-diff investigation tooling | no |
+| `headroom copilot-auth ...` | Manage Headroom's GitHub Copilot OAuth token | no |
+| `headroom output-savings` | Show estimated/measured output-token reduction from the shaper | no (reads the ledger from disk) |
+| `headroom perf` | Analyze proxy performance from logs | no (reads log files) |
+| `headroom doctor` | Reduced Rust health check for proxy liveness and local ledgers | probes proxy, exits non-zero when unreachable |
+| `headroom savings` | Show durable compression savings over time | no (reads the ledger from disk) |
+| `headroom sg ...` | Run ast-grep (AST-aware structural search/replace, passthrough) | no |
+| `headroom diff ...` | Run difftastic (structural diff, passthrough) | no |
+| `headroom loc ...` | Run scc (fast lines-of-code / repo-shape probe, passthrough) | no |
+| `headroom tools ...` | Manage bundled CLI tool binaries (`list`/`doctor`/`install`) | no |
 
 ## Captured `--help` output
 
-The sections below capture the current top-level help output from the live CLI.
-
-### `headroom --help`
+Captured from the built Rust binary (`./target/release/headroom --help`):
 
 ```text
-Usage: headroom [OPTIONS] COMMAND [ARGS]...
+Headroom context-mode CLI
 
-  Headroom - The Context Optimization Layer for LLM Applications.
+Usage: headroom [OPTIONS] <COMMAND>
 
-  Manage memories, run the optimization proxy, and analyze metrics.
-
-  Examples:
-      headroom proxy              Start the optimization proxy
-      headroom memory list        List stored memories
-      headroom memory stats       Show memory statistics
-      headroom update             Update Headroom to the latest release
+Commands:
+  ctx             Context-mode operations
+  agent-savings   Render or verify Codex/Claude/Cursor token-savings settings
+  capture         Capture and compare network traffic for Headroom investigations
+  copilot-auth    Manage Headroom's GitHub Copilot OAuth token
+  output-savings  Show estimated/measured output-token reduction from the shaper
+  perf            Analyze proxy performance from logs
+  doctor          Run a reduced Rust health check for proxy liveness and local ledgers
+  savings         Show durable compression savings over time
+  sg              Run ast-grep (AST-aware structural search/replace)
+  diff            Run difftastic (structural diff)
+  loc             Run scc (fast lines-of-code / repo-shape probe)
+  tools           Manage bundled CLI tool binaries
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -v, --version  Show the version and exit.
-  -?, --help     Show this message and exit.
-
-Commands:
-  agent-savings   Render or verify Codex/Claude/Cursor token-savings...
-  audit-reads     Audit Read-tool traffic for compression opportunities.
-  capture         Capture and compare network traffic for Headroom...
-  copilot-auth    Manage Headroom's GitHub Copilot OAuth token.
-  dashboard       Open the Headroom savings dashboard in your browser.
-  deploy          Deploy a turnkey local Headroom proxy and configure...
-  diff            Run difftastic (structural diff).
-  doctor          Check that the Headroom proxy and client routing are...
-  evals           Evaluation commands (memory, compression robustness,...
-  init            Install durable Headroom integrations for supported...
-  inspect         Show original vs compressed content for recent proxy...
-  install         Install and manage persistent Headroom deployments.
-  learn           Learn from past tool call failures to prevent future ones.
-  loc             Run scc (fast lines-of-code / repo-shape probe).
-  mcp             MCP server for Claude Code integration.
-  memory          Manage memories stored in Headroom.
-  output-savings  Show estimated/measured output-token reduction from the...
-  perf            Analyze proxy performance from logs.
-  proxy           Start the optimization proxy server.
-  recover         Recover agent state left in a temporary Headroom home.
-  rollout         Inspect runtime feature-rollout policy (not package...
-  savings         Show durable compression savings over time.
-  sg              Run ast-grep (AST-aware structural search/replace).
-  tools           Manage bundled CLI tool binaries (ast-grep, difft, scc).
-  unwrap          Undo durable Headroom wrapping for supported tools.
-  update          Update Headroom to the latest release.
-  wrap            Wrap CLI tools to run through Headroom.
+      --proxy-url <PROXY_URL>  Proxy URL (default: http://127.0.0.1:8787) [env: HEADROOM_PROXY_URL=] [default: http://127.0.0.1:8787]
+  -h, --help                   Print help
 ```
 
-Captured from `headroom --help` on this branch, 2026-09-02 (`headroom/cli/main.py`,
-per-command modules under `headroom/cli/`). None of `agent-savings`,
-`audit-reads`, `capture`, `copilot-auth`, `dashboard`, `deploy`, `diff`,
-`doctor`, `init`, `loc`, `output-savings`, `recover`, `rollout`, `savings`,
-`sg`, `tools`, or `update` is documented elsewhere in this file.
+## `headroom ctx`
 
-### Top-level command help snapshots
-
-<details>
-<summary><code>headroom proxy --help</code></summary>
-
-```text
-Usage: headroom proxy [OPTIONS]
-
-  Start the optimization proxy server.
-
-  Examples:
-      headroom proxy                    Start proxy on port 8787
-      headroom proxy --port 8080        Start proxy on port 8080
-      headroom proxy --no-optimize      Passthrough mode (no optimization)
-
-  Usage with Claude Code:
-      ANTHROPIC_BASE_URL=http://localhost:8787 claude
-
-  Usage with OpenAI-compatible clients:
-      OPENAI_BASE_URL=http://localhost:8787/v1 your-app
-```
-
-</details>
-
-<details>
-<summary><code>headroom learn --help</code></summary>
-
-```text
-Usage: headroom learn [OPTIONS]
-
-  Learn from past tool call failures to prevent future ones.
-```
-
-</details>
-
-<details>
-<summary><code>headroom perf --help</code></summary>
-
-```text
-Usage: headroom perf [OPTIONS]
-
-  Analyze proxy performance from logs.
-```
-
-</details>
-
-<details>
-<summary><code>headroom evals --help</code></summary>
-
-```text
-Usage: headroom evals [OPTIONS] COMMAND [ARGS]...
-
-  Memory evaluation commands.
-
-Commands:
-  memory     Run LoCoMo memory evaluation benchmark.
-  memory-v2  Run LoCoMo V2 evaluation with LLM-controlled memory tools.
-```
-
-</details>
-
-<details>
-<summary><code>headroom memory --help</code></summary>
-
-```text
-Usage: headroom memory [OPTIONS] COMMAND [ARGS]...
-
-  Manage memories stored in Headroom.
-
-Commands:
-  delete  Delete one or more memories by ID.
-  edit    Edit a memory's content or importance.
-  export  Export all memories to JSON.
-  import  Import memories from a JSON file.
-  list    List stored memories with optional filters.
-  prune   Prune memories matching specified criteria.
-  purge   Delete ALL memories from the database.
-  show    Show full details of a single memory.
-  stats   Show memory store statistics.
-```
-
-</details>
-
-<details>
-<summary><code>headroom mcp --help</code></summary>
-
-```text
-Usage: headroom mcp [OPTIONS] COMMAND [ARGS]...
-
-  MCP server for Claude Code integration.
-
-Commands:
-  install    Install Headroom MCP server into Claude Code config.
-  serve      Start the MCP server (called by Claude Code).
-  status     Check Headroom MCP configuration status.
-  uninstall  Remove Headroom MCP server from Claude Code config.
-```
-
-</details>
-
-<details>
-<summary><code>headroom install --help</code></summary>
-
-```text
-Usage: headroom install [OPTIONS] COMMAND [ARGS]...
-
-  Install and manage persistent Headroom deployments.
-
-Options:
-  -?, --help  Show this message and exit.
-
-Commands:
-  apply    Install a persistent Headroom deployment.
-  remove   Remove a persistent deployment and undo managed config.
-  restart  Restart a persistent deployment.
-  start    Start a persistent deployment.
-  status   Show persistent deployment status.
-  stop     Stop a persistent deployment.
-```
-
-</details>
-
-<details>
-<summary><code>headroom wrap --help</code></summary>
-
-```text
-Usage: headroom wrap [OPTIONS] COMMAND [ARGS]...
-
-  Wrap CLI tools to run through Headroom.
-
-Commands:
-  aider     Launch aider through Headroom proxy.
-  claude    Launch Claude Code through Headroom proxy.
-  copilot   Launch GitHub Copilot CLI through Headroom proxy.
-  codex     Launch OpenAI Codex CLI through Headroom proxy.
-  cursor    Start Headroom proxy for use with Cursor.
-  openclaw  Install and configure Headroom OpenClaw plugin in one command.
-```
-
-</details>
-
-<details>
-<summary><code>headroom unwrap --help</code></summary>
-
-```text
-Usage: headroom unwrap [OPTIONS] COMMAND [ARGS]...
-
-  Undo durable Headroom wrapping for supported tools.
-
-Commands:
-  openclaw  Disable the Headroom OpenClaw plugin and restore the legacy engine slot.
-```
-
-</details>
-
-## `headroom proxy`
-
-Start the optimization proxy server.
+Context-mode operations. Requires the proxy to run with `--ctx-offload`.
+The CLI sends the current working directory as `x-headroom-cwd` so search
+hits the project it was run from.
 
 ```bash
-headroom proxy
-headroom proxy --port 8787
-headroom proxy --mode cache
+headroom ctx search "<query>" --sort relevance
+headroom ctx get <hash>
+headroom ctx index <path>
+headroom ctx fetch https://example.com/page
+headroom ctx stats
+```
+
+| Subcommand | Arguments / options | Defaults | Meaning |
+|---|---|---|---|
+| `search <QUERY>` | `QUERY` (required); `--sort relevance\|timeline`; `--source <label>`; `--type code\|prose` | `--sort relevance`; `--source`/`--type` unset | Search the content index (`GET /ctx/search`) |
+| `get <HASH>` | `HASH` (required, blake3 hash) | — | Retrieve an offloaded original (`GET /ctx/get/<hash>`); prints content directly for piping |
+| `index <PATH>` | `PATH` (required, file path or `-` for stdin); `--label <label>` | `--label` defaults to filename (`stdin` for `-`) | Index content (`POST /ctx/index`) |
+| `fetch <URL>` | `URL` (required); `--source <label>`; `--force`; `--ttl <seconds>` | `--force` off; `--ttl`/`--source` unset (server applies its 86400s cache TTL) | Fetch a URL, convert to markdown, index (`POST /ctx/fetch`) |
+| `stats` | none | — | Show offload/search statistics (`GET /ctx/stats`) |
+
+All five subcommands honor the root `--proxy-url` / `HEADROOM_PROXY_URL`.
+
+See also: context-mode proxy flags (`--ctx-offload`, `--ctx-store-dir`,
+`--ctx-capture`) under [`headroom-proxy`](#headroom-proxy).
+
+## `headroom agent-savings`
+
+Render or verify Codex/Claude/Cursor token-savings settings
+(`crates/headroom-proxy/src/bin/headroom_cli/agent_savings.rs`).
+
+```bash
+headroom agent-savings
+headroom agent-savings --format json
+headroom agent-savings --check-perf --hours 24
+headroom agent-savings --check-perf --hours 0 --require-agents claude,codex,cursor --accuracy-report eval.json
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--host` | `127.0.0.1` | Host interface to bind |
-| `--port`, `-p` | `8787` | Port to bind |
-| `--mode` | runtime default | Optimization mode: `token`, `cache`, `token_mode`, `cache_mode`, `token_savings`, `cost_savings`, `token_headroom` |
-| `--no-optimize` | off | Disable optimization and operate in passthrough mode |
-| `--no-cache` | off | Disable semantic caching |
-| `--no-rate-limit` | off | Disable rate limiting |
-| `--retry-max-attempts` | runtime default `3` | Maximum upstream retry attempts |
-| `--request-timeout-seconds` | runtime default `300` | Request timeout in seconds |
-| `--connect-timeout-seconds` | runtime default `10` | Upstream connection timeout |
-| `--anthropic-pre-upstream-concurrency` | auto `max(2, min(8, cpu_count))` | Cap simultaneous pre-upstream work on `/v1/messages` (body read, deep copy, first compression stage, memory-context lookup, upstream connect). `0` or negative disables (unbounded); any positive integer is honoured verbatim. Prevents cold-start replay storms from starving `/livez`, `/readyz`, and new Codex WS opens. |
-| `--anthropic-pre-upstream-acquire-timeout-seconds` | `15.0` | Fail fast when the Anthropic pre-upstream queue is saturated. Requests that wait longer return `503` with `Retry-After` instead of parking indefinitely. |
-| `--anthropic-pre-upstream-memory-context-timeout-seconds` | `2.0` | Fail-open timeout for Anthropic memory-context lookup while the request still holds a pre-upstream slot. |
-| `--log-file` | unset | JSONL log output path |
-| `--budget` | unset | Daily USD budget limit |
-| `--no-code-aware` | off | Disable AST-aware code compression |
-| `--code-aware` | off | Enable code-aware compression in the proxy (env: HEADROOM_CODE_AWARE_ENABLED) |
-| `--no-read-lifecycle` | off | Disable stale/superseded read compression |
-| `--no-ccr` | off | Disable CCR entirely — no retrieval markers in content and no injected `headroom_retrieve` tool (lossy, no recovery path) |
-| `--no-ccr-proactive-expansion` | off | Disable proactive CCR context expansion |
-| `--memory` | off | Enable persistent user memory |
-| `--memory-db-path` | `""` | Override memory DB path (help text: `{cwd}/.headroom/memory.db`) |
-| `--no-memory-tools` | off | Disable automatic memory tool injection |
-| `--no-memory-context` | off | Disable automatic memory context injection |
-| `--memory-top-k` | `10` | Number of memories to inject |
-| `--learn` | off | Enable live traffic learning |
-| `--no-learn` | off | Explicitly disable traffic learning |
-| `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-*` |
-| `--anyllm-provider` | `openai` | Provider name for `anyllm` |
-| `--anthropic-api-url` | unset | Custom Anthropic passthrough API URL |
-| `--openai-api-url` | unset | Custom OpenAI passthrough API URL |
-| `--anthropic-extra-headers` | unset | JSON object of extra headers merged into (and overriding) forwarded Anthropic requests |
-| `--openai-extra-headers` | unset | JSON object of extra headers merged into (and overriding) forwarded OpenAI requests |
-| `--gemini-api-url` | unset | Custom Gemini passthrough API URL |
-| `--region` | `us-west-2` | Cloud region for Bedrock / Vertex / related backends |
-| `--bedrock-region` | unset | Deprecated Bedrock region override |
-| `--bedrock-profile` | unset | AWS profile name for Bedrock |
-| `--telemetry` | off | Opt in to anonymous usage telemetry (off by default) |
-| `--no-telemetry` | off | Force anonymous usage telemetry off (already the default) |
+| `--profile` | `agent-90` | Savings profile to render or check |
+| `--format` | `shell` (`shell`\|`json`) | Output format for the profile environment |
+| `--check-perf` | off | Check recent proxy logs against the profile savings target |
+| `--hours` | `24` (`0` = all data; must be `>= 0`) | Hours of proxy logs to inspect with `--check-perf` |
+| `--accuracy-report` | unset | Headroom eval JSON report proving accuracy preservation |
+| `--write-smoke-fixture` | unset | Write deterministic three-agent PERF/eval fixture into the given workspace dir |
+| `--require-agents` | `""` | Comma-separated clients that must each meet the savings target |
+| `--min-accuracy` | `0.9` | Minimum accepted accuracy preservation rate |
 
-Notes:
+Without `--check-perf`/`--accuracy-report`/`--write-smoke-fixture`, the command
+renders the profile environment (`export KEY="value"` per line, or sorted
+pretty JSON with `--format json`).
 
-- `--learn` implies memory unless `--no-learn` is also set.
-- Proxy startup can also read environment variables such as `HEADROOM_HOST`, `HEADROOM_PORT`, `HEADROOM_BUDGET`, `HEADROOM_MODE`, `HEADROOM_ANYLLM_PROVIDER`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS`, `HEADROOM_REQUEST_TIMEOUT`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS`, `ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, `GEMINI_TARGET_API_URL`, `ANTHROPIC_TARGET_API_HEADERS`, and `OPENAI_TARGET_API_HEADERS`. CLI flags take precedence over environment variables.
-- The default Anthropic pre-upstream cap is intentionally conservative for CPU/ONNX-heavy work. Larger containers may want to raise it after checking the resolved runtime values on `/readyz` or `/debug/warmup`.
+## `headroom capture`
 
-See also: [Proxy Server](proxy.md), [Configuration](configuration.md)
-
-## `headroom learn`
-
-Learn from past tool-call failures and produce agent guidance.
+Capture and compare network traffic for Headroom investigations. The only
+subcommand is `network-diff`
+(`crates/headroom-proxy/src/bin/headroom_cli/network_diff.rs`).
 
 ```bash
-headroom learn
-headroom learn --apply
-headroom learn --agent codex --all
+headroom capture network-diff --direct direct.jsonl --headroom proxied.jsonl
+headroom capture network-diff --direct a.jsonl --headroom b.jsonl --output report.md --json-output diff.json
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--project` | current project resolution | Target project path |
-| `--all` | off | Analyze all discovered projects |
-| `--apply` | off | Write recommendations instead of dry-run output |
-| `--agent` | `auto` | Agent source: `auto`, built-ins (`claude`, `codex`, `gemini`), or plugin-provided names |
-| `--model` | auto-detect | LLM model used for analysis |
+| `--direct` | required | JSONL capture from the direct Claude Code lane |
+| `--headroom` | required | JSONL capture from the Headroom-proxied Claude Code lane |
+| `--output` | stdout | Write a Markdown report to this path |
+| `--json-output` | unset | Optional machine-readable JSON diff output path |
+| `--pair-by` | `path` (`path`\|`route`) | Pair exchanges by method+path or by method+host+path |
 
-Notes:
+## `headroom copilot-auth`
 
-- `--agent auto` scans all detected agent data sources.
-- If `--project` is omitted, Headroom resolves from the current directory upward.
-- External agent integrations register through the `headroom.learn_plugin` entry point.
+Manage Headroom's GitHub Copilot OAuth token
+(`crates/headroom-proxy/src/bin/headroom_cli/copilot_auth.rs`).
 
-See also: [Failure Learning](learn.md)
+```bash
+headroom copilot-auth login
+headroom copilot-auth login --domain github.com
+headroom copilot-auth status
+```
+
+| Subcommand | Options | Meaning |
+|---|---|---|
+| `login` | `--domain` (default `github.com`) | Sign in with GitHub's Copilot OAuth device-code flow; prints the verification URI and code, then saves the token |
+| `status` | none | Show the auth file path and whether a token is saved (with fingerprint) |
+
+`login --domain` accepts a custom hostname only for GitHub Enterprise Server;
+use `github.com` for GitHub.com / Enterprise Cloud.
+
+## `headroom output-savings`
+
+Show estimated/measured output-token reduction from the shaper. Takes no
+options.
+
+```bash
+headroom output-savings
+```
+
+Reads the shaper savings ledger from disk (no proxy needed). When the ledger
+path does not exist it prints the seed hint (`learn --verbosity --apply`, then
+`HEADROOM_OUTPUT_SHAPER=1`). The active verbosity level resolves from
+`HEADROOM_OUTPUT_SHAPER` + `HEADROOM_VERBOSITY_LEVEL` (default `2` when the
+shaper is on, clamped to `0..=4`); a level with no measured factors renders the
+honest empty state rather than a guess. A modelled band is labelled `(range …)`,
+not a CI; measured/estimated tiers report a `95% CI`.
 
 ## `headroom perf`
 
-Summarize recent proxy performance from the local proxy log.
+Analyze proxy performance from logs.
 
 ```bash
 headroom perf
 headroom perf --hours 24
 headroom perf --raw
+headroom perf --format json
+headroom perf --raw --format csv
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--hours` | `168.0` | Time window in hours |
-| `--raw` | off | Print raw PERF records instead of the summarized report |
+| `--hours` | `168` (`0` = all data; must be `>= 0`) | Analyze logs from the last N hours (168 = 7 days) |
+| `--raw` | off | Show raw PERF records instead of the summarized report |
+| `--format` | `text` (`text`\|`json`\|`csv`) | Output format; `json`/`csv` emit machine-readable data |
 
-The command reads each per-port runtime log
-`${HEADROOM_WORKSPACE_DIR}/logs/proxy-<port>.log` (defaults to
-`~/.headroom/logs/`) plus PID-qualified files from multi-worker deployments,
-aggregating them while still reading a legacy `proxy.log` when present — see the
-[Filesystem Contract](filesystem-contract.md)).
+`--format csv` emits the PERF record table for `--raw`, else the per-model
+breakdown. With no records, the text report tells you to run the proxy first.
 
-## `headroom inspect`
+## `headroom doctor`
 
-Show the original vs compressed content for recent requests so you can *see*
-what the compressor changed (not just the token counts). Useful for building
-trust in compression and debugging quality regressions.
+Run a reduced Rust health check for proxy liveness and local ledgers. This is
+intentionally narrower than the legacy Python `doctor`: it checks proxy
+reachability plus workspace/config/ledger/auth paths, not installer manifests
+or per-client wrap config.
 
 ```bash
-headroom inspect                 # inspect the most recent request
-headroom inspect --last 5        # inspect the 5 most recent requests
-headroom inspect --full          # include unchanged messages
-headroom inspect --format json   # raw feed for piping into another tool
+headroom doctor
+headroom doctor --json
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--port` / `-p` | `8787` | Proxy port to query (env: `HEADROOM_PORT`) |
-| `--last` | `1` | Number of most-recent requests to show |
-| `--format` | `text` | `text` renders a highlighted diff; `json` emits the raw feed |
-| `--full` | off | Include messages the compressor left unchanged |
+| `--json` | off | Emit JSON instead of text |
 
-`inspect` queries the running proxy's loopback `/transformations/feed` endpoint,
-so the proxy must be started with `--log-messages` (or `--log-file`) for the
-pre/post-compression snapshots to be captured.
+Probes `<proxy-url>/healthz`, falling back to `<proxy-url>/livez` only on a
+404 (legacy Python proxy). The proxy URL comes from the root `--proxy-url` /
+`HEADROOM_PROXY_URL`. Exits non-zero when the proxy is unreachable.
 
-## `headroom evals`
+## `headroom savings`
 
-Memory evaluation command group.
-
-### `headroom evals memory`
-
-Run the LoCoMo memory evaluation benchmark.
+Show durable compression savings over time (reads the append-only savings
+ledger from disk; aggregated on read).
 
 ```bash
-headroom evals memory -n 3
-headroom evals memory --answer-model gpt-4o --llm-judge
+headroom savings
+headroom savings --days 7
+headroom savings --json
+headroom savings --reset
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--n-conversations`, `-n` | all available | Number of conversations to evaluate |
-| `--categories` | benchmark default | Comma-separated categories |
-| `--include-adversarial` | off | Include category 5 / unanswerable questions |
-| `--top-k` | `10` | Memories retrieved per question |
-| `--f1-threshold` | `0.5` | Threshold for correctness |
-| `--answer-model` | unset | Model for answer generation |
-| `--llm-judge` | off | Use LLM-as-judge scoring |
-| `--judge-provider` | `litellm` | Judge provider: `openai`, `anthropic`, `litellm`, `simple` |
-| `--judge-model` | `gpt-4o` | Judge model |
-| `--output`, `-o` | unset | Save JSON results to a path |
-| `--no-extract` | off | Disable LLM memory extraction |
-| `--extraction-model` | `gpt-4o-mini` | Memory extraction model |
-| `--pass-all` | off | Require all checks to pass |
-| `--parallel` | `10` | Parallel worker count |
-| `--debug` | off | Enable debug output |
+| `--json` | off | Emit the raw report as JSON |
+| `--days` | `30` (1 or more) | Retention/lookback window for the ledger, in days |
+| `--reset` | off | Delete the savings ledger and start fresh |
 
-### `headroom evals memory-v2`
+With no calls recorded, the command prints the empty-ledger hint and the
+ledger path instead of a zero row.
 
-Run the V2 memory evaluation flow with LLM-controlled tools.
+## `headroom sg` / `headroom diff` / `headroom loc`
 
-```bash
-headroom evals memory-v2
-headroom evals memory-v2 --save-model gpt-4o-mini --llm-judge
-```
+Bundled-tool passthroughs. Every argument forwards verbatim (`exec`) to the
+resolved tool binary, so `headroom sg --help` shows ast-grep help, not
+Headroom help (help flag disabled on the wrapper).
 
-| Option | Default | Meaning |
+| Command | Tool | Purpose |
 |---|---|---|
-| `--n-conversations`, `-n` | all available | Number of conversations to evaluate |
-| `--categories` | benchmark default | Comma-separated categories |
-| `--include-adversarial` | off | Include adversarial questions |
-| `--f1-threshold` | `0.5` | Threshold for correctness |
-| `--save-model` | `gpt-4o-mini` | Model used when persisting memories |
-| `--answer-model` | `gpt-4o` | Answer model |
-| `--max-results` | `10` | Maximum tool results |
-| `--no-graph` | off | Disable graph usage |
-| `--llm-judge` | off | Use LLM-as-judge scoring |
-| `--judge-model` | `gpt-4o` | Judge model |
-| `--output`, `-o` | unset | Save JSON results |
-| `--parallel` | `5` | Parallel worker count |
-| `--debug` | off | Enable debug output |
-
-Hidden compatibility shims exist for older command paths:
-
-- `headroom memory-eval`
-- `headroom memory-eval-v2`
-
-These are intentionally omitted from normal usage docs.
-
-## `headroom memory`
-
-Memory management command group. This group is only registered when the optional memory dependencies import successfully.
-
-### `headroom memory list`
+| `headroom sg ...` | `ast-grep` | AST-aware structural search/replace |
+| `headroom diff ...` | `difft` (difftastic) | Structural diff that understands syntax |
+| `headroom loc ...` | `scc` | Fast lines-of-code / repo-shape probe |
 
 ```bash
-headroom memory list
-headroom memory list --scope USER --since 7d
-headroom memory list -q "budget"
+headroom sg --help
+headroom diff old.rs new.rs
+headroom loc ./crates
 ```
 
-| Option | Default | Meaning |
+Use `headroom tools doctor` / `headroom tools install` when a passthrough
+binary is missing.
+
+## `headroom tools`
+
+Manage bundled CLI tool binaries
+(`crates/headroom-proxy/src/bin/headroom_cli/tools.rs`; registry mirrored
+from `upstream-python/headroom/tools.json`).
+
+```bash
+headroom tools list
+headroom tools doctor
+headroom tools doctor --json
+headroom tools install
+headroom tools install --tool ast-grep --tool difft --force
+```
+
+| Subcommand | Options | Meaning |
 |---|---|---|
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--limit`, `-n` | `50` | Maximum memories to show |
-| `--session`, `-s` | unset | Filter by session ID |
-| `--scope` | unset | `USER`, `SESSION`, `AGENT`, or `TURN` |
-| `--since` | unset | Age filter using duration syntax such as `7d`, `2w`, `1m` |
-| `--search`, `-q` | unset | Content search query |
+| `list` | none | Print the tool registry (platform, cache dir, versions, sources) |
+| `doctor` | `--json` (off) | Check the status of every bundled tool; exits non-zero when any tool is `missing` / `unsupported-platform` |
+| `install` | `--tool <name>` (repeatable, default: all); `--force` (off) | Pre-fetch binaries into the per-user cache; `--force` re-fetches even when cached |
 
-### `headroom memory show <memory_id>`
+Related environment overrides: `HEADROOM_BINARIES_MIRROR`,
+`HEADROOM_BINARIES_CACHE`, `HEADROOM_BINARIES_OFFLINE`.
+
+## `headroom-proxy`
+
+The proxy is a separate binary, not a `headroom` subcommand. `--upstream` is
+required (no default); `--listen` defaults to `0.0.0.0:8787`.
 
 ```bash
-headroom memory show 1234abcd
-headroom memory show 1234abcd --json
+headroom-proxy --upstream http://127.0.0.1:8788
+headroom-proxy --upstream https://api.anthropic.com --listen 127.0.0.1:8787 --compression
+headroom-proxy --version
 ```
 
-| Argument / option | Default | Meaning |
+### Full flag reference
+
+`headroom-proxy --help` currently lists **128 `--` flags** (plus `-h/--help`
+and `-V/--version`). The generated reference is authoritative — this page
+groups the surface instead of copying it:
+
+- [`docs/flags.md`](../docs/flags.md) — every option with env var and default,
+  generated from the binary. Regenerate after adding/renaming a flag (see the
+  header of that file).
+- Flag definition: `crates/headroom-proxy/src/config.rs` (`CliArgs`).
+- Binary entry: `crates/headroom-proxy/src/main.rs`.
+- Maintainer runtime set: `contrib/headroom-flags.sh` (copied to
+  `~/.headroom-flags.sh` by `install.sh`).
+
+There is no config file. Each flag also names its `HEADROOM_*` / provider env
+var in `--help`; the CLI flag wins over the environment.
+
+### Major option groups
+
+Defaults below are from `headroom-proxy --help` / `docs/flags.md`. Every flag
+named here was verified there.
+
+| Group | Representative flags (defaults) | Notes |
 |---|---|---|
-| `memory_id` | required | Full or partial memory ID |
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--json` | off | Emit raw JSON |
-
-### `headroom memory stats`
-
-```bash
-headroom memory stats
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-
-### `headroom memory edit <memory_id>`
-
-```bash
-headroom memory edit 1234abcd --content "Updated note"
-headroom memory edit 1234abcd --importance 0.9
-```
-
-| Argument / option | Default | Meaning |
-|---|---|---|
-| `memory_id` | required | Full or partial memory ID |
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--content`, `-c` | unset | New memory content |
-| `--importance`, `-i` | unset | New importance score (`0.0` to `1.0`) |
-
-At least one of `--content` or `--importance` is required.
-
-### `headroom memory delete <memory_ids...>`
-
-```bash
-headroom memory delete 1234abcd 5678efgh
-headroom memory delete 1234abcd --force
-```
-
-| Argument / option | Default | Meaning |
-|---|---|---|
-| `memory_ids...` | required | One or more memory IDs |
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--force`, `-f` | off | Skip confirmation |
-
-### `headroom memory prune`
-
-```bash
-headroom memory prune --older-than 30d --dry-run
-headroom memory prune --scope SESSION --force
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--older-than` | unset | Age threshold |
-| `--scope` | unset | Scope filter: `USER`, `SESSION`, `AGENT`, `TURN` |
-| `--low-importance` | unset | Importance cutoff |
-| `--session`, `-s` | unset | Session ID filter |
-| `--dry-run` | off | Show what would be removed |
-| `--force`, `-f` | off | Skip confirmation |
-
-At least one filter is required. Filters combine with **AND** semantics.
-
-### `headroom memory purge`
-
-```bash
-headroom memory purge --confirm
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--confirm` | off | Required confirmation flag |
-
-### `headroom memory export`
-
-```bash
-headroom memory export
-headroom memory export --output export.json
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--output`, `-o` | stdout | Output path |
-
-### `headroom memory import <file>`
-
-```bash
-headroom memory import export.json
-headroom memory import export.json --force
-```
-
-| Argument / option | Default | Meaning |
-|---|---|---|
-| `file` | required | JSON file containing exported memories |
-| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
-| `--force`, `-f` | off | Skip confirmation |
-
-The import expects a JSON array. Malformed entries are skipped.
-
-## `headroom mcp`
-
-Manage the Headroom MCP server integration.
-
-### `headroom mcp install`
-
-```bash
-headroom mcp install
-headroom mcp install --proxy-url http://127.0.0.1:9000
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--proxy-url` | `http://127.0.0.1:8787` | Proxy URL written into MCP config |
-| `--force` | off | Overwrite an existing Headroom MCP config |
-
-### `headroom mcp uninstall`
-
-```bash
-headroom mcp uninstall
-```
-
-This removes the Headroom MCP server entry from the Claude configuration.
-
-### `headroom mcp status`
-
-```bash
-headroom mcp status
-```
-
-This inspects MCP SDK availability, Claude config state, and proxy reachability.
-
-### `headroom mcp serve`
-
-```bash
-headroom mcp serve
-headroom mcp serve --proxy-url http://127.0.0.1:9000 --debug
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--proxy-url` | `http://127.0.0.1:8787` | Proxy URL (also reads `HEADROOM_PROXY_URL`) |
-| `--direct` | off | Disable stdio transport wrapping |
-| `--debug` | off | Enable debug logging |
-
-`serve` is part of the public CLI, but it is usually consumed by MCP host tooling rather than by humans directly.
-
-See also: [MCP Tools](mcp.md)
-
-## `headroom install`
-
-Install and manage persistent local Headroom deployments.
-
-### `headroom install apply --help`
-
-```text
-Usage: headroom install apply [OPTIONS]
-
-  Install a persistent Headroom deployment.
-
-Options:
-  --preset [persistent-service|persistent-task|persistent-docker]
-                                  Persistent runtime preset to install.
-                                  [default: persistent-service]
-  --runtime [python|docker]       Runtime used to execute Headroom for
-                                  service/task modes.  [default: python]
-  --scope [provider|user|system]  Where to apply persistent configuration.
-                                  [default: user]
-  --providers [auto|all|manual]   Target selection mode for direct tool
-                                  configuration.  [default: auto]
-  --target [claude|copilot|codex|aider|cursor|openclaw]
-                                  Tool target to configure when --providers
-                                  manual is used.
-  --profile TEXT                  Deployment profile name.  [default: default]
-  -p, --port INTEGER              Persistent proxy port.  [default: 8787]
-  --backend TEXT                  Proxy backend for the persistent runtime.
-                                  [default: anthropic]
-  --anyllm-provider TEXT          Provider for any-llm backends when --backend
-                                  anyllm is used.
-  --region TEXT                   Cloud region for Bedrock / Vertex style
-                                  backends.
-  --mode TEXT                     Proxy optimization mode.  [default: token]
-  --memory                        Enable persistent memory in the proxy runtime.
-  --telemetry                     Opt in to anonymous telemetry in the runtime
-                                  (off by default).
-  --no-telemetry                  Force anonymous telemetry off in the runtime
-                                  (already the default).
-  --image TEXT                    Docker image to use when runtime=docker or
-                                  preset=persistent-docker.  [default:
-                                  ghcr.io/headroomlabs-ai/headroom:latest]
-  -?, --help                      Show this message and exit.
-```
-
-### `headroom install apply`
-
-```bash
-headroom install apply --preset persistent-service --providers auto
-headroom install apply --preset persistent-task --providers manual --target claude --target codex
-headroom install apply --preset persistent-docker --scope user
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--preset` | `persistent-service` | Lifecycle preset: `persistent-service`, `persistent-task`, or `persistent-docker` |
-| `--runtime` | `python` | Runtime used for service/task installs: `python` or `docker` |
-| `--scope` | `user` | Config scope: `provider`, `user`, or `system` |
-| `--providers` | `auto` | Target selection mode: `auto`, `all`, or `manual` |
-| `--target` | repeatable | Tool target used with `--providers manual` |
-| `--profile` | `default` | Deployment profile name |
-| `--port`, `-p` | `8787` | Persistent proxy port |
-| `--backend` | `anthropic` | Backend for the managed runtime |
-| `--anyllm-provider` | unset | Provider name used with `--backend anyllm` |
-| `--region` | unset | Cloud region override |
-| `--mode` | `token` | Proxy optimization mode |
-| `--memory` | off | Enable persistent memory in the managed runtime |
-| `--telemetry` | off | Opt in to anonymous telemetry (off by default) |
-| `--no-telemetry` | off | Force anonymous telemetry off (already the default) |
-| `--image` | `ghcr.io/headroomlabs-ai/headroom:latest` | Docker image for Docker-backed installs |
-
-`apply` stores a manifest under
-`${HEADROOM_WORKSPACE_DIR}/deploy/<profile>/manifest.json` (default
-`~/.headroom/deploy/<profile>/manifest.json`), applies managed tool
-configuration, starts the chosen runtime, and waits for `readyz`.
-
-Docker-native host wrappers expose a narrower `headroom install` subset for `persistent-docker` only: `apply`, `status`, `start`, `stop`, `restart`, and `remove`. Those wrapper flows preserve the same port and manifest behavior, but they intentionally reject `persistent-service`, `persistent-task`, and provider mutation flags like `--scope`, `--providers`, and `--target`.
-
-### `headroom install status`
-
-```bash
-headroom install status
-headroom install status --profile default
-```
-
-Shows the stored profile, preset, runtime, supervisor kind, scope, port, runtime status, readiness, and backend from `/health`.
-
-### `headroom install start`
-
-```bash
-headroom install start
-headroom install start --profile default
-```
-
-Starts a previously installed deployment profile without reapplying mutations.
-
-### `headroom install stop`
-
-```bash
-headroom install stop
-```
-
-Stops the managed runtime for an installed deployment profile.
-
-### `headroom install restart`
-
-```bash
-headroom install restart
-```
-
-Stops and starts the selected deployment profile.
-
-### `headroom install remove`
-
-```bash
-headroom install remove
-```
-
-Stops the runtime, removes installed supervisor artifacts, reverts managed configuration changes, and deletes the stored manifest.
-
-See also: [Persistent Installs](persistent-installs.md)
-
-## `headroom wrap`
-
-Wrap external coding tools so their traffic flows through Headroom.
-
-### Shared semantics
-
-- `--port`, when available, defaults to `8787`
-- `--no-proxy` skips proxy startup and assumes an existing proxy
-- `--learn` enables live traffic learning
-- `-v`, `--verbose` means **verbose output**
-- Hidden `--prepare-only` exists for internal Docker-native bridge flows and is intentionally omitted from normal usage
-
-### `headroom wrap claude`
-
-```bash
-headroom wrap claude
-headroom wrap claude --resume <session-id>
-headroom wrap claude --port 9999
-```
-
-| Option / arg | Default | Meaning |
-|---|---|---|
-| `--port`, `-p` | `8787` | Proxy port |
-| `--no-proxy` | off | Reuse an existing proxy |
-| `--learn` | off | Enable live traffic learning |
-| `--verbose`, `-v` | off | Verbose output |
-| `claude_args...` | passthrough | Additional Claude Code arguments |
-
-Requires the `claude` binary on the host.
-
-### `headroom wrap codex`
-
-```bash
-headroom wrap codex
-headroom wrap codex -- "fix the bug"
-headroom wrap codex --backend anyllm --anyllm-provider groq
-```
-
-| Option / arg | Default | Meaning |
-|---|---|---|
-| `--port`, `-p` | `8787` | Proxy port |
-| `--no-proxy` | off | Reuse an existing proxy |
-| `--learn` | off | Enable live traffic learning |
-| `--backend` | unset | Proxy backend override |
-| `--anyllm-provider` | unset | `anyllm` provider override |
-| `--region` | unset | Cloud region override |
-| `--verbose`, `-v` | off | Verbose output |
-| `codex_args...` | passthrough | Additional Codex CLI arguments |
-
-Requires the `codex` binary on the host.
-
-### `headroom wrap copilot`
-
-```bash
-headroom wrap copilot -- --model claude-sonnet-4-20250514
-headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
-```
-
-| Option / arg | Default | Meaning |
-|---|---|---|
-| `--port`, `-p` | `8787` | Proxy port |
-| `--no-proxy` | off | Reuse an existing proxy |
-| `--learn` | off | Enable live traffic learning |
-| `--backend` | unset | Proxy backend override |
-| `--anyllm-provider` | unset | `anyllm` provider override |
-| `--region` | unset | Cloud region override |
-| `--provider-type` | `auto` | Force Copilot BYOK provider type (`anthropic` or `openai`) |
-| `--wire-api` | unset | OpenAI wire API override for OpenAI-style backends |
-| `--verbose`, `-v` | off | Verbose output |
-| `copilot_args...` | passthrough | Additional Copilot CLI arguments |
-
-Requires the `copilot` binary on the host. When a matching persistent deployment exists on the requested port, `wrap copilot` reuses or recovers it before falling back to an ephemeral proxy.
-
-### `headroom wrap aider`
-
-```bash
-headroom wrap aider
-headroom wrap aider -- --model gpt-4o
-headroom wrap aider --backend litellm-vertex --region us-central1
-```
-
-| Option / arg | Default | Meaning |
-|---|---|---|
-| `--port`, `-p` | `8787` | Proxy port |
-| `--no-proxy` | off | Reuse an existing proxy |
-| `--learn` | off | Enable live traffic learning |
-| `--backend` | unset | Proxy backend override |
-| `--anyllm-provider` | unset | `anyllm` provider override |
-| `--region` | unset | Cloud region override |
-| `--verbose`, `-v` | off | Verbose output |
-| `aider_args...` | passthrough | Additional Aider arguments |
-
-Requires the `aider` binary on the host.
-
-### `headroom wrap cursor`
-
-```bash
-headroom wrap cursor
-headroom wrap cursor --port 9999
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--port`, `-p` | `8787` | Proxy port |
-| `--no-proxy` | off | Reuse an existing proxy |
-| `--learn` | off | Enable live traffic learning |
-| `--verbose`, `-v` | off | Verbose output |
-
-This command prints Cursor configuration instructions and waits while the proxy stays up. It does **not** launch Cursor directly.
-
-### `headroom wrap openclaw`
-
-```bash
-headroom wrap openclaw
-headroom wrap openclaw --plugin-path ./plugins/openclaw
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--plugin-path` | unset | Local plugin source directory |
-| `--plugin-spec` | `headroom-ai/openclaw` | NPM plugin spec |
-| `--skip-build` | off | Skip local `npm install` / build steps |
-| `--copy` | off | Copy plugin instead of linked install |
-| `--proxy-port` | `8787` | Headroom proxy port |
-| `--startup-timeout-ms` | `20000` | Proxy startup timeout |
-| `--gateway-provider-id` | repeatable | OpenClaw provider IDs routed through Headroom |
-| `--python-path` | unset | Python launcher override |
-| `--no-auto-start` | off | Disable plugin auto-start behavior |
-| `--no-restart` | off | Do not restart the OpenClaw gateway |
-| `--verbose`, `-v` | off | Verbose output |
-
-Requires the `openclaw` binary on the host, and local-source mode may also require `npm`. In Docker-native mode, the installed host wrapper drives the host `openclaw` CLI while the plugin auto-starts the host `headroom` wrapper from `PATH`.
-
-## `headroom unwrap`
-
-Undo durable wrapping for supported tools.
-
-### `headroom unwrap openclaw`
-
-```bash
-headroom unwrap openclaw
-headroom unwrap openclaw --no-restart
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--no-restart` | off | Do not restart the OpenClaw gateway |
-| `--verbose`, `-v` | off | Verbose output |
-
-This disables the Headroom OpenClaw plugin and restores the legacy context engine slot.
-
-## Docker-native parity matrix
-
-This matrix compares the **Python CLI contract** to the Docker-native host wrapper added in this branch.
-
-Legend:
-
-- **native in container** — the command runs entirely inside the Headroom container
-- **host-bridged** — Headroom runs in Docker, but the wrapped external tool still runs on the host
-
-| Command path | Python CLI | Docker-native wrapper | Parity |
-|---|---|---|---|
-| `headroom proxy` | native | native in container | full |
-| `headroom learn` | native | native in container | full |
-| `headroom perf` | native | native in container | full |
-| `headroom evals memory` | native | native in container | full |
-| `headroom evals memory-v2` | native | native in container | full |
-| `headroom memory ...` | native (when memory deps are available) | native in container | full |
-| `headroom mcp install` | native | native in container | full |
-| `headroom mcp uninstall` | native | native in container | full |
-| `headroom mcp status` | native | native in container | full |
-| `headroom mcp serve` | native | native in container | full |
-| `headroom install apply|status|start|stop|restart|remove` | native | Docker-native wrapper for `persistent-docker`; compose remains an alternative | partial |
-| `headroom wrap claude` | native | host-bridged | partial |
-| `headroom wrap copilot` | native | not implemented in Docker-native wrapper | none |
-| `headroom wrap codex` | native | host-bridged | partial |
-| `headroom wrap aider` | native | host-bridged | partial |
-| `headroom wrap cursor` | native | host-bridged | partial |
-| `headroom wrap openclaw` | native | host-bridged | partial |
-| `headroom unwrap openclaw` | native | host-bridged | partial |
-
-For the Docker-native execution model itself, see [Docker-Native Install](docker-install.md). For persistent service/task/docker lifecycle management, see [Persistent Installs](persistent-installs.md).
-
-## Hidden and compatibility-only command paths
-
-These exist in code but are intentionally excluded from normal user docs:
-
-- `headroom memory-eval`
-- `headroom memory-eval-v2`
-- hidden internal `--prepare-only` flags on `wrap` subcommands
-
-If you are documenting operational behavior or debugging internal wrapper flows, refer to the implementation in `headroom/cli/wrap.py`.
+| Core networking | `--listen` (`0.0.0.0:8787`, env `HEADROOM_PROXY_LISTEN`), `--upstream` (required, env `HEADROOM_PROXY_UPSTREAM`), `--upstream-timeout` (`600s`), `--upstream-connect-timeout` (`10s`), `--upstream-write-timeout` (`150s`), `--pool-idle-timeout` (`90s`), `--http-proxy` (unset), `--max-body-bytes` (`100MB`), `--log-level` (`info`), `--rewrite-host` (`true`) / `--no-rewrite-host`, `--graceful-shutdown-timeout` (`30s`) | `--upstream-write-timeout` bounds pushing request bytes upstream; `--pool-idle-timeout` bounds idle keepalive reuse. `--http-proxy` applies to provider calls only, not the process environment |
+| Rollout | `--rollout-channel` (`stable`), `--features` (`""`), `--disable-features` (`""`), `--unsafe-allow-unstable-features` (`false`) | Disable wins over enable; the unsafe override is break-glass only |
+| Compression master | `--compression` (off, env `HEADROOM_PROXY_COMPRESSION`), `--compression-mode` (unset → resolved to `all_messages` when interception is on, else `off`; `off`/`live_zone`/`all_messages`), `--compression-max-body-bytes` (unset → falls back to `--max-body-bytes`), `--compression-max-workers` (`4`), `--enable-cross-turn-dedup` (off) | With `--compression` off the proxy is a byte-pipe and never mutates headers |
+| Run mode | `--mode` (`token`, env `HEADROOM_MODE`; `token` prioritizes compression, `cache` prioritizes prefix-cache stability) | Legacy Python aliases are not accepted here; see `--help` for the exact choice set |
+| Cache stabilization | `--prefix-replay` (`false`), `--cache-tail-breakpoints` (`1`), `--cache-tail-breakpoint` (`true`), `--strip-system-cache-breakpoints` (`false`), `--cache-stable-tool-order` (`true`), `--cache-pin-tool-roster` (`false`), `--cache-control-auto-frozen` (`enabled`), `--auth-mode-policy-enforcement` (`enabled`), `--beta-header-sticky` (`enabled`), `--strip-internal-headers` (`enabled`), `--force-1h-cache-ttl` (`false`), `--split-cache-ttl` (`false`), `--respect-client-5m-ttl` (`false`), `--replay-store-dir` (`""`), `--hold-working-directory` / `--hold-role-sentence` (`false`), `--max-conversation-concurrency` (`0` = unbounded) | Freeze-replay and breakpoint placement keep the forwarded prefix byte-stable so provider prompt caches hold across turns |
+| Context offload / recall (ctx) | `--ctx-capture` (`false`), `--ctx-store-dir` (unset → `<workspace>/ctx`), `--ctx-offload` (`false`), `--ctx-offload-min-bytes` (`50000`), `--ctx-offload-stale-messages` / `--ctx-offload-stale-window` (`0`), `--ctx-offload-ttl-seconds` (`604800`), `--ctx-offload-tool-use` (`false`), `--ctx-inject` (`false`), `--ctx-drop-prior-thinking` (`true`), `--max-injection-bytes` (`32768`), `--ccr-context-tracking` / `--ccr-proactive-expansion` (`true`), `--ccr-max-proactive-expansions` (`2`), `--ccr-inject-tool` / `--ccr-handle-responses` (`true`), `--ccr-max-retrieval-rounds` (`8`), `--ccr-inject-marker` (`true`) | Backs `headroom ctx *`; `--ctx-offload` replaces oversized `tool_result` blocks with retrievable pointers |
+| Context editing | `--context-edit` (off), `--context-edit-keep-tool-uses` (`6`), `--context-edit-trigger-tokens` (`60000`), `--context-edit-min-messages` (`40`), `--context-edit-clear-at-least` (unset), `--context-edit-keep-thinking` (unset) | Anthropic-native `context_management` (`clear_tool_uses` / `clear_thinking`); off by default |
+| Tool pruning | `--prune-drop-mcp` / `--prune-drop-tools` / `--prune-keep-tools` (all unset) | Deterministic, cache-safe; keep-allowlist wins over drops |
+| Semantic cache / retry / budget | `--cache` (`true`), `--cache-ttl` (`3600`), `--cache-max-entries` (`1000`), `--retry` (`true`), `--retry-max-attempts` (`3`), `--retry-overload-max-attempts` (`6`), `--retry-stream-hold-bytes` (`8192`), `--retry-base-delay-ms` (`1000`), `--retry-max-delay-ms` (`30000`), `--cost-tracking` (`true`), `--budget-limit-usd` (unset = unlimited), `--budget-period` (`daily`), `--min-tokens-to-crush` (`200`), `--max-items-after-crush` (`15`), `--savings-profile` (`balanced`), `--target-ratio` (`0` = auto) | `--retry-stream-hold-bytes 0` disables the holdback |
+| Provider routing | `--bedrock-region` (`us-east-1`), `--bedrock-endpoint` (unset → derived), `--aws-profile` (unset), `--bedrock-validate-eventstream-crc` (`true`), `--vertex-region` (`us-central1`), `--vertex-adc-scope` (`cloud-platform`), `--local-model` / `--local-upstream` (unset; upstream required when model is set), `--sidecar-model` (unset), `--sidecar-route-timeout` (`15s`), `--extra-model-route` (repeatable `MODEL=URL…`), `--codex-auth-file` (unset → `~/.codex/auth.json`), `--foundry-base-url` / `--foundry-resource` (unset), `--cursor-agent-binary` (`agent`), `--enable-responses-streaming` / `--enable-conversations-passthrough` / `--enable-bedrock-native` (`true`), `--enable-batch-api` (`false`) | `--local-model` translates Anthropic↔OpenAI at `--local-upstream`; `--extra-model-route` adds `MODEL=UPSTREAM[:openai[:TARGET]][:auth=ENV]` routes |
+| Compression content gates | `--code-aware` (`false`), `--enable-kompress` (`false`), `--disable-kompress` (`true`), `--disable-kompress-fallback` (`true`), `--disable-kompress-anthropic` / `--disable-kompress-openai` (`false`), `--force-kompress-all` (`false`), `--image-optimize` (`true`), `--smart-crusher-compaction` (`true`), `--compress-user-messages` / `--compress-system-messages` (`true`, currently not wired), `--protect-recent` / `--protect-analysis-context` (`false`), `--accuracy-guard` (`""`), `--lossless` (`false`), `--exclude-tools` (default `Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve`), `--protect-tool-results` (`""`), `--read-lifecycle` / `--read-maturation` (`false`) | `--exclude-tools ""` compresses everything; the two `compress-*-messages` gates are documented no-ops in `--help` |
+| Safety / operator | `--memory` (`false`, env `HEADROOM_MEMORY_ENABLED`), `--output-shaper` (unset, env `HEADROOM_OUTPUT_SHAPER`), `--verbosity-level` (`2`), `--redact-sensitive` (`false`), `--stateless` (`false`), `--offline` (`false`), `--proxy-token` (unset), `--anthropic-pre-upstream-concurrency` (`1000`) | `--stateless` disables filesystem writes; `--offline` disables outbound egress |
+
+See also: [Proxy Server](proxy.md), [Configuration](configuration.md).
+
+## Python-only paths removed from this page
+
+The previous revision of this page documented the Python CLI (15 of the 30
+`headroom --help` entries, ~30 of the ~90 `headroom proxy --help` options).
+None of the paths below exists in the Rust `headroom` binary (verified against
+`headroom --help` and `crates/headroom-proxy/src/bin/headroom_cli.rs`); the
+proxy rows no longer exist as `headroom <subcommand>` at all because the proxy
+is the separate `headroom-proxy` binary (128 flags, see above). They live on in
+the read-only mirror and are intentionally undocumented here:
+
+- `headroom proxy` (incl. `--host/--port/--mode/--no-optimize/--no-cache/--memory/--backend/--region…`) → `upstream-python/headroom/cli/proxy.py`; replaced by `headroom-proxy --upstream … --listen …` plus [`docs/flags.md`](../docs/flags.md).
+- `headroom dashboard` → `upstream-python/headroom/cli/proxy.py`; no Rust equivalent.
+- `headroom learn` → `upstream-python/headroom/cli/learn.py`; no Rust equivalent.
+- `headroom inspect` → `upstream-python/headroom/cli/inspect.py`; no Rust equivalent (closest read-only views are `ctx stats`, `perf`, `savings`).
+- `headroom evals` (`memory`, `memory-v2`, `probes`, `adversarial`; hidden `memory-eval`/`memory-eval-v2` shims) → `upstream-python/headroom/cli/evals.py`; no Rust equivalent.
+- `headroom memory` (`list/show/stats/edit/repair-supersession/delete/prune/purge/reindex/export/import`) → `upstream-python/headroom/cli/memory.py`; no Rust equivalent.
+- `headroom mcp` (`install/uninstall/reconcile/status/serve`) → `upstream-python/headroom/cli/mcp.py`; no Rust equivalent.
+- `headroom install` (`apply/status/start/stop/restart/remove`) and `headroom deploy` alias → `upstream-python/headroom/cli/install.py`; no Rust equivalent.
+- `headroom init` (`claude/copilot/codex/openclaw`, hook `ensure`) → `upstream-python/headroom/cli/init.py`; no Rust equivalent.
+- `headroom wrap` / `headroom unwrap` (claude/copilot/codex/aider/cursor/openclaw/vscode/…) → `upstream-python/headroom/cli/wrap.py`; no Rust equivalent.
+- `headroom audit-reads` → `upstream-python/headroom/cli/audit.py`; no Rust equivalent.
+- `headroom recover` (`codex`) → `upstream-python/headroom/cli/recover.py`; no Rust equivalent.
+- `headroom rollout status` → `upstream-python/headroom/cli/rollout.py`; the runtime knobs survive as `headroom-proxy --rollout-channel/--features/--disable-features/--unsafe-allow-unstable-features`.
+- `headroom update` → `upstream-python/headroom/cli/update.py`; no Rust equivalent.
+- Hidden `--prepare-only` wrap flags and the Docker-native parity matrix → Python/Docker install flows; no Rust equivalent (the Rust `doctor` is the reduced local check documented above).
+
+If you need one of these, run it from an installed `headroom-ai` Python
+distribution and treat `upstream-python/` as the source of truth — do not mix
+its flags (e.g. `headroom proxy --port`, `wrap --port`, `install apply
+--preset`) with the Rust binaries on this page.
+
+## See also
+
+- [Proxy Server](proxy.md)
+- [Configuration](configuration.md)
+- [Filesystem Contract](filesystem-contract.md)
+- [`docs/flags.md`](../docs/flags.md) — authoritative `headroom-proxy` flag list

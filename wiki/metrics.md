@@ -1,5 +1,8 @@
 # Metrics & Monitoring
 
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
+
 Headroom provides comprehensive metrics for monitoring compression performance, cost savings, and system health.
 
 ## Proxy Metrics

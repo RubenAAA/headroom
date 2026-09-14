@@ -1,718 +1,265 @@
 # macOS Deployment Guide
 
-This guide covers deploying the headroom proxy server as a background service on macOS using LaunchAgent. The service will start automatically on login and restart on crash.
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`), installed by `./install.sh` and launched with `cclaude --context`. Python paths on this page live in the read-only `upstream-python/` mirror. The old Python installer (`examples/deployment/macos-launchagent/install.sh`) does not exist in this repo — its last copy is `upstream-python/examples/deployment/macos-launchagent/`, and its plist template runs `headroom proxy`, a subcommand the Rust `headroom` CLI does not have. Nothing below uses it.
+
+This guide covers running the Rust proxy on macOS: the standard launcher path first, and an optional hand-written LaunchAgent for login-time startup. There is no repo-shipped plist or installer script for the Rust binary — if you want launchd supervision, you write the plist below by hand.
 
 ## Overview
 
-macOS LaunchAgent provides a native way to run background services with:
+The standard deployment has one supervisor already: `cclaude` starts the proxy when nothing answers on `127.0.0.1:8787` and reuses the running instance otherwise. A LaunchAgent only makes sense if you want the proxy up at login without opening a shell first — crash recovery (`KeepAlive`) and login start (`RunAtLoad`) via `launchctl`.
 
-- **Automatic startup** on user login
-- **Crash recovery** with automatic restart
-- **Standard logging** to `~/Library/Logs/`
-- **Native lifecycle management** via `launchctl`
-
-This is ideal for local development environments where you want "set and forget" proxy configuration.
+- **Standard path**: `./install.sh`, then `cclaude --context`. No plist needed.
+- **LaunchAgent path**: a small plist that runs `~/.local/bin/headroom-proxy` directly. Pick one supervisor — do not mix this with `cclaude`-started or `restart-headroom.sh`-started proxies (see the warning below).
 
 ## Prerequisites
 
-- macOS 10.13+ (High Sierra or later)
-- headroom-ai installed with proxy support
-- Anthropic API key configured
+- macOS 10.13+ with [Homebrew](https://brew.sh) (the installer pulls GNU tools and a bash newer than the 3.2 macOS ships)
+- Git, Rust via [rustup](https://rustup.rs), plus `jq` and `lsof` (statusline and restart script need them; the installer warns if they are missing)
+- No API key configuration on the service: the proxy forwards your own client authentication upstream. There is nothing secret to put in a plist.
 
-### Installing Headroom with Proxy Support
-
-```bash
-# Install the host CLI with proxy support
-uv tool install --python 3.13 "headroom-ai[proxy]"
-
-# If your shell cannot find `headroom` after installation
-uv tool update-shell
-
-# Verify installation
-headroom proxy --help
-```
-
-On macOS with Homebrew, `python3` may point at a newer interpreter than the
-current Headroom wheel set. Passing `--python 3.13` keeps the CLI install on a
-wheel-supported interpreter. If Python 3.13 is missing, install it first:
+## Standard Install (No LaunchAgent)
 
 ```bash
-brew install python@3.13
-```
-
-### API Key Configuration
-
-Your Anthropic API key can be configured in several ways:
-
-**Option 1: Shell environment (recommended)**
-
-```bash
-# Add to ~/.bashrc or ~/.zshrc
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-**Option 2: LaunchAgent plist**
-
-```xml
-<key>EnvironmentVariables</key>
-<dict>
-    <key>ANTHROPIC_API_KEY</key>
-    <string>sk-ant-...</string>
-</dict>
-```
-
-**Option 3: System environment**
-
-```bash
-# Add to /etc/launchd.conf (requires admin)
-setenv ANTHROPIC_API_KEY sk-ant-...
-```
-
-## Quick Install
-
-The automated installer handles all setup:
-
-```bash
-# Clone or navigate to headroom repository
-cd examples/deployment/macos-launchagent
-
-# Run installer
+git clone https://github.com/RubenAAA/headroom.git ~/headroom
+cd ~/headroom
 ./install.sh
 ```
 
-The installer will:
+Options: `--no-build` skips cargo and installs whatever `target/release` holds; `--link` symlinks the scripts and flag file into `contrib/` so editing the checkout edits the live setup (binaries are always copied).
 
-1. Detect your headroom installation
-2. Prompt for port configuration (default: 8787)
-3. Create log directory
-4. Generate LaunchAgent plist
-5. Load and start the service
-6. Verify service is running
+What it installs and where (existing files are left alone, never overwritten):
 
-### Installation Options
+- `~/.local/bin/headroom-proxy` and `~/.local/bin/headroom`, built release
+- `~/.local/bin/claude-launcher`, with `cclaude` symlinked to it, and `~/.local/bin/restart-headroom.sh`
+- `~/.headroom-flags.sh`, the measured flag set copied from `contrib/headroom-flags.sh`
+- `~/.headroom-paths.sh`, holding `HEADROOM_REPO` plus the GNU-tools `PATH` prefix on macOS
+- `~/.claude/statusline-with-cache.sh` and `statusline-usage-dump.sh`, wired into `~/.claude/settings.json`, plus one subagent per routed model in `~/.claude/agents/` and memory-tool instructions spliced into `~/.claude/CLAUDE.md`
 
-**Custom port:**
+If `~/.local/bin` is not on your `PATH`, the installer says so — add it to your shell profile, or neither `cclaude` nor `headroom` resolves.
 
-```bash
-./install.sh --port 9000
-```
-
-**Unattended install (no prompts):**
+### Launch via cclaude
 
 ```bash
-./install.sh --port 8787 --unattended
+cclaude --context     # starts the proxy if down, sets ANTHROPIC_BASE_URL, execs claude
 ```
 
-**Reinstall over existing:**
+The launcher starts the proxy with `--listen 127.0.0.1:8787 --upstream https://api.anthropic.com` plus the flags from `~/.headroom-flags.sh`, waits for `/cache-health` to answer, and logs to `~/headroom-proxy.log`. A proxy already on the port is **reused** — flags passed on the command line do not apply to it. To use new flags: `pkill -f headroom-proxy`, then rerun.
+
+!!! warning "One supervisor at a time"
+    `cclaude`, `restart-headroom.sh`, and a LaunchAgent all start the same binary onto the same port and the same log. A running proxy ignores later flags, and two starters race for port 8787. Use the LaunchAgent section below *or* the launcher path — never both at once.
+
+### Verify
 
 ```bash
-# Installer will prompt to reinstall if service exists
-./install.sh
+curl -s localhost:8787/healthz                  # {"ok":true,"service":"headroom-proxy"}
+curl -s localhost:8787/cache-health | head -20  # hit rates; low means it is not helping
+tail -f ~/headroom-proxy.log                    # JSON lines
+headroom doctor
+headroom savings
 ```
 
-## Manual Installation
+`/healthz` only proves the process is up. `/cache-health` proves it helps.
 
-If you prefer full control over the installation:
+### Flags
 
-### Step 1: Create Log Directory
+Flags come only from the command line and the environment, never a config file. Every flag has a `HEADROOM_PROXY_*` variable (`--listen` ↔ `HEADROOM_PROXY_LISTEN`, `--upstream` ↔ `HEADROOM_PROXY_UPSTREAM`, and so on — see `headroom-proxy --help`, or the generated `docs/flags.md`).
+
+Edit `~/.headroom-flags.sh`, then restart. Editing alone changes nothing about the process already running.
+
+### Restart and rollback
+
+After rebuilding the Rust binary:
 
 ```bash
-mkdir -p ~/Library/Logs/headroom
+restart-headroom.sh
 ```
 
-### Step 2: Generate LaunchAgent Plist
+It swaps `target/release/headroom-proxy` into `~/.local/bin/headroom-proxy` (keeping a `.prev` backup), restarts onto port 8787 with your flags file, and rolls back to the previous binary if the new one fails to listen. Progress lands in `~/headroom-proxy.log`. It refuses to start if `~/.headroom-flags.sh` is missing rather than serve traffic on defaults.
 
-Copy and customize the template:
+Stop it by hand with `pkill -f headroom-proxy`.
 
-```bash
-cd examples/deployment/macos-launchagent
-cp com.headroom.proxy.plist.template ~/Library/LaunchAgents/com.headroom.proxy.plist
-```
+## LaunchAgent (Optional, Rust Binary)
 
-Edit `~/Library/LaunchAgents/com.headroom.proxy.plist`:
+!!! note "When this earns its keep"
+    Only if you want the proxy listening after login with no terminal involved. If `cclaude --context` already covers your sessions, skip this section — it adds a second supervisor you then have to keep out of the launcher's way.
 
-1. Replace `__HEADROOM_PATH__` with your headroom path:
+There is no template or installer for this in the repo. The unit runs the Rust binary, not Python:
 
-   ```bash
-   command -v headroom
-   # Example output: /usr/local/bin/headroom
-   ```
+### Step 1: Write the plist
 
-2. Replace `__PORT__` with your desired port (e.g., `8787`)
-
-3. Replace `__HOME__` with your home directory:
-
-   ```bash
-   echo $HOME
-   # Example output: /Users/yourusername
-   ```
-
-### Step 3: Load the LaunchAgent
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.proxy.plist
-```
-
-### Step 4: Verify Service
-
-```bash
-# Check if service is running
-launchctl print gui/$(id -u)/com.headroom.proxy
-
-# Check if port is listening
-lsof -iTCP:8787 -sTCP:LISTEN
-
-# Test health endpoint
-curl http://localhost:8787/health
-```
-
-## Configuration
-
-### Port Customization
-
-The default port is 8787. To use a custom port:
-
-**During installation:**
-
-```bash
-./install.sh --port 9000
-```
-
-**After installation:**
-
-1. Uninstall: `./uninstall.sh`
-2. Reinstall with new port: `./install.sh --port 9000`
-3. Update shell integration: `export HEADROOM_PORT=9000`
-
-### Log Location
-
-Logs are written to standard macOS locations:
-
-- **Standard output**: `~/Library/Logs/headroom/proxy.log`
-- **Error output**: `~/Library/Logs/headroom/proxy-error.log`
-
-To change log locations, edit the plist:
+Create `~/Library/LaunchAgents/com.headroom.proxy.plist`:
 
 ```xml
-<key>StandardOutPath</key>
-<string>/custom/path/proxy.log</string>
-```
-
-### Environment Variables
-
-Configure additional options in the plist `EnvironmentVariables` section:
-
-```xml
-<key>EnvironmentVariables</key>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
-    <!-- Required: Proxy port -->
-    <key>HEADROOM_PORT</key>
-    <string>8787</string>
+    <key>Label</key>
+    <string>com.headroom.proxy</string>
 
-    <!-- Optional: API key (or set in shell) -->
-    <key>ANTHROPIC_API_KEY</key>
-    <string>sk-ant-...</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/headroom-proxy</string>
+        <string>--listen</string>
+        <string>127.0.0.1:8787</string>
+        <string>--upstream</string>
+        <string>https://api.anthropic.com</string>
+    </array>
 
+    <!-- The proxy writes to stdout and nothing else, so the log lives
+         wherever this points. ~/headroom-proxy.log keeps headroom perf,
+         the statusline, and the restart script working unchanged. -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/headroom-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/headroom-proxy.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
 </dict>
+</plist>
 ```
 
-**Note:** The earlier LLMLingua-2 launch-agent variables
-(`HEADROOM_COMPRESSION_PROVIDER=llmlingua`, `HEADROOM_LLMLINGUA_DEVICE`,
-the `headroom-ai[llmlingua]` extra) were retired with the
-`--llmlingua` flag. For ML compression today, install the `[ml]`
-extra and follow `wiki/transforms.md`.
-
-### Crash Recovery
-
-The LaunchAgent is configured with:
-
-- **KeepAlive**: Automatically restarts on crash
-- **ThrottleInterval**: 10 seconds between restart attempts
-
-To disable automatic restart, edit the plist:
-
-```xml
-<key>KeepAlive</key>
-<false/>
-```
-
-## Shell Integration
-
-Automatically configure your shell to use the proxy when available.
-
-### Setup
-
-Add to `~/.bashrc` (bash) or `~/.zshrc` (zsh):
+Replace `__HOME__` with your home directory (`echo $HOME` — a plist does no shell expansion):
 
 ```bash
-# Configure port (optional, defaults to 8787)
-export HEADROOM_PORT=8787
-
-# Source shell integration
-source /path/to/headroom/examples/deployment/macos-launchagent/shell-integration.sh
-```
-
-### What It Does
-
-The shell integration script:
-
-1. Checks if proxy is running on configured port
-2. If running, sets `ANTHROPIC_BASE_URL=http://localhost:8787`
-3. If not running, attempts to start the LaunchAgent
-4. Provides status messages on first load
-
-This makes Claude clients automatically use the proxy without manual configuration.
-
-### Manual Configuration
-
-If you prefer not to use shell integration:
-
-```bash
-# Add to ~/.bashrc or ~/.zshrc
-export ANTHROPIC_BASE_URL=http://localhost:8787
-```
-
-## Service Management
-
-### Check Status
-
-```bash
-# View service status
-launchctl print gui/$(id -u)/com.headroom.proxy
-
-# Check if port is listening
-lsof -iTCP:8787 -sTCP:LISTEN
-
-# Test health endpoint
-curl http://localhost:8787/health
-```
-
-### View Logs
-
-```bash
-# Tail standard output
-tail -f ~/Library/Logs/headroom/proxy.log
-
-# Tail error output
-tail -f ~/Library/Logs/headroom/proxy-error.log
-
-# View last 50 lines
-tail -n 50 ~/Library/Logs/headroom/proxy-error.log
-```
-
-### Restart Service
-
-```bash
-# Graceful restart (stop and let KeepAlive restart it)
-launchctl kickstart -k gui/$(id -u)/com.headroom.proxy
-
-# Manual stop/start
-launchctl bootout gui/$(id -u)/com.headroom.proxy
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.proxy.plist
-```
-
-### Stop Service Temporarily
-
-```bash
-# Disable without uninstalling
-launchctl disable gui/$(id -u)/com.headroom.proxy
-
-# Re-enable
-launchctl enable gui/$(id -u)/com.headroom.proxy
-```
-
-## Verification
-
-After installation, verify everything is working:
-
-### 1. Check Service Status
-
-```bash
-launchctl print gui/$(id -u)/com.headroom.proxy
-```
-
-Expected output includes:
-
-```
-state = running
-```
-
-### 2. Check Port
-
-```bash
-lsof -iTCP:8787 -sTCP:LISTEN
-```
-
-Should show headroom listening on port 8787.
-
-### 3. Test Health Endpoint
-
-```bash
-curl http://localhost:8787/health
-```
-
-Expected response:
-
-```json
-{"status": "healthy"}
-```
-
-### 4. Test Proxy Functionality
-
-```bash
-# Set base URL
-export ANTHROPIC_BASE_URL=http://localhost:8787
-
-# Test with Python
-python -c "
-import anthropic
-client = anthropic.Anthropic()
-response = client.messages.create(
-    model='claude-3-5-sonnet-20241022',
-    max_tokens=50,
-    messages=[{'role': 'user', 'content': 'Hi'}]
-)
-print(response.content[0].text)
-"
-```
-
-### 5. Check Logs for Errors
-
-```bash
-tail -n 20 ~/Library/Logs/headroom/proxy-error.log
-```
-
-Should show no errors. Common startup errors are listed in [Troubleshooting](#troubleshooting).
-
-## Troubleshooting
-
-### Service Won't Start
-
-**Symptom:** `launchctl print` shows service not loaded or failed state
-
-**Check logs:**
-
-```bash
-tail -n 50 ~/Library/Logs/headroom/proxy-error.log
-```
-
-**Common causes:**
-
-| Error | Solution |
-|-------|----------|
-| `ANTHROPIC_API_KEY not set` | Set API key in environment or plist |
-| `ModuleNotFoundError: No module named 'headroom'` | Install: `uv tool install --python 3.13 "headroom-ai[proxy]"` |
-| `command not found: headroom` | Update plist with correct path: `command -v headroom` |
-| `Address already in use` | Change port or stop conflicting service |
-
-### Port Already in Use
-
-**Symptom:** Service starts but port not listening, logs show "Address already in use"
-
-**Find what's using the port:**
-
-```bash
-lsof -iTCP:8787 -sTCP:LISTEN
-```
-
-**Solutions:**
-
-1. Stop conflicting service
-2. Use different port: `./uninstall.sh && ./install.sh --port 9000`
-
-### Service Crashes Immediately
-
-**Symptom:** Service starts but immediately exits
-
-**Check for Python errors:**
-
-```bash
-tail -f ~/Library/Logs/headroom/proxy-error.log
-```
-
-**Common causes:**
-
-- Missing dependencies: `uv tool install --python 3.13 "headroom-ai[proxy]"`
-- Invalid API key: Verify `ANTHROPIC_API_KEY`
-- Python version incompatible: Requires Python 3.10+
-
-### ANTHROPIC_BASE_URL Not Set
-
-**Symptom:** Shell integration not setting environment variable
-
-**Verify proxy is running:**
-
-```bash
-curl http://localhost:8787/health
-```
-
-**Reload shell configuration:**
-
-```bash
-source ~/.bashrc  # or ~/.zshrc
-```
-
-**Check shell integration is sourced:**
-
-```bash
-# Should be set to 1
-echo $HEADROOM_SHELL_INTEGRATION_LOADED
-```
-
-### Service Not Auto-Starting on Login
-
-**Symptom:** Service doesn't start after reboot
-
-**Verify LaunchAgent is loaded:**
-
-```bash
-launchctl list | grep headroom
-```
-
-**If not listed:**
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.proxy.plist
-```
-
-**Check RunAtLoad is enabled:**
-
-```bash
-grep -A1 RunAtLoad ~/Library/LaunchAgents/com.headroom.proxy.plist
-```
-
-Should show:
-
-```xml
-<key>RunAtLoad</key>
-<true/>
-```
-
-### Permission Issues
-
-**Symptom:** "Operation not permitted" errors
-
-**Ensure plist has correct permissions:**
-
-```bash
+mkdir -p ~/Library/LaunchAgents
+sed -e "s|__HOME__|$HOME|g" <template-from-above> > ~/Library/LaunchAgents/com.headroom.proxy.plist
 chmod 644 ~/Library/LaunchAgents/com.headroom.proxy.plist
 ```
 
-**Verify ownership:**
+`--listen` and `--upstream` are required — the binary has no default upstream. Extra flags from `~/.headroom-flags.sh` do **not** carry over: that file is bash, sourced only by `cclaude` and `restart-headroom.sh`. Repeat any non-default flag literally in `ProgramArguments` (check names with `headroom-proxy --help`), or set its `HEADROOM_PROXY_*` equivalent in an `EnvironmentVariables` dict. Either way, the plist and the flags file must be kept in step by hand.
+
+### Step 2: Load it
 
 ```bash
-ls -l ~/Library/LaunchAgents/com.headroom.proxy.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.proxy.plist
 ```
 
-Should be owned by your user, not root.
-
-## Uninstallation
-
-### Quick Uninstall
+### Step 3: Verify
 
 ```bash
-cd examples/deployment/macos-launchagent
-./uninstall.sh
+launchctl print gui/$(id -u)/com.headroom.proxy   # state = running
+lsof -iTCP:8787 -sTCP:LISTEN
+curl -s localhost:8787/healthz
+curl -s localhost:8787/cache-health | head -20
 ```
 
-This will:
+### Step 4: Use it
 
-1. Stop the service
-2. Remove LaunchAgent plist
-3. Optionally remove log directory (prompts)
+With the agent listening, `cclaude --context` reuses the agent's proxy (it finds port 8787 already answering) — just remember its command-line flags will not apply to that process.
 
-### Remove Everything
+### Service management
 
 ```bash
-# Uninstall service and remove logs
-./uninstall.sh --remove-logs
+# Restart (picks up plist or binary changes)
+launchctl kickstart -k gui/$(id -u)/com.headroom.proxy
 
-# Remove shell integration from ~/.bashrc or ~/.zshrc
-# Delete or comment out:
-#   export HEADROOM_PORT=8787
-#   source .../shell-integration.sh
-```
-
-### Manual Uninstall
-
-```bash
-# Stop service
+# Stop / start by hand
 launchctl bootout gui/$(id -u)/com.headroom.proxy
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.proxy.plist
 
-# Remove plist
-rm ~/Library/LaunchAgents/com.headroom.proxy.plist
-
-# Remove logs (optional)
-rm -rf ~/Library/Logs/headroom
+# Disable without uninstalling (and re-enable)
+launchctl disable gui/$(id -u)/com.headroom.proxy
+launchctl enable gui/$(id -u)/com.headroom.proxy
 ```
 
-## Production Deployment
+Do not run `restart-headroom.sh` while the agent is loaded: it kills the listener and starts its own proxy, fighting `KeepAlive` for the port. Unload the agent first (`bootout`), or rebuild and `kickstart -k` instead.
 
-For production environments, consider:
+### Uninstall
 
-- **System-wide LaunchDaemon** instead of per-user LaunchAgent
-- **Resource limits** in plist (CPU, memory)
-- **Log rotation** for long-running deployments
-- **Monitoring** via external tools
-- **Multiple instances** on different ports for redundancy
+```bash
+launchctl bootout gui/$(id -u)/com.headroom.proxy
+rm ~/Library/LaunchAgents/com.headroom.proxy.plist
+# Logs (optional): rm -f ~/headroom-proxy.log ~/headroom-proxy.log.[1234]
+```
 
-LaunchAgent is designed for single-user development. For production, evaluate:
+## Logs
 
-- [Docker deployment](proxy.md#docker-deployment) for containerized environments
-- systemd on Linux servers
-- Cloud-native solutions (ECS, Cloud Run, etc.)
+One file to know: `~/headroom-proxy.log` (JSON lines). Both starters — `cclaude` and `restart-headroom.sh` — append there, and everything that reads proxy output reads that path: `headroom perf`, the `statusline-cache-perf.sh` statusline (`HEADROOM_PROXY_LOG` overrides it), `contrib/reconcile_books.py`, and `contrib/zen-rotate-watch.sh`.
 
-## Related Documentation
+Pointing the LaunchAgent's `StandardOutPath`/`StandardErrorPath` at the same file keeps all of that tooling working. Nothing rotates it under an agent — the file grows until you truncate it. `headroom perf --hours N` bounds what it reads, so a large file stays cheap to query:
 
-- [Proxy Server Documentation](proxy.md) - Core proxy configuration and features
-- [Configuration Guide](configuration.md) - Detailed configuration options
-- [Architecture](ARCHITECTURE.md) - How Headroom works internally
-- [Troubleshooting](troubleshooting.md) - General troubleshooting guide
+```bash
+headroom perf --hours 24
+headroom perf --raw | head -5
+```
 
-## Platform Alternatives
+!!! note "Per-port logs are the Python path, not this one"
+    Since the Sep-09 change, the Python `headroom proxy` / `wrap` path writes per-port runtime logs at `${HEADROOM_WORKSPACE_DIR}/logs/proxy-<port>.log` (default `~/.headroom/logs/`), plus PID-qualified `proxy-<port>-<pid>.log` files for multi-worker runs, with a legacy `proxy.log` fallback — see `upstream-python/headroom/paths.py` (`proxy_log_path`) and `wiki/cli.md`. The Rust binary has no per-port log: it writes to stdout only, and the log lives wherever the starter pointed it (`docs/filesystem-layout.md`). `headroom perf` aggregates both layouts, so history is not orphaned either way. Override the launcher-log path it reads with `HEADROOM_PROXY_LOG_PATH`.
 
-- **Linux**: Use systemd instead of LaunchAgent
-- **Windows**: Use Task Scheduler or NSSM (Non-Sucking Service Manager)
-- **Docker**: See [proxy.md](proxy.md) for containerized deployment
+## Troubleshooting
+
+| Symptom | Check / fix |
+|---|---|
+| `headroom: proxy failed to start` | `tail -n 50 ~/headroom-proxy.log` — the launcher prints exactly this path on failure |
+| Proxy exits on a flag error / usage text in the log | A stale `headroom-proxy` shadows the fresh one. The launcher and installer both warn about duplicate copies on `PATH` — `~/.local/bin` must win; remove the other (`~/.cargo/bin` is the usual suspect) |
+| Flags edited, nothing changed | A running proxy keeps the flags it started with. `pkill -f headroom-proxy` (launcher path) or `kickstart -k` (agent path), then start again |
+| Port already in use | `lsof -iTCP:8787 -sTCP:LISTEN` to find the owner; two starters means two supervisors — unload one |
+| Agent won't load / not running after login | `launchctl print gui/$(id -u)/com.headroom.proxy`; `chmod 644` the plist and confirm it is owned by you, not root; confirm `RunAtLoad` is `<true/>` |
+| `~/headroom/logs/proxy-8787.log` is stale or missing | That is the Python runtime log, not the Rust one. The Rust proxy's output is in `~/headroom-proxy.log` — check there first |
 
 ## Security Considerations
 
-### LaunchAgent vs LaunchDaemon
+The proxy binds `127.0.0.1` — localhost only, no external exposure. Do not change `--listen` to `0.0.0.0` without firewall rules.
 
-**LaunchAgent** (used here):
-
-- Runs in user context
-- No root privileges required
-- Starts on user login
-- Per-user isolation
-
-**LaunchDaemon** (not covered):
-
-- Runs as root or specific user
-- System-wide service
-- Starts on boot
-- Requires admin privileges
-
-For single-user development, LaunchAgent is recommended for security.
-
-### API Key Security
-
-Store API keys securely:
-
-- ✅ Use environment variables in shell config
-- ✅ Use macOS Keychain (advanced)
-- ✅ Restrict plist file permissions: `chmod 600`
-- ❌ Don't commit API keys to version control
-- ❌ Don't store in world-readable files
-
-### Network Security
-
-The proxy binds to `127.0.0.1` (localhost only) by default:
-
-- ✅ Only accessible from local machine
-- ✅ No external network exposure
-- ❌ Don't bind to `0.0.0.0` without firewall rules
+**LaunchAgent** (this page) runs in your user context, needs no root, and starts at login. A **LaunchDaemon** would run system-wide at boot as root — unnecessary for a single-user dev proxy, and not covered here.
 
 ## Advanced Configuration
 
-### Multiple Proxy Instances
+### Multiple instances
 
-Run multiple proxies on different ports:
+One port per process. Duplicate the plist under a new label (e.g. `com.headroom.proxy-2`), change `--listen` to `127.0.0.1:8788`, and give it its own `StandardOutPath` — two agents must not share one log file. A `cclaude` started proxy always takes 8787, so point other clients at the second port explicitly.
 
-```bash
-# Install first instance
-./install.sh --port 8787
+### Resource limits
 
-# For second instance, manually create plist with different label
-cp com.headroom.proxy.plist.template ~/Library/LaunchAgents/com.headroom.proxy-2.plist
-# Edit: Change Label to com.headroom.proxy-2, port to 8788
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.proxy-2.plist
-```
-
-### Custom LaunchAgent Schedule
-
-Run proxy only during business hours:
+Stock launchd keys work as usual under the agent:
 
 ```xml
-<!-- Add to plist -->
-<key>StartCalendarInterval</key>
-<dict>
-    <key>Hour</key>
-    <integer>9</integer>
-    <key>Minute</key>
-    <integer>0</integer>
-</dict>
-```
-
-### Resource Limits
-
-Limit CPU and memory usage:
-
-```xml
-<!-- Add to plist -->
 <key>HardResourceLimits</key>
 <dict>
     <key>NumberOfProcesses</key>
     <integer>1</integer>
-    <key>MemoryMax</key>
-    <integer>536870912</integer> <!-- 512 MB -->
 </dict>
 ```
 
-## Apple GPU (MPS) Embedding Offload
-
-On Apple Silicon, the proxy's memory embedder can run on the Apple GPU (MPS)
-instead of the default ONNX CPU backend. Offloading embedding to the GPU frees
-the CPU under load, keeping the proxy responsive — useful on fanless Macs (e.g.
-the M5 Air) that are prone to CPU-saturation timeouts.
-
-Enable it by installing the extra and setting the env var:
-
-```bash
-pip install 'headroom-ai[pytorch-mps]'   # also works as [pytorch_mps]
-export HEADROOM_EMBEDDER_RUNTIME=pytorch_mps
-```
-
-Under a LaunchAgent, set the env var in the plist `EnvironmentVariables`
-section:
-
-```xml
-<key>HEADROOM_EMBEDDER_RUNTIME</key>
-<string>pytorch_mps</string>
-```
-
-It only engages when Apple MPS is actually available (Apple Silicon + torch).
-If MPS is unavailable or the dependencies are missing, the proxy logs a warning
-and uses the existing default embedder selection path. This is strictly opt-in;
-default behavior is unchanged. See [Memory](memory.md#embedding-runtime--gpu-offload-apple-silicon)
-for details.
+After any plist edit: `launchctl kickstart -k gui/$(id -u)/com.headroom.proxy`.
 
 ## FAQ
 
-**Q: Why LaunchAgent instead of running `headroom proxy` manually?**
+**Q: Why not just run the proxy by hand?**
 
-A: LaunchAgent provides automatic startup, crash recovery, and proper lifecycle management. You don't have to remember to start the proxy or keep a terminal window open.
+A: You can: `headroom-proxy --upstream https://api.anthropic.com --listen 127.0.0.1:8787`, then `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` for any client. `cclaude --context` just automates that and keeps one shared instance.
 
-**Q: Can I use this in production?**
+**Q: Do I need the LaunchAgent if I already use `cclaude`?**
 
-A: LaunchAgent is designed for development. For production, use Docker, systemd, or cloud-native deployment.
+A: No. The agent is only for login-time startup without a shell. One supervisor at a time.
 
-**Q: How much does the proxy impact performance?**
+**Q: Where did the `./install.sh --port` installer go?**
 
-A: Minimal. The proxy adds ~10-50ms latency while reducing token costs by 50-90%. The cost savings far outweigh the latency.
+A: That was the Python-era installer (`uv tool install "headroom-ai[proxy]"` plus a generated plist). It has no Rust equivalent in this repo. Port selection for the Rust proxy is the `--listen` flag / `HEADROOM_PROXY_LISTEN`.
 
-**Q: Do I need to restart the proxy when configuration changes?**
+**Q: Does this work on Apple Silicon?**
 
-A: Yes. After changing the plist, reload the service:
+A: Yes. The Rust binary builds and runs on arm64; the installer pulls the GNU toolchain it needs through Homebrew.
 
-```bash
-launchctl kickstart -k gui/$(id -u)/com.headroom.proxy
-```
+## Related Documentation
 
-**Q: Can I use this with multiple API providers?**
-
-A: The LaunchAgent setup is Anthropic-specific. For other providers, see [proxy.md](proxy.md) for configuration options.
-
-**Q: Does this work with Apple Silicon (M1/M2/M3)?**
-
-A: Yes, fully compatible. ML compression (Kompress, opt-in via `headroom-ai[ml]`) auto-detects MPS on Apple Silicon.
+- [Proxy Server Documentation](proxy.md) - Core proxy configuration and features
+- [Filesystem Contract](filesystem-contract.md) - Where state, logs, and config live
+- [CLI Reference](cli.md) - `headroom perf`, `doctor`, and `savings`
+- [Configuration Guide](configuration.md) - Detailed configuration options
+- [Troubleshooting](troubleshooting.md) - General troubleshooting guide

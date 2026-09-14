@@ -1,5 +1,8 @@
 # SharedContext — Compressed Inter-Agent Context Sharing
 
+!!! note "Python SDK mirror"
+    This page documents the Python SDK, which now lives in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. The production proxy itself is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`).
+
 When agents hand off to each other, context gets replayed in full. SharedContext compresses what moves between agents using Headroom's compression pipeline.
 
 ## Quick Start

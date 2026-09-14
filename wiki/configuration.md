@@ -1,5 +1,8 @@
 # Configuration
 
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
+
 Headroom can be configured via the SDK, proxy command line, or per-request overrides.
 
 ## Runtime Rollout Channels
@@ -196,12 +199,12 @@ from headroom import CacheAlignerConfig
 
 config = CacheAlignerConfig(
     # Enable/disable cache alignment (disabled by default: prefix-stability
-    # gains are marginal in practice -- see headroom/config.py:61)
+    # gains are marginal in practice -- see upstream-python/headroom/config.py:61)
     enabled=True,
     # Legacy pattern list (only used when use_dynamic_detector=False;
     # the field is `date_patterns`, not `dynamic_patterns`). Default mode
     # (use_dynamic_detector=True) auto-detects dates, UUIDs, tokens, etc.
-    # via detection_tiers instead -- see headroom/config.py:68-79.
+    # via detection_tiers instead -- see upstream-python/headroom/config.py:68-79.
     use_dynamic_detector=False,
     date_patterns=[
         r"Today is \w+ \d+, \d{4}",

@@ -1,150 +1,70 @@
 # Getting Started with Headroom
 
-This guide will help you get up and running with Headroom in under 5 minutes.
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths anywhere in this wiki now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
 
-## Installation
+The fuller tutorial: install → run → verify → first useful workflows. For the fastest copy-paste path, see [Quickstart](quickstart.md); for the map of the whole wiki, see [Headroom home](index.md).
 
-**CLI on macOS Apple Silicon/Linux with uv:**
+## 1. Install
 
-```bash
-uv tool install --python 3.13 "headroom-ai[all]"
-headroom --version
-```
-
-Use `uv tool update-shell` if the install succeeds but `headroom` is not on
-`PATH`.
-
-**Python project / virtualenv:**
+Prerequisites: git, Rust via rustup, plus `jq` and `lsof`.
 
 ```bash
-# Core package (minimal dependencies)
-pip install headroom-ai
-
-# With proxy server
-pip install "headroom-ai[proxy]"
-
-# With semantic relevance (for smarter compression)
-pip install "headroom-ai[relevance]"
-
-# Everything
-pip install "headroom-ai[all]"
+git clone https://github.com/RubenAAA/headroom.git ~/headroom
+cd ~/headroom
+./install.sh
 ```
 
-**TypeScript / Node.js:**
+This builds the release binaries and installs `headroom-proxy` and `headroom` to `~/.local/bin`, plus the `cclaude` launcher, `restart-headroom.sh`, the flags file (`~/.headroom-flags.sh`), and the status line. `./install.sh --help` lists the options.
+
+!!! tip "`--link` is for working on Headroom itself"
+    Pass `./install.sh --link` only if the machine is for developing Headroom: it symlinks the scripts and the flags file into the checkout, so editing the repo edits the live setup. Otherwise the installer copies, and an existing `~/.headroom-flags.sh` is left alone (delete it to regenerate).
+
+## 2. Run
 
 ```bash
-npm install headroom-ai
+cclaude --context
 ```
 
-**Docker-native:**
+`--context` routes through the proxy: the launcher starts it if nothing is listening on 8787 (with the measured flags from `~/.headroom-flags.sh`), sets `ANTHROPIC_BASE_URL`, and execs `claude` with the rest of your arguments.
+
+!!! warning "Always `cclaude --context`, never bare `claude`"
+    Plain `claude` talks straight to the API and the proxy does nothing. Bare `cclaude` without `--context` is plain passthrough too — `--context` is what puts the proxy in the path (see `contrib/claude-launcher`).
+
+## 3. Verify
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.sh | bash
+curl -s localhost:8787/healthz
+# {"ok":true,"service":"headroom-proxy"}
+
+curl -s localhost:8787/cache-health
+# hit rates and recent cache events
+
+headroom doctor
+# proxy liveness + local ledgers
+
+headroom savings
+# durable compression savings over time
 ```
 
-PowerShell:
+Do a little work in the session first — `headroom savings` reads the local ledger, so it only shows numbers once traffic has flowed.
 
-```powershell
-irm https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.ps1 | iex
-```
+!!! warning "The health path is `/healthz`, not `/health`"
+    `curl -s localhost:8787/healthz` is the ground truth: `{"ok": true}` means the proxy is up, while a 404 or refused connection means nothing is listening. See [Troubleshooting](troubleshooting.md).
 
-See [Docker-native install](docker-install.md) for wrapper behavior, compose usage, and host-integrated `wrap` flows.
+## 4. First useful workflows
 
-If you want Headroom to stay up in the background and automatically serve supported tools, use [Persistent Installs](persistent-installs.md):
+**Tune flags, then restart.** The measured settings live in `~/.headroom-flags.sh`, sourced by both the launcher and `restart-headroom.sh`. Edit them there, then apply with:
 
 ```bash
-headroom install apply --preset persistent-service --providers auto
+restart-headroom.sh
 ```
 
-## Quick Start: Proxy Mode (Recommended)
+This restarts the proxy onto the freshly built binary, and rolls back to the previous one if the new build fails to come up. Note a running proxy is reused and keeps the flags it started with — editing the file alone changes nothing until a restart. Full option list: `headroom-proxy --help`; every flag also has a `HEADROOM_PROXY_*` environment variable. See [Configuration](configuration.md) and [Proxy](proxy.md).
 
-The easiest way to use Headroom is as a proxy server:
+**Read the savings.** `headroom savings` shows durable compression savings over time (see [Metrics](metrics.md) for the health, cache-hit, and savings endpoints).
 
-```bash
-# Start the proxy
-headroom proxy --port 8787
-```
+## 5. Python SDK mirror (not the live path)
 
-Then point your LLM client at it:
-
-```bash
-# Claude Code
-ANTHROPIC_BASE_URL=http://localhost:8787 claude
-
-# GitHub Copilot CLI (default Anthropic-style proxy route)
-headroom wrap copilot -- --model claude-sonnet-4-20250514
-
-# OpenAI-compatible clients
-OPENAI_BASE_URL=http://localhost:8787/v1 your-app
-```
-
-That's it! All your requests now go through Headroom and get optimized automatically.
-
-## Quick Start: Python SDK
-
-If you want programmatic control:
-
-```python
-from headroom import HeadroomClient
-from openai import OpenAI
-
-# Create a wrapped client
-client = HeadroomClient(
-    original_client=OpenAI(),
-    default_mode="optimize",
-)
-
-# Use exactly like the original
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Hello!"},
-    ],
-)
-```
-
-## Modes
-
-### Audit Mode
-
-Observe without modifying:
-
-```python
-client = HeadroomClient(
-    original_client=OpenAI(),
-    default_mode="audit",
-)
-# Logs metrics but doesn't change requests
-```
-
-### Optimize Mode
-
-Apply transforms to reduce tokens:
-
-```python
-client = HeadroomClient(
-    original_client=OpenAI(),
-    default_mode="optimize",
-)
-# Compresses tool outputs, aligns cache prefixes, etc.
-```
-
-### Simulate Mode
-
-Preview what optimizations would do:
-
-```python
-plan = client.chat.completions.simulate(
-    model="gpt-4o",
-    messages=[...],
-)
-print(f"Would save {plan.tokens_saved} tokens")
-print(f"Transforms: {plan.transforms}")
-```
-
-## Next Steps
-
-- [Proxy Server Documentation](proxy.md) - Configure the proxy
-- [Transforms Reference](transforms.md) - Understand each transform
-- [API Reference](api.md) - Full API documentation
+!!! note "Read-only mirror"
+    The `headroom-ai` pip/uv package, the Python SDK, and `headroom proxy` live in the read-only `upstream-python/` mirror. They are not built here; they exist so upstream diffs stay readable when porting. [Full SDK docs](sdk.md).

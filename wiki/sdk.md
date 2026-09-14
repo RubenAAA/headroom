@@ -1,5 +1,8 @@
 # SDK Guide
 
+!!! note "Python SDK mirror"
+    This page documents the Python SDK, which now lives in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. The production proxy itself is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`).
+
 The Headroom SDK wraps your existing LLM client to add compression and optimization transparently.
 
 ## Installation

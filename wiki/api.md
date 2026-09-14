@@ -1,5 +1,8 @@
 # API Reference
 
+!!! note "Python SDK mirror"
+    This page documents the Python SDK, which now lives in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. The production proxy itself is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`).
+
 ## HeadroomClient
 
 The main entry point for Headroom SDK.

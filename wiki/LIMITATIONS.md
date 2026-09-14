@@ -1,5 +1,8 @@
 # Headroom Limitations & Known Behavior
 
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
+
 Honest documentation of when Headroom helps, when it doesn't, and what to watch out for.
 
 ## When Headroom Helps (and When It Doesn't)

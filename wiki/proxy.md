@@ -1,7 +1,7 @@
 # Proxy Server Documentation
+
 !!! note "Live implementation: Rust"
     The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
-
 
 The Headroom proxy server is a production-ready HTTP server that applies context optimization to all requests passing through it.
 
@@ -64,6 +64,14 @@ LANGFUSE_BASE_URL=https://cloud.langfuse.com
 When configured, Headroom emits OTLP traces for the shared compression pipeline to Langfuse while continuing to expose metrics through `/metrics` and OTEL metric exporters.
 
 ## Command Line Options
+
+> **Which proxy?** This table documents the Python `headroom proxy` CLI. The
+> production Rust proxy (`headroom-proxy`, launched with `cclaude`) takes
+> different flags — run `headroom-proxy --help` for the authoritative list.
+> In particular the Rust proxy has no `--openai-api-url`: point it at a custom
+> OpenAI-compatible upstream with the required `--upstream` base URL, per-model
+> `--extra-model-route "name*=URL:openai"`, or the per-request
+> `x-headroom-base-url` header.
 
 ### Core Options
 

@@ -1,398 +1,137 @@
-# Universal Compression
+# Compression
 
-Headroom's Universal Compression module provides intelligent, automatic compression with ML-based content detection and structure preservation.
+!!! note "Live implementation: Rust"
+    The production proxy is the Rust binary (`crates/headroom-proxy`, launched with `cclaude`). Python paths on this page now live in the read-only `upstream-python/` mirror — re-resolve any `headroom/*.py` cite there. Behavior described here still holds; only the implementation moved.
 
-## Overview
+Compression shrinks the wasteful parts of LLM traffic — huge repetitive
+tool outputs — deterministically (statistical analysis and rules, no LLM
+calls), inside the proxy, before the request goes upstream. It touches
+only the newest content blocks, never the cached prefix, and every lossy
+step is reversible via CCR.
 
-Universal Compression combines several techniques:
+This page is the concept and the what-runs-where map. The stage-by-stage
+pipeline order lives in [ARCHITECTURE.md](ARCHITECTURE.md); per-transform
+knobs live in the [Transform Reference](transforms.md).
 
-1. **ML-based Detection** - Automatically detects content type (JSON, code, logs, text) using Magika
-2. **Structure Preservation** - Keeps keys, signatures, and templates intact via structure masks
-3. **Intelligent Compression** - Compresses content while preserving meaning with the optional ML compressor (Kompress)
-4. **Reversible via CCR** - Stores originals for retrieval when LLM needs full context
+## What compresses
 
-## Quick Start
+The live-zone dispatcher (`crates/headroom-core/src/transforms/live_zone.rs`)
+detects each eligible block's content type and routes it to one compressor:
 
-### One-Liner
+| Content | Compressor | Module |
+|---------|-----------|--------|
+| JSON arrays | SmartCrusher | `crates/headroom-core/src/transforms/smart_crusher/` |
+| Build / test / log output | LogCompressor | `crates/headroom-core/src/transforms/log_compressor.rs` |
+| Grep / ripgrep output | SearchCompressor | `crates/headroom-core/src/transforms/search_compressor.rs` |
+| Unified diffs | DiffCompressor | `crates/headroom-core/src/transforms/diff_compressor.rs` |
+| Source code | CodeCompressor | `crates/headroom-core/src/transforms/code_compressor.rs` |
+| Plain prose | Kompress (ML, opt-in) | `crates/headroom-core/src/transforms/kompress.rs` |
+| HTML | No-op (extraction, not compression) | — |
 
-```python
-from headroom.compression import compress
+Two gates keep the dispatcher honest: blocks under the ~512-byte
+per-type floor are skipped without even spinning up a compressor, and a
+tokenizer check rejects any output that is not strictly smaller in tokens
+(`compressed.tokens >= original.tokens` falls back to the original bytes).
 
-result = compress(content)
-print(result.compressed)
-print(f"Saved {result.savings_percentage:.0f}% tokens")
-```
+### Detection
 
-### With Configuration
+Detection is regex-native by default
+(`crates/headroom-core/src/transforms/content_detector.rs`, dispatched via
+`crates/headroom-core/src/transforms/content_router.rs`): JSON shape, code
+syntax, `file:line:` patterns, timestamps and log levels, diff headers.
+Magika (`crates/headroom-core/src/transforms/magika_detector.rs`, behind
+the `ml` feature) acts as an ML Tier 1 classifier whose labels map onto
+the same `ContentType` enum; failures fall through to the regex tiers
+rather than silently degrading to plain text.
 
-```python
-from headroom.compression import UniversalCompressor, UniversalCompressorConfig
+### What is preserved
 
-config = UniversalCompressorConfig(
-    compression_ratio_target=0.5,  # Keep 50% of content
-    use_entropy_preservation=True,  # Preserve UUIDs, hashes
-)
-
-compressor = UniversalCompressor(config=config)
-result = compressor.compress(content)
-```
-
----
-
-## How It Works
-
-### Detection Flow
-
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Content   │───>│   Detect    │───>│   Extract   │───>│  Compress   │
-│   Input     │    │   Type      │    │   Structure │    │  Content    │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-                         │                   │                   │
-                         ▼                   ▼                   ▼
-                   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-                   │   Magika    │    │   Handler   │    │  Kompress   │
-                   │   (ML)      │    │   (JSON,    │    │  (ML, opt-  │
-                   │             │    │   Code...)  │    │  in [ml])   │
-                   └─────────────┘    └─────────────┘    └─────────────┘
-```
-
-### Structure Masks
-
-Structure masks identify what to preserve:
+Every compressor preserves structure and drops bulk:
 
 | Content Type | What's Preserved | What's Compressed |
 |--------------|------------------|-------------------|
-| **JSON** | Keys, brackets, booleans, nulls, short values, UUIDs | Long string values, whitespace |
+| **JSON** | Keys, brackets, booleans, nulls, short values, UUIDs | Long string values, whitespace, redundant array items |
 | **Code** | Imports, function signatures, class definitions, types | Function bodies, comments |
 | **Logs** | Timestamps, log levels, error messages | Repeated patterns, verbose details |
 | **Text** | High-entropy tokens (IDs, hashes) | Low-information content |
 
----
-
-## Configuration
-
-### UniversalCompressorConfig
-
-```python
-from headroom.compression import UniversalCompressorConfig
-
-config = UniversalCompressorConfig(
-    # Detection
-    use_magika=True,  # Use ML-based detection (requires magika)
-    # Compression
-    # (Note: the legacy `use_llmlingua` flag was retired with the
-    # LLMLingua-2 integration. The optional ML compressor is now Kompress,
-    # installed via `headroom-ai[ml]` and configured separately.)
-    compression_ratio_target=0.3,  # Keep 30% of content (70% reduction)
-    min_content_length=100,  # Skip content shorter than this
-    # Structure preservation
-    use_entropy_preservation=True,  # Preserve high-entropy tokens
-    entropy_threshold=0.85,  # Entropy threshold for preservation
-    # CCR
-    ccr_enabled=True,  # Store originals for retrieval
-)
-```
-
-### Configuration Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `use_magika` | `True` | Use ML-based content detection |
-| `use_kompress` | `True` | Use Kompress for content compression (`use_llmlingua` was retired; passing it raises `TypeError`) |
-| `compression_ratio_target` | `0.3` | Target ratio (0.3 = keep 30%) |
-| `min_content_length` | `100` | Minimum chars to compress |
-| `use_entropy_preservation` | `True` | Preserve high-entropy tokens |
-| `entropy_threshold` | `0.85` | Entropy threshold (0.0-1.0) |
-| `ccr_enabled` | `True` | Enable CCR storage |
-
----
-
-## Content Handlers
-
-### JSON Handler
-
-Preserves JSON structure while compressing values:
-
-```python
-from headroom.compression.handlers.json_handler import JSONStructureHandler
-
-handler = JSONStructureHandler(
-    preserve_short_values=True,  # Keep values < 20 chars
-    short_value_threshold=20,  # Threshold for "short"
-    preserve_high_entropy=True,  # Keep UUIDs, hashes
-    entropy_threshold=0.85,  # Entropy threshold
-    max_array_items_full=3,  # Keep first N array items full
-    max_number_digits=10,  # Preserve numbers up to N digits
-)
-```
-
-**What's Preserved:**
-- All keys (navigational - LLM sees schema)
-- Structural syntax (`{`, `}`, `[`, `]`, `:`, `,`)
-- Booleans and nulls (semantically important)
-- High-entropy strings (UUIDs, hashes - identifiers)
-- Short numbers (often IDs)
-
-**Example:**
-
-```python
-# Before
-{"id": "usr_abc123", "name": "Alice Johnson", "bio": "A long description that goes on and on..."}
-
-# After (structure preserved, long values compressed)
-{"id": "usr_abc123", "name": "Alice Johnson", "bio": "A long...[compressed]..."}
-```
-
-### Code Handler
-
-Preserves code structure using AST parsing (tree-sitter) or regex fallback:
-
-```python
-from headroom.compression.handlers.code_handler import CodeStructureHandler
-
-handler = CodeStructureHandler(
-    preserve_comments=False,  # Preserve comments as structural
-    use_tree_sitter=True,  # Use tree-sitter for parsing
-    default_language="python",  # Default when detection fails
-)
-```
-
-**What's Preserved:**
-- Import statements
-- Function/method signatures
-- Class definitions
-- Type annotations
-- Decorators
-
-**What's Compressed:**
-- Function bodies (implementations)
-- Comments (unless `preserve_comments=True`)
-
-**Example:**
-
-```python
-# Before
-def process_data(items: List[str]) -> Dict[str, int]:
-    """Process items and count occurrences."""
-    result = {}
-    for item in items:
-        item = item.strip().lower()
-        if item in result:
-            result[item] += 1
-        else:
-            result[item] = 1
-    return result
-
-# After (signature preserved, body compressed)
-def process_data(items: List[str]) -> Dict[str, int]:
-    """Process items and count occurrences."""
-    result = {}
-    for item in items:
-    ...[compressed]...
-```
-
-### Supported Languages
-
-| Language | Parser | Support Level |
-|----------|--------|---------------|
-| Python | tree-sitter | Full AST |
-| JavaScript | tree-sitter | Full AST |
-| TypeScript | tree-sitter | Full AST |
-| Go | tree-sitter | Full AST |
-| Rust | tree-sitter | Full AST |
-| Java | tree-sitter | Full AST |
-| C | tree-sitter | Full AST |
-| C++ | tree-sitter | Full AST |
-
----
-
-## Compression Result
-
-```python
-from headroom.compression import compress
-
-result = compress(content)
-
-# Access result fields
-print(result.compressed)  # Compressed content
-print(result.original)  # Original content
-print(result.compression_ratio)  # e.g., 0.35 (35% of original size)
-print(result.tokens_before)  # Estimated tokens before
-print(result.tokens_after)  # Estimated tokens after
-print(result.tokens_saved)  # tokens_before - tokens_after
-print(result.savings_percentage)  # e.g., 65.0 (65% savings)
-
-# Detection info
-print(result.content_type)  # ContentType.JSON, CODE, etc.
-print(result.detection_confidence)  # 0.0-1.0
-
-# Structure info
-print(result.handler_used)  # "json", "code", etc.
-print(result.preservation_ratio)  # Fraction preserved as structure
-
-# CCR info
-print(result.ccr_key)  # Key for retrieval (if CCR enabled)
-```
-
----
-
-## Batch Compression
-
-For multiple contents, batch compression is more efficient:
-
-```python
-from headroom.compression import UniversalCompressor
-
-compressor = UniversalCompressor()
-
-contents = [
-    '{"users": [...]}',
-    "def hello(): pass",
-    "Plain text content",
-]
-
-results = compressor.compress_batch(contents)
-
-for result in results:
-    print(f"{result.content_type}: {result.savings_percentage:.0f}% saved")
-```
-
----
-
-## Custom Handlers
-
-Register custom handlers for specific content types:
-
-```python
-from headroom.compression import UniversalCompressor
-from headroom.compression.detector import ContentType
-from headroom.compression.handlers.base import BaseStructureHandler, HandlerResult
-from headroom.compression.masks import StructureMask
-
-
-class LogStructureHandler(BaseStructureHandler):
-    """Custom handler for log content."""
-
-    def __init__(self):
-        super().__init__(name="log")
-
-    def can_handle(self, content: str) -> bool:
-        return "[INFO]" in content or "[ERROR]" in content
-
-    def _extract_mask(self, content, tokens, **kwargs):
-        # Mark timestamps and log levels as structural
-        mask = [False] * len(content)
-        # ... (custom logic)
-        return HandlerResult(
-            mask=StructureMask(tokens=tokens, mask=mask),
-            handler_name=self.name,
-            confidence=0.9,
-        )
-
-
-# Register the custom handler
-compressor = UniversalCompressor()
-compressor.register_handler(ContentType.TEXT, LogStructureHandler())
-```
-
----
-
-## CCR Integration
-
-Universal Compression integrates with CCR (Compress-Cache-Retrieve) for reversible compression:
-
-```python
-from headroom.compression import UniversalCompressor, UniversalCompressorConfig
-
-config = UniversalCompressorConfig(ccr_enabled=True)
-compressor = UniversalCompressor(config=config)
-
-result = compressor.compress(large_content)
-
-# CCR key for retrieval
-if result.ccr_key:
-    print(f"Original stored with key: {result.ccr_key}")
-    # LLM can request original via CCR when needed
-```
-
-See [CCR Guide](ccr.md) for full CCR documentation.
-
----
-
-## Performance
-
-| Content Type | Compression | Speed | Accuracy |
-|--------------|-------------|-------|----------|
-| JSON (large arrays) | 70-90% | ~1ms | Keys preserved |
-| Code (Python) | 50-70% | ~10ms | Signatures preserved |
-| Plain text | 60-80% | ~5ms | High-entropy preserved |
-
-**Overhead:** ~1-10ms per compression depending on content size and type.
-
----
-
-## Installation
-
-```bash
-# Basic compression (fallback to simple compression)
-pip install headroom-ai
-
-# With ML detection (recommended)
-pip install "headroom-ai[magika]"
-
-# With LLMLingua compression
-pip install "headroom-ai[llmlingua]"
-
-# With AST-based code handling
-pip install "headroom-ai[code]"
-
-# Everything
-pip install "headroom-ai[all]"
-```
-
----
-
-## Example: Full Pipeline
-
-```python
-from headroom.compression import UniversalCompressor, UniversalCompressorConfig
-
-# Configure for aggressive compression
-config = UniversalCompressorConfig(
-    compression_ratio_target=0.25,  # Keep 25%
-    use_magika=True,
-    use_kompress=True,
-    ccr_enabled=True,
-)
-
-compressor = UniversalCompressor(config=config)
-
-# Compress JSON API response
-json_content = """
-{
-    "users": [
-        {"id": "usr_123", "name": "Alice", "bio": "Software engineer..."},
-        {"id": "usr_456", "name": "Bob", "bio": "Product manager..."}
-    ],
-    "total": 2,
-    "page": 1
-}
-"""
-
-result = compressor.compress(json_content)
-
-print(f"Type: {result.content_type}")  # ContentType.JSON
-print(f"Handler: {result.handler_used}")  # json
-print(f"Saved: {result.savings_percentage:.0f}%")  # ~60%
-print(f"Structure: {result.preservation_ratio:.0%} preserved")  # ~40%
-print(f"CCR Key: {result.ccr_key}")  # For retrieval
-```
-
----
+Safety invariants (shared with all transforms): human content is never
+removed, tool call/result pairing is never broken, parse failures pass
+content through untouched, and error items are always kept. See
+[Transform Reference](transforms.md#safety-guarantees).
+
+## Where in the pipeline it runs
+
+Compression is one stage of the request path described in
+[ARCHITECTURE.md](ARCHITECTURE.md). Its neighbors matter:
+
+- **Sidecar short-circuit comes first**
+  (`crates/headroom-proxy/src/sidecar.rs`). Claude Code's spinner-text
+  sidecar resends the conversation to render a status line; the proxy
+  answers it with a tail-only request to a small model before any
+  pipeline state runs, so it neither bills a full prefix read nor
+  poisons the replay store.
+- **CTX offload runs before live-zone compression**
+  (`crates/headroom-proxy/src/compression/ctx_offload.rs`). Oversized
+  `tool_result` blocks are replaced with `<<ctx:…>>` digests and the
+  originals persist into the CCR store. The live zone recognizes those
+  digests and skips them — re-compressing a digest would buy almost
+  nothing and bury the true bytes under a second marker.
+- **Live-zone compression rewrites only the newest blocks**
+  (`crates/headroom-proxy/src/compression/live_zone_anthropic.rs`,
+  `live_zone_openai.rs`, `live_zone_responses.rs` calling into
+  `crates/headroom-core/src/transforms/live_zone.rs`). Everything outside
+  the rewritten ranges is spliced through byte-identical, so the cached
+  prefix the provider already holds stays stable.
+- **Prefix replay runs after**
+  (`crates/headroom-proxy/src/cache_stabilization/prefix_replay.rs`).
+  The previously *forwarded* (compressed) prefix is replayed byte-for-byte
+  when the turn append-only-extends the last one; only the new delta goes
+  out as fresh compressor output. Deterministic output matters here:
+  identical content must compress to identical bytes turn after turn, or
+  the prefix oscillates and the provider cache cascades.
+
+!!! warning "Reversibility is a requirement, not a feature"
+    Each rewritten block stores its original under a hash and appends a
+    `<<ccr:HASH>>` marker the model can redeem with `headroom_retrieve`.
+    See [CCR](ccr.md) for the operator-facing details.
+
+## Kompress (opt-in ML prose compression)
+
+SmartCrusher/Log/Search/Diff/Code are deterministic and always on.
+Kompress is the ML exception: a ModernBERT token-salience model (~261 MB
+ONNX) that keeps only the words the model scores as salient. Because of
+its size it is opt-in at startup (`--enable-kompress`), loads cache-only
+(never downloads on the request path), and warms off-path via
+`warm_live_zone_compressors` — until warming completes, plain-text blocks
+pass through. When disabled or uncached, prose simply skips compression;
+nothing else changes.
+
+## Observing savings
+
+- **`GET /stats`** (`crates/headroom-proxy/src/handlers/stats.rs`) is the
+  operator view: cost totals, the durable `persistent_savings` ledger
+  (backed by `crates/headroom-core/src/savings_ledger.rs` alongside
+  `crates/headroom-core/src/cost_tracker.rs`), savings/wire verdicts,
+  per-tool inventory, proxy overhead, and recent requests. History lives
+  at `/stats-history`; `headroom savings` renders the same ledger from
+  disk without a running proxy.
+- **`turn_cost_ledger`** (`crates/headroom-proxy/src/cache_stabilization/usage_observer.rs`)
+  is the per-turn structured-log ledger joining billed usage across
+  retrieval and continuation rounds, so one turn's true cost is visible
+  in one place.
+- **`GET /cache-health`** is the cache watchdog snapshot (hit rates,
+  re-cache counts, upstream health) — the proof that compression is not
+  busting the provider prefix cache it exists to protect.
+
+> **Sourced numbers live elsewhere:** illustrative token counts are
+> deliberately not repeated here. For measured compression figures see
+> [Benchmarks](benchmarks.md); for the metrics surface see
+> [Metrics](metrics.md).
 
 ## See Also
 
-- [Transforms Reference](transforms.md) - Other compression transforms
-- [CCR Guide](ccr.md) - Reversible compression architecture
-- [Text Compression](text-compression.md) - Opt-in utilities for search/logs
+- [Transform Reference](transforms.md) — per-transform behavior and configuration
+- [ARCHITECTURE.md](ARCHITECTURE.md) — the full request pipeline
+- [CCR](ccr.md) — reversible compression and retrieval
+- [Text Compression](text-compression.md) — opt-in utilities for search/logs
