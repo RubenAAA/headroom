@@ -142,6 +142,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
+      # Guards the ML-free build: with `ml` off, ort/fastembed/magika leave the
+      # dependency tree entirely, so a missing `#[cfg(feature = "ml")]` only
+      # shows up here. Users who do not want ONNX Runtime build this way.
+      - name: cargo check --no-default-features
+        run: |
+          cargo check -p headroom-core --no-default-features --all-targets
+          cargo check -p headroom-proxy --no-default-features --all-targets
       - name: cargo test
         run: cargo test --workspace
 

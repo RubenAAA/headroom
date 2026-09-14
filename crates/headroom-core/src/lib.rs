@@ -82,6 +82,7 @@ pub fn hello() -> &'static str {
 ///   (default: `NPU`; also accepts `CPU`, `GPU`, `GPU.0`, `HETERO:NPU,GPU`)
 /// - `HEADROOM_ORT_OPENVINO_CACHE` — directory for compiled NPU/GPU blobs;
 ///   first run compiles and saves, subsequent runs load instantly
+#[cfg(feature = "ml")]
 pub fn init_ort_ep() {
     use ort::execution_providers::{OpenVINO, CUDA};
 
@@ -141,6 +142,12 @@ pub fn init_ort_ep() {
         ),
     }
 }
+
+/// Without the `ml` feature there is no ONNX Runtime linked in, so there is no
+/// execution provider to pick. Kept as a no-op so callers need no `cfg` of
+/// their own.
+#[cfg(not(feature = "ml"))]
+pub fn init_ort_ep() {}
 
 #[cfg(test)]
 mod tests {

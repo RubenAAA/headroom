@@ -37,6 +37,7 @@ use lru::LruCache;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "ml")]
 use super::kompress::Kompress;
 
 /// Number of most-recent assistant turns whose reasoning is left intact.
@@ -86,6 +87,7 @@ pub trait ThinkingCompressor {
     fn compress_thinking(&self, text: &str) -> Option<String>;
 }
 
+#[cfg(feature = "ml")]
 impl ThinkingCompressor for Kompress {
     fn compress_thinking(&self, text: &str) -> Option<String> {
         // Mirrors Python's `allow_download=False` call: the model is loaded

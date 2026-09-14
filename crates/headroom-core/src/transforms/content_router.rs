@@ -2019,6 +2019,7 @@ fn try_kompress(
     }
 
     // Try to load and run Kompress
+    #[cfg(feature = "ml")]
     match super::kompress::Kompress::from_cache(super::kompress::KompressConfig::default()) {
         Ok(Some(kompress)) => {
             let result = kompress.compress(content);

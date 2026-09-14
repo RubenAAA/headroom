@@ -109,6 +109,7 @@ use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
 use super::content_router::detect_content_native;
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
+#[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::read_protection::{
@@ -683,10 +684,15 @@ pub fn kompress_status() -> KompressStatus {
     if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
         return KompressStatus::Disabled;
     }
+    #[cfg(feature = "ml")]
     match KOMPRESS_INSTANCE.get() {
         Some(Some(_)) => KompressStatus::Loaded,
         _ => KompressStatus::Deferred,
     }
+    // Without `ml` there is no ONNX session to load, so the switch being on
+    // changes nothing — report it the same way a switched-off model reads.
+    #[cfg(not(feature = "ml"))]
+    KompressStatus::Disabled
 }
 
 // Loaded Kompress singleton. Populated **only** by `warm_live_zone_compressors`
@@ -694,6 +700,7 @@ pub fn kompress_status() -> KompressStatus {
 // path. The model is a ~261 MB ONNX session whose load can be slow (and on the
 // OpenVINO/NPU EP, the int8 graph compile can take many seconds), so the
 // request path must never trigger or block on that init. See `kompress()`.
+#[cfg(feature = "ml")]
 static KOMPRESS_INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
 
 // Kompress is the ML prose compressor. Unlike the others it carries a ~261 MB
@@ -708,6 +715,7 @@ static KOMPRESS_INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
 // doing so makes a request thread block on the (possibly slow/hung) model load,
 // which previously stalled the whole proxy when the NPU compile didn't return.
 // The load happens once, off the request path, in `warm_live_zone_compressors`.
+#[cfg(feature = "ml")]
 fn kompress() -> Option<&'static Kompress> {
     if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
         return None;
@@ -732,16 +740,23 @@ pub fn warm_live_zone_compressors() -> bool {
     let _ = code_compressor();
     // Kompress: perform the (potentially slow) load here, off the request path.
     // `Some` iff enabled AND the model was already in the HF cache.
-    KOMPRESS_INSTANCE
-        .get_or_init(|| {
-            if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
-                return None;
-            }
-            Kompress::from_cache(KompressConfig::default())
-                .ok()
-                .flatten()
-        })
-        .is_some()
+    #[cfg(feature = "ml")]
+    {
+        KOMPRESS_INSTANCE
+            .get_or_init(|| {
+                if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
+                    return None;
+                }
+                Kompress::from_cache(KompressConfig::default())
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+    }
+    // No ONNX Runtime linked in, so there is nothing to warm and no model to
+    // report as ready. The lexical compressors above are warmed either way.
+    #[cfg(not(feature = "ml"))]
+    false
 }
 
 // ─── Public entry point ────────────────────────────────────────────────
@@ -2174,6 +2189,8 @@ fn dispatch_compressor_with_config(
     result
 }
 
+// `config` carries the target ratio, which only the Kompress arm reads.
+#[cfg_attr(not(feature = "ml"), allow(unused_variables))]
 fn dispatch_compressor_uncached(
     text: &str,
     content_type: ContentType,
@@ -2293,6 +2310,7 @@ fn dispatch_compressor_uncached(
                 declined_by: None,
             }
         }
+        #[cfg(feature = "ml")]
         ContentType::PlainText => match kompress() {
             // Cache-only model present → let it score the prose. Passes
             // through (NoOp) when the model keeps everything or the input is
@@ -2319,6 +2337,13 @@ fn dispatch_compressor_uncached(
                 content_type: content_type.as_str(),
                 declined_by: None,
             },
+        },
+        // Same passthrough as an uncached model, reached without `ml` because
+        // no prose compressor is built in at all.
+        #[cfg(not(feature = "ml"))]
+        ContentType::PlainText => DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+            declined_by: None,
         },
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.

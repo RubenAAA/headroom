@@ -50,7 +50,9 @@ humantime = "2"
 bytesize = "2"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7" }
-headroom-core = { path = "../headroom-core" }
+# `default-features = false` so the proxy's own `ml` feature is what decides
+# whether ONNX Runtime is linked; see `[features]` below.
+headroom-core = { path = "../headroom-core", default-features = false }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS
@@ -135,6 +137,17 @@ chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
 # header-map churn); measured 1.6-1.7x on that workload vs the system
 # allocator with byte-identical output. See `src/main.rs`.
 mimalloc = "0.1"
+
+[features]
+# Pass-through to headroom-core. `ml` is ON by default, so a stock build is
+# unchanged. Turning it off (`--no-default-features`) drops ONNX Runtime and
+# the models from the tree; the proxy then runs the lexical paths only —
+# TextCrusher instead of Kompress, extension-based file typing instead of
+# magika, BM25 instead of embeddings.
+default = ["ml"]
+ml = ["headroom-core/ml"]
+# Shared Redis CCR store for multi-worker deployments. See headroom-core.
+redis = ["headroom-core/redis"]
 
 [dev-dependencies]
 # CTX-2: unit tests for the passive-capture observer open a throwaway

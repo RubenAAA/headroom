@@ -11,6 +11,9 @@
 //! locally after `python scripts/record_kompress_trace.py` to get the
 //! real assertion.
 
+// The engine under test is only compiled with the `ml` feature.
+#![cfg(feature = "ml")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

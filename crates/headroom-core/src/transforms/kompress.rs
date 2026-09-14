@@ -58,15 +58,25 @@
 //! marker is intentionally **not** reproduced; the Rust side uses the
 //! canonical `<<ccr:HASH>>` marker convention.
 
+// Everything below the config/result/error types is the loaded model, so
+// without the `ml` feature only `thiserror` is left in use here.
+#[cfg(feature = "ml")]
 use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "ml")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ml")]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "ml")]
 use ort::session::Session;
+#[cfg(feature = "ml")]
 use ort::value::Tensor;
+#[cfg(feature = "ml")]
 use regex::Regex;
 use thiserror::Error;
+#[cfg(feature = "ml")]
 use tokenizers::tokenizer::TruncationParams;
+#[cfg(feature = "ml")]
 use tokenizers::{EncodeInput, InputSequence, Tokenizer};
 
 // ─── Tunable defaults (parity-pinned to kompress-v2-base) ───────────────
@@ -107,6 +117,7 @@ pub const MAX_SEQ_LEN: usize = 512;
 // standalone numbers, but Rust's `regex` crate doesn't support look-around.
 // We use `\b` word boundaries instead, which is slightly less precise but
 // covers the same practical cases (numbers surrounded by whitespace/punctuation).
+#[cfg(feature = "ml")]
 fn must_keep_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -130,6 +141,7 @@ fn must_keep_re() -> &'static Regex {
 }
 
 /// Env var to disable the must-keep safety net (set to "0" to disable).
+#[cfg(feature = "ml")]
 const MUST_KEEP_ENV: &str = "HEADROOM_KOMPRESS_MUST_KEEP";
 
 /// Add semantically fragile words that should never be model-dropped.
@@ -137,6 +149,7 @@ const MUST_KEEP_ENV: &str = "HEADROOM_KOMPRESS_MUST_KEEP";
 /// Mirrors Python `_add_kompress_must_keep_words`: scans `chunk_words` for
 /// patterns the model might incorrectly score as unimportant (hex addresses,
 /// file paths, CLI flags, error codes, etc.) and forces them into `kept_ids`.
+#[cfg(feature = "ml")]
 fn add_must_keep_words(kept_ids: &mut BTreeSet<usize>, chunk_words: &[&str], chunk_start: usize) {
     let re = must_keep_re();
     for (word_idx, word) in chunk_words.iter().enumerate() {
@@ -148,6 +161,7 @@ fn add_must_keep_words(kept_ids: &mut BTreeSet<usize>, chunk_words: &[&str], chu
 
 /// Returns `true` if the must-keep safety net is enabled (default) or
 /// disabled via `HEADROOM_KOMPRESS_MUST_KEEP=0`.
+#[cfg(feature = "ml")]
 fn must_keep_enabled() -> bool {
     !std::env::var(MUST_KEEP_ENV)
         .map(|v| v == "0")
@@ -259,6 +273,7 @@ pub enum KompressError {
 /// ONNX inference is serialized behind a `Mutex` — matching the Python
 /// reference, which caps ONNX execution to one concurrent call (the CPU
 /// provider does not parallelize the batch dimension for this model).
+#[cfg(feature = "ml")]
 pub struct Kompress {
     config: KompressConfig,
     tokenizer: Tokenizer,
@@ -273,6 +288,7 @@ pub struct Kompress {
     static_seq: Option<usize>,
 }
 
+#[cfg(feature = "ml")]
 impl std::fmt::Debug for Kompress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Kompress")
@@ -285,12 +301,14 @@ impl std::fmt::Debug for Kompress {
 /// sequence dimension is a fixed `n > 0` (a static-shape model), else `None`
 /// (dynamic `seq`). ONNX inputs are `[batch, seq]`; a dynamic dim is reported
 /// as `-1` by ONNX Runtime.
+#[cfg(feature = "ml")]
 fn detect_static_seq(session: &Session) -> Option<usize> {
     let outlet = session.inputs().iter().find(|o| o.name() == "input_ids")?;
     let seq = *outlet.dtype().tensor_shape()?.get(1)?;
     (seq > 0).then_some(seq as usize)
 }
 
+#[cfg(feature = "ml")]
 impl Kompress {
     /// Wrap built artifacts into a `Kompress`, detecting whether the loaded
     /// model has a static sequence length (so `score_chunk` knows to pad).
@@ -644,6 +662,7 @@ impl Kompress {
 
 // ─── Loading helpers ────────────────────────────────────────────────────
 
+#[cfg(feature = "ml")]
 fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
     let mut tokenizer = Tokenizer::from_file(path).map_err(|e| KompressError::Tokenizer {
         repo: repo.to_string(),
@@ -664,6 +683,7 @@ fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
 
 /// Read an env var as `usize`, returning `None` when absent, empty, or
 /// non-positive. Mirrors Python `_env_int`.
+#[cfg(feature = "ml")]
 fn env_usize(name: &str) -> Option<usize> {
     let raw = std::env::var(name).ok()?;
     let raw = raw.trim();
@@ -677,6 +697,7 @@ fn env_usize(name: &str) -> Option<usize> {
     Some(value)
 }
 
+#[cfg(feature = "ml")]
 fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
     // `ort` is built with `load-dynamic`, so the ONNX Runtime shared library
     // must be resolved and committed BEFORE any session is constructed. This
@@ -739,6 +760,7 @@ fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Sen
 /// inside the local HuggingFace cache for `repo` (`"owner/name"`), searching
 /// every snapshot under every candidate cache root. Returns `None` if not
 /// present — never touches the network.
+#[cfg(feature = "ml")]
 fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
     let repo_dir = format!("models--{}", repo.replace('/', "--"));
     for hub in hf_hub_roots() {
@@ -765,6 +787,7 @@ fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
 /// `{HOME|USERPROFILE}/.cache/huggingface/hub`. `HOME` is the unix home; on
 /// Windows the process sees `USERPROFILE` (and often no `HOME`), so both are
 /// tried. Honoring `HF_HOME` also lets a Windows proxy point at a WSL cache.
+#[cfg(feature = "ml")]
 fn hf_hub_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let push_env = |roots: &mut Vec<PathBuf>, var: &str, suffix: &[&str]| {
@@ -810,6 +833,7 @@ mod tests {
         assert_eq!(config.min_words.max(MIN_WORDS), MIN_WORDS);
     }
 
+    #[cfg(feature = "ml")]
     #[test]
     fn must_keep_regex_matches_expected_patterns() {
         let re = must_keep_re();
@@ -857,6 +881,7 @@ mod tests {
         assert!(!re.is_match("notebook")); // substring, not a word
     }
 
+    #[cfg(feature = "ml")]
     #[test]
     fn add_must_keep_words_forces_fragile_words() {
         let mut kept = BTreeSet::new();
@@ -868,6 +893,7 @@ mod tests {
         assert!(!kept.contains(&10)); // "the" not matched
     }
 
+    #[cfg(feature = "ml")]
     #[test]
     fn add_must_keep_words_disabled_via_env() {
         std::env::set_var(MUST_KEEP_ENV, "0");
@@ -875,6 +901,7 @@ mod tests {
         std::env::remove_var(MUST_KEEP_ENV);
     }
 
+    #[cfg(feature = "ml")]
     #[test]
     fn env_usize_helper() {
         assert_eq!(env_usize("NONEXISTENT_VAR_12345"), None);
