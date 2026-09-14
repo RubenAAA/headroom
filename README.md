@@ -74,6 +74,22 @@ runs it. That symlinks the scripts and the flag file into `contrib/` instead of
 copying, so editing the repo edits the live setup. Binaries are copied either
 way, so a Rust change still needs a rebuild and `restart-headroom.sh`.
 
+When the checkout moves under you (`git pull` on this repo, or on a
+colleague's machine tracking it), installed copies go stale: rerunning
+`install.sh` is what refreshes them. `update-headroom.sh` does the whole
+round in one command — `git pull --ff-only`, `install.sh` in the same mode
+as the last install (`--link` iff `~/.headroom-flags.sh` links into the
+checkout), then `restart-headroom.sh` onto the rebuilt binary:
+
+```bash
+update-headroom.sh          # installed to ~/.local/bin by install.sh
+update-headroom.sh --link   # override the detected mode either way
+```
+
+Sessions started inside the checkout also say so: a SessionStart hook
+prints a one-time STALE INSTALL notice when installed copies differ from
+the checkout (or the built binary is newer than the installed one).
+
 Then start Claude Code with `cclaude`, not `claude`. The wrapper starts the
 proxy if it is down, sets `ANTHROPIC_BASE_URL`, and execs `claude` with your
 arguments. Plain `claude` bypasses the proxy without any error. For another

@@ -227,12 +227,14 @@ if [ "$LINK" = 1 ]; then
     ln -sfn "$CONTRIB/restart-headroom.sh" "$BIN_DIR/restart-headroom.sh"
     ln -sfn "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
     ln -sfn "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
+    ln -sfn "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
     say "linked claude-launcher and restart-headroom.sh into the checkout"
 else
     install -m 755 "$CONTRIB/claude-launcher" "$BIN_DIR/claude-launcher"
     install -m 755 "$CONTRIB/restart-headroom.sh" "$BIN_DIR/restart-headroom.sh"
     install -m 755 "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
     install -m 755 "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
+    install -m 755 "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
     say "installed claude-launcher and restart-headroom.sh"
 fi
 ln -sfn claude-launcher "$BIN_DIR/cclaude"
@@ -423,6 +425,11 @@ const WANT = [
   // counterpart. Pure git, no forge CLI, so GitHub and GitLab behave the
   // same. Silent when up to date; never blocks, never fetches.
   ["SessionStart",     null,                  "stale-branch.sh",    10],
+  // Stale install: one-time notice when the headroom checkout moved under
+  // the installed copies (scripts/hooks differ, or the built binary is
+  // newer than the installed one). Fires only inside the checkout itself;
+  // silent everywhere else. Never blocks, never changes anything.
+  ["SessionStart",     null,                  "stale-install.sh",   10],
 ];
 
 function load(f) { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return {}; } }

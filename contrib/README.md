@@ -12,6 +12,7 @@ nothing here is on the request path.
 | --- | --- | --- |
 | `claude-launcher` | `~/.local/bin/claude-launcher`, `cclaude` | Starts the proxy if port 8787 is dead, sets `ANTHROPIC_BASE_URL`, execs `claude`. Handles several profiles and an optional local Qwen. |
 | `restart-headroom.sh` | `~/.local/bin/` | Restarts the proxy onto a freshly built binary and rolls back if it fails to come up. Detached, so killing the proxy does not kill the restart. |
+| `update-headroom.sh` | `~/.local/bin/` | Pulls the checkout, reinstalls in the last install's mode, restarts the proxy. Run after `git pull`, or instead of it. |
 | `headroom-flags.sh` | `~/.headroom-flags.sh` | The flag array both starters read. An existing file is never overwritten, so tuning survives a re-install. |
 | `zen-rotate-watch.sh` | `~/.local/bin/` | Watches the log for Zen/Spark rate limits and rotates the VPN exit. Not started by the installer. |
 | `headroom-rss-sample` | `~/.local/bin/` | Samples the proxy's RSS once a minute into `~/headroom-rss.log`, so a leak over a long session is visible. |
@@ -37,7 +38,7 @@ exactly like the usage dump on its own.
 
 ## Claude Code hooks (`claude/hooks/`)
 
-All ten install to `~/.claude/hooks` and are registered idempotently in the
+All eleven install to `~/.claude/hooks` and are registered idempotently in the
 settings file — a re-run never duplicates an entry. Each script carries a
 header comment explaining the failure it exists for; read that before changing
 one. Every hook exits 0 on its own errors, so a broken hook cannot wedge a
@@ -52,6 +53,7 @@ session.
 | `shared-worktree-guard.sh` | PreToolUse (Bash) | Yes — the destructive git commands banned by `.agents/SHARED-WORKTREE-PROTOCOL.md`, but only while another agent is live in the same toplevel |
 | `peer-awareness.sh` | SessionStart, UserPromptSubmit | No — reports other sessions sharing the checkout |
 | `stale-branch.sh` | SessionStart | No — one-time notice when the branch trails its origin |
+| `stale-install.sh` | SessionStart | No — one-time notice when the checkout moved under the installed copies (scripts/hooks differ, or the built binary is newer); fires only inside the checkout |
 | `session-map-log.sh` | SessionStart | No — logs session id to transcript path for the review worker |
 | `rotation-notice.sh` | UserPromptSubmit | No — relays VPN-rotation notices once each |
 | `retry-dropped-turn.sh` | Stop | No — continues a turn parked on a dropped connection |
