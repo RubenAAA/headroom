@@ -302,7 +302,7 @@ fn verify_sha256(path: &Path, expected: Option<&str>) -> Result<(), Error> {
         return Ok(());
     };
     let got = sha256_file(path)?;
-    if got.to_ascii_lowercase() != expected.to_ascii_lowercase() {
+    if !got.eq_ignore_ascii_case(expected) {
         let _ = std::fs::remove_file(path);
         return Err(BinaryError::new(format!(
             "sha256 mismatch for {}: expected {expected}, got {got}",
@@ -535,7 +535,7 @@ pub fn exec_tool(tool: &str, args: Vec<OsString>) -> Result<(), Error> {
     {
         use std::os::unix::process::CommandExt;
         let err = Command::new(&path).args(args).exec();
-        return Err(err.into());
+        Err(err.into())
     }
     #[cfg(not(unix))]
     {

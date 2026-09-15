@@ -462,7 +462,7 @@ fn match_stream(streams: &[TurnRecord], msgs: Option<usize>) -> Option<usize> {
     streams
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.msgs.is_none_or(|m| m <= msgs))
+        .filter(|(_, r)| r.msgs.map_or(true, |m| m <= msgs))
         .max_by_key(|(_, r)| (r.msgs.unwrap_or(0), r.at))
         .map(|(i, _)| i)
 }

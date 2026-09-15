@@ -357,7 +357,7 @@ impl ModelMap {
     /// then most recent activity, then name.
     fn ranked(&self) -> Vec<(String, ModelEntry)> {
         let mut ranked = self.0.clone();
-        ranked.sort_by(|left, right| model_rank(left).cmp(&model_rank(right)));
+        ranked.sort_by_key(model_rank);
         ranked
     }
 }
@@ -1539,17 +1539,18 @@ fn normalize_enum_map(raw: Option<&Value>, allowed: &[&str], fallback: &str) -> 
 /// Turn a raw persisted blob into a fully normalised state.
 fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
     let source = dict_or_empty(raw);
-    let mut result = MetricsSnapshotState::default();
-
-    result.started_at = get(source, "started_at")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    result.last_activity_at = get(source, "last_activity_at")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    result.full_fidelity_started_at = get(source, "full_fidelity_started_at")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let mut result = MetricsSnapshotState {
+        started_at: get(source, "started_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        last_activity_at: get(source, "last_activity_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        full_fidelity_started_at: get(source, "full_fidelity_started_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ..MetricsSnapshotState::default()
+    };
 
     let raw_requests = dict_or_empty(get(source, "requests"));
     result.requests = RequestsState {

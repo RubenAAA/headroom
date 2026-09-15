@@ -57,6 +57,7 @@ impl CompressionStrategy {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "code_aware" => Some(Self::CodeAware),
@@ -104,6 +105,7 @@ impl SavingsProfile {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "agent-90" => Some(Self::Agent90),
@@ -393,11 +395,7 @@ impl ToolSignature {
     fn calculate_depth(json: &Value) -> usize {
         match json {
             Value::Object(map) => {
-                let inner = map
-                    .values()
-                    .map(|v| Self::calculate_depth(v))
-                    .max()
-                    .unwrap_or(0);
+                let inner = map.values().map(Self::calculate_depth).max().unwrap_or(0);
                 1 + inner
             }
             Value::Array(arr) => {
@@ -834,7 +832,7 @@ fn shell_wrappers() -> &'static HashSet<&'static str> {
 /// Peels leading wrappers (`rtk grep` -> `grep`, `timeout 30 rg` -> `rg`)
 /// and env assignments (`FOO=1 grep` -> `grep`).
 pub fn bash_program(command: &str) -> (String, Vec<String>) {
-    let toks: Vec<&str> = command.trim().split_whitespace().collect();
+    let toks: Vec<&str> = command.split_whitespace().collect();
     let mut i = 0;
     while i < toks.len() {
         let tok = toks[i];
@@ -1058,8 +1056,8 @@ pub fn strip_detection_envelope(content: &str) -> String {
             // Validate numeric (matching Python's -?\d+): optional leading minus, then digits
             let valid = if rc_content.is_empty() {
                 false
-            } else if rc_content.starts_with('-') {
-                rc_content[1..].chars().all(|c| c.is_ascii_digit())
+            } else if let Some(digits) = rc_content.strip_prefix('-') {
+                digits.chars().all(|c| c.is_ascii_digit())
             } else {
                 rc_content.chars().all(|c| c.is_ascii_digit())
             };
@@ -1106,8 +1104,7 @@ pub fn extract_json_block(lines: &[&str], start: usize) -> (Option<String>, usiz
     let mut in_string = false;
     let mut escaped = false;
 
-    for i in start..lines.len() {
-        let line = lines[i];
+    for (i, &line) in lines.iter().enumerate().skip(start) {
         json_lines.push(line);
 
         for ch in line.chars() {
@@ -2033,19 +2030,17 @@ fn try_kompress(
         }
         Ok(None) => {
             // Model not cached — try downloading
-            match super::kompress::Kompress::from_pretrained(
+            // Download failed: fall through.
+            if let Ok(kompress) = super::kompress::Kompress::from_pretrained(
                 super::kompress::KompressConfig::default(),
             ) {
-                Ok(kompress) => {
-                    let result = kompress.compress(content);
-                    let tokens = result.compressed.split_whitespace().count();
-                    if tokens < original_tokens {
-                        let mut full_chain = chain.to_vec();
-                        full_chain.push("kompress".to_string());
-                        return (result.compressed, tokens, full_chain);
-                    }
+                let result = kompress.compress(content);
+                let tokens = result.compressed.split_whitespace().count();
+                if tokens < original_tokens {
+                    let mut full_chain = chain.to_vec();
+                    full_chain.push("kompress".to_string());
+                    return (result.compressed, tokens, full_chain);
                 }
-                Err(_) => {} // Download failed — fall through
             }
         }
         Err(_) => {} // Load failed — fall through
@@ -2112,7 +2107,7 @@ pub fn segment(content: &str, window: usize, max_chars: usize) -> Vec<String> {
                 i += 1;
                 // Python: `while j < n and block[j][:1] in (" ", "\t"): j += 1`
                 // Extend window to include indented continuation lines
-                while i < block.len() && block[i].starts_with(|c: char| c == ' ' || c == '\t') {
+                while i < block.len() && block[i].starts_with([' ', '\t']) {
                     window_lines.push(block[i]);
                     window_chars += block[i].len();
                     i += 1;
@@ -2206,7 +2201,7 @@ pub fn plan_relevance_split(
     }
 
     let segs = segment(content, 8, 1200);
-    if segs.len() < 2 || max_records.map_or(false, |m| segs.len() > m) {
+    if segs.len() < 2 || max_records.is_some_and(|m| segs.len() > m) {
         return vec![RelevanceRun {
             keep: true,
             text: content.to_string(),

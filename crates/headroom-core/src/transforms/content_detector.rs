@@ -869,7 +869,7 @@ fn looks_like_prose(sample: &[&str], delim: &str) -> bool {
             trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?')
         })
         .count();
-    if sample.len() > 0 && enders as f64 / sample.len() as f64 >= 0.5 {
+    if !sample.is_empty() && enders as f64 / sample.len() as f64 >= 0.5 {
         return true;
     }
     let cells: Vec<&str> = sample

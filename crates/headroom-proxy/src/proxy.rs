@@ -15,7 +15,6 @@ use axum::Router;
 #[cfg(test)]
 use bytes::Bytes;
 use futures_util::{StreamExt as _, TryStreamExt};
-use http_body_util::BodyExt;
 
 use crate::cache_stabilization;
 use crate::cache_stabilization::beta_sticky::BetaProvider;
@@ -3199,6 +3198,7 @@ fn prefix_head_bytes(value: &serde_json::Value) -> i64 {
 /// a name accumulates across the turns it survives in that history rather than
 /// once per call — the inventory is read as "used / never used", not as an
 /// exact call count.
+#[allow(clippy::type_complexity)]
 fn tool_inventory_of(value: &serde_json::Value) -> (Vec<(String, i64)>, Vec<(String, i64)>) {
     let mut definitions = Vec::new();
     if let Some(tools) = value.get("tools").and_then(serde_json::Value::as_array) {
@@ -6977,7 +6977,7 @@ pub(crate) async fn forward_http(
         let mut collected = bytes::BytesMut::new();
         let mut first_err: Option<reqwest::Error> = None;
         {
-            let mut s = &mut upstream_body;
+            let s = &mut upstream_body;
             while let Some(chunk) = s.next().await {
                 match chunk {
                     Ok(b) => collected.extend_from_slice(&b),
@@ -7025,6 +7025,7 @@ pub(crate) async fn forward_http(
         .clone()
         .unwrap_or_else(|| original_buffered.clone());
 
+    #[allow(clippy::type_complexity)]
     let (upstream_body, ccr_round_usage): (
         std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
         Option<Arc<Mutex<CcrRoundUsage>>>,
@@ -7297,9 +7298,11 @@ pub(crate) async fn forward_http(
                         } else {
                             None
                         };
-                        if let Some(ccr_provider) = ccr_provider {
-                            let ccr_store = state.ctx_offload.as_ref().unwrap().store.ccr();
-                            let ccr_stores = state.ctx_offload.as_ref().unwrap().store.stores();
+                        if let (Some(ccr_provider), Some(offload)) =
+                            (ccr_provider, state.ctx_offload.as_ref())
+                        {
+                            let ccr_store = offload.store.ccr();
+                            let ccr_stores = offload.store.stores();
                             let (resolved, extra) = handle_ccr_response(
                                 &body_bytes,
                                 &continuation_base,
@@ -8093,7 +8096,7 @@ fn drop_reasoning_blocks_where(
         // this proxy writes looks like that — `stream_finisher` always leaves a
         // text block behind — but history the proxy did not write reaches here
         // too, and trading one bad turn for a different bad turn is no trade.
-        if content.iter().all(|b| doomed(b)) {
+        if content.iter().all(&doomed) {
             continue;
         }
         // A `cache_control` marker on a doomed block is a cache breakpoint, and
@@ -8170,7 +8173,7 @@ fn is_unsigned_reasoning(block: &serde_json::Value) -> bool {
     let unsigned = block
         .get("signature")
         .and_then(|s| s.as_str())
-        .is_none_or(|s| s.is_empty());
+        .map_or(true, |s| s.is_empty());
     is_reasoning && unsigned && block.get("data").is_none()
 }
 
@@ -9439,6 +9442,7 @@ pub(crate) fn maybe_cold_fork(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_prefix_replay(
     store: &SessionReplayStore,
     session_key: &str,
@@ -10259,6 +10263,7 @@ struct ParserTelemetry {
 
 /// Drive the per-provider state machine over a stream of byte chunks.
 /// Lives in its own task; the byte path never waits on it.
+#[allow(clippy::too_many_arguments)]
 async fn run_sse_state_machine(
     kind: SseStreamKind,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
@@ -11264,6 +11269,7 @@ impl crate::turn_hooks::CallModel for ProxyCallModel {
 ///
 /// `provider` is the hook-facing label (`"anthropic"` / `"openai"`);
 /// `usage_provider` is the finer one the outcome block parses `usage` by.
+#[allow(clippy::too_many_arguments)]
 async fn apply_response_hooks(
     body_bytes: bytes::Bytes,
     original_request: &bytes::Bytes,
@@ -11495,6 +11501,7 @@ fn is_plausible_ccr_hash(hash: &str) -> bool {
     hash.len() == 24 && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_ccr_response(
     body_bytes: &bytes::Bytes,
     forwarded_request: &bytes::Bytes,
@@ -12381,6 +12388,7 @@ pub(crate) struct MemoryToolContext {
 /// Deliberately shaped like [`handle_ccr_response`], down to the round cap and
 /// the mixed-tool rule: a turn that calls a memory tool *and* a client tool is
 /// left alone, because we cannot fabricate the client's half.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_memory_response(
     body_bytes: &bytes::Bytes,
     forwarded_request: &bytes::Bytes,
@@ -13050,6 +13058,7 @@ fn memory_results_message(results: &[serde_json::Value], provider: &str) -> serd
 #[cfg(test)]
 pub async fn body_to_bytes(body: Body) -> Result<Bytes, axum::Error> {
     use axum::Error;
+    use http_body_util::BodyExt;
     body.collect()
         .await
         .map(|c| c.to_bytes())

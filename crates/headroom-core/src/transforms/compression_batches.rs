@@ -311,13 +311,11 @@ fn protect_ccr_markers(batch: &CompressionBatch, nonce: &str) -> (Vec<String>, V
 
     for (entry_index, entry) in batch.entries.iter().enumerate() {
         let text = &entry.routed.unit.text;
-        let mut marker_index = 0usize;
         let mut out = String::with_capacity(text.len());
         let mut last = 0usize;
-        for m in re.find_iter(text) {
+        for (marker_index, m) in re.find_iter(text).enumerate() {
             let placeholder =
                 format!("[[HEADROOM_BATCH_CCR_{nonce}_{entry_index}_{marker_index}]]");
-            marker_index += 1;
             out.push_str(&text[last..m.start()]);
             out.push_str(&placeholder);
             last = m.end();
@@ -485,7 +483,7 @@ pub fn compress_batch_with_router(
     batch
         .entries
         .iter()
-        .zip(replacements.into_iter())
+        .zip(replacements)
         .map(|(entry, replacement)| {
             let unit = &entry.routed.unit;
             let tokens_before = tokenizer.count_text(&unit.text);

@@ -21,23 +21,12 @@ pub fn split_frozen(messages: &[Value], frozen_message_count: usize) -> (&[Value
 }
 
 /// Result of applying a transform to messages.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TransformResult {
     pub messages: Vec<Value>,
     pub transforms_applied: Vec<String>,
     pub bytes_before: usize,
     pub bytes_after: usize,
-}
-
-impl Default for TransformResult {
-    fn default() -> Self {
-        Self {
-            messages: Vec::new(),
-            transforms_applied: Vec::new(),
-            bytes_before: 0,
-            bytes_after: 0,
-        }
-    }
 }
 
 /// Trait that all message transforms implement.

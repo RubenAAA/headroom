@@ -301,7 +301,7 @@ fn common_keys(items: &[&Value]) -> Vec<String> {
         }
     }
     let mut sorted: Vec<(String, usize)> = key_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     sorted.into_iter().take(8).map(|(k, _)| k).collect()
 }
 

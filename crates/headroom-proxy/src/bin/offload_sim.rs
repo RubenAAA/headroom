@@ -249,7 +249,7 @@ fn simulate(
                 })
                 .collect();
             // Largest first.
-            candidates.sort_by(|a, b| b.1.full_tokens.cmp(&a.1.full_tokens));
+            candidates.sort_by_key(|entry| std::cmp::Reverse(entry.1.full_tokens));
             let take = match cfg.depth {
                 Depth::Largest1 => 1,
                 Depth::TopK(k) => k,

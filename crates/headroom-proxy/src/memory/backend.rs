@@ -26,6 +26,7 @@ pub struct MemorySearchResult {
 #[async_trait::async_trait]
 pub trait MemoryBackend: Send + Sync {
     /// Save a memory entry.
+    #[allow(clippy::too_many_arguments)]
     async fn save_memory(
         &self,
         content: &str,

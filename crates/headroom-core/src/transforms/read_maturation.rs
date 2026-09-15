@@ -80,7 +80,7 @@ struct Activity {
 }
 
 /// Output of one per-request maturation pass.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MaturationResult {
     pub messages: Vec<Value>,
     /// Message indices that contain still-holding Reads.
@@ -89,19 +89,6 @@ pub struct MaturationResult {
     pub newly_matured: usize,
     pub replacements_applied: usize,
     pub bytes_saved: usize,
-}
-
-impl Default for MaturationResult {
-    fn default() -> Self {
-        Self {
-            messages: Vec::new(),
-            holding_msg_indices: Vec::new(),
-            holding_reads: 0,
-            newly_matured: 0,
-            replacements_applied: 0,
-            bytes_saved: 0,
-        }
-    }
 }
 
 /// Per-session Read maturation state machine.
@@ -424,8 +411,8 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
     let mut held_marker: Option<Value> = None;
 
     // 1. Strip breakpoints from the held region [earliest:].
-    for i in earliest..out.len() {
-        let content = match out[i].get("content").and_then(Value::as_array) {
+    for message in out.iter_mut().skip(earliest) {
+        let content = match message.get("content").and_then(Value::as_array) {
             Some(arr) => arr,
             None => continue,
         };
@@ -456,7 +443,7 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
                     }
                 })
                 .collect();
-            out[i]["content"] = Value::Array(new_content);
+            message["content"] = Value::Array(new_content);
             stripped_any = true;
         }
     }

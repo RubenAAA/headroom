@@ -450,9 +450,7 @@ pub fn parse_message_to_blocks(
                             } else if map.contains_key("toolResult") {
                                 // Strands/Bedrock converse format.
                                 tool_result_parts.push(part);
-                            } else if part_type == Some("tool_use") {
-                                tool_use_parts.push(part);
-                            } else if map.contains_key("toolUse") {
+                            } else if part_type == Some("tool_use") || map.contains_key("toolUse") {
                                 tool_use_parts.push(part);
                             }
                         }

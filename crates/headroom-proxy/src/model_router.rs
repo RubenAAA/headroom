@@ -232,7 +232,7 @@ impl ModelCooldowns {
         };
         let log = entry
             .last_logged
-            .is_none_or(|at| now.duration_since(at) >= SKIP_LOG_INTERVAL);
+            .map_or(true, |at| now.duration_since(at) >= SKIP_LOG_INTERVAL);
         if log {
             entry.last_logged = Some(now);
         }
@@ -728,7 +728,7 @@ fn py_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().is_none_or(|f| f != 0.0),
+        Value::Number(n) => n.as_f64() != Some(0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(items) => !items.is_empty(),
         Value::Object(map) => !map.is_empty(),

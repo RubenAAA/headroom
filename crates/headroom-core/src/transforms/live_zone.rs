@@ -2029,6 +2029,7 @@ enum DispatchResult {
 /// - `PlainText` → Kompress (cache-only; passthrough when the model is
 ///   not in the local HF cache — never downloads on the dispatch thread)
 /// - `Html` → no-op (no compressor)
+///
 /// Configuration for the compressor dispatch logic.
 #[derive(Debug, Clone, Default)]
 pub struct DispatchConfig {
@@ -3551,8 +3552,8 @@ pub fn compress_openai_chat_live_zone_with_config(
                     dispatch_config.exclude_tools.iter().map(String::as_str),
                 )
             });
-            let verbatim = tool_name.is_some_and(|name| is_verbatim_excluded(name));
-            let byte_exact = tool_name.is_some_and(|name| is_byte_exact_excluded(name));
+            let verbatim = tool_name.is_some_and(is_verbatim_excluded);
+            let byte_exact = tool_name.is_some_and(is_byte_exact_excluded);
             // Builtin byte-exact always holds (pre-existing behavior);
             // operator exclusion adds verbatim/byte-exact passthrough.
             if byte_exact || (excluded && verbatim) {

@@ -440,24 +440,23 @@ pub fn compress_unit_with_router(
         && unit.item_type == "local_shell_call_output"
         && is_structured_shell_output(&unit.text)
         && lossy_unmarked_strategies().contains(strategy.as_str())
+        && !ccr_marker_re().is_match(&replacement)
     {
-        if !ccr_marker_re().is_match(&replacement) {
-            return UnitCompressionResult {
-                original: unit.text.clone(),
-                compressed: unit.text.clone(),
-                modified: false,
-                tokens_before,
-                tokens_after,
-                tokens_saved: 0,
-                transforms_applied: vec![],
-                strategy: strategy.clone(),
-                reason: Some("lossy_unrecoverable_tool_output".to_string()),
-                reason_category: categorize_reason(Some("lossy_unrecoverable_tool_output")),
-                text_bytes,
-                min_bytes: unit.min_bytes,
-                router_result: Some(router_result),
-            };
-        }
+        return UnitCompressionResult {
+            original: unit.text.clone(),
+            compressed: unit.text.clone(),
+            modified: false,
+            tokens_before,
+            tokens_after,
+            tokens_saved: 0,
+            transforms_applied: vec![],
+            strategy: strategy.clone(),
+            reason: Some("lossy_unrecoverable_tool_output".to_string()),
+            reason_category: categorize_reason(Some("lossy_unrecoverable_tool_output")),
+            text_bytes,
+            min_bytes: unit.min_bytes,
+            router_result: Some(router_result),
+        };
     }
 
     // ── Success ──────────────────────────────────────────────────────────

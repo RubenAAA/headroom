@@ -263,7 +263,7 @@ fn appended_len(text: &str) -> usize {
 /// Returns the number of chars appended (0 when no eligible user message was
 /// found — no mutation). Port of `helpers.append_text_to_latest_user_chat_message`.
 pub fn append_text_to_latest_user_chat_message(
-    messages: &mut Vec<Value>,
+    messages: &mut [Value],
     context_text: &str,
 ) -> usize {
     splice_latest_user(messages, context_text, &["text", "input_text"])
@@ -272,7 +272,7 @@ pub fn append_text_to_latest_user_chat_message(
 /// OpenAI Responses `body["input"]` analog. Same semantics; the eligible text
 /// block types are `input_text`/`text`. Port of
 /// `helpers.append_text_to_latest_user_input_item`.
-pub fn append_text_to_latest_user_input_item(items: &mut Vec<Value>, context_text: &str) -> usize {
+pub fn append_text_to_latest_user_input_item(items: &mut [Value], context_text: &str) -> usize {
     splice_latest_user(items, context_text, &["input_text", "text"])
 }
 

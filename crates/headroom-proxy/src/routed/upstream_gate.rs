@@ -85,6 +85,7 @@ pub(crate) fn gate_hold(host: &str, delay_ms: u64) {
 }
 
 /// Test/reset helper: drops every hold.
+#[allow(dead_code)]
 pub(crate) fn clear_gate() {
     lock().clear();
 }
@@ -99,6 +100,7 @@ pub(crate) struct ZenSlot {
 }
 
 impl ZenSlot {
+    #[allow(dead_code)]
     fn is_held(&self) -> bool {
         self.counter.is_some()
     }

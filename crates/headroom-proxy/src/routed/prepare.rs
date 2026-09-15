@@ -111,11 +111,11 @@ pub(crate) async fn prepare_turn(
         && maybe_redact_outbound(&state.redact_store, &session_key, &mut parsed, request_id);
     // Kept aside: a later `session_key` binding (the Codex turn-state one)
     // shadows the String above, and the fallback below needs this one.
-    let redact_session_key = state
-        .config
-        .redact_sensitive
-        .then(|| session_key.clone())
-        .unwrap_or_default();
+    let redact_session_key = if state.config.redact_sensitive {
+        session_key.clone()
+    } else {
+        Default::default()
+    };
     let compression_report =
         apply_compression_and_replay(state, &mut parsed, headers, request_id, &lane_key);
     let compression_tokens_saved = compression_report.tokens_saved;

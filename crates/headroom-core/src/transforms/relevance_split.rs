@@ -183,6 +183,7 @@ pub fn adaptive_threshold(values: &[f64], floor: f64) -> f64 {
 /// by `threshold`. Returns a single KEEP run (no split) when the query is
 /// empty, the content is a single record, or it segments into more than
 /// `max_records` records.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_relevance_split(
     content: &str,
     query: &str,

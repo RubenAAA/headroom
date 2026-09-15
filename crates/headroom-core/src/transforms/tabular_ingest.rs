@@ -161,7 +161,7 @@ pub fn to_records(headers: &[String], rows: &[Vec<String>]) -> Vec<HashMap<Strin
                 .collect();
             headers
                 .iter()
-                .zip(padded.into_iter())
+                .zip(padded)
                 .map(|(h, v)| (h.clone(), v.to_string()))
                 .collect()
         })

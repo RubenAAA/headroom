@@ -152,7 +152,7 @@ fn contains_memory_block(message: &Value) -> bool {
 }
 
 pub fn append_to_latest_user_tail(
-    messages: &mut Vec<Value>,
+    messages: &mut [Value],
     context_text: &str,
     provider: &str,
     frozen_message_count: usize,

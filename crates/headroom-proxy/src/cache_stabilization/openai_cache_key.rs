@@ -220,7 +220,7 @@ fn derive_key(body: &Value, shape: OpenAiShape) -> String {
 /// content-block-array systems and string systems with the same
 /// concatenated text produce *different* keys — which is the
 /// correct behaviour for cache pinning.
-fn extract_system<'a>(body: &'a Value, shape: OpenAiShape) -> &'a Value {
+fn extract_system(body: &Value, shape: OpenAiShape) -> &Value {
     match shape {
         OpenAiShape::ChatCompletions => first_system_message_content(body, "messages"),
         OpenAiShape::Responses => {

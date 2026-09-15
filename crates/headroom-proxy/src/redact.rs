@@ -73,9 +73,9 @@ const MAX_OVERLAP: usize = MAX_TOKEN_LEN;
 /// turns after it first saw it, and because subagent fan-out mints under a new
 /// session key every time — see `RedactStore::remember`.
 const GLOBAL_RESTORE_CAPACITY: usize = 32_768;
-/// Hex characters a counted token may carry. A token holds nonce + ciphertext
-/// + tag, so its length tracks the value it replaced; this bounds the value at
-/// ~1 KB, well past any path or credential the scanners match.
+/// Hex characters a counted token may carry. A token holds nonce, ciphertext
+/// and tag, so its length tracks the value it replaced; this bounds the value
+/// at ~1 KB, well past any path or credential the scanners match.
 const MAX_TOKEN_HEX: usize = 2048;
 /// The longest a whole placeholder can be: prefix, kind, the hex body, and the
 /// closing `__`. The streaming restore holds back this much at a chunk edge.
@@ -359,7 +359,7 @@ impl RedactStore {
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(capacity))),
             global: Arc::new(Mutex::new(LruCache::new(global))),
-            cipher: Arc::new(ChaCha20Poly1305::new(Key::from_slice(&key))),
+            cipher: Arc::new(ChaCha20Poly1305::new(&Key::from(key))),
             key_is_durable: durable,
         }
     }
@@ -374,7 +374,7 @@ impl RedactStore {
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(capacity))),
             global: Arc::new(Mutex::new(LruCache::new(global))),
-            cipher: Arc::new(ChaCha20Poly1305::new(Key::from_slice(&key))),
+            cipher: Arc::new(ChaCha20Poly1305::new(&Key::from(key))),
             key_is_durable: true,
         }
     }
@@ -404,6 +404,7 @@ impl RedactStore {
 
     /// Whether anything has been minted at all. Cheap check so a process that
     /// never redacts never pays for a restore pass.
+    #[allow(dead_code)]
     fn recall_is_empty(&self) -> bool {
         let guard = match self.global.lock() {
             Ok(g) => g,
@@ -962,13 +963,16 @@ fn token_for(
         hasher.update(attempt.to_le_bytes());
     }
     let digest = hasher.finalize();
-    let nonce = Nonce::from_slice(&digest[..NONCE_LEN]);
+    let nonce_bytes: [u8; NONCE_LEN] = digest[..NONCE_LEN]
+        .try_into()
+        .expect("digest is longer than the nonce");
+    let nonce = Nonce::from(nonce_bytes);
 
     // The kind is authenticated but not encrypted: it is already in the token,
     // and binding it stops a token being read back as another kind.
     let sealed = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: original.as_bytes(),
                 aad: kind.as_bytes(),
@@ -994,7 +998,9 @@ fn value_of(cipher: &ChaCha20Poly1305, token: &str) -> Option<String> {
     let (nonce, sealed) = body.split_at(NONCE_LEN);
     let opened = cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(
+                <[u8; NONCE_LEN]>::try_from(nonce).expect("split_at gave NONCE_LEN bytes"),
+            ),
             Payload {
                 msg: sealed,
                 aad: kind.as_bytes(),

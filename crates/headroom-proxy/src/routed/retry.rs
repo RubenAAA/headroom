@@ -90,6 +90,7 @@ pub(crate) struct UpstreamSend {
 /// `retry_zen_hold_budget_ms`, instead of returning the fatal 429 — the VPN
 /// watcher rotates the exit on the 429 log line, and the turn must outlive
 /// the rotation to land on the fresh exit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_with_retry(
     state: &AppState,
     upstream_url: &str,

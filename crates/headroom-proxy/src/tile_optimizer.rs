@@ -355,6 +355,7 @@ fn optimize_content_block(item: &Value, provider: &str) -> Option<(Value, TileOp
 /// A miss stores `None` too, so an image that is not worth resizing is decoded
 /// once rather than on every turn.
 type ImageCacheKey = [u8; 32];
+#[allow(clippy::type_complexity)]
 static RESIZE_CACHE: std::sync::OnceLock<
     std::sync::Mutex<lru::LruCache<ImageCacheKey, Option<(Value, TileOptResult)>>>,
 > = std::sync::OnceLock::new();
@@ -484,7 +485,7 @@ pub fn optimize_images_in_messages_cached(
 /// Decode base64 image data from a data URL.
 fn decode_data_url(url: &str) -> Option<Vec<u8>> {
     // Format: data:image/png;base64,<data>
-    let b64_part = url.split(',').last()?;
+    let b64_part = url.split(',').next_back()?;
     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_part).ok()
 }
 

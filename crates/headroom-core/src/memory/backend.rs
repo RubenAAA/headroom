@@ -23,6 +23,7 @@ pub struct MemorySearchResult {
 /// are synchronous here; async wrappers live in the proxy crate.
 pub trait MemoryBackend: Send + Sync {
     /// Save a new memory to the backend.
+    #[allow(clippy::too_many_arguments)]
     fn save_memory(
         &self,
         content: &str,

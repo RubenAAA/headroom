@@ -80,10 +80,10 @@ impl MemoryQuery {
                     }
                 }
                 "assistant" => match content {
-                    Some(Value::String(text)) if !text.is_empty() => {
-                        if assistant_turns.len() < lookback_assistant {
-                            assistant_turns.push(text.clone());
-                        }
+                    Some(Value::String(text))
+                        if !text.is_empty() && assistant_turns.len() < lookback_assistant =>
+                    {
+                        assistant_turns.push(text.clone());
                     }
                     Some(Value::Array(blocks)) => {
                         let joined: String = blocks

@@ -74,6 +74,7 @@ const PIN_TTL: Duration = Duration::from_secs(2 * 3600);
 /// Per-conversation working-directory pins.
 #[derive(Clone)]
 pub struct WorkingDirPins {
+    #[allow(clippy::type_complexity)]
     pins: Arc<Mutex<LruCache<String, (Vec<String>, Instant)>>>,
 }
 

@@ -36,7 +36,7 @@ pub trait CompressionObserver: Send + Sync {
     }
 
     /// Record a single compression unit outcome (for unit-level observability).
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::too_many_arguments)]
     fn record_unit(
         &self,
         strategy: &str,
@@ -52,7 +52,7 @@ pub trait CompressionObserver: Send + Sync {
     }
 
     /// Record a frame-level compression outcome.
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::too_many_arguments)]
     fn record_frame(
         &self,
         elapsed_ms: u64,
@@ -180,8 +180,8 @@ mod tests {
 /// size gate reports through a process-global hook that the proxy installs at
 /// startup. Without one installed the gate still works — it just goes
 /// unmetered, which keeps `headroom-core` usable without the proxy.
-static SIZE_GATE_HOOK: std::sync::OnceLock<Box<dyn Fn(&str) + Send + Sync>> =
-    std::sync::OnceLock::new();
+type SizeGateHook = Box<dyn Fn(&str) + Send + Sync>;
+static SIZE_GATE_HOOK: std::sync::OnceLock<SizeGateHook> = std::sync::OnceLock::new();
 
 /// Install the process-global size-gate hook. The first call wins.
 ///

@@ -504,6 +504,7 @@ fn bounded_model(model: &str) -> &str {
 }
 
 /// Record a completed proxy request.
+#[allow(clippy::too_many_arguments)]
 pub fn record_request(
     provider: &str,
     model: &str,

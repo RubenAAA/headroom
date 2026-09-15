@@ -1167,7 +1167,7 @@ fn offload_tool_result(
     is_live: bool,
     near_tail: bool,
 ) -> BlockOutcome {
-    let Some(original) = block.get("content").and_then(|c| tool_result_text(c)) else {
+    let Some(original) = block.get("content").and_then(tool_result_text) else {
         return BlockOutcome::Skipped;
     };
 

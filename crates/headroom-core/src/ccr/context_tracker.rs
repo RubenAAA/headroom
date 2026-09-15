@@ -184,6 +184,7 @@ impl ContextTracker {
     }
 
     /// Track a compression event.
+    #[allow(clippy::too_many_arguments)]
     pub fn track_compression(
         &mut self,
         hash_key: &str,

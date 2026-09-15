@@ -172,14 +172,14 @@ impl BatchResultProcessor {
 
         match provider {
             "anthropic" => {
-                if !result.get("result").is_some() {
+                if result.get("result").is_none() {
                     result["result"] = serde_json::json!({});
                 }
                 result["result"]["message"] = final_response.clone();
                 result["result"]["type"] = serde_json::json!("succeeded");
             }
             "openai" => {
-                if !result.get("response").is_some() {
+                if result.get("response").is_none() {
                     result["response"] = serde_json::json!({});
                 }
                 result["response"]["body"] = final_response.clone();

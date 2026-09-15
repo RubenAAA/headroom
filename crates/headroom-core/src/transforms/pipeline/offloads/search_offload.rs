@@ -167,7 +167,7 @@ fn extract_file_prefix(line: &str) -> Option<&str> {
     // matches `-2-` inside `file-2-backup.py:42:` and returns "file".
     // The `:` form is authoritative grep output; `-` is only the ripgrep
     // context-line fallback, so it must not shadow a later colon match.
-    for &sep in &[b':', b'-'] {
+    for &sep in b":-" {
         let mut i = scan_start;
         while i < bytes.len() {
             if bytes[i] == sep {

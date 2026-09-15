@@ -426,7 +426,7 @@ impl CompressionFeedback {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect();
-            fields.sort_by(|a, b| b.1.cmp(&a.1));
+            fields.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             hints.preserve_fields = fields.into_iter().take(5).map(|(k, _)| k).collect();
         }
 
@@ -519,7 +519,7 @@ fn truncate_strategy_dicts(pattern: &mut LocalToolPattern) {
 
 fn sorted_keys(map: &HashMap<String, u64>, limit: usize) -> Vec<String> {
     let mut entries: Vec<(String, u64)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     entries.into_iter().take(limit).map(|(k, _)| k).collect()
 }
 
@@ -531,8 +531,8 @@ fn keep_top_by_value(map: &mut HashMap<String, u64>, limit: usize) {
 
 fn extract_field_hints(pattern: &mut LocalToolPattern, query: &str) {
     // Field:value or field=value patterns (matches Python's re.findall(r"(\w+)[=:]", query))
-    let mut chars = query.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
+    let chars = query.char_indices().peekable();
+    for (i, c) in chars {
         if (c == '=' || c == ':') && i > 0 {
             // Walk backwards to find the start of the word
             let start = query[..i]

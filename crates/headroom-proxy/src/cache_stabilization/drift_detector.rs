@@ -732,6 +732,7 @@ fn hash_json_str(s: &str) -> [u8; 32] {
 /// borrowed `Value` defends against trivial whitespace differences
 /// from the wire — operators care about *semantic* drift, not
 /// formatter drift.
+#[allow(dead_code)]
 fn hash_value(value: &serde_json::Value) -> [u8; 32] {
     // Stream canonical bytes straight into the digest instead of
     // buffering a `to_vec` first (measured 1.14x). `to_writer` on a

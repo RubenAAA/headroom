@@ -397,7 +397,7 @@ impl ReadLifecycleManager {
     ) -> Vec<ReadClassification> {
         let mut classifications = Vec::new();
 
-        for (_file_path, ops) in file_ops {
+        for ops in file_ops.values() {
             let reads: Vec<&FileOperation> =
                 ops.iter().filter(|op| op.operation == "read").collect();
             let edits: Vec<&FileOperation> =
@@ -538,7 +538,7 @@ impl ReadLifecycleManager {
     }
 
     /// Process Anthropic-format content blocks for lifecycle replacement.
-    fn process_anthropic_blocks<'a>(
+    fn process_anthropic_blocks(
         &self,
         content_blocks: &[Value],
         replacements: &HashMap<&str, &ReadClassification>,

@@ -25,15 +25,9 @@ const JWT_MIN_SEGMENT_BYTES: usize = 4;
 // ─── Types ───────────────────────────────────────────────────────────────
 
 /// Configuration for cache alignment detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CacheAlignerConfig {
     pub enabled: bool,
-}
-
-impl Default for CacheAlignerConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 /// One detected piece of volatile content.
@@ -108,8 +102,8 @@ fn is_iso8601(token: &str) -> bool {
         return false;
     }
     // Try parsing as ISO 8601. Replace trailing Z with +00:00.
-    let candidate = if token.ends_with('Z') {
-        format!("{}+00:00", &token[..token.len() - 1])
+    let candidate = if let Some(stripped) = token.strip_suffix('Z') {
+        format!("{stripped}+00:00")
     } else {
         token.to_string()
     };
@@ -120,7 +114,7 @@ fn is_iso8601(token: &str) -> bool {
         return false;
     }
     // Check for YYYY-MM-DD at start
-    let is_digit = |b: u8| b >= b'0' && b <= b'9';
+    let is_digit = |b: u8| b.is_ascii_digit();
     if bytes.len() >= 10
         && is_digit(bytes[0])
         && is_digit(bytes[1])
@@ -313,7 +307,7 @@ impl CacheAligner {
         frozen_message_count: Option<usize>,
     ) -> CacheAlignerResult {
         let frozen = frozen_message_count.unwrap_or(0);
-        let result_messages: Vec<serde_json::Value> = messages.iter().map(|m| m.clone()).collect();
+        let result_messages: Vec<serde_json::Value> = messages.to_vec();
 
         let tokens_before: usize = result_messages
             .iter()

@@ -429,7 +429,7 @@ impl SessionsStore {
         )
     }
 
-    /// Rows above which the dedup index is left to offline maintenance.
+    // Rows above which the dedup index is left to offline maintenance.
     // ── Events ──
 
     /// Insert one event. Mirrors `insertEvent` (session/db.ts:915). An empty

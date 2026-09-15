@@ -188,7 +188,7 @@ pub fn collapse_runs(text: &str) -> String {
 pub fn fold_repeated_blocks(text: &str) -> String {
     let (lines, had_trailing) = split_keep_trailing(text);
     let n = lines.len();
-    if n < FOLD_MIN_BLOCK * 2 || n > FOLD_MAX_LINES {
+    if !(FOLD_MIN_BLOCK * 2..=FOLD_MAX_LINES).contains(&n) {
         return text.to_string();
     }
     // Recent original positions per distinct line, bounded so a pathological
@@ -604,7 +604,7 @@ pub fn compact_lossless(content: &str, kind: &str) -> String {
         return content.to_string();
     }
 
-    let result = match kind {
+    match kind {
         "log" => {
             // ANSI is non-semantic and dropped one-way; run-collapse must be
             // exactly reversible against the de-ANSI'd baseline.
@@ -616,7 +616,7 @@ pub fn compact_lossless(content: &str, kind: &str) -> String {
             if candidate.len() < content.len() {
                 candidate
             } else {
-                return content.to_string();
+                content.to_string()
             }
         }
         "search" => {
@@ -626,6 +626,7 @@ pub fn compact_lossless(content: &str, kind: &str) -> String {
             // match each across many files in a dir — the `grep -rn` case the
             // file fold misses entirely).
             let mut best = content.to_string();
+            #[allow(clippy::type_complexity)]
             let attempts: [(String, fn(&str) -> String); 2] = [
                 (search_heading(content), search_unheading),
                 (search_dir_heading(content), search_dir_unheading),
@@ -646,7 +647,7 @@ pub fn compact_lossless(content: &str, kind: &str) -> String {
             if candidate.len() < content.len() {
                 candidate
             } else {
-                return content.to_string();
+                content.to_string()
             }
         }
         "config" => {
@@ -659,7 +660,7 @@ pub fn compact_lossless(content: &str, kind: &str) -> String {
             if candidate.len() < content.len() {
                 candidate
             } else {
-                return content.to_string();
+                content.to_string()
             }
         }
         "diff" => {
@@ -669,7 +670,7 @@ pub fn compact_lossless(content: &str, kind: &str) -> String {
             if candidate.len() < content.len() {
                 candidate
             } else {
-                return content.to_string();
+                content.to_string()
             }
         }
         "text" => {
@@ -681,13 +682,11 @@ pub fn compact_lossless(content: &str, kind: &str) -> String {
             if candidate.len() < content.len() {
                 candidate
             } else {
-                return content.to_string();
+                content.to_string()
             }
         }
-        _ => return content.to_string(),
-    };
-
-    result
+        _ => content.to_string(),
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────

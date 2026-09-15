@@ -100,16 +100,16 @@ impl Conversation {
                     &parked.args,
                 );
                 frames.extend(self.running.translator.pause_for_tool());
-                return Step::Pause(frames);
+                Step::Pause(frames)
             }
 
             frames = self.running.next_frames() => {
                 match frames {
                     Some(frames) => {
                         self.record_chat_id().await;
-                        return Step::Emit(frames);
+                        Step::Emit(frames)
                     }
-                    None => return Step::End,
+                    None => Step::End,
                 }
             }
         }

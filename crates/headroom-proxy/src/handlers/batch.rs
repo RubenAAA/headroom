@@ -315,6 +315,7 @@ pub fn compress_batch_jsonl(content: &str) -> (Vec<String>, BatchJsonlStats) {
     )
 }
 
+#[allow(clippy::result_large_err)]
 fn serialize_json_body(value: &Value) -> Result<Bytes, Response> {
     serde_json::to_vec(value).map(Bytes::from).map_err(|e| {
         error_response(
@@ -410,7 +411,7 @@ pub async fn google_batch_create(
         let item_request_id = format!("google-batch:{idx}");
         let Some((compressed_messages, before, after)) = compress_messages(
             &messages,
-            &model,
+            model,
             state.config.compression_mode,
             auth_mode,
             &item_request_id,

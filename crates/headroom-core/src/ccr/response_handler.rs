@@ -632,6 +632,12 @@ pub struct StreamingCcrBuffer {
     detected_ccr: bool,
 }
 
+impl Default for StreamingCcrBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingCcrBuffer {
     pub fn new() -> Self {
         Self {
@@ -731,8 +737,7 @@ impl StreamingCcrHandler {
         let text = String::from_utf8_lossy(data);
         for line in text.lines() {
             let line = line.trim();
-            if line.starts_with("data: ") {
-                let payload = &line[6..];
+            if let Some(payload) = line.strip_prefix("data: ") {
                 if payload == "[DONE]" || payload.is_empty() {
                     continue;
                 }

@@ -192,14 +192,12 @@ pub fn apply_verbosity_steering(body: &mut Value, level: i32) -> bool {
         for block in blocks {
             if let Some(obj) = block.as_object() {
                 if let Some(Value::String(t)) = obj.get("text") {
-                    if t.starts_with(STEERING_SENTINEL) {
-                        if *t == text {
-                            return false; // already applied at this level
-                        }
-                        // Level changed — would need to replace in place
-                        // but we can't mutate through the Value easily.
-                        // Append and let dedup handle it.
+                    if t.starts_with(STEERING_SENTINEL) && *t == text {
+                        return false; // already applied at this level
                     }
+                    // Level changed — would need to replace in place
+                    // but we can't mutate through the Value easily.
+                    // Append and let dedup handle it.
                 }
             }
         }

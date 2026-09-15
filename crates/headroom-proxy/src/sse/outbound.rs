@@ -88,9 +88,9 @@ pub(crate) fn content_block_delta(
     let _ = write!(out, "{index}");
     out.push_str(",\"delta\":{\"type\":");
     out.push_str(&delta_type_json);
-    out.push_str(",");
+    out.push(',');
     out.push_str(&field_json);
-    out.push_str(":");
+    out.push(':');
     out.push_str(&value_json);
     out.push_str("}}\n\n");
     out

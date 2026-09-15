@@ -272,12 +272,9 @@ pub fn emit_volatile_warnings(
         let locations = mem.get_mut(conversation).expect("just inserted");
         for location in &order {
             let digest = combined[location];
-            let verdict = match locations.put((*location).to_string(), digest) {
-                // Seen here before: only interesting if the value moved.
-                Some(previous) => Some(previous != digest),
-                // First sighting on this conversation — no evidence yet.
-                None => None,
-            };
+            let verdict = locations
+                .put((*location).to_string(), digest)
+                .map(|previous| previous != digest);
             verdicts.insert(location, verdict);
         }
     }

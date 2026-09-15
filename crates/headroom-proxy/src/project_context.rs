@@ -11,7 +11,7 @@ pub const PROJECT_HEADER: &str = "x-headroom-project";
 pub const PROJECT_PATH_PREFIX: &str = "/p/";
 
 thread_local! {
-    static CURRENT_PROJECT: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    static CURRENT_PROJECT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Sanitize a project name: printable ASCII only, length-capped.

@@ -489,8 +489,7 @@ impl MemoryHandler {
             .unwrap_or(path)
             .trim_start_matches('/');
 
-        if subpath.starts_with("search/") {
-            let query = &subpath["search/".len()..];
+        if let Some(query) = subpath.strip_prefix("search/") {
             if query.is_empty() {
                 return "Error: Please provide a search query. Example: view /memories/search/food preferences".to_string();
             }
@@ -502,7 +501,7 @@ impl MemoryHandler {
             "all" => self.list_all_memories(user_id, 20).await,
             "" => self.get_memory_overview(user_id).await,
             _ => {
-                let q = subpath.replace('/', " ").replace('_', " ");
+                let q = subpath.replace(['/', '_'], " ");
                 self.semantic_search(&q, user_id, 5).await
             }
         }
@@ -761,8 +760,7 @@ impl MemoryHandler {
 
         let topic = path
             .replace("/memories/", "")
-            .replace('/', " ")
-            .replace('_', " ")
+            .replace(['/', '_'], " ")
             .replace(".txt", "");
 
         let results = match backend.search_memories(&topic, user_id, 10, false).await {
@@ -810,8 +808,7 @@ impl MemoryHandler {
 
         let old_topic = old_path
             .replace("/memories/", "")
-            .replace('/', " ")
-            .replace('_', " ")
+            .replace(['/', '_'], " ")
             .replace(".txt", "");
 
         let results = match backend
@@ -1451,7 +1448,7 @@ impl MemoryHandler {
 
     fn get_or_init_tool_cache(&self) -> &[Value] {
         self.memory_tool_cache
-            .get_or_init(|| tool_adapter::openai_tools())
+            .get_or_init(tool_adapter::openai_tools)
     }
 
     fn tool_config(&self) -> tool_adapter::MemoryToolAdapterConfig {

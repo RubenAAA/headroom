@@ -139,10 +139,8 @@ pub(crate) fn anthropic_to_openai_responses_request(
 
     if let Some(system) = anthropic.get("system") {
         match system {
-            Value::String(s) => {
-                if !s.is_empty() {
-                    instructions.push(s.clone());
-                }
+            Value::String(s) if !s.is_empty() => {
+                instructions.push(s.clone());
             }
             Value::Array(arr) => {
                 let text = arr

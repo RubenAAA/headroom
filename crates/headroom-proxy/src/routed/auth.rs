@@ -24,6 +24,7 @@ use axum::response::Response;
 /// one-shot with no session to correlate), and turn-state capture stays with
 /// response handling. That seam is named here so a future merge has to cross
 /// it explicitly.
+#[allow(clippy::result_large_err)]
 pub(crate) fn auth_headers(
     auth_env: Option<&str>,
     client_headers: &HeaderMap,
@@ -56,6 +57,7 @@ pub(crate) fn auth_headers(
 /// A missing or empty variable is an error rather than a header left off. The
 /// silent version sends an unauthenticated request and gets back an upstream
 /// 401, which reads like a bad token rather than a missing one.
+#[allow(clippy::result_large_err)]
 pub(crate) fn route_auth_headers(var: &str) -> Result<HeaderMap, Response> {
     // `none` is not a variable: it declares the route carries no credential
     // at all. The upstream gets only Content-Type — no Authorization, and

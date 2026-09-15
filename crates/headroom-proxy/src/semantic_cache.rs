@@ -112,6 +112,7 @@ const KEY_EXTRA_FIELDS: &[&str] = &[
 /// field (measured 481x on a 100-tool body) just to hand them to
 /// `compute_key`, which only reads them. Both callers use the result
 /// immediately, so references tied to `parsed` are sufficient.
+#[allow(clippy::type_complexity)]
 pub fn cache_key_inputs(parsed: &Value) -> Option<(Vec<&Value>, Vec<(&str, &Value)>)> {
     let turns: Vec<&Value> = match parsed.get("messages").or_else(|| parsed.get("input")) {
         Some(Value::Array(items)) => items.iter().collect(),

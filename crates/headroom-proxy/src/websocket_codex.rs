@@ -254,7 +254,7 @@ fn decode_bearer_jwt_payload(auth: &str) -> Option<Value> {
     if token.matches('.').count() < 2 {
         return None;
     }
-    let payload = token.splitn(3, '.').nth(1)?;
+    let payload = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
@@ -1248,7 +1248,7 @@ async fn connect_upstream_with_retry(
                     Ok(Ok(_)) => unreachable!("handled above"),
                 };
                 if attempt + 1 < attempts {
-                    let delay = crate::proxy::backoff_ms(&state, attempt);
+                    let delay = crate::proxy::backoff_ms(state, attempt);
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
             }
@@ -1664,7 +1664,7 @@ async fn run_codex_session_inner(
     // intentional Python asymmetry, judgment #10).
     let c2u = {
         let cancel = cancel.clone();
-        let totals = Arc::clone(&totals);
+        let totals = Arc::clone(totals);
         let ctx_state = ctx.state.clone();
         let request_id = ctx.request_id.clone();
         let session_id = ctx.session_id.clone();
@@ -1786,7 +1786,7 @@ async fn run_codex_session_inner(
     // unconditional flush+continue makes Phases 2a/2b unreachable).
     let u2c = {
         let cancel = cancel.clone();
-        let totals = Arc::clone(&totals);
+        let totals = Arc::clone(totals);
         let emit_ctx = SessionCtx {
             state: ctx.state.clone(),
             request_id: ctx.request_id.clone(),

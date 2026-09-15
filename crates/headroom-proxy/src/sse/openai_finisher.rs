@@ -34,14 +34,17 @@ use futures_util::{Stream, StreamExt};
 use super::framing::SseFramer;
 
 /// Depth of the hand-off queue to the client. Matches `stream_finisher`.
+#[allow(dead_code)]
 const CLIENT_QUEUE_DEPTH: usize = 64;
 
 /// Appended to the reply so a truncated answer never reads as a finished one.
+#[allow(dead_code)]
 const TRUNCATION_MARKER: &str = "\n\n[truncated: the connection to the API dropped mid-response]";
 
 /// The marker for a drop that took an unfinished tool call with it. Naming the
 /// call is what makes it recoverable: the model reads this on its next turn
 /// and re-issues the call itself.
+#[allow(dead_code)]
 fn tool_truncation_marker(tool_name: Option<&str>) -> String {
     match tool_name {
         Some(name) => format!(
@@ -56,6 +59,7 @@ fn tool_truncation_marker(tool_name: Option<&str>) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn client_gone(request_id: &str) {
     tracing::warn!(
         request_id = %request_id,
@@ -65,11 +69,13 @@ fn client_gone(request_id: &str) {
 }
 
 /// One parsed SSE block: optional `event:` name, concatenated `data:` payload.
+#[allow(dead_code)]
 struct ParsedBlock {
     event: Option<String>,
     data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 fn parse_block(raw: &[u8]) -> Option<ParsedBlock> {
     let mut event: Option<String> = None;
     let mut datas: Vec<&[u8]> = Vec::new();
@@ -103,6 +109,7 @@ fn parse_block(raw: &[u8]) -> Option<ParsedBlock> {
     Some(ParsedBlock { event, data })
 }
 
+#[allow(dead_code)]
 fn is_done(data: &[u8]) -> bool {
     data == b"[DONE]"
 }
@@ -110,12 +117,14 @@ fn is_done(data: &[u8]) -> bool {
 // ─── Chat Completions ────────────────────────────────────────────────
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct ChatTool {
     id: Option<String>,
     name: Option<String>,
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct ChatChoice {
     finish_reason: Option<String>,
     tools: HashMap<usize, ChatTool>,
@@ -123,6 +132,7 @@ struct ChatChoice {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct ChatWire {
     id: Option<String>,
     model: Option<String>,
@@ -133,6 +143,7 @@ struct ChatWire {
 }
 
 impl ChatWire {
+    #[allow(dead_code)]
     fn observe(&mut self, v: &serde_json::Value) {
         if v.get("error").is_some() {
             self.saw_error = true;
@@ -274,6 +285,7 @@ impl ChatWire {
 
 /// Wrap an OpenAI Chat Completions SSE body so a mid-stream drop still ends as
 /// a well-formed turn (`stop` + `[DONE]`, marked truncated).
+#[allow(dead_code)]
 pub(crate) fn finish_openai_chat_on_drop<S, E>(
     inner: S,
     request_id: String,
@@ -356,6 +368,7 @@ where
 // ─── Responses (incl. Zen) ───────────────────────────────────────────
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct RespWire {
     response_id: Option<String>,
     model: Option<String>,
@@ -369,6 +382,7 @@ struct RespWire {
 }
 
 impl RespWire {
+    #[allow(dead_code)]
     fn observe(&mut self, event: Option<&str>, v: &serde_json::Value) {
         let Some(name) = event else {
             // Responses mandates an event: line; a bare data: chunk is drift.
@@ -555,6 +569,7 @@ impl RespWire {
 
 /// Wrap an OpenAI Responses SSE body (incl. Zen) so a mid-stream drop still
 /// ends as a well-formed turn (`response.completed` + `[DONE]`, marked).
+#[allow(dead_code)]
 pub(crate) fn finish_openai_responses_on_drop<S, E>(
     inner: S,
     request_id: String,
@@ -642,6 +657,7 @@ where
 // added, request untouched, telemetry still books the short stream.
 
 /// End a provider-unknown SSE body cleanly after a mid-stream drop.
+#[allow(dead_code)]
 pub(crate) fn finish_generic_on_drop<S, E>(
     inner: S,
     request_id: String,

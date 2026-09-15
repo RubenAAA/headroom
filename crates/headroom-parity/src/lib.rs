@@ -154,6 +154,7 @@ pub fn run_comparator(dir: &Path, comparator: &dyn TransformComparator) -> Resul
 /// code path. `put` always succeeds (returns `true`); `get` always returns
 /// `None`. This lets the compressor emit CCR markers in the output without
 /// requiring a real storage backend.
+#[allow(dead_code)]
 struct NullCcrStore;
 
 impl headroom_core::ccr::CcrStore for NullCcrStore {

@@ -77,11 +77,10 @@ fn tool_truncation_marker(tool_name: Option<&str>) -> String {
              A pending `{name}` tool call was discarded and did NOT run. \
              Re-issue it if it is still wanted.]"
         ),
-        None => format!(
-            "\n\n[truncated: the connection to the API dropped mid-response. \
+        None => "\n\n[truncated: the connection to the API dropped mid-response. \
              A pending tool call was discarded and did NOT run. \
              Re-issue it if it is still wanted.]"
-        ),
+            .to_string(),
     }
 }
 

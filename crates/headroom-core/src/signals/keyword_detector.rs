@@ -173,7 +173,7 @@ impl CategoryAutomaton {
             if is_word_boundary(bytes, m.start(), m.end()) {
                 let cat = self.categories[m.pattern().as_usize()];
                 let p = priority_for(cat);
-                if best.is_none_or(|(_, bp)| p > bp) {
+                if best.map_or(true, |(_, bp)| p > bp) {
                     best = Some((cat, p));
                 }
             }

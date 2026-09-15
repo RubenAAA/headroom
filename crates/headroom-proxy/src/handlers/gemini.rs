@@ -288,7 +288,7 @@ fn count_message_tokens(messages: &[Value]) -> usize {
     messages
         .iter()
         .filter_map(|m| m.get("content").and_then(Value::as_str))
-        .map(|s| estimate_tokens(s))
+        .map(estimate_tokens)
         .sum()
 }
 
@@ -313,6 +313,7 @@ struct GeminiRequest {
 }
 
 /// Parse a Gemini body, or hand back the error response to return instead.
+#[allow(clippy::result_large_err)]
 fn parse_gemini_request(body: &Bytes, headers: &HeaderMap) -> Result<GeminiRequest, Response> {
     let body_json: Value = serde_json::from_slice(body).map_err(|e| {
         error_response(
@@ -924,6 +925,7 @@ async fn forward_to_gemini_upstream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_streaming(
     state: &AppState,
     model: &str,

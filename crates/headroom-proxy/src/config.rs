@@ -2741,7 +2741,7 @@ impl Config {
             ),
             provider_name: args.provider_name.clone(),
             output_shaper_enabled: args.output_shaper_enabled,
-            verbosity_level: args.verbosity_level.max(0).min(4),
+            verbosity_level: args.verbosity_level.clamp(0, 4),
             max_injection_bytes: args.max_injection_bytes,
             memory_enabled: args.memory_enabled,
             cursor_agent_binary: args.cursor_agent_binary.clone(),
