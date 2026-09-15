@@ -96,12 +96,14 @@ model_short=${model_id#claude-}
 # Provider color for the model name, as truecolor RGB (256-color palette
 # entries render inconsistently across terminals): Meta blue #0082FB for
 # spark/muse, Anthropic orange #D97757 for opus/sonnet/haiku, bright white
-# for OpenAI-routed (gpt/codex/o-series). Anything else stays default.
+# for OpenAI-routed (gpt/codex/o-series), X light blue #1D9BF0 for grok.
+# Anything else stays default.
 model_color=""
 case "$model_short" in
   *spark*|*muse*) model_color="0;130;251" ;;
   *opus*|*sonnet*|*haiku*) model_color="217;119;87" ;;
   *gpt*|*codex*|*o1*|*o3*|*o4*) model_color="255;255;255" ;;
+  *grok*) model_color="29;155;240" ;;
 esac
 
 parts=()
