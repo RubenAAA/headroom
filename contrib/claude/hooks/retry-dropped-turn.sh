@@ -92,18 +92,48 @@ fi
 # added alongside the upstream-error branch left the dropped-connection case
 # (the original, more common trigger) setting MSG but never actually
 # blocking the stop.
+#
+# Persisted drop state: the tail detector only sees the last 30 lines, so a
+# drop marker that scrolls out before a Stop would otherwise exit 0 silently.
+# When a branch matches, record it; on a later stop with no tail match but a
+# pending drop for this session, re-prompt unless the transcript shows the
+# dropped work ran since, or the breaker tripped.
+DROP_FILE="$STATE_DIR/$SESSION.drop"
+if [ -n "$MSG" ]; then
+  wc -l <"$TRANSCRIPT" 2>/dev/null >"$DROP_FILE" 2>/dev/null || true
+elif [ -f "$DROP_FILE" ]; then
+  # Marker scrolled out of the tail window. Re-arm only if no tool ran since
+  # the drop: compare transcript lines after the recorded offset for tool
+  # execution (tool_use blocks or tool results). Plain chat without recovery
+  # keeps the drop pending; observed tool activity clears it.
+  DROP_LINES=$(cat "$DROP_FILE" 2>/dev/null || echo 0)
+  case "$DROP_LINES" in '' | *[!0-9]*) DROP_LINES=0 ;; esac
+  if tail -n +"$((DROP_LINES + 1))" "$TRANSCRIPT" 2>/dev/null | grep -qF '"type":"tool_use"'; then
+    rm -f "$DROP_FILE"
+  else
+    MSG="The API connection dropped mid-response and a pending tool call was discarded without running"
+    TAIL_INSTR="Check the transcript first: if that call already ran since the drop, do not re-issue it. Otherwise re-issue the discarded tool call now; do not ask, do not narrate."
+  fi
+fi
+
+# Decision log: one line per invocation so the next failure leaves evidence
+# (fired / breaker-tripped / no-match with the tail counts from above).
+DECISION="no-match"
 if [ -z "$MSG" ]; then
   rm -f "$STATE_DIR/$SESSION"
+  echo "ts=$(date -u +%FT%TZ) session=$SESSION decision=$DECISION" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
   exit 0
 fi
 
 COUNT=$(cat "$STATE_DIR/$SESSION" 2>/dev/null || echo 0)
 case "$COUNT" in '' | *[!0-9]*) COUNT=0 ;; esac
 if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
-  rm -f "$STATE_DIR/$SESSION"
+  rm -f "$STATE_DIR/$SESSION" "$DROP_FILE"
+  echo "ts=$(date -u +%FT%TZ) session=$SESSION decision=breaker-tripped" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
   exit 0
 fi
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 echo $((COUNT + 1)) >"$STATE_DIR/$SESSION" 2>/dev/null || exit 0
+echo "ts=$(date -u +%FT%TZ) session=$SESSION decision=fired retry=$((COUNT + 1))/$MAX_RETRIES" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
 echo "$MSG (retry $((COUNT + 1))/$MAX_RETRIES). $TAIL_INSTR" >&2
 exit 2
