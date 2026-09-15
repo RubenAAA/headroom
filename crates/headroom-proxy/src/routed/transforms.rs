@@ -11,6 +11,130 @@ use axum::http::HeaderMap;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
+/// Inject memory tool definitions into a routed body (memory-tools stage).
+///
+/// Split out of [`apply_ctx_request_transforms`]: the flag read
+/// (`memory_handler` present and initialized) and the "memory_tools" label are
+/// unchanged; only the nesting moved into the return value.
+fn inject_memory_tools(
+    handler: &crate::memory::handler::MemoryHandler,
+    parsed: &mut Value,
+    provider: crate::memory::tool_adapter::Provider,
+) -> bool {
+    // A request with no `tools` array still gets the memory tools; the
+    // array is created on demand, matching the Claude path.
+    let existing: Vec<Value> = parsed
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let (new_tools, injected) = handler.inject_memory_tools(Some(&existing), provider);
+    if injected {
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("tools".to_string(), Value::Array(new_tools));
+            tracing::debug!(
+                event = "codex_memory_tools",
+                "injected memory tool definitions into routed-model request"
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// Extend an existing `tools` array with the `headroom_retrieve` tool
+/// (CCR-tool stage). Returns true when the tool was added.
+fn inject_ccr_retrieve_tool(parsed: &mut Value) -> bool {
+    if let Some(tools) = parsed.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        let already_has = tools
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve"));
+        if !already_has {
+            tools.push(json!({
+                "name": "headroom_retrieve",
+                "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` copied exactly from a <<ccr:...>> compression marker (24 lowercase hex characters, e.g. <<ccr:7f6e11a407235b972da63df8>>) — never invent or shorten a hash — or `query` with keywords to search previously offloaded content. Exactly one of the two.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "hash": {"type": "string", "description": "Full response text for one compressed tool result. Either this or `query` is required."},
+                        "query": {"type": "string", "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."}
+                    }
+                }
+            }));
+            tracing::debug!(
+                event = "codex_ccr_tool",
+                "injected headroom_retrieve tool into routed-model request"
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// Apply the output shaper to a routed body (request-shaper stage).
+///
+/// Split out of [`apply_ctx_request_transforms`]: same gate
+/// (`output_shaper_enabled`), same extend of the report labels, same debug
+/// event. Returns nothing — the label extend is the only report effect.
+fn apply_output_shaper(state: &AppState, parsed: &mut Value, labels: &mut Vec<String>) {
+    let shaped = crate::output_shaper::shape_request_for_mode(
+        parsed,
+        true,
+        state.config.verbosity_level,
+        &state.config.mode,
+    );
+    if shaped.changed {
+        labels.extend(shaped.labels.clone());
+        tracing::debug!(
+            event = "codex_output_shaper",
+            labels = ?shaped.labels,
+            "shaped routed-model request"
+        );
+    }
+}
+
+/// Search memory and append recalled context to the latest user message
+/// (memory-context stage). Returns true when context was appended.
+///
+/// Split out of [`apply_ctx_request_transforms`]: same double gate
+/// (`memory_handler` present and initialized), same "memory_context" report
+/// label, same debug event. `async` like the caller — the search awaits.
+async fn append_memory_context(
+    handler: &crate::memory::handler::MemoryHandler,
+    parsed: &mut Value,
+    user_id: &str,
+    provider: crate::memory::tool_adapter::Provider,
+) -> bool {
+    if let Some(messages) = parsed.get("messages").and_then(|v| v.as_array()).cloned() {
+        if let Some(context) = handler
+            .search_and_format_context(user_id, &messages, None, None, None, None)
+            .await
+        {
+            let frozen = parsed
+                .get("system")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let (new_msgs, bytes) =
+                crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
+                    &messages, &context, provider, frozen,
+                );
+            if bytes > 0 {
+                if let Some(msgs) = parsed.get_mut("messages") {
+                    *msgs = Value::Array(new_msgs);
+                    tracing::debug!(
+                        event = "codex_memory_context",
+                        bytes_appended = bytes,
+                        "injected recalled memory into routed-model request"
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// What [`apply_ctx_request_transforms`] did, for the request outcome.
 ///
 /// `transforms_applied` uses the same label strings the Claude path feeds to
@@ -299,61 +423,16 @@ pub(crate) async fn apply_ctx_request_transforms(
     // to write memories at all — `--memory` looked enabled and silently did
     // nothing.
     if let Some(handler) = state.memory_handler.as_ref() {
-        if handler.is_initialized() {
-            // A request with no `tools` array still gets the memory tools; the
-            // array is created on demand, matching the Claude path.
-            let existing: Vec<Value> = parsed
-                .get("tools")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let (new_tools, injected) = handler.inject_memory_tools(Some(&existing), PROVIDER);
-            if injected {
-                if let Some(obj) = parsed.as_object_mut() {
-                    obj.insert("tools".to_string(), Value::Array(new_tools));
-                    report.transforms_applied.push("memory_tools".to_string());
-                    tracing::debug!(
-                        event = "codex_memory_tools",
-                        "injected memory tool definitions into routed-model request"
-                    );
-                }
-            }
+        if handler.is_initialized() && inject_memory_tools(handler, parsed, PROVIDER) {
+            report.transforms_applied.push("memory_tools".to_string());
         }
     }
 
     // CCR: the `headroom_retrieve` tool, so the model can pull back original
     // content by hash from a compression marker. Only extends an existing
     // `tools` array — same as the Claude path, which does not create one here.
-    if state.config.ccr_inject_tool {
-        if let Some(tools) = parsed.get_mut("tools").and_then(|v| v.as_array_mut()) {
-            let already_has = tools
-                .iter()
-                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve"));
-            if !already_has {
-                tools.push(json!({
-                    "name": "headroom_retrieve",
-                    "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` copied exactly from a <<ccr:...>> compression marker (24 lowercase hex characters, e.g. <<ccr:7f6e11a407235b972da63df8>>) — never invent or shorten a hash — or `query` with keywords to search previously offloaded content. Exactly one of the two.",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "hash": {
-                                "type": "string",
-                                "description": "Hash key copied exactly from a <<ccr:...>> compression marker (24 lowercase hex chars, e.g. '7f6e11a407235b972da63df8' from <<ccr:7f6e11a407235b972da63df8>>). Never invent or truncate a hash."
-                            },
-                            "query": {
-                                "type": "string",
-                                "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."
-                            }
-                        }
-                    }
-                }));
-                report.transforms_applied.push("ccr_tool".to_string());
-                tracing::debug!(
-                    event = "codex_ccr_tool",
-                    "injected headroom_retrieve tool into routed-model request"
-                );
-            }
-        }
+    if state.config.ccr_inject_tool && inject_ccr_retrieve_tool(parsed) {
+        report.transforms_applied.push("ccr_tool".to_string());
     }
 
     // Output shaping: verbosity steering. Idempotent — the
@@ -363,55 +442,18 @@ pub(crate) async fn apply_ctx_request_transforms(
     // Anthropic-shaped, so steering appends to the same system-prompt tail
     // that carries the provider prefix-cache key.
     if state.config.output_shaper_enabled {
-        let shaped = crate::output_shaper::shape_request_for_mode(
-            parsed,
-            true,
-            state.config.verbosity_level,
-            &state.config.mode,
-        );
-        if shaped.changed {
-            report.transforms_applied.extend(shaped.labels.clone());
-            tracing::debug!(
-                event = "codex_output_shaper",
-                labels = ?shaped.labels,
-                "shaped routed-model request"
-            );
-        }
+        apply_output_shaper(state, parsed, &mut report.transforms_applied);
     }
 
     // Memory: search and append recalled context to the latest user message.
     if let Some(handler) = state.memory_handler.as_ref() {
         if handler.is_initialized() {
-            if let Some(messages) = parsed.get("messages").and_then(|v| v.as_array()).cloned() {
-                let user_id = headers
-                    .get("x-headroom-user-id")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("default");
-                if let Some(context) = handler
-                    .search_and_format_context(user_id, &messages, None, None, None, None)
-                    .await
-                {
-                    let frozen = parsed
-                        .get("system")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    let (new_msgs, bytes) =
-                        crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
-                            &messages, &context, PROVIDER, frozen,
-                        );
-                    if bytes > 0 {
-                        if let Some(msgs) = parsed.get_mut("messages") {
-                            *msgs = Value::Array(new_msgs);
-                            report.transforms_applied.push("memory_context".to_string());
-                            tracing::debug!(
-                                event = "codex_memory_context",
-                                bytes_appended = bytes,
-                                "injected recalled memory into routed-model request"
-                            );
-                        }
-                    }
-                }
+            let user_id = headers
+                .get("x-headroom-user-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("default");
+            if append_memory_context(handler, parsed, user_id, PROVIDER).await {
+                report.transforms_applied.push("memory_context".to_string());
             }
         }
     }

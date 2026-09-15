@@ -119,6 +119,29 @@ pub(crate) fn anthropic_to_openai_request(
     Ok(openai)
 }
 
+/// Table-driven scalar passthrough for the Responses translation above.
+///
+/// Each row is `(anthropic_field, responses_field)`, applied in order: when
+/// the source field is present its value is cloned across unchanged. Rows
+/// that need branching beyond a mechanical copy (system/messages/tools,
+/// `tool_choice`, `instructions`, `max_output_tokens` gating, readonly
+/// `stream`) stay inline in the caller.
+fn copy_scalar_fields(anthropic: &Value, openai: &mut Value) {
+    // `temperature` is deliberately absent: the Codex ResponsesApiRequest
+    // has no such field and the real CLI never sends it (the tail comment
+    // restates this for readers who only read the caller).
+    const SCALAR_FIELDS: &[(&str, &str)] = &[
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        ("stop_sequences", "stop"),
+    ];
+    for (src, dst) in SCALAR_FIELDS {
+        if let Some(v) = anthropic.get(*src) {
+            openai[*dst] = (*v).clone();
+        }
+    }
+}
+
 pub(crate) fn anthropic_to_openai_responses_request(
     anthropic: &Value,
     include_max_output_tokens: bool,
@@ -225,6 +248,8 @@ pub(crate) fn anthropic_to_openai_responses_request(
         "input": input,
         "stream": stream,
     });
+
+    copy_scalar_fields(anthropic, &mut openai);
 
     let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
     if let Some(tools) = tools {
