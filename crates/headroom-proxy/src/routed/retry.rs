@@ -116,10 +116,11 @@ pub(crate) async fn send_with_retry(
     let mut attempt: u32 = 0;
     // Zen in-flight cap: bound the first wave (concurrent POST starts),
     // which no backoff can stagger because nothing has failed yet. The slot
-    // releases when this function returns; the streamed body outlives it by
-    // design (streams already accepted need no gate). Fail-open: over-cap
-    // turns proceed without a slot rather than stalling.
-    let _zen_slot = if is_zen {
+    // releases when this function returns or when a 429 hold begins; the
+    // streamed body outlives it by design (streams already accepted need
+    // no gate). Fail-open: over-cap turns proceed without a slot rather
+    // than stalling.
+    let mut zen_slot = if is_zen {
         Some(
             crate::routed::upstream_gate::acquire_global_zen_slot(
                 state.config.retry_zen_max_inflight,
@@ -294,6 +295,14 @@ pub(crate) async fn send_with_retry(
                 }
                 if status.as_u16() == 429 && is_zen && state.config.retry_zen_hold_enabled {
                     drop(r);
+                    // A hold sleeps for up to the hold budget (187 s seen
+                    // 2026-09-14) with nothing in flight. Holding the Zen
+                    // slot through it pinned every slot behind 429s, so the
+                    // 1,152 over-cap turns that day each waited the full
+                    // 30 s and then went without one anyway. Give it back;
+                    // the per-host gate already staggers arrivals behind
+                    // the same 429.
+                    zen_slot.take();
                     match crate::routed::zen_hold::hold_for_rotation(
                         state,
                         upstream_url,

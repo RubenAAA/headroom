@@ -480,6 +480,25 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --cache-stampede-gate <CACHE_STAMPEDE_GATE>
+          Hold requests that share a cold cacheable head until the first of them has begun its response.
+          
+          Anthropic makes a cache entry readable only once the response that wrote it begins, so a fan-out of subagents sent in one instant all miss and all pay write price for one head. Followers park until the leader's response headers arrive or `--cache-stampede-wait-cap` passes. Nothing about the request changes; only when it goes.
+          
+          Default `false`. The mechanism is real but the 2026-09-14/15 logs showed no follower behind a cold leader in the 46% of turns that carry a fingerprint, so it stays opt-in until a window shows one.
+          
+          [env: HEADROOM_PROXY_CACHE_STAMPEDE_GATE=]
+          [default: false]
+          [possible values: true, false]
+
+      --cache-stampede-wait-cap <CACHE_STAMPEDE_WAIT_CAP>
+          Longest a follower waits on its leader under `--cache-stampede-gate`.
+          
+          Bounds the delay a cold fan-out can add. Past it the follower goes as it would have without the gate. Default `10s`, about twice the median time to first byte of a cold large-prefix turn.
+          
+          [env: HEADROOM_PROXY_CACHE_STAMPEDE_WAIT_CAP=]
+          [default: 10s]
+
       --ctx-offload-min-bytes <CTX_OFFLOAD_MIN_BYTES>
           CTX-3: minimum serialized byte length a `tool_result` block must exceed to be offloaded. Static per invariant I3 (never changes mid-session). Default `50_000` (mirrors context-mode's Read threshold)
           

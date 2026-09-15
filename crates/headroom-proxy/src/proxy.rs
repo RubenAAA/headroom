@@ -120,6 +120,8 @@ pub struct AppState {
     /// Per-conversation opening-sentence pins. Same lifetime rules as
     /// `working_dir_pins`; see [`cache_stabilization::role_sentence`].
     pub role_sentence_pins: cache_stabilization::role_sentence::RoleSentencePins,
+    /// Same-head stampede gate; see [`cache_stabilization::prefix_stampede`].
+    pub stampede_gate: cache_stabilization::prefix_stampede::PrefixStampedeGate,
     /// When this process started. The replay store is in-memory, so every
     /// restart empties it and the first turn of every live conversation then
     /// finds no prefix. Without this, that expected gap is indistinguishable
@@ -264,11 +266,25 @@ const CCR_CONTINUATION_RETRIES: u32 = 2;
 /// stalled headers wait: measured 2026-09-09, one round hung 43s/31s/26s
 /// across its three attempts on flaky egress while the 600s bound sat
 /// untouched, holding the client's turn 107s for a retrieval that died.
-/// `.send()` resolves at response headers, so this cannot cut a slow model
-/// short — body streaming happens after, under the total timeout. A headers
-/// wait past this is a stall, not thinking; fail it fast so the retry can
-/// actually help instead of re-waiting the same stall.
+/// `.send()` resolves at response headers, so on a streamed continuation this
+/// cannot cut a slow model short — the body arrives after, bounded by
+/// [`CCR_CONTINUATION_IDLE_TIMEOUT`]. A headers wait past this is a stall, not
+/// thinking; fail it fast so the retry can actually help instead of re-waiting
+/// the same stall.
+///
+/// On a *buffered* continuation the two are the same wait, and this is a bound
+/// on generation: a routed chat-completions backend can still lose a slow round
+/// here. Anthropic continuations stream for exactly that reason (see
+/// `streamed_continuation_request`); the routed shapes need their own SSE fold
+/// before they can follow.
 const CCR_CONTINUATION_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ceiling on the silence between two chunks of a streamed continuation's
+/// response body. The generation lives in that body, so the only bound that
+/// does not cut a slow model short is one on silence: Anthropic pings while it
+/// thinks, so a gap this long is a dead connection rather than a long one. A
+/// buffered continuation arrives in one chunk and never waits on this.
+const CCR_CONTINUATION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Short classification of a reqwest transport failure for log lines.
 /// reqwest's Display names the URL but not the phase; without this every
@@ -747,6 +763,11 @@ impl AppState {
         } else {
             cache_stabilization::usage_observer::ANTHROPIC_CACHE_TTL
         };
+        let stampede_gate = cache_stabilization::prefix_stampede::PrefixStampedeGate::new(
+            REPLAY_STORE_CAPACITY,
+            config.cache_stampede_wait_cap,
+            observed_cache_ttl,
+        );
 
         Ok(Self {
             config: Arc::new(config),
@@ -767,6 +788,7 @@ impl AppState {
             role_sentence_pins: cache_stabilization::role_sentence::RoleSentencePins::new(
                 REPLAY_STORE_CAPACITY,
             ),
+            stampede_gate,
             started_at: std::time::Instant::now(),
             beta_sticky: cache_stabilization::beta_sticky::BetaStickyState::new(
                 cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
@@ -1841,6 +1863,38 @@ async fn catch_all(
         // Sec-WebSocket-Key) — fall through to HTTP forwarding which will
         // surface the upstream error.
     }
+    // Codex Live call creation (port of upstream `53982aef`): a multipart
+    // POST carrying `sdp` + `session` that the generic forwarder would relay
+    // to the default upstream unconverted. The handler gates on headers
+    // alone first and hands an unauthenticated request back with its body
+    // unread, so the fall-through below forwards exactly what arrived.
+    // Non-POST methods keep existing behaviour (the upgrade branch above
+    // owns GET-with-upgrade; plain GET forwards as HTTP).
+    if parts.method == http::Method::POST
+        && crate::codex_live_http::is_live_call_path(parts.uri.path())
+    {
+        let request_id = ensure_request_id(&parts.headers);
+        let inbound_path = parts.uri.path().to_string();
+        match crate::codex_live_http::handle_live_call(
+            &state.client,
+            state.config.strip_internal_headers.is_enabled(),
+            state.config.max_body_bytes as usize,
+            &request_id,
+            &inbound_path,
+            parts,
+            body,
+        )
+        .await
+        {
+            crate::codex_live_http::LiveHttpDecision::Handled(resp) => return resp,
+            crate::codex_live_http::LiveHttpDecision::Fallthrough(p, b) => {
+                let req = Request::from_parts(p, b);
+                return forward_http(state, client_addr, req)
+                    .await
+                    .unwrap_or_else(|e| e.into_response());
+            }
+        }
+    }
     let req = Request::from_parts(parts, body);
     forward_http(state, client_addr, req)
         .await
@@ -2472,7 +2526,7 @@ pub(crate) fn maybe_inject_tool_search(
 ///
 /// Unconditional and last: runs after turn hooks (which may rewrite tools)
 /// and after every other tools/messages mutator, validating against the
-/// final outbound array. Returns the removed-block count; zero means the
+/// final outbound array. Returns the neutralized-block count; zero means the
 /// original bytes are forwarded untouched.
 pub(crate) fn maybe_repair_tool_search_history(
     body: bytes::Bytes,
@@ -2494,7 +2548,7 @@ pub(crate) fn maybe_repair_tool_search_history(
         None => return (body, 0),
     };
     let repair = tsd::strip_unsupported_blocks(messages, &tools);
-    if repair.removed == 0 {
+    if repair.neutralized == 0 {
         return (body, 0);
     }
     value["messages"] = serde_json::Value::Array(repair.messages);
@@ -2503,10 +2557,10 @@ pub(crate) fn maybe_repair_tool_search_history(
             tracing::info!(
                 event = "tool_search_history_repair",
                 request_id = %request_id,
-                removed_blocks = repair.removed,
-                "dropped tool-search history blocks the tools array cannot support"
+                neutralized_blocks = repair.neutralized,
+                "repaired tool-search history blocks the tools array cannot support (replaced with text in place)"
             );
-            (bytes::Bytes::from(bytes), repair.removed)
+            (bytes::Bytes::from(bytes), repair.neutralized)
         }
         Err(_) => (body, 0),
     }
@@ -3936,6 +3990,14 @@ pub(crate) async fn forward_http(
     // CCR can resolve (see `openai_buffered_ccr`); read after the upstream
     // responds to resynthesize SSE for the client. `false` on passthrough.
     let mut buffered_responses_ccr = false;
+    // Same-head stampede gate: the key this turn went out under and, for a
+    // leader, the token that marks the head readable once headers arrive.
+    // `None` on passthrough, on non-Anthropic endpoints, and on heads with no
+    // cache marker.
+    let mut stampede: Option<(
+        String,
+        Option<cache_stabilization::prefix_stampede::LeaderToken>,
+    )> = None;
     let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
         let max = state.config.compression_max_body_bytes as usize;
@@ -4045,24 +4107,21 @@ pub(crate) async fn forward_http(
             && memchr::memmem::find(&buffered, DESCRIBE).is_some()
         {
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
-                let sidecar_model = state
-                    .config
-                    .sidecar_model
-                    .clone()
-                    .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
                 let empty = http::HeaderMap::new();
-                if let Some(resp) = crate::sidecar::try_handle(
-                    &upstream_client,
-                    &upstream_url,
-                    &request_id,
-                    headers_snapshot.as_ref().unwrap_or(&empty),
-                    &parsed,
-                    &sidecar_model,
-                    crate::sidecar::SidecarRetry::from_config(&state.config),
-                )
-                .await
-                {
-                    return Ok(resp);
+                if let Some(sidecar_model) = crate::sidecar::direct_sidecar_model(&state.config) {
+                    if let Some(resp) = crate::sidecar::try_handle(
+                        &upstream_client,
+                        &upstream_url,
+                        &request_id,
+                        headers_snapshot.as_ref().unwrap_or(&empty),
+                        &parsed,
+                        &sidecar_model,
+                        crate::sidecar::SidecarRetry::from_config(&state.config),
+                    )
+                    .await
+                    {
+                        return Ok(resp);
+                    }
                 }
             }
         }
@@ -4176,6 +4235,16 @@ pub(crate) async fn forward_http(
         // PR-J4: whether the drift detector saw a cache hot-zone rebuild on
         // this turn. Consumed below by the offload boundary gate.
         let mut rebuild_boundary = false;
+        // How much of what this lane forwarded last turn the client is still
+        // sending, read *before* the boundary invalidation below wipes the
+        // tracker it lives in. Same lane key, same field: `invalidate` clears
+        // `last_forwarded_messages` and `forwarded_agreement_len` returns
+        // `None` on exactly that being empty, so reading it after the
+        // invalidation reports "no agreement" on every boundary turn — the
+        // turns it was added to speak for. The gate it feeds then had nothing
+        // left to check, and the log line published the erased value as
+        // evidence the drop was free.
+        let mut pre_boundary_agreement: Option<usize> = None;
         // Tokens removed by transforms that run *outside* the compression
         // pipeline (ctx_offload). Compression reports its own savings; these
         // reached no metric at all, so a body that genuinely shrank still
@@ -4375,6 +4444,14 @@ pub(crate) async fn forward_http(
                 // fresh baseline with no warn — so sibling streams stop
                 // invalidating each other.
                 if rebuild_boundary {
+                    pre_boundary_agreement = parsed
+                        .get("messages")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|messages| {
+                            state
+                                .replay_store
+                                .forwarded_agreement_len(&request_lane_key, messages)
+                        });
                     state.replay_store.invalidate(&request_lane_key);
                     tracing::info!(
                         event = "prefix_replay_invalidated_on_rebuild",
@@ -4726,6 +4803,17 @@ pub(crate) async fn forward_http(
         // rewritten anyway — rebuild boundary, no tracker, or agreement
         // ending at index 0/1. A tail divergence keeps its head thinking;
         // only the tail is re-billed either way.
+        // On a boundary turn this is the reading taken before the
+        // invalidation; otherwise the tracker is intact and the live read is
+        // the same reading. The log below publishes this one too, so the field
+        // and the decision can never disagree.
+        let forwarded_agreement = pre_boundary_agreement.or_else(|| {
+            replay_original_messages.as_deref().and_then(|messages| {
+                state
+                    .replay_store
+                    .forwarded_agreement_len(&request_lane_key, messages)
+            })
+        });
         let buffered = if state.config.ctx_drop_prior_thinking
             && offload_boundary
             && matches!(
@@ -4737,11 +4825,7 @@ pub(crate) async fn forward_http(
                 .any(|w| w == b"thinking")
             && crate::compression::prior_thinking::thinking_drop_is_free(
                 rebuild_boundary,
-                replay_original_messages.as_deref().and_then(|messages| {
-                    state
-                        .replay_store
-                        .forwarded_agreement_len(&request_lane_key, messages)
-                }),
+                forwarded_agreement,
             ) {
             match serde_json::from_slice::<serde_json::Value>(&buffered) {
                 Ok(mut value) => {
@@ -4779,14 +4863,8 @@ pub(crate) async fn forward_http(
                             // one compares what we last sent, which is what got
                             // cached. Where the two disagree this is the one
                             // that decides whether the drop costs anything.
-                            forwarded_agreement_len = replay_original_messages
-                                .as_deref()
-                                .and_then(|m| {
-                                    state
-                                        .replay_store
-                                        .forwarded_agreement_len(&request_lane_key, m)
-                                })
-                                .map_or(-1_i64, |n| n as i64),
+                            forwarded_agreement_len =
+                                forwarded_agreement.map_or(-1_i64, |n| n as i64),
                             incoming_msgs = replay_original_messages
                                 .as_deref()
                                 .map_or(-1_i64, |m| m.len() as i64),
@@ -6307,11 +6385,11 @@ pub(crate) async fn forward_http(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
         ) {
-            let (bytes, removed) = maybe_repair_tool_search_history(body_to_send, &request_id);
-            if removed > 0 {
+            let (bytes, neutralized) = maybe_repair_tool_search_history(body_to_send, &request_id);
+            if neutralized > 0 {
                 if let Some(ctx) = outcome_ctx.as_mut() {
                     ctx.transforms_applied
-                        .push(format!("router:tool_search_repair:{removed}blocks"));
+                        .push(format!("router:tool_search_repair:{neutralized}blocks"));
                 }
             }
             bytes
@@ -6417,14 +6495,22 @@ pub(crate) async fn forward_http(
         // already parses and re-serializes it several times, so this is a
         // small addition to a cost that is already paid.
         if let Some(kind) = request_api_kind {
+            // Tri-state, and the middle one is the point: `Some("")` says the
+            // lane was compared and the forwarded body held still in all three
+            // dimensions, which is how a stabilizer absorbing a client edit
+            // shows up. `None` stays reserved for "no comparison" — a birth
+            // turn, or a body that never parsed — so a positive finding is
+            // never confused with an absent one.
             let outbound_dims = serde_json::from_slice::<serde_json::Value>(&body_to_send)
                 .ok()
                 .and_then(|sent| {
-                    cache_stabilization::drift_detector::observe_outbound_drift(
-                        &state.outbound_drift_state,
-                        &request_lane_key,
-                        compute_structural_hash(&sent, kind),
-                    )
+                    let (dims, birth) =
+                        cache_stabilization::drift_detector::observe_outbound_drift_with_birth(
+                            &state.outbound_drift_state,
+                            &request_lane_key,
+                            compute_structural_hash(&sent, kind),
+                        );
+                    (!birth).then(|| dims.unwrap_or_default())
                 });
             state
                 .usage_observer
@@ -6559,6 +6645,39 @@ pub(crate) async fn forward_http(
                 http::header::ACCEPT,
                 http::HeaderValue::from_static("application/json"),
             );
+        }
+
+        // Same-head stampede gate. Runs last, on the bytes that go out, so the
+        // key matches what the provider will cache. Its wait is recorded as
+        // its own stage: it is proxy time, but chosen, not spent.
+        if state.config.cache_stampede_gate
+            && endpoint == compression::CompressibleEndpoint::AnthropicMessages
+        {
+            let key = serde_json::from_slice::<serde_json::Value>(&body_to_send)
+                .ok()
+                .as_ref()
+                .and_then(cache_stabilization::prefix_stampede::PrefixStampedeGate::head_key);
+            if let Some(key) = key {
+                use cache_stabilization::prefix_stampede::Admission;
+                let gate_start = Instant::now();
+                let token = match state.stampede_gate.admit(&key).await {
+                    Admission::Leader(token) => Some(token),
+                    Admission::Warm => None,
+                    Admission::Follower { waited, release } => {
+                        tracing::info!(
+                            event = "stampede_follower_released",
+                            request_id = %request_id,
+                            head_key = %key,
+                            waited_ms = waited.as_millis() as u64,
+                            release = release.as_str(),
+                            "held behind a same-head leader"
+                        );
+                        None
+                    }
+                };
+                stage_timer.record("stampede_wait", gate_start.elapsed().as_secs_f64() * 1000.0);
+                stampede = Some((key, token));
+            }
         }
 
         // Forward the request with retry on transient errors (429, 529, 5xx).
@@ -6764,6 +6883,15 @@ pub(crate) async fn forward_http(
     // Bytes already read off the body while checking for a leading in-band
     // error. They lead the client's stream so nothing is lost.
     let (upstream_resp, sse_prefix) = upstream_resp;
+    if let Some((key, token)) = stampede.take() {
+        if upstream_resp.status().is_success() {
+            match token {
+                Some(token) => token.first_byte(),
+                None => state.stampede_gate.touch(&key),
+            }
+        }
+        // A failed leader drops its token here and releases its followers.
+    }
     // Response headers are in hand. Whatever is left after `pre_forward` is
     // the provider's own time, including retries and backoff.
     {
@@ -6777,126 +6905,30 @@ pub(crate) async fn forward_http(
     }
 
     let upstream_status = upstream_resp.status();
+
     let mut status =
         StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    // PR-A8 / P5-57: capture the upstream request id BEFORE we move
-    // `upstream_resp.headers()` into the response filter. Anthropic
-    // emits `request-id` (lowercase, no `x-`); OpenAI emits
-    // `x-request-id`. We forward both to the client unchanged in
-    // `resp_headers` and additionally surface a side-channel
-    // `headroom-request-id` header so callers can correlate proxy
-    // logs without conflating with the proxy's own `x-request-id`.
-    let upstream_request_id_anthropic = upstream_resp
-        .headers()
-        .get("request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let upstream_request_id_openai = upstream_resp
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    // Prefer the provider-specific id whichever was set. Both
-    // present is unusual but legal; prefer Anthropic since it's the
-    // path-shape we lockdown with cache invariants.
-    let upstream_request_id = upstream_request_id_anthropic
-        .clone()
-        .or_else(|| upstream_request_id_openai.clone());
+    let (upstream_request_id_anthropic, upstream_request_id_openai, upstream_request_id) =
+        capture_upstream_request_ids(upstream_resp.headers());
 
-    // PR-C1: detect SSE responses so the state machine can run in
-    // parallel with the byte-passthrough. We classify ONCE here and
-    // pick the response provider arm based on the request path —
-    // bytes flow to the client unchanged; the state machine sinks
-    // bytes into a `tokio::sync::mpsc` and runs in a spawned task
-    // that can never block the byte path.
-    //
-    // PR-C4: the OpenAI Responses arm is gated by
-    // `enable_responses_streaming`. When that flag is false the
-    // tee is short-circuited to `None` so the framer + state
-    // machine don't spin up and bytes flow opaquely. Other
-    // providers' state machines are unaffected.
     let is_sse = is_sse_response(upstream_resp.headers());
-    let sse_kind = if is_sse {
-        let kind = SseStreamKind::for_request_path(&path_for_log);
-        if matches!(kind, SseStreamKind::OpenAiResponses)
-            && !state.config.enable_responses_streaming
-        {
-            tracing::info!(
-                request_id = %request_id,
-                path = %path_for_log,
-                event = "responses_streaming_state_machine_skipped",
-                reason = "enable_responses_streaming=false",
-                "PR-C4 streaming pipeline disabled; SSE bytes pass through without telemetry"
-            );
-            SseStreamKind::None
-        } else {
-            kind
-        }
-    } else {
-        SseStreamKind::None
-    };
+    let sse_kind = classify_sse_kind(
+        is_sse,
+        &path_for_log,
+        state.config.enable_responses_streaming,
+        &request_id,
+    );
 
     let mut resp_headers = filter_response_headers(upstream_resp.headers());
 
-    // Phase G PR-G3: extract upstream rate-limit headers from this
-    // response and record them as gauges. The `provider` label is
-    // chosen by which of the upstream `request-id` shapes we saw
-    // (Anthropic vs OpenAI). When neither shape was detected we
-    // skip emission rather than guessing — per realignment build-
-    // constraint "no silent fallbacks".
-    let rate_limit_snapshot =
-        crate::observability::extract_rate_limit_snapshot(upstream_resp.headers());
-    let rate_limit_provider: Option<&'static str> = if upstream_request_id_anthropic.is_some() {
-        Some(crate::observability::cache_hit_rate_provider::ANTHROPIC)
-    } else if upstream_request_id_openai.is_some() {
-        // We can't distinguish chat vs responses purely from the
-        // request-id header; the `path_for_log` is more specific.
-        Some(if path_for_log.contains("/v1/responses") {
-            crate::observability::cache_hit_rate_provider::OPENAI_RESPONSES
-        } else {
-            crate::observability::cache_hit_rate_provider::OPENAI_CHAT
-        })
-    } else {
-        None
-    };
-    if let Some(provider) = rate_limit_provider {
-        crate::observability::record_rate_limit_snapshot(
-            provider,
-            &rate_limit_snapshot,
-            &request_id,
-        );
-    } else if rate_limit_snapshot.remaining_requests.is_some()
-        || rate_limit_snapshot.remaining_tokens.is_some()
-        || rate_limit_snapshot.remaining_input_tokens.is_some()
-        || rate_limit_snapshot.remaining_output_tokens.is_some()
-    {
-        // Headers present but provider unattributable. Log loud so
-        // operators see the wire-format drift; do not emit unlabelled
-        // metrics.
-        tracing::debug!(
-            event = "rate_limit_snapshot_unattributable",
-            request_id = %request_id,
-            path = %path_for_log,
-            "rate-limit headers present but provider couldn't be inferred; skipping gauge emit"
-        );
-    }
-
-    // Subscription / OAuth traffic carries the `anthropic-ratelimit-
-    // unified-*` family instead of `*-remaining` — the headers above
-    // stay None on a Claude-subscription plan, so the `*-remaining`
-    // gauges never populate. Parse + record the unified family too so
-    // subscription headroom (utilization per 5h/7d window) is visible.
-    // Provider-agnostic: the unified prefix is Anthropic-specific, so a
-    // non-empty snapshot is self-attributing.
-    let unified_snapshot =
-        crate::observability::extract_unified_rate_limit(upstream_resp.headers());
-    if !unified_snapshot.windows.is_empty()
-        || unified_snapshot.overall_status.is_some()
-        || unified_snapshot.fallback_percentage.is_some()
-    {
-        crate::observability::record_unified_rate_limit(&unified_snapshot, &request_id);
-    }
+    record_upstream_rate_limits(
+        upstream_resp.headers(),
+        upstream_request_id_anthropic.is_some(),
+        upstream_request_id_openai.is_some(),
+        &path_for_log,
+        &request_id,
+    );
 
     // Stream response body back without buffering. Wrap errors so mid-stream
     // upstream failures are logged rather than silently truncating the client.
@@ -6923,46 +6955,25 @@ pub(crate) async fn forward_http(
         && state.config.ccr_handle_responses
         && state.ctx_offload.is_some()
         && path_for_log.contains("/v1/messages");
-    // Put the peeked bytes back at the head of the stream. `sse_prefix` is
-    // empty on every path that did not peek, so this is a no-op there.
-    let upstream_body = {
-        let rest = upstream_resp.bytes_stream();
-        let head =
-            futures_util::stream::iter((!sse_prefix.is_empty()).then(|| Ok(sse_prefix.clone())));
-        head.chain(rest)
-    };
-    // A stream that dies part-way leaves the turn dead, and the retry loop above
-    // is long gone by then — it only ever saw the headers. This wrapper holds the
-    // opening bytes back so an early drop can start a new request instead of
-    // reaching the client. It sits below CCR and below the telemetry tee, so a
-    // discarded attempt is invisible to both.
-    let upstream_body: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-    > = if let Some(body) = retry_body.filter(|_| {
-        is_sse
-            && status.is_success()
-            && state.config.retry_enabled
-            && state.config.retry_stream_hold_bytes > 0
-            && state.config.retry_max_attempts > 1
-    }) {
-        Box::pin(crate::sse::stream_retry::retry_on_early_drop(
-            upstream_body,
-            crate::sse::stream_retry::RetryContext {
-                client: upstream_client.clone(),
-                method: reqwest_method.clone(),
-                url: upstream_url.to_string(),
-                headers: outgoing_headers.clone(),
-                body,
-                request_id: request_id.clone(),
-                max_attempts: state.config.retry_max_attempts,
-                base_delay_ms: state.config.retry_base_delay_ms,
-                max_delay_ms: state.config.retry_max_delay_ms,
-                hold_bytes: state.config.retry_stream_hold_bytes,
-            },
-        ))
-    } else {
-        Box::pin(upstream_body)
-    };
+    let upstream_body = assemble_upstream_body(
+        upstream_resp,
+        sse_prefix,
+        retry_body,
+        is_sse,
+        status,
+        UpstreamBodyRetry {
+            enabled: state.config.retry_enabled,
+            hold_bytes: state.config.retry_stream_hold_bytes,
+            max_attempts: state.config.retry_max_attempts,
+            client: upstream_client.clone(),
+            method: reqwest_method.clone(),
+            url: upstream_url.to_string(),
+            headers: outgoing_headers.clone(),
+            request_id: request_id.clone(),
+            base_delay_ms: state.config.retry_base_delay_ms,
+            max_delay_ms: state.config.retry_max_delay_ms,
+        },
+    );
     // #2613 edge, port of `_openai_responses_from_sse`: some
     // OpenAI-compatible upstreams answer a `stream: false` request with a
     // valid 200 SSE body. When this request was buffered for Responses CCR,
@@ -6970,206 +6981,50 @@ pub(crate) async fn forward_http(
     // arm below still resolves retrieval. Without a terminal event the
     // collected bytes stream through unchanged (previous behaviour,
     // error included).
-    let mut upstream_body = upstream_body;
-    let (mut is_sse, mut sse_kind) = (is_sse, sse_kind);
-    if buffered_responses_ccr && is_sse && status.is_success() {
-        use futures_util::StreamExt as _;
-        let mut collected = bytes::BytesMut::new();
-        let mut first_err: Option<reqwest::Error> = None;
-        {
-            let s = &mut upstream_body;
-            while let Some(chunk) = s.next().await {
-                match chunk {
-                    Ok(b) => collected.extend_from_slice(&b),
-                    Err(e) => {
-                        first_err = Some(e);
-                        break;
-                    }
-                }
-            }
-        }
-        let reassembled: Option<bytes::Bytes> = if first_err.is_none() {
-            // Whole stream collected cleanly: reassemble the terminal JSON
-            // when one is present.
-            crate::openai_buffered_ccr::responses_completed_from_sse(&String::from_utf8_lossy(
-                &collected,
-            ))
-            .and_then(|completed| serde_json::to_vec(&completed).ok())
-            .map(bytes::Bytes::from)
-        } else {
-            None
-        };
-        if let Some(json_bytes) = reassembled {
-            tracing::info!(
-                request_id = %request_id,
-                event = "buffered_responses_ccr_sse_answer",
-                "upstream answered stream:false with SSE; reassembled terminal JSON for buffered handling"
-            );
-            upstream_body = Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
-                json_bytes,
-            )]));
-            is_sse = false;
-            sse_kind = SseStreamKind::None;
-        } else {
-            let mut items: Vec<reqwest::Result<bytes::Bytes>> = vec![Ok(collected.freeze())];
-            if let Some(e) = first_err {
-                items.push(Err(e));
-            }
-            upstream_body = Box::pin(futures_util::stream::iter(items));
-        }
-    }
-    // What every continuation round below appends to: the bytes the provider
-    // saw and cached, falling back to the client's own body on the passthrough
-    // branch, which forwards nothing of its own.
-    let continuation_base = forwarded_body
+    let (upstream_body, is_sse, sse_kind) = reframe_buffered_responses_sse(
+        upstream_body,
+        is_sse,
+        sse_kind,
+        buffered_responses_ccr,
+        status,
+        &request_id,
+    )
+    .await;
+    // What every continuation round appends to: the bytes the provider saw and
+    // cached, falling back to the client's own body on the passthrough branch,
+    // which forwards nothing of its own. Shared by the streamed CCR rewrite
+    // above and the buffered CCR/memory rounds below.
+    let continuation_base: bytes::Bytes = forwarded_body
         .clone()
         .unwrap_or_else(|| original_buffered.clone());
 
     #[allow(clippy::type_complexity)]
-    let (upstream_body, ccr_round_usage): (
-        std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
-        Option<Arc<Mutex<CcrRoundUsage>>>,
-    ) = if ccr_stream_eligible {
-        let ctx = crate::sse::ccr_stream::CcrStreamContext {
-            client: upstream_client.clone(),
-            upstream_url: upstream_url.clone(),
-            outgoing_headers: outgoing_headers.clone(),
-            forwarded_request: continuation_base.clone(),
-            ccr_store: state
-                .ctx_offload
-                .as_ref()
-                .expect("ctx_offload checked above")
-                .store
-                .ccr(),
-            ccr_stores: state.ctx_offload.as_ref().map(|r| r.store.stores()),
-            config: state.config.clone(),
-            request_id: request_id.clone(),
-            shape: crate::sse::ccr_stream::CcrShape::Anthropic,
-            memory: memory_tool_context(
-                &state,
-                &headers_snapshot,
-                Some("anthropic"),
-                &original_buffered,
-            )
-            .await,
-            // Anthropic path: redaction lives on routed translate paths only.
-            redact: None,
-            // Anthropic path: the caller folds the returned handle itself.
-            rounds_sink: None,
-        };
-        let (stream, usage) = crate::sse::ccr_stream::rewrite_anthropic_stream(upstream_body, ctx);
-        (Box::pin(stream), Some(usage))
-    } else {
-        (Box::pin(upstream_body), None)
-    };
+    let (upstream_body, ccr_round_usage) = maybe_rewrite_anthropic_stream(
+        upstream_body,
+        ccr_stream_eligible,
+        continuation_base.clone(),
+        original_buffered.clone(),
+        &state,
+        &upstream_client,
+        &upstream_url,
+        &outgoing_headers,
+        &headers_snapshot,
+        &request_id,
+    )
+    .await;
 
     let rid = request_id.clone();
     let parser_telemetry = std::sync::Arc::new(ParserTelemetry::default());
-    let parser_tx = if !matches!(sse_kind, SseStreamKind::None) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(SSE_PARSER_QUEUE_DEPTH);
-        let rid_for_parser = request_id.clone();
-        // Freeze-replay: hand the state machine a store handle so the
-        // Anthropic arm can feed the final usage's cache tokens back
-        // into the session tracker (`SessionReplayStore::complete`) —
-        // the request→response correlation the Python handler did
-        // inline. `None` when the feature is off so the flag-off path
-        // is observably unchanged.
-        let replay_store_for_parser = if state.config.prefix_replay {
-            Some(state.replay_store.clone())
-        } else {
-            None
-        };
-        let parser_task = tokio::spawn(run_sse_state_machine(
-            sse_kind,
-            rx,
-            rid_for_parser.clone(),
-            state.usage_observer.clone(),
-            outcome_ctx.clone(),
-            replay_store_for_parser,
-            ccr_round_usage.clone(),
-            status,
-        ));
-        // Keep the parser detached from response forwarding, but do not drop
-        // its JoinHandle: a panic would otherwise erase the only completion
-        // record for this request. The waiter preserves the streaming path and
-        // makes task panics/cancellation operator-visible.
-        let waiter_telemetry = parser_telemetry.clone();
-        tokio::spawn(async move {
-            let result = parser_task.await;
-            let sent_chunks = waiter_telemetry
-                .sent_chunks
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let dropped_chunks = waiter_telemetry
-                .dropped_chunks
-                .load(std::sync::atomic::Ordering::Relaxed);
-            match result {
-                // A clean finish is already announced once per stream by
-                // `sse stream closed`, so this stays quiet unless the chunk
-                // counts say something that line cannot: a parser that missed
-                // input because its queue was full or already closed. Logging
-                // every clean finish at info would double the per-stream volume
-                // of a log that is never rotated.
-                Ok(()) if dropped_chunks > 0 => tracing::warn!(
-                    request_id = %rid_for_parser,
-                    sent_chunks,
-                    dropped_chunks,
-                    "sse state-machine task completed having missed chunks; \
-                     its usage totals are short by whatever those carried"
-                ),
-                Ok(()) => tracing::debug!(
-                    request_id = %rid_for_parser,
-                    sent_chunks,
-                    dropped_chunks,
-                    "sse state-machine task completed"
-                ),
-                Err(error) => tracing::error!(
-                    request_id = %rid_for_parser,
-                    sent_chunks,
-                    dropped_chunks,
-                    task_panic = error.is_panic(),
-                    task_cancelled = error.is_cancelled(),
-                    error = %error,
-                    "sse state-machine task failed"
-                ),
-            }
-        });
-        Some(tx)
-    } else {
-        None
-    };
-    let resp_stream = upstream_body.map(move |r| match r {
-        Ok(b) => {
-            if let Some(tx) = &parser_tx {
-                if let Err(e) = tx.try_send(b.clone()) {
-                    parser_telemetry
-                        .dropped_chunks
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::debug!(
-                        request_id = %rid,
-                        error = %e,
-                        "sse parser queue full or closed; skipping telemetry chunk"
-                    );
-                } else {
-                    parser_telemetry
-                        .sent_chunks
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            Ok(b)
-        }
-        Err(e) => {
-            // `cause` for the same reason as `stream_finisher`: the source
-            // chain is `Debug`-only and it is the only thing that separates a
-            // TLS record failure from an idle drop.
-            tracing::warn!(
-                request_id = %rid,
-                error = %e,
-                cause = ?e,
-                "upstream stream error mid-response"
-            );
-            Err(e)
-        }
-    });
+    let parser_tx = spawn_sse_parser_tee(
+        sse_kind,
+        &state,
+        outcome_ctx.clone(),
+        ccr_round_usage.clone(),
+        status,
+        &request_id,
+        &parser_telemetry,
+    );
+    let resp_stream = tee_stream_to_parser(upstream_body, parser_tx, parser_telemetry, rid);
 
     // For non-SSE successful responses, buffer the body so we can
     // cache it. SSE responses stream through without buffering.
@@ -7806,6 +7661,460 @@ pub(crate) async fn forward_http(
     );
 
     Ok(response)
+}
+
+/// Tee every streamed chunk toward the SSE state machine without ever holding
+/// up the client: `try_send` failures (parser behind, queue full/closed) are
+/// logged + counted, never awaited. Mid-stream transport errors are logged with
+/// their `Debug`-only source chain — the only thing separating a TLS record
+/// failure from an idle drop — and passed through unchanged.
+fn tee_stream_to_parser<S>(
+    upstream_body: S,
+    parser_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    parser_telemetry: std::sync::Arc<ParserTelemetry>,
+    request_id: String,
+) -> futures_util::stream::Map<
+    S,
+    impl FnMut(Result<bytes::Bytes, reqwest::Error>) -> Result<bytes::Bytes, reqwest::Error>,
+>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>,
+{
+    let rid = request_id;
+    upstream_body.map(move |r| match r {
+        Ok(b) => {
+            if let Some(tx) = &parser_tx {
+                if let Err(e) = tx.try_send(b.clone()) {
+                    parser_telemetry
+                        .dropped_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        request_id = %rid,
+                        error = %e,
+                        "sse parser queue full or closed; skipping telemetry chunk"
+                    );
+                } else {
+                    parser_telemetry
+                        .sent_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Ok(b)
+        }
+        Err(e) => {
+            // `cause` for the same reason as `stream_finisher`: the source
+            // chain is `Debug`-only and it is the only thing that separates a
+            // TLS record failure from an idle drop.
+            tracing::warn!(
+                request_id = %rid,
+                error = %e,
+                cause = ?e,
+                "upstream stream error mid-response"
+            );
+            Err(e)
+        }
+    })
+}
+
+/// Spawn the SSE state-machine tee: bytes flow to the client unchanged while a
+/// spawned task sinks them into an mpsc the state machine drains. The parser is
+/// detached from forwarding but its JoinHandle is kept: a waiter task makes
+/// panics/cancellation operator-visible instead of erasing the only completion
+/// record. The mpsc is bounded; when the parser falls behind `try_send` fails
+/// and chunks are logged + dropped — the byte path is never blocked.
+fn spawn_sse_parser_tee(
+    sse_kind: SseStreamKind,
+    state: &AppState,
+    outcome_ctx: Option<OutcomeContext>,
+    ccr_round_usage: Option<Arc<Mutex<CcrRoundUsage>>>,
+    status: StatusCode,
+    request_id: &str,
+    parser_telemetry: &std::sync::Arc<ParserTelemetry>,
+) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
+    if !matches!(sse_kind, SseStreamKind::None) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(SSE_PARSER_QUEUE_DEPTH);
+        let rid_for_parser = request_id.to_owned();
+        // Freeze-replay: hand the state machine a store handle so the
+        // Anthropic arm can feed the final usage's cache tokens back
+        // into the session tracker (`SessionReplayStore::complete`) —
+        // the request→response correlation the Python handler did
+        // inline. `None` when the feature is off so the flag-off path
+        // is observably unchanged.
+        let replay_store_for_parser = if state.config.prefix_replay {
+            Some(state.replay_store.clone())
+        } else {
+            None
+        };
+        let parser_task = tokio::spawn(run_sse_state_machine(
+            sse_kind,
+            rx,
+            rid_for_parser.clone(),
+            state.usage_observer.clone(),
+            outcome_ctx,
+            replay_store_for_parser,
+            ccr_round_usage,
+            status,
+        ));
+        // Keep the parser detached from response forwarding, but do not drop
+        // its JoinHandle: a panic would otherwise erase the only completion
+        // record for this request. The waiter preserves the streaming path and
+        // makes task panics/cancellation operator-visible.
+        let waiter_telemetry = parser_telemetry.clone();
+        tokio::spawn(async move {
+            let result = parser_task.await;
+            let sent_chunks = waiter_telemetry
+                .sent_chunks
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dropped_chunks = waiter_telemetry
+                .dropped_chunks
+                .load(std::sync::atomic::Ordering::Relaxed);
+            match result {
+                // A clean finish is already announced once per stream by
+                // `sse stream closed`, so this stays quiet unless the chunk
+                // counts say something that line cannot: a parser that missed
+                // input because its queue was full or already closed. Logging
+                // every clean finish at info would double the per-stream volume
+                // of a log that is never rotated.
+                Ok(()) if dropped_chunks > 0 => tracing::warn!(
+                    request_id = %rid_for_parser,
+                    sent_chunks,
+                    dropped_chunks,
+                    "sse state-machine task completed having missed chunks; \
+                     its usage totals are short by whatever those carried"
+                ),
+                Ok(()) => tracing::debug!(
+                    request_id = %rid_for_parser,
+                    sent_chunks,
+                    dropped_chunks,
+                    "sse state-machine task completed"
+                ),
+                Err(error) => tracing::error!(
+                    request_id = %rid_for_parser,
+                    sent_chunks,
+                    dropped_chunks,
+                    task_panic = error.is_panic(),
+                    task_cancelled = error.is_cancelled(),
+                    error = %error,
+                    "sse state-machine task failed"
+                ),
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    }
+}
+
+/// Streamed-path CCR retrieval: answer the offered `headroom_retrieve` tool call
+/// inside the Anthropic SSE stream — suppressing the block, running the
+/// continuation against `continuation_base`, splicing the result back in — so
+/// the streamed turn behaves like the buffered one. When `ccr_stream_eligible`
+/// is false the upstream body is handed on untouched.
+async fn maybe_rewrite_anthropic_stream(
+    upstream_body: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+    >,
+    ccr_stream_eligible: bool,
+    continuation_base: bytes::Bytes,
+    original_buffered: bytes::Bytes,
+    state: &AppState,
+    upstream_client: &reqwest::Client,
+    upstream_url: &url::Url,
+    outgoing_headers: &http::HeaderMap,
+    headers_snapshot: &Option<http::HeaderMap>,
+    request_id: &str,
+) -> (
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    Option<Arc<Mutex<CcrRoundUsage>>>,
+) {
+    if ccr_stream_eligible {
+        let ctx = crate::sse::ccr_stream::CcrStreamContext {
+            client: upstream_client.clone(),
+            upstream_url: upstream_url.clone(),
+            outgoing_headers: outgoing_headers.clone(),
+            forwarded_request: continuation_base.clone(),
+            ccr_store: state
+                .ctx_offload
+                .as_ref()
+                .expect("ctx_offload checked above")
+                .store
+                .ccr(),
+            ccr_stores: state.ctx_offload.as_ref().map(|r| r.store.stores()),
+            config: state.config.clone(),
+            request_id: request_id.to_owned(),
+            shape: crate::sse::ccr_stream::CcrShape::Anthropic,
+            memory: memory_tool_context(
+                state,
+                headers_snapshot,
+                Some("anthropic"),
+                &original_buffered,
+            )
+            .await,
+            // Anthropic path: redaction lives on routed translate paths only.
+            redact: None,
+            // Anthropic path: the caller folds the returned handle itself.
+            rounds_sink: None,
+        };
+        let (stream, usage) = crate::sse::ccr_stream::rewrite_anthropic_stream(upstream_body, ctx);
+        (Box::pin(stream), Some(usage))
+    } else {
+        (Box::pin(upstream_body), None)
+    }
+}
+
+/// #2613 edge, port of `_openai_responses_from_sse`: some OpenAI-compatible
+/// upstreams answer a `stream: false` request with a valid 200 SSE body. When
+/// this request was buffered for Responses CCR, collect that stream and
+/// reassemble the terminal JSON so the buffered arm below still resolves
+/// retrieval. Without a terminal event the collected bytes stream through
+/// unchanged (previous behaviour, error included).
+async fn reframe_buffered_responses_sse(
+    mut upstream_body: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+    >,
+    is_sse: bool,
+    sse_kind: SseStreamKind,
+    buffered_responses_ccr: bool,
+    status: StatusCode,
+    request_id: &str,
+) -> (
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    bool,
+    SseStreamKind,
+) {
+    let (mut is_sse, mut sse_kind) = (is_sse, sse_kind);
+    if buffered_responses_ccr && is_sse && status.is_success() {
+        use futures_util::StreamExt as _;
+        let mut collected = bytes::BytesMut::new();
+        let mut first_err: Option<reqwest::Error> = None;
+        {
+            let s = &mut upstream_body;
+            while let Some(chunk) = s.next().await {
+                match chunk {
+                    Ok(b) => collected.extend_from_slice(&b),
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        let reassembled: Option<bytes::Bytes> = if first_err.is_none() {
+            // Whole stream collected cleanly: reassemble the terminal JSON
+            // when one is present.
+            crate::openai_buffered_ccr::responses_completed_from_sse(&String::from_utf8_lossy(
+                &collected,
+            ))
+            .and_then(|completed| serde_json::to_vec(&completed).ok())
+            .map(bytes::Bytes::from)
+        } else {
+            None
+        };
+        if let Some(json_bytes) = reassembled {
+            tracing::info!(
+                request_id = %request_id,
+                event = "buffered_responses_ccr_sse_answer",
+                "upstream answered stream:false with SSE; reassembled terminal JSON for buffered handling"
+            );
+            upstream_body = Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                json_bytes,
+            )]));
+            is_sse = false;
+            sse_kind = SseStreamKind::None;
+        } else {
+            let mut items: Vec<reqwest::Result<bytes::Bytes>> = vec![Ok(collected.freeze())];
+            if let Some(e) = first_err {
+                items.push(Err(e));
+            }
+            upstream_body = Box::pin(futures_util::stream::iter(items));
+        }
+    }
+    (upstream_body, is_sse, sse_kind)
+}
+
+/// Assemble the client-bound upstream byte stream: re-prepend bytes peeked while
+/// checking for a leading in-band error (`sse_prefix` is empty on paths that did
+/// not peek, so that step is a no-op there), then wrap the stream so an early
+/// drop retries from a held-back opening instead of reaching the client. The
+/// retry loop above only ever saw the headers; this wrapper sits below CCR and
+/// below the telemetry tee, so a discarded attempt is invisible to both.
+fn assemble_upstream_body(
+    upstream_resp: reqwest::Response,
+    sse_prefix: bytes::Bytes,
+    retry_body: Option<bytes::Bytes>,
+    is_sse: bool,
+    status: StatusCode,
+    retry: UpstreamBodyRetry,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>> {
+    let upstream_body = {
+        let rest = upstream_resp.bytes_stream();
+        let head =
+            futures_util::stream::iter((!sse_prefix.is_empty()).then(|| Ok(sse_prefix.clone())));
+        head.chain(rest)
+    };
+    if let Some(body) = retry_body.filter(|_| {
+        is_sse
+            && status.is_success()
+            && retry.enabled
+            && retry.hold_bytes > 0
+            && retry.max_attempts > 1
+    }) {
+        Box::pin(crate::sse::stream_retry::retry_on_early_drop(
+            upstream_body,
+            crate::sse::stream_retry::RetryContext {
+                client: retry.client,
+                method: retry.method,
+                url: retry.url,
+                headers: retry.headers,
+                body,
+                request_id: retry.request_id,
+                max_attempts: retry.max_attempts,
+                base_delay_ms: retry.base_delay_ms,
+                max_delay_ms: retry.max_delay_ms,
+                hold_bytes: retry.hold_bytes,
+            },
+        ))
+    } else {
+        Box::pin(upstream_body)
+    }
+}
+
+/// By-value retry inputs for [`assemble_upstream_body`], cloned out of the live
+/// request state at the call site so the stream wrapper owns what it needs.
+struct UpstreamBodyRetry {
+    enabled: bool,
+    hold_bytes: usize,
+    max_attempts: u32,
+    client: reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    headers: http::HeaderMap,
+    request_id: String,
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+}
+
+/// Phase G PR-G3: extract upstream rate-limit headers from this response and
+/// record them as gauges. The `provider` label comes from which upstream
+/// `request-id` shape was seen (Anthropic vs OpenAI); when neither was detected
+/// emission is skipped rather than guessed ("no silent fallbacks").
+///
+/// Also parses + records the Subscription/OAuth `unified-*` family, which the
+/// `*-remaining` gauges never see on a Claude-subscription plan. A non-empty
+/// unified snapshot is self-attributing, so no provider label is needed.
+fn record_upstream_rate_limits(
+    headers: &http::HeaderMap,
+    has_anthropic_request_id: bool,
+    has_openai_request_id: bool,
+    request_path: &str,
+    request_id: &str,
+) {
+    let rate_limit_snapshot = crate::observability::extract_rate_limit_snapshot(headers);
+    let rate_limit_provider: Option<&'static str> = if has_anthropic_request_id {
+        Some(crate::observability::cache_hit_rate_provider::ANTHROPIC)
+    } else if has_openai_request_id {
+        // We can't distinguish chat vs responses purely from the
+        // request-id header; the `request_path` is more specific.
+        Some(if request_path.contains("/v1/responses") {
+            crate::observability::cache_hit_rate_provider::OPENAI_RESPONSES
+        } else {
+            crate::observability::cache_hit_rate_provider::OPENAI_CHAT
+        })
+    } else {
+        None
+    };
+    if let Some(provider) = rate_limit_provider {
+        crate::observability::record_rate_limit_snapshot(
+            provider,
+            &rate_limit_snapshot,
+            &request_id,
+        );
+    } else if rate_limit_snapshot.remaining_requests.is_some()
+        || rate_limit_snapshot.remaining_tokens.is_some()
+        || rate_limit_snapshot.remaining_input_tokens.is_some()
+        || rate_limit_snapshot.remaining_output_tokens.is_some()
+    {
+        // Headers present but provider unattributable. Log loud so
+        // operators see the wire-format drift; do not emit unlabelled
+        // metrics.
+        tracing::debug!(
+            event = "rate_limit_snapshot_unattributable",
+            request_id = %request_id,
+            path = %request_path,
+            "rate-limit headers present but provider couldn't be inferred; skipping gauge emit"
+        );
+    }
+
+    // Subscription / OAuth traffic carries the `anthropic-ratelimit-
+    // unified-*` family instead of `*-remaining` — the headers above
+    // stay None on a Claude-subscription plan, so the `*-remaining`
+    // gauges never populate. Parse + record the unified family too so
+    // subscription headroom (utilization per 5h/7d window) is visible.
+    // Provider-agnostic: the unified prefix is Anthropic-specific, so a
+    // non-empty snapshot is self-attributing.
+    let unified_snapshot = crate::observability::extract_unified_rate_limit(headers);
+    if !unified_snapshot.windows.is_empty()
+        || unified_snapshot.overall_status.is_some()
+        || unified_snapshot.fallback_percentage.is_some()
+    {
+        crate::observability::record_unified_rate_limit(&unified_snapshot, &request_id);
+    }
+}
+
+/// PR-C1: classify the SSE flavor for the response state machine from the request
+/// path. Bytes flow to the client unchanged; the state machine sinks bytes into
+/// a channel in a spawned task that never blocks the byte path.
+///
+/// PR-C4: the OpenAI Responses arm is gated by `enable_responses_streaming`.
+/// When false the tee short-circuits to `None` so the framer + state machine
+/// don't spin up and bytes flow opaquely. Other providers' state machines are
+/// unaffected.
+fn classify_sse_kind(
+    is_sse: bool,
+    request_path: &str,
+    enable_responses_streaming: bool,
+    request_id: &str,
+) -> SseStreamKind {
+    if is_sse {
+        let kind = SseStreamKind::for_request_path(request_path);
+        if matches!(kind, SseStreamKind::OpenAiResponses) && !enable_responses_streaming {
+            tracing::info!(
+                request_id = %request_id,
+                path = %request_path,
+                event = "responses_streaming_state_machine_skipped",
+                reason = "enable_responses_streaming=false",
+                "PR-C4 streaming pipeline disabled; SSE bytes pass through without telemetry"
+            );
+            SseStreamKind::None
+        } else {
+            kind
+        }
+    } else {
+        SseStreamKind::None
+    }
+}
+
+/// PR-A8 / P5-57: capture the upstream request id BEFORE the caller moves
+/// `upstream_resp.headers()` into the response filter. Anthropic emits
+/// `request-id` (lowercase, no `x-`); OpenAI emits `x-request-id`.
+/// Returns `(anthropic, openai, preferred)`; when both are present the
+/// Anthropic one wins since it is the path-shape the cache invariants lock down.
+fn capture_upstream_request_ids(
+    headers: &http::HeaderMap,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let anthropic = headers
+        .get("request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let openai = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    // Prefer the provider-specific id whichever was set. Both
+    // present is unusual but legal; prefer Anthropic since it's the
+    // path-shape we lockdown with cache invariants.
+    let preferred = anthropic.clone().or_else(|| openai.clone());
+    (anthropic, openai, preferred)
 }
 
 /// Bound on the in-flight queue between the byte-passthrough and the
@@ -9001,13 +9310,13 @@ mod tool_search_wiring_tests {
     #[test]
     fn repair_is_byte_identical_without_search_blocks() {
         let body = body_with(fourteen_tools(), json!([{"role": "user", "content": "hi"}]));
-        let (out, removed) = maybe_repair_tool_search_history(body.clone(), "req-test");
-        assert_eq!(removed, 0);
+        let (out, neutralized) = maybe_repair_tool_search_history(body.clone(), "req-test");
+        assert_eq!(neutralized, 0);
         assert_eq!(out, body);
     }
 
     #[test]
-    fn repair_drops_unsupported_pairs() {
+    fn repair_neutralizes_unsupported_pair_in_place() {
         let body = body_with(
             vec![tool("read")],
             json!([{
@@ -9019,10 +9328,14 @@ mod tool_search_wiring_tests {
                 ],
             }]),
         );
-        let (out, removed) = maybe_repair_tool_search_history(body, "req-test");
-        assert_eq!(removed, 2);
+        let (out, neutralized) = maybe_repair_tool_search_history(body, "req-test");
+        assert_eq!(neutralized, 2);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert!(v["messages"].as_array().unwrap().is_empty());
+        // Message slot kept, pair replaced with text — never dropped, so
+        // signed thinking coordinates downstream are undisturbed.
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content.iter().all(|b| b["type"] == json!("text")));
     }
 
     #[test]
@@ -11420,11 +11733,11 @@ fn extend_or_push(
 
 /// Read a continuation response into the turn JSON the CCR machinery speaks.
 ///
-/// Continuations normally come back as JSON, which parses directly. A
-/// Responses backend that mandates streaming (the chatgpt codex gateway
-/// answers `stream: false` with `400 Stream must be set to true`, so
-/// continuations there go out streamed) answers SSE instead, which
-/// `serde_json` cannot read — fold it back into a turn first. JSON-first, so
+/// A routed continuation comes back as JSON, which parses directly. Anthropic
+/// continuations stream, and so do those on a Responses backend that mandates
+/// it (the chatgpt codex gateway answers `stream: false` with `400 Stream must
+/// be set to true`); both answer SSE, which `serde_json` cannot read — fold it
+/// back into a turn first, in the shape the provider speaks. JSON-first, so
 /// a JSON body never changes shape no matter its content type; the fold only
 /// runs when plain parsing already failed. Returns `None` when the body is
 /// neither, and the caller ends the round as it always has.
@@ -11445,7 +11758,7 @@ fn continuation_turn_from_body(
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         return Some(v);
     }
-    if provider != "openai_responses" {
+    if !matches!(provider, "openai_responses" | "anthropic") {
         return None;
     }
     // A missing Content-Type is not "not SSE": on 2026-09-14 eleven
@@ -11460,6 +11773,9 @@ fn continuation_turn_from_body(
     if !is_sse {
         return None;
     }
+    if provider == "anthropic" {
+        return crate::sse::ccr_stream::anthropic_stream_to_turn(body);
+    }
     let text = std::string::String::from_utf8_lossy(body);
     let (turn, _) = crate::openai::response::responses_stream_to_turn(&text);
     let has_blocks = turn
@@ -11470,6 +11786,27 @@ fn continuation_turn_from_body(
         Some(turn)
     } else {
         None
+    }
+}
+
+/// Read a continuation's response body, failing on silence rather than on
+/// elapsed time. `reqwest::Response::bytes` has neither bound, so a streamed
+/// continuation that dies mid-body would otherwise sit until the 600s client
+/// timeout. The error string is for the log line at the call site.
+async fn read_continuation_body(mut resp: reqwest::Response) -> Result<bytes::Bytes, String> {
+    let mut buf = bytes::BytesMut::new();
+    loop {
+        match tokio::time::timeout(CCR_CONTINUATION_IDLE_TIMEOUT, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Ok(None)) => return Ok(buf.freeze()),
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => {
+                return Err(format!(
+                    "no body chunk within {}s",
+                    CCR_CONTINUATION_IDLE_TIMEOUT.as_secs()
+                ))
+            }
+        }
     }
 }
 
@@ -12088,6 +12425,11 @@ pub(crate) async fn handle_ccr_response(
             status = resp.status().as_u16(),
             // Time to response headers. What is left of the span up to
             // "retrieval handled" is reading and rewriting the stream.
+            //
+            // On a streamed continuation that is nearly all of it, so this
+            // number dropped to around a second when Anthropic rounds started
+            // streaming. Do not read it across that change as the model
+            // getting faster: before, headers waited on the whole generation.
             upstream_ms = continuation_started.elapsed().as_millis() as u64,
             "ccr: continuation response headers received"
         );
@@ -12117,7 +12459,7 @@ pub(crate) async fn handle_ccr_response(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        match resp.bytes().await {
+        match read_continuation_body(resp).await {
             Ok(bytes) => {
                 // The response about to be dropped was still billed.
                 round_usage.add_response(&current_response);
@@ -12632,7 +12974,9 @@ pub(crate) async fn handle_memory_response(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let Ok(bytes) = resp.bytes().await else { break };
+        let Ok(bytes) = read_continuation_body(resp).await else {
+            break;
+        };
         round_usage.add_response(&current_response);
         let Some(next) = continuation_turn_from_body(&bytes, Some(&content_type), provider) else {
             break;
@@ -13509,7 +13853,33 @@ mod tests {
 
         assert!(
             continuation_turn_from_body(&sse, Some("text/event-stream"), "anthropic").is_none(),
-            "other providers never expect SSE here"
+            "a Responses body carries no Anthropic events to fold"
+        );
+
+        let anthropic_sse = bytes::Bytes::from(
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n\
+             event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+             event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+             event: content_block_stop\n\
+             data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+             event: message_stop\n\
+             data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let v = continuation_turn_from_body(&anthropic_sse, Some("text/event-stream"), "anthropic")
+            .expect("Anthropic SSE folds into a turn");
+        assert_eq!(v["content"][0]["text"], "hi");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["usage"]["input_tokens"], 7);
+        assert_eq!(v["usage"]["output_tokens"], 3);
+        assert!(
+            continuation_turn_from_body(&anthropic_sse, Some("application/json"), "anthropic")
+                .is_none(),
+            "a content type that says JSON still wins over the sniff"
         );
         let garbage = bytes::Bytes::from("data: not json\n\n");
         assert!(

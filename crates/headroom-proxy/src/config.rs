@@ -1023,6 +1023,39 @@ pub struct CliArgs {
     )]
     pub hold_role_sentence: bool,
 
+    /// Hold requests that share a cold cacheable head until the first of
+    /// them has begun its response.
+    ///
+    /// Anthropic makes a cache entry readable only once the response that
+    /// wrote it begins, so a fan-out of subagents sent in one instant all
+    /// miss and all pay write price for one head. Followers park until the
+    /// leader's response headers arrive or `--cache-stampede-wait-cap`
+    /// passes. Nothing about the request changes; only when it goes.
+    ///
+    /// Default `false`. The mechanism is real but the 2026-09-14/15 logs
+    /// showed no follower behind a cold leader in the 46% of turns that
+    /// carry a fingerprint, so it stays opt-in until a window shows one.
+    #[arg(
+        long = "cache-stampede-gate",
+        env = "HEADROOM_PROXY_CACHE_STAMPEDE_GATE",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub cache_stampede_gate: bool,
+
+    /// Longest a follower waits on its leader under `--cache-stampede-gate`.
+    ///
+    /// Bounds the delay a cold fan-out can add. Past it the follower goes as
+    /// it would have without the gate. Default `10s`, about twice the median
+    /// time to first byte of a cold large-prefix turn.
+    #[arg(
+        long = "cache-stampede-wait-cap",
+        env = "HEADROOM_PROXY_CACHE_STAMPEDE_WAIT_CAP",
+        default_value = "10s",
+        value_parser = parse_duration
+    )]
+    pub cache_stampede_wait_cap: Duration,
+
     /// CTX-3: minimum serialized byte length a `tool_result` block must exceed
     /// to be offloaded. Static per invariant I3 (never changes mid-session).
     /// Default `50_000` (mirrors context-mode's Read threshold).
@@ -2352,6 +2385,8 @@ pub struct Config {
     pub hold_working_directory: bool,
     /// See [`crate::cache_stabilization::role_sentence`].
     pub hold_role_sentence: bool,
+    pub cache_stampede_gate: bool,
+    pub cache_stampede_wait_cap: Duration,
     /// Where forwarded prefixes are persisted so they survive a restart. Empty
     /// keeps them in memory only.
     pub replay_store_dir: String,
@@ -2669,6 +2704,8 @@ impl Config {
             cache_tail_breakpoint: args.cache_tail_breakpoint,
             hold_working_directory: args.hold_working_directory,
             hold_role_sentence: args.hold_role_sentence,
+            cache_stampede_gate: args.cache_stampede_gate,
+            cache_stampede_wait_cap: args.cache_stampede_wait_cap,
             replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_stale_messages: args.ctx_offload_stale_messages,
@@ -2943,6 +2980,8 @@ impl Config {
             cache_tail_breakpoint: false,
             hold_working_directory: false,
             hold_role_sentence: false,
+            cache_stampede_gate: false,
+            cache_stampede_wait_cap: Duration::from_secs(10),
             replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,
             ctx_offload_stale_messages: 0,

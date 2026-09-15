@@ -59,6 +59,11 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
         replay_store: crate::cache_stabilization::prefix_replay::SessionReplayStore::new(8),
         working_dir_pins: crate::cache_stabilization::working_dir::WorkingDirPins::new(8),
         role_sentence_pins: crate::cache_stabilization::role_sentence::RoleSentencePins::new(8),
+        stampede_gate: crate::cache_stabilization::prefix_stampede::PrefixStampedeGate::new(
+            8,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(300),
+        ),
         usage_observer: std::sync::Arc::new(
             crate::cache_stabilization::usage_observer::UsageObserver::new(),
         ),

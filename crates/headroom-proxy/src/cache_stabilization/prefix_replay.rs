@@ -7093,6 +7093,36 @@ mod interleaved_stream_tests {
         );
     }
 
+    /// The trap behind the read-before-invalidate contract in
+    /// `prior_thinking::thinking_drop_is_free`: the same call that drops the
+    /// stored prefix also erases the figure a caller would use to judge whether
+    /// dropping was safe, and erasure is reported as `None` — "nothing cached
+    /// to lose" — which is the answer that permits the rewrite.
+    #[test]
+    fn invalidate_erases_the_forwarded_agreement_reading() {
+        let store = SessionReplayStore::new(8);
+        let history = stream("a", 6);
+        // Forward the originals verbatim so the agreement is the whole history
+        // rather than the marker copies `turn` sends.
+        store.begin_request("r1", "S", history.clone(), history.clone(), String::new());
+        store.complete("r1", 5_000, 0);
+
+        assert_eq!(
+            store.forwarded_agreement_len("S", &history),
+            Some(history.len()),
+            "the lane agrees with everything it forwarded"
+        );
+
+        store.invalidate("S");
+
+        assert_eq!(
+            store.forwarded_agreement_len("S", &history),
+            None,
+            "read after the invalidation and the history the provider still \
+             holds reads as no history at all"
+        );
+    }
+
     /// A rebuild boundary kills the provider's cache, so every prefix held for
     /// that session is dead — including the alternates.
     #[test]

@@ -830,6 +830,23 @@ pub fn observe_outbound_drift(
     observe(state, session_key, current, Origin::Outbound).0
 }
 
+/// Like [`observe_outbound_drift`], plus whether this lane key was seen here
+/// for the first time.
+///
+/// `None` dims mean two different things and a caller reasoning about what the
+/// provider keyed on has to tell them apart: on a birth turn there is nothing
+/// to compare against, while on any later turn `None` is a positive finding —
+/// the forwarded body is unchanged in all three dimensions. Callers that treat
+/// the second as "no information" throw away the only evidence that a stabilizer
+/// held a client edit back.
+pub fn observe_outbound_drift_with_birth(
+    state: &DriftState,
+    session_key: &str,
+    current: StructuralHash,
+) -> (Option<String>, bool) {
+    observe(state, session_key, current, Origin::Outbound)
+}
+
 #[derive(Clone, Copy)]
 enum Origin {
     Inbound,

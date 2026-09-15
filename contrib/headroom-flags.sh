@@ -688,6 +688,16 @@ HEADROOM_FLAGS=(
   # above). No retry by design: on timeout the sidecar falls back to Haiku.
   # 15s is 3x the measured ~5s Zen answer for a minimal-effort summary.
   --sidecar-route-timeout 15s
+  # Same-head stampede gate (off by default; on here to measure). A fan-out
+  # of subagents sent in one instant shares one system prompt and tool
+  # roster; Anthropic makes that head readable only once the first response
+  # begins, so each follower would pay write price for it. Followers wait
+  # for the leader's first byte, at most the cap, then go regardless. The
+  # 2026-09-14/15 logs showed zero such followers among 31 cold writes
+  # (46% fingerprint coverage), so watch `stampede_follower_released`:
+  # none after a week means delete these two lines.
+  --cache-stampede-gate true
+  --cache-stampede-wait-cap 10s
   --graceful-shutdown-timeout 30s
   --max-body-bytes 100MB
   --anthropic-pre-upstream-concurrency 1000
