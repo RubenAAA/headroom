@@ -350,6 +350,7 @@ def main():
         "iid": iid,
         "session_id": session,
         "mr_url": f"{web_base}/{project}/-/merge_requests/{iid}",
+        "head_sha": draft.get("head_sha"),
         "planned": len(planned),
         "skipped_already_present": len(skipped),
         "posted": len(posted),

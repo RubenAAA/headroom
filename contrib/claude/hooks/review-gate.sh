@@ -82,6 +82,12 @@ arm_mode() {
 # done = worker finished WITH a draft ready (listener chained, see below).
 # done + .failed = worker finished with NO draft; the reason is in .failed.
 # diverted without done = worker still running (or crashed; worker_alive says).
+#
+# done is per MR head, not forever: a new push (new head SHA) re-arms the
+# session instead of reporting ALREADY POSTED. Review is multi-round -- the
+# author fixes, pushes, and the reviewer answers again. Encoding done as a
+# bare flag made the second round impossible: the hook reported a stale proof
+# against commits the draft never saw (MR !597).
 worker_state() {
   if [ -f "$OUTDIR/$SESSION_ID.done" ]; then
     if [ -f "$OUTDIR/$SESSION_ID.failed" ]; then echo "failed"; else echo "done"; fi
@@ -90,6 +96,69 @@ worker_state() {
   else
     echo "idle"
   fi
+}
+
+# The head SHA the last completed round posted against. Empty when unknown
+# (proofs predating the head_sha field, or no proof at all).
+posted_head() {
+  local proof
+  proof=$(proof_for_draft)
+  [ -n "$proof" ] && [ -f "$proof" ] || return 1
+  jq -r '.head_sha // empty' "$proof" 2>/dev/null
+}
+
+# Non-empty message when the local checkout is ahead of the MR head, so a
+# divert would draft against commits the server never saw. Compares the
+# source branch tip (fetched fresh) with the MR head SHA. Empty means push
+# state is fine or unknowable (no repo configured, fetch failed) -- the gate
+# fails open; the poster's own head check is the backstop.
+local_ahead_of_mr() {
+  local mr="$1" repo branch head_sha tip
+  repo="${SPARK_REPO:-}"
+  [ -n "$repo" ] && [ -d "$repo/.git" ] || return 0
+  branch=$(python3 -c "
+import sys; sys.path.insert(0, '$POSTER')
+import gitlab_api as gl
+try:
+    mr = gl.merge_request('$mr') or {}
+    print((mr.get('source_branch') or '') + ' ' + (mr.get('sha') or ''))
+except Exception:
+    pass
+" 2>/dev/null) || return 0
+  set -- $branch
+  branch="$1"; head_sha="$2"
+  [ -n "$branch" ] && [ -n "$head_sha" ] || return 0
+  git -C "$repo" fetch origin "$branch" >/dev/null 2>&1 || return 0
+  tip=$(git -C "$repo" rev-parse "origin/$branch" 2>/dev/null) || return 0
+  [ -n "$tip" ] || return 0
+  if [ "$tip" != "$head_sha" ]; then
+    # Local tip moved past the MR head: unpushed commits exist. (A tip
+    # behind the head cannot happen from pushing; ignore that direction.)
+    if git -C "$repo" merge-base --is-ancestor "$head_sha" "$tip" 2>/dev/null; then
+      echo "local $branch ($tip) is ahead of MR !$mr head ($head_sha): unpushed commits would be invisible to the draft."
+    fi
+  fi
+  return 0
+}
+
+# True when the MR moved since the last completed round -- the stored proof
+# describes commits the draft saw, and the new head needs a fresh round.
+mr_moved_since_post() {
+  local posted now mr
+  posted=$(posted_head) || return 1
+  [ -n "$posted" ] || return 1
+  mr=$(mr_in_transcript) || return 1
+  [ -n "$mr" ] || return 1
+  now=$(python3 -c "
+import sys; sys.path.insert(0, '$POSTER')
+import gitlab_api as gl
+try:
+    mr = gl.merge_request('$mr') or {}
+    print(mr.get('sha') or '')
+except Exception:
+    pass
+" 2>/dev/null) || return 1
+  [ -n "$now" ] && [ "$now" != "$posted" ]
 }
 
 worker_alive() {
@@ -301,6 +370,15 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null |
            tr '[:upper:]' '[:lower:]')
 
+  # The slash command only arms. /fix-mr-comments means "fetch the threads
+  # and fix the code" -- the worker equivalent of that (drafting replies from
+  # a snapshot) firing on the command itself posted 11 replies the author
+  # never asked for (MR !597). Posting needs its own instruction, so the
+  # command text never counts as one: strip it before matching.
+  # The args carry the MR link by construction, so a bare command still
+  # matches the object half -- strip the whole wrapper, args included.
+  PROMPT=$(echo "$PROMPT" | sed -E 's/<command-message>.*<\/command-message>//g; s/<command-name>.*<\/command-name>//g; s/<command-args>.*<\/command-args>//g; s#/(gitlab-review|fix-mr-comments)##g')
+
   # Said outright: "post the threads", "answer the comments", "запости ответы".
   # Length is not a filter here -- an instruction that names the action is an
   # instruction however it is phrased.
@@ -312,7 +390,7 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   # threads" itself went through. Two greps need no ranges at all.
   INTENT=""
   if echo "$PROMPT" | grep -qE 'post|repl|answer|respond|resolve|close|запост|ответ|отвеч|закр' &&
-     echo "$PROMPT" | grep -qE 'thread|comment|note|discussion|review|mr|тред|коммент|ветк|замечан|ответ'; then
+     echo "$PROMPT" | grep -qE 'thread|comment|note|discussion|review|mr|repl|тред|коммент|ветк|замечан|ответ'; then
     INTENT=1
   fi
 
@@ -361,11 +439,19 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
     # "already running" here would wedge the session: every later prompt
     # gets the same answer while nothing runs. Restart instead.
     if [ "$ST" = "running" ] && ! worker_alive; then ST="idle"; fi
+    # A new push re-opens a completed round: the stored proof describes the
+    # old head, and anything new (reviewer notes, fixed code) needs a fresh
+    # draft. Without this the second round reports ALREADY POSTED forever.
+    if [ "$ST" = "done" ] && mr_moved_since_post; then
+      rm -f "$OUTDIR/$SESSION_ID.diverted" "$OUTDIR/$SESSION_ID.done" \
+        "$OUTDIR/$SESSION_ID.reported" "$OUTDIR/$SESSION_ID.started"
+      ST="idle"
+    fi
     case $ST in
       done)
         PROOF=$(proof_for_draft)
         if [ -n "$PROOF" ] && [ -f "$PROOF" ]; then
-          echo "REVIEW ALREADY POSTED: $(proof_summary "$PROOF"). Nothing further to do; do not post anything yourself."
+          echo "REVIEW POSTED AT $(posted_head | cut -c1-12): $(proof_summary "$PROOF"). The MR has not moved since, so there is nothing new to answer; do not post anything yourself."
         elif [ -f "$OUTDIR/$SESSION_ID.draft.json" ]; then
           echo "REVIEW POSTER STILL WORKING: the draft is posting now; the outcome will ping you here when it lands. Do not post anything yourself."
         else
@@ -384,8 +470,17 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
         ;;
       idle)
         if [ -n "$MR" ]; then
-          spawn_worker
-          echo "REVIEW DIVERTED. Worker started for MR !$MR ($(arm_mode)): it reads the threads and the commits itself, drafts the replies, posts them, and pings you here with the proof. If it fails, the next prompt will say so and you can post the threads yourself."
+          # Push gate: the dossier reads the MR head, so fixes that exist
+          # only locally are invisible and verdicts describe code that is not
+          # on the server yet (MR !597: replies citing pushed code while the
+          # fixes sat unpushed). Push first, then divert.
+          PUSH_CHECK=$(local_ahead_of_mr "$MR") || true
+          if [ -n "$PUSH_CHECK" ]; then
+            echo "REVIEW NOT STARTED: $PUSH_CHECK Push first, then say 'post the threads' again. Nothing was drafted and nothing was posted."
+          else
+            spawn_worker
+            echo "REVIEW DIVERTED. Worker started for MR !$MR ($(arm_mode)): it reads the threads and the commits itself, drafts the replies, posts them, and pings you here with the proof. If it fails, the next prompt will say so and you can post the threads yourself."
+          fi
         else
           echo "REVIEW DIVERT NOT STARTED: no merge_requests/NNN number in this session's transcript, so no worker was launched. Name the MR (e.g. !554) and repeat the instruction."
           # A .diverted marker alongside no MR is a phantom -- nothing is

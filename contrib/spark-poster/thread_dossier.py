@@ -41,15 +41,37 @@ def select_threads(discussions, me, mode):
     are self-notes -- and a resolved thread needs no reply. Scoping this to
     "threads I opened" drafted nothing on exactly the MRs the command is
     for (MR !554: 44 threads, 20 open, zero opened by me).
+
+    A thread I already answered stays out: anything I wrote after the
+    reviewer's last note is my reply, and drafting a second one next to it
+    (MR !597: 11 replies, several doubling answers already on the threads)
+    reads as arguing with myself. System notes are not replies -- resolves
+    and moves land as system notes and must not count as answered.
     """
     ds = [d for d in discussions
           if not d.get("individual_note") and d.get("notes")]
     if mode == "fix-mr-comments":
         return [d for d in ds
                 if not d.get("resolved")
-                and d["notes"][0].get("author", {}).get("username") != me]
+                and d["notes"][0].get("author", {}).get("username") != me
+                and not _already_answered(d, me)]
     return [d for d in ds
             if d["notes"][0].get("author", {}).get("username") == me]
+
+
+def _already_answered(discussion, me):
+    """True when I wrote on the thread after the reviewer's last note."""
+    notes = [n for n in (discussion.get("notes") or []) if not n.get("system")]
+    if not notes:
+        return False
+    last_reviewer = -1
+    for i, n in enumerate(notes):
+        if n.get("author", {}).get("username") != me:
+            last_reviewer = i
+    if last_reviewer < 0:
+        return True
+    return any(n.get("author", {}).get("username") == me
+               for n in notes[last_reviewer + 1:])
 
 
 def my_threads(iid, mode="gitlab-review"):
