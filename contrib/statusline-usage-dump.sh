@@ -93,9 +93,22 @@ model_id=$(echo "$input" | jq -r '.model.id // empty')
 [ -z "$model_id" ] && model_id=$(echo "$input" | jq -r '.model.display_name // empty' | sed "s/$(printf '\033')\[[0-9;]*m//g")
 model_short=${model_id#claude-}
 
+# Provider color for the model name: Meta blue for spark/muse, Anthropic
+# orange for opus/sonnet/haiku, default (white) for OpenAI-routed and
+# anything unrecognized.
+model_color=""
+case "$model_short" in
+  *spark*|*muse*) model_color="34" ;;
+  *opus*|*sonnet*|*haiku*) model_color="208" ;;
+esac
+
 parts=()
 if [ -n "$model_short" ] && [ "$model_short" != "null" ]; then
-  parts+=("model:$model_short")
+  if [ -n "$model_color" ]; then
+    parts+=("$(printf 'model:\033[38;5;%sm%s\033[0m' "$model_color" "$model_short")")
+  else
+    parts+=("model:$model_short")
+  fi
 fi
 if [ -n "$five_pct" ]; then
   r=$(fmt_reset "$five_reset")
