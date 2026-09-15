@@ -394,6 +394,54 @@ pub fn record_sidecar(request_id: &str, shape: &SidecarShape) {
 /// capture, no tracker update, no offload, no compression — the request must
 /// leave no trace in per-conversation state, because the turn that follows it
 /// is the one whose prefix has to still match.
+/// How long the direct sidecar stays off after the direct upstream answers
+/// `404` for the sidecar model. A model-not-found is a stable answer for a
+/// name, not a transient fault, so re-asking on every spinner only adds the
+/// round trip to every turn.
+const DIRECT_404_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+
+static DIRECT_HELD_UNTIL: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn direct_hold_remaining() -> Option<std::time::Duration> {
+    let guard = DIRECT_HELD_UNTIL.lock().ok()?;
+    let until = (*guard)?;
+    until.checked_duration_since(std::time::Instant::now())
+}
+
+fn note_direct_404() {
+    if let Ok(mut guard) = DIRECT_HELD_UNTIL.lock() {
+        *guard = Some(std::time::Instant::now() + DIRECT_404_HOLD);
+    }
+}
+
+/// The model the direct sidecar may shrink onto, or `None` to leave the
+/// spinner request untouched.
+///
+/// `--sidecar-model` can name a routed alias (a Zen free-tier model) so the
+/// routed sidecar tries it first. When that path declines, the direct path
+/// used to send the same alias to the direct upstream, which does not serve
+/// it: 2026-09-14/15 logged 2,487 spinner calls answered
+/// `404 model: claude-muse-spark-1.3` by Anthropic, each holding its turn a
+/// median 3.9 s (p95 35 s) plus up to two retries before the original request
+/// went out. A model with a route entry is never sent direct.
+pub fn direct_sidecar_model(config: &crate::config::Config) -> Option<String> {
+    let model = config
+        .sidecar_model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SIDECAR_MODEL.to_string());
+    if config.model_routes.iter().any(|r| r.matches(&model)) {
+        tracing::debug!(
+            event = "sidecar_direct_skipped",
+            reason = "routed_alias",
+            model = %model,
+            "sidecar model is a routed alias; not sending it to the direct upstream"
+        );
+        return None;
+    }
+    Some(model)
+}
+
 pub async fn try_handle(
     client: &reqwest::Client,
     upstream_url: &url::Url,
@@ -404,6 +452,17 @@ pub async fn try_handle(
     retry: SidecarRetry,
 ) -> Option<Response> {
     if !is_describe_action_sidecar(body) {
+        return None;
+    }
+    if let Some(remaining) = direct_hold_remaining() {
+        tracing::info!(
+            event = "sidecar_direct_skipped",
+            reason = "recent_404",
+            request_id = %request_id,
+            model = %sidecar_model,
+            hold_remaining_s = remaining.as_secs(),
+            "direct upstream answered 404 for the sidecar model recently; forwarding the original request"
+        );
         return None;
     }
     let model_from = body
@@ -633,6 +692,9 @@ async fn forward(
 /// Always returns `None`: the caller reads that as "not handled" and forwards
 /// the client's original body untouched.
 fn fall_back(request_id: &str, status: Option<u16>, detail: &str) -> Option<Response> {
+    if status == Some(404) {
+        note_direct_404();
+    }
     tracing::warn!(
         event = "sidecar_fallback",
         request_id = %request_id,
@@ -647,6 +709,76 @@ fn fall_back(request_id: &str, status: Option<u16>, detail: &str) -> Option<Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(sidecar_model: &str, routed: bool) -> crate::config::Config {
+        let mut c = crate::config::Config::for_test("http://127.0.0.1:9".parse().expect("url"));
+        c.sidecar_model = Some(sidecar_model.to_string());
+        if routed {
+            c.model_routes = vec![crate::config::ProviderRoute {
+                model_prefix: sidecar_model.to_string(),
+                prefix_match: false,
+                upstream: Some("https://opencode.ai/zen/v1".parse().expect("url")),
+                translate: true,
+                cursor_agent: None,
+                target_model: Some("muse-spark-1.3-contributor-free".to_string()),
+                auth_env: None,
+            }];
+        }
+        c
+    }
+
+    #[test]
+    fn direct_sidecar_skips_a_routed_alias() {
+        assert_eq!(
+            direct_sidecar_model(&test_config("claude-muse-spark-1.3", true)),
+            None
+        );
+        assert_eq!(
+            direct_sidecar_model(&test_config("claude-haiku-4-5-20251001", false)).as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_sidecar_stays_off_after_a_404() {
+        let mut body = json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        });
+        body["messages"][0]["content"]
+            .as_array_mut()
+            .expect("array")
+            .push(describe_block());
+        assert!(is_describe_action_sidecar(&body));
+        let client = reqwest::Client::new();
+        let url: url::Url = "http://127.0.0.1:9/v1/messages".parse().expect("url");
+        let retry = SidecarRetry {
+            max_attempts: 1,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+        };
+        // Nothing listens on port 9: a transport error, which does not arm
+        // the hold.
+        assert!(
+            try_handle(&client, &url, "r1", &HeaderMap::new(), &body, "m", retry)
+                .await
+                .is_none()
+        );
+        assert!(direct_hold_remaining().is_none());
+        note_direct_404();
+        let remaining = direct_hold_remaining().expect("held");
+        assert!(remaining <= DIRECT_404_HOLD);
+        // Held: no attempt is made (port 9 would refuse anyway; the point is
+        // the early return leaves the hold untouched and answers `None`).
+        assert!(
+            try_handle(&client, &url, "r2", &HeaderMap::new(), &body, "m", retry)
+                .await
+                .is_none()
+        );
+        if let Ok(mut guard) = DIRECT_HELD_UNTIL.lock() {
+            *guard = None;
+        }
+    }
 
     fn describe_block() -> Value {
         json!({
