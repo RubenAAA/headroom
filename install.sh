@@ -228,6 +228,7 @@ if [ "$LINK" = 1 ]; then
     ln -sfn "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
     ln -sfn "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     ln -sfn "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
+    ln -sfn "$CONTRIB/concurrency-report.sh" "$BIN_DIR/concurrency-report.sh"
     say "linked claude-launcher and restart-headroom.sh into the checkout"
 else
     install -m 755 "$CONTRIB/claude-launcher" "$BIN_DIR/claude-launcher"
@@ -235,6 +236,7 @@ else
     install -m 755 "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
     install -m 755 "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     install -m 755 "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
+    install -m 755 "$CONTRIB/concurrency-report.sh" "$BIN_DIR/concurrency-report.sh"
     say "installed claude-launcher and restart-headroom.sh"
 fi
 ln -sfn claude-launcher "$BIN_DIR/cclaude"

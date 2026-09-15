@@ -54,7 +54,7 @@ for src in "$CONTRIB"/claude/hooks/*.sh; do
 done
 
 # ~/.local/bin scripts vs the checkout (copy mode only, same reasoning).
-for name in claude-launcher restart-headroom.sh zen-rotate-watch.sh headroom-rss-sample update-headroom.sh; do
+for name in claude-launcher restart-headroom.sh zen-rotate-watch.sh headroom-rss-sample update-headroom.sh concurrency-report.sh; do
     src="$CONTRIB/$name"
     [ -f "$src" ] || continue
     dst="$HOME/.local/bin/$name"

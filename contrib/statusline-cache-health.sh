@@ -51,6 +51,13 @@ if [ "${1:-}" = "--self-test" ]; then
         printf 'not ok - provider miss after replay\nexpected: %s\nactual:   %s\n' "$expected" "$actual" >&2
         exit 1
     fi
+    fixture='{"upstream":{"verdict":"healthy"},"last_event_age_seconds":6,"last_event":{"event_kind":"unexplained","attribution_reason":"provider_missed_newest_write","origin":"unknown","scope":"replayed_prefix","wasted_tokens":5320,"cache_creation_input_tokens":5320,"replayed_prefix":true,"replay_chain_id":1,"breakpoints_placed":2,"system_markers_dropped":0}}'
+    actual=$(HEADROOM_STATUSLINE_TEST_HEALTH="$fixture" "${BASH_SOURCE[0]}" --segment)
+    expected='⚠ recache 6s ago: replay applied, provider missed newest write, ~5K tok wasted'
+    if [ "$actual" != "$expected" ]; then
+        printf 'not ok - named provider landing\nexpected: %s\nactual:   %s\n' "$expected" "$actual" >&2
+        exit 1
+    fi
     printf 'ok - branch build and provider miss evidence are rendered\n'
     exit 0
 fi
@@ -125,7 +132,18 @@ if [ -n "$age" ]; then
         elif [ "$kind" = "expected" ]; then
             printf '%s\n' "${prefix:+$prefix | }ℹ cache drop ${age}s ago: cause unattributed, ~${wasted} tok re-cached"
         elif [ "$kind" = "unexplained" ]; then
-            printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: replay applied, cause unexplained, ~${wasted} tok wasted"
+            # `unexplained` means no client-side drift dimension moved, which is
+            # not the same as no known cause: the proxy classifies where the
+            # read landed relative to the last two turns and names the provider
+            # behaviour in `attribution_reason`. Saying "cause unexplained" over
+            # the top of `provider_missed_newest_write` sends the reader looking
+            # for a fault on this side of the wire. Only the residual bucket,
+            # which names itself, is genuinely unexplained.
+            reason=$(printf '%s' "$health" | jq -r '.last_event.attribution_reason // empty' | tr '_' ' ')
+            case "$reason" in
+                ''|'unexplained after replay') reason='cause unexplained' ;;
+            esac
+            printf '%s\n' "${prefix:+$prefix | }⚠ recache ${age}s ago: replay applied, ${reason}, ~${wasted} tok wasted"
         else
             # `drift_dims` keeps this useful against older proxy payloads.
             reason=$(printf '%s' "$health" | jq -r '([.last_event.attribution_reason, .last_event.drift_dims] | map(select(type == "string" and length > 0)) | first) // "unknown cause"')

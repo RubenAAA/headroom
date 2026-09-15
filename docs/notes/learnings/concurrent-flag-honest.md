@@ -6,3 +6,6 @@
   failure mode in practice. Overlap raises re-cache rate 7.7× (17.16% vs
   2.23% over 29,432 turns). Small bucket (150k tokens), honest label, nothing
   to do.
+- **Update 2026-09-15:** the cost now has a fix, not just a label: the
+  same-head stampede gate (`docs/notes/ideas/implemented/stampede-gate.md`)
+  holds followers until the leader's first byte.
