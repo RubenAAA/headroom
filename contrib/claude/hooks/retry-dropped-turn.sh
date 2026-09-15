@@ -46,11 +46,17 @@ mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-retry-dropped" 2>/dev/null
 # crates/headroom-proxy/src/sse/stream_finisher.rs), not the bare words —
 # those also appear in this script's own comments and in docs, so a Read/grep
 # of this file (or a reply quoting it) landing in the last 30 lines used to
-# self-trigger a false "dropped" retry.
+# self-trigger a false "dropped" retry. Gated on assistant text lines for the
+# same reason: the marker also appears in tool_use inputs (an Edit patching a
+# detector, a Bash command grepping a transcript) and tool_result outputs,
+# which land in user lines and must never re-arm the hook. The truncation
+# branch needs the same gate — a Bash command I ran grepping this transcript
+# for the marker text matched its own command line and blocked the stop.
 MSG=""
 TAIL_INSTR=""
-if printf '%s' "$TAIL" | grep -qF '[truncated: the connection to the API dropped mid-response'; then
-  if printf '%s' "$TAIL" | grep -qF 'did NOT run'; then
+RETRY_TAIL=$(printf '%s\n' "$TAIL" | grep -F '"type":"assistant"' | grep -F '"type":"text"')
+if printf '%s' "$RETRY_TAIL" | grep -qF '[truncated: the connection to the API dropped mid-response'; then
+  if printf '%s' "$RETRY_TAIL" | grep -qF 'did NOT run'; then
     MSG="The API connection dropped mid-response and a pending tool call was discarded without running"
     TAIL_INSTR="Check the transcript first: if that call already ran since the drop, do not re-issue it. Otherwise re-issue the discarded tool call now; do not ask, do not narrate."
   else
@@ -68,7 +74,7 @@ elif API_ERR_LINES=$(printf '%s\n' "$TAIL" | grep -F '"isApiErrorMessage":true')
   # for a real error that ended the turn.
   MSG="The upstream request failed and the turn ended on an error"
   TAIL_INSTR="Check the transcript first: re-issue whatever was in flight when the error hit (tool call or reply), without repeating work that already ran; if the error text names rate limiting, wait a few seconds before retrying — do not ask, do not narrate."
-elif RETRY_LINES=$(printf '%s\n' "$TAIL" | grep -F '"type":"assistant"') && [ -n "$RETRY_LINES" ] && printf '%s' "$RETRY_LINES" | grep -F '"type":"text"' | grep -qF '[headroom: a proxy tool call was dropped and did NOT run; re-issue it]'; then
+elif printf '%s' "$RETRY_TAIL" | grep -qF '[headroom: a proxy tool call was dropped and did NOT run; re-issue it]'; then
   # A retrieval-ended turn: the proxy dropped a tool call the client expected
   # and downgraded stop_reason to end_turn, leaving an apology instead of
   # content (empty_turn_text in crates/headroom-proxy/src/sse/ccr_stream.rs).
