@@ -878,6 +878,45 @@ struct RecacheAttribution<'a> {
     counts_as_waste: bool,
 }
 
+/// Whether every dimension the client moved was held back before the wire.
+///
+/// Only `body_to_send` is a cache-key input, and the stabilizers exist to stop
+/// a client edit from reaching it: the roster pin puts a flapped tool back, the
+/// working-directory hold puts the old `cd` back. When one of them absorbs the
+/// edit, the inbound dims still name it, and naming it as the cause of a
+/// re-cache blames a change that never left this machine. On 2026-09-15 a
+/// client dropped `WaitForMcpServers` from `tools[]`; the pin held the
+/// forwarded roster byte-identical across the turn (outbound dims said
+/// `early_messages`, never `tools`), and the event still reported `tools`.
+///
+/// Both lanes hash the same three dimensions, so a shared name is enough to
+/// clear the edit: it says this dimension moved on the wire too, and the client
+/// moving it first is then the cause the caller already prefers. Only disjoint
+/// sets are absorption, and then the caller falls through to the evidence that
+/// speaks for the forwarded body.
+///
+/// The outbound side is a tri-state and all three matter. Dims that overlap
+/// clear the edit; dims that do not are absorption; and an *empty* string is
+/// the strongest absorption there is — the lane was compared and the forwarded
+/// body held still in every dimension, so nothing the client did reached the
+/// provider. Only `None`, which means no comparison was available (a birth
+/// turn, or a body that never reached the forwarding path), is an absence, and
+/// then the inbound reading stands.
+///
+/// An empty inbound side is never absorption either: it is the case the head
+/// check below exists for, and suppressing that on a silent lane would lose the
+/// one cause those turns have.
+fn client_edit_was_absorbed(inbound_dims: Option<&str>, outbound_dims: Option<&str>) -> bool {
+    let (Some(inbound), Some(outbound)) =
+        (inbound_dims.filter(|dims| !dims.is_empty()), outbound_dims)
+    else {
+        return false;
+    };
+    !inbound
+        .split(',')
+        .any(|dim| outbound.split(',').any(|other| other == dim))
+}
+
 fn recache_attribution<'a>(
     drift_dims: Option<&'a str>,
     head_changed: bool,
@@ -896,7 +935,9 @@ fn recache_attribution<'a>(
         };
     }
 
-    if let Some(dims) = drift_dims.filter(|dims| !dims.is_empty()) {
+    let absorbed = client_edit_was_absorbed(drift_dims, outbound_drift_dims);
+
+    if let Some(dims) = drift_dims.filter(|dims| !dims.is_empty() && !absorbed) {
         // The dims come from the inbound hash, taken before the proxy touches
         // anything, so whatever moved was moved by the client. The dims name
         // which part of the hot zone it was.
@@ -924,7 +965,14 @@ fn recache_attribution<'a>(
     // fell through to `concurrent_turn_in_flight`, which was true and not the
     // cause. `prefix_head` on this event and `prefix_composition` on the
     // request say which of system or tools moved.
-    if head_changed {
+    //
+    // Skipped when the dims above were absorbed, because then this check is
+    // reading the same held-back edit one turn wider: the roster pin keeps the
+    // forwarded tools steady but the fingerprint is taken on the client's own
+    // body, so a flapped tool moves the head here while the provider was keyed
+    // on bytes that never changed. An empty `drift_dims` is not that case and
+    // still lands here, which is the whole point of the check.
+    if head_changed && !absorbed {
         return RecacheAttribution {
             reason: Some("prefix_head_changed"),
             origin: Some("client"),
@@ -1096,6 +1144,12 @@ pub struct RecacheEvent {
     /// PR-E6 drift axes ("system" / "tools" / "early_messages",
     /// comma-joined) when the drift detector saw structural change.
     pub drift_dims: Option<String>,
+    /// The same axes measured on the body actually forwarded. Published beside
+    /// `drift_dims` because only this one is a cache-key input, and the two
+    /// disagreeing is the signature of a stabilizer holding a client edit back:
+    /// `Some("")` says the forwarded body held still in every dimension.
+    /// `None` says no comparison was available, which is not the same thing.
+    pub outbound_drift_dims: Option<String>,
     /// Stable, explicit cause derived only from direct evidence. This is a
     /// structural drift dimension or a causal prefix-replay skip reason;
     /// `None` means the event is genuinely unattributed.
@@ -2676,6 +2730,7 @@ impl UsageObserver {
                     conversation_key: pending.conversation_key.clone(),
                     session_key_hash: pending.session_key_hash.clone(),
                     drift_dims: pending.drift_dims.clone(),
+                    outbound_drift_dims: pending.outbound_drift_dims.clone(),
                     attribution_reason: attribution.reason.map(str::to_owned),
                     origin: attribution.origin.map(str::to_owned),
                     scope: attribution.scope.map(str::to_owned),
@@ -2693,6 +2748,21 @@ impl UsageObserver {
                     expected_cache_read,
                     actual_cache_read: cache_read_input_tokens,
                 };
+                // Whether the *forwarded* prefix head moved, which is the
+                // question `rebuild_boundary` is asked on the request side and
+                // answers from the client's body instead. Derived from the
+                // outbound dims rather than the inbound ones, and deliberately
+                // ignoring `early_messages`: the prior-thinking drop and the
+                // history offload rewrite messages, so on a turn where they
+                // fired that dimension is partly our own doing and cannot be
+                // used to judge whether the boundary that unlocked them was
+                // real. `system` and `tools` are untouched by both, so they
+                // still speak for the provider. `-1` where no comparison was
+                // available.
+                let forwarded_head_moved =
+                    event.outbound_drift_dims.as_deref().map_or(-1_i64, |dims| {
+                        i64::from(dims.split(',').any(|dim| matches!(dim, "system" | "tools")))
+                    });
                 match event_kind {
                     RecacheEventKind::Drift => tracing::warn!(
                         event = "cache_recache_observed",
@@ -2705,6 +2775,9 @@ impl UsageObserver {
                         turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
                         streams_tracked = streams_tracked,
                         drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+                        outbound_drift_dims =
+                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
+                        forwarded_head_moved = forwarded_head_moved,
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         // `-1` for "not a divergence". The index says how much
                         // of the prefix died: an edit near the opener costs far
@@ -2747,6 +2820,9 @@ impl UsageObserver {
                         turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
                         streams_tracked = streams_tracked,
                         drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+                        outbound_drift_dims =
+                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
+                        forwarded_head_moved = forwarded_head_moved,
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         attribution_reason = "inbound_tail_replaced",
                         origin = "inbound",
@@ -2798,6 +2874,9 @@ impl UsageObserver {
                         // it lets a later query ask how many of these turns had
                         // a structural dimension that simply went unconsulted.
                         drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+                        outbound_drift_dims =
+                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
+                        forwarded_head_moved = forwarded_head_moved,
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
                         prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
@@ -2832,6 +2911,9 @@ impl UsageObserver {
                         turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
                         streams_tracked = streams_tracked,
                         drift_dims = "",
+                        outbound_drift_dims =
+                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
+                        forwarded_head_moved = forwarded_head_moved,
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         attribution_reason = "",
                         origin = "",
@@ -3360,6 +3442,83 @@ mod tests {
         // move that.
         assert_eq!(a.origin, Some("client"));
         assert_eq!(a.scope, Some("hot_zone"));
+    }
+
+    #[test]
+    fn an_absorbed_client_edit_is_not_the_cause() {
+        // 2026-09-15: a client dropped one tool from `tools[]`, the roster pin
+        // put it back, and the forwarded roster went out byte-identical — the
+        // outbound lane moved on `early_messages` and never on `tools`. The
+        // event still read `tools`, sending the reader after a client the pin
+        // had already handled instead of after the proxy stage that rewrote
+        // the history.
+        let a = recache_attribution(
+            Some("tools"),
+            false,
+            Some("early_messages"),
+            None,
+            Some(applied_evidence()),
+            false,
+            false,
+        );
+        assert_eq!(a.reason, Some("early_messages"));
+        assert_eq!(a.origin, Some("proxy"));
+        assert_eq!(a.scope, Some("forwarded_hot_zone"));
+        assert!(a.counts_as_waste);
+    }
+
+    #[test]
+    fn an_unobserved_outbound_lane_keeps_the_inbound_reading() {
+        // `None` is not absorption: the lane reads `None` both when nothing
+        // drifted and when the forwarding path never ran. Discarding the
+        // inbound dims on that would throw away the one cause the turn has.
+        let a = recache_attribution(Some("tools"), false, None, None, None, false, false);
+        assert_eq!(a.reason, Some("tools"));
+        assert_eq!(a.origin, Some("client"));
+        assert_eq!(a.scope, Some("hot_zone"));
+    }
+
+    #[test]
+    fn a_forwarded_body_that_held_still_absorbs_everything() {
+        // `Some("")` is the strongest absorption evidence there is: the lane
+        // was compared and not one of the three dimensions moved on the wire,
+        // so nothing the client did reached the provider. Reading that as "no
+        // information" — which it was until the call site started
+        // distinguishing it from a birth turn — threw away the only proof a
+        // stabilizer had done its job.
+        let a = recache_attribution(
+            Some("tools"),
+            true,
+            Some(""),
+            None,
+            Some(applied_evidence()),
+            false,
+            false,
+        );
+        assert_ne!(a.reason, Some("tools"));
+        assert_ne!(
+            a.reason,
+            Some("prefix_head_changed"),
+            "the head check reads the same absorbed edit one turn wider"
+        );
+    }
+
+    #[test]
+    fn a_partly_absorbed_client_edit_still_names_the_client() {
+        // One shared dimension is enough. `tools` was absorbed and `system`
+        // was not, and the client moving `system` first is the cause however
+        // the rest of its edit fared.
+        let a = recache_attribution(
+            Some("system,tools"),
+            false,
+            Some("system"),
+            None,
+            Some(applied_evidence()),
+            false,
+            false,
+        );
+        assert_eq!(a.reason, Some("system,tools"));
+        assert_eq!(a.origin, Some("client"));
     }
 
     #[test]

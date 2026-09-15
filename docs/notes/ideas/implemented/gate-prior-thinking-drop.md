@@ -1,6 +1,7 @@
 # Idea: run the prior-thinking drop only on head divergences
 
-- **Status:** implemented 2026-09-11 (09-11 re-audit)
+- **Status:** implemented 2026-09-11 (09-11 re-audit); the §0b decider that
+  closed it was void — see **Correction, 2026-09-15** at the bottom
 - **Source:** `docs/notes/savings-ideas-2.md` §4.2, `docs/speed-ideas.md` §0.2
   (2026-09-03 window)
 - **Summary:** `history_rewritten` fires the thinking drop on the premise that
@@ -99,3 +100,21 @@ reads 0 on 11 of 12 `prior_thinking_dropped` events (one `-1`, untracked),
 with `agreed_prefix_len` ≈ incoming−1 throughout — the §0 "low" case:
 re-stripping reproduces bytes the provider already cached, so the drop
 is free. §0 point 2 closes.
+
+
+## Correction, 2026-09-15
+
+The §0b reading is void. `forwarded_agreement_len` was read *after*
+`PrefixReplayStore::invalidate` had already cleared `last_forwarded_messages`
+for the same lane key, and that function returns `None` on exactly that field
+being empty. The 11-of-12 zeroes are the erasure, not the turns: every
+`rebuild_boundary` drop was guaranteed to read empty before it was measured.
+
+The ordering is fixed — the agreement is captured before the invalidation and
+the same reading feeds both the gate and the log field — so the field is
+evidence again. No decision changed, because the `rebuild_boundary` arm
+short-circuits past it, which means §0 point 2 is reopened rather than
+re-settled. It needs a fresh window on the corrected field.
+
+See `../absorbed-rebuild-boundary.md` for the turn that prompted this and for
+the policy question the corrected field is needed to answer.

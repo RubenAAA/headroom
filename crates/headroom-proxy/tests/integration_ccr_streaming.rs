@@ -6,10 +6,12 @@
 //! that had never heard of the tool and the turn died with `No such tool
 //! available: headroom_retrieve`.
 //!
-//! The upstream here answers in two shapes, which is what the real one does:
-//! the first request has `stream: true` and gets SSE ending in a
-//! `headroom_retrieve` tool_use; the continuation has `stream: false` (the
-//! rewriter forces it) and gets plain JSON carrying the answer.
+//! The upstream here answers both rounds in SSE, which is what the real one
+//! does: the first request gets a stream ending in a `headroom_retrieve`
+//! tool_use, and the continuation — which carries the assistant turn and the
+//! tool result, and so has more than one message — gets a stream carrying the
+//! answer. Continuations stream so that a slow round cannot be mistaken for a
+//! stalled one; the proxy folds that second stream back into a turn.
 
 mod common;
 
@@ -59,37 +61,52 @@ async fn ccr_upstream(rounds: Arc<AtomicUsize>) -> (SocketAddr, tokio::task::Joi
                                     .ok()
                                     .and_then(|b| serde_json::from_slice(&b).ok())
                                     .unwrap_or(serde_json::Value::Null);
-                                let streaming = parsed
+                                // Both rounds stream, so the message count is
+                                // what tells them apart: the client sends one,
+                                // the continuation appends the assistant turn
+                                // and the tool result.
+                                let is_continuation = parsed
+                                    .get("messages")
+                                    .and_then(serde_json::Value::as_array)
+                                    .is_some_and(|m| m.len() > 1);
+                                // A de-streamed continuation would hold its
+                                // headers until generation finished, which is
+                                // what the 30s headers bound used to kill. Only
+                                // count a round that asked to stream, so the
+                                // round assertion below fails if that regresses.
+                                let streamed = parsed
                                     .get("stream")
                                     .and_then(serde_json::Value::as_bool)
                                     .unwrap_or(false);
 
-                                if !streaming {
+                                if is_continuation && streamed {
                                     // The continuation. Answer with the text the
                                     // model produced after seeing the retrieval.
                                     rounds.fetch_add(1, Ordering::SeqCst);
-                                    let payload = json!({
-                                        "id": "msg_2",
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "model": "claude",
-                                        "content": [
-                                            {"type": "text", "text": "ANSWER_AFTER_RETRIEVAL"}
-                                        ],
-                                        "stop_reason": "end_turn",
-                                        "usage": {"input_tokens": 900, "output_tokens": 12},
-                                    });
+                                    let payload = concat!(
+                                        "event: message_start\n",
+                                        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude\",\"usage\":{\"input_tokens\":900,\"output_tokens\":0}}}\n\n",
+                                        "event: content_block_start\n",
+                                        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                                        "event: content_block_delta\n",
+                                        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ANSWER_AFTER_RETRIEVAL\"}}\n\n",
+                                        "event: content_block_stop\n",
+                                        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                                        "event: message_delta\n",
+                                        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n",
+                                        "event: message_stop\n",
+                                        "data: {\"type\":\"message_stop\"}\n\n",
+                                    );
                                     return Ok::<_, Infallible>(
                                         Response::builder()
                                             .status(200)
-                                            .header("content-type", "application/json")
+                                            .header("content-type", "text/event-stream")
                                             .body(StreamBody::new(
                                                 tokio_stream::wrappers::ReceiverStream::new({
                                                     let (tx, rx) = tokio::sync::mpsc::channel::<
                                                         Result<Frame<Bytes>, std::io::Error>,
                                                     >(2);
-                                                    let bytes =
-                                                        serde_json::to_vec(&payload).unwrap();
+                                                    let bytes = payload.as_bytes().to_vec();
                                                     tokio::spawn(async move {
                                                         let _ = tx
                                                             .send(Ok(Frame::data(Bytes::from(

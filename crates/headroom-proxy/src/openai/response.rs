@@ -166,6 +166,12 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
 
     if let Some(msg) = message {
         // Handle reasoning_content (thinking tokens from models like Qwen).
+        // Deliberately UNSIGNED: chat reasoning is bare text with no
+        // replayable identity, and the sealed envelope needs a backend-issued
+        // id + encrypted_content pair (see reasoning_signature). Sealing a
+        // fabricated pair would replay an item the upstream never produced.
+        // The client sees the reasoning once; next turn the request
+        // translator drops it as foreign, so it never reaches an upstream.
         if let Some(reasoning) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
             if !reasoning.is_empty() {
                 content.push(json!({"type": "thinking", "thinking": reasoning}));

@@ -63,7 +63,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 
-use crate::sse::anthropic::{AnthropicStreamState, BlockState};
+use crate::sse::anthropic::{AnthropicStreamState, BlockState, StreamStatus};
 use crate::sse::{SseEvent, SseFramer};
 
 /// The tool the proxy injects and therefore has to answer itself.
@@ -390,6 +390,45 @@ pub(crate) fn rebuild_message(state: &AnthropicStreamState) -> Value {
             "cache_creation_input_tokens": state.usage.cache_creation_input_tokens,
         },
     })
+}
+
+/// Fold a finished Anthropic SSE body into the turn JSON the CCR machinery
+/// speaks.
+///
+/// Continuation rounds stream (see [`resolve_retrieval`]), so their response
+/// arrives as the same event sequence a client turn does. The parser and the
+/// rebuild are the ones round one already runs, fed a complete body instead of
+/// a live stream.
+///
+/// `None` when the body carried no usable turn, which the caller handles as it
+/// handles any unparseable continuation. A stream that stopped short counts as
+/// that: an `error` event says upstream gave up partway, and a missing
+/// `stop_reason` says the body ended before `message_delta` did. Either way the
+/// blocks that arrived are not the model's answer, and splicing them would
+/// truncate the turn where a buffered round would have failed to parse.
+///
+/// One thing streaming gives up: an overload that lands after the headers
+/// arrives as an `error` event inside a 200, so the round ends here instead of
+/// on a 5xx the send loop would have retried. The trade is deliberate — every
+/// continuation failure measured so far was a timeout, not an overload.
+pub(crate) fn anthropic_stream_to_turn(body: &[u8]) -> Option<Value> {
+    let mut framer = SseFramer::new();
+    framer.push(body);
+    let mut state = AnthropicStreamState::new();
+    while let Some(event) = framer.next_event() {
+        let Ok(event) = event else { continue };
+        let _ = state.apply(event);
+    }
+    if matches!(state.status, StreamStatus::Errored) {
+        return None;
+    }
+    let turn = rebuild_message(&state);
+    let complete = turn
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|c| !c.is_empty())
+        && turn.get("stop_reason").is_some_and(Value::is_string);
+    complete.then_some(turn)
 }
 
 /// Every tool this proxy injects and therefore has to answer itself.
@@ -1011,9 +1050,10 @@ where
     (stream, usage_handle)
 }
 
-/// A continuation round is always a buffered JSON request: this code
-/// synthesises the client's stream itself and has no use for a second SSE
-/// body to splice.
+/// De-stream a continuation for routed backends, whose SSE this code cannot
+/// fold back into a turn: it synthesises the client's stream itself and has no
+/// use for a second SSE body to splice. Anthropic upstreams stream instead —
+/// see [`streamed_continuation_request`] for why.
 ///
 /// `stream_options` is only valid with `stream: true` (the Responses API
 /// rejects the combination with `400 stream_options requires stream to be
@@ -1041,11 +1081,29 @@ fn non_streaming_continuation_request(forwarded_request: &Bytes) -> Bytes {
 /// the main turn streams, so only the continuation trips it, and the
 /// retrieval lands unresolved. `handle_ccr_response` folds the SSE back into
 /// a turn before parsing, so the round still resolves from equivalent
-/// content. Every other backend keeps the de-streamed request above.
+/// content. Every other routed backend keeps the de-streamed request above.
 fn restore_stream_when_mandated(request: Bytes, upstream_url: &url::Url) -> Bytes {
     if upstream_url.host_str() != Some("chatgpt.com") {
         return request;
     }
+    streamed_continuation_request(request)
+}
+
+/// Stream a continuation, which is how Anthropic upstreams take it.
+///
+/// A buffered request holds its response headers until generation is done, so
+/// the bounded headers wait in `handle_ccr_response` was really a bound on the
+/// model's thinking time. Measured 2026-09-15: one retrieval spent 30s per
+/// attempt three times over and died at 90.8s with the content already
+/// fetched, while the 18 continuations that did land took 0.8s to 17.9s — the
+/// 30s ceiling sat inside the working range. Streamed, headers arrive at once
+/// and a stall there is transport, as the comment on that timeout always
+/// claimed. The body is folded back into a turn by
+/// [`anthropic_stream_to_turn`].
+///
+/// `stream_options` goes with it for the reason given above: it is only valid
+/// on the Responses API and only tunes streaming delivery.
+fn streamed_continuation_request(request: Bytes) -> Bytes {
     match serde_json::from_slice::<Value>(&request) {
         Ok(mut v) => {
             if let Some(obj) = v.as_object_mut() {
@@ -1097,13 +1155,18 @@ async fn resolve_retrieval(
         }
     };
 
-    // Continuation rounds must come back as JSON — this code synthesises the
-    // client's stream itself and has no use for a second SSE body to splice —
-    // except on backends that mandate streaming, where de-streaming 400s.
-    let continuation_request = restore_stream_when_mandated(
-        non_streaming_continuation_request(&ctx.forwarded_request),
-        &ctx.upstream_url,
-    );
+    // An Anthropic continuation streams, so a slow round is not mistaken for a
+    // stalled one. A routed one comes back as JSON, which this code can parse
+    // without a second SSE body to fold, except on backends that mandate
+    // streaming, where de-streaming 400s.
+    let continuation_request = if matches!(ctx.shape, CcrShape::Anthropic) {
+        streamed_continuation_request(ctx.forwarded_request.clone())
+    } else {
+        restore_stream_when_mandated(
+            non_streaming_continuation_request(&ctx.forwarded_request),
+            &ctx.upstream_url,
+        )
+    };
 
     // Memory tools run after retrieval, on whatever the retrieval left. A turn
     // can reach for both, and the client can run neither — but neither can the
@@ -1250,6 +1313,74 @@ mod tests {
             restore_stream_when_mandated(garbage.clone(), &codex),
             garbage,
             "unparseable bodies pass through untouched"
+        );
+    }
+
+    /// An Anthropic continuation streams, so the 30s headers bound stops being
+    /// a bound on how long the model may think.
+    #[test]
+    fn anthropic_continuation_streams() {
+        let forwarded = Bytes::from(
+            r#"{"model":"m","stream":true,"stream_options":{"include_usage":true},"messages":[]}"#,
+        );
+        let out = streamed_continuation_request(forwarded);
+        let v: Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(v["stream"], json!(true));
+        assert!(v.get("stream_options").is_none());
+
+        let garbage = Bytes::from(b"not json".to_vec());
+        assert_eq!(
+            streamed_continuation_request(garbage.clone()),
+            garbage,
+            "unparseable bodies pass through untouched"
+        );
+    }
+
+    /// The fold reads a streamed continuation back into a turn, and refuses a
+    /// stream that died partway rather than passing its first blocks off as
+    /// the whole answer.
+    #[test]
+    fn anthropic_stream_folds_into_a_turn() {
+        let body = b"event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\",\"usage\":{\"input_tokens\":9,\"cache_read_input_tokens\":4}}}\n\n\
+             event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+             event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n\
+             event: content_block_stop\n\
+             data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+             event: message_stop\n\
+             data: {\"type\":\"message_stop\"}\n\n";
+        let turn = anthropic_stream_to_turn(body).expect("a complete stream folds");
+        assert_eq!(turn["content"][0]["text"], "done");
+        assert_eq!(turn["stop_reason"], "end_turn");
+        assert_eq!(turn["usage"]["cache_read_input_tokens"], 4);
+
+        let errored = b"event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\"}}\n\n\
+             event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"half\"}}\n\n\
+             event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n";
+        assert!(
+            anthropic_stream_to_turn(errored).is_none(),
+            "a stream that errored mid-body is not an answer"
+        );
+
+        assert!(
+            anthropic_stream_to_turn(b"data: not json\n\n").is_none(),
+            "a body with no Anthropic events folds to nothing"
+        );
+
+        let cut_short = b"event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\"}}\n\n\
+             event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"half\"}}\n\n";
+        assert!(
+            anthropic_stream_to_turn(cut_short).is_none(),
+            "a body that ended before message_delta has no stop_reason to trust"
         );
     }
 

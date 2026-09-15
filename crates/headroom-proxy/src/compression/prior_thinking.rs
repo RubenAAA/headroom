@@ -44,6 +44,15 @@ fn is_thinking(block: &Value) -> bool {
 ///
 /// Takes the provider-side figure (`forwarded_agreement_len`: what we last
 /// sent is what got cached), not the client-originals one.
+///
+/// The caller must read that figure before the boundary invalidation drops the
+/// lane's tracker, not after. `PrefixReplayStore::invalidate` clears
+/// `last_forwarded_messages` and `forwarded_agreement_len` returns `None` on
+/// exactly that being empty, so a read taken afterwards says "nothing cached to
+/// lose" about every boundary turn — the turns this argument exists to judge.
+/// The `rebuild_boundary` arm short-circuits past it either way, so the
+/// consequence was not a wrong decision but a `forwarded_agreement_len` log
+/// field that agreed with the decision by construction.
 pub fn thinking_drop_is_free(
     rebuild_boundary: bool,
     forwarded_agreement_len: Option<usize>,
