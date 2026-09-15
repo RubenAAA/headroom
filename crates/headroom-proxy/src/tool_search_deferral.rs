@@ -329,29 +329,52 @@ fn tool_search_reference_names(content: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Stand-in for a tool-search block the outbound tools array cannot support.
+/// Text so it is inert to every validator, short so it costs ~10 tokens, and
+/// constant so the repaired prefix stays byte-stable across turns (the
+/// provider cache needs the same bytes every time). Mirrors upstream
+/// `_TOOL_SEARCH_PLACEHOLDER_BLOCK`.
+const TOOL_SEARCH_PLACEHOLDER_TEXT: &str = "[tool search omitted: unavailable in this request]";
+
+fn placeholder_block() -> Value {
+    serde_json::json!({"type": "text", "text": TOOL_SEARCH_PLACEHOLDER_TEXT})
+}
+
 /// Outcome of [`strip_unsupported_blocks`].
 pub struct RepairOutcome {
     /// Repaired messages, or the input moved back unchanged when nothing
-    /// was removed. Callers must only re-serialize when `removed > 0`.
+    /// was neutralized. Callers must only re-serialize when `neutralized > 0`.
     pub messages: Vec<Value>,
-    /// Number of blocks removed. Zero means unchanged.
-    pub removed: usize,
+    /// Number of blocks neutralized. Zero means unchanged.
+    pub neutralized: usize,
 }
 
-/// Drop tool-search blocks the request's tools array cannot support.
+/// Neutralize tool-search blocks the request's tools array cannot support.
 ///
 /// A block pair is unsupportable when the request carries no typed search
 /// tool, or when a `tool_reference` names a tool absent from `tools` — both
 /// shapes Anthropic rejects. Both the `tool_search_tool_result` and its
-/// paired `server_tool_use` are removed (an orphan of either 400s on its
-/// own), and a message left with no content blocks is dropped rather than
-/// sent empty. Only tool-search server calls are eligible: `web_search` and
+/// paired `server_tool_use` are handled (an orphan of either 400s on its
+/// own). Only tool-search server calls are eligible: `web_search` and
 /// code execution share the `server_tool_use` block type and must survive
 /// untouched.
+///
+/// Replace in place rather than remove (upstream #3456). The block indexes
+/// of a message are load-bearing: the signed-thinking guard keys a thinking
+/// block by its position, so deleting a block that sits before a thinking
+/// block in the same message — or deleting a whole message ahead of one —
+/// moves that block, the guard reports the reasoning altered, and the
+/// repair is discarded in favour of the client's original bytes. The
+/// request that needed repairing is exactly the one that loses it, and
+/// upstream 400s on the reference already found. Swapping each block for a
+/// short text block keeps every thinking block at its original coordinates,
+/// so the repair survives to the wire. Same reasoning as the CCR sibling
+/// [`crate::ccr_retrieve_repair::strip_unsupported_ccr_blocks`]
+/// ("neutralize rather than drop").
 pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> RepairOutcome {
     let unchanged = |messages: Vec<Value>| RepairOutcome {
         messages,
-        removed: 0,
+        neutralized: 0,
     };
     let available: std::collections::HashSet<&str> = tools
         .iter()
@@ -370,7 +393,7 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
     let has_search_tool = has_typed_search_tool(tools);
 
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
-    let mut removed = 0usize;
+    let mut neutralized = 0usize;
     let mut changed = false;
     for mut message in messages {
         let content = match message.get_mut("content").and_then(|c| c.as_array_mut()) {
@@ -380,7 +403,8 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
                 continue;
             }
         };
-        let mut drop_indexes: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut neutralize_indexes: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         let mut orphaned_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (index, block) in content.iter().enumerate() {
             if block.get("type").and_then(Value::as_str) != Some("tool_search_tool_result") {
@@ -390,7 +414,7 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
             if has_search_tool && names.iter().all(|n| available.contains(n.as_str())) {
                 continue;
             }
-            drop_indexes.insert(index);
+            neutralize_indexes.insert(index);
             if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
                 orphaned_ids.insert(id.to_string());
             }
@@ -405,33 +429,31 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
             let is_search_call = name.starts_with(TOOL_SEARCH_TYPE_PREFIX);
             let id = block.get("id").and_then(Value::as_str).unwrap_or("");
             if orphaned_ids.contains(id) || (is_search_call && !has_search_tool) {
-                drop_indexes.insert(index);
+                neutralize_indexes.insert(index);
             }
         }
-        if drop_indexes.is_empty() {
+        if neutralize_indexes.is_empty() {
             out.push(message);
             continue;
         }
         changed = true;
-        removed += drop_indexes.len();
-        let mut kept: Vec<Value> = Vec::new();
-        for (index, block) in content.drain(..).enumerate() {
-            if !drop_indexes.contains(&index) {
-                kept.push(block);
+        neutralized += neutralize_indexes.len();
+        // Neutralize in place: every block keeps its index, so signed
+        // thinking blocks downstream keep their coordinates and the
+        // tampering guard still sees them byte-identical. No message is
+        // ever dropped — an assistant turn that was pure tool-search
+        // bookkeeping keeps its slot as text.
+        for (index, block) in content.iter_mut().enumerate() {
+            if neutralize_indexes.contains(&index) {
+                *block = placeholder_block();
             }
-        }
-        if kept.is_empty() {
-            continue; // the whole turn was tool-search bookkeeping
-        }
-        if let Some(obj) = message.as_object_mut() {
-            obj.insert("content".to_string(), Value::Array(kept));
         }
         out.push(message);
     }
     if changed {
         RepairOutcome {
             messages: out,
-            removed,
+            neutralized,
         }
     } else {
         unchanged(out)
@@ -695,14 +717,15 @@ mod tests {
         })];
         let before = messages.clone();
         let out = strip_unsupported_blocks(messages, &tools);
-        assert_eq!(out.removed, 0);
+        assert_eq!(out.neutralized, 0);
         assert_eq!(out.messages, before);
     }
 
     #[test]
-    fn unresolvable_references_drop_the_pair() {
+    fn unresolvable_references_neutralize_the_pair_in_place() {
         // Side-request tools array cannot resolve the reference: both the
-        // result and its paired search call go, nothing else moves.
+        // result and its paired search call become text, and every block
+        // keeps its index so signed thinking downstream is undisturbed.
         let tools = many_tools(&["read"]);
         let messages = vec![json!({
             "role": "assistant",
@@ -713,12 +736,16 @@ mod tests {
             ],
         })];
         let out = strip_unsupported_blocks(messages, &tools);
-        assert_eq!(out.removed, 2);
-        assert_eq!(out.messages[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(out.neutralized, 2);
+        let content = out.messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["text"], json!("hi"));
+        assert_eq!(content[1]["type"], json!("text"));
+        assert_eq!(content[2]["type"], json!("text"));
     }
 
     #[test]
-    fn missing_search_tool_drops_search_calls_but_keeps_web_search() {
+    fn missing_search_tool_neutralizes_search_calls_but_keeps_web_search() {
         let tools = many_tools(&["read", "web_search"]);
         let messages = vec![json!({
             "role": "assistant",
@@ -728,23 +755,89 @@ mod tests {
             ],
         })];
         let out = strip_unsupported_blocks(messages, &tools);
-        // Search call dropped (no mechanism); web_search shares the block
+        // Search call neutralized (no mechanism); web_search shares the block
         // type but is not a search call and has no orphan id → survives.
-        assert_eq!(out.removed, 1);
-        assert_eq!(out.messages[0]["content"].as_array().unwrap().len(), 1);
-        assert_eq!(out.messages[0]["content"][0]["name"], json!("web_search"));
+        assert_eq!(out.neutralized, 1);
+        let content = out.messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[1]["name"], json!("web_search"));
     }
 
     #[test]
-    fn message_left_empty_is_dropped() {
+    fn message_left_empty_keeps_its_slot_as_text() {
+        // A turn that was pure tool-search bookkeeping keeps its message
+        // slot: dropping it would shift message indexes for every signed
+        // thinking block after it.
         let tools = many_tools(&["read"]);
         let messages = vec![json!({
             "role": "assistant",
             "content": [search_call_block("srv_1")],
         })];
         let out = strip_unsupported_blocks(messages, &tools);
-        assert_eq!(out.removed, 1);
-        assert!(out.messages.is_empty());
+        assert_eq!(out.neutralized, 1);
+        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages[0]["content"][0]["type"], json!("text"));
+    }
+
+    #[test]
+    fn repair_leaves_neighbor_blocks_untouched() {
+        // The repair swaps only the unsupportable pair: a thinking block
+        // after it must be byte-identical and at the same index, so the
+        // signed-reasoning guard still sees it unchanged.
+        let thinking = json!({
+            "type": "thinking",
+            "thinking": "let me look that up",
+            "signature": "sig-abc",
+        });
+        let tools = many_tools(&["read"]);
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [
+                search_call_block("srv_1"),
+                search_result_block("srv_1", vec![tool_ref("Slack_post")]),
+                thinking,
+            ],
+        })];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 2);
+        let content = out.messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[2], thinking);
+    }
+
+    #[test]
+    fn repair_preserves_role_alternation() {
+        // Dropping a message that was pure tool-search bookkeeping leaves
+        // two adjacent same-role messages, which Anthropic 400s — and the
+        // client replays the same transcript every turn, so the session
+        // wedges permanently. The slot must survive as text.
+        let tools = many_tools(&["read"]);
+        let messages = vec![
+            json!({"role": "user", "content": "find it"}),
+            json!({
+                "role": "assistant",
+                "content": [
+                    search_call_block("srv_1"),
+                    search_result_block("srv_1", vec![tool_ref("gone_tool")]),
+                ],
+            }),
+            json!({"role": "user", "content": "anything?"}),
+        ];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 2);
+        assert_eq!(out.messages.len(), 3);
+        let roles: Vec<&str> = out
+            .messages
+            .iter()
+            .map(|m| m.get("role").and_then(Value::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert!(out.messages[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("type").and_then(Value::as_str) == Some("text")));
     }
 
     #[test]
@@ -752,7 +845,7 @@ mod tests {
         let messages = vec![json!({"role": "user", "content": "hello"})];
         let before = messages.clone();
         let out = strip_unsupported_blocks(messages, &many_tools(&["read"]));
-        assert_eq!(out.removed, 0);
+        assert_eq!(out.neutralized, 0);
         assert_eq!(out.messages, before);
     }
 }
