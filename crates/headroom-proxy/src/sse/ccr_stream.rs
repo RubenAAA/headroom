@@ -478,15 +478,26 @@ impl DropReason {
 /// retrieval" goes looking at the retrieval machinery, which in most of these
 /// turns did nothing wrong. So the message names the tool that was actually
 /// dropped, and says nothing about retrieval when no retrieval was dropped.
+/// Marker the Stop hook matches to continue a retrieval-ended turn.
+///
+/// The hook (`retry-dropped-turn.sh`) greps the transcript tail for this
+/// literal string, the same way it matches TRUNCATION_MARKER. Plain prose —
+/// including the apology above — cannot serve: this session proved a reply
+/// quoting the apology re-arms the hook and blocks the next stop. The marker
+/// is bracketed and names headroom so ordinary prose never contains it.
+const RETRIEVAL_DROPPED_MARKER: &str =
+    "[headroom: a proxy tool call was dropped and did NOT run; re-issue it]";
+
 fn empty_turn_text(unresolved_tool: Option<&str>) -> String {
     match unresolved_tool {
         Some(name) => format!(
             "The proxy could not run `{name}` for this turn, so the turn came \
-             back empty. Nothing was lost; ask again."
+             back empty. Nothing was lost; ask again.\n\n{RETRIEVAL_DROPPED_MARKER}"
         ),
-        None => "The upstream ended this turn on a tool call that carried no \
-                 content. Nothing was lost; ask again."
-            .to_string(),
+        None => format!(
+            "The upstream ended this turn on a tool call that carried no \
+             content. Nothing was lost; ask again.\n\n{RETRIEVAL_DROPPED_MARKER}"
+        ),
     }
 }
 
@@ -1772,5 +1783,20 @@ mod empty_turn_text_tests {
         let text = empty_turn_text(None);
         assert!(!text.contains("retrieval"), "wrong cause named: {text}");
         assert!(text.contains("tool call"));
+    }
+
+    /// The marker rides along so the Stop hook can continue the turn.
+    /// Both branches carry it: the hook cannot tell which fired.
+    #[test]
+    fn empty_turns_carry_the_hook_marker() {
+        for text in [
+            empty_turn_text(Some("memory_search")),
+            empty_turn_text(None),
+        ] {
+            assert!(
+                text.contains(RETRIEVAL_DROPPED_MARKER),
+                "hook marker missing: {text}"
+            );
+        }
     }
 }

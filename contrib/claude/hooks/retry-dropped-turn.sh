@@ -27,6 +27,21 @@ TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || exit 0
 
 TAIL=$(tail -n 30 "$TRANSCRIPT" 2>/dev/null) || exit 0
+# Debug log: every stop records what it saw, so a false fire leaves evidence
+# instead of a guessing game. Best-effort only — never blocks the stop.
+mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/claude-retry-dropped" 2>/dev/null
+{
+  echo "ts=$(date -u +%FT%TZ) session=$SESSION transcript=$TRANSCRIPT"
+  echo "--- tail markers (counts in last 30 lines):"
+  printf '%s' "$TAIL" | grep -cF '[truncated: the connection to the API dropped mid-response' | sed 's/^/trunc=/'
+  printf '%s' "$TAIL" | grep -cF 'did NOT run' | sed 's/^/didnotrun=/'
+  printf '%s' "$TAIL" | grep -cF '"isApiErrorMessage":true' | sed 's/^/apierr=/'
+  printf '%s' "$TAIL" | grep -cF '[headroom: a proxy tool call was dropped and did NOT run; re-issue it]' | sed 's/^/retrieval-marker=/'
+  echo "--- matching lines (first 200 chars):"
+  printf '%s\n' "$TAIL" | grep -F '[truncated: the connection to the API dropped mid-response' | cut -c1-200 | head -3
+  printf '%s\n' "$TAIL" | grep -F '[headroom: a proxy tool call was dropped and did NOT run; re-issue it]' | cut -c1-200 | head -3
+  echo "---"
+} >>"${XDG_RUNTIME_DIR:-/tmp}/claude-retry-dropped/stop-debug.log" 2>/dev/null
 # Match the literal proxy-injected marker (TRUNCATION_MARKER in
 # crates/headroom-proxy/src/sse/stream_finisher.rs), not the bare words —
 # those also appear in this script's own comments and in docs, so a Read/grep
@@ -53,9 +68,21 @@ elif API_ERR_LINES=$(printf '%s\n' "$TAIL" | grep -F '"isApiErrorMessage":true')
   # for a real error that ended the turn.
   MSG="The upstream request failed and the turn ended on an error"
   TAIL_INSTR="Check the transcript first: re-issue whatever was in flight when the error hit (tool call or reply), without repeating work that already ran; if the error text names rate limiting, wait a few seconds before retrying — do not ask, do not narrate."
+elif RETRY_LINES=$(printf '%s\n' "$TAIL" | grep -F '"type":"assistant"') && [ -n "$RETRY_LINES" ] && printf '%s' "$RETRY_LINES" | grep -F '"type":"text"' | grep -qF '[headroom: a proxy tool call was dropped and did NOT run; re-issue it]'; then
+  # A retrieval-ended turn: the proxy dropped a tool call the client expected
+  # and downgraded stop_reason to end_turn, leaving an apology instead of
+  # content (empty_turn_text in crates/headroom-proxy/src/sse/ccr_stream.rs).
+  # The agent loop stalls the same way as a dropped connection, so it gets
+  # the same continue treatment. Matched on the bracketed machine marker, not
+  # the apology prose: matching prose false-fired on a reply quoting it.
+  # Gated on assistant text lines: the marker also appears in tool_use inputs
+  # (e.g. an Edit patching this script) and tool_result outputs, which land
+  # in user lines and must never re-arm the hook.
+  MSG="The proxy dropped a tool call this turn and the reply came back empty"
+  TAIL_INSTR="Check the transcript first: re-issue the dropped tool call now (it never ran), without repeating work that already ran; do not ask, do not narrate."
 fi
 
-# Both branches share the circuit breaker: without it, the elif-only reset
+# All three branches share the circuit breaker: without it, the elif-only reset
 # added alongside the upstream-error branch left the dropped-connection case
 # (the original, more common trigger) setting MSG but never actually
 # blocking the stop.

@@ -41,7 +41,7 @@ import sys
 import thread_dossier as td
 
 OUTDIR = os.path.expanduser("~/.local/state/spark-review")
-MODEL = os.environ.get("SPARK_DRAFT_MODEL", "claude-muse-spark-1.2")
+MODEL = os.environ.get("SPARK_DRAFT_MODEL", "claude-muse-spark-1.3")
 PROXY = os.environ.get("SPARK_DRAFT_BASE_URL", "http://127.0.0.1:8787")
 TIMEOUT = int(os.environ.get("SPARK_DRAFT_TIMEOUT", "180"))
 BATCH = int(os.environ.get("SPARK_DRAFT_BATCH", "6"))

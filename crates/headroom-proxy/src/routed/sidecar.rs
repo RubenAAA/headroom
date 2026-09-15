@@ -318,13 +318,16 @@ pub(crate) async fn handle_sidecar(
     if let Some(resp) = try_routed_sidecar(state, headers, client_addr, parsed, request_id).await {
         return Some(resp);
     }
+    // A routed alias must never go direct: the direct upstream does not serve
+    // it (2,487 spinner 404s over 2026-09-14/15). But when the routed attempt
+    // just failed, returning None falls through with `parsed` exactly as the
+    // client sent it — the client's own model on the normal path, not a
+    // sidecar at all. So fall back to the configured default, which the
+    // direct upstream does serve.
+    let sidecar_model = crate::sidecar::direct_sidecar_model(&state.config)
+        .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
     let base = state.effective_upstream().await;
     if let Ok(url) = crate::proxy::build_upstream_url(&base, uri) {
-        let sidecar_model = state
-            .config
-            .sidecar_model
-            .clone()
-            .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
         if let Some(resp) = crate::sidecar::try_handle(
             &state.client,
             &url,

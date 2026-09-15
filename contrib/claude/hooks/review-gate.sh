@@ -291,6 +291,13 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
     touch "$OUTDIR/$SESSION_ID.reported"
   fi
 
+  # The failure ping: without this a worker that dies unnoticed stays
+  # unnoticed until someone asks. Rides the next prompt like the proof ping.
+  # One-shot: the failed-state cleanup in the divert below clears .failed.
+  if [ -f "$OUTDIR/$SESSION_ID.failed" ]; then
+    echo "SPARK-POSTER FAILED: worker finished with no draft. Reason: $(head -3 "$OUTDIR/$SESSION_ID.failed" 2>/dev/null | tr '\n' ' '). Say 'post the threads' again to retry, or post the threads yourself."
+  fi
+
   PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null |
            tr '[:upper:]' '[:lower:]')
 
@@ -368,17 +375,17 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
         fi
         ;;
       failed)
-        echo "REVIEW WORKER FINISHED WITH NO DRAFT. Reason: $(head -3 "$OUTDIR/$SESSION_ID.failed" 2>/dev/null | tr '\n' ' '). Say 'post the threads' again to run it once more, or leave the threads. Do not draft replies yourself."
+        echo "REVIEW WORKER FINISHED WITH NO DRAFT. Reason: $(head -3 "$OUTDIR/$SESSION_ID.failed" 2>/dev/null | tr '\n' ' '). Say 'post the threads' again to run it once more, or write and post the threads yourself."
         rm -f "$OUTDIR/$SESSION_ID.diverted" "$OUTDIR/$SESSION_ID.done" \
           "$OUTDIR/$SESSION_ID.failed" "$OUTDIR/$SESSION_ID.started"
         ;;
       running)
-        echo "REVIEW WORKER ALREADY RUNNING for MR !${MR:-unknown}. It drafts, posts by itself, and pings you here when done. Do NOT write the reply text, do NOT post anything yourself."
+        echo "REVIEW WORKER ALREADY RUNNING for MR !${MR:-unknown}. It drafts, posts by itself, and pings you here when done. If it fails, the next prompt will say so and you can post the threads yourself."
         ;;
       idle)
         if [ -n "$MR" ]; then
           spawn_worker
-          echo "REVIEW DIVERTED. Worker started for MR !$MR ($(arm_mode)): it reads the threads and the commits itself, drafts the replies, posts them, and pings you here with the proof. Do NOT write the reply text, do NOT draft it in a file, do NOT post anything yourself."
+          echo "REVIEW DIVERTED. Worker started for MR !$MR ($(arm_mode)): it reads the threads and the commits itself, drafts the replies, posts them, and pings you here with the proof. If it fails, the next prompt will say so and you can post the threads yourself."
         else
           echo "REVIEW DIVERT NOT STARTED: no merge_requests/NNN number in this session's transcript, so no worker was launched. Name the MR (e.g. !554) and repeat the instruction."
           # A .diverted marker alongside no MR is a phantom -- nothing is
@@ -450,6 +457,14 @@ if [ "$TOOL" = "Bash" ]; then
     ARTICULATE=1
   fi
   if [ -n "$ARTICULATE" ]; then
+    # Stand down when the worker already failed: blocking the write then
+    # wedges the fallback the failure message just offered. The main session
+    # posting by hand is the recovery path, so let the write through.
+    if [ "$(worker_state)" = "failed" ]; then
+      rm -f "$OUTDIR/$SESSION_ID.diverted" "$OUTDIR/$SESSION_ID.done" \
+        "$OUTDIR/$SESSION_ID.failed" "$OUTDIR/$SESSION_ID.started"
+      exit 0
+    fi
     spawn_worker
     echo "REVIEW WRITE DIVERTED: the spark worker is drafting and will post by itself, then ping here with the proof. Do not compose comments, scripts, or drafts yourself — acknowledge briefly and wait." >&2
     exit 2
@@ -496,9 +511,16 @@ case "$TOOL" in
     fi
 
     if [ -n "$DIVERT" ]; then
-      spawn_worker
-      echo "REVIEW DRAFT DIVERTED. Do not compose the verdicts yourself -- that is the expensive half and it is what the offload exists to move. Delegate the assessment to a subagent (Task tool): give it the thread list, the commit range and the repo path, and have it write the draft. The worker posts by itself and pings here. Composing here and posting there saves nothing." >&2
-      exit 2
+      # Same stand-down as the Bash gate above: a failed worker must not
+      # keep blocking the hand-posted fallback.
+      if [ "$(worker_state)" = "failed" ]; then
+        rm -f "$OUTDIR/$SESSION_ID.diverted" "$OUTDIR/$SESSION_ID.done" \
+          "$OUTDIR/$SESSION_ID.failed" "$OUTDIR/$SESSION_ID.started"
+      else
+        spawn_worker
+        echo "REVIEW DRAFT DIVERTED. Do not compose the verdicts yourself -- that is the expensive half and it is what the offload exists to move. Delegate the assessment to a subagent (Task tool): give it the thread list, the commit range and the repo path, and have it write the draft. The worker posts by itself and pings here. Composing here and posting there saves nothing." >&2
+        exit 2
+      fi
     fi
     ;;
 esac

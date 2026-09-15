@@ -879,7 +879,9 @@ async fn a_failed_routed_sidecar_falls_back_to_the_direct_path() {
     let bodies = default_captured.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1, "exactly one direct-path call followed");
     let fwd: Value = serde_json::from_slice(&bodies[0]).expect("upstream body is JSON");
-    assert_eq!(fwd["model"], "claude-muse-spark-1.2");
+    // The routed alias must never go direct (the direct upstream 404s it):
+    // the fallback answers on the configured default instead.
+    assert_eq!(fwd["model"], headroom_proxy::sidecar::DEFAULT_SIDECAR_MODEL);
     assert!(fwd["messages"].as_array().unwrap().len() <= 4);
     assert!(fwd.get("tools").is_none());
 

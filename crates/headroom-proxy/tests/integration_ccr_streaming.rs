@@ -291,6 +291,128 @@ async fn a_block_expired_from_the_ccr_store_is_recovered_from_the_content_index(
     );
 }
 
+/// Upstream whose retrieval call can never resolve: unknown hash, no cold
+/// tier. The proxy must downgrade the turn and say so, with the marker the
+/// Stop hook matches to continue the turn.
+async fn ccr_upstream_unresolvable(
+    rounds: Arc<AtomicUsize>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
+    let addr = listener.local_addr().expect("local addr");
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let rounds = rounds.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |req: Request<hyper::body::Incoming>| {
+                            let rounds = rounds.clone();
+                            async move {
+                                let _ = rounds.fetch_add(1, Ordering::SeqCst);
+                                let (_parts, body) = req.into_parts();
+                                let _ = body.collect().await;
+                                // Round one: the retrieval call. Every later
+                                // round is a continuation the mock cannot
+                                // answer, so it repeats a bare tool_use
+                                // stop: no content, nothing the client can run.
+                                let frames: Vec<Vec<u8>> = vec![
+                                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n".to_vec(),
+                                    b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"headroom_retrieve\",\"input\":{}}}\n\n".to_vec(),
+                                    format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"hash\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaa\\\"}}\"}}}}}}\n\n").into_bytes(),
+                                    b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_vec(),
+                                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}}\n\n".to_vec(),
+                                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec(),
+                                ];
+                                let (tx, rx) = tokio::sync::mpsc::channel::<
+                                    Result<Frame<Bytes>, std::io::Error>,
+                                >(16);
+                                tokio::spawn(async move {
+                                    for f in frames {
+                                        if tx.send(Ok(Frame::data(Bytes::from(f)))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                });
+                                return Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(200)
+                                        .header("content-type", "text/event-stream")
+                                        .body(StreamBody::new(
+                                            tokio_stream::wrappers::ReceiverStream::new(rx),
+                                        ))
+                                        .unwrap(),
+                                );
+                            }
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn a_failed_retrieval_is_answered_in_place_without_the_hook_marker() {
+    let dir = TempDir::new().unwrap();
+    let (addr, _upstream) = ccr_upstream_unresolvable(Arc::new(AtomicUsize::new(0))).await;
+    let store_dir = dir.path().to_path_buf();
+    let proxy = start_proxy_with_state(
+        &format!("http://{addr}"),
+        move |c| {
+            c.compression = true;
+            c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            c.ctx_offload = true;
+            c.ctx_store_dir = Some(store_dir);
+            c.ccr_handle_responses = true;
+        },
+        |s| s,
+    )
+    .await;
+
+    let body = json!({
+        "model": "claude-3-haiku-20240307",
+        "stream": true,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "what did that say"}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .expect("proxy responds");
+    assert_eq!(resp.status(), 200);
+    let sse = String::from_utf8_lossy(&resp.bytes().await.expect("stream body")).to_string();
+    proxy.shutdown().await;
+    // A failed retrieval is answered in place (splice_ccr_results_as_text),
+    // not dropped: the error text reaches the client, so there is no empty
+    // turn and no hook marker. The marker fires only when the splice drops a
+    // call the client expected and downgrades the turn (unit-tested in
+    // empty_turn_text_tests::empty_turns_carry_the_hook_marker).
+    assert!(
+        sse.contains("CCR content not found"),
+        "the miss must be answered in place, not dropped:\n{sse}"
+    );
+    assert!(
+        !sse.contains("[headroom: a proxy tool call was dropped"),
+        "an answered-in-place miss must not carry the drop marker:\n{sse}"
+    );
+    assert!(
+        !sse.contains("headroom_retrieve"),
+        "the client must never be handed a tool it cannot run:\n{sse}"
+    );
+}
+
 #[tokio::test]
 async fn retrieval_is_resolved_without_reaching_the_client() {
     let dir = TempDir::new().unwrap();

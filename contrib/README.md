@@ -13,6 +13,7 @@ nothing here is on the request path.
 | `claude-launcher` | `~/.local/bin/claude-launcher`, `cclaude` | Starts the proxy if port 8787 is dead, sets `ANTHROPIC_BASE_URL`, execs `claude`. Handles several profiles and an optional local Qwen. |
 | `restart-headroom.sh` | `~/.local/bin/` | Restarts the proxy onto a freshly built binary and rolls back if it fails to come up. Detached, so killing the proxy does not kill the restart. |
 | `update-headroom.sh` | `~/.local/bin/` | Pulls the checkout, reinstalls in the last install's mode, restarts the proxy. Run after `git pull`, or instead of it. |
+| `concurrency-report.sh` | `~/.local/bin/` | Verdict on the 2026-09-15 concurrency fixes from the proxy log: sidecar 404 fallbacks, Zen slot timeouts, proxy-side stalls, and whether `--cache-stampede-gate` held any follower that then read cache. Run after a day of use; it says when to drop the gate flag. |
 | `headroom-flags.sh` | `~/.headroom-flags.sh` | The flag array both starters read. An existing file is never overwritten, so tuning survives a re-install. |
 | `zen-rotate-watch.sh` | `~/.local/bin/` | Watches the log for Zen/Spark rate limits and rotates the VPN exit. Not started by the installer. |
 | `headroom-rss-sample` | `~/.local/bin/` | Samples the proxy's RSS once a minute into `~/headroom-rss.log`, so a leak over a long session is visible. |
@@ -56,7 +57,7 @@ session.
 | `stale-install.sh` | SessionStart | No — one-time notice when the checkout moved under the installed copies (scripts/hooks differ, or the built binary is newer); fires only inside the checkout |
 | `session-map-log.sh` | SessionStart | No — logs session id to transcript path for the review worker |
 | `rotation-notice.sh` | UserPromptSubmit | No — relays VPN-rotation notices once each |
-| `retry-dropped-turn.sh` | Stop | No — continues a turn parked on a dropped connection |
+| `retry-dropped-turn.sh` | Stop | No — continues a turn parked on a dropped connection, a completed upstream error, or a proxy-dropped tool call that left an empty reply |
 
 Two of these need their own worker to be useful (`review-gate.sh` and
 `ticket-gate.sh`); see `spark-poster/README.md`.
