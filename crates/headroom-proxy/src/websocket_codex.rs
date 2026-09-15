@@ -266,8 +266,10 @@ fn decode_bearer_jwt_payload(auth: &str) -> Option<Value> {
 /// the `chatgpt_account_id` claim from the (unverified) Bearer JWT payload.
 /// Inserts `ChatGPT-Account-ID` when derived from the JWT. Returns whether
 /// the session routes to the ChatGPT subscription backend.
-/// Port of `openai.py::_resolve_codex_routing_headers`.
-fn resolve_codex_routing(headers: &mut HeaderMap) -> bool {
+/// Port of `openai.py::_resolve_codex_routing_headers`. Shared with the
+/// HTTP call-creation path ([`crate::codex_live_http`]): the routing hint
+/// is identical, only the transport differs.
+pub(crate) fn resolve_codex_routing(headers: &mut HeaderMap) -> bool {
     if headers.contains_key("chatgpt-account-id") {
         return true;
     }

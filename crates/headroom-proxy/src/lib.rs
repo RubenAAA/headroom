@@ -9,6 +9,7 @@ pub mod cache_stabilization;
 pub mod cc_switch_reconciler;
 pub mod ccr_retrieve_repair;
 pub mod codex;
+pub mod codex_live_http;
 pub mod codex_rate_limits;
 pub mod compression;
 pub mod compression_decision;
