@@ -182,6 +182,24 @@ fn count_content_parts(tokenizer: &dyn Tokenizer, parts: &[serde_json::Value]) -
                 let default_input = serde_json::Value::Object(serde_json::Map::new());
                 let input = obj.get("input").unwrap_or(&default_input);
                 total += count_serialized(tokenizer, input);
+            } else if part_type == "thinking" {
+                // Anthropic extended thinking replayed by the client. The
+                // `signature` is the encrypted full reasoning: on keep-all
+                // models the server decrypts it into the prompt and bills it
+                // as input, and under `display: "omitted"` the `thinking`
+                // text is empty, so text alone is not the input. Nor is the
+                // base64: the JSON catch-all below priced it as prose and
+                // wildly over-counted. Price the text plus the decoded
+                // signature bytes at ~4 bytes/token instead (upstream
+                // `9ed95c38`). Signatures are base64 ASCII, so byte length
+                // equals Python's `len(str)` code-point count here.
+                let text = obj.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                total += tokenizer.count_text(text);
+                let sig_len = obj
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .map_or(0, str::len);
+                total += sig_len * 3 / 16;
             } else if part_type.is_empty() {
                 // No type field — check for Strands SDK format
                 if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
@@ -568,5 +586,47 @@ mod tests {
         let t = estimator();
         let calls = serde_json::json!([{"id": null, "function": {"name": null}}]);
         assert_eq!(count_tool_calls(&t, calls.as_array().unwrap()), 4);
+    }
+
+    /// Thinking blocks price their text plus the decoded signature bytes
+    /// (upstream `9ed95c38`), never the base64-as-prose JSON catch-all.
+    #[test]
+    fn thinking_signature_prices_between_zero_and_the_json_catch_all() {
+        let tok = estimator();
+        let text = "consider the failing test ".repeat(20);
+        let block = serde_json::json!({
+            "type": "thinking",
+            "thinking": text,
+            "signature": "A".repeat(4000),
+        });
+        let signed = vec![serde_json::json!({"role": "assistant", "content": [block.clone()]})];
+        let unsigned = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": text}],
+        })];
+        // The signature is encrypted reasoning the server replays as billed
+        // input, so it adds to the text at decoded bytes / 4 (4000*3/4/4)...
+        assert_eq!(
+            tok.count_messages(&signed) - tok.count_messages(&unsigned),
+            750
+        );
+        // ...which is well under the JSON catch-all's base64-as-prose price.
+        assert!(750 < count_serialized(&tok, &block));
+    }
+
+    #[test]
+    fn omitted_display_thinking_block_is_not_free() {
+        // display: "omitted" returns an empty thinking field and carries the
+        // whole reasoning in the signature.
+        let tok = estimator();
+        let omitted = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "", "signature": "A".repeat(4000)}],
+        })];
+        let empty = vec![serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": ""}],
+        })];
+        assert!(tok.count_messages(&omitted) > tok.count_messages(&empty));
     }
 }
