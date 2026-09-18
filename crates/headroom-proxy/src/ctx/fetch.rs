@@ -371,66 +371,81 @@ fn check_ip(ip: &IpAddr) -> Result<(), String> {
         _ => ip,
     };
     match ip {
-        IpAddr::V4(v4) => {
-            // Unspecified (0.0.0.0/8) routes to localhost on typical stacks.
-            // Note: `is_unspecified()` covers only 0.0.0.0 itself, so the
-            // whole /8 is rejected explicitly (FINDING-023 residual).
-            if v4.is_unspecified() || v4.octets()[0] == 0 {
-                return Err("unspecified address not allowed".into());
-            }
-            // Loopback
-            if v4.is_loopback() {
-                return Err("loopback address not allowed".into());
-            }
-            // Private (RFC1918)
-            if v4.is_private() {
-                return Err("private address not allowed".into());
-            }
-            // Link-local
-            if v4.is_link_local() {
-                return Err("link-local address not allowed".into());
-            }
-            // Multicast / reserved (octet check: is_reserved/is_broadcast
-            // are unstable on this toolchain; >= 224 covers multicast,
-            // 240/4 reserved, and limited-broadcast 255.255.255.255).
-            let octets = v4.octets();
-            if v4.is_multicast() || octets[0] >= 240 || octets == [255, 255, 255, 255] {
-                return Err("multicast/reserved address not allowed".into());
-            }
-            // Shared (100.64/10), benchmarking (198.18/15), and TEST-NET
-            // documentation (192.0.2/24, 198.51.100/24, 203.0.113/24)
-            // ranges are non-routable like privates.
-            if (octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127)
-                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-            {
-                return Err("non-routable address not allowed".into());
-            }
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_unspecified() {
-                return Err("unspecified address not allowed".into());
-            }
-            if v6.is_loopback() {
-                return Err("IPv6 loopback not allowed".into());
-            }
-            let segs = v6.segments();
-            if segs[0] & 0xffc0 == 0xfe80 {
-                return Err("IPv6 link-local not allowed".into());
-            }
-            if v6.is_multicast() {
-                return Err("IPv6 multicast not allowed".into());
-            }
-            if segs[0] & 0xfe00 == 0xfc00 {
-                return Err("IPv6 ULA not allowed".into());
-            }
-            // IPv4-compatible (::10.x) reaches v4 space on dual stacks.
-            if segs[0..6] == [0, 0, 0, 0, 0, 0] {
-                return Err("IPv4-compatible address not allowed".into());
-            }
-        }
+        IpAddr::V4(v4) => check_ipv4(v4),
+        IpAddr::V6(v6) => check_ipv6(v6),
+    }
+}
+
+/// SSRF guard for IPv4: rejects unspecified, loopback, private, link-local,
+/// multicast/reserved, and non-routable documentation ranges.
+/// Extracted from `check_ip` without behavior change.
+fn check_ipv4(v4: &std::net::Ipv4Addr) -> Result<(), String> {
+    // Unspecified (0.0.0.0/8) routes to localhost on typical stacks.
+    // Note: `is_unspecified()` covers only 0.0.0.0 itself, so the
+    // whole /8 is rejected explicitly (FINDING-023 residual).
+    if v4.is_unspecified() || v4.octets()[0] == 0 {
+        return Err("unspecified address not allowed".into());
+    }
+    // Loopback
+    if v4.is_loopback() {
+        return Err("loopback address not allowed".into());
+    }
+    // Private (RFC1918)
+    if v4.is_private() {
+        return Err("private address not allowed".into());
+    }
+    // Link-local
+    if v4.is_link_local() {
+        return Err("link-local address not allowed".into());
+    }
+    // Multicast / reserved (octet check: is_reserved/is_broadcast
+    // are unstable on this toolchain; >= 224 covers multicast,
+    // 240/4 reserved, and limited-broadcast 255.255.255.255).
+    let octets = v4.octets();
+    if v4.is_multicast() || octets[0] >= 240 || octets == [255, 255, 255, 255] {
+        return Err("multicast/reserved address not allowed".into());
+    }
+    check_ipv4_non_routable(&octets)
+}
+
+/// Shared (100.64/10), benchmarking (198.18/15), and TEST-NET documentation
+/// ranges are non-routable like privates.
+/// Extracted from `check_ip` without behavior change.
+fn check_ipv4_non_routable(octets: &[u8; 4]) -> Result<(), String> {
+    if (octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+    {
+        return Err("non-routable address not allowed".into());
+    }
+    Ok(())
+}
+
+/// SSRF guard for IPv6: rejects unspecified, loopback, link-local, multicast,
+/// ULA, and IPv4-compatible addresses.
+/// Extracted from `check_ip` without behavior change.
+fn check_ipv6(v6: &std::net::Ipv6Addr) -> Result<(), String> {
+    if v6.is_unspecified() {
+        return Err("unspecified address not allowed".into());
+    }
+    if v6.is_loopback() {
+        return Err("IPv6 loopback not allowed".into());
+    }
+    let segs = v6.segments();
+    if segs[0] & 0xffc0 == 0xfe80 {
+        return Err("IPv6 link-local not allowed".into());
+    }
+    if v6.is_multicast() {
+        return Err("IPv6 multicast not allowed".into());
+    }
+    if segs[0] & 0xfe00 == 0xfc00 {
+        return Err("IPv6 ULA not allowed".into());
+    }
+    // IPv4-compatible (::10.x) reaches v4 space on dual stacks.
+    if segs[0..6] == [0, 0, 0, 0, 0, 0] {
+        return Err("IPv4-compatible address not allowed".into());
     }
     Ok(())
 }

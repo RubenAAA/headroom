@@ -655,141 +655,31 @@ impl<'a> BodyRedactor<'a> {
     /// password goes.
     fn match_secret(&self, bytes: &[u8], i: usize) -> Option<(usize, usize, &'static str)> {
         let rest = &bytes[i..];
-        // `-----BEGIN ...-----` through the END line: private keys and certs.
-        if rest.starts_with(b"-----BEGIN ") {
-            if let Some(end) = find_subslice(rest, b"-----END ") {
-                let tail = &rest[end..];
-                if let Some(nl) = tail.iter().position(|&b| b == b'\n') {
-                    return Some((0, end + nl + 1, SECRET_KIND));
-                }
-                return Some((0, rest.len(), SECRET_KIND));
-            }
+        if let Some(found) = match_pem_block(rest) {
+            return Some(found);
         }
-        // Known prefixes.
-        for prefix in [
-            b"sk-".as_slice(),
-            b"ghp_".as_slice(),
-            b"gho_".as_slice(),
-            b"ghu_".as_slice(),
-            b"ghs_".as_slice(),
-            b"github_pat_".as_slice(),
-            b"glpat-".as_slice(),
-            b"xoxb-".as_slice(),
-            b"xoxp-".as_slice(),
-            b"xoxa-".as_slice(),
-            b"xoxs-".as_slice(),
-            b"xoxo-".as_slice(),
-            b"xoxr-".as_slice(),
-            b"hf_".as_slice(),
-            b"dop_v1_".as_slice(),
-            b"AKIA".as_slice(),
-            b"ASIA".as_slice(),
-            b"AIza".as_slice(),
-        ] {
-            if rest.starts_with(prefix) {
-                let mut len = prefix.len();
-                while len < rest.len() && is_token_char(rest[len]) {
-                    len += 1;
-                }
-                if len - prefix.len() >= 8 {
-                    return Some((0, len, SECRET_KIND));
-                }
-            }
+        if let Some(found) = match_known_secret_prefix(rest) {
+            return Some(found);
         }
-        // `name[:=] value`: the value goes, the name stays. Identifier chars
-        // between the name and the separator cover `secret_key`, `api-key`,
-        // `apiKey`, `AWS_SECRET_ACCESS_KEY`. `Bearer <token>` has no
-        // separator. A rare prose false positive (`secretary = ...`) restores
-        // exactly, so it costs confusion, never breakage.
-        for name in [
-            b"Bearer ".as_slice(),
-            b"api_key".as_slice(),
-            b"apikey".as_slice(),
-            b"password".as_slice(),
-            b"passwd".as_slice(),
-            b"passphrase".as_slice(),
-            b"pgpassword".as_slice(),
-            b"secret".as_slice(),
-            b"token".as_slice(),
-        ] {
-            if starts_word_insensitive(rest, name) {
-                if let Some((start, len)) =
-                    match_named_value(rest, name.len(), name.ends_with(b" "))
-                {
-                    return Some((start, len, SECRET_KIND));
-                }
-            }
+        if let Some(found) = match_named_credential(rest) {
+            return Some(found);
         }
-        // Compound credential names (`private_key`, `api-key`, `myKey`):
-        // "key" alone is too generic to list (dict keys, prose), but
-        // completing a `_`/`-` compound or a camel hump is a credential
-        // name. The joiner requirement keeps `monkey`/`donkey` out:
-        // alphanumerics before "key" never match.
-        if i > 0 && starts_word_insensitive(rest, b"key") {
-            let prev = bytes[i - 1];
-            if prev == b'_' || prev == b'-' || (prev.is_ascii_lowercase() && rest[0] == b'K') {
-                if let Some((start, len)) = match_named_value(rest, 3, false) {
-                    return Some((start, len, SECRET_KIND));
-                }
-            }
+        if let Some(found) = match_compound_key(bytes, i, rest) {
+            return Some(found);
         }
-        // pgpass line `host:port:db:user:password` at a line start: only the
-        // password goes, the endpoint stays for reasoning.
-        if i == 0 || bytes[i - 1] == b'\n' {
-            if let Some((off, len)) = match_pgpass_password(rest) {
-                return Some((off, len, SECRET_KIND));
-            }
+        if let Some(found) = match_pgpass_at_line_start(bytes, i, rest) {
+            return Some(found);
         }
-        // `postgres[ql]://user:password@host…`: only the password goes.
-        for scheme in [b"postgres://".as_slice(), b"postgresql://".as_slice()] {
-            if rest.starts_with(scheme) {
-                if let Some((off, len)) = match_url_password(&rest[scheme.len()..]) {
-                    return Some((scheme.len() + off, len, SECRET_KIND));
-                }
-            }
+        if let Some(found) = match_postgres_url_password(rest) {
+            return Some(found);
         }
-        // AWS account id inside an ARN `:123456789012:`: the digits go.
-        if rest.first() == Some(&b':') && rest.len() > 14 {
-            let digits = &rest[1..13];
-            if digits.iter().all(|b| b.is_ascii_digit()) && rest.get(13) == Some(&b':') {
-                return Some((1, 12, SECRET_KIND));
-            }
+        if let Some(found) = match_arn_account_id(rest) {
+            return Some(found);
         }
-        // JWT: three base64url segments.
-        if rest.starts_with(b"eyJ") {
-            let mut parts = 0;
-            let mut j = 0;
-            while j < rest.len() && (is_b64url(rest[j]) || rest[j] == b'.') {
-                if rest[j] == b'.' {
-                    parts += 1;
-                }
-                j += 1;
-                if parts == 2 {
-                    while j < rest.len() && is_b64url(rest[j]) {
-                        j += 1;
-                    }
-                    break;
-                }
-            }
-            if parts == 2 && j >= 32 {
-                return Some((0, j, SECRET_KIND));
-            }
+        if let Some(found) = match_jwt_token(rest) {
+            return Some(found);
         }
-        // High-entropy run: long, mixed classes, not a UUID, not a filename
-        // (a trailing `.ext` means file, and filenames are paths' business).
-        let mut j = i;
-        while j < bytes.len() && is_token_char(bytes[j]) {
-            j += 1;
-        }
-        let len = j - i;
-        if len >= 28
-            && looks_secret(&bytes[i..j])
-            && !looks_uuid(&bytes[i..j])
-            && !has_extension(&bytes[i..j])
-        {
-            return Some((0, len, SECRET_KIND));
-        }
-        None
+        match_high_entropy_run(bytes, i)
     }
 
     /// Home-rooted paths, `~/…`, absolute paths outside the clear prefixes,
@@ -798,138 +688,22 @@ impl<'a> BodyRedactor<'a> {
     /// anything else sensitive is [`PathHit::Opaque`].
     fn match_path(&self, bytes: &[u8], i: usize) -> Option<PathHit> {
         let rest = &bytes[i..];
-        let home_known = self.home.is_some();
-        // `$HOME/...` and `${HOME}/...`.
-        for prefix in [b"$HOME".as_slice(), b"${HOME}".as_slice()] {
-            if rest.starts_with(prefix) {
-                let mut len = prefix.len();
-                while len < rest.len() && is_path_char(rest[len]) {
-                    len += 1;
-                }
-                if home_known {
-                    return Some(PathHit::Home {
-                        total: len,
-                        prefix: prefix.len(),
-                    });
-                }
-                return Some(PathHit::Opaque(len));
-            }
+        if let Some(hit) = match_home_var_path(rest, self.home.is_some()) {
+            return Some(hit);
         }
-        // `~/...`.
-        if rest.starts_with(b"~/") {
-            let mut len = 2;
-            while len < rest.len() && is_path_char(rest[len]) {
-                len += 1;
-            }
-            if home_known {
-                return Some(PathHit::Home {
-                    total: len,
-                    prefix: 1,
-                });
-            }
-            return Some(PathHit::Opaque(len));
+        if let Some(hit) = match_tilde_path(rest, self.home.is_some()) {
+            return Some(hit);
         }
-        // Explicit home dir, `/home/<user>/…`, `/root/…`, `/Users/<name>/…`.
-        if let Some(home) = self.home.as_deref() {
-            if rest.starts_with(home.as_bytes())
-                && rest.len() > home.len()
-                && is_path_char(rest[home.len()])
-            {
-                let mut len = home.len();
-                while len < rest.len() && is_path_char(rest[len]) {
-                    len += 1;
-                }
-                return Some(PathHit::Home {
-                    total: len,
-                    prefix: home.len(),
-                });
-            }
+        if let Some(hit) = match_explicit_home_path(rest, self.home.as_deref()) {
+            return Some(hit);
         }
-        for prefix in [
-            b"/home/".as_slice(),
-            b"/root/".as_slice(),
-            b"/Users/".as_slice(),
-        ] {
-            if rest.starts_with(prefix) {
-                let mut len = prefix.len();
-                while len < rest.len() && is_path_char(rest[len]) {
-                    len += 1;
-                }
-                // Need something past the prefix itself.
-                if len > prefix.len() + 1 {
-                    return Some(PathHit::Opaque(len));
-                }
-            }
+        if let Some(hit) = match_generic_home_prefix(rest) {
+            return Some(hit);
         }
-        // Absolute path: starts at `/`, runs on path chars, holds a second
-        // segment or a filename. Skips URLs (`://` inside or directly behind),
-        // mid-word slashes (the relative branch owns those), and the clear
-        // system prefixes.
-        if rest[0] == b'/' {
-            if i > 0 && is_boundary_char(bytes[i - 1]) {
-                return None;
-            } // Second slash of `//`: the first slash already declined the URL.
-            if i > 0 && bytes[i - 1] == b'/' {
-                return None;
-            }
-            // First slash of `://`: the scheme is directly behind.
-            if i > 0 && bytes[i - 1] == b':' && rest.get(1) == Some(&b'/') {
-                return None;
-            }
-            let mut len = 1;
-            while len < rest.len() && is_path_char(rest[len]) {
-                len += 1;
-            }
-            let run = &rest[..len];
-            if run.contains(&b':') && run.windows(3).any(|w| w == b"://") {
-                return None;
-            }
-            if len < 3
-                || run.iter().all(|&b| b == b'/')
-                || (!run[1..].contains(&b'/') && !has_extension(run))
-            {
-                // Single short segment (`/x`), bare root, or a run of nothing
-                // but slashes (`//`, `///`) — not a path worth hiding.
-                return None;
-            }
-            for clear in CLEAR_PREFIXES {
-                if rest.starts_with(clear.as_bytes()) {
-                    return None;
-                }
-            }
-            return Some(PathHit::Opaque(len));
+        if let Some(hit) = match_absolute_path(bytes, i, rest) {
+            return Some(hit);
         }
-        // Relative: needs two slashes (`a/b/c`) or one slash plus an
-        // extension (`src/main.py`). Bare `a/b` is left alone — too often
-        // division, a flag, or prose. A preceding slash means the absolute
-        // branch owns this run (and already passed on it).
-        if is_path_start(rest[0]) {
-            if i > 0 && bytes[i - 1] == b'/' {
-                return None;
-            }
-            let mut len = 0;
-            while len < rest.len() && is_path_char(rest[len]) {
-                len += 1;
-            }
-            let run = &rest[..len];
-            // A `:` inside makes this a URI, not a path — the absolute
-            // branch already declined it.
-            if run.windows(3).any(|w| w == b"://") {
-                return None;
-            }
-            if run.contains(&b'/') {
-                let slashes = run.iter().filter(|&&b| b == b'/').count();
-                if slashes >= 2 || (slashes == 1 && has_extension(run)) {
-                    // Must start at a token boundary, or `import a/b` eats
-                    // its own tail. A preceding joiner means mid-token.
-                    if i > 0 && is_boundary_char(bytes[i - 1]) {
-                        return None;
-                    }
-                    return Some(PathHit::Opaque(len));
-                }
-            }
-        }
-        None
+        match_relative_path(bytes, i, rest)
     }
 }
 
@@ -1559,6 +1333,184 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// `-----BEGIN ...-----` through the END line: private keys and certs.
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_pem_block(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
+    if !rest.starts_with(b"-----BEGIN ") {
+        return None;
+    }
+    let end = find_subslice(rest, b"-----END ")?;
+    let tail = &rest[end..];
+    if let Some(nl) = tail.iter().position(|&b| b == b'\n') {
+        return Some((0, end + nl + 1, SECRET_KIND));
+    }
+    Some((0, rest.len(), SECRET_KIND))
+}
+
+/// Known secret prefixes (`sk-`, `ghp_`, `AKIA`, …).
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_known_secret_prefix(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
+    for prefix in [
+        b"sk-".as_slice(),
+        b"ghp_".as_slice(),
+        b"gho_".as_slice(),
+        b"ghu_".as_slice(),
+        b"ghs_".as_slice(),
+        b"github_pat_".as_slice(),
+        b"glpat-".as_slice(),
+        b"xoxb-".as_slice(),
+        b"xoxp-".as_slice(),
+        b"xoxa-".as_slice(),
+        b"xoxs-".as_slice(),
+        b"xoxo-".as_slice(),
+        b"xoxr-".as_slice(),
+        b"hf_".as_slice(),
+        b"dop_v1_".as_slice(),
+        b"AKIA".as_slice(),
+        b"ASIA".as_slice(),
+        b"AIza".as_slice(),
+    ] {
+        if rest.starts_with(prefix) {
+            let mut len = prefix.len();
+            while len < rest.len() && is_token_char(rest[len]) {
+                len += 1;
+            }
+            if len - prefix.len() >= 8 {
+                return Some((0, len, SECRET_KIND));
+            }
+        }
+    }
+    None
+}
+
+/// `name[:=] value`: the value goes, the name stays.
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_named_credential(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
+    // Identifier chars between the name and the separator cover `secret_key`,
+    // `api-key`, `apiKey`, `AWS_SECRET_ACCESS_KEY`. `Bearer <token>` has no
+    // separator. A rare prose false positive (`secretary = ...`) restores
+    // exactly, so it costs confusion, never breakage.
+    for name in [
+        b"Bearer ".as_slice(),
+        b"api_key".as_slice(),
+        b"apikey".as_slice(),
+        b"password".as_slice(),
+        b"passwd".as_slice(),
+        b"passphrase".as_slice(),
+        b"pgpassword".as_slice(),
+        b"secret".as_slice(),
+        b"token".as_slice(),
+    ] {
+        if starts_word_insensitive(rest, name) {
+            if let Some((start, len)) = match_named_value(rest, name.len(), name.ends_with(b" ")) {
+                return Some((start, len, SECRET_KIND));
+            }
+        }
+    }
+    None
+}
+
+/// Compound credential names (`private_key`, `api-key`, `myKey`).
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_compound_key(bytes: &[u8], i: usize, rest: &[u8]) -> Option<(usize, usize, &'static str)> {
+    // "key" alone is too generic to list (dict keys, prose), but completing a
+    // `_`/`-` compound or a camel hump is a credential name. The joiner
+    // requirement keeps `monkey`/`donkey` out: alphanumerics before "key"
+    // never match.
+    if i == 0 || !starts_word_insensitive(rest, b"key") {
+        return None;
+    }
+    let prev = bytes[i - 1];
+    if prev != b'_' && prev != b'-' && !(prev.is_ascii_lowercase() && rest[0] == b'K') {
+        return None;
+    }
+    match_named_value(rest, 3, false).map(|(start, len)| (start, len, SECRET_KIND))
+}
+
+/// pgpass line at a line start: only the password goes.
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_pgpass_at_line_start(
+    bytes: &[u8],
+    i: usize,
+    rest: &[u8],
+) -> Option<(usize, usize, &'static str)> {
+    if i != 0 && bytes[i - 1] != b'\n' {
+        return None;
+    }
+    match_pgpass_password(rest).map(|(off, len)| (off, len, SECRET_KIND))
+}
+
+/// `postgres[ql]://user:password@host…`: only the password goes.
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_postgres_url_password(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
+    for scheme in [b"postgres://".as_slice(), b"postgresql://".as_slice()] {
+        if rest.starts_with(scheme) {
+            if let Some((off, len)) = match_url_password(&rest[scheme.len()..]) {
+                return Some((scheme.len() + off, len, SECRET_KIND));
+            }
+        }
+    }
+    None
+}
+
+/// AWS account id inside an ARN `:123456789012:`: the digits go.
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_arn_account_id(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
+    if rest.first() != Some(&b':') || rest.len() <= 14 {
+        return None;
+    }
+    let digits = &rest[1..13];
+    if digits.iter().all(|b| b.is_ascii_digit()) && rest.get(13) == Some(&b':') {
+        return Some((1, 12, SECRET_KIND));
+    }
+    None
+}
+
+/// JWT: three base64url segments.
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_jwt_token(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
+    if !rest.starts_with(b"eyJ") {
+        return None;
+    }
+    let mut parts = 0;
+    let mut j = 0;
+    while j < rest.len() && (is_b64url(rest[j]) || rest[j] == b'.') {
+        if rest[j] == b'.' {
+            parts += 1;
+        }
+        j += 1;
+        if parts == 2 {
+            while j < rest.len() && is_b64url(rest[j]) {
+                j += 1;
+            }
+            break;
+        }
+    }
+    if parts == 2 && j >= 32 {
+        return Some((0, j, SECRET_KIND));
+    }
+    None
+}
+
+/// High-entropy run: long, mixed classes, not a UUID, not a filename.
+/// Extracted from `BodyRedactor::match_secret` without behavior change.
+fn match_high_entropy_run(bytes: &[u8], i: usize) -> Option<(usize, usize, &'static str)> {
+    // A trailing `.ext` means file, and filenames are paths' business.
+    let mut j = i;
+    while j < bytes.len() && is_token_char(bytes[j]) {
+        j += 1;
+    }
+    let len = j - i;
+    if len >= 28
+        && looks_secret(&bytes[i..j])
+        && !looks_uuid(&bytes[i..j])
+        && !has_extension(&bytes[i..j])
+    {
+        return Some((0, len, SECRET_KIND));
+    }
+    None
+}
+
 /// Password field of a pgpass line `host:port:db:user:password`, as
 /// `(offset, len)` from the line start. Only the password goes — the endpoint
 /// stays for reasoning.
@@ -1619,6 +1571,166 @@ fn match_url_password(rest: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     Some((colon + 1, at - colon - 1))
+}
+
+/// `$HOME/...` and `${HOME}/...`.
+/// Extracted from `BodyRedactor::match_path` without behavior change.
+fn match_home_var_path(rest: &[u8], home_known: bool) -> Option<PathHit> {
+    for prefix in [b"$HOME".as_slice(), b"${HOME}".as_slice()] {
+        if rest.starts_with(prefix) {
+            let mut len = prefix.len();
+            while len < rest.len() && is_path_char(rest[len]) {
+                len += 1;
+            }
+            if home_known {
+                return Some(PathHit::Home {
+                    total: len,
+                    prefix: prefix.len(),
+                });
+            }
+            return Some(PathHit::Opaque(len));
+        }
+    }
+    None
+}
+
+/// `~/...`.
+/// Extracted from `BodyRedactor::match_path` without behavior change.
+fn match_tilde_path(rest: &[u8], home_known: bool) -> Option<PathHit> {
+    if !rest.starts_with(b"~/") {
+        return None;
+    }
+    let mut len = 2;
+    while len < rest.len() && is_path_char(rest[len]) {
+        len += 1;
+    }
+    if home_known {
+        return Some(PathHit::Home {
+            total: len,
+            prefix: 1,
+        });
+    }
+    Some(PathHit::Opaque(len))
+}
+
+/// Explicit home dir, `/home/<user>/…`, `/root/…`, `/Users/<name>/…`.
+/// Extracted from `BodyRedactor::match_path` without behavior change.
+fn match_explicit_home_path(rest: &[u8], home: Option<&str>) -> Option<PathHit> {
+    let home = home?;
+    if !rest.starts_with(home.as_bytes())
+        || rest.len() <= home.len()
+        || !is_path_char(rest[home.len()])
+    {
+        return None;
+    }
+    let mut len = home.len();
+    while len < rest.len() && is_path_char(rest[len]) {
+        len += 1;
+    }
+    Some(PathHit::Home {
+        total: len,
+        prefix: home.len(),
+    })
+}
+
+/// Other users' home prefixes (`/home/`, `/root/`, `/Users/`).
+/// Extracted from `BodyRedactor::match_path` without behavior change.
+fn match_generic_home_prefix(rest: &[u8]) -> Option<PathHit> {
+    for prefix in [
+        b"/home/".as_slice(),
+        b"/root/".as_slice(),
+        b"/Users/".as_slice(),
+    ] {
+        if rest.starts_with(prefix) {
+            let mut len = prefix.len();
+            while len < rest.len() && is_path_char(rest[len]) {
+                len += 1;
+            }
+            // Need something past the prefix itself.
+            if len > prefix.len() + 1 {
+                return Some(PathHit::Opaque(len));
+            }
+        }
+    }
+    None
+}
+
+/// Absolute path: starts at `/`, runs on path chars, holds a second segment
+/// or a filename. Skips URLs, mid-word slashes, and clear system prefixes.
+/// Extracted from `BodyRedactor::match_path` without behavior change.
+fn match_absolute_path(bytes: &[u8], i: usize, rest: &[u8]) -> Option<PathHit> {
+    if rest[0] != b'/' {
+        return None;
+    }
+    if i > 0 && is_boundary_char(bytes[i - 1]) {
+        return None;
+    } // Second slash of `//`: the first slash already declined the URL.
+    if i > 0 && bytes[i - 1] == b'/' {
+        return None;
+    }
+    // First slash of `://`: the scheme is directly behind.
+    if i > 0 && bytes[i - 1] == b':' && rest.get(1) == Some(&b'/') {
+        return None;
+    }
+    let mut len = 1;
+    while len < rest.len() && is_path_char(rest[len]) {
+        len += 1;
+    }
+    let run = &rest[..len];
+    if run.contains(&b':') && run.windows(3).any(|w| w == b"://") {
+        return None;
+    }
+    if len < 3
+        || run.iter().all(|&b| b == b'/')
+        || (!run[1..].contains(&b'/') && !has_extension(run))
+    {
+        // Single short segment (`/x`), bare root, or a run of nothing but
+        // slashes (`//`, `///`) — not a path worth hiding.
+        return None;
+    }
+    for clear in CLEAR_PREFIXES {
+        if rest.starts_with(clear.as_bytes()) {
+            return None;
+        }
+    }
+    Some(PathHit::Opaque(len))
+}
+
+/// Relative path: needs two slashes (`a/b/c`) or one slash plus an extension.
+/// Extracted from `BodyRedactor::match_path` without behavior change.
+fn match_relative_path(bytes: &[u8], i: usize, rest: &[u8]) -> Option<PathHit> {
+    // Bare `a/b` is left alone — too often division, a flag, or prose. A
+    // preceding slash means the absolute branch owns this run (and already
+    // passed on it).
+    if !is_path_start(rest[0]) {
+        return None;
+    }
+    if i > 0 && bytes[i - 1] == b'/' {
+        return None;
+    }
+    let mut len = 0;
+    while len < rest.len() && is_path_char(rest[len]) {
+        len += 1;
+    }
+    let run = &rest[..len];
+    // A `:` inside makes this a URI, not a path — the absolute branch already
+    // declined it.
+    if run.windows(3).any(|w| w == b"://") {
+        return None;
+    }
+    if !run.contains(&b'/') {
+        return None;
+    }
+    let slashes = run.iter().filter(|&&b| b == b'/').count();
+    if slashes < 2 && !(slashes == 1 && has_extension(run)) {
+        return None;
+    }
+    // Must start at a token boundary, or `import a/b` eats its own tail. A
+    // preceding joiner means mid-token.
+    if i > 0 && is_boundary_char(bytes[i - 1]) {
+        return None;
+    }
+    Some(PathHit::Opaque(len))
 }
 
 /// Last index in `buf` where a placeholder could start, so the stream cut

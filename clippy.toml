@@ -1,0 +1,14 @@
+# Complexity measurement baseline (Phase 0).
+#
+# Thresholds only — no lints are enabled here, on purpose.
+# `cognitive_complexity` is allow-by-default (it absorbed the old
+# `cyclomatic_complexity` lint, which no longer exists on this toolchain),
+# so this file alone changes no build output and keeps
+# `cargo clippy -- -D warnings` (the ci-precheck gate) green.
+#
+# To measure (local only, never in CI):
+#   cargo clippy -p headroom-proxy -p headroom-core --lib --tests -- \
+#     -W clippy::cognitive_complexity
+#
+# Deliberately NOT wired into CI (.github/workflows) — no CI spend.
+cognitive-complexity-threshold = 25

@@ -601,82 +601,56 @@ impl StackTraceDetector {
     fn terminates(flavor: TraceFlavor, line: &str, lines_so_far: usize) -> bool {
         let trimmed = line.trim_start();
         match flavor {
-            TraceFlavor::PythonTraceback => {
-                // Continue across blank lines (chained-exception fix)
-                // and across known continuation markers (`Traceback`,
-                // `File`, "During handling..."); terminate on a non-
-                // indented line UNLESS it looks like the
-                // `ExceptionType: message` terminator (which we keep
-                // inside the trace before ending).
-                let is_indented_or_blank = line.starts_with([' ', '\t']) || line.is_empty();
-                let is_continuation = trimmed.starts_with("Traceback")
-                    || trimmed.starts_with("File ")
-                    || trimmed.starts_with("During handling")
-                    || trimmed.starts_with("The above exception");
-                if is_indented_or_blank || is_continuation {
-                    false
-                } else {
-                    !trimmed.starts_with(char::is_uppercase)
-                }
-            }
-            TraceFlavor::Js => {
-                // Terminate on the first non-`at` line.
-                !trimmed.starts_with("at ") && !line.is_empty()
-            }
-            TraceFlavor::Java => {
-                // Continue across `Caused by:` / `Suppressed:` chain heads and
-                // the `... N more` frame-elision summary — terminating there
-                // split one chained exception into several traces, and the
-                // later chain heads got dropped under `max_stack_traces`.
-                let is_chain = trimmed.starts_with("Caused by:")
-                    || trimmed.starts_with("Suppressed:")
-                    || Self::is_java_more_summary(trimmed);
-                !trimmed.starts_with("at ") && !is_chain && !line.is_empty()
-            }
-            TraceFlavor::DotNet => {
-                // Continue across frames, inner-exception heads (`--->`),
-                // separator lines (`--- End of inner exception stack trace`,
-                // `--- End of stack trace from previous location`), and
-                // exception-type message lines.
-                if line.is_empty() {
-                    return false;
-                }
-                let continues = trimmed.starts_with("at ")
-                    || trimmed.starts_with("--->")
-                    || trimmed.starts_with("--- End of")
-                    || Self::is_dotnet_exception_head(trimmed);
-                !continues
-            }
-            TraceFlavor::RustError => !trimmed.starts_with("--> ") && !line.is_empty(),
-            TraceFlavor::RustBacktrace => {
-                if line.is_empty() || lines_so_far == 1 {
-                    // The panic message is the unindented free-text line right
-                    // after the `panicked at <loc>:` opener — keep it.
-                    return false;
-                }
-                let is_frame = trimmed.chars().next().is_some_and(|c| c.is_ascii_digit());
-                let is_continuation = line.starts_with([' ', '\t'])
-                    || trimmed.starts_with("stack backtrace:")
-                    || trimmed.starts_with("note: run with");
-                !is_frame && !is_continuation
-            }
-            TraceFlavor::GoPanic => {
-                // A goroutine dump is blocks of `goroutine N [state]:` headers,
-                // `pkg.func(...)` call lines, and tab-indented `.go:` file
-                // lines, separated by blank lines. Signal lines (`[signal
-                // SIGSEGV...]`) and chained `panic:` lines continue it.
-                if line.is_empty() {
-                    return false;
-                }
-                let continues = line.starts_with('\t')
-                    || Self::is_goroutine_header(line)
-                    || Self::is_go_call_frame(line)
-                    || line.starts_with("panic: ")
-                    || line.starts_with("fatal error: ")
-                    || line.starts_with("[signal ");
-                !continues
-            }
+            TraceFlavor::PythonTraceback => terminates_python_traceback(line, trimmed),
+            TraceFlavor::Js => terminates_js_frame(line, trimmed),
+            TraceFlavor::Java => Self::terminates_java_frame(line, trimmed),
+            TraceFlavor::DotNet => Self::terminates_dotnet_frame(line, trimmed),
+            TraceFlavor::RustError => terminates_rust_error(line, trimmed),
+            TraceFlavor::RustBacktrace => terminates_rust_backtrace(line, trimmed, lines_so_far),
+            TraceFlavor::GoPanic => Self::terminates_go_panic(line),
         }
+    }
+
+    fn terminates_java_frame(line: &str, trimmed: &str) -> bool {
+        // Continue across `Caused by:` / `Suppressed:` chain heads and the
+        // `... N more` frame-elision summary — terminating there split one
+        // chained exception into several traces, and the later chain heads
+        // got dropped under `max_stack_traces`.
+        let is_chain = trimmed.starts_with("Caused by:")
+            || trimmed.starts_with("Suppressed:")
+            || Self::is_java_more_summary(trimmed);
+        !trimmed.starts_with("at ") && !is_chain && !line.is_empty()
+    }
+
+    fn terminates_dotnet_frame(line: &str, trimmed: &str) -> bool {
+        // Continue across frames, inner-exception heads (`--->`), separator
+        // lines (`--- End of inner exception stack trace`, `--- End of stack
+        // trace from previous location`), and exception-type message lines.
+        if line.is_empty() {
+            return false;
+        }
+        let continues = trimmed.starts_with("at ")
+            || trimmed.starts_with("--->")
+            || trimmed.starts_with("--- End of")
+            || Self::is_dotnet_exception_head(trimmed);
+        !continues
+    }
+
+    fn terminates_go_panic(line: &str) -> bool {
+        // A goroutine dump is blocks of `goroutine N [state]:` headers,
+        // `pkg.func(...)` call lines, and tab-indented `.go:` file lines,
+        // separated by blank lines. Signal lines (`[signal SIGSEGV...]`) and
+        // chained `panic:` lines continue it.
+        if line.is_empty() {
+            return false;
+        }
+        let continues = line.starts_with('\t')
+            || Self::is_goroutine_header(line)
+            || Self::is_go_call_frame(line)
+            || line.starts_with("panic: ")
+            || line.starts_with("fatal error: ")
+            || line.starts_with("[signal ");
+        !continues
     }
 
     fn is_dotnet_exception_head(trimmed: &str) -> bool {
@@ -701,6 +675,51 @@ impl StackTraceDetector {
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
         digits > 0 && rest[digits..].trim() == "more"
     }
+}
+
+/// Python traceback: continue across blank lines and known continuation
+/// markers; terminate on a non-indented line unless it is the
+/// `ExceptionType: message` terminator. Extracted from
+/// `StackTraceDetector::terminates` without behavior change.
+fn terminates_python_traceback(line: &str, trimmed: &str) -> bool {
+    let is_indented_or_blank = line.starts_with([' ', '\t']) || line.is_empty();
+    let is_continuation = trimmed.starts_with("Traceback")
+        || trimmed.starts_with("File ")
+        || trimmed.starts_with("During handling")
+        || trimmed.starts_with("The above exception");
+    if is_indented_or_blank || is_continuation {
+        false
+    } else {
+        !trimmed.starts_with(char::is_uppercase)
+    }
+}
+
+/// JS: terminate on the first non-`at` line.
+/// Extracted from `StackTraceDetector::terminates` without behavior change.
+fn terminates_js_frame(line: &str, trimmed: &str) -> bool {
+    !trimmed.starts_with("at ") && !line.is_empty()
+}
+
+/// Rust error (`--> loc` annotations): terminate on the first line without
+/// the marker. Extracted without behavior change.
+fn terminates_rust_error(line: &str, trimmed: &str) -> bool {
+    !trimmed.starts_with("--> ") && !line.is_empty()
+}
+
+/// Rust backtrace: keep the free-text panic-message line right after the
+/// opener, then end on non-frame, non-continuation lines.
+/// Extracted from `StackTraceDetector::terminates` without behavior change.
+fn terminates_rust_backtrace(line: &str, trimmed: &str, lines_so_far: usize) -> bool {
+    if line.is_empty() || lines_so_far == 1 {
+        // The panic message is the unindented free-text line right after the
+        // `panicked at <loc>:` opener — keep it.
+        return false;
+    }
+    let is_frame = trimmed.chars().next().is_some_and(|c| c.is_ascii_digit());
+    let is_continuation = line.starts_with([' ', '\t'])
+        || trimmed.starts_with("stack backtrace:")
+        || trimmed.starts_with("note: run with");
+    !is_frame && !is_continuation
 }
 
 // ─── Frame-collapse pass ───────────────────────────────────────────────
