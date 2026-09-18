@@ -16,17 +16,23 @@ SETTINGS="$CLAUDE_DIR/settings.json"
 OS=$(uname -s)
 BUILD=1
 LINK=0
+NO_ML=0
 HOOKS_INTO="$HOME"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-build) BUILD=0 ;;
+        --no-ml) NO_ML=1 ;;
         --link) LINK=1 ;;
         --hooks-into) HOOKS_INTO="${2:?--hooks-into needs a directory}"; shift ;;
         --hooks-into=*) HOOKS_INTO="${1#*=}" ;;
         -h|--help)
-            echo "usage: ./install.sh [--no-build] [--link] [--hooks-into DIR]"
+            echo "usage: ./install.sh [--no-build] [--link] [--no-ml] [--hooks-into DIR]"
             echo "  --no-build     skip cargo build; install whatever target/release holds"
+            echo "  --no-ml        build without the ML crates (ort/fastembed/magika,"
+            echo "                 --no-default-features); lexical fallbacks only."
+            echo "                 Faster build, same behaviour unless you enable"
+            echo "                 Kompress or embeddings"
             echo "  --link         symlink the scripts and flags file into the checkout,"
             echo "                 so editing the repo edits the live setup"
             echo "  --hooks-into   project whose sessions should run the review hooks"
@@ -83,6 +89,9 @@ if [ "$OS" = "Darwin" ]; then
 # Puts the GNU tools ahead of the macOS ones for scripts that source this.
 export PATH="$BREW_PREFIX/opt/coreutils/libexec/gnubin:$BREW_PREFIX/opt/grep/libexec/gnubin:$BREW_PREFIX/opt/util-linux/bin:$BREW_PREFIX/opt/util-linux/sbin:\$PATH"
 export HEADROOM_REPO="$REPO_DIR"
+# Build flavour, read back by update-headroom.sh so a later update rebuilds
+# the same way without being told. 1 = last install used --no-ml.
+export HEADROOM_NO_ML="$NO_ML"
 EOF
     say "wrote $PATHS_FILE"
 
@@ -97,6 +106,7 @@ EOF
 else
     say "Linux — GNU tools are already the system ones"
     printf 'export HEADROOM_REPO="%s"\n' "$REPO_DIR" > "$PATHS_FILE"
+    printf 'export HEADROOM_NO_ML="%s"\n' "$NO_ML" >> "$PATHS_FILE"
 fi
 
 for tool in jq lsof; do
@@ -112,7 +122,13 @@ if [ "$BUILD" = 1 ]; then
         exit 1
     }
     say "building release binaries (a few minutes on a cold cache)"
-    ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy )
+    if [ "$NO_ML" = 1 ]; then
+        say "without the ML crates (--no-default-features): ort/fastembed/magika"
+        say "stay out of the tree; TextCrusher/BM25/extension fallbacks only"
+        ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy --no-default-features )
+    else
+        ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy )
+    fi
 fi
 for bin in headroom-proxy headroom; do
     src="$REPO_DIR/target/release/$bin"
@@ -402,9 +418,12 @@ const WANT = [
   ["PreToolUse",       "Bash",                "scrub-secrets.sh",  5],
   ["Stop",             null,                  "review-gate.sh",    10],
   // Auto-continue turns parked on a dropped API connection (stream H owns
-  // the matching logic). Stop only: it reads the transcript tail, and there
-  // is nothing to check on any other event.
+  // the matching logic), turns holding a retrieval splice or a dropped
+  // memory lookup with no answer, and completed upstream errors. Stop and
+  // SubagentStop: both read the transcript tail the same way (session_id +
+  // transcript_path), and there is nothing to check on any other event.
   ["Stop",             null,                  "retry-dropped-turn.sh", 10],
+  ["SubagentStop",     null,                  "retry-dropped-turn.sh", 10],
   // VPN-rotation notices: the watcher leaves per-session files, this relays
   // each once on the next prompt. Informational, never blocks.
   ["UserPromptSubmit", null,                  "rotation-notice.sh",  5],

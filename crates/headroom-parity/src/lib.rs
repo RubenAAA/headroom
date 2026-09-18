@@ -747,10 +747,16 @@ impl TransformComparator for TextCrusherComparator {
 /// Fixtures are recorded with `enable_ccr=False` so the output is the
 /// pure joined kept-word stream (the Rust engine never emits the Python
 /// inline CCR marker; live-zone CCR uses the `<<ccr:>>` convention).
+///
+/// Gated on `ml`: without the feature there is no Kompress engine to run.
+/// The registration in `builtin_comparators` is gated to match, so the
+/// default (lexical) harness simply has no `kompress` comparator.
+#[cfg(feature = "ml")]
 pub struct KompressComparator {
     model: std::sync::OnceLock<Option<headroom_core::transforms::kompress::Kompress>>,
 }
 
+#[cfg(feature = "ml")]
 impl Default for KompressComparator {
     fn default() -> Self {
         Self {
@@ -759,6 +765,7 @@ impl Default for KompressComparator {
     }
 }
 
+#[cfg(feature = "ml")]
 impl KompressComparator {
     pub fn new() -> Self {
         Self::default()
@@ -800,6 +807,7 @@ impl KompressComparator {
     }
 }
 
+#[cfg(feature = "ml")]
 impl TransformComparator for KompressComparator {
     fn name(&self) -> &str {
         "kompress"
@@ -960,6 +968,7 @@ pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
         Box::new(SmartCrusherComparator),
         Box::new(ContentDetectorComparator),
         Box::new(TextCrusherComparator),
+        #[cfg(feature = "ml")]
         Box::new(KompressComparator::new()),
         Box::new(CodeCompressorComparator),
     ]

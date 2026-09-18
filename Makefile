@@ -8,11 +8,18 @@ PYTHON ?= python3
 FIXTURES ?= upstream-python/tests/parity/fixtures
 PREFIX ?= $(HOME)/.local
 
-.PHONY: help test test-parity bench build-proxy install-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
+.PHONY: help test test-unit test-int test-ml test-nextest test-nextest-unit test-nextest-int test-nextest-shard test-parity bench build-proxy install-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
 
 help:
 	@echo "Headroom Rust targets:"
-	@echo "  make test               - cargo test --workspace"
+	@echo "  make test               - cargo test --workspace (lexical default, no ONNX)"
+	@echo "  make test-ml            - full suite with --features ml (needs ORT dylib)"
+	@echo "  make test-unit          - unit tests only (lib+bins, fast loop)"
+	@echo "  make test-int           - integration binaries only"
+	@echo "  make test-nextest       - nextest full suite (preferred; sharded in CI)"
+	@echo "  make test-nextest-unit  - nextest unit only"
+	@echo "  make test-nextest-int   - nextest integration only"
+	@echo "  make test-nextest-shard SHARD=1/4 - one hash-partition (what CI runs)"
 	@echo "  make test-parity        - parity-run against recorded fixtures"
 	@echo "  make bench              - cargo bench --workspace"
 	@echo "  make build-proxy        - release build + strip headroom-proxy, print size"
@@ -40,6 +47,52 @@ help:
 test:
 	$(CARGO) test --workspace
 	@bash scripts/cargo-gc.sh --auto || true # build-triggered GC; gated, never fails the build
+
+# Opt back into the ONNX-backed transforms (Kompress, magika, embeddings).
+# Needs a real libonnxruntime + ORT_DYLIB_PATH (CI's test-ml job sets both
+# up); without them the ml tests hang on ort's Once — see rust.yml.
+test-ml:
+	$(CARGO) test -p headroom-core -p headroom-proxy -p headroom-parity --features ml
+	@bash scripts/cargo-gc.sh --auto || true
+
+# Fast local loops. `test-unit` skips linking the 80+ integration binaries.
+# `test-int` runs the integration binaries (plain cargo also re-runs lib
+# unit tests here — use `test-nextest-int` for an exact integration-only
+# split). `test` above stays the full back-compat suite.
+test-unit:
+	$(CARGO) test --workspace --lib --bins
+	@bash scripts/cargo-gc.sh --auto || true
+
+test-int:
+	$(CARGO) test --workspace --tests --no-fail-fast
+	@bash scripts/cargo-gc.sh --auto || true
+
+# Nextest variants. Preferred locally and what CI shards run
+# (`--partition hash:<shard>/4`, see .github/workflows/rust.yml and
+# .config/nextest.toml). Falls back to plain `cargo test` when nextest is
+# not installed so fresh checkouts keep working.
+test-nextest:
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		$(CARGO) nextest run --workspace --profile ci; \
+	else \
+		echo "cargo-nextest not installed; falling back to 'cargo test --workspace' (cargo install cargo-nextest --locked for the fast path)"; \
+		$(CARGO) test --workspace; \
+	fi
+	@bash scripts/cargo-gc.sh --auto || true
+
+test-nextest-unit:
+	$(CARGO) nextest run --workspace --profile ci -E 'kind(lib) | kind(bin)'
+	@bash scripts/cargo-gc.sh --auto || true
+
+test-nextest-int:
+	$(CARGO) nextest run --workspace --profile ci -E 'kind(test)'
+	@bash scripts/cargo-gc.sh --auto || true
+
+# One CI shard, e.g. `make test-nextest-shard SHARD=2/4`.
+SHARD ?= 1/1
+test-nextest-shard:
+	$(CARGO) nextest run --workspace --profile ci --partition hash:$(SHARD)
+	@bash scripts/cargo-gc.sh --auto || true
 
 # headroom-parity has no pyo3 dependency — its comparators call headroom-core
 # directly, so this target needs neither a venv nor a built extension module.
@@ -86,6 +139,10 @@ install-proxy: build-proxy
 	fi
 
 build-wheel:
+	# No --features needed: every maturin invocation enables `extension-module`
+	# (via [tool.maturin] in the Python package metadata), which implies
+	# headroom-py's `ml` feature — wheels always ship the ONNX-backed paths
+	# even though plain cargo builds default to lexical.
 	$(MATURIN) build --release -m crates/headroom-py/Cargo.toml
 	@bash scripts/cargo-gc.sh --auto || true # build-triggered GC; gated, never fails the build
 
@@ -155,7 +212,7 @@ ci-precheck-rust:
 	@echo "── ci-precheck-rust ────────────────────────────────────────────"
 	$(CARGO) fmt --all -- --check
 	$(CARGO) clippy --workspace -- -D warnings
-	$(CARGO) test --workspace
+	$(MAKE) test-nextest
 
 # Mirrors the smart_crusher-affected test files we expect green on every
 # push. Builds the Rust extension first because most of these tests

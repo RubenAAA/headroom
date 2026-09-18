@@ -1,0 +1,16 @@
+# Local cargo config. CI mirrors the sccache bits via env (see
+# .github/workflows/rust.yml); this file intentionally does NOT set
+# `build.rustc-wrapper`, so checkouts without sccache installed keep working.
+# To opt in locally: `cargo install sccache` and export RUSTC_WRAPPER=sccache.
+
+[profile.dev]
+# Trade a little runtime for much faster incremental test builds: 256
+# parallel codegen units instead of the default 16. Release profile is
+# untouched (workspace Cargo.toml keeps codegen-units=1 + fat LTO for size).
+codegen-units = 256
+
+[profile.test]
+inherits = "dev"
+# Debug info dominates link time on the 84-binary integration tree without
+# helping failure diagnosis (nextest already captures output per test).
+debug = "line-tables-only"

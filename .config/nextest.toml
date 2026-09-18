@@ -1,0 +1,21 @@
+# Nextest config: `cargo nextest run --workspace --profile ci`.
+# Sharded in CI: `--partition hash:<shard>/4` (see .github/workflows/rust.yml).
+# Local fast loops:
+#   cargo nextest run --workspace --profile ci -E 'kind(lib) | kind(bin)'  # unit
+#   cargo nextest run --workspace --profile ci -E 'kind(test)'             # integration
+
+[profile.default]
+slow-timeout = "60s"
+fail-fast = false
+
+[profile.ci]
+inherits = "default"
+# Retry only flaky-timing integration tests, not real failures: attempts are
+# cheap, and port-churn flakes waste a full shard re-run otherwise.
+retries = 1
+# Property tests default to 256 cases; 32 keeps the invariant signal while
+# cutting the slowest proptest binaries ~8x. Override per-run with
+# PROPTEST_CASES=256 when touching parser code.
+[profile.ci.env]
+PROPTEST_CASES = "32"
+RUST_BACKTRACE = "1"

@@ -64,12 +64,23 @@ jobs:
             *)                 echo "rust=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
+  # Default suite: the `ml` cargo feature is OFF by default, so these shards
+  # run the fast lexical build with no ONNX Runtime in the tree — no Python
+  # toolchain, no ORT dylib. Full ONNX coverage lives in `test-ml` below.
   test:
-    name: test (ubuntu)
+    name: test (ubuntu, shard ${{ matrix.shard }}/4)
     needs: rust-changes
     if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+      PROPTEST_CASES: '32'
     steps:
       - uses: actions/checkout@v7
       - name: Install stable toolchain
@@ -84,6 +95,46 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest + sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,sccache
+      - name: cargo fmt --check
+        if: matrix.shard == 1
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        if: matrix.shard == 1
+        run: cargo clippy --workspace -- -D warnings
+      - name: cargo nextest (sharded)
+        run: cargo nextest run --workspace --profile ci --partition hash:${{ matrix.shard }}/4
+
+  # Full ONNX-backed suite: `--features ml` opts core/proxy/parity back into
+  # ort/fastembed/magika. Unsharded (the ml-gated subset is small; the rest
+  # re-runs the default suite with ml on). kompress_parity skips pass without
+  # a seeded HF model cache — the job proves wiring/compile, not byte-parity.
+  test-ml:
+    name: test-ml (ubuntu)
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+      PROPTEST_CASES: '32'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest + sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,sccache
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
@@ -138,19 +189,12 @@ jobs:
           print(f"ORT_DYLIB_PATH={libs[0]}")
           print(f"onnxruntime {version} -> {libs[0]}", file=sys.stderr)
           PY
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --workspace -- -D warnings
-      # Guards the ML-free build: with `ml` off, ort/fastembed/magika leave the
-      # dependency tree entirely, so a missing `#[cfg(feature = "ml")]` only
-      # shows up here. Users who do not want ONNX Runtime build this way.
-      - name: cargo check --no-default-features
-        run: |
-          cargo check -p headroom-core --no-default-features --all-targets
-          cargo check -p headroom-proxy --no-default-features --all-targets
-      - name: cargo test
-        run: cargo test --workspace
+      - name: cargo nextest --features ml
+        run: cargo nextest run -p headroom-core -p headroom-proxy -p headroom-parity --features ml --profile ci
+      - name: cargo check py extension-module wiring
+        # Validates `extension-module = [..., "ml"]` (the wheels' ONNX path)
+        # without linking libpython (`check` never links).
+        run: cargo check -p headroom-py --features extension-module
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})

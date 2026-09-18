@@ -139,12 +139,11 @@ chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
 mimalloc = "0.1"
 
 [features]
-# Pass-through to headroom-core. `ml` is ON by default, so a stock build is
-# unchanged. Turning it off (`--no-default-features`) drops ONNX Runtime and
-# the models from the tree; the proxy then runs the lexical paths only —
-# TextCrusher instead of Kompress, extension-based file typing instead of
-# magika, BM25 instead of embeddings.
-default = ["ml"]
+# Pass-through to headroom-core. `ml` is OFF by default, so a stock build is
+# the fast lexical one; turning it ON (`--features ml`) restores ONNX Runtime
+# and the models, and the proxy runs the full paths (Kompress instead of
+# TextCrusher, magika file typing, embedding relevance).
+default = []
 ml = ["headroom-core/ml"]
 # Shared Redis CCR store for multi-worker deployments. See headroom-core.
 redis = ["headroom-core/redis"]
@@ -173,6 +172,12 @@ sha2 = "0.11"
 # including malformed UTF-8 split mid-codepoint or fuzz-generated
 # noise). 100K cases is the project default for "no panic" parser
 # invariants — see `feedback_realignment_build_constraints.md`.
+#
+# NOTE (test-speed): dev-dependencies compile into EVERY integration test
+# binary, so `proptest` is link-cost on all 84 even though few use it.
+# Gating it behind a feature would break `cargo test` for the files that do;
+# instead the case count is cut centrally (PROPTEST_CASES=32 in
+# .config/nextest.toml + CI env) — same invariant signal, ~8x less runtime.
 proptest = "1"
 headroom-simulators = { path = "../headroom-simulators" }
 filetime = "0.2"

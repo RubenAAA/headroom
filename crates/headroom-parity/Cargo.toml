@@ -24,3 +24,12 @@ headroom-core = { path = "../headroom-core" }
 # NOTE: Phase 0 does not invoke Python from Rust. Phase 1 adds `pyo3` with
 # `auto-initialize` here so comparators can call into the installed
 # `headroom` package directly.
+
+[features]
+# Opt-in passthrough to headroom-core's ONNX-backed transforms, for the
+# Kompress comparator only. Keep OFF the plain dep edge above: an
+# unconditional `features = ["ml"]` edge would re-enable ml for the whole
+# workspace build (feature unification) and the lean default is lost.
+# CI's `test-ml` job runs the harness with `--features ml`.
+default = []
+ml = ["headroom-core/ml"]

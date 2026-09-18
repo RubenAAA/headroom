@@ -29,7 +29,16 @@ bench = false
 
 [features]
 default = []
-extension-module = ["pyo3/extension-module"]
+# `extension-module` is what every maturin invocation enables (via
+# `[tool.maturin] features` in the Python package metadata), so tying `ml`
+# to it keeps ALL shipped wheels and `maturin develop` extensions on the
+# ONNX-backed paths with no per-invocation flags — while plain `cargo
+# build`/`cargo test` stays on the fast lexical default. Do NOT put
+# `features = ["ml"]` on the headroom-core dep edge below: an unconditional
+# edge re-enables ml for the whole workspace build (feature unification)
+# and the lean default is lost.
+ml = ["headroom-core/ml"]
+extension-module = ["pyo3/extension-module", "ml"]
 
 [dependencies]
 headroom-core = { path = "../headroom-core" }

@@ -236,16 +236,14 @@ tree-sitter-php = "=0.24.2"
 tree-sitter-bash = "=0.25.1"
 
 [features]
-# `ml` is ON by default, so a stock build is byte-for-byte what it was before:
-# the ONNX-backed transforms (fastembed embeddings, magika detection, the
-# smart-crusher ML path) are all compiled in. Turning it OFF
-# (`default-features = false`) drops `ort`/`fastembed`/`magika` from the tree
-# entirely, so a consumer that only uses the lexical path (`TextCrusher` /
-# BM25 relevance) builds with no ONNX Runtime at all — which is what lets that
-# consumer ship a fully-static musl binary. See the source `#[cfg(feature =
-# "ml")]` gates (TODO: the module + dispatch gating is the collaborative half
-# of this change — flagged in the PR).
-default = ["ml"]
+# `ml` is OFF by default, so a stock `cargo build` / `cargo test` is the fast
+# lexical build with no ONNX Runtime in the tree (TextCrusher instead of
+# Kompress, extension-based file typing instead of magika, BM25 instead of
+# embeddings). Opt in with `--features ml` (CI's `test-ml` job does) for the
+# ONNX-backed transforms: `ort`/`fastembed`/`magika` rejoin the tree entirely.
+# The dispatch sites degrade gracefully without it (passthrough / lexical
+# fallbacks), so the default suite stays green with reduced coverage.
+default = []
 ml = ["dep:ort", "dep:fastembed", "dep:magika"]
 # Compile in the Redis CCR backend. Enable for multi-worker deployments
 # that want a shared CCR store with no sticky-session at the LB. The
@@ -254,6 +252,11 @@ ml = ["dep:ort", "dep:fastembed", "dep:magika"]
 redis = ["dep:redis"]
 
 [dev-dependencies]
+# NOTE (test-speed): these compile into every test target, benches included.
+# `criterion` is only exercised by the [[bench]] targets below (harness=false,
+# so unit/integration binaries never run it) and `proptest` case counts are
+# cut centrally via PROPTEST_CASES=32 (.config/nextest.toml + CI env).
+# Keep it that way: new heavy dev-deps land here only if a test needs them.
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
