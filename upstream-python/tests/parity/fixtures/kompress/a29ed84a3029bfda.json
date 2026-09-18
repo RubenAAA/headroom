@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
-  "input_sha256": "a901398a6751d2d2fd3bd22de4f7962cd5e1bdbc8d84f085a5b8a283c6f629fa",
+  "input_sha256": "a29ed84a3029bfda98f4f55b520faa8775ca77230977ee0407d9cf79a5a43b0f",
   "output": {
     "cache_key": null,
     "compressed": "quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning. Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning.",
@@ -17,6 +18,6 @@
     "original": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
     "original_tokens": 88
   },
-  "recorded_at": "2026-06-18T23:18:24.515863+00:00",
+  "recorded_at": "2026-09-18T00:11:04.562852+00:00",
   "transform": "kompress"
 }

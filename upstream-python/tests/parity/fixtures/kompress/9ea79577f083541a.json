@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "Performance benchmarks on the reference hardware show the int8 weight only model matching the full precision baseline within one tenth of a percent on the held out evaluation split across five hundred samples. Performance benchmarks on the reference hardware show the int8 weight only model matching the full precision baseline within one tenth of a percent on the held out evaluation split across five hundred samples. Performance benchmarks on the reference hardware show the int8 weight only model matching the full precision baseline within one tenth of a percent on the held out evaluation split across five hundred samples. ",
-  "input_sha256": "d9d334193be8ddeb11c1dfa5c88b2ee0c14822bb8576d806e8fa0b19a09443c3",
+  "input_sha256": "9ea79577f083541a6b5cf32a12977b825ca72efa2ed4cc7de3becbff7da62b93",
   "output": {
     "cache_key": null,
     "compressed": "Performance benchmarks on reference hardware show int8 weight only model matching full precision baseline within one tenth percent on held out evaluation split across five hundred samples. Performance benchmarks on reference hardware show int8 weight only model matching full precision baseline within one tenth percent on held out evaluation split across five hundred samples. Performance benchmarks on reference hardware show int8 weight only model matching full precision baseline within one tenth percent on held out evaluation split across five hundred samples.",
@@ -17,6 +18,6 @@
     "original": "Performance benchmarks on the reference hardware show the int8 weight only model matching the full precision baseline within one tenth of a percent on the held out evaluation split across five hundred samples. Performance benchmarks on the reference hardware show the int8 weight only model matching the full precision baseline within one tenth of a percent on the held out evaluation split across five hundred samples. Performance benchmarks on the reference hardware show the int8 weight only model matching the full precision baseline within one tenth of a percent on the held out evaluation split across five hundred samples. ",
     "original_tokens": 99
   },
-  "recorded_at": "2026-06-18T23:18:32.081771+00:00",
+  "recorded_at": "2026-09-18T00:11:11.879937+00:00",
   "transform": "kompress"
 }

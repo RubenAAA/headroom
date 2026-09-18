@@ -3,20 +3,21 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
-  "input_sha256": "9a0fba0115477c8b17d30763a33c036f22a9d8bd4e503a82a60cae9f39fd377d",
+  "input_sha256": "4c78a587b8c7c3894b734572870a4afe5dfe82ae5864f934a6f248f5fb5efcc1",
   "output": {
     "cache_key": null,
-    "compressed": "The quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over the lazy dog.",
-    "compressed_tokens": 23,
-    "compression_ratio": 0.8518518518518519,
+    "compressed": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
+    "compressed_tokens": 27,
+    "compression_ratio": 1.0,
     "model_used": "chopratejas/kompress-v2-base",
     "original": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
     "original_tokens": 27
   },
-  "recorded_at": "2026-06-18T23:18:24.045187+00:00",
+  "recorded_at": "2026-09-18T00:11:01.961041+00:00",
   "transform": "kompress"
 }

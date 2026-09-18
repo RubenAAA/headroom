@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
-  "input_sha256": "1730a6bdcfa35f6d19faf40b0e3765bdb1d4b54a5e413aa0ed741e638ebe4749",
+  "input_sha256": "1287de7593a6bfb607843db235ebe9085a1f13a0c6f675add8f3493b988c5945",
   "output": {
     "cache_key": null,
     "compressed": "Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler discarded without losing essential meaning. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog.",
@@ -17,6 +18,6 @@
     "original": "Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
     "original_tokens": 71
   },
-  "recorded_at": "2026-06-18T23:18:31.240602+00:00",
+  "recorded_at": "2026-09-18T00:11:10.871395+00:00",
   "transform": "kompress"
 }

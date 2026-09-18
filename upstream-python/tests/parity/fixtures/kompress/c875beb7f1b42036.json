@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "Configure the service by setting config.timeout = 30 and config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within the configured start_period window of fifteen seconds. Configure the service by setting config.timeout = 30 and config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within the configured start_period window of fifteen seconds. Configure the service by setting config.timeout = 30 and config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within the configured start_period window of fifteen seconds. ",
-  "input_sha256": "8417b9b5a308609ce3c482d6925ca0c01fc9c33dc4f918427faecb528acc8385",
+  "input_sha256": "c875beb7f1b42036d792369eb0c853835e01a94eff13156ee84878c34416b3d9",
   "output": {
     "cache_key": null,
     "compressed": "Configure service by setting config.timeout = 30 and config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within configured start_period window fifteen seconds. Configure service by setting config.timeout = 30 config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within configured start_period window fifteen seconds. Configure service by setting config.timeout = 30 config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within configured start_period window fifteen seconds.",
@@ -17,6 +18,6 @@
     "original": "Configure the service by setting config.timeout = 30 and config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within the configured start_period window of fifteen seconds. Configure the service by setting config.timeout = 30 and config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within the configured start_period window of fifteen seconds. Configure the service by setting config.timeout = 30 and config.retries = 5 then restart /etc/service/daemon to apply; verify via /health endpoint returning 200 within the configured start_period window of fifteen seconds. ",
     "original_tokens": 93
   },
-  "recorded_at": "2026-06-18T23:18:25.692106+00:00",
+  "recorded_at": "2026-09-18T00:11:05.502745+00:00",
   "transform": "kompress"
 }

@@ -3,20 +3,21 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "tokens   with\tirregular\n\nwhitespace   runs   and\ttabs   scattered throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here ",
-  "input_sha256": "9ef7db920a3d84e9c49aab459c9aa98b5eb4e41a58aab6ec4464b3270b07334c",
+  "input_sha256": "41b32df1cfb6d95701b6da5f1246d37f3d50986c8cdaaaa7a0852e54b1696585",
   "output": {
     "cache_key": null,
-    "compressed": "tokens irregular whitespace runs tabs scattered throughout body text repeatedly again again here throughout body text repeatedly again again here throughout body text repeatedly again again here throughout body text repeatedly again again here throughout body text repeatedly again again here",
-    "compressed_tokens": 41,
-    "compression_ratio": 0.6507936507936508,
+    "compressed": "tokens   with\tirregular\n\nwhitespace   runs   and\ttabs   scattered throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here ",
+    "compressed_tokens": 63,
+    "compression_ratio": 1.0,
     "model_used": "chopratejas/kompress-v2-base",
     "original": "tokens   with\tirregular\n\nwhitespace   runs   and\ttabs   scattered throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here throughout the body of the text repeatedly again and again here ",
     "original_tokens": 63
   },
-  "recorded_at": "2026-06-18T23:18:25.473143+00:00",
+  "recorded_at": "2026-09-18T00:11:05.306658+00:00",
   "transform": "kompress"
 }

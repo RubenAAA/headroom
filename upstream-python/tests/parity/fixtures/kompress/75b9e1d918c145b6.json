@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; the request could not be processed because the upstream returned an unexpected payload shape repeatedly. Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; the request could not be processed because the upstream returned an unexpected payload shape repeatedly. Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; the request could not be processed because the upstream returned an unexpected payload shape repeatedly. ",
-  "input_sha256": "2a4d2bed53060038a62e1d9c9fe4151a3b66ebf8a98e228599291ef934d53273",
+  "input_sha256": "75b9e1d918c145b6f89f9820008d1de0533c6012330cfc156cf39017d7153200",
   "output": {
     "cache_key": null,
     "compressed": "Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; request could not be processed because upstream returned an unexpected payload shape repeatedly. Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; request could not be processed because upstream returned an unexpected payload shape repeatedly. Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; request could not be processed because upstream returned an unexpected payload shape repeatedly.",
@@ -17,6 +18,6 @@
     "original": "Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; the request could not be processed because the upstream returned an unexpected payload shape repeatedly. Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; the request could not be processed because the upstream returned an unexpected payload shape repeatedly. Traceback (most recent call last): File main.py line 42 in handler raise ValueError invalid token; the request could not be processed because the upstream returned an unexpected payload shape repeatedly. ",
     "original_tokens": 90
   },
-  "recorded_at": "2026-06-18T23:18:25.316100+00:00",
+  "recorded_at": "2026-09-18T00:11:05.305866+00:00",
   "transform": "kompress"
 }

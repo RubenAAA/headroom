@@ -3,20 +3,21 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
-  "input_sha256": "e63c879a46621bdb85e0063a716c136f8b11c05433ac315c86c9e536894ed004",
+  "input_sha256": "4d4c355a146f78843d1b740474f422fe726d45851a6d3228cb6eaa30785f0439",
   "output": {
     "cache_key": null,
-    "compressed": "Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning. Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning.",
-    "compressed_tokens": 42,
-    "compression_ratio": 0.8076923076923077,
+    "compressed": "Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
+    "compressed_tokens": 52,
+    "compression_ratio": 1.0,
     "model_used": "chopratejas/kompress-v2-base",
     "original": "Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
     "original_tokens": 52
   },
-  "recorded_at": "2026-06-18T23:18:24.364083+00:00",
+  "recorded_at": "2026-09-18T00:11:04.353906+00:00",
   "transform": "kompress"
 }

@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "Installation requires Python three point ten or newer along with the optional machine learning extra which pulls onnxruntime and transformers for the token compression model used by the proxy at request time. Installation requires Python three point ten or newer along with the optional machine learning extra which pulls onnxruntime and transformers for the token compression model used by the proxy at request time. Installation requires Python three point ten or newer along with the optional machine learning extra which pulls onnxruntime and transformers for the token compression model used by the proxy at request time. ",
-  "input_sha256": "1586e806db77fd58225e7c1f03619de5f67cc9412ebc8b7ff92fde93cd64bdd0",
+  "input_sha256": "a22f80a525b0820a632d208e90416b1fb06b77b9cc7ad020bd6c7fef7ffd901c",
   "output": {
     "cache_key": null,
     "compressed": "Installation requires Python three point ten or newer along with optional machine learning extra pulls onnxruntime transformers for token compression model used by proxy at request time. Installation requires Python three point ten or newer along with optional machine learning extra pulls onnxruntime transformers for token compression model used by proxy at request time. Installation requires Python three point ten or newer along with optional machine learning extra pulls onnxruntime transformers for token compression model used by proxy at request time.",
@@ -17,6 +18,6 @@
     "original": "Installation requires Python three point ten or newer along with the optional machine learning extra which pulls onnxruntime and transformers for the token compression model used by the proxy at request time. Installation requires Python three point ten or newer along with the optional machine learning extra which pulls onnxruntime and transformers for the token compression model used by the proxy at request time. Installation requires Python three point ten or newer along with the optional machine learning extra which pulls onnxruntime and transformers for the token compression model used by the proxy at request time. ",
     "original_tokens": 96
   },
-  "recorded_at": "2026-06-18T23:18:31.734574+00:00",
+  "recorded_at": "2026-09-18T00:11:11.491925+00:00",
   "transform": "kompress"
 }

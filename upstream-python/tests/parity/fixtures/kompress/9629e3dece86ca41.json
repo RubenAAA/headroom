@@ -3,20 +3,21 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
-  "input": "only nine words here so it passes through cleanly",
-  "input_sha256": "96fbac155a26ca59e2f81c6fd1ac0e45c11ad41c87225ac73d881c652be18b60",
+  "input": "just a handful of words below the threshold now",
+  "input_sha256": "9629e3dece86ca41229bb569124771fb7c9f61fc5d970e707335f2302e2d9b6f",
   "output": {
     "cache_key": null,
-    "compressed": "only nine words here so it passes through cleanly",
+    "compressed": "just a handful of words below the threshold now",
     "compressed_tokens": 9,
     "compression_ratio": 1.0,
     "model_used": "chopratejas/kompress-v2-base",
-    "original": "only nine words here so it passes through cleanly",
+    "original": "just a handful of words below the threshold now",
     "original_tokens": 9
   },
-  "recorded_at": "2026-06-18T23:18:19.224096+00:00",
+  "recorded_at": "2026-09-18T00:11:01.960577+00:00",
   "transform": "kompress"
 }

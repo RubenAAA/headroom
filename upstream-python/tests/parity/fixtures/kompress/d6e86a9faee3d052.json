@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. ",
-  "input_sha256": "9a4c0b3a49037be270b7493d9844736f27108e55da49a09979446c100d9a8116",
+  "input_sha256": "d6e86a9faee3d0522e800c65b5a3d27d4130b3d4c8e65df908e38ce46a6976c2",
   "output": {
     "cache_key": null,
     "compressed": "committee reviewed quarterly report concluded revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. committee reviewed quarterly report concluded revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. committee reviewed quarterly report concluded revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. committee reviewed quarterly report concluded revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed.",
@@ -17,6 +18,6 @@
     "original": "The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. The committee reviewed the quarterly report and concluded that revenue grew twelve percent while operating costs declined by four percent year over year across all major regional markets surveyed. ",
     "original_tokens": 116
   },
-  "recorded_at": "2026-06-18T23:18:31.596517+00:00",
+  "recorded_at": "2026-09-18T00:11:11.295116+00:00",
   "transform": "kompress"
 }

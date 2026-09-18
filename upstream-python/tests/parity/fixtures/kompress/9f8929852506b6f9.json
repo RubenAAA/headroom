@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "tiny input",
-  "input_sha256": "e3387b34a2e2f5e0bef68eb40e6696537a8573863aeb81c67827a15543b4515a",
+  "input_sha256": "9f8929852506b6f9ff18532b878ab3dcc559dfad7050c56f582a4bdcfa4571c2",
   "output": {
     "cache_key": null,
     "compressed": "tiny input",
@@ -17,6 +18,6 @@
     "original": "tiny input",
     "original_tokens": 2
   },
-  "recorded_at": "2026-06-18T23:18:19.224283+00:00",
+  "recorded_at": "2026-09-18T00:11:01.959912+00:00",
   "transform": "kompress"
 }

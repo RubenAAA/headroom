@@ -3,11 +3,12 @@
     "chunk_words": 350,
     "device": "auto",
     "enable_ccr": false,
+    "min_input_words": 64,
     "model_id": "chopratejas/kompress-v2-base",
     "score_threshold": 0.5
   },
   "input": "Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. ",
-  "input_sha256": "45d9e4200abaee4fbaa71006890e11acc3eacdcfa50856f5cac953e19b6be643",
+  "input_sha256": "df146658f4092d9b5fb3caf63572439a4b3f49a3de859eef70e992e8c190c7e0",
   "output": {
     "cache_key": null,
     "compressed": "Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later. Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later. Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later. Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later.",
@@ -17,6 +18,6 @@
     "original": "Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. ",
     "original_tokens": 84
   },
-  "recorded_at": "2026-06-18T23:18:31.416183+00:00",
+  "recorded_at": "2026-09-18T00:11:11.039203+00:00",
   "transform": "kompress"
 }
