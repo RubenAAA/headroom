@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::start_proxy_with;
+use common::{start_proxy_with, wait_for_upstream_requests};
 use headroom_proxy::config::ProviderRoute;
 use serde_json::{json, Value};
 use url::Url;
@@ -130,7 +130,7 @@ async fn a_sidecar_is_forwarded_shrunk() {
         c.prefix_replay = true;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     post(&client, &proxy.url(), &sidecar_body()).await;
 
@@ -185,7 +185,7 @@ async fn a_normal_request_is_untouched() {
         c.prefix_replay = true;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     let mut body = sidecar_body();
     // Drop only the appended block; everything else stays identical.
@@ -297,7 +297,7 @@ async fn a_sidecar_between_turns_leaves_the_replay_prefix_alone() {
         c.prefix_replay = true;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let big = big_tool_result_message();
     let original_payload = tool_result_content(&big);
 
@@ -375,7 +375,7 @@ async fn the_routed_entry_path_also_shrinks_the_sidecar() {
         }];
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     post(&client, &proxy.url(), &sidecar_body()).await;
 
@@ -403,7 +403,7 @@ async fn the_sidecar_model_is_configurable() {
         c.sidecar_model = Some("claude-3-5-haiku-latest".to_string());
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     post(&client, &proxy.url(), &sidecar_body()).await;
 
@@ -437,7 +437,7 @@ async fn a_sidecar_does_not_queue_behind_the_turn_it_describes() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_raw(sse_body(), "text/event-stream")
-                .set_delay(Duration::from_millis(1500)),
+                .set_delay(Duration::from_millis(600)),
         )
         .mount(&upstream)
         .await;
@@ -453,7 +453,7 @@ async fn a_sidecar_does_not_queue_behind_the_turn_it_describes() {
         c.prefix_replay = true;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let big = big_tool_result_message();
 
     let url = proxy.url();
@@ -464,8 +464,9 @@ async fn a_sidecar_does_not_queue_behind_the_turn_it_describes() {
         async move { post(&client, &url, &body).await }
     });
 
-    // Give the slow turn a head start so it is provably in flight.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Give the slow turn a head start so it is provably in flight
+    // (event-driven: returns as soon as the upstream saw it).
+    wait_for_upstream_requests(&upstream, 1, Duration::from_secs(2)).await;
     let started = std::time::Instant::now();
     post(&client, &url, &sidecar_between(&big)).await;
     let sidecar_took = started.elapsed();
@@ -475,7 +476,7 @@ async fn a_sidecar_does_not_queue_behind_the_turn_it_describes() {
         "the slow turn finished first; the timing below proves nothing"
     );
     assert!(
-        sidecar_took < Duration::from_millis(1000),
+        sidecar_took < Duration::from_millis(500),
         "sidecar took {sidecar_took:?}, so it serialised behind the main turn"
     );
     slow.await.expect("slow turn finished");
@@ -510,7 +511,7 @@ async fn the_sidecar_reply_keeps_the_event_shape_the_client_expects() {
         .await;
     let proxy = start_proxy_with(&upstream.uri(), |c| c.compression = true).await;
 
-    let resp = reqwest::Client::new()
+    let resp = common::shared_client()
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
         .header("x-api-key", "sk-ant-sidecar-test")
@@ -564,7 +565,7 @@ async fn a_huge_tool_result_is_capped_before_it_reaches_the_upstream() {
     // Replace the last answered tool_result with something enormous.
     body["messages"][10]["content"][0]["content"] = json!(huge);
 
-    post(&reqwest::Client::new(), &proxy.url(), &body).await;
+    post(&common::shared_client(), &proxy.url(), &body).await;
 
     let fwd = captured.lock().unwrap()[0].clone();
     assert!(
@@ -609,7 +610,7 @@ async fn a_transient_upstream_status_is_retried() {
     })
     .await;
 
-    post(&reqwest::Client::new(), &proxy.url(), &sidecar_body()).await;
+    post(&common::shared_client(), &proxy.url(), &sidecar_body()).await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
@@ -677,7 +678,7 @@ async fn a_rejected_sidecar_falls_back_to_the_normal_path() {
     .await;
 
     let before = headroom_proxy::observability::sidecar::detected_get("fallback");
-    let resp = reqwest::Client::new()
+    let resp = common::shared_client()
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
         .header("x-api-key", "sk-ant-sidecar-test")
@@ -728,7 +729,7 @@ async fn retries_disabled_means_a_single_sidecar_attempt() {
     })
     .await;
 
-    post(&reqwest::Client::new(), &proxy.url(), &sidecar_body()).await;
+    post(&common::shared_client(), &proxy.url(), &sidecar_body()).await;
 
     assert_eq!(
         SIDECAR_CALLS.load(Ordering::SeqCst),
@@ -820,7 +821,7 @@ async fn a_routed_sidecar_is_served_from_the_responses_upstream() {
         c.model_routes = vec![zen_route(&zen)];
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     let body = post_json(&client, &proxy.url(), &buffered_sidecar_body()).await;
     assert_eq!(body["content"][0]["text"], "Reading zen.rs");
@@ -869,7 +870,7 @@ async fn a_failed_routed_sidecar_falls_back_to_the_direct_path() {
     })
     .await;
 
-    post(&reqwest::Client::new(), &proxy.url(), &sidecar_body()).await;
+    post(&common::shared_client(), &proxy.url(), &sidecar_body()).await;
 
     assert_eq!(
         zen.received_requests().await.unwrap().len(),

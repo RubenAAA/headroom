@@ -6,8 +6,6 @@
 
 mod common;
 
-use axum::http::HeaderMap;
-use bytes::Bytes;
 use common::{start_proxy_with, start_proxy_with_state};
 use headroom_proxy::config::ProviderRoute;
 use headroom_proxy::model_router::ModelRouterConfig;
@@ -39,7 +37,7 @@ async fn passthrough_when_local_model_disabled() {
 
     let proxy = start_proxy_with(mock.uri().as_str(), |_| {}).await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -88,7 +86,7 @@ async fn non_matching_model_falls_through() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -177,7 +175,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .get(format!("{}/v1/models", proxy.url()))
         .header("x-api-key", "test-key")
@@ -224,7 +222,7 @@ async fn codex_translate_route_uses_responses_endpoint() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -318,7 +316,7 @@ async fn redacted_routed_turn_hides_home_upstream_and_restores_for_client() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -387,7 +385,7 @@ async fn a_redacted_routed_turn_falls_back_on_restored_text() {
     )
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -499,7 +497,7 @@ async fn zen_hold_recovers_after_fast_budget_spent() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("http://{}/v1/messages", proxy.addr))
         .header("x-api-key", "test")
@@ -553,7 +551,7 @@ async fn an_explicit_routed_error_restores_placeholders_for_the_client() {
     )
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -608,7 +606,7 @@ async fn codex_translate_route_buffers_non_stream_responses() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -685,7 +683,7 @@ async fn over_cap_retry_after_returns_immediately_and_preserves_header() {
     )
     .await;
 
-    let resp = reqwest::Client::new()
+    let resp = common::shared_client()
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
         .header("x-api-key", "test-key")
@@ -741,7 +739,7 @@ async fn direct_anthropic_over_cap_retry_after_is_not_retried_early() {
     )
     .await;
 
-    let resp = reqwest::Client::new()
+    let resp = common::shared_client()
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
         .header("x-api-key", "test-key")
@@ -795,7 +793,7 @@ async fn exhausted_5xx_retries_land_only_in_failed_work() {
         },
     )
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -893,7 +891,7 @@ async fn cost_aware_rule_routes_a_small_tool_less_turn() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -949,7 +947,7 @@ async fn cost_aware_rule_skips_a_tool_using_turn() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -1010,7 +1008,7 @@ async fn a_beta_query_does_not_disable_cost_aware_routing() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages?beta=true", proxy.url()))
         .header("content-type", "application/json")
@@ -1140,7 +1138,7 @@ async fn a_failing_routed_upstream_falls_back_to_the_clients_model() {
     .await;
     let cooldowns = cooldowns.expect("state captured");
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -1219,7 +1217,7 @@ async fn the_routed_target_is_tried_again_after_the_cooldown_window() {
     let default = anthropic_default_upstream("from default").await;
     let zen = failing_zen_upstream().await;
     let (_uri, route, mut router) = spark_router_config(&zen);
-    router.cooldown = Some(std::time::Duration::from_millis(250));
+    router.cooldown = Some(std::time::Duration::from_millis(150));
 
     let proxy = start_proxy_with(&default.uri(), |cfg| {
         fast_retries(cfg);
@@ -1228,7 +1226,7 @@ async fn the_routed_target_is_tried_again_after_the_cooldown_window() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let send = |prompt: &'static str| {
         let client = client.clone();
         let url = format!("{}/v1/messages", proxy.url());
@@ -1249,7 +1247,7 @@ async fn the_routed_target_is_tried_again_after_the_cooldown_window() {
     let after_first = zen.received_requests().await.unwrap().len();
     assert_eq!(after_first, 3);
 
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     assert_eq!(send("second").await.status(), 200);
     assert_eq!(
@@ -1285,7 +1283,7 @@ async fn an_explicit_pick_of_the_routed_model_still_returns_the_error() {
     .await;
     let cooldowns = cooldowns.expect("state captured");
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -1353,7 +1351,7 @@ async fn a_streamed_turn_falls_back_to_a_complete_anthropic_stream() {
     })
     .await;
 
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let resp = client
         .post(format!("{}/v1/messages?beta=true", proxy.url()))
         .header("content-type", "application/json")
@@ -1442,7 +1440,7 @@ async fn passthrough_route_forwards_verbatim_and_books_usage() {
         "max_tokens": 100,
         "messages": [{"role": "user", "content": "Hello"}]
     });
-    let resp = reqwest::Client::new()
+    let resp = common::shared_client()
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
         .header("x-api-key", "test-key")
@@ -1534,7 +1532,7 @@ async fn cursor_turn_books_cli_reported_counts() {
     )
     .await;
 
-    let resp = reqwest::Client::new()
+    let resp = common::shared_client()
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
         .header("x-api-key", "test-key")
@@ -1573,4 +1571,369 @@ async fn cursor_turn_books_cli_reported_counts() {
     assert_eq!(entries[0].model, "grok-4.6-high");
 
     proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn anthropic_target_route_rewrites_model_and_auth() {
+    std::env::set_var("HEADROOM_TEST_ZEN_KEY", "zen-route-key");
+
+    let mock = MockServer::start().await;
+    let received: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received2 = received.clone();
+    let headers_seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let headers_seen2 = headers_seen.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let hs: Vec<(String, String)> = req
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string()))
+                .collect();
+            received2.lock().unwrap().push(body);
+            headers_seen2.lock().unwrap().extend(hs);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_zen",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "zen hello"}],
+                "model": "union-alpha",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            }))
+        })
+        .mount(&mock)
+        .await;
+
+    let proxy = start_proxy_with(mock.uri().as_str(), |cfg| {
+        cfg.model_routes = vec![ProviderRoute {
+            model_prefix: "claude-union-alpha".to_string(),
+            prefix_match: false,
+            upstream: Some(Url::parse(mock.uri().as_str()).unwrap()),
+            translate: false,
+            cursor_agent: None,
+            target_model: Some("union-alpha".to_string()),
+            auth_env: Some("HEADROOM_TEST_ZEN_KEY".to_string()),
+        }];
+    })
+    .await;
+
+    let resp = common::shared_client()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer caller-secret-key")
+        .header("x-api-key", "caller-secret-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-union-alpha",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "zen hello");
+
+    let sent = received.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "exactly one upstream request");
+    assert_eq!(
+        sent[0]["model"], "union-alpha",
+        "the alias must be rewritten to the target"
+    );
+    assert_eq!(
+        sent[0]["messages"][0]["content"], "Hello",
+        "the Anthropic body forwards otherwise verbatim"
+    );
+    let hs = headers_seen.lock().unwrap().clone();
+    let get = |name: &str| {
+        hs.iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(get("x-api-key").as_deref(), Some("zen-route-key"));
+    assert_eq!(
+        get("anthropic-version").as_deref(),
+        Some("2023-06-01"),
+        "the Anthropic version header must ride along"
+    );
+    assert_eq!(get("authorization"), None, "no bearer token may be sent");
+    let all: String = hs.iter().map(|(k, v)| format!("{k}: {v}\n")).collect();
+    assert!(
+        !all.contains("caller-secret-key"),
+        "the caller's credential must never leak upstream"
+    );
+
+    std::env::remove_var("HEADROOM_TEST_ZEN_KEY");
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn anthropic_target_route_missing_auth_is_reported() {
+    std::env::remove_var("HEADROOM_TEST_ZEN_MISSING");
+
+    let mock = MockServer::start().await;
+    let proxy = start_proxy_with(mock.uri().as_str(), |cfg| {
+        cfg.model_routes = vec![ProviderRoute {
+            model_prefix: "claude-union-alpha".to_string(),
+            prefix_match: false,
+            upstream: Some(Url::parse(mock.uri().as_str()).unwrap()),
+            translate: false,
+            cursor_agent: None,
+            target_model: Some("union-alpha".to_string()),
+            auth_env: Some("HEADROOM_TEST_ZEN_MISSING".to_string()),
+        }];
+    })
+    .await;
+
+    let resp = common::shared_client()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-union-alpha",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 500);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("HEADROOM_TEST_ZEN_MISSING"));
+    assert!(
+        mock.received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "an unusable credential must not reach the upstream"
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn anthropic_target_route_is_discoverable() {
+    let mock = MockServer::start().await;
+    let proxy = start_proxy_with(mock.uri().as_str(), |cfg| {
+        cfg.model_routes = vec![ProviderRoute {
+            model_prefix: "claude-union-alpha".to_string(),
+            prefix_match: false,
+            upstream: Some(Url::parse("https://opencode.ai/zen").unwrap()),
+            translate: false,
+            cursor_agent: None,
+            target_model: Some("union-alpha".to_string()),
+            auth_env: Some("OPENCODE_API_KEY".to_string()),
+        }];
+    })
+    .await;
+
+    let resp = common::shared_client()
+        .get(format!("{}/v1/models", proxy.url()))
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&"claude-union-alpha".to_string()));
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn anthropic_target_route_streams_sse() {
+    use std::convert::Infallible;
+    use std::sync::Mutex;
+
+    use headroom_proxy::request_logger::RequestLogger;
+
+    const FIRST: &str = "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"usage\":{\"input_tokens\":1234,\"output_tokens\":1}}}\n\n";
+    const REST: &str = "event: content_block_delta\n\
+         data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+         event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":56}}\n\n\
+         event: message_stop\n\
+         data: {\"type\":\"message_stop\"}\n\n";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_for_upstream = release.clone();
+    let upstream = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let release = release_for_upstream.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(
+                            move |req: hyper::Request<hyper::body::Incoming>| {
+                                let release = release.clone();
+                                async move {
+                                    use http_body_util::BodyExt as _;
+                                    let _ = req.into_body().collect().await;
+                                    let (tx, rx) = tokio::sync::mpsc::channel::<
+                                        Result<hyper::body::Frame<bytes::Bytes>, std::io::Error>,
+                                    >(8);
+                                    tokio::spawn(async move {
+                                        if tx
+                                            .send(Ok(hyper::body::Frame::data(
+                                                bytes::Bytes::from_static(FIRST.as_bytes()),
+                                            )))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                        release.notified().await;
+                                        for frame in [REST] {
+                                            if tx
+                                                .send(Ok(hyper::body::Frame::data(
+                                                    bytes::Bytes::from_static(frame.as_bytes()),
+                                                )))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    });
+                                    let body = http_body_util::StreamBody::new(
+                                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                                    );
+                                    Ok::<_, Infallible>(
+                                        hyper::Response::builder()
+                                            .status(200)
+                                            .header("content-type", "text/event-stream")
+                                            .body(body)
+                                            .unwrap(),
+                                    )
+                                }
+                            },
+                        ),
+                    )
+                    .await;
+            });
+        }
+    });
+    let upstream_url = format!("http://{addr}");
+
+    let logger_holder: Arc<Mutex<Option<Arc<RequestLogger>>>> = Arc::new(Mutex::new(None));
+    let logger_holder2 = logger_holder.clone();
+    let proxy = start_proxy_with_state(
+        &upstream_url,
+        |cfg| {
+            cfg.model_routes = vec![ProviderRoute {
+                model_prefix: "claude-union-alpha".to_string(),
+                prefix_match: false,
+                upstream: Some(Url::parse(&upstream_url).unwrap()),
+                translate: false,
+                cursor_agent: None,
+                target_model: Some("union-alpha".to_string()),
+                auth_env: Some("none".to_string()),
+            }];
+        },
+        move |state| {
+            *logger_holder2.lock().unwrap() = Some(state.request_logger.clone());
+            state
+        },
+    )
+    .await;
+
+    let resp = common::shared_client()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-union-alpha",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "SSE content type must survive: {content_type}"
+    );
+
+    use futures_util::StreamExt as _;
+    let mut stream = resp.bytes_stream();
+    let mut first_bytes = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !first_bytes
+        .windows(FIRST.len())
+        .any(|w| w == FIRST.as_bytes())
+    {
+        let chunk = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(chunk)) => chunk.expect("stream must not error early"),
+            _ => panic!("stream ended before the first event arrived"),
+        };
+        first_bytes.extend_from_slice(&chunk);
+    }
+
+    release.notify_one();
+    let mut all = first_bytes.clone();
+    while let Some(chunk) = stream.next().await {
+        all.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(
+        all,
+        format!("{FIRST}{REST}").into_bytes(),
+        "bytes must stay verbatim"
+    );
+
+    let logger = logger_holder
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("logger captured");
+    let mut entries = Vec::new();
+    for _ in 0..100 {
+        entries = logger.get_recent(10);
+        if !entries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        entries.len(),
+        1,
+        "one streamed passthrough turn books exactly once: {entries:?}"
+    );
+    assert_eq!(entries[0].input_tokens_optimized, 1234);
+    assert_eq!(entries[0].output_tokens, 56);
+    assert_eq!(entries[0].provider, "anthropic");
+
+    proxy.shutdown().await;
+    upstream.abort();
 }

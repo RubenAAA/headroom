@@ -227,7 +227,7 @@ async fn post_turn(client: &reqwest::Client, proxy_url: &str, body: &Value) {
     let _ = resp.bytes().await.expect("response body");
     // The replay store commits from a spawned task after the body drains;
     // the next turn must see the committed prefix, not race it.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 /// Interleaved same-opener streams must each keep a stable forwarded prefix:
@@ -243,7 +243,7 @@ async fn interleaved_streams_keep_per_lane_forwarded_prefix() {
         c.prefix_replay = true;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     post_turn(&client, &proxy.url(), &stream_x_turn1()).await;
     post_turn(&client, &proxy.url(), &stream_y_turn1()).await;
@@ -361,7 +361,7 @@ async fn a_cd_turn_replays_across_the_lane_switch() {
         c.hold_working_directory = true;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     // Turn 1 in /repo: latches the lane-A pin and stores the prefix. Its
     // message 4 carries a `<system-reminder>` span the cd turn withdraws:
@@ -488,7 +488,7 @@ async fn a_cd_turn_replays_across_the_lane_switch_under_injection() {
         c.ctx_store_dir = Some(store.path().to_path_buf());
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
 
     let mut t1 = history(5);
     t1["system"] = system("/repo");

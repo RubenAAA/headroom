@@ -9,7 +9,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::start_proxy_with;
+use common::{start_proxy_with, wait_for_upstream_requests};
 use headroom_proxy::config::ProviderRoute;
 use serde_json::{json, Value};
 use url::Url;
@@ -67,7 +67,7 @@ async fn third_concurrent_turn_on_one_conversation_sheds_with_429() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_raw(sse_body(), "text/event-stream")
-                .set_delay(Duration::from_millis(1500)),
+                .set_delay(Duration::from_millis(600)),
         )
         .mount(&upstream)
         .await;
@@ -77,7 +77,7 @@ async fn third_concurrent_turn_on_one_conversation_sheds_with_429() {
         c.max_conversation_concurrency = 2;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let url = proxy.url();
 
     // Two turns sharing an opener (hence a conversation key), held open by
@@ -88,14 +88,16 @@ async fn third_concurrent_turn_on_one_conversation_sheds_with_429() {
         let body = turn("same opener");
         async move { drain(post(&client, &url, &body).await).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Event-driven handoff: proceed as soon as the upstream saw turn A
+    // (was: fixed sleep 200ms).
+    wait_for_upstream_requests(&upstream, 1, Duration::from_secs(2)).await;
     let b = tokio::spawn({
         let client = client.clone();
         let url = url.clone();
         let body = turn("same opener");
         async move { drain(post(&client, &url, &body).await).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_upstream_requests(&upstream, 2, Duration::from_secs(2)).await;
 
     // Third turn, same conversation: shed, fast, with the retry contract.
     let started = std::time::Instant::now();
@@ -126,7 +128,7 @@ async fn third_concurrent_turn_on_one_conversation_sheds_with_429() {
         "unexpected shed body: {shed_body}"
     );
     assert!(
-        shed_took < Duration::from_millis(1000),
+        shed_took < Duration::from_millis(500),
         "shed took {shed_took:?}: it must answer without touching upstream"
     );
 
@@ -156,13 +158,13 @@ async fn unset_cap_forwards_overlapping_turns_untouched() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_raw(sse_body(), "text/event-stream")
-                .set_delay(Duration::from_millis(800)),
+                .set_delay(Duration::from_millis(300)),
         )
         .mount(&upstream)
         .await;
 
     let proxy = start_proxy_with(&upstream.uri(), |_| {}).await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let url = proxy.url();
 
     let a = tokio::spawn({
@@ -171,14 +173,14 @@ async fn unset_cap_forwards_overlapping_turns_untouched() {
         let body = turn("same opener");
         async move { drain(post(&client, &url, &body).await).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_upstream_requests(&upstream, 1, Duration::from_secs(2)).await;
     let b = tokio::spawn({
         let client = client.clone();
         let url = url.clone();
         let body = turn("same opener");
         async move { drain(post(&client, &url, &body).await).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_upstream_requests(&upstream, 2, Duration::from_secs(2)).await;
     let c = drain(post(&client, &url, &turn("same opener")).await).await;
     assert_eq!(c, reqwest::StatusCode::OK);
 
@@ -208,7 +210,7 @@ async fn routed_turn_sheds_with_429_past_the_cap() {
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(response_body)
-                .set_delay(Duration::from_millis(1500)),
+                .set_delay(Duration::from_millis(600)),
         )
         .mount(&mock)
         .await;
@@ -227,7 +229,7 @@ async fn routed_turn_sheds_with_429_past_the_cap() {
         }];
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = common::shared_client();
     let url = proxy.url();
     let routed_turn = |opener: &str| {
         json!({
@@ -244,14 +246,14 @@ async fn routed_turn_sheds_with_429_past_the_cap() {
         let body = routed_turn("same opener");
         async move { drain(post(&client, &url, &body).await).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_upstream_requests(&mock, 1, Duration::from_secs(2)).await;
     let b = tokio::spawn({
         let client = client.clone();
         let url = url.clone();
         let body = routed_turn("same opener");
         async move { drain(post(&client, &url, &body).await).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_upstream_requests(&mock, 2, Duration::from_secs(2)).await;
 
     let shed = post(&client, &url, &routed_turn("same opener")).await;
     assert_eq!(shed.status(), 429);

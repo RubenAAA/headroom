@@ -2,7 +2,7 @@
 //! pointed at an arbitrary upstream URL.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use headroom_proxy::vertex::TokenSource;
@@ -83,8 +83,22 @@ where
             })
             .await;
     });
-    // Tiny delay to let the listener start accepting on slow CI.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Wait for the listener to accept instead of a fixed sleep: typically
+    // ready in ~1ms, with a 2s ceiling for slow CI (was: sleep 20ms per
+    // proxy boot × ~300 tests).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(e) => panic!("proxy listener on {addr} never became ready: {e}"),
+        }
+    }
     ProxyHandle {
         addr,
         shutdown: Some(tx),
@@ -95,10 +109,11 @@ where
 /// Convenience: replace the default `vertex_token_source` with a
 /// `StaticTokenSource` returning the supplied bearer string. Used by
 /// the PR-D4 Vertex integration tests so they never hit real GCP.
-#[allow(dead_code)]
+///
 /// PR-D4: chain-style helper to install a `StaticTokenSource` on an
 /// `AppState`. Returns the modified state so it composes with
 /// `start_proxy_with_state`'s `FnOnce(AppState) -> AppState`.
+#[allow(dead_code)]
 pub fn install_static_token_source(mut state: AppState, bearer: &str) -> AppState {
     state.vertex_token_source = Arc::new(headroom_proxy::vertex::StaticTokenSource::new(
         bearer.to_string(),
@@ -110,4 +125,65 @@ pub fn install_static_token_source(mut state: AppState, bearer: &str) -> AppStat
 #[allow(dead_code)]
 pub fn _config_ref() -> Arc<Config> {
     Arc::new(Config::for_test(Url::parse("http://127.0.0.1:1").unwrap()))
+}
+
+// ─── Shared fixtures: one client, event-driven waits ────────────────────
+//
+// Every integration binary used to build a fresh `reqwest::Client` per test
+// (TLS + connection-pool init each time) and pace overlap handoffs with
+// fixed `sleep(200ms)`s. The helpers below replace both: a process-wide
+// client and polls that return as soon as the observed condition holds.
+
+/// Process-wide HTTP client. `Client::clone` is cheap (Arc-interned pool);
+/// `Client::new` is not — share this instead of constructing per test.
+#[allow(dead_code)]
+pub fn shared_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
+
+/// Poll `cond` every `interval` until it returns true or `timeout` elapses.
+/// Returns true when the condition held in time. Event-driven tests should
+/// prefer this over a fixed `sleep`: fast when the system is fast, still
+/// robust on slow CI.
+#[allow(dead_code)]
+pub async fn wait_until<F>(timeout: Duration, interval: Duration, mut cond: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(interval).await;
+    }
+    cond()
+}
+
+/// Wait until the mock upstream has seen at least `n` requests (2s ceiling).
+/// Use after spawning a request task instead of `sleep(200ms)`: it proves
+/// the request is actually in flight rather than assuming 200ms sufficed.
+#[allow(dead_code)]
+pub async fn wait_for_upstream_requests(
+    upstream: &wiremock::MockServer,
+    n: usize,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let seen = upstream
+            .received_requests()
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0);
+        if seen >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "upstream saw {seen}/{n} requests before the {timeout:?} deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }

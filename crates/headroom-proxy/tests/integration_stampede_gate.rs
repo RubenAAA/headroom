@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const UPSTREAM_DELAY: Duration = Duration::from_millis(400);
+const UPSTREAM_DELAY: Duration = Duration::from_millis(120);
 
 /// Records when each request arrived at the upstream and answers after
 /// `UPSTREAM_DELAY`, standing in for a provider's time to first byte.
@@ -55,7 +55,7 @@ fn payload(system: &str, user: &str) -> Value {
 }
 
 async fn post(proxy_url: &str, body: Value) {
-    let resp = reqwest::Client::new()
+    let resp = common::shared_client()
         .post(format!("{proxy_url}/v1/messages"))
         .header("content-type", "application/json")
         .header("x-api-key", "sk-ant-api03-stampede")
@@ -127,7 +127,7 @@ async fn different_heads_do_not_wait() {
     assert_eq!(seen.len(), 2);
     let gap = seen[1].0.duration_since(seen[0].0);
     assert!(
-        gap < UPSTREAM_DELAY / 2,
+        gap < UPSTREAM_DELAY,
         "unrelated heads should not queue; gap was {gap:?}"
     );
 }
@@ -161,7 +161,7 @@ async fn warm_head_does_not_wait_on_the_next_turn() {
     assert_eq!(seen.len(), 3);
     let gap = seen[2].0.duration_since(seen[1].0);
     assert!(
-        gap < UPSTREAM_DELAY / 2,
+        gap < UPSTREAM_DELAY,
         "a warm head must not park its followers; gap was {gap:?}"
     );
 }

@@ -108,6 +108,45 @@ async fn count_tokens_cursor_alias_answered_locally() {
 }
 
 #[tokio::test]
+async fn count_tokens_anthropic_target_alias_answered_locally() {
+    let upstream = MockServer::start().await;
+    let proxy = start_proxy_with(&upstream.uri(), |cfg| {
+        cfg.model_routes.push(ProviderRoute {
+            model_prefix: "claude-union-alpha".into(),
+            prefix_match: false,
+            upstream: Some(upstream.uri().parse().unwrap()),
+            translate: false,
+            cursor_agent: None,
+            target_model: Some("union-alpha".into()),
+            auth_env: Some("none".into()),
+        });
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages/count_tokens", proxy.url()))
+        .json(&count_body("claude-union-alpha"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let n = body["input_tokens"].as_u64().expect("input_tokens number");
+    assert!(n > 0, "a real body counts for something: {body}");
+
+    assert!(
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "anthropic-target count must not reach upstream"
+    );
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn count_tokens_unrouted_model_forwards_byte_identical() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
