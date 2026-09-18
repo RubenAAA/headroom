@@ -7810,6 +7810,10 @@ fn spawn_sse_parser_tee(
 /// continuation against `continuation_base`, splicing the result back in — so
 /// the streamed turn behaves like the buffered one. When `ccr_stream_eligible`
 /// is false the upstream body is handed on untouched.
+//
+// Ten request-context args for one call site; a params struct would churn
+// both without buying clarity, so the lint stays off here by decision.
+#[allow(clippy::too_many_arguments)]
 async fn maybe_rewrite_anthropic_stream(
     upstream_body: std::pin::Pin<
         Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
@@ -11750,6 +11754,89 @@ fn looks_like_sse(body: &[u8]) -> bool {
     first.starts_with("event:") || first.starts_with("data:")
 }
 
+/// Whether a continuation body arrived as SSE (vs buffered JSON): the
+/// Content-Type header wins when present, otherwise sniff the body. Shared
+/// by the fold and the cut-stream check so they agree on what "should have
+/// folded" for a given body.
+fn continuation_body_is_sse(body: &[u8], content_type: Option<&str>) -> bool {
+    match content_type.map(str::trim).filter(|ct| !ct.is_empty()) {
+        Some(ct) => ct.contains("text/event-stream"),
+        None => looks_like_sse(body),
+    }
+}
+
+/// Truncation signature for buffered-JSON continuations (the `openai` chat
+/// shape folds JSON only): a body that is not valid JSON and does not end
+/// like one was cut mid-write. A complete-but-unparseable body (ends with
+/// `}` or `]`) is deterministic garbage — resending it would fail the same
+/// way. An empty body is never a valid turn.
+fn continuation_json_looks_truncated(body: &[u8]) -> bool {
+    match body.iter().rposition(|b| !b.is_ascii_whitespace()) {
+        None => true,
+        Some(i) => !matches!(body[i], b'}' | b']'),
+    }
+}
+
+/// Whether a continuation body that failed to fold is worth resending
+/// identical, same round: terminal-less SSE streams and truncated JSON are
+/// transport cuts in substance. Explicit verdicts, deterministic garbage,
+/// and unknown provider shapes are not. Budget is enforced by the caller —
+/// CCR and memory continuations keep separate per-turn counters.
+fn continuation_cut_retryable(body: &[u8], content_type: &str, provider: &str) -> bool {
+    match provider {
+        "openai_responses" | "anthropic" => {
+            continuation_stream_terminal(body, provider).is_none()
+                && continuation_body_is_sse(body, Some(content_type))
+        }
+        // Chat completions fold JSON only: truncated JSON (not ending like
+        // a complete value) reads as cut mid-write.
+        "openai" => continuation_json_looks_truncated(body),
+        _ => false,
+    }
+}
+
+/// Terminal marker of a streamed continuation body, if any. A 200 whose SSE
+/// body carries no terminal event ended mid-generation (cut stream): on
+/// 2026-09-17 a gpt-5.6-luna reasoning continuation landed as ~200 KB of
+/// reasoning deltas followed by EOF, folded to zero blocks, and the turn
+/// went quiet on a fallback splice. That shape is transport failure in
+/// substance and worth resending. An explicit failed/incomplete verdict is
+/// deterministic — the identical re-send would fail the same way — so it
+/// must NOT retry. Returns None for non-SSE-fold providers and for bodies
+/// with no terminal marker.
+pub(crate) fn continuation_stream_terminal(body: &[u8], provider: &str) -> Option<&'static str> {
+    if !matches!(provider, "openai_responses" | "anthropic") {
+        return None;
+    }
+    // N.B. the caller already established SSE; this only classifies it.
+    // `event:` names and `"type":` values share these strings, so one
+    // substring scan covers both framings (including the bare/Codex forms).
+    let text = std::string::String::from_utf8_lossy(body);
+    if provider == "openai_responses" {
+        for marker in [
+            "response.failed",
+            "response.incomplete",
+            "response.completed",
+        ] {
+            if text.contains(marker) {
+                return Some(match marker {
+                    "response.failed" => "failed",
+                    "response.incomplete" => "incomplete",
+                    _ => "completed",
+                });
+            }
+        }
+        return None;
+    }
+    // Anthropic turns end on message_delta; without it the fold has no
+    // stop_reason and yields nothing usable.
+    if text.contains("message_delta") {
+        Some("message_delta")
+    } else {
+        None
+    }
+}
+
 fn continuation_turn_from_body(
     body: &bytes::Bytes,
     content_type: Option<&str>,
@@ -11766,11 +11853,7 @@ fn continuation_turn_from_body(
     // Content-Type at all and a 150-180 KB non-JSON body, and refusing the
     // fold here replaced the whole turn with the retrieval-failure note.
     // Sniff the body when the header is absent; a wrong header still wins.
-    let is_sse = match content_type.map(str::trim).filter(|ct| !ct.is_empty()) {
-        Some(ct) => ct.contains("text/event-stream"),
-        None => looks_like_sse(body),
-    };
-    if !is_sse {
+    if !continuation_body_is_sse(body, content_type) {
         return None;
     }
     if provider == "anthropic" {
@@ -11831,13 +11914,9 @@ const CCR_INDEX_RECOVERY_NOTE: &str = "[Recovered from the context index. \
      may differ from what you first read. Re-read the source if you need the \
      exact bytes.]";
 
-/// Whether `hash` could be a CCR key: the 24-character lowercase hex the
-/// offload path emits. Models sometimes pass a summary or a truncated fragment
-/// instead, and those are worth telling apart from a genuine store miss.
-fn is_plausible_ccr_hash(hash: &str) -> bool {
-    hash.len() == 24 && hash.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
+// Shared CCR hash check lives in `headroom_core::ccr::response_handler`
+// so the proxy, batch, and streaming paths agree on what counts as
+// malformed (see `is_plausible_ccr_hash` there). No local copy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_ccr_response(
     body_bytes: &bytes::Bytes,
@@ -11921,6 +12000,11 @@ pub(crate) async fn handle_ccr_response(
 
     let max_rounds = config.ccr_max_retrieval_rounds;
     let mut rounds = 0;
+    // Cut-stream retries spent resending an identical continuation whose SSE
+    // body ended with no terminal event (see continuation_stream_terminal).
+    // Per-turn, not per-round: a sick route must fail fast to fallback (a)
+    // rather than multiply re-sends across rounds.
+    let mut cut_attempts: u32 = 0;
     // Last successfully fetched retrieval content, kept across rounds for
     // fallback (a): if a later round's upstream continuation dies, the turn
     // still resolves with what the store already returned.
@@ -12009,6 +12093,13 @@ pub(crate) async fn handle_ccr_response(
                             Some(r) => crate::redact::redact_string(r, &content),
                             None => content,
                         };
+                        // Link the answer to the query that asked for it, so a
+                        // later turn re-reading history references this message
+                        // instead of paying another continuation round.
+                        let content = format!(
+                            "{}\n\n{content}",
+                            headroom_core::ccr::response_handler::retrieved_query_stamp(&query)
+                        );
                         results.push(CcrToolResult {
                             tool_call_id: call.tool_call_id.clone(),
                             content,
@@ -12064,6 +12155,13 @@ pub(crate) async fn handle_ccr_response(
                         Some(r) => crate::redact::redact_string(r, &content),
                         None => content,
                     };
+                    // Stamp after redact: proxy prose, must survive verbatim.
+                    let content = format!(
+                        "{}\n\n{content}",
+                        headroom_core::ccr::response_handler::retrieved_content_stamp(
+                            &call.hash_key
+                        )
+                    );
                     results.push(CcrToolResult {
                         tool_call_id: call.tool_call_id.clone(),
                         content,
@@ -12095,93 +12193,177 @@ pub(crate) async fn handle_ccr_response(
                     // project, so this recovers reach, not isolation.
                     let project_from =
                         resolve_ctx_project(Some(outgoing_headers), &current_request);
-                    let recovered = match stores {
-                        Some(stores) if is_plausible_ccr_hash(&call.hash_key) => {
-                            // Opening dozens of sqlite files is blocking work.
-                            // Left inline it stalls the tokio worker driving
-                            // this turn and every other request on that thread,
-                            // so it goes to the blocking pool the way the
-                            // savings ledger already does. A panicked or
-                            // cancelled join degrades to a plain miss.
+                    // Same-project fast path first: the cross-project sweep
+                    // below deliberately skips the requesting project's own
+                    // store, but an expired block indexed under the current
+                    // project is still on disk here. One indexed lookup
+                    // before opening every project file on disk.
+                    let local_found: Option<(String, String)> = match stores {
+                        Some(stores)
+                            if headroom_core::ccr::response_handler::is_plausible_ccr_hash(
+                                &call.hash_key,
+                            ) =>
+                        {
                             let stores = std::sync::Arc::clone(stores);
                             let hash = call.hash_key.clone();
                             let project = project_from.clone();
                             tokio::task::spawn_blocking(move || {
-                                stores.find_content_any_project(&hash, &project)
+                                stores.content_local(&project, &hash).map(|content| {
+                                    (
+                                        headroom_core::ctx::hash_project_dir_canonical(&project),
+                                        content,
+                                    )
+                                })
                             })
                             .await
-                            .map_err(|e| {
+                            .unwrap_or(None)
+                        }
+                        _ => None,
+                    };
+                    if let Some((project_to, content)) = local_found {
+                        tracing::info!(
+                            event = "ccr_local_tier_hit",
+                            request_id = %request_id,
+                            hash = %call.hash_key,
+                            project_from = %project_from,
+                            project_to = %project_to,
+                            "ccr: missing from the CCR store, recovered from the requesting project's own content index"
+                        );
+                        crate::observability::ccr_retrieval::observe_local_tier_hit();
+                        let content = format!("{CCR_INDEX_RECOVERY_NOTE}\n\n{content}");
+                        let content = match redact.as_ref() {
+                            Some(r) => crate::redact::redact_string(r, &content),
+                            None => content,
+                        };
+                        let content = format!(
+                            "{}\n\n{content}",
+                            headroom_core::ccr::response_handler::retrieved_content_stamp(
+                                &call.hash_key
+                            )
+                        );
+                        results.push(CcrToolResult {
+                            tool_call_id: call.tool_call_id.clone(),
+                            content,
+                            success: true,
+                            items_retrieved: 1,
+                        });
+                    } else {
+                        let recovered = match stores {
+                            Some(stores)
+                                if headroom_core::ccr::response_handler::is_plausible_ccr_hash(
+                                    &call.hash_key,
+                                ) =>
+                            {
+                                // Opening dozens of sqlite files is blocking work.
+                                // Left inline it stalls the tokio worker driving
+                                // this turn and every other request on that thread,
+                                // so it goes to the blocking pool the way the
+                                // savings ledger already does. A panicked or
+                                // cancelled join degrades to a plain miss.
+                                let stores = std::sync::Arc::clone(stores);
+                                let hash = call.hash_key.clone();
+                                let project = project_from.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    stores.find_content_any_project(&hash, &project)
+                                })
+                                .await
+                                .map_err(|e| {
+                                    tracing::warn!(
+                                        event = "ctx_cold_tier_join_failed",
+                                        hash = %call.hash_key,
+                                        error = %e,
+                                    );
+                                })
+                                .ok()
+                            }
+                            // A hash the model invented cannot be on disk, and
+                            // scanning every project for it costs 85 file opens.
+                            // Both misses seen in production logs were of this
+                            // shape: one was five characters against the 24-hex
+                            // format, the other an English sentence.
+                            Some(_) => {
                                 tracing::warn!(
-                                    event = "ctx_cold_tier_join_failed",
+                                    event = "ccr_malformed_hash",
+                                    request_id = %request_id,
                                     hash = %call.hash_key,
-                                    error = %e,
+                                    project_from = %project_from,
+                                    "ccr: retrieval asked for a malformed hash; not a store miss"
                                 );
-                            })
-                            .ok()
-                        }
-                        // A hash the model invented cannot be on disk, and
-                        // scanning every project for it costs 85 file opens.
-                        // Both misses seen in production logs were of this
-                        // shape: one was five characters against the 24-hex
-                        // format, the other an English sentence.
-                        Some(_) => {
-                            tracing::warn!(
-                                request_id = %request_id,
-                                hash = %call.hash_key,
-                                "ccr: retrieval asked for a malformed hash; not a store miss"
-                            );
-                            None
-                        }
-                        None => None,
-                    };
-                    let (recovered, cold_ms, cold_scanned, cold_gave_up) = match recovered {
-                        Some(l) => (l.found, l.elapsed.as_millis() as u64, l.scanned, l.gave_up),
-                        None => (None, 0, 0, false),
-                    };
-                    match recovered {
-                        Some((project_to, content)) => {
-                            tracing::info!(
-                                event = "ccr_cold_tier_hit",
-                                request_id = %request_id,
-                                hash = %call.hash_key,
-                                project_from = %project_from,
-                                project_to = %project_to,
-                                cold_tier_ms = cold_ms,
-                                projects_scanned = cold_scanned,
-                                "ccr: missing from the CCR store, recovered from the content index"
-                            );
-                            crate::observability::ccr_retrieval::observe_cross_project_hit();
-                            let content = format!("{CCR_INDEX_RECOVERY_NOTE}\n\n{content}");
-                            let content = match redact.as_ref() {
-                                Some(r) => crate::redact::redact_string(r, &content),
-                                None => content,
-                            };
-                            results.push(CcrToolResult {
-                                tool_call_id: call.tool_call_id.clone(),
-                                content,
-                                success: true,
-                                items_retrieved: 1,
-                            });
-                        }
-                        None => {
-                            results.push(CcrToolResult {
-                                tool_call_id: call.tool_call_id.clone(),
-                                content: format!(
-                                    "Error: CCR content not found for hash '{}'. The compressed data may have been evicted.",
-                                    call.hash_key
-                                ),
-                                success: false,
-                                items_retrieved: 0,
-                            });
-                            tracing::warn!(
-                                request_id = %request_id,
-                                hash = %call.hash_key,
-                                cross_project_checked = stores.is_some(),
-                                cold_tier_ms = cold_ms,
-                                projects_scanned = cold_scanned,
-                                cold_tier_gave_up = cold_gave_up,
-                                "ccr: content not found in store"
-                            );
+                                None
+                            }
+                            None => None,
+                        };
+                        let (recovered, cold_ms, cold_scanned, cold_gave_up) = match recovered {
+                            Some(l) => {
+                                (l.found, l.elapsed.as_millis() as u64, l.scanned, l.gave_up)
+                            }
+                            None => (None, 0, 0, false),
+                        };
+                        match recovered {
+                            Some((project_to, content)) => {
+                                tracing::info!(
+                                    event = "ccr_cold_tier_hit",
+                                    request_id = %request_id,
+                                    hash = %call.hash_key,
+                                    project_from = %project_from,
+                                    project_to = %project_to,
+                                    cold_tier_ms = cold_ms,
+                                    projects_scanned = cold_scanned,
+                                    "ccr: missing from the CCR store, recovered from the content index"
+                                );
+                                crate::observability::ccr_retrieval::observe_cross_project_hit();
+                                let content = format!("{CCR_INDEX_RECOVERY_NOTE}\n\n{content}");
+                                let content = match redact.as_ref() {
+                                    Some(r) => crate::redact::redact_string(r, &content),
+                                    None => content,
+                                };
+                                let content = format!(
+                                    "{}\n\n{content}",
+                                    headroom_core::ccr::response_handler::retrieved_content_stamp(
+                                        &call.hash_key
+                                    )
+                                );
+                                results.push(CcrToolResult {
+                                    tool_call_id: call.tool_call_id.clone(),
+                                    content,
+                                    success: true,
+                                    items_retrieved: 1,
+                                });
+                            }
+                            None => {
+                                // Continue-friendly miss notes (same as the batch
+                                // path): the old `Error: ... may have been evicted`
+                                // wording stalled agentic sessions — the model
+                                // treated it as terminal and retried the hash
+                                // instead of re-reading the source or using a
+                                // keyword query. See `missing_ccr_content_note` /
+                                // `malformed_ccr_hash_note` regression test
+                                // `miss_notes_stay_continue_friendly`.
+                                use headroom_core::ccr::response_handler as ccr_rh;
+                                let content = if ccr_rh::is_plausible_ccr_hash(&call.hash_key) {
+                                    ccr_rh::missing_ccr_content_note(&call.hash_key)
+                                } else {
+                                    ccr_rh::malformed_ccr_hash_note(&call.hash_key)
+                                };
+                                results.push(CcrToolResult {
+                                    tool_call_id: call.tool_call_id.clone(),
+                                    content,
+                                    success: false,
+                                    items_retrieved: 0,
+                                });
+                                tracing::warn!(
+                                    event = "ccr_content_not_found",
+                                    request_id = %request_id,
+                                    hash = %call.hash_key,
+                                    hash_plausible = ccr_rh::is_plausible_ccr_hash(&call.hash_key),
+                                    project_from = %project_from,
+                                    cross_project_checked = stores.is_some(),
+                                    cold_tier_ms = cold_ms,
+                                    projects_scanned = cold_scanned,
+                                    cold_tier_gave_up = cold_gave_up,
+                                    "ccr: content not found in store"
+                                );
+                            }
                         }
                     }
                 }
@@ -12327,6 +12509,19 @@ pub(crate) async fn handle_ccr_response(
         let mut attempt = 0;
         let resp = loop {
             let body = continuation_body.clone();
+            // Zen free-tier hygiene: the forward path's header map carries
+            // the original request's `x-opencode-request` UUID; the real
+            // CLI mints one per POST, so refresh before every continuation
+            // send (no-op off zen routes). See `refresh_zen_request_id`.
+            let mut continuation_headers = outgoing_headers.clone();
+            if crate::routed::quirks::refresh_zen_request_id(&mut continuation_headers) {
+                tracing::debug!(
+                    request_id = %request_id,
+                    attempt = attempt,
+                    round = rounds + 1,
+                    "ccr: refreshed x-opencode-request for continuation send"
+                );
+            }
             // Bounded headers wait: `.send()` resolves at response headers,
             // so a stall here is transport, never a slow model (body streams
             // after, under the total timeout). Without this the 600s client
@@ -12340,7 +12535,7 @@ pub(crate) async fn handle_ccr_response(
                     client
                         .post(upstream_url.clone())
                         .headers(crate::headers::headers_for_json_body(
-                            outgoing_headers,
+                            &continuation_headers,
                             &body,
                         ))
                         .body(body)
@@ -12463,24 +12658,74 @@ pub(crate) async fn handle_ccr_response(
             Ok(bytes) => {
                 // The response about to be dropped was still billed.
                 round_usage.add_response(&current_response);
-                current_response =
-                    match continuation_turn_from_body(&bytes, Some(&content_type), provider) {
-                        Some(v) => v,
-                        None => {
+                current_response = match continuation_turn_from_body(
+                    &bytes,
+                    Some(&content_type),
+                    provider,
+                ) {
+                    Some(v) => v,
+                    None => {
+                        let terminal = continuation_stream_terminal(&bytes, provider);
+                        // Retryable cut, per provider fold (see
+                        // continuation_cut_retryable): a cut stream
+                        // resends the identical deterministic re-send;
+                        // explicit verdicts and deterministic garbage
+                        // fall through to fallback (a) below.
+                        if continuation_cut_retryable(&bytes, &content_type, provider)
+                            && cut_attempts < CCR_CONTINUATION_RETRIES
+                        {
+                            // Same round, unchanged request: the
+                            // tool_result is deterministic, only the
+                            // transport failed. `rounds` is not consumed
+                            // and `last_fetched` is recomputed below.
+                            cut_attempts += 1;
+                            crate::observability::ccr_retrieval::observe_continuation_retry();
                             tracing::warn!(
                                 request_id = %request_id,
                                 body_bytes = bytes.len(),
-                                content_type = %content_type,
-                                body_head = %String::from_utf8_lossy(
-                                    &bytes[..bytes.len().min(200)]
-                                ),
-                                "ccr: failed to parse continuation response"
+                                cut_attempt = cut_attempts,
+                                backoff_ms = 250u64 << (cut_attempts - 1),
+                                "ccr: continuation stream ended with no terminal event; retrying same round"
                             );
-                            break;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                250 << (cut_attempts - 1),
+                            ))
+                            .await;
+                            continue;
                         }
-                    };
+                        tracing::warn!(
+                            request_id = %request_id,
+                            body_bytes = bytes.len(),
+                            content_type = %content_type,
+                            terminal = terminal.unwrap_or("absent"),
+                            body_head = %String::from_utf8_lossy(
+                                &bytes[..bytes.len().min(200)]
+                            ),
+                            "ccr: failed to parse continuation response"
+                        );
+                        break;
+                    }
+                };
             }
             Err(e) => {
+                // Body stall / transport cut after 200 headers: the same
+                // class as a terminal-less stream above, and the send loop
+                // only retries the headers wait. Share the per-turn cut
+                // budget; exhaustion falls through to fallback (a) as before.
+                if cut_attempts < CCR_CONTINUATION_RETRIES {
+                    cut_attempts += 1;
+                    crate::observability::ccr_retrieval::observe_continuation_retry();
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %e,
+                        cut_attempt = cut_attempts,
+                        backoff_ms = 250u64 << (cut_attempts - 1),
+                        "ccr: failed to read continuation response body; retrying same round"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250 << (cut_attempts - 1)))
+                        .await;
+                    continue;
+                }
                 tracing::warn!(
                     request_id = %request_id,
                     error = %e,
@@ -12821,6 +13066,10 @@ pub(crate) async fn handle_memory_response(
     let mut rounds = 0;
     // Kept across rounds: the client sees one turn, not one per round.
     let mut trace: Vec<String> = Vec::new();
+    // Cut-stream resends, shared by the body-read and fold failure arms
+    // below. Per-turn budget like the CCR path; exhaustion breaks with the
+    // calls standing (loud) exactly as before.
+    let mut mem_cut_attempts: u32 = 0;
 
     while rounds < config.ccr_max_retrieval_rounds {
         let mut results: Vec<serde_json::Value> = {
@@ -12912,10 +13161,14 @@ pub(crate) async fn handle_memory_response(
         // so keep what upstream objected to instead of dropping it.
         let mut attempt: u32 = 0;
         let resp = loop {
+            // Same Zen hygiene as the CCR continuation above: fresh
+            // `x-opencode-request` per send, no-op off zen routes.
+            let mut continuation_headers = outgoing_headers.clone();
+            crate::routed::quirks::refresh_zen_request_id(&mut continuation_headers);
             match client
                 .post(upstream_url.clone())
                 .headers(crate::headers::headers_for_json_body(
-                    outgoing_headers,
+                    &continuation_headers,
                     &continuation_body,
                 ))
                 .body(continuation_body.clone())
@@ -12974,11 +13227,48 @@ pub(crate) async fn handle_memory_response(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let Ok(bytes) = read_continuation_body(resp).await else {
-            break;
+        let bytes = match read_continuation_body(resp).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Body stall after 200 headers: transport-cut class, same as
+                // the CCR path. Bounded; exhaustion breaks as before.
+                if mem_cut_attempts < MEMORY_CONTINUATION_RETRIES {
+                    mem_cut_attempts += 1;
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %e,
+                        cut_attempt = mem_cut_attempts,
+                        "memory: failed to read continuation response body; retrying same round"
+                    );
+                    tokio::time::sleep(memory_continuation_backoff(mem_cut_attempts)).await;
+                    continue;
+                }
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    "memory: failed to read continuation response body"
+                );
+                break;
+            }
         };
         round_usage.add_response(&current_response);
         let Some(next) = continuation_turn_from_body(&bytes, Some(&content_type), provider) else {
+            // Same cut-stream retry as the CCR path (terminal-less SSE or
+            // truncated JSON). Unlike CCR there is no fallback splice here:
+            // exhaustion breaks with the calls standing, loudly, as before.
+            if continuation_cut_retryable(&bytes, &content_type, provider)
+                && mem_cut_attempts < MEMORY_CONTINUATION_RETRIES
+            {
+                mem_cut_attempts += 1;
+                tracing::warn!(
+                    request_id = %request_id,
+                    body_bytes = bytes.len(),
+                    cut_attempt = mem_cut_attempts,
+                    "memory: continuation body folded to nothing usable; retrying same round"
+                );
+                tokio::time::sleep(memory_continuation_backoff(mem_cut_attempts)).await;
+                continue;
+            }
             break;
         };
         current_response = next;
@@ -13002,11 +13292,20 @@ pub(crate) async fn handle_memory_response(
             );
             // The log says it to the operator; the trace says it to the model,
             // which otherwise writes its answer as if the lookup had happened.
+            // The bracketed marker makes the drop hook-matchable (see
+            // retry-dropped-turn.sh): a turn ending on this note with no
+            // answer of its own stalls the same way a spliced retrieval
+            // does, and the client cannot re-issue a proxy-owned tool.
+            let mut stranded = false;
             for name in pending_memory_call_names(&current_response, memory.provider) {
                 trace.push(format!(
                     "{name} → not run: retrieval round cap ({}) reached",
                     config.ccr_max_retrieval_rounds
                 ));
+                stranded = true;
+            }
+            if stranded {
+                trace.push(crate::memory::deferred::DEFERRED_MEMORY_DROPPED_MARKER.to_string());
             }
         }
     }
@@ -13834,6 +14133,232 @@ mod tests {
         assert_eq!(round_usage.rounds, 1);
     }
 
+    /// Cut-stream retry: a 200 continuation whose SSE body ends with no
+    /// terminal event (reasoning deltas then EOF — the 2026-09-17 luna
+    /// shape, ~200 KB received, zero output blocks) is resent same-round
+    /// instead of falling back to a splice. The retry resolving proves the
+    /// turn answers instead of going quiet holding unanswered content.
+    #[tokio::test]
+    async fn handle_ccr_response_openai_responses_retries_cut_continuation() {
+        use headroom_core::ccr::backends::InMemoryCcrStore;
+        use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
+        use headroom_core::ccr::CcrStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let store = InMemoryCcrStore::new();
+        let hash = "abc123def456abc123def456";
+        store.put(hash, "the original large content");
+
+        let server = MockServer::start().await;
+        let cut_sse = "event: response.created\n\
+                       data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cut\",\"status\":\"in_progress\"}}\n\
+                       \n\
+                       event: response.reasoning_summary_text.delta\n\
+                       data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"delta\":\"thinking about caches\"}\n\
+                       \n";
+        let good_sse = "event: response.output_item.done\n\
+                       data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}\n\
+                       \n\
+                       event: response.completed\n\
+                       data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+                       \n";
+        let cut_sse = cut_sse.to_string();
+        let good_sse = good_sse.to_string();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(move |_: &Request| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_raw(cut_sse.clone(), "text/event-stream")
+                } else {
+                    ResponseTemplate::new(200).set_body_raw(good_sse.clone(), "text/event-stream")
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let forwarded_request = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-x",
+                "stream": true,
+                "input": [{"type": "message", "role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        );
+        let upstream_reply = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "output": [
+                    {"type": "function_call", "call_id": "call_1", "name": CCR_TOOL_NAME,
+                     "arguments": format!("{{\"hash\":\"{hash}\"}}")}
+                ],
+                "usage": {"input_tokens": 4_000, "output_tokens": 60}
+            }))
+            .unwrap(),
+        );
+
+        let config = Config::for_test(server.uri().parse().unwrap());
+        let upstream_url: url::Url = format!("{}/v1/responses", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let headers = http::HeaderMap::new();
+
+        let (body, round_usage) = handle_ccr_response(
+            &upstream_reply,
+            &forwarded_request,
+            &upstream_url,
+            &client,
+            &store as &dyn headroom_core::ccr::CcrStore,
+            None,
+            &config,
+            "req-test-cut",
+            &headers,
+            "openai_responses",
+            None,
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["output"][0]["content"][0]["text"], "done",
+            "the retry must resolve the turn instead of splicing: {parsed}"
+        );
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("retrieved_context"),
+            "no in-place splice when the retry answers: {parsed}"
+        );
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "cut body then retried re-send: {parsed}");
+        // Both upstream calls were billed: the cut body and its retry.
+        assert_eq!(round_usage.rounds, 2);
+    }
+
+    /// Same-project recovery on the model path: a block indexed under the
+    /// requesting project but expired from the CCR store must resolve via
+    /// the own-project fast path (the cross-project sweep skips it by
+    /// design), through a normal continuation — no splice, no stall.
+    #[tokio::test]
+    async fn handle_ccr_response_recovers_same_project_block() {
+        use headroom_core::ccr::backends::InMemoryCcrStore;
+        use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Hot tier deliberately empty: the block lives only in alpha's
+        // content index (post-TTL shape).
+        let ccr_store = InMemoryCcrStore::new();
+        let hash = "abc123def456abc123def456";
+        let dir = tempfile::tempdir().unwrap();
+        let stores = std::sync::Arc::new(crate::ctx::projects::ProjectStores::new(
+            dir.path().to_path_buf(),
+        ));
+        stores
+            .content("/home/dev/alpha")
+            .expect("content store opens")
+            .index_content(
+                "the tool call that produced it",
+                "alpha's original block content",
+                &headroom_core::ctx::IndexOpts {
+                    content_hash: Some(hash.to_string()),
+                    plain_text_lines: Some(50),
+                    ..Default::default()
+                },
+            )
+            .expect("index write");
+
+        let server = MockServer::start().await;
+        let final_body = serde_json::json!({
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "done"}]}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(final_body))
+            .mount(&server)
+            .await;
+
+        let forwarded_request = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-x",
+                "input": [{"type": "message", "role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        );
+        let upstream_reply = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "output": [
+                    {"type": "function_call", "call_id": "call_1", "name": CCR_TOOL_NAME,
+                     "arguments": format!("{{\"hash\":\"{hash}\"}}")}
+                ],
+                "usage": {"input_tokens": 100, "output_tokens": 10}
+            }))
+            .unwrap(),
+        );
+
+        let config = Config::for_test(server.uri().parse().unwrap());
+        let upstream_url: url::Url = format!("{}/v1/responses", server.uri()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-headroom-cwd",
+            http::HeaderValue::from_static("/home/dev/alpha"),
+        );
+
+        let local_before = crate::observability::ccr_retrieval::local_tier_hits_get();
+        let cross_before = crate::observability::ccr_retrieval::cross_project_hits_get();
+        let (body, _) = handle_ccr_response(
+            &upstream_reply,
+            &forwarded_request,
+            &upstream_url,
+            &client,
+            &ccr_store as &dyn headroom_core::ccr::CcrStore,
+            Some(&stores),
+            &config,
+            "req-test-local",
+            &headers,
+            "openai_responses",
+            None,
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["output"][0]["content"][0]["text"], "done",
+            "same-project recovery must continue, not splice: {parsed}"
+        );
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("retrieved_context"),
+            "recovered content goes to the continuation, not the client: {parsed}"
+        );
+
+        // And the continuation carried the recovered block upstream.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            serde_json::to_string(&sent)
+                .unwrap()
+                .contains("alpha's original block content"),
+            "continuation must carry the recovered block: {sent}"
+        );
+        assert_eq!(
+            crate::observability::ccr_retrieval::local_tier_hits_get() - local_before,
+            1,
+            "same-project recovery books the local tier, not the cross-project counter"
+        );
+        assert_eq!(
+            crate::observability::ccr_retrieval::cross_project_hits_get() - cross_before,
+            0,
+            "no sweep needed when the requesting project's own store answers"
+        );
+    }
+
     /// Unit coverage for the continuation body reader: JSON passes through
     /// untouched, SSE folds only for the Responses shape, garbage stays loud.
     #[test]
@@ -13909,6 +14434,79 @@ mod tests {
             continuation_turn_from_body(&bytes::Bytes::from("<html>"), None, "openai_responses")
                 .is_none(),
             "non-SSE body with no Content-Type has no fold to try"
+        );
+    }
+
+    /// Terminal classification for the cut-continuation retry: explicit
+    /// verdicts must not retry, a missing terminal on an SSE body must.
+    #[test]
+    fn continuation_stream_terminal_classifies_cut_vs_verdict() {
+        // The 2026-09-17 incident: ~200 KB of reasoning deltas, EOF, no
+        // terminal event. Folds to nothing and must read as a cut stream.
+        let cut = bytes::Bytes::from(
+            "event: response.created\n\
+             data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n\
+             event: response.reasoning_summary_text.delta\n\
+             data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"delta\":\"thinking about caches\"}}\n\n",
+        );
+        assert_eq!(continuation_stream_terminal(&cut, "openai_responses"), None);
+        assert!(
+            continuation_turn_from_body(&cut, Some("text/event-stream"), "openai_responses")
+                .is_none(),
+            "reasoning-only stream with no terminal folds to no blocks"
+        );
+
+        for (terminal, event) in [
+            ("completed", "response.completed"),
+            ("failed", "response.failed"),
+            ("incomplete", "response.incomplete"),
+        ] {
+            let body = bytes::Bytes::from(format!(
+                "event: {event}\ndata: {{\"type\":\"{event}\",\"response\":{{\"id\":\"r\"}}}}\n\n"
+            ));
+            assert_eq!(
+                continuation_stream_terminal(&body, "openai_responses"),
+                Some(terminal),
+                "explicit verdicts must be named, never retried as cuts"
+            );
+        }
+
+        let anthropic_cut = bytes::Bytes::from(
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n\
+             event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        );
+        assert_eq!(
+            continuation_stream_terminal(&anthropic_cut, "anthropic"),
+            None,
+            "Anthropic stream without message_delta is a cut"
+        );
+        let anthropic_done = bytes::Bytes::from(
+            "event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+        assert_eq!(
+            continuation_stream_terminal(&anthropic_done, "anthropic"),
+            Some("message_delta")
+        );
+
+        assert_eq!(continuation_stream_terminal(&cut, "openai"), None);
+        assert_eq!(continuation_stream_terminal(&cut, "google"), None);
+    }
+
+    /// Truncation signature for the chat-JSON cut retry: only bodies that do
+    /// not end like complete JSON read as cut mid-write.
+    #[test]
+    fn continuation_json_truncation_signature() {
+        assert!(!continuation_json_looks_truncated(br#"{"a":1}"#));
+        assert!(!continuation_json_looks_truncated(b"{\"a\":1}  \n"));
+        assert!(!continuation_json_looks_truncated(br#"[1,2]"#));
+        assert!(continuation_json_looks_truncated(br#"{"a":1,"#));
+        assert!(continuation_json_looks_truncated(b""));
+        assert!(
+            continuation_json_looks_truncated(b"   "),
+            "whitespace-only is never a valid turn"
         );
     }
 

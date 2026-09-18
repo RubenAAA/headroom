@@ -82,6 +82,51 @@ pub fn missing_ccr_content_note(hash: &str) -> String {
     )
 }
 
+// ─── Retrieval-answer stamp ──────────────────────────────────────────
+//
+// Repeat-hash telemetry (2026-09-17: 220 retrieval calls for 63 hashes, the
+// top hash fetched 12× in 3 minutes inside one conversation, one full-prefix
+// continuation round per repeat) shows the model re-requesting the same hash
+// nearly every turn even though the full content is already in history:
+// nothing connects the marker to the delivered answer, so each turn re-follows
+// the marker. Stamping every successful answer with the link costs ~40 tokens
+// and is skipped only for answers the model cannot act on (misses).
+
+/// Header for a successfully retrieved hash answer. Prepended (never redacted:
+/// it is proxy prose, and it must survive verbatim so later turns can match it
+/// against the marker they are about to re-follow).
+pub fn retrieved_content_stamp(hash: &str) -> String {
+    let shown = display_hash(hash);
+    format!(
+        "[headroom_retrieve: the complete stored content for hash `{shown}` follows. \
+         It is now part of this conversation — reference it directly instead of \
+         calling headroom_retrieve for `{shown}` again.]"
+    )
+}
+
+/// Header for a successfully retrieved keyword-query answer. The query is
+/// echoed truncated: it is model-written and unbounded, and the stamp only
+/// needs enough to recognise a repeat.
+pub fn retrieved_query_stamp(query: &str) -> String {
+    const MAX: usize = 120;
+    let trimmed = query.trim();
+    let shown: String = trimmed.chars().take(MAX).collect();
+    let shown = if trimmed.chars().count() > MAX {
+        format!("{shown}…")
+    } else {
+        shown
+    };
+    let shown: String = shown
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect();
+    format!(
+        "[headroom_retrieve: the indexed matches for query '{shown}' follow. \
+         They are now part of this conversation — reference them directly instead of \
+         calling headroom_retrieve for the same query again.]"
+    )
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────
 
 /// A detected CCR tool call.
@@ -1356,6 +1401,27 @@ mod tests {
         assert!(missing.contains("can continue"));
         assert!(missing.contains("Do not retry this hash"));
         assert!(!missing.starts_with("Error:"));
+    }
+
+    #[test]
+    fn retrieval_stamps_link_answer_to_request() {
+        // Regression for the repeat-hash loop (2026-09-17): the model
+        // re-requested the same hash nearly every turn because nothing
+        // connected the marker to the delivered answer.
+        let stamp = retrieved_content_stamp("ea06bec713db19c6a40258ad");
+        assert!(stamp.contains("ea06bec713db19c6a40258ad"));
+        assert!(stamp.contains("instead of"));
+        assert!(stamp.contains("again"));
+        assert!(stamp.chars().count() < 400, "stamp must stay cheap");
+
+        let qstamp = retrieved_query_stamp("auth middleware files");
+        assert!(qstamp.contains("auth middleware files"));
+        assert!(qstamp.contains("again"));
+
+        // Unbounded model-written queries are echoed truncated.
+        let long = retrieved_query_stamp(&"q".repeat(500));
+        assert!(long.contains("…"));
+        assert!(long.chars().count() < 400);
     }
 
     #[test]

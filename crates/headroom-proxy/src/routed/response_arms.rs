@@ -222,8 +222,45 @@ pub(crate) async fn fold_buffered(
     };
 
     let (parsed_body, output_tokens) = if is_responses {
-        let (turn, tokens) = responses_stream_to_turn(&body_text);
-        (turn, tokens as i64)
+        // A gateway honoring stream:false answers buffered JSON, which the
+        // SSE fold below would flatten to an empty turn. Prefer a body that
+        // already is a turn.
+        match serde_json::from_str::<Value>(&body_text) {
+            Ok(v) if v.get("output").and_then(|o| o.as_array()).is_some() => (v, 0),
+            _ => {
+                let (turn, tokens) = responses_stream_to_turn(&body_text);
+                let empty = turn
+                    .get("output")
+                    .and_then(|o| o.as_array())
+                    // `is_none_or` needs Rust 1.82; MSRV is 1.80.
+                    .map_or(true, |o| o.is_empty());
+                if empty
+                    && crate::proxy::continuation_stream_terminal(
+                        body_text.as_bytes(),
+                        "openai_responses",
+                    )
+                    .is_none()
+                {
+                    // Cut stream (reasoning deltas then EOF, no terminal):
+                    // serving it would be a quiet empty turn with end_turn.
+                    // Fail loudly like the chat arm's parse failure below so
+                    // the client retries the turn instead of stopping on one.
+                    tracing::warn!(
+                        event = "routed_responses_empty_fold_no_terminal",
+                        body_len = body_text.len(),
+                        body_head = %body_text.chars().take(200).collect::<String>(),
+                        "routed Responses body folded to zero output blocks with no terminal event"
+                    );
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from(
+                            "upstream response ended before producing content",
+                        ))
+                        .expect("static response");
+                }
+                (turn, tokens as i64)
+            }
+        }
     } else {
         match serde_json::from_str(&body_text) {
             Ok(v) => (v, 0),
@@ -243,11 +280,18 @@ pub(crate) async fn fold_buffered(
 
     let resolved = resolve_and_book(parsed_body, ccr, outcome.as_ref(), output_tokens).await;
 
-    let anthropic_response = if is_responses {
+    let mut anthropic_response = if is_responses {
         crate::sse::ccr_stream::responses_output_as_anthropic_turn(&resolved, original)
     } else {
         openai_to_anthropic_response(&resolved, original)
     };
+    // Undo the Zen outbound rename (translation.rs): the model called the
+    // lowercased names, the client must get its own back. The map derives
+    // from the same tool list both directions, so this is a no-op unless
+    // the outbound pass actually renamed something — unknown names pass
+    // through either way.
+    crate::routed::tool_alias::ToolAlias::derive(original.get("tools").and_then(|t| t.as_array()))
+        .reverse_turn(&mut anthropic_response);
 
     let mut body_bytes = match serde_json::to_vec(&anthropic_response) {
         Ok(b) => b,
@@ -756,5 +800,57 @@ mod tests {
         assert_eq!(entries.len(), 1, "one turn books once: {entries:?}");
         assert_eq!(entries[0].input_tokens_optimized, 1100);
         assert_eq!(entries[0].output_tokens, 70);
+    }
+
+    /// A cut Responses stream (reasoning deltas, EOF, no terminal — the
+    /// 2026-09-17 shape) must fail loudly, not serve a quiet empty turn.
+    #[tokio::test]
+    async fn fold_buffered_cut_responses_stream_is_bad_gateway() {
+        let sse = "event: response.created\n\
+                   data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"status\":\"in_progress\"}}\n\
+                   \n\
+                   event: response.reasoning_summary_text.delta\n\
+                   data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"delta\":\"thinking\"}\n\
+                   \n";
+        let http_resp = axum::http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(sse.to_string()))
+            .unwrap();
+        let out = fold_buffered(
+            reqwest::Response::from(http_resp),
+            &json!({"model": "m", "input": []}),
+            StatusCode::OK,
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A buffered JSON Responses body is already a turn: it must pass
+    /// through, not flatten to empty in the SSE fold.
+    #[tokio::test]
+    async fn fold_buffered_json_responses_body_passes_through() {
+        let body = json!({
+            "id": "resp_1",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        });
+        let http_resp = axum::http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(body.to_string()))
+            .unwrap();
+        let out = fold_buffered(
+            reqwest::Response::from(http_resp),
+            &json!({"model": "m", "input": []}),
+            StatusCode::OK,
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out.status(), StatusCode::OK);
     }
 }

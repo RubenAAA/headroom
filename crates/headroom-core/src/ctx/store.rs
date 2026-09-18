@@ -155,6 +155,11 @@ pub struct SearchHit {
     pub content: String,
     /// The owning source's `label`.
     pub source: String,
+    /// Block key for a `ctx get` round-trip: the full source this excerpt
+    /// came from, retrievable after the CCR original expires. `None` when
+    /// the source row carries no hash (indexed without one, or a legacy
+    /// row) — those hits work exactly as before, just without a key.
+    pub content_hash: Option<String>,
     /// RRF rank (negative score; more-negative = better), matching TS.
     pub rank: f64,
     pub content_type: String,
@@ -464,7 +469,25 @@ impl CtxStore {
               file_path TEXT,
               content_hash TEXT
             );
+            ",
+        )?;
 
+        // `content_hash` postdates the first shipped schema: a DB created
+        // before it has a `sources` table with no such column, and every
+        // hash-lookup query (`content_by_hash`, the search-hit key below,
+        // even the index creation after this) would fail on it. Backfill
+        // the column the same way the index below migrates: the next
+        // write-open brings the DB forward. Read-only opens
+        // (`open_read_only`, the cold-tier sweep) never migrate.
+        let has_hash: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('sources') WHERE name='content_hash'")?
+            .exists([])?;
+        if !has_hash {
+            conn.execute_batch("ALTER TABLE sources ADD COLUMN content_hash TEXT")?;
+        }
+
+        conn.execute_batch(
+            "
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
               title,
               content,
@@ -879,7 +902,7 @@ fn fts_search(
         "SELECT {t}.title, {t}.content, {t}.content_type, {t}.timestamp, sources.label,
                 bm25({t}, 5.0, 1.0) AS rank,
                 highlight({t}, 1, char(2), char(3)) AS highlighted,
-                {t}.session_id
+                {t}.session_id, sources.content_hash
          FROM {t}
          JOIN sources ON sources.id = {t}.source_id
          WHERE {t} MATCH ?1",
@@ -912,6 +935,7 @@ fn fts_search(
             rank: row.get(5)?,
             highlighted: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
             session_id: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            content_hash: row.get::<_, Option<String>>(8)?,
             match_layer: "rrf",
         })
     })?;

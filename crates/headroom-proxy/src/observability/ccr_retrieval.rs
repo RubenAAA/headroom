@@ -25,6 +25,7 @@ use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 use super::metric_names::{
     METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL, METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL_HELP,
     METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL, METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP,
+    METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL, METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL_HELP,
     METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL, METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP,
 };
 
@@ -100,6 +101,34 @@ pub fn observe_cross_project_hit() {
 /// Cross-project recoveries so far. Used by tests.
 pub fn cross_project_hits_get() -> u64 {
     cross_project_hits(super::prometheus::registry()).get()
+}
+
+fn local_tier_hits(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounter::new(
+            METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL,
+            METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL_HELP,
+        )
+        .expect("proxy_ccr_local_tier_hits_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("proxy_ccr_local_tier_hits_total registers exactly once");
+        c
+    })
+}
+
+/// Record one block the CCR store missed that the requesting project's own
+/// content index still held. Same expiry shape as a cross-project hit, but
+/// kept separate: folding it in would drown the cross-project reach signal
+/// this module's sibling counter exists to measure.
+pub fn observe_local_tier_hit() {
+    local_tier_hits(super::prometheus::registry()).inc();
+}
+
+/// Same-project recoveries so far. Used by tests.
+pub fn local_tier_hits_get() -> u64 {
+    local_tier_hits(super::prometheus::registry()).get()
 }
 
 pub fn observe_outcome(outcome: &str, count: u64) {

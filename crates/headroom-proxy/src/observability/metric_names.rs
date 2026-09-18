@@ -406,6 +406,17 @@ pub const METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP: &str =
      is the fallback working; both rising means the CCR TTL is too short for \
      how far back the model reaches.";
 
+// ---------- proxy_ccr_local_tier_hits_total ----------
+
+pub const METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL: &str = "proxy_ccr_local_tier_hits_total";
+pub const METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL_HELP: &str =
+    "Retrievals the CCR store missed that the requesting project's own \
+     content index still held (same-project fast path ahead of the \
+     cross-project sweep, which skips it by design). Same expiry shape as \
+     the cross-project hits, so true information loss reads as \
+     `ctx_retrieval_misses_total` minus both hit counters — never from the \
+     miss counter alone.";
+
 // ---------- proxy_ccr_continuation_retries_total ----------
 
 pub const METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL: &str =

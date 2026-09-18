@@ -264,6 +264,7 @@ mod tests {
             title: "cat big.log".to_string(),
             content: "ERROR: disk full while writing".to_string(),
             source: "cat big.log".to_string(),
+            content_hash: None,
             rank: -1.0,
             content_type: "prose".to_string(),
             highlighted: String::new(),

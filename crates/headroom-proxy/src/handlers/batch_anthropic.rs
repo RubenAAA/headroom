@@ -704,12 +704,19 @@ async fn run_anthropic_continuation(
         let mut results_vec = Vec::with_capacity(ccr_calls.len());
         for call in &ccr_calls {
             let tool_result = match ccr_store.and_then(|s| s.get(&call.hash_key)) {
-                Some(content) => CcrToolResult {
-                    tool_call_id: call.tool_call_id.clone(),
-                    content,
-                    success: true,
-                    items_retrieved: 1,
-                },
+                Some(content) => {
+                    use headroom_core::ccr::response_handler as ccr_rh;
+                    let content = format!(
+                        "{}\n\n{content}",
+                        ccr_rh::retrieved_content_stamp(&call.hash_key)
+                    );
+                    CcrToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        content,
+                        success: true,
+                        items_retrieved: 1,
+                    }
+                }
                 None => {
                     use headroom_core::ccr::response_handler as ccr_rh;
                     let content = if ccr_rh::is_plausible_ccr_hash(&call.hash_key) {

@@ -342,9 +342,9 @@ async fn ccr_upstream_unresolvable(
                                 let frames: Vec<Vec<u8>> = vec![
                                     b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n".to_vec(),
                                     b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"headroom_retrieve\",\"input\":{}}}\n\n".to_vec(),
-                                    format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"hash\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaa\\\"}}\"}}}}}}\n\n").into_bytes(),
+                                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"hash\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaa\\\"}\"}}\n\n".to_vec(),
                                     b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_vec(),
-                                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}}\n\n".to_vec(),
+                                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n".to_vec(),
                                     b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec(),
                                 ];
                                 let (tx, rx) = tokio::sync::mpsc::channel::<
@@ -424,8 +424,12 @@ async fn a_failed_retrieval_is_answered_in_place_without_the_hook_marker() {
         !sse.contains("[headroom: a proxy tool call was dropped"),
         "an answered-in-place miss must not carry the drop marker:\n{sse}"
     );
+    // The miss note names `headroom_retrieve` in prose (the query-keywords
+    // recovery path), so match the JSON tool shape, not the bare name: the
+    // client must never be handed a `tool_use` block for a tool it cannot
+    // run, but prose may mention it.
     assert!(
-        !sse.contains("headroom_retrieve"),
+        !sse.contains("\"headroom_retrieve\""),
         "the client must never be handed a tool it cannot run:\n{sse}"
     );
 }

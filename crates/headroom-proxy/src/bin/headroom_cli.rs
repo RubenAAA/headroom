@@ -400,7 +400,7 @@ fn cmd_get(base: &str, hash: &str) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client().get(&url).send()?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        eprintln!("not found: {hash}");
+        eprintln!("not found: {hash} (expired from the retrieval store and absent from the content index; try `headroom ctx search` for keywords instead)");
         std::process::exit(1);
     }
     if !resp.status().is_success() {

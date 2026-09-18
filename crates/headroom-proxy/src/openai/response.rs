@@ -12,129 +12,101 @@ use serde_json::{json, Value};
 /// Tool calls ride this stream as `output[]` items and never as text deltas, so
 /// a reader that accumulates only `output_text` sees none of them — which is
 /// how every call on this path, `headroom_retrieve` included, used to vanish.
-/// Returns the turn and the output-token count the outcome is booked with.
+///
+/// The fold runs through the shared [`crate::sse::openai_responses::ResponseState`]
+/// machine, so it understands both the `response.`-prefixed event names
+/// (`response.output_item.done`, …) and the bare form (`output_item.done`, …)
+/// that Codex and compatible gateways emit, plus the incremental
+/// `function_call_arguments.delta/done` frames a call can stream as instead of
+/// arriving whole in `output_item.done`. Returns the turn and the output-token
+/// count the outcome is booked with.
 pub(crate) fn responses_stream_to_turn(responses_text: &str) -> (Value, u64) {
-    let mut current_event: Option<String> = None;
-    let mut current_data: Vec<String> = Vec::new();
-    let mut assistant_text = String::new();
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    // The whole usage block, kept for the request outcome — the two counters
-    // above drop the cache details the funnel wants.
-    let mut usage_seen: Option<Value> = None;
-    let mut output_items: Vec<Value> = Vec::new();
-    let mut response_id: Option<String> = None;
+    use crate::sse::{openai_responses::ResponseState, SseFramer};
 
-    let mut flush_frame = |event_name: Option<&str>, data: &str| {
-        if data.trim().is_empty() {
-            return;
-        }
-        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-            return;
+    let mut framer = SseFramer::new();
+    framer.push(responses_text.as_bytes());
+    let mut state = ResponseState::new();
+    // Text that arrived without an `item_id` (older fixtures and some
+    // gateways send bare `{"delta": …}` frames). The state machine needs
+    // `item_id` to attribute text, so these are carried globally exactly as
+    // the previous fold did.
+    let mut global_text = String::new();
+
+    while let Some(ev) = framer.next_event() {
+        let Ok(ev) = ev else {
+            continue;
         };
-        match event_name {
-            Some("response.output_text.delta") | Some("output_text.delta") => {
-                if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
-                    assistant_text.push_str(delta);
-                }
-            }
-            Some("response.output_text.done") | Some("output_text.done") => {
-                if let Some(text) = chunk
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| chunk.get("delta").and_then(|v| v.as_str()))
-                {
-                    if assistant_text.is_empty() {
-                        assistant_text.push_str(text);
+        if ev.is_done_sentinel() {
+            continue;
+        }
+        // Item_id-less text frames predate per-item attribution (bare
+        // `{"delta": …}` fixtures); the state machine needs `item_id`, so
+        // these are carried globally exactly as the previous fold did.
+        // Peeked before apply because `output_text.done` without an item id
+        // returns Ok from the machine (it ignores done payloads) yet must
+        // still land in the global text.
+        if matches!(
+            ev.event_name.as_deref(),
+            Some("response.output_text.delta") | Some("output_text.delta")
+        ) {
+            if let Ok(chunk) = serde_json::from_slice::<Value>(&ev.data) {
+                if chunk.get("item_id").and_then(|v| v.as_str()).is_none() {
+                    if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
+                        global_text.push_str(delta);
                     }
                 }
             }
-            Some("response.output_item.done") => {
-                if let Some(item) = chunk.get("item").filter(|v| v.is_object()) {
-                    output_items.push(item.clone());
+        } else if matches!(
+            ev.event_name.as_deref(),
+            Some("response.output_text.done") | Some("output_text.done")
+        ) {
+            if let Ok(chunk) = serde_json::from_slice::<Value>(&ev.data) {
+                if chunk.get("item_id").and_then(|v| v.as_str()).is_none() {
+                    if let Some(text) = chunk
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| chunk.get("delta").and_then(|v| v.as_str()))
+                    {
+                        if global_text.is_empty() {
+                            global_text.push_str(text);
+                        }
+                    }
                 }
             }
-            Some("response.completed") => {
-                let response = chunk.get("response");
-                // `response.completed` carries the finished `output[]`, so it
-                // wins over the items gathered frame by frame: a call whose
-                // `output_item.done` never arrived is still in here.
-                if let Some(items) = response
-                    .and_then(|v| v.get("output"))
-                    .and_then(Value::as_array)
-                {
-                    output_items = items.clone();
-                }
-                if let Some(id) = response.and_then(|v| v.get("id")).and_then(Value::as_str) {
-                    response_id = Some(id.to_string());
-                }
-                if let Some(usage) = response.and_then(|v| v.get("usage")) {
-                    if let Some(tokens) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                        input_tokens = tokens;
-                    }
-                    if let Some(tokens) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                        output_tokens = tokens;
-                    }
-                    usage_seen = Some(usage.clone());
-                }
-            }
-            _ => {}
         }
-    };
-
-    for line in responses_text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            let data = current_data.join("\n");
-            flush_frame(current_event.as_deref(), &data);
-            current_event = None;
-            current_data.clear();
-            continue;
-        }
-
-        if let Some(event) = line.strip_prefix("event:") {
-            current_event = Some(event.trim().to_string());
-            continue;
-        }
-
-        if let Some(data) = line.strip_prefix("data:") {
-            current_data.push(data.trim_start().to_string());
-            continue;
-        }
+        let _ = state.apply(ev);
     }
-    let data = current_data.join("\n");
-    flush_frame(current_event.as_deref(), &data);
+
+    let (mut turn, output_tokens) = state.to_responses_turn();
 
     // Deltas and items are two views of one turn. A stream that sent its text
-    // only as deltas still needs it carried; one that already sent a `message`
-    // item must not have it carried twice. Keying this off "no items at all"
-    // instead would drop the text of any turn that also made a tool call. Text
-    // leads the calls it introduces, so it goes first.
-    let has_message = output_items
-        .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("message"));
-    if !has_message && !assistant_text.is_empty() {
-        output_items.insert(
-            0,
-            json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": assistant_text}],
-            }),
-        );
-    }
-    let mut responses_turn = json!({
-        "output": output_items,
-        "usage": usage_seen.clone().unwrap_or_else(|| json!({
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        })),
-    });
-    if let Some(id) = response_id {
-        responses_turn["id"] = json!(id);
+    // only as item_id-less deltas still needs it carried; one that already
+    // sent a `message` item must not have it carried twice. Text leads the
+    // calls it introduces, so it goes first.
+    if !global_text.is_empty() {
+        let has_message = turn
+            .get("output")
+            .and_then(|o| o.as_array())
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+            });
+        if !has_message {
+            if let Some(items) = turn.get_mut("output").and_then(|o| o.as_array_mut()) {
+                items.insert(
+                    0,
+                    json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": global_text}],
+                    }),
+                );
+            }
+        }
     }
 
-    (responses_turn, output_tokens)
+    (turn, output_tokens)
 }
 
 pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> Value {
@@ -349,6 +321,167 @@ mod tests {
 
         let items = turn["output"].as_array().expect("output array");
         assert_eq!(items.len(), 1, "text carried twice: {turn}");
+    }
+
+    /// Codex and compatible gateways emit the bare form (`output_item.done`)
+    /// where OpenAI documents the `response.`-prefixed one. The old fold
+    /// matched only the prefixed form, so a Codex continuation folded to an
+    /// empty turn, the CCR loop fell back to splicing `<retrieved_context>`
+    /// as final text, and the subagent stopped instead of continuing.
+    #[test]
+    fn responses_stream_keeps_bare_output_item_done() {
+        let stream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex\"}}\n",
+            "\n",
+            "event: output_item.done\n",
+            "data: {\"type\":\"output_item.done\",\"item\":{\"id\":\"fc_1\",",
+            "\"type\":\"function_call\",\"call_id\":\"call_1\",",
+            "\"name\":\"headroom_retrieve\",",
+            "\"arguments\":\"{\\\"hash\\\":\\\"ea06bec713db19c6a40258ad\\\"}\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex\",",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+            "\n",
+        );
+
+        let (turn, output_tokens) = responses_stream_to_turn(stream);
+
+        assert_eq!(output_tokens, 5);
+        let items = turn["output"].as_array().expect("output array");
+        assert_eq!(items.len(), 1, "bare Codex item was dropped: {turn}");
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["name"], "headroom_retrieve");
+    }
+
+    /// A call can stream as incremental `function_call_arguments` frames with
+    /// no whole arguments in `output_item.done`. The old fold never read
+    /// those frames, so the reassembled call lost its hash and CCR could not
+    /// match the retrieval.
+    #[test]
+    fn responses_stream_reassembles_incremental_function_call_arguments() {
+        let stream = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+            "\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",",
+            "\"call_id\":\"call_1\",\"name\":\"headroom_retrieve\"}}\n",
+            "\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",",
+            "\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"hash\\\":\"}}\n",
+            "\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",",
+            "\"item_id\":\"fc_1\",\"output_index\":0,",
+            "\"delta\":\"\\\"ea06bec713db19c6a40258ad\\\"}\"}\n",
+            "\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",",
+            "\"item_id\":\"fc_1\",\"output_index\":0,",
+            "\"arguments\":\"{\\\"hash\\\":\\\"ea06bec713db19c6a40258ad\\\"}\"}\n",
+            "\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",",
+            "\"call_id\":\"call_1\",\"name\":\"headroom_retrieve\",",
+            "\"arguments\":\"{\\\"hash\\\":\\\"ea06bec713db19c6a40258ad\\\"}\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+            "\n",
+        );
+
+        let (turn, _) = responses_stream_to_turn(stream);
+
+        let items = turn["output"].as_array().expect("output array");
+        assert_eq!(items.len(), 1, "incremental call was dropped: {turn}");
+        assert_eq!(items[0]["type"], "function_call");
+        let args = items[0]
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            args.contains("ea06bec713db19c6a40258ad"),
+            "arguments not reassembled: {turn}"
+        );
+    }
+
+    /// Bare incremental form end to end: undotted added/deltas/done plus a
+    /// completed envelope with no `output[]` (Codex omits it when items
+    /// already streamed). The accumulated items must survive.
+    #[test]
+    fn responses_stream_keeps_bare_incremental_items_without_completed_output() {
+        let stream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex\"}}\n",
+            "\n",
+            "event: output_item.added\n",
+            "data: {\"type\":\"output_item.added\",\"item\":{\"id\":\"fc_1\",",
+            "\"type\":\"function_call\",\"call_id\":\"call_1\",",
+            "\"name\":\"headroom_retrieve\"}}\n",
+            "\n",
+            "event: function_call_arguments.delta\n",
+            "data: {\"type\":\"function_call_arguments.delta\",",
+            "\"item_id\":\"fc_1\",\"delta\":\"{\\\"hash\\\":\"}}\n",
+            "\n",
+            "event: function_call_arguments.done\n",
+            "data: {\"type\":\"function_call_arguments.done\",",
+            "\"item_id\":\"fc_1\",",
+            "\"arguments\":\"{\\\"hash\\\":\\\"ea06bec713db19c6a40258ad\\\"}\"}\n",
+            "\n",
+            "event: output_item.done\n",
+            "data: {\"type\":\"output_item.done\",\"item\":{\"id\":\"fc_1\",",
+            "\"type\":\"function_call\",\"call_id\":\"call_1\",",
+            "\"name\":\"headroom_retrieve\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex\",",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+            "\n",
+        );
+
+        let (turn, _) = responses_stream_to_turn(stream);
+
+        let items = turn["output"].as_array().expect("output array");
+        assert_eq!(items.len(), 1, "bare incremental call was dropped: {turn}");
+        assert_eq!(items[0]["type"], "function_call");
+        let args = items[0]
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            args.contains("ea06bec713db19c6a40258ad"),
+            "arguments not reassembled from bare deltas: {turn}"
+        );
+    }
+
+    /// The completed envelope stays authoritative: when it carries
+    /// `output[]`, that wins over the incrementally gathered items.
+    #[test]
+    fn responses_stream_prefers_completed_output() {
+        let stream = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",",
+            "\"item\":{\"id\":\"fc_stale\",\"type\":\"function_call\",",
+            "\"call_id\":\"call_stale\",\"name\":\"other_tool\",",
+            "\"arguments\":\"{}\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",",
+            "\"output\":[{\"id\":\"fc_final\",\"type\":\"function_call\",",
+            "\"call_id\":\"call_final\",\"name\":\"headroom_retrieve\",",
+            "\"arguments\":\"{}\"}],",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+            "\n",
+        );
+
+        let (turn, _) = responses_stream_to_turn(stream);
+
+        let items = turn["output"].as_array().expect("output array");
+        assert_eq!(items.len(), 1, "completed output did not win: {turn}");
+        assert_eq!(items[0]["id"], "fc_final");
     }
 
     /// Minimal `AppState` for exercising the request-side stages.

@@ -108,6 +108,9 @@ struct SearchHitJson {
     highlighted: String,
     timestamp: Option<String>,
     match_layer: String,
+    /// Block key for a `ctx get` round-trip (the full source behind this
+    /// excerpt). Null when the source row carries no hash.
+    content_hash: Option<String>,
 }
 
 async fn handle_search(
@@ -157,6 +160,7 @@ async fn handle_search(
             highlighted: h.highlighted,
             timestamp: h.timestamp,
             match_layer: h.match_layer.to_string(),
+            content_hash: h.content_hash,
         })
         .collect();
 
@@ -174,6 +178,7 @@ struct GetResponse {
 
 async fn handle_get(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(hash): Path<String>,
 ) -> Result<Json<GetResponse>, StatusCode> {
     let store = clone_store(&state)?;
@@ -183,6 +188,55 @@ async fn handle_get(
     let content = tokio::task::spawn_blocking(move || ccr.get(&hash_str))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Cold-tier parity with the model path (proxy.rs handle_ccr_response):
+    // `ccr.db` drops a block after a week idle while the per-project content
+    // index keeps it with no expiry, so a hot-tier miss is usually an expiry
+    // the index can still satisfy — the CLI (`headroom ctx get`) would
+    // otherwise 404 on content the model turn right next to it recovers.
+    // Skipped for malformed hashes (never stored, nothing to find) and when
+    // the hot tier already hit. Own project first: the cross-project sweep
+    // deliberately skips the requesting project's store.
+    let content = match content {
+        Some(content) => Some(content),
+        None if headroom_core::ccr::response_handler::is_plausible_ccr_hash(&hash) => {
+            let stores = store.stores();
+            let project = request_project(&headers);
+            let hash_str = hash.clone();
+            let project_for_lookup = project.clone();
+            let (recovered, local) = tokio::task::spawn_blocking(move || {
+                if let Some(content) = stores.content_local(&project_for_lookup, &hash_str) {
+                    return (Some(content), true);
+                }
+                let lookup = stores.find_content_any_project(&hash_str, &project_for_lookup);
+                (lookup.found.map(|(_, content)| content), false)
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            match recovered {
+                Some(content) => {
+                    tracing::info!(
+                        event = if local {
+                            "ctx_get_local_tier_hit"
+                        } else {
+                            "ctx_get_cold_tier_hit"
+                        },
+                        hash = %hash,
+                        project_from = %project,
+                        "ctx/get: missing from the CCR store, recovered from the content index"
+                    );
+                    if local {
+                        crate::observability::ccr_retrieval::observe_local_tier_hit();
+                    } else {
+                        crate::observability::ccr_retrieval::observe_cross_project_hit();
+                    }
+                    Some(content)
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
 
     // PR-J5: retrieval hit/miss counters. A miss is an information-loss
     // signal (expired/evicted offload original) — count before returning 404.

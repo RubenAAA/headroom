@@ -959,6 +959,7 @@ where
                 tracing::warn!(
                     request_id = %ctx.request_id,
                     unresolved_proxy_tool = dropped[DropReason::UnresolvedProxyTool as usize],
+                    unresolved_tool_name = ?unresolved_tool,
                     continuation_thinking = dropped[DropReason::ContinuationThinking as usize],
                     already_streamed = dropped[DropReason::AlreadyStreamed as usize],
                     deferred_memory_answer = dropped[DropReason::DeferredMemoryAnswer as usize],
@@ -996,6 +997,7 @@ where
                 event = "ccr_tool_call_dropped_stop_reason_downgraded",
                 request_id = %ctx.request_id,
                 unresolved_proxy_tool = dropped[DropReason::UnresolvedProxyTool as usize],
+                unresolved_tool_name = ?unresolved_tool,
                 "ccr: turn promised a tool call the client will not receive; \
                  downgrading stop_reason to end_turn"
             );
@@ -1134,6 +1136,22 @@ async fn resolve_retrieval(
             "openai_responses",
         ),
     };
+    // The rebuilt turn speaks client tool names (the rewriter observes the
+    // translated-back stream); continuations go back upstream, where the
+    // Zen outbound rename still applies. Same tool list both directions,
+    // so this is a no-op unless that pass renamed something.
+    if !matches!(ctx.shape, CcrShape::Anthropic) {
+        if let Some(anthropic_request) = match &ctx.shape {
+            CcrShape::RoutedChat { anthropic_request } => Some(anthropic_request),
+            CcrShape::RoutedResponses { anthropic_request } => Some(anthropic_request),
+            CcrShape::Anthropic => None,
+        } {
+            crate::routed::tool_alias::ToolAlias::derive(
+                anthropic_request.get("tools").and_then(|t| t.as_array()),
+            )
+            .forward_body(&mut turn_for_handler);
+        }
+    }
     // The rebuilt turn echoes first-response usage, which is already booked
     // through the first-round path on every streaming arm. Leaving the block
     // in place makes the resolver count it as a continuation round and the
@@ -1241,10 +1259,23 @@ async fn resolve_retrieval(
     match &ctx.shape {
         CcrShape::Anthropic => resolved,
         CcrShape::RoutedChat { anthropic_request } => {
-            crate::openai::response::openai_to_anthropic_response(&resolved, anthropic_request)
+            let mut turn =
+                crate::openai::response::openai_to_anthropic_response(&resolved, anthropic_request);
+            // Continuation rounds called the upstream names; map them back
+            // like every other inbound seam (same tool list, same rule).
+            crate::routed::tool_alias::ToolAlias::derive(
+                anthropic_request.get("tools").and_then(|t| t.as_array()),
+            )
+            .reverse_turn(&mut turn);
+            turn
         }
         CcrShape::RoutedResponses { anthropic_request } => {
-            responses_output_as_anthropic_turn(&resolved, anthropic_request)
+            let mut turn = responses_output_as_anthropic_turn(&resolved, anthropic_request);
+            crate::routed::tool_alias::ToolAlias::derive(
+                anthropic_request.get("tools").and_then(|t| t.as_array()),
+            )
+            .reverse_turn(&mut turn);
+            turn
         }
     }
 }
@@ -1927,6 +1958,26 @@ mod empty_turn_text_tests {
             assert!(
                 text.contains(RETRIEVAL_DROPPED_MARKER),
                 "hook marker missing: {text}"
+            );
+        }
+    }
+
+    /// Rust↔shell contract: the hook greps transcripts for these literals,
+    /// so a rename on either side silently disables continuation. Pin them
+    /// together; the hook path is relative to the crate checkout.
+    #[test]
+    fn hook_detector_matches_wire_markers() {
+        let hook = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contrib/claude/hooks/retry-dropped-turn.sh");
+        let hook = std::fs::read_to_string(&hook).expect("hook script readable from checkout");
+        for marker in [
+            RETRIEVAL_DROPPED_MARKER,
+            "<retrieved_context>",
+            crate::memory::deferred::DEFERRED_MEMORY_DROPPED_MARKER,
+        ] {
+            assert!(
+                hook.contains(marker),
+                "hook must grep for wire marker: {marker}"
             );
         }
     }

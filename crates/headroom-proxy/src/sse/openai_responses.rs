@@ -53,6 +53,15 @@ pub struct ResponseState {
     /// Items keyed by their wire `id` field (NOT position). Out-of-
     /// order completion is allowed by spec.
     pub items: HashMap<String, ItemState>,
+    /// First-seen order of item ids. The HashMap above loses arrival
+    /// order, but the CCR continuation fold must materialize `output[]`
+    /// in the order the upstream sent it (text leads the call it
+    /// introduces). Pushed on first insert of each id.
+    pub order: Vec<String>,
+    /// Authoritative `output[]` from the `response.completed` envelope,
+    /// when the upstream sent one. Wins over the incrementally gathered
+    /// items, mirroring the old `responses_stream_to_turn` fold.
+    pub completed_output: Option<Vec<Value>>,
     pub usage: Option<Value>,
     pub status: StreamStatus,
     /// Phase G PR-G3: `service_tier` extracted from the
@@ -142,10 +151,14 @@ impl ResponseState {
         match name {
             "response.created" => self.on_response_created(&v),
             "response.in_progress" => Ok(()),
-            "output_item.added" => self.on_output_item_added(&v),
-            "output_item.done" => self.on_output_item_done(&v),
-            "content_part.added" => self.on_content_part_added(&v),
-            "content_part.done" => self.on_content_part_done(&v),
+            // Both spellings exist in the wild: OpenAI documents the
+            // `response.`-prefixed form, but Codex and several
+            // OpenAI-compatible gateways (plus this repo's own
+            // synthesized truncation streams) emit the bare form.
+            "response.output_item.added" | "output_item.added" => self.on_output_item_added(&v),
+            "response.output_item.done" | "output_item.done" => self.on_output_item_done(&v),
+            "response.content_part.added" | "content_part.added" => self.on_content_part_added(&v),
+            "response.content_part.done" | "content_part.done" => self.on_content_part_done(&v),
             "response.output_text.delta" | "output_text.delta" => self.on_output_text_delta(&v),
             "response.output_text.done" | "output_text.done" => self.on_output_text_done(&v),
             "response.function_call_arguments.delta" | "function_call_arguments.delta" => {
@@ -215,28 +228,62 @@ impl ResponseState {
         Ok(())
     }
 
+    fn note_seen(&mut self, id: &str) {
+        if !self.order.iter().any(|s| s == id) {
+            self.order.push(id.to_string());
+        }
+    }
+
+    /// Key for an output item: the wire `id` when present, else the
+    /// function-call `call_id` (minimal test fixtures and some gateways
+    /// omit `id`). Returns None only when neither exists.
+    fn item_key(item: &Value) -> Option<String> {
+        item.get("id")
+            .and_then(|x| x.as_str())
+            .or_else(|| item.get("call_id").and_then(|x| x.as_str()))
+            .map(str::to_string)
+    }
+
+    /// Find the map key of an existing entry whose metadata carries
+    /// `call_id == target` (for correlating an id-less done/added with
+    /// an earlier added stored under its item id).
+    fn key_by_call_id(&self, target: &str) -> Option<String> {
+        self.items.iter().find_map(|(k, state)| {
+            state
+                .metadata
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .filter(|c| *c == target)
+                .map(|_| k.clone())
+        })
+    }
+
     fn on_output_item_added(&mut self, v: &Value) -> Result<(), StateError> {
         let item = v
             .get("item")
             .ok_or(StateError::MissingField { field: "item" })?;
-        let id = item
-            .get("id")
-            .and_then(|x| x.as_str())
-            .ok_or(StateError::MissingField { field: "item.id" })?
-            .to_string();
+        // Keyless shells carry nothing the fold needs (the old fold ignored
+        // added entirely); skip rather than minting a stray empty entry.
+        let Some(id) = Self::item_key(item) else {
+            return Ok(());
+        };
+        let has_wire_id = item.get("id").and_then(|x| x.as_str()).is_some();
+        let key = if !has_wire_id {
+            self.key_by_call_id(&id).unwrap_or_else(|| id.clone())
+        } else {
+            id.clone()
+        };
         let item_type = item
             .get("type")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        self.items.insert(
-            id,
-            ItemState {
-                item_type,
-                metadata: item.clone(),
-                ..Default::default()
-            },
-        );
+        self.note_seen(&key);
+        // Preserve deltas that arrived before the added (out-of-order):
+        // only refresh the shell, never wipe accumulated arguments/text.
+        let entry = self.items.entry(key).or_default();
+        entry.item_type = item_type;
+        entry.metadata = item.clone();
         Ok(())
     }
 
@@ -244,13 +291,39 @@ impl ResponseState {
         let item = v
             .get("item")
             .ok_or(StateError::MissingField { field: "item" })?;
-        let id = item
-            .get("id")
-            .and_then(|x| x.as_str())
-            .ok_or(StateError::MissingField { field: "item.id" })?;
+        // Keyless dones (bare `{"type":"message",…}` fixtures) still carry
+        // the turn's content; keep each under a unique key so none is lost.
+        let Some(id) = Self::item_key(item) else {
+            let generated = format!("__done_{}", self.order.len());
+            self.note_seen(&generated);
+            self.items.insert(
+                generated,
+                ItemState {
+                    item_type: item
+                        .get("type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    metadata: item.clone(),
+                    complete: true,
+                    ..Default::default()
+                },
+            );
+            return Ok(());
+        };
+        let has_wire_id = item.get("id").and_then(|x| x.as_str()).is_some();
+        // An id-less done whose call_id matches an earlier added (stored
+        // under its wire id) updates that entry rather than forking a
+        // duplicate under the call_id.
+        let key = if !has_wire_id {
+            self.key_by_call_id(&id).unwrap_or_else(|| id.clone())
+        } else {
+            id.clone()
+        };
+        self.note_seen(&key);
         // Out-of-order completion: the item may not have an
         // output_item.added if the producer is exotic; insert-or-update.
-        let entry = self.items.entry(id.to_string()).or_default();
+        let entry = self.items.entry(key).or_default();
         entry.complete = true;
         // Refresh metadata to the final shape — the `done` payload
         // is authoritative.
@@ -269,6 +342,7 @@ impl ResponseState {
             .and_then(|x| x.as_str())
             .ok_or(StateError::MissingField { field: "item_id" })?
             .to_string();
+        self.note_seen(&item_id);
         let part_index = v
             .get("content_index")
             .or_else(|| v.get("part_index"))
@@ -321,6 +395,7 @@ impl ResponseState {
             .and_then(|x| x.as_str())
             .ok_or(StateError::MissingField { field: "item_id" })?
             .to_string();
+        self.note_seen(&item_id);
         let delta = v
             .get("delta")
             .and_then(|x| x.as_str())
@@ -354,6 +429,7 @@ impl ResponseState {
             .and_then(|x| x.as_str())
             .ok_or(StateError::MissingField { field: "item_id" })?
             .to_string();
+        self.note_seen(&item_id);
         let delta = v
             .get("delta")
             .and_then(|x| x.as_str())
@@ -373,6 +449,7 @@ impl ResponseState {
             .and_then(|x| x.as_str())
             .ok_or(StateError::MissingField { field: "item_id" })?
             .to_string();
+        self.note_seen(&item_id);
         if let Some(args) = v.get("arguments").and_then(|x| x.as_str()) {
             let item = self.items.entry(item_id).or_default();
             // Only overwrite if our delta accumulator is empty;
@@ -391,6 +468,7 @@ impl ResponseState {
             .and_then(|x| x.as_str())
             .ok_or(StateError::MissingField { field: "item_id" })?
             .to_string();
+        self.note_seen(&item_id);
         let delta = v
             .get("delta")
             .and_then(|x| x.as_str())
@@ -412,9 +490,141 @@ impl ResponseState {
                     self.usage = Some(usage.clone());
                 }
             }
+            // The completed envelope carries the finished `output[]`, which
+            // is authoritative over the incrementally gathered items (a call
+            // whose `output_item.done` never arrived is still in here).
+            if let Some(items) = resp.get("output").and_then(|o| o.as_array()) {
+                self.completed_output = Some(items.clone());
+            }
+            if let Some(id) = resp.get("id").and_then(|x| x.as_str()) {
+                self.response_id = Some(id.to_string());
+            }
         }
         self.capture_envelope_metadata(v);
         Ok(())
+    }
+
+    /// Materialize the buffered `output[]` turn the CCR machinery speaks.
+    ///
+    /// Prefers the authoritative `output[]` from the `response.completed`
+    /// envelope when the upstream sent one; otherwise rebuilds items from
+    /// the incremental events (added / deltas / done) in first-seen order.
+    /// Returns the turn and the output-token count the outcome is booked with.
+    pub fn to_responses_turn(&self) -> (Value, u64) {
+        let output_tokens = self
+            .usage
+            .as_ref()
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let usage = self.usage.clone().unwrap_or_else(|| {
+            serde_json::json!({
+                "input_tokens": 0,
+                "output_tokens": output_tokens,
+            })
+        });
+        if let Some(items) = self.completed_output.as_ref() {
+            let mut turn = serde_json::json!({
+                "output": items,
+                "usage": usage,
+            });
+            if let Some(id) = self.response_id.as_deref() {
+                turn["id"] = Value::String(id.to_string());
+            }
+            return (turn, output_tokens);
+        }
+        let mut output_items: Vec<Value> = Vec::new();
+        for id in &self.order {
+            let Some(item) = self.items.get(id) else {
+                continue;
+            };
+            let item_type = if item.item_type.is_empty() {
+                item.metadata
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+            } else {
+                item.item_type.as_str()
+            };
+            match item_type {
+                "function_call" => {
+                    // Start from the authoritative final shape when we have
+                    // it (output_item.done), else the added shell; fill in
+                    // arguments from the accumulated deltas when missing.
+                    let mut merged = if item.metadata.is_object() {
+                        item.metadata.clone()
+                    } else {
+                        serde_json::json!({"type": "function_call", "id": id})
+                    };
+                    let has_args = merged
+                        .get("arguments")
+                        .and_then(|a| a.as_str())
+                        .is_some_and(|s| !s.is_empty());
+                    if !has_args && !item.function_call_arguments.is_empty() {
+                        merged["arguments"] = Value::String(item.function_call_arguments.clone());
+                    }
+                    // Ensure the round-trip keys exist: CCR keys off
+                    // `call_id` first, then `id`.
+                    if merged.get("id").is_none() {
+                        merged["id"] = Value::String(id.clone());
+                    }
+                    output_items.push(merged);
+                }
+                "message" => {
+                    // A finished message item carries the whole answer; use
+                    // it verbatim. Otherwise rebuild from the text deltas.
+                    let complete_message = item.complete
+                        && item
+                            .metadata
+                            .get("content")
+                            .and_then(|c| c.as_array())
+                            .is_some_and(|c| !c.is_empty());
+                    if complete_message {
+                        output_items.push(item.metadata.clone());
+                    } else if !item.output_text.is_empty() {
+                        let mut msg = if item.metadata.is_object() {
+                            item.metadata.clone()
+                        } else {
+                            serde_json::json!({
+                                "type": "message",
+                                "id": id,
+                                "role": "assistant",
+                            })
+                        };
+                        msg["content"] = serde_json::json!([{
+                            "type": "output_text",
+                            "text": item.output_text,
+                        }]);
+                        output_items.push(msg);
+                    } else if item.metadata.is_object() {
+                        output_items.push(item.metadata.clone());
+                    }
+                }
+                _ => {
+                    if item.metadata.is_object() {
+                        output_items.push(item.metadata.clone());
+                    } else if !item.output_text.is_empty() {
+                        output_items.push(serde_json::json!({
+                            "type": "message",
+                            "id": id,
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": item.output_text,
+                            }],
+                        }));
+                    }
+                }
+            }
+        }
+        let mut turn = serde_json::json!({
+            "output": output_items,
+            "usage": usage,
+        });
+        if let Some(id) = self.response_id.as_deref() {
+            turn["id"] = Value::String(id.to_string());
+        }
+        (turn, output_tokens)
     }
 
     /// Phase G PR-G3: extract `service_tier` and (when present)

@@ -119,6 +119,16 @@ impl ProjectStores {
         })
     }
 
+    /// The requesting project's own store, for the same-project fast path
+    /// ahead of the cross-project sweep below (which skips it by design —
+    /// it reports cross-project hits). An expired block indexed under the
+    /// current project is still on disk here; one indexed lookup, no sweep.
+    pub fn content_local(&self, project_dir: &str, content_hash: &str) -> Option<String> {
+        self.content(project_dir)
+            .and_then(|store| store.content_by_hash(content_hash).ok())
+            .flatten()
+    }
+
     /// Search every project's content DB for a block by its `content_hash`,
     /// skipping `already_checked`.
     ///
@@ -468,6 +478,42 @@ mod tests {
             !miss.gave_up && miss.elapsed < COLD_TIER_BUDGET,
             "20 small stores must fit the budget, took {:?}",
             miss.elapsed
+        );
+    }
+
+    /// The same-project fast path ahead of the sweep: the requesting
+    /// project's own store answers directly (the sweep skips it by design).
+    #[test]
+    fn content_local_answers_the_requesting_projects_own_store() {
+        let dir = TempDir::new().unwrap();
+        let stores = ProjectStores::new(dir.path().to_path_buf());
+        stores
+            .content("/home/dev/alpha")
+            .unwrap()
+            .index_content(
+                "notes",
+                "alpha stored this block",
+                &IndexOpts {
+                    content_hash: Some("0123456789abcdef01234567".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            stores.content_local("/home/dev/alpha", "0123456789abcdef01234567"),
+            Some("alpha stored this block".to_string()),
+            "own-project block must resolve without a sweep"
+        );
+        assert_eq!(
+            stores.content_local("/home/dev/beta", "0123456789abcdef01234567"),
+            None,
+            "other projects are the sweep's job, not the fast path's"
+        );
+        assert_eq!(
+            stores.content_local("/home/dev/alpha", "ffffffffffffffffffffffff"),
+            None,
+            "unknown hash misses"
         );
     }
 }
