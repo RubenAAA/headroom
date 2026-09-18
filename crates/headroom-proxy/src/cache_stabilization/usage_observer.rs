@@ -2315,6 +2315,59 @@ impl UsageObserver {
         hasher.finish()
     }
 
+    /// Normalized marker layout for the `markers_changed` witness.
+    ///
+    /// The raw layout string (`sys[1]:1h,m0.2:1h,m56.2:1h`) embeds message
+    /// indices, and the tail breakpoint follows conversation growth by
+    /// design — every appended message renumbers the tail entries, so the
+    /// raw digest differs on consecutive turns of any growing conversation
+    /// (measured 2026-09-18: true on 41/41 residual events, all pure
+    /// growth). Comparing raw strings makes the witness a growth detector,
+    /// not a rotation detector.
+    ///
+    /// What actually voids the provider prefix is the breakpoint *shape*:
+    /// how many breakpoints exist, of which kind, at which TTL. Normalize
+    /// to that (`n=4|m:1h,m:1h,m:1h,sys:1h`) and digest the normalized
+    /// form. A TTL downgrade, a dropped marker, or a kind change still
+    /// flags; pure growth no longer does. Entries of unknown shape keep
+    /// their full text as the kind, so a future format change fails loud
+    /// (flags) rather than blind (never flags).
+    fn normalize_marker_layout(markers: &str) -> String {
+        let mut kinds: Vec<String> = markers
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                let (loc, ttl) = e.rsplit_once(':').unwrap_or((e, ""));
+                let kind = if loc.starts_with("sys") {
+                    "sys"
+                } else if loc.starts_with("tools") {
+                    "tools"
+                } else if loc.starts_with('m') {
+                    "m"
+                } else {
+                    // Unknown shape: stay sensitive, not silent.
+                    loc
+                };
+                if ttl.is_empty() {
+                    kind.to_string()
+                } else {
+                    format!("{kind}:{ttl}")
+                }
+            })
+            .collect();
+        kinds.sort();
+        format!("n={}|{}", kinds.len(), kinds.join(","))
+    }
+
+    /// Digest of the marker layout's cache-relevant shape (see
+    /// [`Self::normalize_marker_layout`]). Both sides of the per-stream
+    /// comparison go through this, so shape-equal layouts compare equal
+    /// however far the tail indices advanced.
+    fn marker_layout_digest(layout: &str) -> u64 {
+        Self::witness_digest(&Self::normalize_marker_layout(layout))
+    }
+
     /// Response side: classify this turn's billed usage against the
     /// conversation's previous turn. Call ONLY for cleanly completed
     /// streams (`message_stop`) — half-finished usage would classify
@@ -2570,8 +2623,15 @@ impl UsageObserver {
         // Forwarded beta/marker witnesses, digested for the per-stream
         // comparison below. Same "both known and different" rule as the head:
         // a turn that never reached the fingerprint stage compares as "not
+        // known", never as moved. Markers compare on normalized shape
+        // (count + kind + TTL), not raw indices — the tail breakpoint
+        // renumbers with every appended message, so raw strings differ on
+        // any growing conversation (see `normalize_marker_layout`).
         let turn_beta = pending.forward_beta.as_deref().map(Self::witness_digest);
-        let turn_markers = pending.forward_markers.as_deref().map(Self::witness_digest);
+        let turn_markers = pending
+            .forward_markers
+            .as_deref()
+            .map(Self::marker_layout_digest);
         // Forwarded (post-router) model, same rule. The router can rewrite
         // the model after the compared fingerprint is taken, so only this
         // value says what the provider keyed on.
@@ -6540,7 +6600,76 @@ mod stream_matching_tests {
         assert_eq!(event.forward_beta.as_deref(), Some("beta-bbb"));
     }
 
-    /// A forwarded-model flap between two turns of one stream is flagged on
+    /// Pure conversation growth must not read as a marker-layout move. The
+    /// tail breakpoint renumbers with every appended message, so the raw
+    /// strings differ on any growing conversation while the breakpoint
+    /// shape (count + kind + TTL) holds still. Regression test for the
+    /// 2026-09-18 finding: `markers_changed` true on 41/41 residual events,
+    /// all pure growth.
+    #[test]
+    fn growth_advanced_markers_are_not_a_layout_move() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("g1", "conv-grow".into(), None, None, Some(fp(20)));
+        obs.note_forward_witnesses(
+            "g1",
+            "beta-aaa".into(),
+            "sys[1]:1h,m0.2:1h,m56.2:1h,m57.0:1h".into(),
+            "claude-sonnet-5".into(),
+        );
+        obs.complete("g1", 10_000, 46_985, 55_557, None);
+        obs.begin_request("g2", "conv-grow".into(), None, None, Some(fp(22)));
+        obs.note_forward_witnesses(
+            "g2",
+            "beta-aaa".into(),
+            "sys[1]:1h,m0.2:1h,m58.2:1h,m59.0:1h".into(),
+            "claude-sonnet-5".into(),
+        );
+        obs.note_replay_applied("g2", ReplayAppliedEvidence::new(2, 2, 0));
+        obs.complete("g2", 9_714, 46_985, 48_669, None);
+        let event = obs.snapshot().last_event.expect("recache recorded");
+        assert!(
+            !event.markers_changed,
+            "same shape at new indices is growth, not rotation"
+        );
+        assert_eq!(
+            event.forward_markers.as_deref(),
+            Some("sys[1]:1h,m0.2:1h,m58.2:1h,m59.0:1h"),
+            "raw layout still logged for offline diff"
+        );
+    }
+
+    /// The normalization must stay sensitive to what actually voids the
+    /// prefix: a TTL move, a dropped marker, a kind change.
+    #[test]
+    fn marker_shape_changes_still_flag() {
+        assert_ne!(
+            UsageObserver::normalize_marker_layout("sys[1]:1h,m0.2:1h,m56.2:1h,m57.0:1h"),
+            UsageObserver::normalize_marker_layout("sys[1]:1h,m0.2:1h,m56.2:1h,m57.0:5m"),
+            "TTL downgrade flags"
+        );
+        assert_ne!(
+            UsageObserver::normalize_marker_layout("sys[1]:1h,m0.2:1h,m56.2:1h,m57.0:1h"),
+            UsageObserver::normalize_marker_layout("sys[1]:1h,m0.2:1h,m57.0:1h"),
+            "dropped marker flags"
+        );
+        assert_ne!(
+            UsageObserver::normalize_marker_layout("sys[1]:1h,m0.2:1h,m57.0:1h"),
+            UsageObserver::normalize_marker_layout("m0.2:1h,m57.0:1h"),
+            "dropped system marker flags"
+        );
+        assert_eq!(
+            UsageObserver::normalize_marker_layout("sys[1]:1h,m0.2:1h,m56.2:1h,m57.0:1h"),
+            UsageObserver::normalize_marker_layout("m57.0:1h,sys[1]:1h,m56.2:1h,m0.2:1h"),
+            "entry order is not signal"
+        );
+        assert_eq!(
+            UsageObserver::normalize_marker_layout(""),
+            UsageObserver::normalize_marker_layout(""),
+            "empty layouts compare equal, never as moved"
+        );
+    }
+
     /// A forwarded-model flap between two turns of one stream is flagged on
     /// the event as a witness only — unranked until a first real instance is
     /// measured (2026-09-17: zero flaps in-window). The router can rewrite
