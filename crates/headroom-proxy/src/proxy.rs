@@ -4493,6 +4493,17 @@ pub(crate) async fn forward_http(
                     &request_id,
                     cache_stabilization::cache_ttl::client_ttl_shape(&parsed),
                 );
+                // The stock arm is priced in Anthropic input-equivalents.
+                // Turns forwarded to another cache universe (OpenAI chat /
+                // Responses) bill without a creation counter, TTL split, or
+                // Anthropic horizons, so comparing them at 1.25x/2.0x would
+                // invent a premium the provider never charged.
+                if !matches!(
+                    endpoint,
+                    compression::CompressibleEndpoint::AnthropicMessages
+                ) {
+                    state.usage_observer.note_stock_ineligible(&request_id);
+                }
                 // Conversation-concurrency cap (`--max-conversation-concurrency`):
                 // shed fan-out overlap with the client's own retry instead of
                 // racing the provider's cache commit on every turn. The pending
@@ -6579,6 +6590,17 @@ pub(crate) async fn forward_http(
                         .unwrap_or(0),
                     "cache-key inputs of the request as forwarded"
                 );
+                // Park the cache-key inputs neither drift lane sees (beta
+                // header, marker layout, post-router model) on the pending
+                // turn, so a later recache event can say whether they moved.
+                // Short digests only — the same strings logged one line up —
+                // except the model, which is small-cardinality and logged raw.
+                state.usage_observer.note_forward_witnesses(
+                    &request_id,
+                    short_hash(beta),
+                    markers.clone(),
+                    model.clone(),
+                );
             }
         }
 
@@ -8031,7 +8053,7 @@ fn record_upstream_rate_limits(
         crate::observability::record_rate_limit_snapshot(
             provider,
             &rate_limit_snapshot,
-            &request_id,
+            request_id,
         );
     } else if rate_limit_snapshot.remaining_requests.is_some()
         || rate_limit_snapshot.remaining_tokens.is_some()
@@ -8061,7 +8083,7 @@ fn record_upstream_rate_limits(
         || unified_snapshot.overall_status.is_some()
         || unified_snapshot.fallback_percentage.is_some()
     {
-        crate::observability::record_unified_rate_limit(&unified_snapshot, &request_id);
+        crate::observability::record_unified_rate_limit(&unified_snapshot, request_id);
     }
 }
 

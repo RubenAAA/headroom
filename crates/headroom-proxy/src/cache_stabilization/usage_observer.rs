@@ -138,6 +138,26 @@ const PENDING_CAPACITY: usize = 512;
 /// other request of the session in flight at all. A real turn cannot stream
 /// longer than this, so an older entry is a leftover, not a race.
 const IN_FLIGHT_HORIZON: Duration = Duration::from_secs(15 * 60);
+/// How long after a clean completion a same-key turn still counts as a commit
+/// race suspect (see `PendingRequest::commit_race_suspect`).
+///
+/// `complete` pops the pending entry the moment the stream ends, but the
+/// provider commits the write later: `MissedNewestWrite` landings cluster at
+/// gaps under 3s. Five seconds keeps scripted back-to-back turns (fan-out,
+/// retries) while ordinary interactive turns, which arrive slower, stay out.
+const COMMIT_LATENCY_WINDOW: Duration = Duration::from_secs(5);
+/// How long after a clean completion a *sibling* key of the same session
+/// still counts as recently completed (see
+/// `PendingRequest::sibling_completed_recently`). Fan-out arrivals cluster in
+/// seconds-to-a-minute; beyond that a sibling completion is context, not a
+/// suspect.
+const SIBLING_COMPLETION_WINDOW: Duration = Duration::from_secs(60);
+/// Bounded recent-completion log for the two windows above. Same rationale as
+/// the drift detector's LRU: a flood of unique keys must not grow memory
+/// unboundedly. Completions arrive far less often than requests, so 1024
+/// entries cover hours of traffic; pruning is by window on read, by cap on
+/// write.
+const RECENT_COMPLETION_CAPACITY: usize = 1024;
 const CONVERSATION_CAPACITY: usize = 512;
 
 /// Anthropic's published multipliers against the base input rate. They are the
@@ -225,6 +245,15 @@ pub fn conversation_key(parsed: &serde_json::Value, session_key: &str) -> String
 pub struct PrefixFingerprint {
     /// `model` + `system` + `tools` — the block that does cache.
     pub head: String,
+    /// The three components hashed separately, same projection as `head`
+    /// (`sample_value` per fragment, `hex16` truncation), so a later turn can
+    /// say *which* of model/system/tools moved rather than just that the
+    /// fused head did. Additive logging only: never re-gate attribution on
+    /// these (see `recache_attribution` — the empty-dims + head shape is the
+    /// abandoned-retry witness and must keep firing).
+    pub head_model: String,
+    pub head_system: String,
+    pub head_tools: String,
     /// The first [`FINGERPRINT_FIXED_DEPTH`] messages.
     ///
     /// Fixed depth on purpose. The obvious design — hash every message except
@@ -287,6 +316,22 @@ pub fn prefix_fingerprint_with_model(
         }
     }
 
+    // Per-component heads, same projection as the fused head above so
+    // "system moved" agrees with what moved `head`. Each hashes only its own
+    // component; absent reads as the empty hash, comparable across turns.
+    let mut head_model_hasher = Sha256::new();
+    if let Some(model) = identity_model.or_else(|| parsed.get("model").and_then(|v| v.as_str())) {
+        head_model_hasher.update(model.as_bytes());
+    }
+    let mut head_system_hasher = Sha256::new();
+    if let Some(v) = parsed.get("system") {
+        sample_value(v, &mut head_system_hasher);
+    }
+    let mut head_tools_hasher = Sha256::new();
+    if let Some(v) = parsed.get("tools") {
+        sample_value(v, &mut head_tools_hasher);
+    }
+
     let mut body = Sha256::new();
     let mut stable = Sha256::new();
     let mut stable_msgs = 0usize;
@@ -315,6 +360,9 @@ pub fn prefix_fingerprint_with_model(
 
     PrefixFingerprint {
         head: hex16(head.finalize().as_slice()),
+        head_model: hex16(head_model_hasher.finalize().as_slice()),
+        head_system: hex16(head_system_hasher.finalize().as_slice()),
+        head_tools: hex16(head_tools_hasher.finalize().as_slice()),
         body: if body_comparable {
             hex16(body.finalize().as_slice())
         } else {
@@ -411,6 +459,25 @@ pub struct TurnRecord {
     /// stays `Copy`. `None` when the request reached the observer without a
     /// fingerprint, which compares as "not known", never as "unchanged".
     pub head: Option<u64>,
+    /// Per-component heads (`PrefixFingerprint::head_model/system/tools`),
+    /// same encoding and same both-known-and-different rule as `head`. Carried
+    /// so a `prefix_head_changed` turn can log *which* component moved without
+    /// re-reading the body, which is long gone by the response side.
+    pub head_model: Option<u64>,
+    pub head_system: Option<u64>,
+    pub head_tools: Option<u64>,
+    /// `DefaultHasher` digests of this turn's forwarded `forward_beta` /
+    /// `forward_markers` witness strings (see `PendingRequest`). In-process
+    /// only, like the stream matching they serve: the next turn of the same
+    /// stream compares them to say whether the beta header or the marker
+    /// layout moved, which neither drift lane can see. `None` propagates
+    /// "not known", never "unchanged".
+    pub beta: Option<u64>,
+    pub markers: Option<u64>,
+    /// `DefaultHasher` digest of this turn's forwarded `forward_model` (the
+    /// post-router model string). Compared turn-apart under the same
+    /// both-known rule; unranked witness until a first real flap exists.
+    pub forward_model: Option<u64>,
     /// The stock arm's cached prefix after this turn (`stock_read +
     /// stock_write`), carried per stream the way the rest of this record is.
     ///
@@ -636,6 +703,10 @@ impl ReplaySkipEvidence {
 /// completed one under its conversation key. Computed once in the handler,
 /// where the parsed body is, and parked here until the usage arrives — see
 /// [`UsageObserver::note_first_turn_context`].
+///
+/// The D0 diagnostic (`first-turn-write-sharing.md`) extends this with the
+/// cache-key controls that live outside system/tools/messages: they are only
+/// visible on the request path, and the response side must not guess them.
 #[derive(Debug, Clone, Default)]
 pub struct FirstTurnContext {
     /// Messages the client sent, before any compression.
@@ -645,6 +716,23 @@ pub struct FirstTurnContext {
     /// Message 0 carries Claude Code's compaction summary marker.
     pub compaction_restart: bool,
     pub model: Option<String>,
+    /// Top-level `tool_choice`: `auto` / `any` / `tool:<name>` / `none`.
+    /// A named tool choice is part of the provider cache key.
+    pub tool_choice: Option<String>,
+    /// Top-level `thinking`: `absent` / `disabled` / `enabled:<budget>`.
+    pub thinking: Option<String>,
+    /// Top-level `effort`, when the client sends one. Short scalar only.
+    pub effort: Option<String>,
+    /// Message 0 carries an image block. Images are message content, so one
+    /// here only affects the message span — recorded so the diagnostic can
+    /// rule it in or out rather than assume.
+    pub images_in_m0: bool,
+    /// Message 0 opens with the shared `<system-reminder>` scaffolding run.
+    pub opens_with_scaffolding: bool,
+    /// Byte size of that leading scaffolding run in message 0.
+    pub m0_scaffold_bytes: u64,
+    /// Byte size of the rest of message 0's text (task, recall, summary).
+    pub m0_rest_bytes: u64,
 }
 
 /// Outcome of the cross-session prefix adoption path: the replay store found a
@@ -693,6 +781,119 @@ pub fn first_turn_context(parsed: &serde_json::Value) -> FirstTurnContext {
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        tool_choice: describe_tool_choice(parsed),
+        thinking: describe_thinking(parsed),
+        effort: describe_effort(parsed),
+        images_in_m0: message_zero_has_image(messages),
+        opens_with_scaffolding: super::prefix_replay::opens_with_scaffolding(messages),
+        m0_scaffold_bytes: message_zero_composition(messages).0,
+        m0_rest_bytes: message_zero_composition(messages).1,
+    }
+}
+
+/// Top-level `tool_choice` in a bounded vocabulary. `None` when absent or an
+/// unexpected shape — the diagnostic must never mislabel a novel client.
+fn describe_tool_choice(parsed: &serde_json::Value) -> Option<String> {
+    const MAX_NAME: usize = 32;
+    let choice = parsed.get("tool_choice")?;
+    let kind = choice.get("type").and_then(|v| v.as_str())?;
+    match kind {
+        "auto" | "any" | "none" => Some(kind.to_string()),
+        "tool" => {
+            let name: String = choice
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .chars()
+                .take(MAX_NAME)
+                .collect();
+            Some(format!("tool:{name}"))
+        }
+        _ => None,
+    }
+}
+
+/// Top-level `thinking` in a bounded vocabulary: absent, disabled, or the
+/// enabled budget that sizes the thinking span.
+fn describe_thinking(parsed: &serde_json::Value) -> Option<String> {
+    let thinking = parsed.get("thinking")?;
+    match thinking.get("type").and_then(|v| v.as_str()) {
+        None => None,
+        Some("disabled") => Some("disabled".to_string()),
+        Some("enabled") => Some(format!(
+            "enabled:{}",
+            thinking
+                .get("budget_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        )),
+        _ => None,
+    }
+}
+
+/// Top-level `effort`, when present. Short scalar only; anything else is
+/// `None` rather than a lossy rendering.
+fn describe_effort(parsed: &serde_json::Value) -> Option<String> {
+    const MAX: usize = 16;
+    match parsed.get("effort") {
+        Some(serde_json::Value::String(s)) => Some(s.chars().take(MAX).collect()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether message 0 carries an image block. First message only: deeper
+/// history cannot affect the sys/tools checkpoint match the diagnostic is
+/// about, and walking it on every request would price the instrumentation
+/// against long conversations for no signal.
+fn message_zero_has_image(messages: &[serde_json::Value]) -> bool {
+    messages
+        .first()
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                b.get("type").and_then(|v| v.as_str()) == Some("image")
+                    || b.get("source")
+                        .and_then(|s| s.get("type"))
+                        .and_then(|v| v.as_str())
+                        == Some("base64")
+            })
+        })
+}
+
+/// Byte split of message 0's text into the leading shared-scaffolding run and
+/// everything after it. Sizes only, never content: the diagnostic needs to
+/// know how much of the opener another session could share, not what it says.
+fn message_zero_composition(messages: &[serde_json::Value]) -> (u64, u64) {
+    use super::ephemeral_spans::is_ephemeral_client_block;
+    let Some(first) = messages.first() else {
+        return (0, 0);
+    };
+    match first.get("content") {
+        Some(serde_json::Value::Array(blocks)) => {
+            let run = blocks
+                .iter()
+                .take_while(|b| is_ephemeral_client_block(b))
+                .count();
+            let text_len = |b: &serde_json::Value| {
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map_or(0, |t| t.len() as u64)
+            };
+            let scaffold: u64 = blocks.iter().take(run).map(text_len).sum();
+            let rest: u64 = blocks.iter().skip(run).map(text_len).sum();
+            (scaffold, rest)
+        }
+        Some(serde_json::Value::String(text)) => {
+            if super::ephemeral_spans::is_ephemeral_client_text(text) {
+                (text.len() as u64, 0)
+            } else {
+                (0, text.len() as u64)
+            }
+        }
+        _ => (0, 0),
     }
 }
 
@@ -744,6 +945,20 @@ struct PendingRequest {
     /// wall clock steps backwards under load, and the map already knows the
     /// answer exactly.
     concurrent_with_in_flight: bool,
+    /// A turn of this same conversation completed within
+    /// [`COMMIT_LATENCY_WINDOW`] before this one began. The provider may not
+    /// have committed that turn's cache write yet even though nothing is still
+    /// in flight, so a shortfall here is timing-suspect. Witness only: it does
+    /// not attribute a recache, it lets an offline query separate commit races
+    /// (`commit_race_suspect` + `provider_missed_newest_write`) from evictions.
+    commit_race_suspect: bool,
+    /// A turn under a *different* conversation key of the same session
+    /// completed within [`SIBLING_COMPLETION_WINDOW`] before this one began.
+    /// Same-opener subagent streams share one key by construction, so this is
+    /// either a re-keyed continuation (compaction, model switch, system
+    /// rewrite minted a fresh key) or genuinely different work on one session.
+    /// Witness only, for the same offline join as above.
+    sibling_completed_recently: bool,
     /// The *drift detector's* session hash, so a recache event joins to the
     /// drift and volatile events on the same request. Only
     /// [`UsageObserver::begin_request`] fills this, and it derives the hash
@@ -778,6 +993,22 @@ struct PendingRequest {
     /// proxy stage has run. Set by `note_outbound_drift`; `None` on a turn
     /// that never reached the forwarding path.
     outbound_drift_dims: Option<String>,
+    /// Short hashes of the cache-key inputs that sit outside the drift
+    /// dimensions: the forwarded `anthropic-beta` header value and the
+    /// `cache_control` marker layout, as logged by `turn_cache_fingerprint`.
+    /// Both are provider cache-key inputs the drift detector never sees (it
+    /// hashes the body only, and strips `cache_control`), so a rotation here
+    /// busts the cache with both lanes quiet. Set by
+    /// [`UsageObserver::note_forward_witnesses`]; `None` on a turn that never
+    /// reached the fingerprint stage (birth turns, routed forwards).
+    forward_beta: Option<String>,
+    forward_markers: Option<String>,
+    /// The forwarded `model` string itself (small cardinality — logged raw,
+    /// not hashed), from the same stage. The cost-aware router can rewrite
+    /// it after the compared fingerprint is taken, so only this post-router
+    /// value speaks for what the provider keyed on. Witness only, like the
+    /// two above: unranked until a first real flap exists.
+    forward_model: Option<String>,
     /// `(input, cache_read, cache_write)` actually billed across every round of
     /// this request, when the proxy ran more than one. The usage passed to
     /// [`UsageObserver::complete`] is deliberately the *client baseline* — the
@@ -799,6 +1030,13 @@ struct PendingRequest {
     /// never noted one (the provider default, and the old flat
     /// assumption).
     client_ttl: super::cache_ttl::ClientTtl,
+    /// False when this turn bills from a non-Anthropic cache universe
+    /// (routed/OpenAI translation): no cache-creation counter, no TTL
+    /// telemetry, different pricing and retention. The watchdog still
+    /// scores the turn, but the Anthropic-priced stock arm stays out —
+    /// pricing it at 1.25x/2.0x with 5m/1h horizons would invent a write
+    /// premium the provider never charged.
+    stock_eligible: bool,
 }
 
 /// Where the provider's cache read landed against the two previous boundaries,
@@ -818,7 +1056,10 @@ enum CacheLanding {
     /// Typical at gaps under 3s.
     MissedNewestWrite,
     /// `prev_read < actual < prev_boundary`: the read stops inside the
-    /// previous write. On Fable a fixed 69–114 tokens.
+    /// previous write. Clusters just inside the boundary (30/39 events below
+    /// one-third of the write on 2026-09-17) — the sliver served varies by
+    /// conversation, so no fixed token constant holds. Fable once showed a
+    /// fixed 69–114 tokens; the same window elsewhere ran 209–4575.
     PartialOfPreviousWrite,
     /// `actual == prevprev_boundary` while `prev_read > prevprev_boundary`:
     /// the previous turn read past anything ever written, so the provider
@@ -827,7 +1068,12 @@ enum CacheLanding {
     /// `actual < prevprev_boundary` (or `actual < prev_read` when no earlier
     /// boundary is known): an older entry is gone, with the prefix stable.
     DroppedOlderEntry,
-    /// Anything else below `prev_read`.
+    /// Below `prev_read` but at or above the older boundary. Measured
+    /// 2026-09-17 landing at that boundary plus a few-hundred-token sliver
+    /// (median fractional position 0.01, 28/29 events): a full-generation-
+    /// stale snapshot serve, not a position between entries. Non-monotonic —
+    /// served less than the stream previously read — so commit latency alone
+    /// cannot produce it; replica lag or eviction must cover these.
     BetweenEntries,
 }
 
@@ -917,16 +1163,32 @@ fn client_edit_was_absorbed(inbound_dims: Option<&str>, outbound_dims: Option<&s
         .any(|dim| outbound.split(',').any(|other| other == dim))
 }
 
+// One flat parameter per independent evidence flag; bundling them into a
+// struct would churn every call site below for no gain.
+#[allow(clippy::too_many_arguments)]
 fn recache_attribution<'a>(
     drift_dims: Option<&'a str>,
     head_changed: bool,
+    beta_changed: bool,
     outbound_drift_dims: Option<&'a str>,
     replay_skip: Option<ReplaySkipEvidence>,
     replay_applied: Option<ReplayAppliedEvidence>,
     previous_turn_diverged: bool,
     concurrent_with_in_flight: bool,
 ) -> RecacheAttribution<'a> {
-    if replay_skip.is_some_and(ReplaySkipEvidence::is_inbound_tail_replacement) {
+    let absorbed = client_edit_was_absorbed(drift_dims, outbound_drift_dims);
+
+    // A final-message replacement is a branch build only when the hot zone
+    // held still. The tail check looks at message counts alone, so a turn
+    // that also moved system/tools (or the cacheable head) would otherwise
+    // file genuine waste as a zero-waste branch. Hot-zone evidence wins here;
+    // the ranking below then names it.
+    if replay_skip.is_some_and(ReplaySkipEvidence::is_inbound_tail_replacement)
+        && drift_dims
+            .filter(|dims| !dims.is_empty() && !absorbed)
+            .is_none()
+        && (!head_changed || absorbed)
+    {
         return RecacheAttribution {
             reason: Some("inbound_tail_replaced"),
             origin: Some("inbound"),
@@ -934,8 +1196,6 @@ fn recache_attribution<'a>(
             counts_as_waste: false,
         };
     }
-
-    let absorbed = client_edit_was_absorbed(drift_dims, outbound_drift_dims);
 
     if let Some(dims) = drift_dims.filter(|dims| !dims.is_empty() && !absorbed) {
         // The dims come from the inbound hash, taken before the proxy touches
@@ -1028,6 +1288,37 @@ fn recache_attribution<'a>(
             reason: Some(reason),
             origin: Some("client"),
             scope: Some("stored_prefix"),
+            counts_as_waste: true,
+        };
+    }
+
+    // The forwarded `anthropic-beta` header rotated since the previous
+    // completed turn of this stream. The header is client-supplied and part
+    // of the provider's cache key, so a rotation voids the whole prefix with
+    // both drift lanes quiet: the lanes hash the body only. Measured
+    // 2026-09-17: on 3 recache turns the forwarded model/system/tools
+    // digests held still across 100–200-turn sessions while beta flipped
+    // exactly on the bust turn (88t, 88t, 15,171t).
+    //
+    // Ranked below the client structural evidence above, never above it:
+    // when drift, head, or a declined replay already names a client cause,
+    // that label stands — this arm is for the otherwise-clean miss that
+    // used to file as a commit race or unexplained. Ranked above the
+    // outbound hash by the standing rule that client-origin evidence beats
+    // proxy-origin: the client sent this header, the proxy only forwards it.
+    //
+    // Deliberately beta only, not `markers_changed`: the marker layout moves
+    // with normal conversation growth (the breakpoint stage runs every
+    // turn), so ranking it would fire constantly; beta headers hold still
+    // for hundreds of turns, which is what makes a rotation a signal.
+    // The inbound-tail branch gate above is untouched: a genuine tail build
+    // stays a tail build even when beta moved, and its shortfall already
+    // rides the line as `uncharged_shortfall_tokens`.
+    if beta_changed {
+        return RecacheAttribution {
+            reason: Some("forwarded_beta_rotated"),
+            origin: Some("client"),
+            scope: Some("cache_key"),
             counts_as_waste: true,
         };
     }
@@ -1153,7 +1444,20 @@ pub struct RecacheEvent {
     /// Stable, explicit cause derived only from direct evidence. This is a
     /// structural drift dimension or a causal prefix-replay skip reason;
     /// `None` means the event is genuinely unattributed.
+    ///
+    /// Deliberately never a [`CacheLanding`] boundary name: the residual
+    /// `unexplained_after_replay` keeps its own reason and the landing rides
+    /// alongside in [`RecacheEvent::landing`]. Overwriting the reason with the
+    /// landing is what sent readers hunting a provider bug for a boundary
+    /// position the evidence does not explain.
     pub attribution_reason: Option<String>,
+    /// Where the provider's cache read landed against the two previous
+    /// boundaries — a [`CacheLanding`] name such as
+    /// `provider_missed_newest_write`. `Some` only on residual
+    /// `unexplained_after_replay` events, where it is the boundary position,
+    /// not a proved provider-internal cause. `None` everywhere else, including
+    /// on `uncaused_waste` events whose reason names the replay skip instead.
+    pub landing: Option<String>,
     /// Provenance of the compared histories when it is known.
     pub origin: Option<String>,
     /// Structural extent of the change when it is known.
@@ -1169,6 +1473,31 @@ pub struct RecacheEvent {
     /// `Drift` for charged prefix changes, `Branch` for a legitimate inbound
     /// tail build, and `Expected` when the rebuild is unattributed.
     pub event_kind: RecacheEventKind,
+    /// Forwarded beta-header digest and marker layout of this turn (see
+    /// `PendingRequest::forward_beta`), so an unexplained event can be checked
+    /// against a key rotation neither drift lane sees. Observational only.
+    pub forward_beta: Option<String>,
+    pub forward_markers: Option<String>,
+    /// Forwarded (post-router) model string of this turn, with the
+    /// turn-apart comparison below. The router can rewrite the model after
+    /// the compared fingerprint is taken; only this value says what the
+    /// provider keyed on. Observational only.
+    pub forward_model: Option<String>,
+    /// Whether the beta header / marker layout moved against the previous
+    /// completed turn of the same stream. Both sides known and different;
+    /// unknown on either side reads as "not known", never as moved.
+    pub beta_changed: bool,
+    pub markers_changed: bool,
+    /// Whether the forwarded (post-router) model string moved against the
+    /// previous completed turn of the same stream. Same both-known rule.
+    /// Witness only — `recache_attribution` does not consult it until a
+    /// first real flap is measured.
+    pub model_changed: bool,
+    /// Timing witnesses from `PendingRequest`: a same-key turn completed just
+    /// before this one began (commit race suspect), or a sibling key of the
+    /// same session did (fan-out / re-key context). Neither attributes.
+    pub commit_race_suspect: bool,
+    pub sibling_completed_recently: bool,
     pub wasted_tokens: u64,
     /// Tokens the provider created for this turn, whether waste or a legitimate
     /// branch-tail cache build.
@@ -1249,6 +1578,10 @@ pub struct CacheHealthSnapshot {
 
     /// How this proxy compares with a plain Claude Code client -- no
     /// compression, no offload, no holds -- on the same traffic.
+    ///
+    /// Anthropic-billed turns only: routed/OpenAI turns stay out (different
+    /// cache universe, different pricing), while the watchdog still scores
+    /// them.
     ///
     /// Both arms are counted in input-equivalent tokens: fresh input at 1x,
     /// cache reads at 0.1x, 5-minute writes at 1.25x, 1-hour writes at 2.0x.
@@ -1338,8 +1671,24 @@ struct RecentHitRateSample {
     cache_capable: bool,
 }
 
+/// One cleanly completed turn, for the recency witnesses in `begin_request`.
+///
+/// Carries the session hash alongside the conversation key so a re-keyed
+/// continuation — same session, fresh key after a compaction, model switch,
+/// or system rewrite — can be joined offline to the sibling completion that
+/// preceded it, instead of reading as an unrelated cold start.
+struct CompletedTurn {
+    conversation_key: String,
+    session_key_hash: Option<String>,
+    completed_at: Instant,
+}
+
 struct Inner {
     pending: LruCache<String, PendingRequest>,
+    /// Cleanly completed turns, newest last, for the commit-race and sibling
+    /// recency witnesses computed in [`UsageObserver::begin_request`].
+    /// Pruned by window on read, capped on write.
+    recently_completed: VecDeque<CompletedTurn>,
     /// Several streams can share one key — see [`match_stream`].
     conversations: LruCache<String, Vec<TurnRecord>>,
     /// Conversations `conversations` has evicted, so a turn that comes back
@@ -1353,7 +1702,10 @@ struct Inner {
     /// only fires when the stream list is not empty. The classification stays
     /// as it was, since the earlier turn really is gone and inventing waste
     /// would be worse; what changes is that the undercount can be seen.
-    forgotten: LruCache<String, ()>,
+    ///
+    /// Value is the evicted prefix footprint (last turn's read + creation, 0
+    /// when unknown), so the forgotten floor can be token-sized offline.
+    forgotten: LruCache<String, u64>,
     /// Message-0 hash of each recent first turn → `(seen, conversation_key)`.
     first_turn_openers: LruCache<String, (Instant, String)>,
     recent_hit_rates: VecDeque<RecentHitRateSample>,
@@ -1490,6 +1842,7 @@ impl UsageObserver {
                 forgotten: LruCache::new(
                     NonZeroUsize::new(CONVERSATION_CAPACITY).expect("capacity is non-zero"),
                 ),
+                recently_completed: VecDeque::with_capacity(RECENT_COMPLETION_CAPACITY),
                 first_turn_openers: LruCache::new(
                     NonZeroUsize::new(FIRST_TURN_OPENER_CAPACITY).expect("capacity is non-zero"),
                 ),
@@ -1571,6 +1924,30 @@ impl UsageObserver {
                 concurrent_with_in_flight = true;
             }
         }
+        // Recency witnesses against clean completions. Pruned by window here;
+        // a stale entry is not evidence of anything. These never attribute —
+        // they only ride along so an unexplained shortfall can be checked
+        // against a commit race or a sibling re-key without log mining.
+        let session_hash = session_key.map(super::drift_detector::session_key_log_prefix);
+        let mut commit_race_suspect = false;
+        let mut sibling_completed_recently = false;
+        inner
+            .recently_completed
+            .retain(|c| now.duration_since(c.completed_at) < SIBLING_COMPLETION_WINDOW);
+        for c in inner.recently_completed.iter() {
+            let age = now.duration_since(c.completed_at);
+            if c.conversation_key == conversation_key && age < COMMIT_LATENCY_WINDOW {
+                commit_race_suspect = true;
+            } else if session_hash.as_deref().is_some_and(|h| {
+                Some(h) == c.session_key_hash.as_deref() && c.conversation_key != conversation_key
+            }) && age < SIBLING_COMPLETION_WINDOW
+            {
+                sibling_completed_recently = true;
+            }
+            if commit_race_suspect && sibling_completed_recently {
+                break;
+            }
+        }
         for id in abandoned {
             inner.pending.pop(&id);
             inner.abandoned_requests_total += 1;
@@ -1587,13 +1964,18 @@ impl UsageObserver {
             PendingRequest {
                 began: now,
                 concurrent_with_in_flight,
+                commit_race_suspect,
+                sibling_completed_recently,
                 conversation_key,
                 project: None,
                 first_turn: None,
                 adoption: None,
-                session_key_hash: session_key.map(super::drift_detector::session_key_log_prefix),
+                session_key_hash: session_hash,
                 drift_dims,
                 outbound_drift_dims: None,
+                forward_beta: None,
+                forward_markers: None,
+                forward_model: None,
                 replay_skip: None,
                 replay_applied: None,
                 compression: None,
@@ -1604,6 +1986,7 @@ impl UsageObserver {
                 billed_totals: None,
                 billed_output: None,
                 client_ttl: super::cache_ttl::ClientTtl::Unmarked,
+                stock_eligible: true,
             },
         );
         if let Some((evicted_id, _)) = evicted {
@@ -1800,6 +2183,17 @@ impl UsageObserver {
         }
     }
 
+    /// Mark a parked turn as billed outside the Anthropic cache universe, so
+    /// the stock arm skips it. The watchdog (hit rate, recache, earned
+    /// write, first turn) still scores the turn; only the comparison built
+    /// on Anthropic read/write multipliers and TTL horizons stays out.
+    pub fn note_stock_ineligible(&self, request_id: &str) {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(request_id) {
+            pending.stock_eligible = false;
+        }
+    }
+
     /// What the client asked for on a turn already past the gate, if it got
     /// that far. `None` falls back to pinning: a turn the observer never
     /// saw is not a turn to change TTL behaviour on.
@@ -1890,6 +2284,37 @@ impl UsageObserver {
         }
     }
 
+    /// Record the forwarded beta-header digest and marker layout for this
+    /// turn — the two provider cache-key inputs neither drift lane sees.
+    ///
+    /// Called from the `turn_cache_fingerprint` stage, which already computed
+    /// both strings for the log. Short opaque digests only, never header
+    /// values. A turn that never reaches that stage keeps `None`, which
+    /// compares as "not known", never as "unchanged".
+    pub fn note_forward_witnesses(
+        &self,
+        request_id: &str,
+        beta: String,
+        markers: String,
+        model: String,
+    ) {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(request_id) {
+            pending.forward_beta = Some(beta);
+            pending.forward_markers = Some(markers);
+            pending.forward_model = Some(model);
+        }
+    }
+
+    /// Digest a witness string for the per-stream comparison in `TurnRecord`.
+    /// In-process only, like the stream matching it serves.
+    fn witness_digest(value: &str) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Response side: classify this turn's billed usage against the
     /// conversation's previous turn. Call ONLY for cleanly completed
     /// streams (`message_stop`) — half-finished usage would classify
@@ -1966,6 +2391,21 @@ impl UsageObserver {
             // rate above still counted it.
             return None;
         };
+
+        // Log this clean completion for the recency witnesses: a same-key
+        // turn beginning within `COMMIT_LATENCY_WINDOW` may be racing the
+        // provider's commit of this write, and a sibling key of the same
+        // session completing nearby is the re-key/fan-out join. Only clean
+        // completions reach here — abandoned entries never pop — so this is
+        // exactly the committed set.
+        inner.recently_completed.push_back(CompletedTurn {
+            conversation_key: pending.conversation_key.clone(),
+            session_key_hash: pending.session_key_hash.clone(),
+            completed_at: now_instant,
+        });
+        while inner.recently_completed.len() > RECENT_COMPLETION_CAPACITY {
+            inner.recently_completed.pop_front();
+        }
 
         // Price this turn's saving against the usage actually billed for it.
         //
@@ -2070,6 +2510,9 @@ impl UsageObserver {
                 event = "turn_cost_ledger",
                 request_id = %request_id,
                 conversation_key = %pending.conversation_key,
+                // Join key for the re-key floor: a continuation under a fresh
+                // key shares the session hash, not the conversation key.
+                session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
                 // Anthropic's own numbers, summed over every round the proxy
                 // ran and otherwise unmodified.
                 input_tokens = billed_input,
@@ -2106,11 +2549,33 @@ impl UsageObserver {
         // whatever turn happened to arrive last under the same key.
         let turn_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs);
         // `head` is the hex of eight digest bytes (see `hex16`), so it reads
-        // back as the `u64` the record holds.
+        // back as the `u64` the record holds. Same for the per-component
+        // heads: unknown on either side compares as "not known", never moved.
         let turn_head = pending
             .prefix
             .as_ref()
             .and_then(|p| u64::from_str_radix(&p.head, 16).ok());
+        let turn_head_model = pending
+            .prefix
+            .as_ref()
+            .and_then(|p| u64::from_str_radix(&p.head_model, 16).ok());
+        let turn_head_system = pending
+            .prefix
+            .as_ref()
+            .and_then(|p| u64::from_str_radix(&p.head_system, 16).ok());
+        let turn_head_tools = pending
+            .prefix
+            .as_ref()
+            .and_then(|p| u64::from_str_radix(&p.head_tools, 16).ok());
+        // Forwarded beta/marker witnesses, digested for the per-stream
+        // comparison below. Same "both known and different" rule as the head:
+        // a turn that never reached the fingerprint stage compares as "not
+        let turn_beta = pending.forward_beta.as_deref().map(Self::witness_digest);
+        let turn_markers = pending.forward_markers.as_deref().map(Self::witness_digest);
+        // Forwarded (post-router) model, same rule. The router can rewrite
+        // the model after the compared fingerprint is taken, so only this
+        // value says what the provider keyed on.
+        let turn_forward_model = pending.forward_model.as_deref().map(Self::witness_digest);
         let (
             class,
             expected_cache_read,
@@ -2120,31 +2585,50 @@ impl UsageObserver {
             previous_cache_read,
             previous_previous_boundary,
             head_changed,
+            head_model_changed,
+            head_system_changed,
+            head_tools_changed,
+            beta_changed,
+            markers_changed,
+            model_changed,
             matched_stream_msgs,
             streams_tracked,
             matched_stream_idx,
             matched_stock_prior,
         ) = {
             if inner.conversations.get(&pending.conversation_key).is_none() {
-                if inner.forgotten.pop(&pending.conversation_key).is_some() {
+                if let Some(evicted_footprint) = inner.forgotten.pop(&pending.conversation_key) {
                     inner.forgotten_conversations_total += 1;
                     tracing::warn!(
                         event = "cache_conversation_forgotten",
                         conversation_key = %pending.conversation_key,
+                        session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
                         capacity = CONVERSATION_CAPACITY,
                         forgotten_total = inner.forgotten_conversations_total,
+                        evicted_footprint_tokens = evicted_footprint,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
                         "conversation evicted before its next turn; booked as a first turn, \
                          so any cache write it just paid for goes uncounted"
                     );
                 }
                 // `push` reports what fell off the end; `put` does not, and the
-                // eviction is the whole signal.
-                if let Some((evicted, _)) = inner
+                // eviction is the whole signal. Park the evicted prefix
+                // footprint with the key so the forgotten line above can size
+                // the floor it reports.
+                if let Some((evicted, evicted_streams)) = inner
                     .conversations
                     .push(pending.conversation_key.clone(), Vec::new())
                 {
                     if evicted != pending.conversation_key {
-                        inner.forgotten.put(evicted, ());
+                        let footprint = evicted_streams
+                            .last()
+                            .map(|r| {
+                                r.cache_read_input_tokens
+                                    .saturating_add(r.cache_creation_input_tokens)
+                            })
+                            .unwrap_or(0);
+                        inner.forgotten.put(evicted, footprint);
                     }
                 }
             }
@@ -2168,6 +2652,7 @@ impl UsageObserver {
                     event = "cache_stream_unmatched",
                     request_id = %request_id,
                     conversation_key = %pending.conversation_key,
+                    session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
                     turn_msgs = turn_msgs.unwrap_or(0),
                     longest_tracked = streams.iter().filter_map(|r| r.msgs).max().unwrap_or(0),
                     streams_tracked = streams.len(),
@@ -2198,6 +2683,12 @@ impl UsageObserver {
                     0,
                     None,
                     false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
                 ),
                 Some(i) => {
                     let prev = streams[i];
@@ -2223,8 +2714,18 @@ impl UsageObserver {
                         // Both sides known and different. An unknown head on
                         // either side is not comparable, and reporting a change
                         // from it would blame the client for a missing
-                        // measurement.
+                        // measurement. Same rule per component below.
                         matches!((prev.head, turn_head), (Some(p), Some(c)) if p != c),
+                        matches!((prev.head_model, turn_head_model), (Some(p), Some(c)) if p != c),
+                        matches!((prev.head_system, turn_head_system), (Some(p), Some(c)) if p != c),
+                        matches!((prev.head_tools, turn_head_tools), (Some(p), Some(c)) if p != c),
+                        // Same rule for the forwarded beta/marker witnesses:
+                        // unknown on either side is not a move.
+                        matches!((prev.beta, turn_beta), (Some(p), Some(c)) if p != c),
+                        matches!((prev.markers, turn_markers), (Some(p), Some(c)) if p != c),
+                        // Same rule for the forwarded model: unknown on
+                        // either side is not a flap.
+                        matches!((prev.forward_model, turn_forward_model), (Some(p), Some(c)) if p != c),
                     )
                 }
             };
@@ -2248,6 +2749,12 @@ impl UsageObserver {
                         .saturating_add(streams[i].cache_creation_input_tokens)
                 }),
                 head: turn_head,
+                head_model: turn_head_model,
+                head_system: turn_head_system,
+                head_tools: turn_head_tools,
+                beta: turn_beta,
+                markers: turn_markers,
+                forward_model: turn_forward_model,
                 // Patched below once the stock arm prices this turn; 0 until
                 // then so a turn that never reaches the stock arm (empty
                 // prompt) leaves a rebuild, never a phantom hit.
@@ -2275,8 +2782,22 @@ impl UsageObserver {
                     streams.len() - 1
                 }
             };
-            let (class, expected, gap, bytes, diverged, prev_read, prevprev_boundary, head_moved) =
-                outcome;
+            let (
+                class,
+                expected,
+                gap,
+                bytes,
+                diverged,
+                prev_read,
+                prevprev_boundary,
+                head_moved,
+                head_model_moved,
+                head_system_moved,
+                head_tools_moved,
+                beta_moved,
+                markers_moved,
+                model_moved,
+            ) = outcome;
             (
                 class,
                 expected,
@@ -2286,12 +2807,33 @@ impl UsageObserver {
                 prev_read,
                 prevprev_boundary,
                 head_moved,
+                head_model_moved,
+                head_system_moved,
+                head_tools_moved,
+                beta_moved,
+                markers_moved,
+                model_moved,
                 matched_stream_msgs,
                 streams_tracked,
                 matched_stream_idx,
                 matched_stock_prior,
             )
         };
+
+        // Which head component moved, for the recache lines below. Same
+        // both-known-and-different rule as `head_changed` itself: unknown on
+        // either side is "not known", never a move. Empty when the fused head
+        // held still (or was not comparable). Additive logging only — never a
+        // re-gating input (see the absorbed-head note on `recache_attribution`).
+        let head_moved_which = [
+            ("model", head_model_changed),
+            ("system", head_system_changed),
+            ("tools", head_tools_changed),
+        ]
+        .iter()
+        .filter_map(|(name, moved)| moved.then_some(*name))
+        .collect::<Vec<_>>()
+        .join("|");
 
         // A healthy turn is the one class that reports nothing, and it is by
         // far the largest: 5,747 turns and 10,935,835 written tokens on
@@ -2356,20 +2898,31 @@ impl UsageObserver {
         // one. `predicted_read_error_pct` below measures that same rule
         // against our own observed reads every turn, which is what bounds how
         // far to trust this arm.
+        // Anthropic-billed turns only. Routed/OpenAI turns bill from a
+        // different cache universe (no creation counter, no TTL split,
+        // different pricing and retention); the watchdog above still
+        // scores them, but the comparison below is priced in Anthropic
+        // input-equivalents and must not touch them.
         let ours_prompt = input_tokens + cache_read_input_tokens + cache_creation_input_tokens;
-        if ours_prompt > 0 {
-            // Bytes to tokens by proportion. Both numbers are the same kind of
-            // JSON measured at the same place, so the ratio carries over even
-            // though neither side is a token count.
+        if ours_prompt > 0 && pending.stock_eligible {
+            // Bytes to tokens by proportion, either direction. Both numbers
+            // are the same kind of JSON measured at the same place, so the
+            // ratio carries over even though neither side is a token count.
+            // Injections can make the forwarded body larger than what the
+            // client sent; scaling down there is the same assumption as
+            // scaling up for compression, and what keeps the arm symmetric.
+            // (The fresh tail below is still shared unscaled, so an
+            // injection into the tail overstates stock slightly — the
+            // injected fresh bytes are unseparated here.)
             let stock_prompt = match (
                 pending.client_request_bytes,
                 pending.forwarded_request_bytes,
             ) {
-                (Some(sent), Some(fwd)) if fwd > 0 && sent > fwd => {
+                (Some(sent), Some(fwd)) if fwd > 0 => {
                     ((ours_prompt as f64) * (sent as f64) / (fwd as f64)).round() as u64
                 }
-                // Nothing was removed, or we cannot prove anything was: the
-                // stock client would have sent what we sent.
+                // No wire sizes to scale by: the stock client would have
+                // sent what we sent.
                 _ => ours_prompt,
             };
 
@@ -2480,6 +3033,7 @@ impl UsageObserver {
                 conversation_key = %pending.conversation_key,
                 turn_class = ?class,
                 head_changed,
+                head_moved = head_moved_which.as_str(),
                 stock_kept,
                 client_ttl = ?pending.client_ttl,
                 ours_effective = ours_effective.round() as u64,
@@ -2503,6 +3057,17 @@ impl UsageObserver {
             inner.predicted_read_tokens += predicted_ours_read;
             inner.observed_read_tokens += cache_read_input_tokens;
             inner.predicted_read_abs_error += predicted_ours_read.abs_diff(cache_read_input_tokens);
+        } else if ours_prompt > 0 {
+            // Ineligible turn on a tracked stream: carry the eligible
+            // lineage's footprint forward so the next compared turn prices
+            // against it, instead of a zero this turn never earned. The
+            // watchdog record above already carries this turn's own billed
+            // footprint for classification; this is only the stock arm's.
+            if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key) {
+                if let Some(rec) = streams.get_mut(matched_stream_idx) {
+                    rec.stock_footprint = matched_stock_prior;
+                }
+            }
         }
 
         // Every completed turn that wrote anything, not just the healthy ones.
@@ -2607,6 +3172,64 @@ impl UsageObserver {
             }
         }
 
+        // D0 diagnostic for first-turn-write-sharing.md: one line per turn
+        // classified FirstTurn, with none of the write branch's gates
+        // (`streams_tracked == 0`, >64 tokens), so tracked first turns (the
+        // arrived-with-history shape the counters never see) and tiny turns
+        // are measured too. Pure observation: no counter moves here, the
+        // fan-out table is untouched, and the `reason` from
+        // `first_turn_reason` is derived offline from the inputs below
+        // (message_zero_hash joins across conversations for the fan-out
+        // check) rather than recomputed against live tables.
+        //
+        // Deliberately joined, not self-contained: marker layout rides on
+        // `turn_cache_fingerprint`, forwarded sys/tools hashes on
+        // `prefix_composition`, and beta/auth digests on the former — all keyed
+        // by request_id. This line carries only what no other line has: the
+        // request-path cache-key controls, the outer-vs-rounds usage split the
+        // ledger folds together, and the message-0 composition sizes.
+        if matches!(&class, TurnClass::FirstTurn) {
+            let dctx = pending.first_turn.clone().unwrap_or_default();
+            let (rounds_in, rounds_read, rounds_write) =
+                pending.billed_totals.map_or((0, 0, 0), |(bi, bcr, bcw)| {
+                    (
+                        bi.saturating_sub(input_tokens),
+                        bcr.saturating_sub(cache_read_input_tokens),
+                        bcw.saturating_sub(cache_creation_input_tokens),
+                    )
+                });
+            let (write_5m, write_1h) =
+                cache_write_ttl_split.map_or((-1_i64, -1_i64), |(m5, h1)| (m5 as i64, h1 as i64));
+            tracing::info!(
+                event = "first_turn_prefix_diagnostic",
+                request_id = %request_id,
+                conversation_key = %pending.conversation_key,
+                session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                model = dctx.model.as_deref().unwrap_or(""),
+                msgs = dctx.msgs,
+                message_zero_hash = dctx.message_zero_hash.as_deref().unwrap_or(""),
+                compaction_restart = dctx.compaction_restart,
+                adopted = pending.adoption.is_some(),
+                replay_applied = pending.replay_applied.is_some(),
+                tool_choice = dctx.tool_choice.as_deref().unwrap_or("absent"),
+                thinking = dctx.thinking.as_deref().unwrap_or("absent"),
+                effort = dctx.effort.as_deref().unwrap_or("absent"),
+                images_in_m0 = dctx.images_in_m0,
+                opens_with_scaffolding = dctx.opens_with_scaffolding,
+                m0_scaffold_bytes = dctx.m0_scaffold_bytes,
+                m0_rest_bytes = dctx.m0_rest_bytes,
+                outer_input_tokens = input_tokens,
+                outer_cache_read = cache_read_input_tokens,
+                outer_cache_write = cache_creation_input_tokens,
+                outer_write_5m = write_5m,
+                outer_write_1h = write_1h,
+                rounds_input_tokens = rounds_in,
+                rounds_cache_read = rounds_read,
+                rounds_cache_write = rounds_write,
+                "first turn under its conversation key completed; cache-key controls and outer-vs-rounds split"
+            );
+        }
+
         match class {
             TurnClass::FirstTurn | TurnClass::Healthy => None,
             TurnClass::TtlExpiry => {
@@ -2642,15 +3265,21 @@ impl UsageObserver {
                 let attribution = recache_attribution(
                     pending.drift_dims.as_deref(),
                     head_changed,
+                    beta_changed,
                     pending.outbound_drift_dims.as_deref(),
                     pending.replay_skip,
                     pending.replay_applied,
                     previous_turn_diverged,
                     pending.concurrent_with_in_flight,
                 );
-                // The residual is never left as "unexplained": the proxy's side
-                // was stable, so the only thing left to name is where the
-                // provider's read landed.
+                // Where the provider's read landed against the two previous
+                // boundaries. Computed for every recache so the line is
+                // auditable, but only *stored* on the residual path: the
+                // reason keeps what the evidence named (`unexplained_after_replay`
+                // when nothing did), and the landing rides alongside it.
+                // Overwriting the reason with the landing is what used to send
+                // readers hunting a provider bug for a boundary position the
+                // evidence does not explain.
                 let landing = CacheLanding::classify(
                     cache_read_input_tokens,
                     previous_cache_read,
@@ -2658,14 +3287,7 @@ impl UsageObserver {
                     previous_previous_boundary,
                 );
                 let unexplained = attribution.reason == Some("unexplained_after_replay");
-                let attribution = if unexplained {
-                    RecacheAttribution {
-                        reason: Some(landing.as_str()),
-                        ..attribution
-                    }
-                } else {
-                    attribution
-                };
+                let landing = unexplained.then(|| landing.as_str().to_owned());
                 let charged_wasted_tokens = if attribution.counts_as_waste {
                     wasted_tokens
                 } else {
@@ -2732,6 +3354,7 @@ impl UsageObserver {
                     drift_dims: pending.drift_dims.clone(),
                     outbound_drift_dims: pending.outbound_drift_dims.clone(),
                     attribution_reason: attribution.reason.map(str::to_owned),
+                    landing,
                     origin: attribution.origin.map(str::to_owned),
                     scope: attribution.scope.map(str::to_owned),
                     replayed_prefix: pending.replay_applied.is_some(),
@@ -2743,6 +3366,14 @@ impl UsageObserver {
                     previous_forwarded_request_bytes,
                     forwarded_request_bytes: pending.forwarded_request_bytes,
                     event_kind,
+                    forward_beta: pending.forward_beta.clone(),
+                    forward_markers: pending.forward_markers.clone(),
+                    forward_model: pending.forward_model.clone(),
+                    beta_changed,
+                    markers_changed,
+                    model_changed,
+                    commit_race_suspect: pending.commit_race_suspect,
+                    sibling_completed_recently: pending.sibling_completed_recently,
                     wasted_tokens: charged_wasted_tokens,
                     cache_creation_input_tokens,
                     expected_cache_read,
@@ -2778,6 +3409,10 @@ impl UsageObserver {
                         outbound_drift_dims =
                             event.outbound_drift_dims.as_deref().unwrap_or("?"),
                         forwarded_head_moved = forwarded_head_moved,
+                        // Which client-head component moved (model|system|tools),
+                        // same both-known rule as `head_changed`. Empty when the
+                        // fused head held still or was not comparable.
+                        head_moved = head_moved_which.as_str(),
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         // `-1` for "not a divergence". The index says how much
                         // of the prefix died: an edit near the opener costs far
@@ -2804,7 +3439,25 @@ impl UsageObserver {
                         prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
                         prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
                         prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
+                        // Same key witnesses as the unexplained arm: a drift
+                        // event can ride alongside a beta rotation or a commit
+                        // race, and the line should say so.
+                        forward_beta = event.forward_beta.as_deref().unwrap_or(""),
+                        forward_markers = event.forward_markers.as_deref().unwrap_or(""),
+                        beta_changed = event.beta_changed,
+                        markers_changed = event.markers_changed,
+                        // Forwarded (post-router) model: the router can rewrite
+                        // it after the compared fingerprint is taken, so this
+                        // is the only line that says what the provider keyed
+                        // on. Witness only, unranked.
+                        forward_model = event.forward_model.as_deref().unwrap_or(""),
+                        model_changed = event.model_changed,
+                        commit_race_suspect = event.commit_race_suspect,
+                        sibling_completed_recently = event.sibling_completed_recently,
                         expected_cache_read = expected_cache_read,
+                        // Float, unlike the TTL line's truncated int: the 5s
+                        // commit window is queryable only with sub-second gap.
+                        idle_seconds = idle_gap.as_secs_f64(),
                         actual_cache_read = cache_read_input_tokens,
                         cache_creation_input_tokens = cache_creation_input_tokens,
                         "prompt cache re-written inside the TTL window: billed tokens wasted re-caching"
@@ -2823,6 +3476,7 @@ impl UsageObserver {
                         outbound_drift_dims =
                             event.outbound_drift_dims.as_deref().unwrap_or("?"),
                         forwarded_head_moved = forwarded_head_moved,
+                        head_moved = head_moved_which.as_str(),
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         attribution_reason = "inbound_tail_replaced",
                         origin = "inbound",
@@ -2844,6 +3498,9 @@ impl UsageObserver {
                         prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
                         prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
                         expected_cache_read = expected_cache_read,
+                        // Float, unlike the TTL line's truncated int: the 5s
+                        // commit window is queryable only with sub-second gap.
+                        idle_seconds = idle_gap.as_secs_f64(),
                         actual_cache_read = cache_read_input_tokens,
                         cache_creation_input_tokens = cache_creation_input_tokens,
                         "prompt cache built for an inbound final-message replacement; branch creation, not waste"
@@ -2858,10 +3515,14 @@ impl UsageObserver {
                         matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
                         turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
                         streams_tracked = streams_tracked,
-                        attribution_reason = landing.as_str(),
-                        landing = landing.as_str(),
-                        origin = "unknown",
-                        scope = "replayed_prefix",
+                        // The cause the evidence named (`unexplained_after_replay`
+                        // when none did; a replay-skip reason on the uncaused
+                        // path). The boundary position rides alongside in
+                        // `landing` — it is not the cause.
+                        attribution_reason = event.attribution_reason.as_deref().unwrap_or(""),
+                        landing = event.landing.as_deref().unwrap_or(""),
+                        origin = event.origin.as_deref().unwrap_or(""),
+                        scope = event.scope.as_deref().unwrap_or(""),
                         event_kind = "unexplained",
                         // The same structural evidence the drift arm prints.
                         // Until this was here, "unexplained" was unexplained by
@@ -2877,12 +3538,33 @@ impl UsageObserver {
                         outbound_drift_dims =
                             event.outbound_drift_dims.as_deref().unwrap_or("?"),
                         forwarded_head_moved = forwarded_head_moved,
+                        head_moved = head_moved_which.as_str(),
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
                         prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
                         prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
                         prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
-                        replayed_prefix = true,
+                        // Cache-key witnesses neither drift lane sees: a beta
+                        // rotation or marker-layout move busts the cache with
+                        // both lanes quiet. The `*_changed` flags compare
+                        // against the previous completed turn of the same
+                        // stream; unknown on either side reads as false.
+                        // `commit_race_suspect` says the previous turn of this
+                        // stream completed just before this one began, so the
+                        // write may not have committed yet.
+                        forward_beta = event.forward_beta.as_deref().unwrap_or(""),
+                        forward_markers = event.forward_markers.as_deref().unwrap_or(""),
+                        beta_changed = event.beta_changed,
+                        markers_changed = event.markers_changed,
+                        // Forwarded (post-router) model: the router can rewrite
+                        // it after the compared fingerprint is taken, so this
+                        // is the only line that says what the provider keyed
+                        // on. Witness only, unranked.
+                        forward_model = event.forward_model.as_deref().unwrap_or(""),
+                        model_changed = event.model_changed,
+                        commit_race_suspect = event.commit_race_suspect,
+                        sibling_completed_recently = event.sibling_completed_recently,
+                        replayed_prefix = event.replayed_prefix,
                         replay_chain_id = event.replay_chain_id.unwrap_or(0),
                         breakpoints_placed = event.breakpoints_placed.unwrap_or(0),
                         system_markers_dropped = event.system_markers_dropped.unwrap_or(0),
@@ -2890,6 +3572,9 @@ impl UsageObserver {
                         forwarded_request_bytes = event.forwarded_request_bytes.unwrap_or(0),
                         wasted_tokens = charged_wasted_tokens,
                         expected_cache_read = expected_cache_read,
+                        // Float, unlike the TTL line's truncated int: the 5s
+                        // commit window is queryable only with sub-second gap.
+                        idle_seconds = idle_gap.as_secs_f64(),
                         actual_cache_read = cache_read_input_tokens,
                         // The three boundaries the landing was read against,
                         // so the classification can be audited off the line.
@@ -2898,7 +3583,7 @@ impl UsageObserver {
                         previous_boundary = expected_cache_read,
                         previous_previous_boundary = previous_previous_boundary.map_or(-1_i64, |b| b as i64),
                         cache_creation_input_tokens = cache_creation_input_tokens,
-                        "provider did not reuse the expected cache footprint after a confirmed prefix replay"
+                        "prompt cache re-written inside the TTL window without an attributed cause"
                     ),
                     RecacheEventKind::Expected => tracing::info!(
                         event = "cache_recache_observed",
@@ -2914,6 +3599,7 @@ impl UsageObserver {
                         outbound_drift_dims =
                             event.outbound_drift_dims.as_deref().unwrap_or("?"),
                         forwarded_head_moved = forwarded_head_moved,
+                        head_moved = head_moved_which.as_str(),
                         replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
                         attribution_reason = "",
                         origin = "",
@@ -2925,6 +3611,9 @@ impl UsageObserver {
                         prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
                         prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
                         expected_cache_read = expected_cache_read,
+                        // Float, unlike the TTL line's truncated int: the 5s
+                        // commit window is queryable only with sub-second gap.
+                        idle_seconds = idle_gap.as_secs_f64(),
                         actual_cache_read = cache_read_input_tokens,
                         cache_creation_input_tokens = cache_creation_input_tokens,
                         "prompt cache re-written inside the TTL window with no causal evidence: cause unattributed"
@@ -3160,6 +3849,9 @@ mod tests {
         let obs = UsageObserver::new();
         let fp = |msgs| PrefixFingerprint {
             head: "h".into(),
+            head_model: "m".into(),
+            head_system: "s".into(),
+            head_tools: "t".into(),
             body: "b".into(),
             stable: "s".into(),
             stable_msgs: msgs,
@@ -3198,6 +3890,7 @@ mod tests {
         let a = recache_attribution(
             None,
             false,
+            false,
             None,
             None,
             Some(applied_evidence()),
@@ -3209,12 +3902,13 @@ mod tests {
         assert!(a.counts_as_waste, "the rewrite is still real waste");
     }
 
-    /// The residual marker never reaches an event: `complete` swaps it for a
-    /// [`CacheLanding`] reason, keeping `origin` as it is.
+    /// The residual marker reaches the event as the reason, with the boundary
+    /// position riding alongside in `landing` — never swapped for it.
     #[test]
     fn without_a_previous_divergence_the_residual_is_left_for_the_landing() {
         let a = recache_attribution(
             None,
+            false,
             false,
             None,
             None,
@@ -3271,6 +3965,9 @@ mod tests {
         let obs = UsageObserver::new();
         let fp = |msgs| PrefixFingerprint {
             head: "h".into(),
+            head_model: "m".into(),
+            head_system: "s".into(),
+            head_tools: "t".into(),
             body: "b".into(),
             stable: "s".into(),
             stable_msgs: msgs,
@@ -3294,6 +3991,11 @@ mod tests {
         let event = obs.snapshot().last_event.expect("recache recorded");
         assert_eq!(
             event.attribution_reason.as_deref(),
+            Some("unexplained_after_replay"),
+            "the residual keeps its own reason; the landing rides alongside"
+        );
+        assert_eq!(
+            event.landing.as_deref(),
             Some("provider_free_read_not_persisted")
         );
         assert_eq!(event.origin.as_deref(), Some("unknown"));
@@ -3312,6 +4014,7 @@ mod tests {
     fn a_turn_racing_its_own_conversation_is_named_but_still_billed() {
         let a = recache_attribution(
             None,
+            false,
             false,
             None,
             None,
@@ -3335,6 +4038,7 @@ mod tests {
         let a = recache_attribution(
             Some("system"),
             false,
+            false,
             None,
             None,
             Some(applied_evidence()),
@@ -3354,6 +4058,7 @@ mod tests {
         let a = recache_attribution(
             None,
             true,
+            false,
             None,
             None,
             Some(applied_evidence()),
@@ -3364,6 +4069,63 @@ mod tests {
         assert_eq!(a.origin, Some("client"));
         assert_eq!(a.scope, Some("hot_zone"));
         assert!(a.counts_as_waste, "the prefix was genuinely re-written");
+    }
+
+    /// A rotated `anthropic-beta` header voids the provider's prefix with
+    /// both drift lanes quiet. Measured 2026-09-17: 3 recache turns whose
+    /// forwarded model/system/tools held still while beta flipped exactly
+    /// on the bust turn. Client origin — the client sent the header — so it
+    /// outranks proxy causes and timing suspects, but yields to the
+    /// structural client evidence above.
+    #[test]
+    fn a_rotated_beta_header_is_a_named_client_cause() {
+        let a = recache_attribution(None, false, true, None, None, None, false, false);
+        assert_eq!(a.reason, Some("forwarded_beta_rotated"));
+        assert_eq!(a.origin, Some("client"));
+        assert_eq!(a.scope, Some("cache_key"));
+        assert!(a.counts_as_waste, "the rotation re-billed the prefix");
+    }
+
+    /// Ordering: drift, head, and a declined replay all outrank beta, so the
+    /// three simultaneously-true turns from 2026-09-17 keep their existing
+    /// labels. Beta outranks the proxy outbound lane and the commit race,
+    /// which is where otherwise-clean beta busts used to land.
+    #[test]
+    fn beta_yields_to_structural_client_evidence_but_beats_proxy_and_timing() {
+        // Head wins.
+        let a = recache_attribution(None, true, true, None, None, None, false, false);
+        assert_eq!(a.reason, Some("prefix_head_changed"));
+        // Inbound drift wins.
+        let a = recache_attribution(Some("tools"), false, true, None, None, None, false, false);
+        assert_eq!(a.reason, Some("tools"));
+        // Proxy outbound loses to client beta.
+        let a = recache_attribution(None, false, true, Some("tools"), None, None, false, false);
+        assert_eq!(a.reason, Some("forwarded_beta_rotated"));
+        // Commit race loses to measured evidence.
+        let a = recache_attribution(None, false, true, None, None, None, false, true);
+        assert_eq!(a.reason, Some("forwarded_beta_rotated"));
+    }
+
+    /// The declined replay outranks beta too: on the three measured turns all
+    /// of head, divergence, and beta were true, and the label stays head —
+    /// with divergence second, beta third.
+    #[test]
+    fn a_declined_replay_outranks_a_rotated_beta() {
+        let prior = vec![serde_json::json!({"role": "user", "content": "a"})];
+        let current = vec![
+            serde_json::json!({"role": "user", "content": "b"}),
+            serde_json::json!({"role": "assistant", "content": "c"}),
+        ];
+        let skip = ReplaySkipEvidence::from_inbound_original_histories(
+            ReplaySkip::PrefixContentDiverged {
+                first_diff_index: 0,
+                replayed_prefix_msgs: 0,
+            },
+            Some(&prior),
+            &current,
+        );
+        let a = recache_attribution(None, false, true, None, Some(skip), None, false, false);
+        assert_eq!(a.reason, Some("prefix_content_diverged"));
     }
 
     /// Declining a replay is what moves the forwarded hot zone: the overlay
@@ -3393,6 +4155,7 @@ mod tests {
         let a = recache_attribution(
             None,
             false,
+            false,
             Some("early_messages"),
             Some(skip),
             None,
@@ -3412,6 +4175,7 @@ mod tests {
         let a = recache_attribution(
             None,
             false,
+            false,
             Some("tools,messages[0]"),
             None,
             Some(applied_evidence()),
@@ -3430,6 +4194,7 @@ mod tests {
         // would misattribute nearly every ordinary recache.
         let a = recache_attribution(
             Some("system"),
+            false,
             false,
             Some("system,tools"),
             None,
@@ -3455,6 +4220,7 @@ mod tests {
         let a = recache_attribution(
             Some("tools"),
             false,
+            false,
             Some("early_messages"),
             None,
             Some(applied_evidence()),
@@ -3472,7 +4238,7 @@ mod tests {
         // `None` is not absorption: the lane reads `None` both when nothing
         // drifted and when the forwarding path never ran. Discarding the
         // inbound dims on that would throw away the one cause the turn has.
-        let a = recache_attribution(Some("tools"), false, None, None, None, false, false);
+        let a = recache_attribution(Some("tools"), false, false, None, None, None, false, false);
         assert_eq!(a.reason, Some("tools"));
         assert_eq!(a.origin, Some("client"));
         assert_eq!(a.scope, Some("hot_zone"));
@@ -3489,6 +4255,7 @@ mod tests {
         let a = recache_attribution(
             Some("tools"),
             true,
+            false,
             Some(""),
             None,
             Some(applied_evidence()),
@@ -3510,6 +4277,7 @@ mod tests {
         // the rest of its edit fared.
         let a = recache_attribution(
             Some("system,tools"),
+            false,
             false,
             Some("system"),
             None,
@@ -3542,6 +4310,7 @@ mod tests {
         let a = recache_attribution(
             None,
             false,
+            false,
             None,
             Some(skip),
             Some(applied_evidence()),
@@ -3572,6 +4341,12 @@ mod tests {
             diverged: false,
             previous_boundary: None,
             head: None,
+            head_model: None,
+            head_system: None,
+            head_tools: None,
+            beta: None,
+            markers: None,
+            forward_model: None,
             stock_footprint: read + creation,
         }
     }
@@ -3603,6 +4378,9 @@ mod tests {
     fn a_request_nothing_completes_is_counted_as_abandoned() {
         let print = |n: usize| PrefixFingerprint {
             head: "head".into(),
+            head_model: "m".into(),
+            head_system: "s".into(),
+            head_tools: "t".into(),
             body: "body".into(),
             stable: format!("stable-{n}"),
             stable_msgs: n,
@@ -3829,6 +4607,7 @@ mod tests {
                 message_zero_hash: None,
                 compaction_restart: false,
                 model: None,
+                ..Default::default()
             },
         );
         obs.complete("f1", 100, 0, 50_000, None);
@@ -3855,12 +4634,59 @@ mod tests {
                 message_zero_hash: None,
                 compaction_restart: false,
                 model: None,
+                ..Default::default()
             },
         );
         obs.complete("f1", 100, 0, 50_000, None);
         let snap = obs.snapshot();
         assert_eq!(snap.first_turn_writes_total, 1);
         assert_eq!(snap.first_turn_contradictions_total, 0);
+    }
+
+    #[test]
+    fn first_turn_context_captures_d0_cache_key_controls() {
+        let parsed = serde_json::json!({
+            "model": "claude-opus-5",
+            "tool_choice": {"type": "tool", "name": "Bash"},
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "effort": "high",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>shared digest"},
+                    {"type": "text", "text": "do the task"},
+                    {"type": "image", "source": {"type": "base64", "data": "x"}},
+                ],
+            }],
+        });
+        let ctx = first_turn_context(&parsed);
+        assert_eq!(ctx.tool_choice.as_deref(), Some("tool:Bash"));
+        assert_eq!(ctx.thinking.as_deref(), Some("enabled:10000"));
+        assert_eq!(ctx.effort.as_deref(), Some("high"));
+        assert!(ctx.images_in_m0);
+        assert!(ctx.opens_with_scaffolding);
+        assert_eq!(
+            ctx.m0_scaffold_bytes,
+            "<system-reminder>shared digest".len() as u64
+        );
+        assert_eq!(
+            ctx.m0_rest_bytes,
+            "do the task".len() as u64,
+            "non-text blocks carry no text bytes"
+        );
+
+        // Absent controls stay absent rather than degrading to guesses.
+        let bare = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let ctx = first_turn_context(&bare);
+        assert_eq!(ctx.tool_choice, None);
+        assert_eq!(ctx.thinking, None);
+        assert_eq!(ctx.effort, None);
+        assert!(!ctx.images_in_m0);
+        assert!(!ctx.opens_with_scaffolding);
+        assert_eq!((ctx.m0_scaffold_bytes, ctx.m0_rest_bytes), (0, 5));
     }
 
     /// A turn that read nothing of a prefix it should have read, wrote
@@ -4289,6 +5115,12 @@ mod tests {
                     diverged: false,
                     previous_boundary: None,
                     head: None,
+                    head_model: None,
+                    head_system: None,
+                    head_tools: None,
+                    beta: None,
+                    markers: None,
+                    forward_model: None,
                     stock_footprint: 12_000,
                 }],
             );
@@ -4331,6 +5163,12 @@ mod tests {
                     diverged: false,
                     previous_boundary: None,
                     head: None,
+                    head_model: None,
+                    head_system: None,
+                    head_tools: None,
+                    beta: None,
+                    markers: None,
+                    forward_model: None,
                     stock_footprint: 12_000,
                 }],
             );
@@ -4373,6 +5211,12 @@ mod tests {
                     diverged: false,
                     previous_boundary: None,
                     head: None,
+                    head_model: None,
+                    head_system: None,
+                    head_tools: None,
+                    beta: None,
+                    markers: None,
+                    forward_model: None,
                     stock_footprint: 12_000,
                 }],
             );
@@ -4509,6 +5353,36 @@ mod prefix_fingerprint_tests {
         assert_eq!(a.stable, b.stable);
     }
 
+    /// The per-component heads isolate which cacheable input moved, in the
+    /// same projection as the fused head. Each change moves its own component
+    /// and leaves the other two alone — the property `head_moved` reports.
+    #[test]
+    fn head_components_isolate_which_cacheable_input_moved() {
+        let base = body("sys", &["a", "b", "tail"]);
+        let a = prefix_fingerprint(&base);
+        // System move: only the system component changes.
+        let mut resys = base.clone();
+        resys["system"] = json!("a different system");
+        let b = prefix_fingerprint(&resys);
+        assert_ne!(b.head_system, a.head_system);
+        assert_eq!(b.head_model, a.head_model);
+        assert_eq!(b.head_tools, a.head_tools);
+        // Tools move: only the tools component changes.
+        let mut retools = base.clone();
+        retools["tools"] = json!([{"name": "Write", "input_schema": {}}]);
+        let c = prefix_fingerprint(&retools);
+        assert_ne!(c.head_tools, a.head_tools);
+        assert_eq!(c.head_model, a.head_model);
+        assert_eq!(c.head_system, a.head_system);
+        // Model move: only the model component changes.
+        let mut remodel = base.clone();
+        remodel["model"] = json!("claude-opus-5");
+        let d = prefix_fingerprint(&remodel);
+        assert_ne!(d.head_model, a.head_model);
+        assert_eq!(d.head_system, a.head_system);
+        assert_eq!(d.head_tools, a.head_tools);
+    }
+
     /// Divergence beyond the sampled window still has to register, or a long
     /// shared preamble would hide it.
     #[test]
@@ -4578,6 +5452,9 @@ mod prefix_on_recache_event_tests {
 
         let fp = PrefixFingerprint {
             head: "aaaaaaaaaaaaaaaa".into(),
+            head_model: "mmmmmmmmmmmmmmmm".into(),
+            head_system: "ssssssssssssssss".into(),
+            head_tools: "tttttttttttttttt".into(),
             body: "bbbbbbbbbbbbbbbb".into(),
             stable: "cccccccccccccccc".into(),
             stable_msgs: 42,
@@ -4633,6 +5510,48 @@ mod prefix_on_recache_event_tests {
         assert!(
             line.contains(&format!("session_key_hash={expected}")),
             "session key missing: {line}"
+        );
+    }
+
+    /// `head_moved` names the component behind a `prefix_head_changed` turn.
+    /// Two fingerprints identical except the system component: the recache
+    /// must report `head_moved=system` and nothing else.
+    #[test]
+    fn a_recache_event_names_which_head_component_moved() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+
+        let fp_a = PrefixFingerprint {
+            head: "aaaaaaaaaaaaaaaa".into(),
+            head_model: "1111111111111111".into(),
+            head_system: "2222222222222222".into(),
+            head_tools: "3333333333333333".into(),
+            body: "bbbbbbbbbbbbbbbb".into(),
+            stable: "cccccccccccccccc".into(),
+            stable_msgs: 42,
+        };
+        let fp_b = PrefixFingerprint {
+            head_system: "4444444444444444".into(),
+            ..fp_a.clone()
+        };
+
+        tracing::subscriber::with_default(sub, || {
+            let obs = UsageObserver::new();
+            obs.begin_request("r1", "conv-hm".into(), None, None, Some(fp_a));
+            obs.complete("r1", 300, 0, 10_000, None);
+            obs.begin_request("r2", "conv-hm".into(), None, None, Some(fp_b));
+            obs.complete("r2", 200, 0, 11_000, None);
+        });
+
+        let joined = cap.lock().unwrap().fields.join("\n");
+        let line = joined
+            .lines()
+            .find(|l| l.contains("cache_recache_observed"))
+            .unwrap_or_else(|| panic!("no recache event emitted; captured:\n{joined}"));
+        assert!(
+            line.contains("head_moved=system"),
+            "which-moved missing: {line}"
         );
     }
 
@@ -4828,6 +5747,9 @@ mod prefix_on_recache_event_tests {
 
         let fp = PrefixFingerprint {
             head: "hhhhhhhhhhhhhhhh".into(),
+            head_model: "mmmmmmmmmmmmmmmm".into(),
+            head_system: "ssssssssssssssss".into(),
+            head_tools: "tttttttttttttttt".into(),
             body: "dddddddddddddddd".into(),
             stable: "ssssssssssssssss".into(),
             stable_msgs: 17,
@@ -4865,8 +5787,12 @@ mod prefix_on_recache_event_tests {
         let line = joined
             .lines()
             .filter(|l| l.contains("cache_recache_observed"))
-            .find(|l| l.contains("attribution_reason=provider_missed_newest_write"))
+            .find(|l| l.contains("attribution_reason=unexplained_after_replay"))
             .unwrap_or_else(|| panic!("no unexplained event; captured:\n{joined}"));
+        assert!(
+            line.contains("landing=provider_missed_newest_write"),
+            "{line}"
+        );
 
         assert!(line.contains("prefix_head=hhhhhhhhhhhhhhhh"), "{line}");
         assert!(line.contains("prefix_body=dddddddddddddddd"), "{line}");
@@ -4908,7 +5834,7 @@ mod prefix_on_recache_event_tests {
         let line = joined
             .lines()
             .filter(|l| l.contains("cache_recache_observed"))
-            .find(|l| l.contains("attribution_reason=provider_missed_newest_write"))
+            .find(|l| l.contains("attribution_reason=unexplained_after_replay"))
             .unwrap_or_else(|| panic!("no unexplained event; captured:\n{joined}"));
         assert!(line.contains("replay_skipped=no_previous_turn"), "{line}");
     }
@@ -4967,6 +5893,9 @@ mod prefix_on_recache_event_tests {
 
         let fp = |msgs: usize| PrefixFingerprint {
             head: "hhhhhhhhhhhhhhhh".into(),
+            head_model: "mmmmmmmmmmmmmmmm".into(),
+            head_system: "ssssssssssssssss".into(),
+            head_tools: "tttttttttttttttt".into(),
             body: "dddddddddddddddd".into(),
             stable: "ssssssssssssssss".into(),
             stable_msgs: msgs,
@@ -5052,6 +5981,9 @@ mod stream_matching_tests {
     fn fp(stable_msgs: usize) -> PrefixFingerprint {
         PrefixFingerprint {
             head: "head".into(),
+            head_model: "m".into(),
+            head_system: "s".into(),
+            head_tools: "t".into(),
             body: "body".into(),
             stable: format!("stable-{stable_msgs}"),
             stable_msgs,
@@ -5068,6 +6000,12 @@ mod stream_matching_tests {
             diverged: false,
             previous_boundary: None,
             head: None,
+            head_model: None,
+            head_system: None,
+            head_tools: None,
+            beta: None,
+            markers: None,
+            forward_model: None,
             stock_footprint: 0,
         }
     }
@@ -5288,6 +6226,78 @@ mod stream_matching_tests {
         .is_inbound_tail_replacement());
     }
 
+    /// A final-message replacement that also moved the hot zone is a bust,
+    /// not a branch: the tail check sees message counts only, so without this
+    /// gate a head change files as a zero-waste branch and real money goes
+    /// uncounted.
+    #[test]
+    fn a_tail_replacement_that_moved_the_head_is_a_bust_not_a_branch() {
+        let prior = [
+            serde_json::json!({"role":"user","content":"open"}),
+            serde_json::json!({"role":"assistant","content":"answer"}),
+            serde_json::json!({"role":"user","content":"old tail"}),
+        ];
+        let current = [
+            prior[0].clone(),
+            prior[1].clone(),
+            serde_json::json!({"role":"user","content":"replacement tail"}),
+        ];
+        let skip = ReplaySkipEvidence::from_inbound_original_histories(
+            ReplaySkip::PrefixContentDiverged {
+                first_diff_index: 2,
+                replayed_prefix_msgs: 2,
+            },
+            Some(&prior),
+            &current,
+        );
+        assert!(
+            skip.is_inbound_tail_replacement(),
+            "test setup must be a tail replacement"
+        );
+        let a = recache_attribution(None, true, false, None, Some(skip), None, false, false);
+        assert_eq!(a.reason, Some("prefix_head_changed"));
+        assert_eq!(a.origin, Some("client"));
+        assert!(a.counts_as_waste, "the head move re-wrote the prefix");
+    }
+
+    /// Same gate for inbound drift: a tail replacement plus a tools change is
+    /// the tools change's bust.
+    #[test]
+    fn a_tail_replacement_with_drift_dims_is_a_bust_not_a_branch() {
+        let prior = [
+            serde_json::json!({"role":"user","content":"open"}),
+            serde_json::json!({"role":"assistant","content":"old"}),
+        ];
+        let current = [
+            serde_json::json!({"role":"user","content":"open"}),
+            serde_json::json!({"role":"assistant","content":"new"}),
+        ];
+        let skip = ReplaySkipEvidence::from_inbound_original_histories(
+            ReplaySkip::PrefixContentDiverged {
+                first_diff_index: 1,
+                replayed_prefix_msgs: 1,
+            },
+            Some(&prior),
+            &current,
+        );
+        assert!(
+            skip.is_inbound_tail_replacement(),
+            "test setup must be a tail replacement"
+        );
+        let a = recache_attribution(
+            Some("tools"),
+            false,
+            false,
+            None,
+            Some(skip),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(a.reason, Some("tools"));
+        assert!(a.counts_as_waste);
+    }
+
     /// A bust whose divergence sits below the drift detector's window used to
     /// be filed as `Expected` — "no cause found" — and written off as a session
     /// reset. A declined prefix replay names that cause. Measured: 98% of the
@@ -5409,9 +6419,14 @@ mod stream_matching_tests {
         );
         let event = obs.snapshot().last_event.expect("provider miss recorded");
         assert_eq!(event.event_kind, RecacheEventKind::Unexplained);
-        // Read 46_985 both turns: the write p1 made was never found.
+        // Read 46_985 both turns: the write p1 made was never found. The
+        // reason stays the residual; the boundary rides alongside in landing.
         assert_eq!(
             event.attribution_reason.as_deref(),
+            Some("unexplained_after_replay")
+        );
+        assert_eq!(
+            event.landing.as_deref(),
             Some("provider_missed_newest_write")
         );
         assert_eq!(event.origin.as_deref(), Some("unknown"));
@@ -5423,6 +6438,146 @@ mod stream_matching_tests {
         assert_eq!(event.previous_forwarded_request_bytes, Some(147_638));
         assert_eq!(event.forwarded_request_bytes, Some(130_528));
         assert_eq!(event.wasted_tokens, 48_669);
+    }
+
+    /// A turn that begins right after its conversation's previous turn
+    /// completed is a commit-race suspect: the provider may not have committed
+    /// the write yet even though nothing is in flight. Witness only — the
+    /// residual keeps its own reason, and the suspect flag rides alongside so
+    /// an offline query can separate races from evictions.
+    #[test]
+    fn a_turn_right_after_a_completion_is_flagged_a_commit_race_suspect() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("k1", "conv-race".into(), None, None, Some(fp(20)));
+        obs.complete("k1", 10_000, 46_985, 55_557, None);
+        // Immediately: inside COMMIT_LATENCY_WINDOW by construction.
+        obs.begin_request("k2", "conv-race".into(), None, None, Some(fp(22)));
+        obs.note_replay_applied("k2", ReplayAppliedEvidence::new(2, 2, 0));
+        obs.complete("k2", 9_714, 46_985, 48_669, None);
+        let event = obs.snapshot().last_event.expect("recache recorded");
+        assert_eq!(event.event_kind, RecacheEventKind::Unexplained);
+        assert_eq!(
+            event.attribution_reason.as_deref(),
+            Some("unexplained_after_replay"),
+            "a suspect flag must not attribute"
+        );
+        assert!(event.commit_race_suspect);
+        assert!(
+            !event.sibling_completed_recently,
+            "no sibling key completed on this session"
+        );
+    }
+
+    /// A sibling key of the same session completing nearby is fan-out or
+    /// re-key context on the event — again as a witness, never a cause.
+    #[test]
+    fn a_sibling_completion_is_recorded_as_context_not_cause() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("a1", "conv-sib-a".into(), Some("sess"), None, Some(fp(20)));
+        obs.complete("a1", 10_000, 46_985, 55_557, None);
+        // Same session, different key: a fork or a re-keyed continuation.
+        obs.begin_request("b1", "conv-sib-b".into(), Some("sess"), None, Some(fp(4)));
+        obs.complete("b1", 500, 0, 5_000, None);
+        // Back on the first key with drift: a Drift event carrying context.
+        obs.begin_request(
+            "a2",
+            "conv-sib-a".into(),
+            Some("sess"),
+            Some("tools".into()),
+            Some(fp(22)),
+        );
+        obs.complete("a2", 9_714, 0, 48_669, None);
+        let event = obs.snapshot().last_event.expect("recache recorded");
+        assert_eq!(event.event_kind, RecacheEventKind::Drift);
+        assert_eq!(event.attribution_reason.as_deref(), Some("tools"));
+        assert!(
+            event.sibling_completed_recently,
+            "sibling key b completed just before on the same session"
+        );
+    }
+
+    /// A beta-header rotation between two turns of one stream is a ranked
+    /// cause on the event, not just a witness. Neither drift lane sees
+    /// headers; measured 2026-09-17, rotations coincide exactly with bust
+    /// turns after 100+ stable turns, so filing them unexplained hid a
+    /// genuine client cause in the residual bucket.
+    #[test]
+    fn a_beta_rotation_between_turns_is_flagged_on_the_event() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("w1", "conv-wit".into(), None, None, Some(fp(20)));
+        obs.note_forward_witnesses(
+            "w1",
+            "beta-aaa".into(),
+            "sys[1]:1h,m19:1h".into(),
+            "claude-opus-5".into(),
+        );
+        obs.complete("w1", 10_000, 46_985, 55_557, None);
+        obs.begin_request("w2", "conv-wit".into(), None, None, Some(fp(22)));
+        obs.note_forward_witnesses(
+            "w2",
+            "beta-bbb".into(),
+            "sys[1]:1h,m19:1h".into(),
+            "claude-opus-5".into(),
+        );
+        obs.note_replay_applied("w2", ReplayAppliedEvidence::new(2, 2, 0));
+        obs.complete("w2", 9_714, 46_985, 48_669, None);
+        let event = obs.snapshot().last_event.expect("recache recorded");
+        assert_eq!(event.event_kind, RecacheEventKind::Drift);
+        assert_eq!(
+            event.attribution_reason.as_deref(),
+            Some("forwarded_beta_rotated")
+        );
+        assert_eq!(event.origin.as_deref(), Some("client"));
+        assert_eq!(event.scope.as_deref(), Some("cache_key"));
+        assert!(event.beta_changed, "beta digest moved between turns");
+        assert!(
+            !event.markers_changed,
+            "marker layout held still between turns"
+        );
+        assert_eq!(event.forward_beta.as_deref(), Some("beta-bbb"));
+    }
+
+    /// A forwarded-model flap between two turns of one stream is flagged on
+    /// A forwarded-model flap between two turns of one stream is flagged on
+    /// the event as a witness only — unranked until a first real instance is
+    /// measured (2026-09-17: zero flaps in-window). The router can rewrite
+    /// the model after the compared fingerprint is taken, so only this
+    /// post-router value says what the provider keyed on.
+    #[test]
+    fn a_forwarded_model_flap_between_turns_is_flagged_not_ranked() {
+        let _guard = super::tests::miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        obs.begin_request("m1", "conv-mod".into(), None, None, Some(fp(20)));
+        obs.note_forward_witnesses(
+            "m1",
+            "beta-aaa".into(),
+            "sys[1]:1h,m19:1h".into(),
+            "claude-opus-5".into(),
+        );
+        obs.complete("m1", 10_000, 46_985, 55_557, None);
+        obs.begin_request("m2", "conv-mod".into(), None, None, Some(fp(22)));
+        obs.note_forward_witnesses(
+            "m2",
+            "beta-aaa".into(),
+            "sys[1]:1h,m19:1h".into(),
+            "claude-sonnet-5".into(),
+        );
+        obs.complete("m2", 9_714, 0, 48_669, None);
+        let event = obs.snapshot().last_event.expect("recache recorded");
+        assert!(event.model_changed, "forwarded model moved between turns");
+        assert_eq!(event.forward_model.as_deref(), Some("claude-sonnet-5"));
+        assert!(
+            !event.beta_changed,
+            "beta held still: this is a model flap, not a rotation"
+        );
+        assert_eq!(
+            event.attribution_reason.as_deref(),
+            Some("no_cause_found"),
+            "witness only — unranked until a first real flap is measured"
+        );
     }
 
     /// Noting a skip for a request the observer never parked must not panic or
@@ -5497,6 +6652,7 @@ mod first_turn_attribution_tests {
             message_zero_hash: Some(hash.into()),
             compaction_restart: compaction,
             model: Some("claude-sonnet-5".into()),
+            ..Default::default()
         }
     }
 
@@ -5517,6 +6673,31 @@ mod first_turn_attribution_tests {
         obs.begin_request(rid, conv.into(), Some(&format!("sess-{conv}")), None, None);
         obs.note_first_turn_context(rid, c);
         obs.complete(rid, 300, 0, creation, None);
+    }
+
+    fn fp_msgs(stable_msgs: usize) -> PrefixFingerprint {
+        PrefixFingerprint {
+            head: "head".into(),
+            head_model: "m".into(),
+            head_system: "s".into(),
+            head_tools: "t".into(),
+            body: "body".into(),
+            stable: format!("stable-{stable_msgs}"),
+            stable_msgs,
+        }
+    }
+
+    /// Run `f` against a fresh observer and return every
+    /// `first_turn_prefix_diagnostic` line it emitted.
+    fn diagnostic_lines(f: impl FnOnce(&UsageObserver)) -> Vec<String> {
+        let cap = Arc::new(StdMutex::new(Captured::default()));
+        let sub = tracing_subscriber::registry().with(CaptureFields(cap.clone()));
+        tracing::subscriber::with_default(sub, || f(&UsageObserver::new()));
+        let lines = cap.lock().unwrap().lines.clone();
+        lines
+            .into_iter()
+            .filter(|l| l.contains("first_turn_prefix_diagnostic"))
+            .collect()
     }
 
     #[test]
@@ -5550,6 +6731,49 @@ mod first_turn_attribution_tests {
         assert_eq!(
             first_turn_reason(&ctx(9, "h", false), None, true),
             "arrived_with_history"
+        );
+    }
+
+    #[test]
+    fn diagnostic_fires_for_every_first_turn_classification() {
+        let lines = diagnostic_lines(|obs| {
+            // A tracked stream exists, but the short turn matches none of
+            // them: FirstTurn with streams_tracked == 1, the shape
+            // `first_turn_write_observed` never sees.
+            obs.begin_request("d1", "conv-d".into(), None, None, Some(fp_msgs(40)));
+            obs.note_first_turn_context("d1", ctx(40, "h40", false));
+            obs.complete("d1", 300, 0, 50_000, None);
+            obs.begin_request("d2", "conv-d".into(), None, None, Some(fp_msgs(2)));
+            obs.note_first_turn_context("d2", ctx(1, "h1", false));
+            obs.note_billed_totals("d2", 310, 5_000, 52_000);
+            obs.complete("d2", 300, 0, 50_000, None);
+            // A continuation of the tracked stream: healthy, no diagnostic.
+            obs.begin_request("d3", "conv-d".into(), None, None, Some(fp_msgs(41)));
+            obs.note_first_turn_context("d3", ctx(41, "h41", false));
+            obs.complete("d3", 300, 40_000, 5_000, None);
+        });
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let d2 = lines
+            .iter()
+            .find(|l| l.contains("request_id=d2"))
+            .expect("tracked first turn measured");
+        for field in [
+            "msgs=1 ",
+            "outer_cache_write=50000",
+            "rounds_input_tokens=10",
+            "rounds_cache_read=5000",
+            "rounds_cache_write=2000",
+            "outer_write_5m=-1",
+            "tool_choice=absent",
+            "thinking=absent",
+            "effort=absent",
+            "opens_with_scaffolding=false",
+        ] {
+            assert!(d2.contains(field), "{field} missing: {d2}");
+        }
+        assert!(
+            !lines.iter().any(|l| l.contains("request_id=d3")),
+            "healthy turns emit nothing: {lines:?}"
         );
     }
 
@@ -5711,6 +6935,11 @@ mod stabilization_meter_tests {
     fn hot(head: &str) -> PrefixFingerprint {
         PrefixFingerprint {
             head: head.into(),
+            // Mirror the head so a hot-zone change moves the components with
+            // it; short hex strings parse the same way `complete` parses them.
+            head_model: head.into(),
+            head_system: head.into(),
+            head_tools: head.into(),
             body: "body".into(),
             stable: "stable".into(),
             stable_msgs: 4,
@@ -5825,6 +7054,11 @@ mod stock_baseline_tests {
     fn hot(head: &str) -> PrefixFingerprint {
         PrefixFingerprint {
             head: head.into(),
+            // Mirror the head so a hot-zone change moves the components with
+            // it; short hex strings parse the same way `complete` parses them.
+            head_model: head.into(),
+            head_system: head.into(),
+            head_tools: head.into(),
             body: "body".into(),
             stable: "stable".into(),
             stable_msgs: 4,
@@ -6082,6 +7316,9 @@ mod stock_baseline_tests {
         fn lane_fp(msgs: usize) -> PrefixFingerprint {
             PrefixFingerprint {
                 head: "aaaa".into(),
+                head_model: "m".into(),
+                head_system: "s".into(),
+                head_tools: "t".into(),
                 body: "body".into(),
                 stable: "stable".into(),
                 stable_msgs: msgs,
@@ -6142,5 +7379,85 @@ mod stock_baseline_tests {
             "{}",
             s.vs_stock_saving_pct
         );
+    }
+
+    /// Bytes we added scale the stock prompt down, symmetrically with how
+    /// removed bytes scale it up. Injections (recall, proactive expansion)
+    /// make the forwarded body larger than what the client sent; pricing
+    /// stock at our inflated size would report no difference where we
+    /// added real cost.
+    #[test]
+    fn bytes_we_added_scale_the_stock_prompt_down() {
+        let obs = UsageObserver::new();
+
+        // Client sent 1 KB, we forwarded 2 KB: the stock prompt is half ours.
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 1_000, 2_000, "on");
+        obs.complete("r1", 100, 0, 10_000, None);
+
+        let s = obs.snapshot();
+        // Ours: 100 fresh + 10_000 written at 1.25x.
+        assert_eq!(s.ours_effective_tokens, 12_600);
+        // Stock: 5_050 prompt, 100 fresh tail kept, 4_950 rebuilt at 1.25x.
+        assert_eq!(s.stock_effective_tokens, 6_288);
+        assert!(
+            s.vs_stock_saving_pct < 0.0,
+            "doubling the wire size with no cache benefit is a loss, not par: {}",
+            s.vs_stock_saving_pct
+        );
+    }
+
+    /// Translated (non-Anthropic-billed) turns stay out of the comparison.
+    /// They report no creation counter and no TTL split, and their provider
+    /// charges no Anthropic write premium — pricing them at 1.25x/2.0x
+    /// invents cost the bill never had. The watchdog still books them.
+    #[test]
+    fn ineligible_turns_skip_the_stock_arm_but_keep_the_watchdog() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_stock_ineligible("r1");
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        obs.complete("r1", 100, 0, 10_000, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.stock_turns_compared, 0);
+        assert_eq!(s.vs_stock_saving_pct, 0.0);
+        assert_eq!(s.vs_stock_saving_pct_recent, None);
+        assert_eq!(s.vs_stock_turns_recent, 0);
+        // The watchdog still saw it: one capable sample in the hit-rate
+        // window, even though the stock arm booked nothing.
+        assert_eq!(s.samples, 1);
+    }
+
+    /// An ineligible turn between two compared turns of one stream must not
+    /// reset the eligible lineage: the next compared turn prices against
+    /// the footprint the last compared turn filed, not a zero.
+    #[test]
+    fn an_ineligible_turn_does_not_reset_the_eligible_lineage() {
+        let obs = UsageObserver::new();
+
+        obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+        obs.complete("r1", 100, 0, 10_000, None);
+
+        obs.begin_request("r2", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_stock_ineligible("r2");
+        obs.note_wire_bytes("r2", 1_000, 1_000, "off");
+        // No growth on the ineligible turn, so the footprints on either
+        // side agree and the carry-forward is exactly observable.
+        obs.complete("r2", 100, 10_000, 0, None);
+
+        obs.begin_request("r3", "conv".into(), None, None, Some(hot("aaaa")));
+        obs.note_wire_bytes("r3", 1_000, 1_000, "off");
+        obs.complete("r3", 100, 10_000, 200, None);
+
+        let s = obs.snapshot();
+        assert_eq!(s.stock_turns_compared, 2);
+        assert_eq!(s.vs_stock_turns_recent, 2);
+        // r3 reads the 10_000 footprint r1 filed, carried through r2: both
+        // arms price 100 + 1_000 + 250, so the comparison is par.
+        assert_eq!(s.ours_effective_tokens, s.stock_effective_tokens);
+        assert_eq!(s.vs_stock_saving_pct, 0.0);
     }
 }

@@ -1177,7 +1177,10 @@ pub fn apply_to_anthropic_body_with_cooldowns(
         true
     });
     tracing::info!(
+        event = "model_routing_decision",
         request_id = %request_id,
+        from_model = %model,
+        to_model = %decision.routed_model,
         reason = %decision.reason,
         "model routing decision"
     );
