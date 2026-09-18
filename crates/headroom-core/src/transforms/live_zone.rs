@@ -4311,6 +4311,12 @@ pub fn compress_openai_responses_live_zone_with_config(
         let command = match type_tag {
             "function_call" => item.get("arguments").map(tool_call_command_text),
             "local_shell_call" => item.get("action").map(tool_call_command_text),
+            // NOTE: no `custom_tool_call` arm (Codex `exec`): its outputs
+            // (`custom_tool_call_output`) are not compression candidates on
+            // any layer, so there is nothing to protect yet. If that type
+            // ever becomes a candidate, wire read protection through
+            // `read_protection::custom_tool_call_commands` (which parses
+            // `tools.exec_command({"cmd": …})` scripts) before compressing.
             _ => None,
         };
         if let (Some(command), Some(call_id)) =

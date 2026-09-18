@@ -161,6 +161,51 @@ pub fn tool_call_command_text(raw: &Value) -> String {
     }
 }
 
+/// Extract shell commands from a Codex code-mode `exec` custom tool call.
+///
+/// Codex sends shell commands as a Responses `custom_tool_call` named `exec`
+/// whose `input` is a JavaScript snippet rather than JSON arguments:
+///
+/// ```js
+/// const r = await tools.exec_command({"cmd": "sed -n '1,80p' f.py"});
+/// ```
+///
+/// Returns every `cmd` passed to `exec_command`, in order. Returns empty
+/// when the input is not that shape; an argument object that is not strict
+/// JSON is skipped, which leaves the output compressible exactly as before
+/// (ports upstream `_custom_tool_call_commands`).
+pub fn custom_tool_call_commands(script: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\bexec_command\s*\(").expect("valid"));
+    if !script.contains("exec_command") {
+        return Vec::new();
+    }
+    let mut commands = Vec::new();
+    let mut pos = 0;
+    while let Some(m) = re.find_at(script, pos) {
+        pos = m.end();
+        let rest = &script[pos..];
+        let brace = match rest.find('{') {
+            Some(i) => i,
+            None => continue,
+        };
+        // Only whitespace may sit between `(` and the argument object.
+        if !rest[..brace].trim().is_empty() {
+            continue;
+        }
+        let mut stream = serde_json::Deserializer::from_str(&rest[brace..]).into_iter::<Value>();
+        let args = match stream.next() {
+            Some(Ok(v)) => v,
+            _ => continue,
+        };
+        let command = tool_call_command_text(&args);
+        if !command.is_empty() {
+            commands.push(command);
+        }
+    }
+    commands
+}
+
 /// True when a shell command's output is raw file content the agent will
 /// patch from — `cat`/`head`/`tail`/`nl`/`less`/`more` of a file, or `sed -n`
 /// printing a range.
@@ -358,5 +403,31 @@ mod tests {
         assert!(read_output_should_be_protected(
             "name: build\non:\n  push:\n    branches: [main]\njobs:\n  test:\n    runs-on: ubuntu\n"
         ));
+    }
+
+    /// Codex code-mode `exec` input is JavaScript calling
+    /// `tools.exec_command({"cmd": …})` (upstream #3621). Every `cmd`
+    /// comes back in order.
+    #[test]
+    fn custom_tool_call_commands_parses_codex_exec_input() {
+        let script = "const r0 = await tools.exec_command({\"cmd\": \"sed -n '1,80p' f.py\", \"workdir\": \"/repo\"});\n\
+                      text(r0.output);\n\
+                      const r1 = await tools.exec_command({\"cmd\": \"cat g.py\"});\n\
+                      text(r1.output);";
+        assert_eq!(
+            custom_tool_call_commands(script),
+            vec!["sed -n '1,80p' f.py".to_string(), "cat g.py".to_string()]
+        );
+    }
+
+    #[test]
+    fn custom_tool_call_commands_ignores_other_shapes() {
+        assert!(custom_tool_call_commands("").is_empty());
+        assert!(custom_tool_call_commands("*** Begin Patch\n*** Update File: f.py\n").is_empty());
+        // Not strict JSON: skipped, output stays compressible as before.
+        assert!(custom_tool_call_commands("tools.exec_command(notJson)").is_empty());
+        assert!(custom_tool_call_commands("tools.exec_command({cmd: 'cat f'})").is_empty());
+        // No exec_command call at all.
+        assert!(custom_tool_call_commands(r#"{"command": "cat f"}"#).is_empty());
     }
 }
