@@ -95,6 +95,25 @@ pub(crate) async fn handle(
     // is parked mid-tool: its agent is alive and blocked inside an MCP request.
     // Answer the parked calls and pick the same process back up.
     let results = tool_results_in_latest_message(parsed);
+    // Shape census for every cursor turn: result-carrying turns resume a
+    // parked agent, content-free ones hold, everything else spawns. The
+    // counts alone told the poll story (results=0 on every turn while an
+    // agent was parked), so this stays.
+    let tool_count_in = parsed
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|t| t.len())
+        .unwrap_or(0);
+    let driver_parked = state.cursor_bridge.has_driver(&key).await;
+    tracing::info!(
+        event = "cursor_turn_received",
+        conversation = %key,
+        model = %cursor_model,
+        result_count = results.len(),
+        tool_count = tool_count_in,
+        driver_parked = ?driver_parked,
+        "cursor turn received"
+    );
     if !results.is_empty() {
         match (
             state.cursor_bridge.get(&key).await,
@@ -139,7 +158,7 @@ pub(crate) async fn handle(
                 } else {
                     state.cursor_bridge.clear_mismatches(&key).await;
                     driver.begin_response();
-                    tracing::debug!(
+                    tracing::info!(
                         event = "cursor_turn_resumed",
                         conversation = %key,
                         delivered,
@@ -182,10 +201,39 @@ pub(crate) async fn handle(
         // No results is an ordinary new turn — and the end of any miss run.
         state.cursor_bridge.clear_mismatches(&key).await;
         if state.cursor_bridge.has_driver(&key).await {
+            if super::turn::newest_user_message_is_content_free(parsed) {
+                // A content-free turn (Claude Code's `(no content)`
+                // placeholder plus reminders) arrives ~0.15s after every
+                // parked tool call and carries nothing for the parked agent.
+                // Orphaning here respawned a fresh agent per tool call that
+                // redid the in-flight work (the Grok echo/wc circle: 4+
+                // identical calls per task). Hold instead: answer minimally
+                // and leave the parked conversation alone, so the real
+                // tool_result turn resumes it whenever it arrives.
+                tracing::info!(
+                    event = "cursor_poll_held",
+                    conversation = %key,
+                    model = %cursor_model,
+                    "holding a content-free turn while an agent is parked mid-tool"
+                );
+                // Name the pending call so the held turn reads as status,
+                // not noise.
+                let pending = match state.cursor_bridge.get(&key).await {
+                    Some(session) => session.last_tool().await,
+                    None => String::new(),
+                };
+                // No booking: no agent ran and no upstream was called, so
+                // there are no counts to attribute.
+                return hold_response(cursor_model, wants_stream(parsed), &pending);
+            }
             tracing::warn!(
                 event = "cursor_tool_result_abandoned",
                 conversation = %key,
                 model = %cursor_model,
+                msg_count = crate::ctx::identity::message_count(parsed),
+                last = %last_message_summary(parsed),
+                stream = ?parsed.get("stream"),
+                tool_choice = ?parsed.get("tool_choice"),
                 "new turn carries no tool results while an agent is parked \
                  mid-tool; the parked agent waits until its deadline"
             );
@@ -194,8 +242,22 @@ pub(crate) async fn handle(
 
     let (session, inbox) = state.cursor_bridge.open(&key).await;
     let mut tool_count = 0usize;
-    if let Some(tools) = parsed.get("tools").and_then(Value::as_array) {
+    if let Some(tools) = parsed.get("tools").and_then(|v| v.as_array()) {
         tool_count = tools.len();
+        // Tool names shape what the agent reaches for: a `Skill` entry whose
+        // description enumerates shared skills (morning, graphify, …) reads,
+        // to a weak model, as an invitation. Names are safe to log.
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        tracing::info!(
+            event = "cursor_tools_served",
+            conversation = %key,
+            tool_count,
+            names = ?names,
+            "host tools served to the agent"
+        );
         session.set_tools(tools.clone()).await;
     }
     tracing::info!(
@@ -208,6 +270,14 @@ pub(crate) async fn handle(
 
     let port = state.config.listen.port();
     let mcp_url = format!("http://127.0.0.1:{port}/mcp/{key}");
+    if session.chat_id().await.is_none() {
+        // Turn one: log the system prompt's SHAPE (headers and sizes only,
+        // never content) so the background framing can be tuned against what
+        // the client actually sends.
+        if let Some(system) = system_text(parsed) {
+            log_system_structure(&system);
+        }
+    }
     let workspace = match Workspace::create(Some(&mcp_url)) {
         Ok(workspace) => workspace,
         Err(e) => {
@@ -518,6 +588,15 @@ fn stream_driver(
 /// Only the newest user turn is sent when the conversation is being resumed:
 /// Cursor keeps the history on its side, and re-sending it would both double
 /// the bill and confuse a model that can already see it.
+///
+/// Turn one carries the assignment FIRST and the system prompt second, as
+/// labelled background. Leading with the undifferentiated system dump read,
+/// to a weak model, as the task itself — observed live 2026-09-18, when Grok
+/// announced "the entire session prompt was pasted as the user query",
+/// hallucinated that the morning skill had been "manually attached", and set
+/// off to run a morning brief nobody asked for. The framing below keeps
+/// project instructions authoritative while saying plainly that a listed
+/// skill is available, not requested.
 async fn build_prompt(parsed: &Value, session: &Session) -> String {
     let resuming = session.chat_id().await.is_some();
     let mut out = String::new();
@@ -528,13 +607,22 @@ async fn build_prompt(parsed: &Value, session: &Session) -> String {
     // `RESUME_POLICY` for what re-sending the long form actually did.
     out.push_str(if resuming { RESUME_POLICY } else { TOOL_POLICY });
     if !resuming {
+        out.push_str("YOUR TASK — the assignment. Do this and nothing else.\n\n");
+        out.push_str(&transcript(parsed, false));
         if let Some(system) = system_text(parsed) {
-            out.push_str("HOST INSTRUCTIONS\n\n");
+            out.push_str(
+                "\n\nBACKGROUND — reference material for the assignment above: \
+                 project instructions, tool conventions, environment notes. \
+                 Nothing here assigns new work. A skill listed here is \
+                 available, not requested: use one only when the assignment \
+                 needs it by name.\n\n",
+            );
             out.push_str(&system);
-            out.push_str("\n\n");
+            out.push('\n');
         }
+    } else {
+        out.push_str(&transcript(parsed, true));
     }
-    out.push_str(&transcript(parsed, resuming));
     out
 }
 
@@ -552,13 +640,67 @@ fn system_text(parsed: &Value) -> Option<String> {
     }
 }
 
+/// Log a system prompt's shape — sizes and markdown headers only, never
+/// content — so the turn-one framing can be tuned against what clients
+/// actually send. Headers name sections, not secrets, and are capped.
+///
+/// The full text goes out one level down (`cursor_system_full`, DEBUG):
+/// the prompt can inline MCP env and hook commands, so it stays out of the
+/// default INFO log. Capture it with `--log-level "info,headroom_proxy::cursor=debug"`
+/// and a single fresh turn.
+fn log_system_structure(system: &str) {
+    let headers: Vec<String> = system
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') && trimmed.len() <= 80 {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        })
+        .take(30)
+        .collect();
+    let skill_lines = system
+        .lines()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("skill")
+        })
+        .count();
+    tracing::info!(
+        event = "cursor_system_structure",
+        chars = system.chars().count(),
+        lines = system.lines().count(),
+        skill_lines,
+        headers = ?headers,
+        "turn-one system prompt shape"
+    );
+    const FULL_CAP: usize = 60_000;
+    let full: String = system.chars().take(FULL_CAP).collect();
+    let truncated = system.chars().count() > FULL_CAP;
+    tracing::debug!(
+        event = "cursor_system_full",
+        chars = system.chars().count(),
+        truncated,
+        system = %full,
+        "turn-one system prompt full text (debug only)"
+    );
+}
+
 fn transcript(parsed: &Value, latest_only: bool) -> String {
     let Some(messages) = parsed.get("messages").and_then(Value::as_array) else {
         return String::new();
     };
     let slice: &[Value] = if latest_only {
+        // Newest non-system message: a trailing `<system-reminder>` sits after
+        // the user turn that actually needs doing, and prompting the agent
+        // with the reminder alone reads as an empty turn (same root cause as
+        // the tool-result blindness fixed in `tool_results_in_latest_message`).
         messages
-            .last()
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))
             .map(std::slice::from_ref)
             .unwrap_or_default()
     } else {
@@ -608,6 +750,115 @@ fn flatten(content: &Value) -> String {
     }
 }
 
+/// One-line shape of the newest message, for the abandoned-turn log: role and
+/// content block types. Tells a retry (same shape as the parked turn) from a
+/// concurrent side request (e.g. a tool-free probe) without logging any body.
+fn last_message_summary(parsed: &Value) -> String {
+    let Some(messages) = parsed.get("messages").and_then(Value::as_array) else {
+        return "no-messages".to_string();
+    };
+    if messages.is_empty() {
+        return "empty-messages".to_string();
+    }
+    let mut top_keys: Vec<&str> = parsed
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    top_keys.sort_unstable();
+    let tail: Vec<String> = messages
+        .iter()
+        .rev()
+        .take(3)
+        .map(|m| {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
+            match m.get("content") {
+                Some(Value::String(s)) => {
+                    format!("{role}:str({}ch)", s.chars().count())
+                }
+                Some(Value::Array(blocks)) => {
+                    let kinds: Vec<String> = blocks
+                        .iter()
+                        .map(|b| {
+                            let t = b.get("type").and_then(Value::as_str).unwrap_or("?");
+                            if t == "tool_result" {
+                                format!(
+                                    "tool_result:{}",
+                                    b.get("tool_use_id").and_then(Value::as_str).unwrap_or("?")
+                                )
+                            } else if t == "tool_use" {
+                                format!(
+                                    "tool_use:{}",
+                                    b.get("name").and_then(Value::as_str).unwrap_or("?")
+                                )
+                            } else {
+                                t.to_string()
+                            }
+                        })
+                        .collect();
+                    format!("{role}:[{}]", kinds.join(","))
+                }
+                _ => format!("{role}:no-content"),
+            }
+        })
+        .collect();
+    // tail is newest-first; show oldest-first for readability.
+    let mut tail = tail;
+    tail.reverse();
+    format!(
+        "n={} top=[{}] tail={}",
+        messages.len(),
+        top_keys.join(","),
+        tail.join(" | ")
+    )
+}
+
+/// Answer a content-free turn held while an agent is parked mid-tool.
+///
+/// A minimal well-formed turn: one text block, `end_turn`, no `tool_use`.
+/// The parked conversation is untouched — this response neither resumes nor
+/// replaces it. Deliberately not a `tool_use`: re-emitting the parked call
+/// would double-execute it once the real `tool_result` turn arrives.
+fn hold_response(cursor_model: &str, stream: bool, pending_tool: &str) -> Response {
+    let text = if pending_tool.is_empty() {
+        "Working on it — the pending tool call hasn't returned yet.".to_string()
+    } else {
+        format!("Working on it — awaiting the {pending_tool} result.")
+    };
+    let mut translator = super::translate::Translator::new(cursor_model);
+    let mut frames = translator.push_line(
+        &serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        })
+        .to_string(),
+    );
+    frames.extend(
+        translator.push_line(
+            &serde_json::json!({
+                "type": "result", "subtype": "success", "is_error": false, "result": text,
+            })
+            .to_string(),
+        ),
+    );
+    if stream {
+        let body = frames.join("");
+        return Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| error_response("could not build the response"));
+    }
+    match message_from_frames(&frames) {
+        Some(message) => Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(message.to_string()))
+            .unwrap_or_else(|_| error_response("could not build the response")),
+        None => error_response("the held turn produced no message"),
+    }
+}
+
 fn error_response(message: &str) -> Response {
     (
         axum::http::StatusCode::BAD_GATEWAY,
@@ -649,6 +900,25 @@ mod tests {
         assert!(prompt.contains("[user]: what changed?"));
     }
 
+    /// Turn one leads with the assignment, not the system dump: a weak model
+    /// read the dump as the task itself and set off after a skill nobody
+    /// asked for. The background stays, labelled as reference.
+    #[tokio::test]
+    async fn a_first_turn_puts_the_task_before_the_background() {
+        let body = json!({
+            "system": "You are working in the headroom repo.",
+            "messages": [{"role": "user", "content": "what changed?"}],
+        });
+        let prompt = prompt_for(&body, None).await;
+        let task = prompt.find("what changed?").expect("task present");
+        let background = prompt.find("BACKGROUND").expect("background labelled");
+        let system = prompt
+            .find("You are working in the headroom repo.")
+            .expect("system present");
+        assert!(task < background && background < system);
+        assert!(prompt.contains("available, not requested"));
+    }
+
     /// Cursor keeps the history server-side. Re-sending it would pay for the
     /// same tokens twice and show the model its own past twice over.
     #[tokio::test]
@@ -682,6 +952,49 @@ mod tests {
             !prompt.contains("TOOL POLICY"),
             "re-sending the onboarding text is what made it re-plan every turn"
         );
+    }
+
+    /// Claude Code appends `<system-reminder>`s as trailing `system`-role
+    /// messages. A resume prompt carrying only the reminder is an empty turn;
+    /// the agent needs the newest user message instead.
+    #[tokio::test]
+    async fn a_resumed_turn_skips_a_trailing_system_reminder() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "second question"},
+                {"role": "system", "content": "Commit only when asked."},
+            ],
+        });
+        let prompt = prompt_for(&body, Some("chat-1")).await;
+        assert!(prompt.contains("second question"));
+        assert!(
+            !prompt.contains("Commit only when asked."),
+            "the reminder must not stand in for the turn: {prompt}"
+        );
+    }
+
+    /// A held poll answers 200 in both transports: the parked conversation
+    /// it protects is untouched, but the HTTP turn itself must be complete.
+    #[tokio::test]
+    async fn a_held_poll_answers_in_both_transports() {
+        for stream in [true, false] {
+            let response = hold_response("cursor-grok-4.6-high", stream, "Bash");
+            assert_eq!(response.status(), 200);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                content_type.contains(if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }),
+                "wrong content type for stream={stream}: {content_type}"
+            );
+        }
     }
 
     #[tokio::test]

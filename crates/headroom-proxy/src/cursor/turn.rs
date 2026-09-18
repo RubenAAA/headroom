@@ -137,13 +137,27 @@ impl Conversation {
 /// entire history every turn, and answering an id from ten turns ago would push
 /// a stale result into a call parked now. Only the newest message can hold the
 /// answer to the call this conversation is actually blocked on.
+///
+/// Trailing `system`-role messages are skipped: Claude Code appends its
+/// `<system-reminder>`s *after* the newest user message — including after one
+/// carrying `tool_result` blocks. Reading only `messages.last()` went blind on
+/// exactly those turns: the result sat one slot back, the turn misread as
+/// result-free, the parked agent was orphaned and a fresh one respawned that
+/// redid the work (the Grok circle of 2026-09-17: the same `wc -l` three
+/// times). Anything else stops the scan: past a non-system message, only the
+/// newest user message counts.
 pub(crate) fn tool_results_in_latest_message(
     body: &Value,
 ) -> Vec<(String, super::bridge::ToolOutcome)> {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return Vec::new();
     };
-    let Some(last) = messages.last() else {
+    let Some(last) = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    else {
         return Vec::new();
     };
     let Some(blocks) = last.get("content").and_then(Value::as_array) else {
@@ -166,6 +180,53 @@ pub(crate) fn tool_results_in_latest_message(
             ))
         })
         .collect()
+}
+
+/// Whether the newest user message carries no content: empty text, or Claude
+/// Code's literal `(no content)` placeholder, which it sends (with trailing
+/// system reminders) on turns that repeat no prior block — observed arriving
+/// ~0.15s after every parked tool call on the cursor path. Such a turn is not
+/// a new turn and must not orphan the parked agent.
+pub(crate) fn newest_user_message_is_content_free(body: &Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(user) = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return false;
+    };
+    let text: String = match user.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => {
+            // A result turn is never content-free, even though its blocks are
+            // not `text`. (The resume path runs before this check, so this is
+            // belt and braces.)
+            if blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                return false;
+            }
+            blocks
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(Value::as_str) == Some("text") {
+                        b.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        }
+        _ => return false,
+    };
+    let trimmed = text.trim();
+    trimmed.is_empty() || trimmed == "(no content)"
 }
 
 /// The text of a `tool_result`, which Claude Code writes either as a bare
@@ -240,11 +301,81 @@ mod tests {
         assert_eq!(got[0].0, "new");
     }
 
+    /// Claude Code appends `<system-reminder>`s as trailing `system`-role
+    /// messages after the newest user message — including after one carrying
+    /// `tool_result` blocks. The result sits one slot back; reading only the
+    /// last message orphaned the parked agent and respawned one that redid
+    /// the work (the Grok circle of 2026-09-17).
+    #[test]
+    fn a_tool_result_followed_by_a_system_reminder_is_still_read() {
+        let body = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "…"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "fresh"}]},
+            {"role": "system", "content": "Commit or push only when the user asks."}
+        ]});
+        let got = tool_results_in_latest_message(&body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "t");
+    }
+
+    #[test]
+    fn several_trailing_system_messages_are_all_skipped() {
+        let body = json!({"messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "fresh"}]},
+            {"role": "system", "content": "reminder one"},
+            {"role": "system", "content": [{"type": "text", "text": "reminder two"}]}
+        ]});
+        let got = tool_results_in_latest_message(&body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "t");
+    }
+
+    /// Past a trailing non-system message the scan stops: an assistant turn
+    /// after the user message means the user message is history, not the
+    /// answer to the call parked now.
+    #[test]
+    fn a_trailing_assistant_message_stops_the_scan() {
+        let body = json!({"messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "old", "content": "stale"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "…"}]},
+            {"role": "system", "content": "reminder"}
+        ]});
+        assert!(tool_results_in_latest_message(&body).is_empty());
+    }
+
     #[test]
     fn a_turn_with_no_tool_results_yields_none() {
         let body = json!({"messages": [{"role": "user", "content": "just a question"}]});
         assert!(tool_results_in_latest_message(&body).is_empty());
         assert!(tool_results_in_latest_message(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_placeholder_user_message_is_content_free() {
+        let body = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "working"}]},
+            {"role": "user", "content": "(no content)"},
+            {"role": "system", "content": "Concise output style is active."}
+        ]});
+        assert!(newest_user_message_is_content_free(&body));
+    }
+
+    #[test]
+    fn a_real_user_turn_is_not_content_free() {
+        let body = json!({"messages": [
+            {"role": "user", "content": "do the thing"},
+            {"role": "system", "content": "reminder"}
+        ]});
+        assert!(!newest_user_message_is_content_free(&body));
+    }
+
+    #[test]
+    fn a_tool_result_turn_is_not_content_free() {
+        let body = json!({"messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "out"}]},
+            {"role": "system", "content": "reminder"}
+        ]});
+        assert!(!newest_user_message_is_content_free(&body));
     }
 
     #[test]

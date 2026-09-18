@@ -421,6 +421,15 @@ fn completed_tool_text(event: &Value) -> Option<String> {
     if name == "mcp" {
         return None;
     }
+    // Tool discovery is scaffolding, not work: the agent lists the host tools
+    // before every real call, and surfacing the listing pastes every tool
+    // schema into the transcript as model-visible text. Seen live as
+    // "[cursor getMcpTools result]" followed by the whole Bash description on
+    // a Grok turn that then re-ran the same call instead of answering.
+    let lower = name.to_lowercase();
+    if lower.contains("mcp") || lower.contains("discover") || lower.contains("gettools") {
+        return None;
+    }
     let content = payload.pointer("/result/success/content")?;
     let body = flatten_result_content(content)?;
     if body.trim().is_empty() {

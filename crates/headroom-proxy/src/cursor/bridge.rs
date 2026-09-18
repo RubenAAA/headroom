@@ -58,6 +58,16 @@ impl ToolOutcome {
     }
 }
 
+/// Process-wide tool-call counter for Anthropic `tool_use` ids.
+///
+/// Was per-`Session`, and a `Session` is per-turn state recreated by every
+/// fresh spawn — so each respawn re-minted `toolu_cursor_00000000` and the
+/// transcript filled with identical ids. Worse, a stale `tool_result` for the
+/// old call then answered the new call parked under the same id, feeding one
+/// turn's data to another turn's agent. A global counter keeps every id
+/// unique across turns and conversations of this process.
+static NEXT_CALL: AtomicU64 = AtomicU64::new(0);
+
 /// One conversation's worth of bridge state.
 pub(crate) struct Session {
     /// Exactly what the request in flight advertised. Replaced each turn:
@@ -72,8 +82,9 @@ pub(crate) struct Session {
     /// Cursor's chat id, once a turn has reported one. `--resume` takes this,
     /// and it is what keeps the history on Cursor's side instead of ours.
     chat_id: Mutex<Option<String>>,
-    /// Monotonic within a session — enough to make a `tool_use` id unique.
-    next_call: AtomicU64,
+    /// Name of the most recently parked tool, for status reporting while it
+    /// is in flight (e.g. naming the pending call a held turn waits on).
+    last_tool: Mutex<String>,
 }
 
 impl std::fmt::Debug for Session {
@@ -90,7 +101,7 @@ impl Session {
             outbox,
             waiting: Mutex::new(HashMap::new()),
             chat_id: Mutex::new(None),
-            next_call: AtomicU64::new(0),
+            last_tool: Mutex::new(String::new()),
         });
         (session, inbox)
     }
@@ -101,6 +112,10 @@ impl Session {
 
     pub(crate) async fn chat_id(&self) -> Option<String> {
         self.chat_id.lock().await.clone()
+    }
+
+    pub(crate) async fn last_tool(&self) -> String {
+        self.last_tool.lock().await.clone()
     }
 
     pub(crate) async fn set_chat_id(&self, id: String) {
@@ -144,8 +159,9 @@ impl Session {
     /// request open while this turn ends and the next one begins, which is what
     /// lets a tool run in a different process from the model that asked for it.
     async fn park(&self, name: &str, args: Value) -> ToolOutcome {
-        let n = self.next_call.fetch_add(1, Ordering::Relaxed);
+        let n = NEXT_CALL.fetch_add(1, Ordering::Relaxed);
         let id = format!("toolu_cursor_{n:08}");
+        *self.last_tool.lock().await = name.to_string();
         let (tx, rx) = oneshot::channel();
         self.waiting.lock().await.insert(id.clone(), tx);
 
@@ -729,6 +745,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply["error"]["code"], -32601);
+    }
+
+    /// The parked tool's name backs the held-turn status line, so it must be
+    /// recorded even when the call itself goes nowhere.
+    #[tokio::test]
+    async fn the_parked_tool_name_is_remembered() {
+        let (session, inbox) = Bridge::new().open("c1").await;
+        assert_eq!(session.last_tool().await, "");
+        drop(inbox);
+        let _ = handle_rpc(
+            &session,
+            &rpc("tools/call", json!({"name": "Bash", "arguments": {}})),
+        )
+        .await;
+        assert_eq!(session.last_tool().await, "Bash");
     }
 
     #[tokio::test]
