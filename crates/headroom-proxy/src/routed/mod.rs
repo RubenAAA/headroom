@@ -10,6 +10,7 @@ pub(crate) mod response_arms;
 pub(crate) mod retry;
 pub(crate) mod routing;
 pub(crate) mod sidecar;
+pub(crate) mod tool_alias;
 pub(crate) mod transforms;
 pub(crate) mod translation;
 pub(crate) mod upstream_gate;

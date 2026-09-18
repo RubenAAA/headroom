@@ -288,6 +288,11 @@ pub(crate) async fn apply_ctx_request_transforms(
             request_id,
             crate::cache_stabilization::cache_ttl::client_ttl_shape(parsed),
         );
+        // Translated turns bill upstream as OpenAI, not Anthropic: no
+        // creation counter, no TTL split, different pricing and retention.
+        // The watchdog still scores them; the Anthropic-priced stock arm
+        // stays out rather than inventing a premium never charged.
+        state.usage_observer.note_stock_ineligible(request_id);
     }
 
     // CTX-2: passive session capture. Read-only — clones the body onto a

@@ -107,17 +107,10 @@ pub(crate) async fn try_routed_sidecar(
         .sidecar_model
         .clone()
         .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
-    // A routed sidecar would carry the client's raw text to a routed upstream
-    // past the redaction stage, which runs later. Skip it while redaction is
-    // on; the direct sidecar path answers instead, on the default upstream.
-    if state.config.redact_sensitive {
-        tracing::info!(
-            event = "sidecar_routed_skipped_redacted",
-            request_id = %request_id,
-            "routed sidecar disabled while redaction is on"
-        );
-        return None;
-    }
+    // Redaction runs ahead of the route (below): the shrunk body carries
+    // placeholders, never raw secrets, so the routed sidecar stays live
+    // while redaction is on. The direct sidecar path remains the fallback
+    // for every failure below.
     let route = sidecar_responses_route(&state.config.model_routes, &sidecar_model)?;
     let target = route.target_model.clone()?;
     let upstream = route.upstream.clone()?;
@@ -239,6 +232,8 @@ pub(crate) async fn try_routed_sidecar(
             None,
             // Sidecars never book: the direct path they fall back to owns
             // the turn's outcome, and a routed attempt must not book twice.
+            None,
+            // A sidecar carries no tools, so there is nothing to rename.
             None,
         );
         // Same close-on-drop as the main routed path: a mid-response death
@@ -452,41 +447,116 @@ mod tests {
     }
 
     /// Redact-then-route: with redaction on, the routed sidecar still runs —
-    /// the shrunk body carries placeholders, not raw secrets. A route that
-    /// fails (here: unreachable upstream) falls back to the direct path.
+    /// the shrunk body carries placeholders, not raw secrets. Proved by
+    /// capture, not by fallback shape: a local listener records the exact
+    /// bytes the routed attempt would have sent (answered 500 so the call
+    /// falls back), and the secret must be absent while a placeholder is
+    /// present. A skip-gate regression fails this (nothing captured at all).
     #[tokio::test]
     async fn redaction_on_still_routes_the_sidecar() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("capture listener");
+        let port = listener.local_addr().expect("port").port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let captured_writer = captured.clone();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let len = head
+                .windows(b"Content-Length:".len())
+                .position(|w| w.eq_ignore_ascii_case(b"Content-Length:"))
+                .and_then(|i| {
+                    std::str::from_utf8(&head[i..])
+                        .ok()?
+                        .lines()
+                        .next()?
+                        .split(':')
+                        .nth(1)?
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len.min(4_000_000)];
+            let mut read = 0;
+            while read < body.len() {
+                match stream.read(&mut body[read..]) {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(_) => break,
+                }
+            }
+            body.truncate(read);
+            *captured_writer.lock().expect("capture") = body;
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let upstream = format!("http://127.0.0.1:{port}");
         let state = crate::test_support::test_state(|c| {
             c.redact_sensitive = true;
             c.sidecar_model = Some("claude-muse-spark-1.3".to_string());
             c.model_routes = vec![crate::config::ProviderRoute {
                 model_prefix: "claude-muse-spark-1.3".to_string(),
                 prefix_match: false,
-                upstream: Some("https://opencode.ai/zen/v1".parse().unwrap()),
+                upstream: Some(upstream.parse().unwrap()),
                 translate: true,
                 cursor_agent: None,
                 target_model: Some("muse-spark-1.3-contributor-free".to_string()),
                 auth_env: None,
             }];
         });
+        // Secret sits in the tail (kept by the shrink) while the describe
+        // block alone opens the last user message (detection reads it there).
         let parsed = json!({
             "model": "claude-opus-5",
-            "messages": [{"role": "user", "content": "hello"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "deploy with aws key AKIAQQQQWWWWEEEERRRR today"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "on it"}]},
+                {"role": "user", "content": [{"type": "text", "text": "Describe your most recent action in 3-5 words using present tense (-ing)."}]},
+            ],
         });
-        // Unreachable upstream: the routed attempt fails fast and the
-        // direct path owns the answer, so `None` here means "fell back",
-        // not "skipped". The assertion that matters is below: redaction
-        // ran on the shrunk body before the attempt went out.
         let addr: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
-        let out = try_routed_sidecar(
-            &state,
-            &axum::http::HeaderMap::new(),
-            &addr,
-            &parsed,
-            "req-redact-skip",
-        )
-        .await;
-        assert!(out.is_none(), "unreachable upstream must fall back");
+        let headers = axum::http::HeaderMap::new();
+        let out = try_routed_sidecar(&state, &headers, &addr, &parsed, "req-redact-capture").await;
+        assert!(out.is_none(), "500 upstream must fall back");
+        // Join the capture: poll briefly (the send already happened).
+        let body = {
+            let mut waited = 0;
+            loop {
+                {
+                    let guard = captured.lock().expect("capture");
+                    if !guard.is_empty() || waited >= 50 {
+                        break guard.clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                waited += 1;
+            }
+        };
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !body.is_empty(),
+            "routed attempt must have sent bytes (skip-gate regression sends none)"
+        );
+        assert!(
+            !text.contains("AKIAQQQQWWWWEEEERRRR"),
+            "raw secret must not reach the routed upstream"
+        );
+        assert!(
+            text.contains("__HR_"),
+            "redacted placeholder must stand in for the secret"
+        );
     }
 
     /// The redaction the routed sidecar applies uses the conversation's

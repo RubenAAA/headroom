@@ -218,21 +218,19 @@ impl UpstreamKind {
 /// `chunk-*.js` (`x-opencode-session`, `x-opencode-request`,
 /// `x-opencode-client`, `User-Agent: opencode/…`). Without the session
 /// header the free models are gated, even with a valid key.
+///
+/// Since ~2026-09-17 Zen additionally validates the session value itself:
+/// a minted `ses_<64hex>` passes the shape but comes back
+/// `FreeTierError: OpenCode's free tier can only be used from within
+/// OpenCode`, while the id of a real OpenCode session (probed live:
+/// existing ids 200, random well-formed ids 403) is served. So the
+/// session below is a real one — see [`resolve_zen_session`].
 pub(crate) fn inject_opencode_headers(
     headers: &mut HeaderMap,
     request_id: &str,
     session_key: Option<&str>,
 ) {
-    // `ses_` + 64 hex, like OpenCode's `ses_[0-9a-f]{64}`. Derive from the
-    // request_id UUID so retries within the same logical request share the
-    // same session, but different requests don't collide.
-    let raw = request_id.replace('-', "");
-    let mut hex = String::with_capacity(64);
-    while hex.len() < 64 {
-        hex.push_str(&raw);
-    }
-    hex.truncate(64);
-    let session = format!("ses_{hex}");
+    let session = resolve_zen_session(request_id);
     if let Ok(v) = http::HeaderValue::from_str(&session) {
         headers.insert(http::HeaderName::from_static("x-opencode-session"), v);
     }
@@ -254,6 +252,439 @@ pub(crate) fn inject_opencode_headers(
             headers.insert(http::HeaderName::from_static("x-opencode-project"), v);
         }
     }
+}
+
+/// Mint a fresh `x-opencode-request` id on headers that already carry one.
+///
+/// The real OpenCode CLI mints one UUID per POST. Proxy continuations
+/// (CCR/memory rounds) re-send with the forward path's header map, which
+/// replays the original request's UUID; on 2026-09-17 eleven zen-route
+/// continuations 403'd (`FreeTierError`) while same-shape originals passed.
+/// UUID replay is unproven as the trigger (25 same-path continuations passed
+/// with replayed UUIDs), but per-POST freshness is client-faithful and costs
+/// nothing, so continuations refresh before every send. Presence-gated: maps
+/// without the header (non-zen routes) are untouched. Session, client, UA
+/// and project headers are preserved — only the request nonce rotates.
+/// Returns whether a refresh happened (for logging at the call site).
+pub(crate) fn refresh_zen_request_id(headers: &mut HeaderMap) -> bool {
+    const REQ: &str = "x-opencode-request";
+    if !headers.contains_key(REQ) {
+        return false;
+    }
+    match http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
+        Ok(v) => {
+            headers.insert(http::HeaderName::from_static(REQ), v);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Grace period before a freshly created OpenCode session is trusted for
+/// the Zen gate: the id has to exist in Zen's server-side registry (a
+/// minted id 403s even when well-formed — probed 2026-09-17, including a
+/// locally-inserted row re-tested minutes later), and a session created
+/// seconds ago may not have synced yet. The grace applies to the session's
+/// *creation*, not its last update: a live session updated seconds ago is
+/// ideal (it is actively syncing), while a row minted moments ago is not
+/// — local rows never count, only cloud-synced ids do.
+const ZEN_SESSION_SYNC_GRACE_MS: i64 = 5 * 60 * 1000;
+
+/// How long a resolved real session id is reused before the DB is
+/// re-read: new sessions appear as the operator works, and a pinned id
+/// would outlive a deleted session. Fail-open either way — resolution
+/// falls back to the legacy minted id, never to an error.
+const ZEN_SESSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Explicit override for the Zen session header, read per resolution (not
+/// cached) so an operator can rotate it without restarting the proxy.
+const ZEN_SESSION_ENV: &str = "HEADROOM_ZEN_SESSION";
+
+/// Resolve the `x-opencode-session` value for a Zen request.
+///
+/// Zen's free-tier gate checks the id against its server-side session
+/// registry, so this must be the id of a real OpenCode session, not a
+/// minted one. Sources, in order: the `HEADROOM_ZEN_SESSION` override,
+/// the most recently used real session from the local OpenCode database
+/// (cached briefly), a session minted in the background when nothing
+/// usable exists yet, and — until that lands — the legacy minted
+/// `ses_<64hex>` derived from the request id (gated upstream, kept only
+/// so the header is always present).
+pub(crate) fn resolve_zen_session(request_id: &str) -> String {
+    if let Ok(pinned) = std::env::var(ZEN_SESSION_ENV) {
+        let pinned = pinned.trim().to_string();
+        if !pinned.is_empty() {
+            return pinned;
+        }
+    }
+    if let Some(cached) = cached_zen_session() {
+        return cached;
+    }
+    if let Some(real) = read_zen_session_from_db() {
+        tracing::debug!(
+            event = "zen_session_source",
+            source = "db",
+            session_prefix = %real.chars().take(12).collect::<String>(),
+        );
+        store_cached_zen_session(real.clone());
+        return real;
+    }
+    // No usable session: start a background mint (guarded, at most one in
+    // flight and spaced apart) and serve the legacy fallback until it
+    // lands. Requests in between may still gate — unavoidable without a
+    // session that exists yet — but the next resolutions pick the minted
+    // id up, first via the cache, then via the database.
+    tracing::debug!(event = "zen_session_source", source = "fallback");
+    trigger_zen_session_mint();
+    mint_zen_session(request_id)
+}
+
+/// The legacy minted id, kept as the last-resort fallback. Well-formed
+/// but unknown to Zen, so the free tier gates it — better than no
+/// header (which fails closed as `MissingSessionID`), worse than a real
+/// id. Derive from the request id so retries within one logical request
+/// share the session but different requests don't collide.
+fn mint_zen_session(request_id: &str) -> String {
+    let raw = request_id.replace('-', "");
+    let mut hex = String::with_capacity(64);
+    while hex.len() < 64 {
+        hex.push_str(&raw);
+    }
+    hex.truncate(64);
+    format!("ses_{hex}")
+}
+
+static ZEN_SESSION_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<(Option<String>, std::time::Instant)>,
+> = std::sync::OnceLock::new();
+
+fn cached_zen_session() -> Option<String> {
+    let lock = ZEN_SESSION_CACHE.get_or_init(|| {
+        std::sync::Mutex::new((None, std::time::Instant::now() - ZEN_SESSION_CACHE_TTL))
+    });
+    let guard = lock.lock().ok()?;
+    let (session, at) = (&guard.0, guard.1);
+    match session {
+        Some(s) if at.elapsed() < ZEN_SESSION_CACHE_TTL => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn store_cached_zen_session(session: String) {
+    if let Some(lock) = ZEN_SESSION_CACHE.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = (Some(session), std::time::Instant::now());
+        }
+    }
+}
+
+/// Read the most recently used real session id from the local OpenCode
+/// database (`$HEADROOM_OPENCODE_DB`, else
+/// `~/.local/share/opencode/opencode.db`). Read-only, fail-open:
+/// anything missing, locked, or oddly shaped yields `None` and the
+/// caller falls back to the minted id.
+fn read_zen_session_from_db() -> Option<String> {
+    let path = zen_session_db_path()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    // Most recently used first: a live session is actively syncing, so its
+    // id is certain to exist server-side. The grace check below runs on
+    // creation time, not update time.
+    let mut stmt = conn
+        .prepare("SELECT id, time_created FROM session ORDER BY time_updated DESC LIMIT 20")
+        .ok()?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)?;
+    // Newest-used session created before the grace horizon; the newest
+    // used overall when everything is fresher than that.
+    let picked = rows
+        .iter()
+        .find(|(_, created)| now_ms.saturating_sub(*created) >= ZEN_SESSION_SYNC_GRACE_MS)
+        .or(rows.first())
+        .map(|(id, _)| id.clone())?;
+    if picked.starts_with("ses_") && picked.len() > 8 {
+        Some(picked)
+    } else {
+        None
+    }
+}
+
+/// Locate the local OpenCode database. `$HEADROOM_OPENCODE_DB` wins when
+/// it points at an existing file; otherwise the default location. `None`
+/// when neither exists, so machines without OpenCode skip the lookup
+/// silently instead of logging an error per request.
+fn zen_session_db_path() -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var("HEADROOM_OPENCODE_DB") {
+        let p = std::path::PathBuf::from(custom.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let p = std::path::PathBuf::from(home).join(".local/share/opencode/opencode.db");
+    p.is_file().then_some(p)
+}
+
+#[cfg(test)]
+fn clear_zen_session_cache() {
+    if let Some(lock) = ZEN_SESSION_CACHE.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = (None, std::time::Instant::now() - ZEN_SESSION_CACHE_TTL);
+        }
+    }
+}
+
+/// Title marking proxy-minted sessions in the operator's session list,
+/// so a background mint never looks like a session the operator opened.
+const ZEN_MINT_TITLE: &str = "headroom zen route";
+
+/// Model the mint run asks for: the same free-tier model the route
+/// serves, so minting spends no key budget either.
+const ZEN_MINT_MODEL: &str = "opencode/muse-spark-1.3-contributor-free";
+
+/// Explicit `opencode` binary override; otherwise resolved via `PATH`.
+const ZEN_OPENCODE_BIN_ENV: &str = "HEADROOM_OPENCODE_BIN";
+
+/// Minimum gap between background mint attempts. A mint shells out to
+/// the OpenCode CLI and burns one tiny inference, so a persistent
+/// failure (CLI missing, key revoked) must not retry per request.
+const ZEN_MINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Bound on the whole mint: the CLI run plus the session read. The
+/// session row is created in the first second, so even a killed run
+/// usually leaves a usable id behind — the read below runs regardless
+/// of how the child exited.
+const ZEN_MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Mint guard state: `(in-flight, last attempt)`.
+static ZEN_MINT_STATE: std::sync::OnceLock<std::sync::Mutex<(bool, std::time::Instant)>> =
+    std::sync::OnceLock::new();
+
+fn mint_state() -> &'static std::sync::Mutex<(bool, std::time::Instant)> {
+    ZEN_MINT_STATE.get_or_init(|| {
+        // Start "long ago" so the very first claim succeeds.
+        std::sync::Mutex::new((false, std::time::Instant::now() - ZEN_MINT_MIN_INTERVAL))
+    })
+}
+
+/// Mint guard: at most one mint in flight, attempts spaced apart.
+/// Returns true exactly when the caller earned a mint.
+fn mint_guard_claim() -> bool {
+    let mut guard = match mint_state().lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if guard.0 || guard.1.elapsed() < ZEN_MINT_MIN_INTERVAL {
+        return false;
+    }
+    guard.0 = true;
+    guard.1 = std::time::Instant::now();
+    true
+}
+
+fn mint_guard_release() {
+    if let Ok(mut guard) = mint_state().lock() {
+        guard.0 = false;
+    }
+}
+
+#[cfg(test)]
+fn mint_guard_reset() {
+    if let Ok(mut guard) = mint_state().lock() {
+        *guard = (false, std::time::Instant::now() - ZEN_MINT_MIN_INTERVAL);
+    }
+}
+
+/// Test-only RAII hold on the mint guard: while held, no code path can
+/// spawn a background `opencode run`, so resolving sessions inside unit
+/// tests stays side-effect free on developer machines (where the real
+/// CLI exists). Claim first so a stale in-flight flag from another test
+/// cannot leak a spawn either.
+#[cfg(test)]
+pub(crate) struct MintTestGuard;
+
+#[cfg(test)]
+pub(crate) fn hold_mint_for_test() -> MintTestGuard {
+    mint_guard_reset();
+    assert!(mint_guard_claim(), "mint guard must be claimable in tests");
+    MintTestGuard
+}
+
+#[cfg(test)]
+impl Drop for MintTestGuard {
+    fn drop(&mut self) {
+        mint_guard_release();
+    }
+}
+
+/// Start a detached background mint unless one is already running or a
+/// recent attempt is still cooling down. Never blocks the request: the
+/// minted id lands in the session cache for later resolutions.
+fn trigger_zen_session_mint() {
+    if !mint_guard_claim() {
+        return;
+    }
+    tracing::info!(
+        event = "zen_session_mint_started",
+        "no usable OpenCode session; minting one in the background"
+    );
+    std::thread::spawn(|| {
+        let minted = run_mint_once();
+        match &minted {
+            Some(id) => {
+                store_cached_zen_session(id.clone());
+                tracing::info!(
+                    event = "zen_session_minted",
+                    session_prefix = %id.chars().take(12).collect::<String>(),
+                    "background mint landed; Zen route serves real sessions again"
+                );
+            }
+            None => {
+                tracing::debug!(
+                    event = "zen_session_mint_failed",
+                    "background mint produced no session; still on the fallback id"
+                );
+            }
+        }
+        mint_guard_release();
+    });
+}
+
+/// Run one synchronous mint: shell out to the OpenCode CLI for a trivial
+/// run (creating the session is the point; its own model call may gate
+/// on the still-fresh id and fail — harmless), then read the fresh
+/// session id back. Sessions created through OpenCode are valid for the
+/// Zen gate immediately (verified live 2026-09-17: a fresh run's own
+/// call succeeded on its brand-new id), unlike locally inserted rows,
+/// which never become valid.
+fn run_mint_once() -> Option<String> {
+    let bin = resolve_opencode_bin()?;
+    let dir = mint_workdir();
+    let start_ms = now_ms();
+    let mut child = std::process::Command::new(&bin)
+        .args(mint_argv(&dir))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + ZEN_MINT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::debug!(
+                    event = "zen_mint_run_exited",
+                    success = status.success(),
+                    "opencode mint run finished"
+                );
+                break;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    // The row is created before the run's model call, so read it back
+    // however the child exited.
+    read_session_created_since(start_ms)
+}
+
+/// The mint command, factored pure for tests: a trivial non-interactive
+/// run that exists to create (and title, for operator visibility) one
+/// session. `--pure` keeps plugins out of it.
+fn mint_argv(dir: &std::path::Path) -> Vec<String> {
+    [
+        "run",
+        "--dir",
+        dir.to_str().unwrap_or("."),
+        "--pure",
+        "-m",
+        ZEN_MINT_MODEL,
+        "--title",
+        ZEN_MINT_TITLE,
+        "Reply with the single word: ok",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Newest session created since `start_ms`, if any.
+fn read_session_created_since(start_ms: i64) -> Option<String> {
+    let path = zen_session_db_path()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row(
+        "SELECT id FROM session WHERE time_created >= ?1 ORDER BY time_created DESC LIMIT 1",
+        rusqlite::params![start_ms],
+        |row| row.get(0),
+    )
+    .ok()
+    .filter(|id: &String| id.starts_with("ses_") && id.len() > 8)
+}
+
+/// Where the mint run executes: the most recently used project
+/// directory that still exists (guaranteed OpenCode-accessible —
+/// sessions actively run there), else the system temp dir.
+fn mint_workdir() -> std::path::PathBuf {
+    if let Some(path) = zen_session_db_path() {
+        if let Ok(conn) =
+            rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        {
+            if let Ok(dir) = conn.query_row(
+                "SELECT directory FROM session ORDER BY time_updated DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            ) {
+                let p = std::path::PathBuf::from(dir);
+                if p.is_dir() {
+                    return p;
+                }
+            }
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Locate the `opencode` binary: `$HEADROOM_OPENCODE_BIN` when it names
+/// an existing file, else the first `opencode` on `PATH`. `None` when
+/// OpenCode is not installed — minting is impossible, fail open.
+fn resolve_opencode_bin() -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var(ZEN_OPENCODE_BIN_ENV) {
+        let p = std::path::PathBuf::from(custom.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("opencode"))
+        .find(|p| p.is_file())
+}
+
+/// Millis since epoch, the unit OpenCode stores session times in.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The placeholder a cursor route uses to take its effort from the request.
@@ -288,8 +719,81 @@ pub(crate) fn resolve_cursor_model(cursor_agent_id: &str, effort: Option<&str>) 
 mod tests {
     use super::*;
 
+    /// Env-backed resolution serializes: `set_var` is process-wide and the
+    /// session cache persists across tests in one binary.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn header(h: &HeaderMap, name: &str) -> Option<String> {
         h.get(name).and_then(|v| v.to_str().ok()).map(String::from)
+    }
+
+    #[test]
+    fn refresh_zen_request_id_rotates_only_the_nonce() {
+        let _mint = hold_mint_for_test();
+        let zen_upstream: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        let zen = classify_upstream(&zen_upstream, false);
+        let mut h = HeaderMap::new();
+        zen.inject_extra_headers(&mut h, "req-1", Some("proj"));
+        let before = header(&h, "x-opencode-request").expect("injected");
+        let session = header(&h, "x-opencode-session").expect("injected");
+
+        assert!(refresh_zen_request_id(&mut h));
+        let after = header(&h, "x-opencode-request").expect("still present");
+        assert_ne!(before, after, "nonce must rotate");
+        // UUID v4 shape: 36 chars, version nibble `4`.
+        assert_eq!(after.len(), 36);
+        assert_eq!(after.chars().nth(14), Some('4'));
+        // Everything else untouched.
+        assert_eq!(header(&h, "x-opencode-session"), Some(session));
+        assert_eq!(header(&h, "x-opencode-client").as_deref(), Some("opencode"));
+        assert_eq!(header(&h, "x-opencode-project").as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn refresh_zen_request_id_noop_off_zen() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("claude-code/1.0"),
+        );
+        assert!(!refresh_zen_request_id(&mut h));
+        assert_eq!(header(&h, "x-opencode-request"), None);
+        assert_eq!(header(&h, "user-agent").as_deref(), Some("claude-code/1.0"));
+    }
+
+    fn with_env(var: &str, value: Option<&str>) -> Option<String> {
+        let prev = std::env::var(var).ok();
+        match value {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        prev
+    }
+
+    fn restore_env(var: &str, prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+    }
+
+    fn temp_session_db(rows: &[(&str, i64, i64, Option<&str>)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&path).expect("create temp db");
+        conn.execute(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, directory TEXT NOT NULL DEFAULT '/tmp')",
+            [],
+        )
+        .expect("create session table");
+        for (id, created, updated, directory) in rows {
+            conn.execute(
+                "INSERT INTO session (id, time_created, time_updated, directory) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, created, updated, directory.unwrap_or("/tmp")],
+            )
+            .expect("insert session row");
+        }
+        dir
     }
 
     fn responses_body_with_reasoning() -> serde_json::Value {
@@ -339,6 +843,11 @@ mod tests {
     /// scattered branches did before. A new provider adds a row here.
     #[test]
     fn provider_quirks_matrix() {
+        // Resolving Zen headers must not shell out from inside a unit
+        // test: hold the mint guard so the fallback path can't spawn a
+        // real `opencode run` on a developer machine. (Shape asserts
+        // below hold for every session source.)
+        let _mint = hold_mint_for_test();
         // Codex route on ChatGPT auth: the Codex endpoint, session headers
         // on, Zen headers off.
         let codex_upstream: url::Url = "https://api.openai.com/v1".parse().unwrap();
@@ -462,5 +971,241 @@ mod tests {
             resolve_cursor_model("cursor-agent-fixed", Some("low")),
             "cursor-agent-fixed"
         );
+    }
+
+    /// The explicit override wins over every other source, so an operator
+    /// can pin (and rotate) the session without touching the database.
+    #[test]
+    fn zen_session_env_override_wins() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = with_env(ZEN_SESSION_ENV, Some("ses_pinned00000000000000000000001"));
+        clear_zen_session_cache();
+        assert_eq!(
+            resolve_zen_session("req-1"),
+            "ses_pinned00000000000000000000001"
+        );
+        restore_env(ZEN_SESSION_ENV, prev);
+        clear_zen_session_cache();
+    }
+
+    /// Without an override the newest-used session created before the grace
+    /// horizon is used: a live session updated seconds ago is ideal (it is
+    /// actively syncing), while a session created seconds ago may not have
+    /// reached Zen's registry yet.
+    #[test]
+    fn zen_session_prefers_synced_over_newest() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_env = with_env(ZEN_SESSION_ENV, None);
+        let now = now_ms();
+        let dir = temp_session_db(&[
+            (
+                "ses_live00000000000000000000001",
+                now - ZEN_SESSION_SYNC_GRACE_MS - 1000,
+                now,
+                None,
+            ),
+            ("ses_fresh0000000000000000000001", now, now - 1000, None),
+        ]);
+        let prev_db = with_env(
+            "HEADROOM_OPENCODE_DB",
+            Some(dir.path().join("opencode.db").to_str().unwrap()),
+        );
+        clear_zen_session_cache();
+        assert_eq!(
+            resolve_zen_session("req-1"),
+            "ses_live00000000000000000000001"
+        );
+        restore_env("HEADROOM_OPENCODE_DB", prev_db);
+        restore_env(ZEN_SESSION_ENV, prev_env);
+        clear_zen_session_cache();
+    }
+
+    /// When every session is fresher than the grace period, the newest-used
+    /// is still better than a minted id Zen has never seen.
+    #[test]
+    fn zen_session_falls_back_to_newest_when_all_fresh() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_env = with_env(ZEN_SESSION_ENV, None);
+        let now = now_ms();
+        let dir = temp_session_db(&[("ses_only00000000000000000000001", now, now, None)]);
+        let prev_db = with_env(
+            "HEADROOM_OPENCODE_DB",
+            Some(dir.path().join("opencode.db").to_str().unwrap()),
+        );
+        clear_zen_session_cache();
+        assert_eq!(
+            resolve_zen_session("req-1"),
+            "ses_only00000000000000000000001"
+        );
+        restore_env("HEADROOM_OPENCODE_DB", prev_db);
+        restore_env(ZEN_SESSION_ENV, prev_env);
+        clear_zen_session_cache();
+    }
+
+    /// No override, no database: the legacy minted shape, so the header is
+    /// always present (fails gated, not missing).
+    #[test]
+    fn zen_session_mints_when_no_source_exists() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_env = with_env(ZEN_SESSION_ENV, None);
+        let prev_db = with_env(
+            "HEADROOM_OPENCODE_DB",
+            Some("/nonexistent-8787/opencode.db"),
+        );
+        // Point HOME at an empty dir so the default location can't hit a
+        // real developer database when this runs on a workstation.
+        let home = tempfile::tempdir().expect("temp home");
+        let prev_home = with_env("HOME", Some(home.path().to_str().unwrap()));
+        clear_zen_session_cache();
+        // Hold the mint guard so the fallback path can't spawn a real
+        // `opencode run` from inside the unit test.
+        mint_guard_reset();
+        assert!(mint_guard_claim());
+        let minted = resolve_zen_session("123e4567-e89b-12d3-a456-426614174000");
+        assert!(minted.starts_with("ses_"), "{minted}");
+        assert_eq!(minted.len(), 4 + 64);
+        assert!(minted[4..].chars().all(|c| c.is_ascii_hexdigit()));
+        mint_guard_release();
+        restore_env("HOME", prev_home);
+        restore_env("HEADROOM_OPENCODE_DB", prev_db);
+        restore_env(ZEN_SESSION_ENV, prev_env);
+        clear_zen_session_cache();
+    }
+
+    /// The mint guard hands out one mint, then suppresses repeats until
+    /// released or the interval lapses.
+    #[test]
+    fn zen_mint_guard_claims_once() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        mint_guard_reset();
+        assert!(mint_guard_claim(), "first claim earns the mint");
+        assert!(!mint_guard_claim(), "second claim loses while in flight");
+        mint_guard_release();
+        assert!(
+            !mint_guard_claim(),
+            "release alone does not re-arm inside the interval"
+        );
+        mint_guard_reset();
+        assert!(mint_guard_claim(), "reset re-arms for the next test");
+        mint_guard_release();
+    }
+
+    /// The mint command is a trivial non-interactive run in the given dir,
+    /// titled so the operator recognizes the session.
+    #[test]
+    fn zen_mint_argv_is_a_trivial_run() {
+        let argv = mint_argv(std::path::Path::new("/tmp/work"));
+        assert_eq!(argv[0], "run");
+        assert!(argv.contains(&"--dir".to_string()));
+        assert!(argv.contains(&"/tmp/work".to_string()));
+        assert!(argv.contains(&ZEN_MINT_MODEL.to_string()));
+        assert!(argv.contains(&ZEN_MINT_TITLE.to_string()));
+        assert!(argv.contains(&"--pure".to_string()));
+    }
+
+    /// Binary resolution honors the explicit override, else `PATH`.
+    #[test]
+    fn zen_mint_bin_resolution() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = with_env(ZEN_OPENCODE_BIN_ENV, Some("/bin/true"));
+        assert_eq!(
+            resolve_opencode_bin().as_deref(),
+            Some(std::path::Path::new("/bin/true"))
+        );
+        restore_env(ZEN_OPENCODE_BIN_ENV, prev);
+    }
+
+    /// The mint worker picks up the session the CLI run created: with a
+    /// no-op binary standing in for `opencode` and a row dated at/after
+    /// the mint start standing in for what the run would insert, the row
+    /// is read back. (A real run inserts its row while running, i.e.
+    /// after `run_mint_once` records its start instant.)
+    #[test]
+    fn zen_mint_task_stores_the_created_session() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_env = with_env(ZEN_SESSION_ENV, None);
+        let prev_bin = with_env(ZEN_OPENCODE_BIN_ENV, Some("/bin/true"));
+        let now = now_ms();
+        let dir = temp_session_db(&[(
+            "ses_minted000000000000000000001",
+            now + 120_000,
+            now + 120_000,
+            None,
+        )]);
+        let prev_db = with_env(
+            "HEADROOM_OPENCODE_DB",
+            Some(dir.path().join("opencode.db").to_str().unwrap()),
+        );
+        clear_zen_session_cache();
+        mint_guard_reset();
+        assert_eq!(
+            run_mint_once().as_deref(),
+            Some("ses_minted000000000000000000001")
+        );
+        restore_env("HEADROOM_OPENCODE_DB", prev_db);
+        restore_env(ZEN_OPENCODE_BIN_ENV, prev_bin);
+        restore_env(ZEN_SESSION_ENV, prev_env);
+        clear_zen_session_cache();
+        mint_guard_reset();
+    }
+
+    /// No row created, no session stored: fail-open, the fallback id
+    /// keeps serving (gated) instead of erroring.
+    #[test]
+    fn zen_mint_task_without_a_row_stores_nothing() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_env = with_env(ZEN_SESSION_ENV, None);
+        let prev_bin = with_env(ZEN_OPENCODE_BIN_ENV, Some("/bin/true"));
+        let dir = temp_session_db(&[]);
+        let prev_db = with_env(
+            "HEADROOM_OPENCODE_DB",
+            Some(dir.path().join("opencode.db").to_str().unwrap()),
+        );
+        clear_zen_session_cache();
+        mint_guard_reset();
+        assert_eq!(run_mint_once(), None);
+        restore_env("HEADROOM_OPENCODE_DB", prev_db);
+        restore_env(ZEN_OPENCODE_BIN_ENV, prev_bin);
+        restore_env(ZEN_SESSION_ENV, prev_env);
+        clear_zen_session_cache();
+        mint_guard_reset();
+    }
+
+    /// Cache roundtrip without touching resolution: store, read, clear.
+    #[test]
+    fn zen_session_cache_roundtrip() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        clear_zen_session_cache();
+        assert_eq!(cached_zen_session(), None);
+        store_cached_zen_session("ses_cache00000000000000000000001".to_string());
+        assert_eq!(
+            cached_zen_session().as_deref(),
+            Some("ses_cache00000000000000000000001")
+        );
+        clear_zen_session_cache();
+        assert_eq!(cached_zen_session(), None);
+    }
+
+    /// The mint workdir is the most recently used project dir that still
+    /// exists, else the system temp dir.
+    #[test]
+    fn zen_mint_workdir_prefers_live_project_dirs() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_env = with_env(ZEN_SESSION_ENV, None);
+        let live = tempfile::tempdir().expect("live project dir");
+        let now = now_ms();
+        let dir = temp_session_db(&[(
+            "ses_proj00000000000000000000001",
+            now - ZEN_SESSION_SYNC_GRACE_MS - 1000,
+            now,
+            Some(live.path().to_str().unwrap()),
+        )]);
+        let prev_db = with_env(
+            "HEADROOM_OPENCODE_DB",
+            Some(dir.path().join("opencode.db").to_str().unwrap()),
+        );
+        assert_eq!(mint_workdir(), live.path());
+        restore_env("HEADROOM_OPENCODE_DB", prev_db);
+        restore_env(ZEN_SESSION_ENV, prev_env);
     }
 }

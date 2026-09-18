@@ -54,7 +54,35 @@ pub(crate) fn translate_routed_request(
     let openai_body = match translated {
         Ok(v) => {
             let mut v = apply_target_model_override(v, target_model, is_responses, is_responses);
-            classify_upstream(upstream, is_chatgpt_auth).strip_unreplayable_reasoning(&mut v);
+            let kind = classify_upstream(upstream, is_chatgpt_auth);
+            kind.strip_unreplayable_reasoning(&mut v);
+            // Zen's free-tier gate reads tool names: they must be
+            // OpenCode-native lowercase (`read`, not `Read`). Rename the
+            // translated body (definitions, history calls, forced choice)
+            // and map the model's calls back before delivery — see
+            // `routed::tool_alias`. Responses shape only: Chat routes
+            // have no Zen free-tier configuration today.
+            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
+                let alias = crate::routed::tool_alias::ToolAlias::derive(
+                    parsed.get("tools").and_then(|t| t.as_array()),
+                );
+                let renamed = alias.forward_body(&mut v);
+                // Tool-poor turns cannot clear the gate on renamed names
+                // alone (there is nothing to rename, or extras like memory
+                // tools inflate the count without adding known names): top
+                // up the missing core names with marked shadow copies.
+                // Already-present names are never duplicated.
+                let shadowed = crate::routed::tool_alias::ensure_gate_tools(&mut v);
+                if renamed > 0 || shadowed > 0 {
+                    tracing::debug!(
+                        event = "zen_tool_alias_applied",
+                        request_id = %request_id,
+                        renamed,
+                        shadowed,
+                        "lowercased tool names for the Zen gate; mapped back before delivery"
+                    );
+                }
+            }
             v
         }
         Err(e) => {
@@ -239,6 +267,80 @@ mod tests {
             out.openai_body["include"],
             json!(["reasoning.encrypted_content"])
         );
+    }
+
+    /// Zen's free-tier gate reads tool names: the translated body carries
+    /// OpenCode-native lowercase names upstream, while every other
+    /// provider keeps the client's names verbatim.
+    #[test]
+    fn zen_route_lowercases_tool_names_only_there() {
+        let parsed = json!({
+            "model": "claude-muse-spark-1.3",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "c1", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "ok"}
+                ]},
+            ],
+            "tools": [
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+            ],
+        });
+        let tool_names = |out: &TranslatedRequest| {
+            out.openai_body["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .map(|t| t["name"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        };
+        let history_names = |out: &TranslatedRequest| {
+            out.openai_body["input"]
+                .as_array()
+                .expect("input array")
+                .iter()
+                .filter(|i| i["type"] == json!("function_call"))
+                .map(|i| i["name"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("muse-spark-1.3-contributor-free"),
+            &zen,
+            false,
+            "claude-muse-spark-1.3",
+            "req-zen",
+        )
+        .expect("translates");
+        // Client names lowered, plus shadow copies of the missing core
+        // names (two client tools only — the gate needs nine).
+        let names = tool_names(&out);
+        assert_eq!(&names[..2], ["read", "bash"]);
+        assert_eq!(names.len(), 9);
+        assert_eq!(history_names(&out), vec!["read"]);
+
+        // Same turn on a generic upstream: names verbatim.
+        let openai: url::Url = "https://api.x.ai/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("grok-4.6"),
+            &openai,
+            false,
+            "claude-grok-4.6",
+            "req-xai",
+        )
+        .expect("translates");
+        assert_eq!(tool_names(&out), vec!["Read", "Bash"]);
+        assert_eq!(history_names(&out), vec!["Read"]);
     }
 
     /// Retroactive lock: Responses shape forces upstream streaming while

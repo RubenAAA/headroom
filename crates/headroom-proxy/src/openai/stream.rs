@@ -157,6 +157,10 @@ pub(crate) struct StreamTranslator {
     /// a chunk of its own rather than a terminal event, so it has to be held
     /// until the stream ends.
     last_usage: Option<Value>,
+    /// Reverse tool-name map (upstream → client) for the Zen gate's
+    /// lowercase rename. `None` on every path that never renamed outbound,
+    /// so only Zen-bound routed turns pay attention to it.
+    tool_aliases: Option<crate::routed::tool_alias::ToolAlias>,
 }
 
 impl StreamTranslator {
@@ -245,7 +249,20 @@ impl StreamTranslator {
             observation_completed: false,
             ttfb_ms: 0.0,
             last_usage: None,
+            tool_aliases: None,
         }
+    }
+
+    /// Restore client tool names on the way back from a renamed outbound
+    /// turn (see `routed::tool_alias`). The stored name is what every
+    /// later emission for this call uses, so one mapping at capture covers
+    /// the block start, the done frame, and the abort marker alike.
+    pub(crate) fn with_tool_aliases(
+        mut self,
+        aliases: Option<crate::routed::tool_alias::ToolAlias>,
+    ) -> Self {
+        self.tool_aliases = aliases;
+        self
     }
 
     fn with_codex_limits(mut self, store: crate::codex_rate_limits::CodexRateLimitStore) -> Self {
@@ -290,6 +307,18 @@ impl StreamTranslator {
     fn with_deferred_ccr(mut self, deferred: DeferredCcrBooking) -> Self {
         self.deferred_ccr = Some(deferred);
         self
+    }
+
+    /// Record the tool name for the call now streaming, mapping it back
+    /// to the client's name when the outbound turn was renamed for the
+    /// Zen gate (see `with_tool_aliases`). One site covers both wire
+    /// shapes: Responses `output_item.added` and Chat `delta.tool_calls`.
+    fn capture_tool_name(&mut self, upstream_name: &str) {
+        self.current_tool_name = self
+            .tool_aliases
+            .as_ref()
+            .map(|aliases| aliases.reverse_name(upstream_name).to_string())
+            .unwrap_or_else(|| upstream_name.to_string());
     }
 
     /// Snapshot first-round usage for the deferred booking. Written when
@@ -575,12 +604,12 @@ impl StreamTranslator {
                 for tc in tool_calls {
                     if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                         self.current_tool_id = id.to_string();
-                        self.current_tool_name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        self.capture_tool_name(
+                            tc.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .unwrap_or(""),
+                        );
 
                         self.open_tool_block(&mut events);
                     }
@@ -720,11 +749,11 @@ impl StreamTranslator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    self.current_tool_name = item
+                    let upstream_name = item
                         .and_then(|i| i.get("name"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .unwrap_or("");
+                    self.capture_tool_name(upstream_name);
                     self.open_tool_block(&mut events);
                     self.saw_tool_use = true;
                     // Per call, not per stream: `arguments.done` below may
@@ -1156,11 +1185,13 @@ pub(crate) fn translate_openai_stream_to_anthropic(
     quota_seen_in_headers: bool,
     outcome: Option<RoutedOutcomeContext>,
     deferred_ccr: Option<DeferredCcrBooking>,
+    tool_aliases: Option<crate::routed::tool_alias::ToolAlias>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let mut translator = StreamTranslator::new(model)
         .with_codex_limits(codex_limits)
         .with_initial_rate_limits_seen(quota_seen_in_headers)
-        .with_outcome(outcome);
+        .with_outcome(outcome)
+        .with_tool_aliases(tool_aliases);
     if let Some(deferred) = deferred_ccr {
         translator = translator.with_deferred_ccr(deferred);
     }
@@ -1485,6 +1516,48 @@ mod tests {
         assert!(all.contains(r#"\"command\":"#));
         assert!(all.contains(r#""stop_reason":"tool_use""#));
         assert!(all.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_translator_restores_renamed_tool_names() {
+        use crate::routed::tool_alias::ToolAlias;
+        let alias = ToolAlias::derive(Some(&vec![
+            json!({"name": "Bash"}),
+            json!({"name": "Read"}),
+        ]));
+        let mut t = StreamTranslator::new("claude-muse-spark-1.3".to_string())
+            .with_tool_aliases(Some(alias));
+        let mut all = String::new();
+        for (event, data) in [
+            (
+                "response.created",
+                r#"{"response":{"model":"muse-spark-1.3-contributor-free"}}"#,
+            ),
+            (
+                "response.output_item.added",
+                r#"{"item":{"type":"function_call","call_id":"call_1","name":"bash","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"delta":"{\"command\":"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"item":{"type":"function_call","call_id":"call_1","name":"bash"}}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"response":{"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            ),
+        ] {
+            for e in t.process_frame(Some(event), data) {
+                all.push_str(&e);
+            }
+        }
+        // The client must see its own `Bash`, never the upstream `bash`.
+        assert!(all.contains(r#""type":"tool_use","id":"call_1","name":"Bash""#));
+        assert!(!all.contains(r#""name":"bash""#));
+        assert!(all.contains(r#""stop_reason":"tool_use""#));
     }
 
     #[test]
@@ -2188,6 +2261,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         let out: Vec<String> = translated
             .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
@@ -2240,6 +2314,7 @@ mod tests {
             "muse-spark-1.3".to_string(),
             crate::codex_rate_limits::CodexRateLimitStore::new(),
             false,
+            None,
             None,
             None,
         );

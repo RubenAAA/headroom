@@ -163,6 +163,16 @@ pub async fn handle_messages(
                     &parsed,
                     crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
                 );
+                // TEMPORARY: source port distinguishes a pipelined follow-up
+                // (same connection) from a concurrent sender (new
+                // connection). Drop once the poll source is identified.
+                tracing::info!(
+                    event = "cursor_route",
+                    from = %client_addr,
+                    body_model,
+                    cursor_model = %cursor_model,
+                    "routed to cursor agent"
+                );
                 return crate::cursor::handler::handle(
                     state,
                     &parsed,
@@ -206,19 +216,44 @@ pub async fn handle_messages(
         auth_env,
     } = target;
 
-    let (upstream_headers, is_chatgpt_auth) = match crate::routed::auth::auth_headers(
-        auth_env.as_deref(),
-        &headers,
-        state.config.codex_auth_file.as_deref(),
-        &upstream,
-        &request_id,
-        None,
-    ) {
+    let anthropic_target = !translate && target_model.is_some();
+    let auth = if anthropic_target {
+        crate::routed::auth::anthropic_auth_headers(
+            auth_env.as_deref(),
+            &headers,
+            Some(&upstream),
+            &request_id,
+        )
+        .map(|headers| (headers, false))
+    } else {
+        crate::routed::auth::auth_headers(
+            auth_env.as_deref(),
+            &headers,
+            state.config.codex_auth_file.as_deref(),
+            &upstream,
+            &request_id,
+            None,
+        )
+    };
+    let (upstream_headers, is_chatgpt_auth) = match auth {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
 
     if !translate {
+        let body = if let Some(target_model) = target_model {
+            let mut parsed = parsed;
+            parsed["model"] = Value::String(target_model);
+            match serde_json::to_vec(&parsed) {
+                Ok(body) => Bytes::from(body),
+                Err(_) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "serialization error")
+                        .into_response();
+                }
+            }
+        } else {
+            body
+        };
         return handle_passthrough(
             &state,
             &upstream,
@@ -227,6 +262,7 @@ pub async fn handle_messages(
             body,
             body_model,
             &request_id,
+            anthropic_target,
         )
         .await;
     }

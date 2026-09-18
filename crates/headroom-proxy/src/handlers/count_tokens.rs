@@ -187,7 +187,21 @@ pub(crate) async fn handle_count_tokens(
     // string we could put here would count.
     // Everything else (real Anthropic models, non-translating passthrough
     // routes) forwards byte-identical and keeps the exact upstream count.
-    let translated = find_route_target(&state.config, model).is_some_and(|t| t.translate);
+    let target = find_route_target(&state.config, model);
+    let translated = target.as_ref().is_some_and(|t| t.translate);
+    if target
+        .as_ref()
+        .is_some_and(|t| !t.translate && t.target_model.is_some())
+    {
+        let input_tokens = estimate_input_tokens(&parsed, model);
+        tracing::info!(
+            event = "count_tokens_local",
+            model = %model,
+            input_tokens = input_tokens,
+            "count_tokens for an Anthropic-target route answered locally"
+        );
+        return axum::Json(serde_json::json!({ "input_tokens": input_tokens })).into_response();
+    }
     if !translated {
         return forward_unchanged(state, client_addr, method, uri, headers, body).await;
     }

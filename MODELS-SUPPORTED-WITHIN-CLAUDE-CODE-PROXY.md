@@ -12,6 +12,7 @@ the proxy; the session, tools, and cache stay intact.
 | `claude-grok-4.6-low` | Grok 4.6 Low | Cursor subscription | `grok-low` |
 | `claude-grok-4.6-xhigh` | Grok 4.6 Extra High | Cursor subscription | `grok-xhigh` |
 | `claude-muse-spark-1.3` | Muse Spark 1.3 | OpenCode Zen, free tier | `spark`, `spark-explore` |
+| `claude-union-alpha` | Union Alpha Free | OpenCode Zen, Anthropic Messages | — |
 
 Notes:
 
@@ -23,6 +24,8 @@ Notes:
   limits, and Meta may train on prompts/completions — keep sensitive files out
   of spark sessions. `spark-explore` is read-only reconnaissance on the same
   model.
+- Union Alpha uses Zen's Anthropic Messages endpoint with the
+  `OPENCODE_API_KEY` environment variable. Its upstream model ID is `union-alpha`.
 - When delegating from Claude Code, invoke the subagent without the `model`
   parameter. Passing one overrides the pinned model and sends the work back to
   a Claude alias.

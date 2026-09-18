@@ -466,6 +466,12 @@ pub(crate) async fn handle_streaming_response(
         .as_ref()
         .map(|_| crate::openai::stream::DeferredCcrBooking::new());
     let guard_outcome = deferred.as_ref().and(outcome.clone());
+    // Undo the Zen outbound rename (translation.rs) per emitted call: the
+    // map derives from the same client tool list both directions, so an
+    // inactive map (or unknown names) passes everything through untouched.
+    let tool_aliases = crate::routed::tool_alias::ToolAlias::derive(
+        original.get("tools").and_then(|t| t.as_array()),
+    );
     let translated_stream = translate_openai_stream_to_anthropic(
         stream,
         original_model,
@@ -473,6 +479,7 @@ pub(crate) async fn handle_streaming_response(
         quota_seen_in_headers,
         outcome,
         deferred.clone(),
+        Some(tool_aliases),
     );
 
     // The translator has already put the turn into the Anthropic event
@@ -590,6 +597,75 @@ pub(crate) fn streaming_body_response(body: axum::body::Body) -> Response {
         .expect("static response")
 }
 
+struct PassthroughStreamBooking {
+    sink: Option<crate::proxy::ProxyOutcomeSink>,
+    request_id: String,
+    model: String,
+    status: i64,
+    started_at: std::time::Instant,
+    framer: crate::sse::SseFramer,
+    usage: Option<crate::sse::anthropic::UsageBuilder>,
+}
+
+impl PassthroughStreamBooking {
+    fn observe(&mut self, bytes: &[u8]) {
+        self.framer.push(bytes);
+        while let Some(event) = self.framer.next_event() {
+            let value = match event {
+                Ok(event) => serde_json::from_slice::<Value>(&event.data),
+                Err(error) => {
+                    tracing::warn!(request_id = %self.request_id, %error, "sse framer error");
+                    continue;
+                }
+            };
+            match value {
+                Ok(value) => {
+                    let usage = match value.get("type").and_then(Value::as_str) {
+                        Some("message_start") => value.get("message").and_then(|v| v.get("usage")),
+                        Some("message_delta") => value.get("usage"),
+                        _ => None,
+                    };
+                    if let Some(usage) = usage {
+                        let builder = self.usage.get_or_insert_with(Default::default);
+                        builder.merge_from(usage);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(request_id = %self.request_id, %error, "sse usage parse error");
+                }
+            }
+        }
+    }
+
+    fn book(&mut self) {
+        let Some(sink) = self.sink.take() else {
+            return;
+        };
+        let usage = self.usage.map(|usage| {
+            serde_json::json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            })
+        });
+        crate::routed::outcome::book_passthrough_outcome(
+            &sink,
+            &self.request_id,
+            &self.model,
+            self.status,
+            usage.as_ref(),
+            self.started_at,
+        );
+    }
+}
+
+impl Drop for PassthroughStreamBooking {
+    fn drop(&mut self) {
+        self.book();
+    }
+}
+
 /// Forward a no-translation route's Anthropic body straight to its upstream
 /// and hand the upstream's reply back, dropping the hop-by-hop headers the
 /// client must not see.
@@ -598,6 +674,7 @@ pub(crate) fn streaming_body_response(body: axum::body::Body) -> Response {
 /// the turn books through the shared funnel (C7 flip B): the spend is real
 /// and unbooked passthrough traffic is invisible to `/stats`. Booking reads
 /// the response usage read-only and never touches the bytes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_passthrough(
     state: &crate::proxy::AppState,
     upstream: &url::Url,
@@ -606,6 +683,7 @@ pub(crate) async fn handle_passthrough(
     body: bytes::Bytes,
     body_model: &str,
     request_id: &str,
+    anthropic_target: bool,
 ) -> Response {
     let started_at = std::time::Instant::now();
     // No translation needed — forward Anthropic format directly to the upstream.
@@ -653,6 +731,50 @@ pub(crate) async fn handle_passthrough(
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
+    let is_sse = anthropic_target
+        && resp_headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim()
+                    .to_ascii_lowercase()
+                    .starts_with("text/event-stream")
+            });
+    let mut builder = Response::builder().status(status);
+    for (name, value) in resp_headers.iter() {
+        if !crate::headers::is_response_drop(name) {
+            builder = builder.header(name.clone(), value.clone());
+        }
+    }
+    if is_sse {
+        let mut booking = PassthroughStreamBooking {
+            sink: Some(crate::proxy::ProxyOutcomeSink::from_state(state)),
+            request_id: request_id.to_string(),
+            model: body_model.to_string(),
+            status: status.as_u16() as i64,
+            started_at,
+            framer: crate::sse::SseFramer::new(),
+            usage: None,
+        };
+        let mut stream = Box::pin(resp.bytes_stream());
+        let observed = futures_util::stream::poll_fn(move |cx| {
+            use futures_util::Stream;
+            let next = stream.as_mut().poll_next(cx);
+            match &next {
+                std::task::Poll::Ready(Some(Ok(bytes))) => booking.observe(bytes),
+                std::task::Poll::Ready(None) => {
+                    booking.observe(b"\n\n");
+                    booking.book();
+                }
+                std::task::Poll::Ready(Some(Err(_))) => booking.book(),
+                std::task::Poll::Pending => {}
+            }
+            next
+        });
+        return builder
+            .body(Body::from_stream(crate::proxy::track_streaming(observed)))
+            .expect("static response");
+    }
     let body_bytes = resp.bytes().await.unwrap_or_default();
 
     // Read-only: usage for booking only, bytes forwarded untouched.

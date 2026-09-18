@@ -2204,7 +2204,7 @@ fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
     // Check for a trailing `:<kw>` or `:<kw>:TARGET_ID` suffix, where `<kw>`
     // is any of TRANSLATE_KEYWORDS (but not `://` from the scheme).
     let mut parsed_suffix = None;
-    for kw in TRANSLATE_KEYWORDS {
+    for kw in TRANSLATE_KEYWORDS.into_iter().chain(["anthropic"]) {
         let with_target = format!(":{kw}:");
         if let Some(idx) = rest.find(&with_target) {
             let target = rest[idx + with_target.len()..].trim();
@@ -2213,11 +2213,14 @@ fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
                     "expected non-empty TARGET_MODEL_ID after :{kw}: in {spec}"
                 ));
             }
-            parsed_suffix = Some((&rest[..idx], true, Some(target.to_string())));
+            parsed_suffix = Some((&rest[..idx], kw != "anthropic", Some(target.to_string())));
             break;
         }
         let bare = format!(":{kw}");
         if rest.ends_with(&bare) {
+            if kw == "anthropic" {
+                return Err(format!("expected :anthropic:TARGET_MODEL_ID in {spec}"));
+            }
             parsed_suffix = Some((&rest[..rest.len() - bare.len()], true, None));
             break;
         }
@@ -3326,6 +3329,31 @@ mod model_route_tests {
             "https://opencode.ai/zen/v1"
         );
         assert!(r.matches("claude-muse-spark-1.3"));
+    }
+
+    #[test]
+    fn parse_anthropic_target_route() {
+        for auth in ["", ":auth=OPENCODE_API_KEY", ":auth=none"] {
+            let r = parse_model_route(&format!(
+                "claude-union-alpha=https://opencode.ai/zen:anthropic:union-alpha{auth}"
+            ))
+            .unwrap();
+            assert!(!r.translate);
+            assert!(!r.prefix_match);
+            assert_eq!(r.target_model.as_deref(), Some("union-alpha"));
+            assert_eq!(r.upstream.unwrap().as_str(), "https://opencode.ai/zen");
+            assert_eq!(r.auth_env.as_deref(), auth.strip_prefix(":auth="));
+        }
+        for suffix in [":anthropic", ":anthropic:", ":anthropic: :auth=KEY"] {
+            assert!(parse_model_route(&format!("m=https://example.com{suffix}")).is_err());
+        }
+        for suffix in ["?anthropic=1", "#anthropic"] {
+            let url = format!("https://example.com/{suffix}");
+            let r = parse_model_route(&format!("m={url}")).unwrap();
+            assert!(!r.translate);
+            assert!(r.target_model.is_none());
+            assert_eq!(r.upstream.unwrap().as_str(), url);
+        }
     }
 
     #[test]

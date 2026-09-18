@@ -59,6 +59,47 @@ pub(crate) fn auth_headers(
 /// 401, which reads like a bad token rather than a missing one.
 #[allow(clippy::result_large_err)]
 pub(crate) fn route_auth_headers(var: &str) -> Result<HeaderMap, Response> {
+    route_auth_headers_for(var, false)
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn anthropic_auth_headers(
+    auth_env: Option<&str>,
+    client_headers: &HeaderMap,
+    upstream: Option<&url::Url>,
+    request_id: &str,
+) -> Result<HeaderMap, Response> {
+    let mut headers = route_auth_headers_for(auth_env.unwrap_or("none"), true)?;
+    if auth_env.is_none() {
+        for name in ["x-api-key", "authorization"] {
+            if let Some(value) = client_headers.get(name) {
+                headers.insert(name, value.clone());
+            }
+        }
+    }
+    headers.insert(
+        "anthropic-version",
+        client_headers
+            .get("anthropic-version")
+            .cloned()
+            .unwrap_or_else(|| http::HeaderValue::from_static("2023-06-01")),
+    );
+    for name in ["anthropic-beta", "accept"] {
+        if let Some(value) = client_headers.get(name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    // Same provider-gated extras as the OpenAI path: a Zen route in
+    // Anthropic shape needs its session headers too, or the free tier
+    // gates it exactly like a missing credential.
+    if let Some(upstream) = upstream {
+        classify_upstream(upstream, false).inject_extra_headers(&mut headers, request_id, None);
+    }
+    Ok(headers)
+}
+
+#[allow(clippy::result_large_err)]
+fn route_auth_headers_for(var: &str, anthropic: bool) -> Result<HeaderMap, Response> {
     // `none` is not a variable: it declares the route carries no credential
     // at all. The upstream gets only Content-Type — no Authorization, and
     // none of the Codex identity headers the default path would add. For a
@@ -103,9 +144,21 @@ pub(crate) fn route_auth_headers(var: &str) -> Result<HeaderMap, Response> {
     );
     // A token with a newline or a stray control character would otherwise be
     // rejected deep inside the client with a message naming no variable.
-    let value = http::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
-        .map_err(|_| deny(format!("${var} is not usable as an Authorization header")))?;
-    upstream_headers.insert(http::header::AUTHORIZATION, value);
+    let (name, token) = if anthropic {
+        (
+            http::header::HeaderName::from_static("x-api-key"),
+            token.trim().to_string(),
+        )
+    } else {
+        (
+            http::header::AUTHORIZATION,
+            format!("Bearer {}", token.trim()),
+        )
+    };
+    let mut value = http::HeaderValue::from_str(&token)
+        .map_err(|_| deny(format!("${var} is not usable as an {name} header")))?;
+    value.set_sensitive(true);
+    upstream_headers.insert(name, value);
     Ok(upstream_headers)
 }
 
@@ -333,6 +386,10 @@ mod tests {
     /// at both call sites, now asserted in one place.
     #[test]
     fn opencode_upstream_gains_session_headers() {
+        // Session resolution must not shell out from inside a unit test:
+        // hold the mint guard so a machine with no usable session (e.g.
+        // CI) can't spawn a real `opencode run` here.
+        let _mint = crate::routed::quirks::hold_mint_for_test();
         let upstream: url::Url = "https://opencode.ai/zen/v1".parse().expect("valid url");
         let (h, _) = super::auth_headers(None, &HeaderMap::new(), None, &upstream, "req-1", None)
             .expect("no credential needed");

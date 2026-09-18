@@ -227,36 +227,16 @@ fn block_type(block: &Value) -> Option<&str> {
 
 /// Rewrite blocks whose partner is outside `tail`, and strip signed thinking.
 ///
-/// A `tool_use` is kept only if some later message in `tail` carries a
-/// `tool_result` for it, and a `tool_result` only if some earlier message
-/// carries its `tool_use`. Anything else becomes a text block. `cache_control`
-/// is stripped throughout: the sidecar is a one-shot request whose prefix is
-/// never read again, so a cache write on it is pure cost.
+/// The sidecar request carries no `tools` array (`rewrite_sidecar` strips
+/// it), so upstream rejects ANY surviving `tool_use` — paired or not — with
+/// `Tool reference 'X' not found in available tools` (seen live for
+/// WebFetch, headroom_retrieve, Agent, SendMessage, MCP tools). Every
+/// `tool_use` therefore becomes `[calling X]` text, and every `tool_result`
+/// becomes the orphan note: with no `tool_use` left standing, nothing can
+/// stay paired. `cache_control` is stripped throughout: the sidecar is a
+/// one-shot request whose prefix is never read again, so a cache write on
+/// it is pure cost.
 fn repair_tool_pairs(tail: &mut [Value]) {
-    let mut use_ids: Vec<String> = Vec::new();
-    let mut result_ids: Vec<String> = Vec::new();
-    for message in tail.iter() {
-        let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        for block in blocks {
-            match block_type(block) {
-                Some("tool_use") => {
-                    if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
-                        use_ids.push(id.to_string());
-                    }
-                }
-                Some("tool_result") => {
-                    if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
-                        result_ids.push(id.to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let paired = |id: &str| use_ids.iter().any(|u| u == id) && result_ids.iter().any(|r| r == id);
-
     for message in tail.iter_mut() {
         let blocks = match message.get_mut("content") {
             Some(Value::Array(blocks)) => blocks,
@@ -279,28 +259,21 @@ fn repair_tool_pairs(tail: &mut [Value]) {
             truncate_block(&mut block);
             match block_type(&block) {
                 Some("thinking") | Some("redacted_thinking") => continue,
+                // No `tools` array rides along (see `FORWARDED_KEYS`), so
+                // every `tool_use` — paired or not — would 400 as an
+                // undeclared reference. Narrate instead of dropping: the
+                // spinner model still sees that a tool ran.
                 Some("tool_use") => {
-                    let id = block.get("id").and_then(|i| i.as_str()).unwrap_or_default();
-                    if paired(id) {
-                        rebuilt.push(block);
-                    } else {
-                        let name = block
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("a tool");
-                        rebuilt.push(json!({"type": "text", "text": format!("[calling {name}]")}));
-                    }
+                    let name = block
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("a tool");
+                    rebuilt.push(json!({"type": "text", "text": format!("[calling {name}]")}));
                 }
+                // No `tool_use` survives (above), so no result can stay
+                // paired; all become the orphan note.
                 Some("tool_result") => {
-                    let id = block
-                        .get("tool_use_id")
-                        .and_then(|i| i.as_str())
-                        .unwrap_or_default();
-                    if paired(id) {
-                        rebuilt.push(block);
-                    } else {
-                        rebuilt.push(json!({"type": "text", "text": ORPHAN_TOOL_RESULT}));
-                    }
+                    rebuilt.push(json!({"type": "text", "text": ORPHAN_TOOL_RESULT}));
                 }
                 _ => rebuilt.push(block),
             }
@@ -926,9 +899,42 @@ mod tests {
         assert_eq!(tail.len(), 3);
         assert_eq!(tail[0]["content"][0]["type"], "text");
         assert_eq!(tail[0]["content"][0]["text"], ORPHAN_TOOL_RESULT);
-        // The pair that survives intact is left alone.
-        assert_eq!(tail[1]["content"][0]["type"], "tool_use");
-        assert_eq!(tail[2]["content"][0]["type"], "tool_result");
+        // The sidecar request carries no `tools` array, so even the intact
+        // pair is narrated: a surviving `tool_use` would 400 as an
+        // undeclared reference.
+        assert_eq!(tail[1]["content"][0]["type"], "text");
+        assert_eq!(tail[1]["content"][0]["text"], "[calling Read]");
+        assert_eq!(tail[2]["content"][0]["type"], "text");
+        assert_eq!(tail[2]["content"][0]["text"], ORPHAN_TOOL_RESULT);
+    }
+
+    #[test]
+    fn no_tool_blocks_survive_regardless_of_pairing() {
+        // Live 400s: `Tool reference 'WebFetch'/'Agent'/'headroom_retrieve'
+        // not found in available tools. The shrunk request declares no tools,
+        // so any surviving tool block is a 400.
+        let webfetch_use = json!({"type": "tool_use", "id": "w1", "name": "WebFetch", "input": {}});
+        let webfetch_result =
+            json!({"type": "tool_result", "tool_use_id": "w1", "content": "page"});
+        let agent_use = json!({"type": "tool_use", "id": "a1", "name": "Agent", "input": {}});
+        let agent_result = json!({"type": "tool_result", "tool_use_id": "a1", "content": "done"});
+        let messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "go"}]}),
+            json!({"role": "assistant", "content": [webfetch_use, agent_use]}),
+            json!({"role": "user", "content": [webfetch_result, agent_result, describe_block()]}),
+        ];
+        let tail = sidecar_tail(&messages, 4);
+        for message in &tail {
+            if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+                for block in blocks {
+                    let t = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    assert!(
+                        t != "tool_use" && t != "tool_result",
+                        "tool block survived into a tools-less sidecar request: {block}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1075,7 +1081,10 @@ mod tests {
     // ---- truncation ----
 
     #[test]
-    fn a_long_tool_result_is_capped() {
+    fn a_huge_tool_result_is_narrated_not_forwarded() {
+        // No `tools` array rides along, so no `tool_result` can survive —
+        // the 300KB payload never reaches the wire at all (previously it
+        // was capped per block; narration supersedes the cap).
         let huge = "x".repeat(300_000);
         let messages = vec![
             json!({"role": "user", "content": [{"type": "text", "text": "go"}]}),
@@ -1087,12 +1096,10 @@ mod tests {
         ];
         let tail = sidecar_tail(&messages, 4);
         assert_eq!(tail.len(), 3);
-        let content = tail[2]["content"][0]["content"].as_str().unwrap();
-        assert_eq!(
-            content.chars().count(),
-            SIDECAR_MAX_BLOCK_CHARS + TRUNCATION_SUFFIX.chars().count()
-        );
-        assert!(content.ends_with(TRUNCATION_SUFFIX));
+        let wire = serde_json::to_string(&tail).unwrap();
+        assert!(!wire.contains('x'.to_string().repeat(100).as_str()));
+        assert_eq!(tail[1]["content"][0]["text"], "[calling Read]");
+        assert_eq!(tail[2]["content"][0]["text"], ORPHAN_TOOL_RESULT);
     }
 
     #[test]
@@ -1111,10 +1118,12 @@ mod tests {
         assert_eq!(tail[1]["content"][0]["text"], "short");
     }
 
-    /// `tool_result.content` is sometimes an array of blocks rather than a
-    /// string, and the cap has to reach into it.
+    /// `tool_result.content` used to be capped block by block when results
+    /// survived; now every result is narrated (see above), so the cap only
+    /// ever sees text blocks. This pins that a block-holding result still
+    /// collapses instead of leaking 50KB through.
     #[test]
-    fn a_tool_result_holding_blocks_is_capped_block_by_block() {
+    fn a_tool_result_holding_blocks_is_narrated() {
         let messages = vec![
             json!({"role": "user", "content": [{"type": "text", "text": "go"}]}),
             json!({"role": "assistant", "content": [tool_use("a")]}),
@@ -1126,14 +1135,9 @@ mod tests {
             ]}),
         ];
         let tail = sidecar_tail(&messages, 4);
-        let inner = tail[2]["content"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap();
-        assert!(inner.ends_with(TRUNCATION_SUFFIX));
-        assert_eq!(
-            inner.chars().count(),
-            SIDECAR_MAX_BLOCK_CHARS + TRUNCATION_SUFFIX.chars().count()
-        );
+        let wire = serde_json::to_string(&tail).unwrap();
+        assert!(!wire.contains('z'.to_string().repeat(100).as_str()));
+        assert_eq!(tail[2]["content"][0]["text"], ORPHAN_TOOL_RESULT);
     }
 
     #[test]
