@@ -85,13 +85,13 @@ pub use kompress::{
     KompressConfig, KompressError, KompressResult, DEFAULT_MODEL_ID, DEFAULT_TOKENIZER_REPO,
 };
 pub use live_zone::{
-    compress_anthropic_all_messages, compress_anthropic_live_zone,
+    code_aware_enabled, compress_anthropic_all_messages, compress_anthropic_live_zone,
     compress_anthropic_live_zone_with_ccr, compress_block_for_offload,
     compress_openai_chat_live_zone, compress_openai_chat_live_zone_with_config,
     compress_openai_responses_live_zone, compress_openai_responses_live_zone_with_config,
-    set_kompress_enabled, summarize_openai_responses_no_change_reason, warm_live_zone_compressors,
-    AuthMode, BlockAction, BlockOutcome, CompressionManifest, DispatchConfig, ExclusionReason,
-    LiveZoneError, LiveZoneOutcome, DEFAULT_MODEL,
+    set_code_aware_enabled, set_kompress_enabled, summarize_openai_responses_no_change_reason,
+    warm_live_zone_compressors, AuthMode, BlockAction, BlockOutcome, CompressionManifest,
+    DispatchConfig, ExclusionReason, LiveZoneError, LiveZoneOutcome, DEFAULT_MODEL,
 };
 pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,

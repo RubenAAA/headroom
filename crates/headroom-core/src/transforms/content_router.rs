@@ -182,6 +182,30 @@ pub struct ToolSignature {
     pub has_message_like_field: bool,
 }
 
+/// Per-field type tallies plus semantic pattern flags.
+#[derive(Default)]
+struct FieldCounts {
+    string_count: usize,
+    numeric_count: usize,
+    boolean_count: usize,
+    array_count: usize,
+    object_count: usize,
+    has_nested: bool,
+    has_arrays: bool,
+    has_id: bool,
+    has_score: bool,
+    has_timestamp: bool,
+    has_status: bool,
+    has_error: bool,
+    has_message: bool,
+}
+
+/// Merged per-field observations plus the name-sorted pairs used for hashing.
+struct MergedFields {
+    merged: HashMap<String, Vec<String>>,
+    sorted: Vec<(String, String)>,
+}
+
 impl ToolSignature {
     /// Create a signature for non-JSON content types (code, search, logs, text).
     /// The hash is deterministic and persists to disk.
@@ -238,10 +262,47 @@ impl ToolSignature {
         }
 
         let sample_items: Vec<&Value> = items.iter().take(5).collect();
+        let max_depth = sample_items
+            .iter()
+            .map(|item| Self::calculate_depth(item))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let field_info = Self::merge_field_types(&sample_items);
+        let mut counts = FieldCounts::default();
+        for (key, types) in &field_info.merged {
+            Self::add_count(&mut counts, &Self::resolve_field_type(types), key);
+        }
+        let structure_hash = Self::hash_field_info(&field_info.sorted);
 
+        Self {
+            structure_hash,
+            field_count: field_info.sorted.len(),
+            has_nested_objects: counts.has_nested,
+            has_arrays: counts.has_arrays,
+            max_depth,
+            string_field_count: counts.string_count,
+            numeric_field_count: counts.numeric_count,
+            boolean_field_count: counts.boolean_count,
+            array_field_count: counts.array_count,
+            object_field_count: counts.object_count,
+            has_id_like_field: counts.has_id,
+            has_score_like_field: counts.has_score,
+            has_timestamp_like_field: counts.has_timestamp,
+            has_status_like_field: counts.has_status,
+            has_error_like_field: counts.has_error,
+            has_message_like_field: counts.has_message,
+        }
+    }
+
+    /// Merge per-field type observations across sampled items.
+    ///
+    /// Returns field names mapped to every observed type, plus the same pairs
+    /// sorted by name for hashing.
+    fn merge_field_types(sample_items: &[&Value]) -> MergedFields {
         // Merge field info from all sampled items
         let mut all_fields: HashMap<String, Vec<String>> = HashMap::new();
-        for item in &sample_items {
+        for item in sample_items {
             if let Some(obj) = item.as_object() {
                 for (key, value) in obj {
                     let type_name = match value {
@@ -262,133 +323,107 @@ impl ToolSignature {
 
         // Build field_info with most common type per field
         let mut field_info: Vec<(String, String)> = Vec::new();
-        let mut string_count = 0;
-        let mut numeric_count = 0;
-        let mut boolean_count = 0;
-        let mut array_count = 0;
-        let mut object_count = 0;
-        let mut has_nested = false;
-        let mut has_arrays = false;
-        let mut max_depth = 1;
-
-        // Pattern detection
-        let mut has_id = false;
-        let mut has_score = false;
-        let mut has_timestamp = false;
-        let mut has_status = false;
-        let mut has_error = false;
-        let mut has_message = false;
-
-        for item in &sample_items {
-            let d = Self::calculate_depth(item);
-            if d > max_depth {
-                max_depth = d;
-            }
-        }
-
         for (key, types) in &all_fields {
-            let types_no_null: Vec<&str> = types
-                .iter()
-                .filter(|t| *t != "null")
-                .map(|s| s.as_str())
-                .collect();
-
-            let field_type = if types_no_null.len() == 1 {
-                types_no_null[0].to_string()
-            } else if !types_no_null.is_empty() {
-                // Multiple types - pick by priority
-                let mut found = "mixed".to_string();
-                for t in &["object", "array", "string", "numeric", "boolean"] {
-                    if types_no_null.contains(t) {
-                        found = t.to_string();
-                        break;
-                    }
-                }
-                found
-            } else {
-                types.first().cloned().unwrap_or_else(|| "null".to_string())
-            };
-
-            match field_type.as_str() {
-                "string" => string_count += 1,
-                "boolean" => boolean_count += 1,
-                "numeric" => numeric_count += 1,
-                "array" => {
-                    array_count += 1;
-                    has_arrays = true;
-                }
-                "object" => {
-                    object_count += 1;
-                    has_nested = true;
-                }
-                _ => {}
-            }
-
-            // Pattern detection
-            let key_lower = key.to_lowercase();
-            if Self::matches_pattern(&key_lower, &["id", "uuid", "guid"])
-                || key_lower.ends_with("key")
-            {
-                has_id = true;
-            }
-            if Self::matches_pattern(
-                &key_lower,
-                &["score", "rank", "rating", "relevance", "priority"],
-            ) {
-                has_score = true;
-            }
-            if Self::matches_pattern(&key_lower, &["time", "date", "timestamp"])
-                || key_lower.ends_with("_at")
-                || key_lower == "created"
-                || key_lower == "updated"
-            {
-                has_timestamp = true;
-            }
-            if Self::matches_pattern(&key_lower, &["status", "state"])
-                || key_lower == "level"
-                || key_lower == "type"
-                || key_lower == "kind"
-            {
-                has_status = true;
-            }
-            if Self::matches_pattern(&key_lower, &["error", "exception", "fail", "warning"]) {
-                has_error = true;
-            }
-            if Self::matches_pattern(
-                &key_lower,
-                &["message", "msg", "text", "content", "body", "description"],
-            ) {
-                has_message = true;
-            }
-
-            field_info.push((key.clone(), field_type));
+            field_info.push((key.clone(), Self::resolve_field_type(types)));
         }
 
         // Create structure hash (matching Python's json.dumps(sorted_fields, sort_keys=True))
         field_info.sort_by(|a, b| a.0.cmp(&b.0));
-        let hash_input = serde_json::to_string(&field_info).unwrap_or_default();
+        MergedFields {
+            merged: all_fields,
+            sorted: field_info,
+        }
+    }
+
+    /// Resolve the dominant type for one field from its observations.
+    ///
+    /// Nulls are ignored; a single remaining type wins; multiple types resolve
+    /// by priority (object > array > string > numeric > boolean); all-null
+    /// falls back to the first observation.
+    fn resolve_field_type(types: &[String]) -> String {
+        let types_no_null: Vec<&str> = types
+            .iter()
+            .filter(|t| *t != "null")
+            .map(|s| s.as_str())
+            .collect();
+
+        if types_no_null.len() == 1 {
+            types_no_null[0].to_string()
+        } else if !types_no_null.is_empty() {
+            // Multiple types - pick by priority
+            let mut found = "mixed".to_string();
+            for t in &["object", "array", "string", "numeric", "boolean"] {
+                if types_no_null.contains(t) {
+                    found = t.to_string();
+                    break;
+                }
+            }
+            found
+        } else {
+            types.first().cloned().unwrap_or_else(|| "null".to_string())
+        }
+    }
+
+    /// SHA-256[:24] of the sorted (field, type) pairs.
+    fn hash_field_info(sorted_field_info: &[(String, String)]) -> String {
+        let hash_input = serde_json::to_string(sorted_field_info).unwrap_or_default();
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(hash_input.as_bytes());
-        let structure_hash = hex::encode(hasher.finalize())[..24].to_string();
+        hex::encode(hasher.finalize())[..24].to_string()
+    }
 
-        Self {
-            structure_hash,
-            field_count: field_info.len(),
-            has_nested_objects: has_nested,
-            has_arrays,
-            max_depth,
-            string_field_count: string_count,
-            numeric_field_count: numeric_count,
-            boolean_field_count: boolean_count,
-            array_field_count: array_count,
-            object_field_count: object_count,
-            has_id_like_field: has_id,
-            has_score_like_field: has_score,
-            has_timestamp_like_field: has_timestamp,
-            has_status_like_field: has_status,
-            has_error_like_field: has_error,
-            has_message_like_field: has_message,
+    /// Fold one resolved (field, type) pair into running tallies and flags.
+    fn add_count(counts: &mut FieldCounts, field_type: &str, key: &str) {
+        match field_type {
+            "string" => counts.string_count += 1,
+            "boolean" => counts.boolean_count += 1,
+            "numeric" => counts.numeric_count += 1,
+            "array" => {
+                counts.array_count += 1;
+                counts.has_arrays = true;
+            }
+            "object" => {
+                counts.object_count += 1;
+                counts.has_nested = true;
+            }
+            _ => {}
+        }
+
+        // Pattern detection
+        let key_lower = key.to_lowercase();
+        if Self::matches_pattern(&key_lower, &["id", "uuid", "guid"]) || key_lower.ends_with("key")
+        {
+            counts.has_id = true;
+        }
+        if Self::matches_pattern(
+            &key_lower,
+            &["score", "rank", "rating", "relevance", "priority"],
+        ) {
+            counts.has_score = true;
+        }
+        if Self::matches_pattern(&key_lower, &["time", "date", "timestamp"])
+            || key_lower.ends_with("_at")
+            || key_lower == "created"
+            || key_lower == "updated"
+        {
+            counts.has_timestamp = true;
+        }
+        if Self::matches_pattern(&key_lower, &["status", "state"])
+            || key_lower == "level"
+            || key_lower == "type"
+            || key_lower == "kind"
+        {
+            counts.has_status = true;
+        }
+        if Self::matches_pattern(&key_lower, &["error", "exception", "fail", "warning"]) {
+            counts.has_error = true;
+        }
+        if Self::matches_pattern(
+            &key_lower,
+            &["message", "msg", "text", "content", "body", "description"],
+        ) {
+            counts.has_message = true;
         }
     }
 

@@ -522,6 +522,7 @@ HEADROOM_FLAGS=(
   #   export OPENCODE_API_KEY="your-key"   (or add to ~/.bashrc)
   # or: opencode auth login  (if you prefer the auth file, export the env var from it)
   --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=OPENCODE_API_KEY
+  --extra-model-route claude-union-alpha=https://opencode.ai/zen:anthropic:union-alpha:auth=OPENCODE_API_KEY
 
   # Weaker, faster sibling for the spinner sidecar was 1.2 (~250 tokens
   # vs 1.3's ~500-1000, measured 2026-09-06) until Zen retired
@@ -598,7 +599,12 @@ HEADROOM_FLAGS=(
   # 0 = no ratio target; the transforms decide
   --target-ratio 0
   --lossless false
-  --code-aware false
+  # ON 2026-09-18 (was false). The flag was previously a no-op on the Rust
+  # live-zone path — code_aware_compressor fired 2,097 times live regardless
+  # (261k tokens saved, no invalid-syntax signal under the re-parse gate).
+  # The dispatcher now honors this switch; true pins our measured behavior,
+  # false is the off-arm for the code-aware A/B. Upstream default stays false.
+  --code-aware true
   --savings-profile balanced
   --mode token
   --verbosity-level 2

@@ -640,8 +640,27 @@ fn code_compressor() -> &'static CodeAwareCompressor {
     INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
 }
 
+// Process-wide gate for the CodeAware (`SourceCode`) compressor. Default ON:
+// this preserves the historical dispatch behavior (the arm predates the
+// flag). The proxy sets this once at startup from `--code-aware`, so an
+// operator that wants the off-arm gets it, while our deployment pins it on.
+// Mirrors the `KOMPRESS_ENABLED` pattern below.
+static CODE_AWARE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable the CodeAware `SourceCode` compressor process-wide.
+/// Call once at startup (before serving) from config. When disabled, source
+/// code blocks pass through untouched.
+pub fn set_code_aware_enabled(enabled: bool) {
+    CODE_AWARE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Current state of the CodeAware process-wide gate (default `true`).
+pub fn code_aware_enabled() -> bool {
+    CODE_AWARE_ENABLED.load(Ordering::Relaxed)
+}
+
 // Process-wide gate for the Kompress (PlainText) compressor. Default OFF:
-// unlike the always-on structural compressors and CodeCompressor, Kompress
+// unlike the structural compressors, Kompress
 // carries a ~261 MB ONNX model, so an operator must opt in before it is ever
 // loaded. Mirrors the Python reference's `config.enable_kompress`. The proxy
 // sets this once at startup from `--enable-kompress`.
@@ -2077,13 +2096,14 @@ fn dispatch_cache() -> &'static super::content_router::CompressionCache {
 /// type that selects the compressor, `target_ratio` — the only
 /// [`DispatchConfig`] field this function reads (the rest are role gates applied
 /// by callers, and `exclude_tools`, which the planner consumes before a block
-/// ever reaches this cache) — and the global Kompress enable flag. This extends Python's
-/// `hash((content, _runtime_target_ratio))`.
+/// ever reaches this cache) — and the global Kompress and CodeAware enable
+/// flags. This extends Python's `hash((content, _runtime_target_ratio))`.
 ///
 /// The Kompress flag has to be part of the key even though it is not an
 /// argument: [`set_kompress_enabled`] flips it at runtime and it decides whether
 /// `PlainText` compresses at all, so a key without it would serve a
-/// Kompress-disabled result after Kompress was switched on.
+/// Kompress-disabled result after Kompress was switched on. Same for
+/// [`set_code_aware_enabled`] and `SourceCode`.
 ///
 /// Like Python's, this is a 64-bit key with no stored copy of the input to
 /// verify against, so a hash collision would serve another block's bytes. The
@@ -2096,6 +2116,9 @@ fn dispatch_cache_key(text: &str, content_type: ContentType, target_ratio: Optio
     // `f64` is not `Hash`; its bit pattern is, and is exact for this purpose.
     target_ratio.map(f64::to_bits).hash(&mut hasher);
     KOMPRESS_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .hash(&mut hasher);
+    CODE_AWARE_ENABLED
         .load(std::sync::atomic::Ordering::Relaxed)
         .hash(&mut hasher);
     hasher.finish() as i64
@@ -2262,6 +2285,14 @@ fn dispatch_compressor_uncached(
             }
         }
         ContentType::SourceCode => {
+            // Off-arm (`--code-aware false`, via `set_code_aware_enabled`):
+            // source passes through untouched, byte-identical.
+            if !CODE_AWARE_ENABLED.load(Ordering::Relaxed) {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                    declined_by: Some("code_aware_disabled"),
+                };
+            }
             let result = code_compressor().compress(text);
             // The engine returns the input unchanged for passthrough
             // branches (below min-tokens, UNKNOWN language, invalid-syntax

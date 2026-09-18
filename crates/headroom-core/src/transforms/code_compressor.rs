@@ -1934,6 +1934,16 @@ impl<'a> Ctx<'a> {
         out
     }
 
+    /// Dispatch a single AST node to its structure-extraction arm.
+    ///
+    /// Pure dispatcher: each `visit_*` arm below returns `true` when it
+    /// handles the node, mirroring the original early-`return` chain. Order
+    /// is load-bearing (package → import → export → decorator → function →
+    /// opaque → container → class → type → recurse) and unchanged.
+    ///
+    /// `structure` + `captured` stay shared `&mut` out-params threaded through
+    /// every arm (same as the Python closure over `structure` /
+    /// `captured_byte_ranges`): the aliasing risk is known and kept as-is.
     fn visit(
         &self,
         node: Node,
@@ -1943,149 +1953,283 @@ impl<'a> Ctx<'a> {
         let nt = node.kind();
         let range = (node.start_byte(), node.end_byte());
 
-        // Package declarations (Go, Java).
-        if self.lang.package_node == Some(nt) {
-            let leading = self.leading_comment_text(node, captured);
-            structure.imports.insert(0, leading + self.node_text(node));
-            captured.insert(range);
+        if self.visit_package(node, nt, range, structure, captured) {
             return;
         }
-        // Import statements.
-        if self.lang.is_import(nt) {
-            let leading = self.leading_comment_text(node, captured);
-            structure.imports.push(leading + self.node_text(node));
-            captured.insert(range);
+        if self.visit_import(node, nt, range, structure, captured) {
             return;
         }
-        // Export statements (JS/TS).
-        if nt == "export_statement" {
-            let leading = self.leading_comment_text(node, captured);
-            let text = leading + self.node_text(node);
-            let mut has_func_or_class = false;
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if self.lang.is_function(child.kind()) || self.lang.is_class(child.kind()) {
-                    has_func_or_class = true;
-                    let compressed = self.compress_function_ast(child);
-                    let export_prefix = &self.code[node.start_byte()..child.start_byte()];
-                    let export_suffix = &self.code[child.end_byte()..node.end_byte()];
-                    structure
-                        .function_signatures
-                        .push(format!("{export_prefix}{compressed}{export_suffix}"));
-                    break;
+        if self.visit_export(node, nt, range, structure, captured) {
+            return;
+        }
+        if self.visit_decorated(node, nt, range, structure, captured) {
+            return;
+        }
+        if self.visit_function(node, nt, range, structure, captured) {
+            return;
+        }
+        if self.visit_opaque(node, nt, range, structure, captured) {
+            return;
+        }
+        if self.visit_container(node, nt, range, structure, captured) {
+            return;
+        }
+        if self.visit_class(node, nt, range, structure, captured) {
+            return;
+        }
+        if self.visit_type(node, nt, range, structure, captured) {
+            return;
+        }
+        self.visit_children(node, structure, captured);
+    }
+
+    // Package declarations (Go, Java).
+    fn visit_package(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if self.lang.package_node != Some(nt) {
+            return false;
+        }
+        let leading = self.leading_comment_text(node, captured);
+        structure.imports.insert(0, leading + self.node_text(node));
+        captured.insert(range);
+        true
+    }
+
+    // Import statements.
+    fn visit_import(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if !self.lang.is_import(nt) {
+            return false;
+        }
+        let leading = self.leading_comment_text(node, captured);
+        structure.imports.push(leading + self.node_text(node));
+        captured.insert(range);
+        true
+    }
+
+    // Export statements (JS/TS).
+    fn visit_export(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if nt != "export_statement" {
+            return false;
+        }
+        let leading = self.leading_comment_text(node, captured);
+        let text = leading + self.node_text(node);
+        let mut has_func_or_class = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if self.lang.is_function(child.kind()) || self.lang.is_class(child.kind()) {
+                has_func_or_class = true;
+                let compressed = self.compress_function_ast(child);
+                let export_prefix = &self.code[node.start_byte()..child.start_byte()];
+                let export_suffix = &self.code[child.end_byte()..node.end_byte()];
+                structure
+                    .function_signatures
+                    .push(format!("{export_prefix}{compressed}{export_suffix}"));
+                break;
+            }
+        }
+        if !has_func_or_class {
+            structure.imports.push(text);
+        }
+        captured.insert(range);
+        true
+    }
+
+    // Decorated definitions (Python).
+    fn visit_decorated(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if self.lang.decorator_node != Some(nt) {
+            return false;
+        }
+        let mut decorator_text: Vec<String> = Vec::new();
+        let mut definition_compressed: Option<String> = None;
+        let mut has_class_child = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            let ck = child.kind();
+            if ck == "decorator" {
+                decorator_text.push(self.node_text(child).to_string());
+            } else if self.lang.is_function(ck) {
+                definition_compressed = Some(self.compress_function_ast(child));
+            } else if self.lang.is_class(ck) {
+                definition_compressed = Some(self.compress_class_ast(child));
+            }
+            if self.lang.is_class(ck) {
+                has_class_child = true;
+            }
+        }
+        match definition_compressed {
+            Some(def) if !decorator_text.is_empty() => {
+                let full_def = format!("{}\n{}", decorator_text.join("\n"), def);
+                if has_class_child {
+                    structure.class_definitions.push(full_def);
+                } else {
+                    structure.function_signatures.push(full_def);
                 }
             }
-            if !has_func_or_class {
-                structure.imports.push(text);
+            Some(def) => structure.function_signatures.push(def),
+            None => {}
+        }
+        captured.insert(range);
+        true
+    }
+
+    // Function/method definitions.
+    fn visit_function(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if !self.lang.is_function(nt) {
+            return false;
+        }
+        let compressed = self.compress_function_ast(node);
+        structure
+            .function_signatures
+            .push(self.validated_candidate(node, compressed));
+        captured.insert(range);
+        true
+    }
+
+    // Opaque nodes (C# `preproc_if`): keep verbatim rather than descend.
+    // Their branches can each be individually unparseable, so compressing
+    // the pieces risks emitting code that doesn't build. A block that
+    // contains ONLY imports is emitted WITH the imports — C# `using`
+    // directives must precede type declarations, so appending it as
+    // trailing top-level code would produce invalid output and lose the
+    // whole compression.
+    fn visit_opaque(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if !self.lang.opaque_node_types.contains(&nt) {
+            return false;
+        }
+        let mut cursor = node.walk();
+        let child_kinds: Vec<&str> = node.named_children(&mut cursor).map(|c| c.kind()).collect();
+        let has_import = child_kinds.iter().any(|t| self.lang.is_import(t));
+        let has_declaration = child_kinds.iter().any(|t| {
+            self.lang.is_class(t)
+                || self.lang.is_type(t)
+                || self.lang.is_function(t)
+                || self.lang.container_node_types.contains(t)
+        });
+        let text = self.node_text(node).to_string();
+        if has_import && !has_declaration {
+            structure.imports.push(text);
+        } else {
+            structure.top_level_code.push(text);
+        }
+        captured.insert(range);
+        true
+    }
+
+    // Container nodes (C# `namespace_declaration`): compressed like a
+    // class so the declarations inside are processed individually instead
+    // of the whole namespace being swept up as one blob.
+    fn visit_container(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if !self.lang.container_node_types.contains(&nt) {
+            return false;
+        }
+        let compressed = self.compress_class_ast(node);
+        structure
+            .class_definitions
+            .push(self.validated_candidate(node, compressed));
+        captured.insert(range);
+        true
+    }
+
+    // Class definitions.
+    fn visit_class(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if !self.lang.is_class(nt) {
+            return false;
+        }
+        let compressed = self.compress_class_ast(node);
+        structure
+            .class_definitions
+            .push(self.validated_candidate(node, compressed));
+        captured.insert(range);
+        // Capture trailing semicolon on the same line (e.g., C++ `class Foo {} ;`).
+        if let Some(next) = node.next_sibling() {
+            if next.kind() == ";" && next.start_position().row == node.end_position().row {
+                captured.insert((next.start_byte(), next.end_byte()));
             }
-            captured.insert(range);
-            return;
         }
-        // Decorated definitions (Python).
-        if self.lang.decorator_node == Some(nt) {
-            let mut decorator_text: Vec<String> = Vec::new();
-            let mut definition_compressed: Option<String> = None;
-            let mut has_class_child = false;
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                let ck = child.kind();
-                if ck == "decorator" {
-                    decorator_text.push(self.node_text(child).to_string());
-                } else if self.lang.is_function(ck) {
-                    definition_compressed = Some(self.compress_function_ast(child));
-                } else if self.lang.is_class(ck) {
-                    definition_compressed = Some(self.compress_class_ast(child));
-                }
-                if self.lang.is_class(ck) {
-                    has_class_child = true;
-                }
-            }
-            match definition_compressed {
-                Some(def) if !decorator_text.is_empty() => {
-                    let full_def = format!("{}\n{}", decorator_text.join("\n"), def);
-                    if has_class_child {
-                        structure.class_definitions.push(full_def);
-                    } else {
-                        structure.function_signatures.push(full_def);
-                    }
-                }
-                Some(def) => structure.function_signatures.push(def),
-                None => {}
-            }
-            captured.insert(range);
-            return;
+        true
+    }
+
+    // Type definitions.
+    fn visit_type(
+        &self,
+        node: Node,
+        nt: &str,
+        range: (usize, usize),
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        if !self.lang.is_type(nt) {
+            return false;
         }
-        // Function/method definitions.
-        if self.lang.is_function(nt) {
-            let compressed = self.compress_function_ast(node);
-            structure
-                .function_signatures
-                .push(self.validated_candidate(node, compressed));
-            captured.insert(range);
-            return;
-        }
-        // Opaque nodes (C# `preproc_if`): keep verbatim rather than descend.
-        // Their branches can each be individually unparseable, so compressing
-        // the pieces risks emitting code that doesn't build. A block that
-        // contains ONLY imports is emitted WITH the imports — C# `using`
-        // directives must precede type declarations, so appending it as
-        // trailing top-level code would produce invalid output and lose the
-        // whole compression.
-        if self.lang.opaque_node_types.contains(&nt) {
-            let mut cursor = node.walk();
-            let child_kinds: Vec<&str> =
-                node.named_children(&mut cursor).map(|c| c.kind()).collect();
-            let has_import = child_kinds.iter().any(|t| self.lang.is_import(t));
-            let has_declaration = child_kinds.iter().any(|t| {
-                self.lang.is_class(t)
-                    || self.lang.is_type(t)
-                    || self.lang.is_function(t)
-                    || self.lang.container_node_types.contains(t)
-            });
-            let text = self.node_text(node).to_string();
-            if has_import && !has_declaration {
-                structure.imports.push(text);
-            } else {
-                structure.top_level_code.push(text);
-            }
-            captured.insert(range);
-            return;
-        }
-        // Container nodes (C# `namespace_declaration`): compressed like a
-        // class so the declarations inside are processed individually instead
-        // of the whole namespace being swept up as one blob.
-        if self.lang.container_node_types.contains(&nt) {
-            let compressed = self.compress_class_ast(node);
-            structure
-                .class_definitions
-                .push(self.validated_candidate(node, compressed));
-            captured.insert(range);
-            return;
-        }
-        // Class definitions.
-        if self.lang.is_class(nt) {
-            let compressed = self.compress_class_ast(node);
-            structure
-                .class_definitions
-                .push(self.validated_candidate(node, compressed));
-            captured.insert(range);
-            // Capture trailing semicolon on the same line (e.g., C++ `class Foo {} ;`).
-            if let Some(next) = node.next_sibling() {
-                if next.kind() == ";" && next.start_position().row == node.end_position().row {
-                    captured.insert((next.start_byte(), next.end_byte()));
-                }
-            }
-            return;
-        }
-        // Type definitions.
-        if self.lang.is_type(nt) {
-            structure
-                .type_definitions
-                .push(self.node_text(node).to_string());
-            captured.insert(range);
-            return;
-        }
-        // Recurse.
+        structure
+            .type_definitions
+            .push(self.node_text(node).to_string());
+        captured.insert(range);
+        true
+    }
+
+    // Recurse.
+    fn visit_children(
+        &self,
+        node: Node,
+        structure: &mut CodeStructure,
+        captured: &mut std::collections::HashSet<(usize, usize)>,
+    ) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             self.visit(child, structure, captured);

@@ -128,7 +128,232 @@ TASKS_MULTI = [
 ]
 
 
-def score(kind: str, truth: str, answer: str) -> bool:
+# Edit suite (rung 4b of the code-aware ladder): each task requires the model
+# to INSERT one line at an anchored position. Fixtures are written into the
+# worktree before each run (the main loop's git reset/clean removes them
+# after). Truth format is three newline-separated fields:
+#   relpath\nanchor-line\nexpected-line-after-anchor
+# Grading reads the file, not the answer text: the expected line must sit
+# immediately after the anchor line. Fixtures exceed 512B so they qualify
+# for live-zone dispatch; bodies exceed 5 lines so skeletons elide them.
+# 5-tuples: (id, prompt, truth, kind, fixture_content). The two arms for
+# this suite are sequential proxy states, NOT HEADROOM_CODEMODE (which only
+# steers the client): run once with code-aware active, restart the proxy
+# with it disabled, run again with --out pointing at a second file, then
+# compare with codemode_ab_report.py. The off-arm works since 2026-09-18
+# (CODE_AWARE_ENABLED gate in live_zone.rs, set from --code-aware at proxy
+# startup; flags.sh pins true).
+TASKS_EDIT = [
+    (
+        "edit_py_after_def",
+        "In ab_edit_target_py.py, insert the line '    log_call(\"refresh\")' "
+        "immediately after the line 'def refresh_token(session_id):' (it appears "
+        "once). Reply with just DONE.",
+        "ab_edit_target_py.py\ndef refresh_token(session_id):\n    log_call(\"refresh\")",
+        "edit",
+        None,  # fixture filled by EDIT_FIXTURES below
+    ),
+    (
+        "edit_py_midfile",
+        "In ab_edit_target_py.py, insert the line '    metrics.incr(\"revoke\")' "
+        "immediately after the line 'def revoke_session(session_id):' (it appears "
+        "once). Reply with just DONE.",
+        "ab_edit_target_py.py\ndef revoke_session(session_id):\n    metrics.incr(\"revoke\")",
+        "edit",
+        None,
+    ),
+    (
+        "edit_go_after_func",
+        "In ab_edit_target_go.go, insert the line '\tfetched.Add(1)' immediately "
+        "after the line 'func Refresh(s *Session) string {' (it appears once). "
+        "Reply with just DONE.",
+        "ab_edit_target_go.go\nfunc Refresh(s *Session) string {\n\tfetched.Add(1)",
+        "edit",
+        None,
+    ),
+    (
+        "edit_rs_after_fn",
+        "In ab_edit_target_rs.rs, insert the line '    let _guard = lock();' "
+        "immediately after the line '    pub fn revoke(&mut self, token: &str) -> bool {' "
+        "(it appears once). Reply with just DONE.",
+        "ab_edit_target_rs.rs\n    pub fn revoke(&mut self, token: &str) -> bool {\n    let _guard = lock();",
+        "edit",
+        None,
+    ),
+    (
+        "edit_ts_after_export",
+        "In ab_edit_target_ts.ts, insert the line '  trace(\"refresh\");' "
+        "immediately after the line 'export async function refreshToken(id: string) {' "
+        "(it appears once). Reply with just DONE.",
+        "ab_edit_target_ts.ts\nexport async function refreshToken(id: string) {\n  trace(\"refresh\");",
+        "edit",
+        None,
+    ),
+]
+
+EDIT_FIXTURES = {
+    "ab_edit_target_py.py": '''"""Fixture module for line-insert A/B tasks (untracked, reset per run)."""
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def authenticate(username, password):
+    """Validate credentials."""
+    record = directory.lookup(username)
+    if record is None:
+        logger.warning("unknown user %s", username)
+        return None
+    if not verify(password, record.hash):
+        audit("login", username, False)
+        return None
+    session = create_session(record.id)
+    audit("login", username, True)
+    return session
+
+
+def refresh_token(session_id):
+    """Rotate the session token."""
+    session = load_session(session_id)
+    if session.expired():
+        raise SessionExpired(session_id)
+    session.token = generate_token(32)
+    session.expires_at = now() + 3600
+    persist_session(session)
+    metrics.incr("token.refresh")
+    return session.token
+
+
+def revoke_session(session_id):
+    """Kill a session everywhere."""
+    session = load_session(session_id)
+    cache.delete(session.cache_key)
+    db.execute("DELETE FROM sessions WHERE id = ?", session_id)
+    audit("revoke", session.user)
+    notify(session.user, "revoked")
+    return True
+''',
+    "ab_edit_target_go.go": '''package auth
+
+import (
+\t"errors"
+\t"time"
+)
+
+func Authenticate(username, password string) (string, error) {
+\tfor i := 0; i < 3; i++ {
+\t\trec, err := Lookup(username)
+\t\tif err != nil {
+\t\t\treturn "", err
+\t\t}
+\t\tif Verify(rec.Hash, password) {
+\t\t\treturn Issue(rec.ID)
+\t\t}
+\t}
+\treturn "", errors.New("denied")
+}
+
+func Refresh(s *Session) string {
+\ttok := Generate(32)
+\ts.Token = tok
+\ts.Expires = time.Now().Add(time.Hour)
+\tif err := Persist(s); err != nil {
+\t\tpanic(err)
+\t}
+\tAudit("refresh", s.User)
+\treturn tok
+}
+
+func Health() string {
+\treturn "ok"
+}
+''',
+    "ab_edit_target_rs.rs": '''use std::collections::HashMap;
+
+pub struct Store {
+    entries: HashMap<String, String>,
+}
+
+impl Store {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn lookup(&self, key: &str) -> Option<&String> {
+        self.entries.get(key)
+    }
+
+    pub fn insert(&mut self, key: String, val: String) -> bool {
+        if self.entries.contains_key(&key) {
+            return false;
+        }
+        self.entries.insert(key, val);
+        self.persist();
+        self.notify();
+        true
+    }
+
+    pub fn revoke(&mut self, token: &str) -> bool {
+        let hit = self.entries.remove(token).is_some();
+        if hit {
+            self.persist();
+            self.audit(token);
+        }
+        hit
+    }
+}
+''',
+    "ab_edit_target_ts.ts": '''import { Directory, Session } from "./store";
+
+export async function authenticateUser(name: string, pw: string): Promise<Session> {
+  const rec = await Directory.lookup(name);
+  if (!rec) {
+    throw new Error("unknown user");
+  }
+  const ok = await verify(pw, rec.hash);
+  if (!ok) {
+    await audit("login", name, false);
+    throw new Error("bad password");
+  }
+  return createSession(rec.id);
+}
+
+export async function refreshToken(id: string) {
+  const s = await loadSession(id);
+  if (s.expired()) {
+    throw new Error("expired");
+  }
+  s.token = generateToken(32);
+  s.expires = Date.now() + 3600000;
+  await persist(s);
+  return s.token;
+}
+
+export function health(): boolean {
+  return true;
+}
+''',
+}
+
+
+def score_edit(wt: Path, truth: str) -> bool:
+    """Grade a line-insert task by file state: expected line immediately
+    after the anchor line. Both must match exactly (no stripping — Edit
+    anchoring is byte-exact or it is nothing)."""
+    try:
+        rel, anchor, expected = truth.split("\n", 2)
+    except ValueError:
+        return False
+    try:
+        lines = (wt / rel).read_text().splitlines()
+    except OSError:
+        return False
+    for i, line in enumerate(lines):
+        if line == anchor:
+            return i + 1 < len(lines) and lines[i + 1] == expected
+    return False
     """Grade an answer.
 
     Answers often carry a trailing citation ("3\n\n(file.py:72)"), so numeric
@@ -234,7 +459,14 @@ def trace(session_id: str) -> dict:
 
 
 def run_one(task, arm: str, wt: Path, plugin_dir: Path, model: str | None) -> dict:
-    tid, prompt, truth, kind = task
+    tid, prompt, truth, kind = task[:4]
+    fixture_path = None
+    if kind == "edit":
+        # (Re)create the fixture: the main loop's git clean removes it
+        # after every run, so each arm starts from identical bytes.
+        rel = truth.split("\n", 1)[0]
+        fixture_path = wt / rel
+        fixture_path.write_text(EDIT_FIXTURES[rel])
     env = dict(os.environ)
     env["HEADROOM_CODEMODE"] = "1" if arm == "steered" else "0"
     cmd = [
@@ -276,7 +508,7 @@ def run_one(task, arm: str, wt: Path, plugin_dir: Path, model: str | None) -> di
         "output_tokens": u.get("output_tokens", 0),
         "answer": str(d.get("result", ""))[:200],
     }
-    rec["correct"] = score(kind, truth, rec["answer"])
+    rec["correct"] = score_edit(wt, truth) if kind == "edit" else score(kind, truth, rec["answer"])
     rec.update(trace(rec["session_id"] or ""))
     return rec
 
@@ -288,7 +520,7 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--model", default=None)
     ap.add_argument("--out", default="benchmark_results/codemode_ab.json")
-    ap.add_argument("--suite", choices=["simple", "multi"], default="simple")
+    ap.add_argument("--suite", choices=["simple", "multi", "edit"], default="simple")
     args = ap.parse_args()
 
     wt = Path(args.worktree).resolve()
@@ -298,7 +530,7 @@ def main() -> int:
     results = json.loads(out.read_text()) if out.exists() else []
     done = {(r["task"], r["arm"], r.get("rep")) for r in results}
 
-    suite = TASKS_MULTI if args.suite == "multi" else TASKS
+    suite = {"multi": TASKS_MULTI, "edit": TASKS_EDIT}.get(args.suite, TASKS)
     for rep in range(args.reps):
         for task in suite:
             # interleave arms so prompt-cache warmth cannot favour one side

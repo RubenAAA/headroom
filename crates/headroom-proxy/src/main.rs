@@ -163,8 +163,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // when an operator opts in via `--enable-kompress`. The warm runs on a
     // blocking thread off the request path; cache-only means a cold cache
     // just leaves it deferred (PlainText passes through) rather than stalling
-    // startup. The always-on structural compressors + CodeCompressor need no
-    // such gate.
+    // startup. The structural compressors need no such gate.
+    //
+    // CodeAware gate: default-ON at the dispatcher (historical behavior), set
+    // here from `--code-aware` so the off-arm exists for operators that want
+    // it. Our deployment pins it on (flags.sh) — the 2026-09-18 ladder
+    // measured 261k tokens saved live with no invalid-syntax signal.
+    headroom_core::transforms::set_code_aware_enabled(config.code_aware_enabled);
     headroom_core::transforms::set_kompress_enabled(config.enable_kompress);
     if config.enable_kompress {
         tokio::task::spawn_blocking(|| {

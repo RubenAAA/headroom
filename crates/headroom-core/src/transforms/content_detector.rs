@@ -154,6 +154,25 @@ static CODE_PATTERNS: LazyLock<Vec<CodePatterns>> = LazyLock::new(|| {
             patterns: vec![
                 Regex::new(r"^\s*(func|type|package|import)\s+").unwrap(),
                 Regex::new(r"^\s*func\s+\([^)]+\)\s+\w+").unwrap(),
+                // Short variable declarations (`x := f()`) are the only
+                // signal in headerless fragments — tool output rarely shows
+                // the file top. `:=` at line start is vanishingly rare in
+                // prose, and the >= 3-hit gate below absorbs strays.
+                // Measured 2026-09-18 over captured bodies: fixes Go
+                // fragments, zero moves on agreement blocks.
+                Regex::new(r"^\s*\w[\w.]*\s*:=").unwrap(),
+            ],
+        },
+        CodePatterns {
+            // SQL had no entry at all: query blocks fell to text even with
+            // SELECT/FROM/WHERE on consecutive lines. Uppercase-anchored so
+            // prose ("from the docs…") never matches. Measured 2026-09-18:
+            // fixes query blocks (including ones Magika also missed);
+            // apparent "regressions" were all real SQL under a prose header.
+            name: "sql",
+            patterns: vec![
+                Regex::new(r"^\s*(SELECT|WITH|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b").unwrap(),
+                Regex::new(r"^\s*(FROM|WHERE|JOIN|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b").unwrap(),
             ],
         },
         CodePatterns {
@@ -189,6 +208,83 @@ static CODE_PATTERNS: LazyLock<Vec<CodePatterns>> = LazyLock::new(|| {
         },
     ]
 });
+
+// ─── Line-number prefixes ──────────────────────────────────────────
+//
+// Tool output routinely prefixes code with line numbers (`1\tpackage …`
+// from grep -n / reviewers, `1 │ …` from renderers). The tabular stage
+// reads those as consistent TSV columns and the start-anchored code
+// patterns never see the keywords. Measured 2026-09-18 over captured
+// bodies (`upstream-python/bench/_detect_miss_probes.py`): tolerating the
+// prefix in the CODE view only fixes line-numbered Go/Rust/Python while a
+// whole-text strip moved prose — so the strip applies to code matching
+// (and the tabular guard below), nowhere else.
+static LINE_NUM_TAB_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\d+\t").expect("valid"));
+static LINE_NUM_BAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\d+\s*[│|]\s?").expect("valid"));
+
+/// Detection-time view for CODE patterns: strip one `N<TAB>` / `N │`
+/// line-number prefix. Returns the raw line when no prefix is present.
+fn strip_line_number_prefix(line: &str) -> &str {
+    for re in [&LINE_NUM_TAB_RE, &LINE_NUM_BAR_RE] {
+        if let Some(m) = re.find(line) {
+            debug_assert_eq!(m.start(), 0);
+            return &line[m.end()..];
+        }
+    }
+    line
+}
+
+// ─── Shell scripts ─────────────────────────────────────────────────
+//
+// Shell has no header keywords (`func`, `import`, …), so script bodies —
+// especially after a tool-output header line like `Exit code 1` — fall to
+// text. There is not even a shebang rule today. A bare `WORD=` pattern
+// fires on analysis prose (`dob=both`, `name_sim=1.0`), so the rule is
+// conjunctive: a shebang within the first 3 non-empty lines (tolerating
+// the header) plus >= 2 shell-ish body lines. Measured 2026-09-18: fixes
+// shebang scripts, zero moves on agreement blocks.
+static SHELL_BODY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*[A-Za-z_]\w*=\S|^\s*(cd|export|exit|exec|source)\b|\$\(|^\s*(if|then|fi|for|while|do|done|case|esac|function)\b",
+    )
+    .expect("valid")
+});
+
+/// Conjunctive shell check; see [`SHELL_BODY_RE`]. Returns SourceCode
+/// with language "shell", or None.
+fn try_detect_shell(lines: &[&str]) -> Option<DetectionResult> {
+    let nonempty: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .take(100)
+        .collect();
+    // Shebang tolerates a tool-output header above it, but must be
+    // unindented: `line.starts_with`, mirroring the measured rule.
+    if !nonempty.iter().take(3).any(|l| l.starts_with("#!")) {
+        return None;
+    }
+    let hits = nonempty
+        .iter()
+        .filter(|l| SHELL_BODY_RE.is_match(l))
+        .count();
+    if hits < 2 {
+        return None;
+    }
+    Some(DetectionResult::new(
+        ContentType::SourceCode,
+        0.7,
+        json!({
+            "language": "shell",
+            "pattern_matches": hits,
+        })
+        .as_object()
+        .cloned()
+        .unwrap(),
+    ))
+}
 
 // ─── Log / build output patterns ───────────────────────────────────────
 //
@@ -861,6 +957,34 @@ fn try_detect_markdown_table(lines: &[&str]) -> Option<DetectionResult> {
     None
 }
 
+/// True when every sampled row's first tab field is an integer and the
+/// integers strictly increase down the rows: `grep -n` / reviewer line
+/// numbers, not a data column. Accepted false negative: a genuine TSV
+/// whose id column happens to run 1,2,3… — none appeared in 800+
+/// agreement blocks over captured bodies, and search/log/config claim
+/// their content before tabular runs.
+fn first_col_sequential_ints(sample: &[&str]) -> bool {
+    if sample.len() < 3 {
+        return false;
+    }
+    let mut prev: Option<u64> = None;
+    for row in sample {
+        if !row.contains('\t') {
+            return false;
+        }
+        let first = row.split('\t').next().map(str::trim).unwrap_or("");
+        let n: u64 = match first.parse() {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if prev.is_some_and(|p| n <= p) {
+            return false;
+        }
+        prev = Some(n);
+    }
+    true
+}
+
 fn looks_like_prose(sample: &[&str], delim: &str) -> bool {
     let enders = sample
         .iter()
@@ -898,6 +1022,14 @@ fn try_detect_delimited(lines: &[&str]) -> Option<DetectionResult> {
     let mut best: Option<DetectionResult> = None;
 
     for &(delim, min_consistency) in delimiters {
+        // `N<TAB>code` excerpts are column-consistent TSV to a counter but
+        // line numbers to a reader; the code stage tolerates the prefix, so
+        // yield the tab candidacy when the first column is a strictly
+        // increasing integer run. Other delimiters are untouched:
+        // comma/semicolon id columns are real data.
+        if delim == "\t" && first_col_sequential_ints(&sample) {
+            continue;
+        }
         let counts: Vec<usize> = sample
             .iter()
             .map(|row| row.matches(delim).count())
@@ -961,6 +1093,13 @@ fn try_detect_code(content: &str) -> Option<DetectionResult> {
     if lines.is_empty() {
         return None;
     }
+    // Shell scripts have no header keywords for the pattern table below;
+    // the conjunctive shebang rule runs first so they are not hostage to
+    // it (config/INI-looking assignments still route to config — that
+    // stage runs before code in the orchestrator).
+    if let Some(r) = try_detect_shell(&lines) {
+        return Some(r);
+    }
     // Track scores in **first-match insertion order** to mirror Python's
     // dict semantics. Python:
     //
@@ -978,7 +1117,11 @@ fn try_detect_code(content: &str) -> Option<DetectionResult> {
     // the first-on-tie tie-break (Rust's `max_by` returns LAST on ties).
     let mut language_scores: Vec<(&'static str, u32)> = Vec::new();
 
-    for line in &lines {
+    // Match against the line-number-tolerant view: a `17\t` / `17 │`
+    // prefix is tooling, not content. Tabular/search/log saw the raw lines
+    // in their own earlier stages; only code matching looks through it.
+    let viewed: Vec<&str> = lines.iter().map(|l| strip_line_number_prefix(l)).collect();
+    for line in &viewed {
         for cp in CODE_PATTERNS.iter() {
             for pattern in &cp.patterns {
                 if pattern.is_match(line) {
@@ -1004,7 +1147,7 @@ fn try_detect_code(content: &str) -> Option<DetectionResult> {
     if best_score < 3 {
         return None;
     }
-    let non_empty_lines = lines.iter().filter(|l| !l.trim().is_empty()).count() as u32;
+    let non_empty_lines = viewed.iter().filter(|l| !l.trim().is_empty()).count() as u32;
     let ratio = best_score as f64 / non_empty_lines.max(1) as f64;
     let confidence = (0.4 + ratio * 0.4 + (best_score as f64) * 0.02).min(1.0);
     Some(DetectionResult::new(
@@ -1280,6 +1423,129 @@ func helper() {}
         let r = detect_content_type(content);
         assert_eq!(r.content_type, ContentType::SourceCode);
         assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("go"));
+    }
+
+    #[test]
+    fn go_assign_fragment_detected() {
+        // Headerless fragments carry no `func`/`package` in view; `:=` is
+        // the only signal. (Corpus case: tool output starting mid-function.)
+        let content = "\
+entryA := matching.LineupPlayerEntry{Provider: pA}
+evEntryA := matching.EventsPlayerEntry{Provider: pA}
+normA := NormalizePlayerName(a.FirstName, a.LastName)
+for ib, b := range bs {
+\tvar lineupFeat matching.LineupPairFeatures
+\tif lineupIdx != nil {
+\t\teventsFeat = sig.Events.PairFeatures(
+";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("go"));
+    }
+
+    #[test]
+    fn sql_block_detected() {
+        // SQL had no entry: query blocks fell to text.
+        let content = "\
+WITH team_members AS (
+  SELECT m.group_id, m.provider FROM members m
+  JOIN groups g ON g.id = m.group_id
+  WHERE m.type = 'team'
+)
+SELECT group_id FROM team_members GROUP BY group_id
+";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("sql"));
+    }
+
+    #[test]
+    fn shell_shebang_offset_detected() {
+        // Shebang tolerates one tool-output header line above it.
+        let content = "\
+Exit code 1
+#!/bin/bash
+# read-only query helper
+cd /home/ruben/meta
+PW=$(grep -A5 'x' .env | head -1)
+PGPASSWORD=\"$PW\" psql -h example.com
+echo done
+";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("shell"));
+    }
+
+    #[test]
+    fn shell_without_shebang_stays_text() {
+        // The conjunctive rule needs the shebang: `WORD=` lines alone
+        // (analysis prose is full of `dob=both`) must never fire it.
+        let content = "\
+# read-only query helper
+cd /home/ruben/meta
+PW=$(grep -A5 'x' .env | head -1)
+PGPASSWORD=\"$PW\" psql -h example.com
+echo done
+";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::PlainText);
+    }
+
+    #[test]
+    fn prose_with_equals_stays_text() {
+        // `dob=both`, `name_sim=1.0`: bare `WORD=` is prose, not shell.
+        let content = "\
+pairs with BYTE-IDENTICAL full names: 704
+  dob=both     n= 689
+  surname_sim >= 0.9: 867/969 = 89.5%
+  CONFIRMED SAME PERSON (merged, both present and equal): 969
+  CLAIM: one hundred percent of merges involve enetpulse
+";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::PlainText);
+    }
+
+    #[test]
+    fn line_numbered_go_detected() {
+        // `N<TAB>` prefixes are tooling; the keywords underneath count.
+        let content = "1\tpackage matching\n2\t\n3\timport (\n4\t\t\"strings\"\n5\t)\n6\t\n7\tfunc Compare(a string) string {\n8\t\treturn strings.ToUpper(a)\n9\t}\n";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("go"));
+    }
+
+    #[test]
+    fn pipe_bar_numbered_code_detected() {
+        let content = "1 │ package matching\n2 │\n3 │ import (\n4 │ \t\"strings\"\n5 │ )\n6 │\n7 │ func Compare(a string) string {\n8 │ \treturn a\n9 │ }\n";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("go"));
+    }
+
+    #[test]
+    fn numbered_list_stays_text() {
+        // The prefix strip must not conjure code from prose.
+        let content = "1\tBuy milk\n2\tWalk the dog\n3\tCall mom about dinner\n4\tFinish the quarterly report draft\n";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::PlainText);
+    }
+
+    #[test]
+    fn line_numbered_code_not_tabular() {
+        // Sequential-int first column is line numbers, not data: the tab
+        // candidacy yields so code (or text) wins over a TSV misroute.
+        let content = "1\tfoo(\n2\tbar(\n3\tbaz(\n4\tqux(\n";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::PlainText);
+    }
+
+    #[test]
+    fn non_sequential_int_first_col_stays_tabular() {
+        // The guard only fires on *increasing* runs: a real id column
+        // routes tabular as before.
+        let content = "5\tapple\n3\tbanana\n9\tcherry\n7\tdate\n";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::Tabular);
     }
 
     #[test]
