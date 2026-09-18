@@ -1996,13 +1996,14 @@ fn header_map_to_lowercase_strings(
 pub(crate) fn resolve_ccr_workspace(
     headers: Option<&HeaderMap>,
     body: &serde_json::Value,
+    project_root_override: Option<&str>,
 ) -> Option<(String, Option<String>)> {
     let system_prompt = crate::memory::router::extract_system_prompt(body);
     let ctx = crate::memory::router::RequestContext {
         headers: header_map_to_lowercase_strings(headers),
         system_prompt,
         base_user_id: String::new(),
-        project_root_override: None,
+        project_root_override: project_root_override.map(str::to_string),
     };
     crate::memory::router::ProjectResolver::resolve(&ctx).map(|(key, display)| (key, Some(display)))
 }
@@ -2016,12 +2017,16 @@ pub(crate) fn resolve_ccr_workspace(
 /// Falls back to [`crate::ctx::projects::UNRESOLVED_PROJECT`] instead of
 /// failing closed: capture and recall have to go *somewhere*, and the shared
 /// bucket is where every request already landed before sharding existed.
-pub(crate) fn resolve_ctx_project(headers: Option<&HeaderMap>, body: &serde_json::Value) -> String {
+pub(crate) fn resolve_ctx_project(
+    headers: Option<&HeaderMap>,
+    body: &serde_json::Value,
+    project_root_override: Option<&str>,
+) -> String {
     let ctx = crate::memory::router::RequestContext {
         headers: header_map_to_lowercase_strings(headers),
         system_prompt: crate::memory::router::extract_system_prompt(body),
         base_user_id: String::new(),
-        project_root_override: None,
+        project_root_override: project_root_override.map(str::to_string),
     };
     crate::memory::router::ProjectResolver::resolve_project_dir(&ctx)
         .unwrap_or_else(|| crate::ctx::projects::UNRESOLVED_PROJECT.to_string())
@@ -4483,7 +4488,11 @@ pub(crate) async fn forward_http(
                 // shed check below can pop the entry.
                 state.usage_observer.note_project(
                     &request_id,
-                    resolve_ctx_project(headers_snapshot.as_ref(), &parsed),
+                    resolve_ctx_project(
+                        headers_snapshot.as_ref(),
+                        &parsed,
+                        state.config.memory_project_root.as_deref(),
+                    ),
                 );
                 // Price the stock arm at the tier the client actually bought:
                 // `parsed` still carries its own markers here, before the
@@ -4559,7 +4568,11 @@ pub(crate) async fn forward_http(
                 // body once and hands it to a detached worker. No-op unless
                 // `ctx_capture` is enabled (then `ctx_observer` is `Some`).
                 if let Some(observer) = state.ctx_observer.as_ref() {
-                    let project_dir = resolve_ctx_project(headers_snapshot.as_ref(), &parsed);
+                    let project_dir = resolve_ctx_project(
+                        headers_snapshot.as_ref(),
+                        &parsed,
+                        state.config.memory_project_root.as_deref(),
+                    );
                     observer.observe(&parsed, &session_key, &project_dir);
                 }
 
@@ -4903,8 +4916,16 @@ pub(crate) async fn forward_http(
                     let ctx_session_key = request_session_key.clone();
                     let mut changed = false;
                     // Which project's stores recall reads and offload writes.
-                    let ctx_project = resolve_ctx_project(headers_snapshot.as_ref(), &value);
-                    let ccr_workspace = resolve_ccr_workspace(headers_snapshot.as_ref(), &value);
+                    let ctx_project = resolve_ctx_project(
+                        headers_snapshot.as_ref(),
+                        &value,
+                        state.config.memory_project_root.as_deref(),
+                    );
+                    let ccr_workspace = resolve_ccr_workspace(
+                        headers_snapshot.as_ref(),
+                        &value,
+                        state.config.memory_project_root.as_deref(),
+                    );
                     let latest_user_query = latest_user_query(&value);
                     let turn_number = anthropic_turn_number(&value);
 
@@ -5321,7 +5342,10 @@ pub(crate) async fn forward_http(
                                             &value,
                                         ),
                                         base_user_id: base_user_id.to_string(),
-                                        project_root_override: None,
+                                        project_root_override: state
+                                            .config
+                                            .memory_project_root
+                                            .clone(),
                                     },
                                 );
                                 // Memory runs last, so it sees whatever the
@@ -5673,7 +5697,7 @@ pub(crate) async fn forward_http(
                 headers: hdrs,
                 system_prompt,
                 base_user_id: String::new(),
-                project_root_override: None,
+                project_root_override: state.config.memory_project_root.clone(),
             };
             let project = crate::memory::router::ProjectResolver::resolve(&project_ctx)
                 .map(|(key, _display)| key);
@@ -12058,7 +12082,11 @@ pub(crate) async fn handle_ccr_response(
             // fallback is a miss-recovery tool, not a search scope.
             if call.hash_key.is_empty() {
                 if let Some(query) = call.query.clone() {
-                    let project = resolve_ctx_project(Some(outgoing_headers), &current_request);
+                    let project = resolve_ctx_project(
+                        Some(outgoing_headers),
+                        &current_request,
+                        config.memory_project_root.as_deref(),
+                    );
                     tracing::info!(
                         request_id = %request_id,
                         round = rounds + 1,
@@ -12213,8 +12241,11 @@ pub(crate) async fn handle_ccr_response(
                     // all move the resolved project between turns. The CCR
                     // store itself is one global file and never was sharded by
                     // project, so this recovers reach, not isolation.
-                    let project_from =
-                        resolve_ctx_project(Some(outgoing_headers), &current_request);
+                    let project_from = resolve_ctx_project(
+                        Some(outgoing_headers),
+                        &current_request,
+                        config.memory_project_root.as_deref(),
+                    );
                     // Same-project fast path first: the cross-project sweep
                     // below deliberately skips the requesting project's own
                     // store, but an expired block indexed under the current
@@ -12967,7 +12998,7 @@ pub(crate) async fn memory_tool_context(
             headers: header_map_to_lowercase_strings(headers_snapshot.as_ref()),
             system_prompt: crate::memory::router::extract_system_prompt(&parsed),
             base_user_id: base_user_id.to_string(),
-            project_root_override: None,
+            project_root_override: state.config.memory_project_root.clone(),
         },
     );
     Some(MemoryToolContext {
@@ -15277,9 +15308,23 @@ mod tests {
         headers.insert("x-headroom-project-id", "my-project".parse().unwrap());
         let body = serde_json::json!({});
 
-        let (key, label) = resolve_ccr_workspace(Some(&headers), &body).unwrap();
+        let (key, label) = resolve_ccr_workspace(Some(&headers), &body, None).unwrap();
         assert_eq!(key, "my-project");
         assert_eq!(label.as_deref(), Some("my-project"));
+    }
+
+    #[test]
+    fn ccr_workspace_configured_project_root_override() {
+        // Ports upstream #3606: the CLI project-root override reaches CCR
+        // workspace resolution for clients without cwd metadata.
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let (key, label) =
+            resolve_ccr_workspace(None, &body, Some("/home/user/code/project-c")).unwrap();
+        assert!(key.starts_with("project-c-"));
+        assert_eq!(label.as_deref(), Some("project-c"));
     }
 
     #[test]
@@ -15287,7 +15332,7 @@ mod tests {
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}]
         });
-        assert!(resolve_ccr_workspace(None, &body).is_none());
+        assert!(resolve_ccr_workspace(None, &body, None).is_none());
     }
 
     #[test]
@@ -15297,7 +15342,7 @@ mod tests {
             "messages": []
         });
 
-        let (key, label) = resolve_ccr_workspace(None, &body).unwrap();
+        let (key, label) = resolve_ccr_workspace(None, &body, None).unwrap();
         assert!(key.starts_with("my-project-"));
         assert_eq!(label.as_deref(), Some("my-project"));
     }

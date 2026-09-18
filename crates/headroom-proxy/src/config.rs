@@ -742,6 +742,13 @@ pub struct CliArgs {
     )]
     pub memory_enabled: bool,
 
+    /// Project root override for CCR/memory workspace resolution. When set,
+    /// requests that carry no cwd metadata (no header, no system-prompt cwd)
+    /// resolve to this directory instead of the shared unresolved bucket.
+    /// Empty string counts as unset. Ports upstream `--memory-project-root`.
+    #[arg(long = "memory-project-root", env = "HEADROOM_MEMORY_PROJECT_ROOT")]
+    pub memory_project_root: Option<String>,
+
     /// Path to the `cursor-agent` CLI, for `MODEL=cursor:ID` routes.
     ///
     /// Defaults to `agent` on `PATH`. Worth setting explicitly when the proxy
@@ -2483,6 +2490,8 @@ pub struct Config {
     pub max_injection_bytes: usize,
     /// Memory system: master switch. When false, no memory operations run.
     pub memory_enabled: bool,
+    /// Project root override for CCR/memory workspace resolution.
+    pub memory_project_root: Option<String>,
     /// Path to the `cursor-agent` CLI, for `MODEL=cursor:ID` routes.
     pub cursor_agent_binary: String,
     /// Memory injection mode: "auto_tail" (append to user message) or "tool" (model calls memory_search).
@@ -2784,6 +2793,10 @@ impl Config {
             verbosity_level: args.verbosity_level.clamp(0, 4),
             max_injection_bytes: args.max_injection_bytes,
             memory_enabled: args.memory_enabled,
+            memory_project_root: args
+                .memory_project_root
+                .clone()
+                .filter(|s| !s.trim().is_empty()),
             cursor_agent_binary: args.cursor_agent_binary.clone(),
             memory_mode: std::env::var("HEADROOM_MEMORY_MODE")
                 .unwrap_or_else(|_| "auto_tail".to_string()),
@@ -3025,6 +3038,7 @@ impl Config {
             verbosity_level: 2,
             max_injection_bytes: crate::injection_budget::DEFAULT_MAX_INJECTION_BYTES,
             memory_enabled: false,
+            memory_project_root: None,
             cursor_agent_binary: "agent".to_string(),
             memory_mode: "auto_tail".to_string(),
             memory_inject_tools: true,

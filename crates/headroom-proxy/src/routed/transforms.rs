@@ -298,7 +298,11 @@ pub(crate) async fn apply_ctx_request_transforms(
     // CTX-2: passive session capture. Read-only — clones the body onto a
     // detached worker; never mutates and never blocks.
     // Which project's ctx stores this turn is captured into and recalled from.
-    let ctx_project = crate::proxy::resolve_ctx_project(Some(headers), parsed);
+    let ctx_project = crate::proxy::resolve_ctx_project(
+        Some(headers),
+        parsed,
+        state.config.memory_project_root.as_deref(),
+    );
     // Presence for /debug/active-conversations: same project dir the ctx
     // stores shard on, parked under the request id.
     state
@@ -310,7 +314,11 @@ pub(crate) async fn apply_ctx_request_transforms(
 
     // CCR identity for this turn. All three helpers read the Anthropic
     // `messages` shape, which is exactly what `parsed` still is here.
-    let ccr_workspace = crate::proxy::resolve_ccr_workspace(Some(headers), parsed);
+    let ccr_workspace = crate::proxy::resolve_ccr_workspace(
+        Some(headers),
+        parsed,
+        state.config.memory_project_root.as_deref(),
+    );
     let user_query = crate::proxy::latest_user_query(parsed);
     let turn_number = crate::proxy::anthropic_turn_number(parsed);
 
