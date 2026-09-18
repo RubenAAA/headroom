@@ -93,6 +93,28 @@ impl DetectionResult {
 static SEARCH_RESULT_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[^\s:]+:\d+:").unwrap());
 
+/// `path-NN-content` shape of `grep -A`/`-B`/`-C` context lines (upstream
+/// #3599). The path group is non-greedy so the earliest `-digits-` marker
+/// wins, mirroring the search parser that anchors on the first line-number
+/// marker in the line.
+static GREP_CONTEXT_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([^\s:]+?)-(\d+)-").unwrap());
+
+/// Same idea with the path/line separator left as `:`:
+/// `path:NN-content`. Real GNU grep emits dashes in both positions, but the
+/// reported repro builds context lines this way, so both shapes must route
+/// identically.
+static GREP_COLON_DASH_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[^\s:]+:(\d+)-").unwrap());
+
+/// Shared path-shape guard for every grep-line shape.
+///
+/// Rules out markup tags and `key=value` log prefixes; a single helper so
+/// the three shapes cannot drift apart.
+fn prefix_looks_like_path(prefix: &str) -> bool {
+    !prefix.contains('<') && !prefix.contains('>') && !prefix.contains('=')
+}
+
 /// Diff-header detection. Recognizes:
 /// - `git diff` (`diff --git`, `--- a/`)
 /// - merge-commit headers (`diff --combined`, `diff --cc`)
@@ -812,12 +834,36 @@ fn try_detect_html(content: &str) -> Option<DetectionResult> {
 /// the rest. So the pre-colon segment must additionally look like a file path:
 /// no angle brackets and no `=` (rules out markup tags and `key=value:12:` log
 /// lines).
+///
+/// `grep -A`/`-B`/`-C` context lines (`path-NN-content` and the reported
+/// `path:NN-content` shape) count too (upstream #3599): without this branch
+/// those lines read as prose and code in them reaches the word-dropping
+/// Kompress compressor. The colon branch runs first; context is tried after.
 fn is_search_result_line(line: &str) -> bool {
-    if !SEARCH_RESULT_PATTERN.is_match(line) {
+    if SEARCH_RESULT_PATTERN.is_match(line) || GREP_COLON_DASH_PATTERN.is_match(line) {
+        let prefix = line.split(':').next().unwrap_or("");
+        return prefix_looks_like_path(prefix);
+    }
+    is_grep_context_line(line)
+}
+
+/// True when a line looks like `path-NN-content` grep context output.
+///
+/// GNU grep (and ripgrep / git grep) separate `-A`/`-B`/`-C` context lines
+/// with `-` where match lines use `:`. The prefix must additionally look
+/// like a file path: the same `</>=` exclusions as the colon branch, plus
+/// it must contain `/` or `.` — which keeps dates (`2026-09-14`) and dashed
+/// prose (`version-2-release`) out while accepting real paths, including
+/// dashed names (`my-file.py`).
+pub(crate) fn is_grep_context_line(line: &str) -> bool {
+    let Some(caps) = GREP_CONTEXT_PATTERN.captures(line) else {
+        return false;
+    };
+    let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+    if !prefix_looks_like_path(prefix) {
         return false;
     }
-    let prefix = line.split(':').next().unwrap_or("");
-    !prefix.contains('<') && !prefix.contains('>') && !prefix.contains('=')
+    prefix.contains('/') || prefix.contains('.')
 }
 
 pub fn try_detect_search(content: &str) -> Option<DetectionResult> {
@@ -1229,6 +1275,59 @@ mod tests {
         let r = detect_content_type(content);
         assert_eq!(r.content_type, ContentType::SearchResults);
         assert!(r.confidence >= 0.6);
+    }
+
+    /// Upstream #3599: `grep -A`/`-B`/`-C` context lines must classify as
+    /// search results, not prose — code in them reached the word-dropping
+    /// Kompress compressor. Both the real GNU shape (`path-NN-content`)
+    /// and the reported `path:NN-content` shape route identically.
+    #[test]
+    fn grep_context_lines_detected() {
+        // Context-heavy -C output: 2 match lines in 10 would read as
+        // 20% < the 30% floor without the context branch, routing code
+        // to the word-dropping Kompress compressor.
+        let content = "src/main.py:42:def process():\n\
+                       src/main.py-38-# helper\n\
+                       src/main.py-39-# more context\n\
+                       src/main.py-40-x = 1\n\
+                       src/main.py-41-y = 2\n\
+                       src/main.py-43-    result = compute()\n\
+                       src/main.py-44-    return result\n\
+                       src/main.py-45-\n\
+                       src/main.py-46-# trailing\n\
+                       src/util.py:13:    return None";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SearchResults);
+    }
+
+    #[test]
+    fn grep_colon_dash_context_lines_detected() {
+        // Same floor logic for the reported `path:NN-content` shape: a
+        // lone match line in context would otherwise stay below it.
+        let content = "src/main.py:42:def process():\n\
+                       src/main.py:43-    result = compute()\n\
+                       src/main.py:44-    return result\n\
+                       src/main.py:45-    x = 1\n\
+                       src/main.py:46-    y = 2\n\
+                       src/main.py:47-    return x";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SearchResults);
+    }
+
+    #[test]
+    fn grep_context_predicate_rejects_dates_and_dashed_prose() {
+        // `2026-09-14` parses as path `2026`, line `09` — but the prefix
+        // has neither `/` nor `.`, so it stays out. Same for dashed prose
+        // and markup/log prefixes.
+        assert!(!is_grep_context_line("2026-09-14 release notes"));
+        assert!(!is_grep_context_line("version-2-release is out"));
+        assert!(!is_grep_context_line("<li-2-highlighted text"));
+        assert!(!is_grep_context_line("timeout=30-12-retried"));
+        // Real paths route, including dashed names.
+        assert!(is_grep_context_line(
+            "src/main.py-43-    result = compute()"
+        ));
+        assert!(is_grep_context_line("my-file.py-7-class Worker:"));
     }
 
     /// Regression: wrap-copilot ate one-line interactive prompts (2026-08-23).

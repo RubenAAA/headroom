@@ -933,6 +933,16 @@ fn search_result_pattern() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?m)^\S+:\d+:").expect("SEARCH_RESULT_PATTERN is valid"))
 }
 
+/// True for grep match lines and `grep -A`/`-B`/`-C` context lines.
+///
+/// Unions the legacy splitter pattern above (kept so every previously
+/// carved line still carves) with the guarded context predicate from the
+/// detector, so code in context lines routes to the search compressor
+/// instead of the prose path (upstream #3599).
+fn is_search_section_line(line: &str) -> bool {
+    search_result_pattern().is_match(line) || super::content_detector::is_grep_context_line(line)
+}
+
 fn prose_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[A-Z][a-z]+\s+\w+\s+\w+").expect("PROSE_PATTERN is valid"))
@@ -1184,7 +1194,6 @@ pub fn split_into_sections(content: &str) -> Vec<ContentSection> {
     let mut sections: Vec<ContentSection> = Vec::new();
     let lines: Vec<&str> = content.split('\n').collect();
     let code_re = code_fence_pattern();
-    let search_re = search_result_pattern();
 
     let mut i = 0;
     while i < lines.len() {
@@ -1236,10 +1245,10 @@ pub fn split_into_sections(content: &str) -> Vec<ContentSection> {
         }
 
         // Search result lines
-        if search_re.is_match(line) {
+        if is_search_section_line(line) {
             let mut search_lines: Vec<&str> = Vec::new();
             let start_line = i;
-            while i < lines.len() && search_re.is_match(lines[i]) {
+            while i < lines.len() && is_search_section_line(lines[i]) {
                 search_lines.push(lines[i]);
                 i += 1;
             }
@@ -1266,7 +1275,7 @@ pub fn split_into_sections(content: &str) -> Vec<ContentSection> {
             if code_re.is_match(next_line)
                 || next_line.trim().starts_with('[')
                 || next_line.trim().starts_with('{')
-                || search_re.is_match(next_line)
+                || is_search_section_line(next_line)
             {
                 break;
             }
@@ -3070,6 +3079,16 @@ mod tests {
     #[test]
     fn split_into_sections_search_results() {
         let content = "src/a.py:42: code\nsrc/b.py:10: other";
+        let sections = split_into_sections(content);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].content_type, ContentType::SearchResults);
+    }
+
+    #[test]
+    fn split_into_sections_carves_grep_context_lines() {
+        // Upstream #3599: match lines and -A/-B/-C context lines carve as
+        // search sections so code in them avoids the prose path.
+        let content = "src/a.py:42:def f():\nsrc/a.py-43-    return 1\nsrc/b.py:10: other";
         let sections = split_into_sections(content);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].content_type, ContentType::SearchResults);
