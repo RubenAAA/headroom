@@ -57,7 +57,7 @@ session.
 | `stale-install.sh` | SessionStart | No — one-time notice when the checkout moved under the installed copies (scripts/hooks differ, or the built binary is newer); fires only inside the checkout |
 | `session-map-log.sh` | SessionStart | No — logs session id to transcript path for the review worker |
 | `rotation-notice.sh` | UserPromptSubmit | No — relays VPN-rotation notices once each |
-| `retry-dropped-turn.sh` | Stop | No — continues a turn parked on a dropped connection, a completed upstream error, or a proxy-dropped tool call that left an empty reply |
+| `retry-dropped-turn.sh` | Stop, SubagentStop | No — continues a turn parked on a dropped connection, a completed upstream error, a proxy-dropped tool call that left an empty reply, a retrieval splice the model never answered, or a dropped memory lookup |
 
 Two of these need their own worker to be useful (`review-gate.sh` and
 `ticket-gate.sh`); see `spark-poster/README.md`.

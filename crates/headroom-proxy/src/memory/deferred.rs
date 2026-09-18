@@ -23,6 +23,15 @@ const TTL: Duration = Duration::from_secs(600);
 /// case the oldest are the least likely to be claimed.
 const MAX_HELD: usize = 32;
 
+/// Bracketed marker for a memory answer dropped before delivery. The
+/// Stop-hook greps transcript tails for it the same way it matches the
+/// retrieval markers: prose alone would false-fire on replies quoting it.
+/// The client cannot re-run proxy-owned memory tools (it never declared
+/// them), so the instruction is to continue WITHOUT the lookup — never to
+/// re-issue it.
+pub const DEFERRED_MEMORY_DROPPED_MARKER: &str =
+    "[headroom: a memory answer was dropped before delivery; continue without it]";
+
 /// A memory call that ran, whose answer the model has not seen.
 #[derive(Debug, Clone)]
 pub struct PendingMemoryResult {
@@ -77,13 +86,41 @@ impl DeferredMemory {
     pub fn hold(&mut self, pending: PendingMemoryResult) {
         self.expire();
         if self.held.len() >= MAX_HELD {
+            let evicted_tool = self
+                .held
+                .first()
+                .and_then(|p| p.tool_use.get("name").and_then(Value::as_str))
+                .unwrap_or("?")
+                .to_string();
+            tracing::warn!(
+                event = "memory_deferred_capacity_evicted",
+                evicted_tool = %evicted_tool,
+                "memory: held-answer cap reached; dropping the oldest unclaimed answer"
+            );
             self.held.remove(0);
         }
         self.held.push(pending);
     }
 
     fn expire(&mut self) {
-        self.held.retain(|p| p.stored.elapsed() < TTL);
+        let mut dropped_tools = Vec::new();
+        self.held.retain(|p| {
+            if p.stored.elapsed() < TTL {
+                return true;
+            }
+            if let Some(name) = p.tool_use.get("name").and_then(Value::as_str) {
+                dropped_tools.push(name.to_string());
+            }
+            false
+        });
+        if !dropped_tools.is_empty() {
+            tracing::warn!(
+                event = "memory_deferred_expired",
+                dropped = dropped_tools.len(),
+                tools = ?dropped_tools,
+                "memory: held answers expired unclaimed; the model answered without them"
+            );
+        }
     }
 
     /// Put held answers back into `messages`, and return how many landed.

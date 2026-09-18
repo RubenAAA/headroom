@@ -5,9 +5,15 @@ anchored to, plus whether that file moved in the commits that postdate the
 review. That is the whole evidence base for "was this addressed" -- the
 alternative, judging from the thread alone, cannot see a fix that landed as a
 commit rather than a reply.
+
+Anchor-only evidence is not enough on its own: fixes land in files the
+anchor never named. Every dossier therefore also carries the branch-wide
+commit list since the review plus the diff of the files the thread itself
+names, so a fix outside the anchored file still shows up.
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -22,11 +28,36 @@ ME = gl.me()
 REPO = os.environ.get("SPARK_REPO", "").strip()
 HEAD = os.environ.get("SPARK_HEAD", "FETCH_HEAD")
 CONTEXT = 25
+# Bounds for the branch-wide evidence below. Each dossier is copied into a
+# batched worker prompt, so these multiply by batch size: keep them tight.
+BRANCH_LOG_LIMIT = 30
+MENTIONED_FILE_LIMIT = 5
+MENTIONED_DIFF_MAX_LINES = 80
 
 
 def git(*args):
     r = subprocess.run(["git", "-C", REPO, *args], capture_output=True, text=True)
     return r.stdout
+
+
+def mentioned_paths(text):
+    """Repo-relative file paths named in the thread text.
+
+    Reviewers cite the files a fix must touch (`internal/metrics/...`);
+    the anchor only names where the note sits. A fix that lands in a cited
+    file but not the anchored one is invisible to anchor-only evidence, so
+    these paths get their own commit list + diff below.
+    """
+    paths = []
+    for m in re.finditer(
+        r'(?:^|[\s`"\'(])((?:internal|scripts|docs|crates|contrib)/'
+        r'[A-Za-z0-9_.\-/]+\.[A-Za-z0-9]+)', text):
+        p = m.group(1).rstrip('.,:;)')
+        if p and p not in paths:
+            paths.append(p)
+        if len(paths) >= MENTIONED_FILE_LIMIT:
+            break
+    return paths
 
 
 def select_threads(discussions, me, mode):
@@ -153,6 +184,17 @@ def dossier(d, first_review, head=None):
         log = git("log", "--oneline", f"--since={first_review}", head, "--", path)
         out += ["", f"--- COMMITS TOUCHING {path} SINCE REVIEW ---",
                 log.strip() or "(none)"]
+        if log.strip():
+            # The commit titles above claim the fix; the diff proves it --
+            # and proves it landed in the hunk this thread cares about
+            # rather than somewhere else in the file.
+            adiff = git("log", f"--since={first_review}", "-p",
+                        "--format=COMMIT %h %s", "-U3", head, "--", path)
+            alines = adiff.splitlines()
+            if len(alines) > MENTIONED_DIFF_MAX_LINES:
+                alines = (alines[:MENTIONED_DIFF_MAX_LINES]
+                          + ["... (truncated)"])
+            out += [f"--- DIFF {path} SINCE REVIEW ---"] + (alines or ["(empty)"])
         # FINDING-047: GitLab line fields are ints when present, but a
         # defensive int() broke the whole batch on one malformed thread.
         # Non-numeric anchors keep the commits list and skip the snippet.
@@ -163,11 +205,43 @@ def dossier(d, first_review, head=None):
         if lineno:
             lo, hi = max(1, lineno - CONTEXT), lineno + CONTEXT
             lines = git("show", f"{head}:{path}").splitlines()
-            out += ["", f"--- {path} @ {head} lines {lo}-{hi} ---"]
+            out += ["", f"--- {path} @ {head} lines {lo}-{hi} "
+                         f"(anchor line is from review time; code may have moved) ---"]
             out += [f"{i + 1:6d}| {lines[i]}"
                     for i in range(lo - 1, min(hi, len(lines)))]
     else:
         out += ["", "--- UNANCHORED: no file position on this thread ---"]
+
+    # Branch-wide evidence. The fix for this thread can land in a file the
+    # anchor never named (MR !612: the ~0.4% figures were fixed in
+    # internal/metrics/ + monitoring/ while the thread sits anchored on
+    # store/data_invariants.go). Anchor-only evidence reads that as "nothing
+    # changed" at every head, forever -- so every dossier also carries what
+    # the branch did since the review, and what changed in the files the
+    # thread itself names.
+    blog = git("log", "--oneline", f"--since={first_review}",
+               f"--max-count={BRANCH_LOG_LIMIT}", head, "--")
+    out += ["", "--- ALL BRANCH COMMITS SINCE REVIEW ---",
+            blog.strip() or "(none)"]
+    # Only the thread's own words name the files a fix may live in -- the
+    # snippet above is file contents and would match every path it mentions.
+    thread_text = (n0.get("body") or "") + "\n" + "\n".join(
+        (n.get("body") or "") for n in d["notes"][1:] if not n.get("system"))
+    for mp in mentioned_paths(thread_text):
+        if mp == path:
+            continue
+        mlog = git("log", "--oneline", f"--since={first_review}", head,
+                   "--", mp)
+        out += ["", f"--- COMMITS TOUCHING MENTIONED FILE {mp} SINCE REVIEW ---",
+                mlog.strip() or "(none)"]
+        if mlog.strip():
+            diff = git("log", f"--since={first_review}", "-p",
+                       "--format=COMMIT %h %s", "-U3", head, "--", mp)
+            dlines = diff.splitlines()
+            if len(dlines) > MENTIONED_DIFF_MAX_LINES:
+                dlines = (dlines[:MENTIONED_DIFF_MAX_LINES]
+                          + ["... (truncated)"])
+            out += [f"--- DIFF {mp} SINCE REVIEW ---"] + (dlines or ["(empty)"])
     return "\n".join(out)
 
 

@@ -50,8 +50,9 @@ BATCH_TIMEOUT = int(os.environ.get("SPARK_DRAFT_BATCH_TIMEOUT", "600"))
 TASK = """You are answering ONE review thread you opened on a merge request.
 
 Below is everything known about it: the note you wrote, any replies, the
-commits that touched the anchored file since the review, and that file's
-current contents around the anchor.
+commits since the review (the anchored file, the whole branch, and the
+files the thread names), and that file's current contents around the
+anchor.
 
 Decide whether your original objection has been addressed by the code as it
 now stands. Replies may be absent -- a fix can land as a commit and nothing
@@ -76,8 +77,9 @@ EVIDENCE:
 FIX_TASK = """You authored this merge request, and a reviewer left the thread below.
 
 Below is everything known about it: the reviewer's note, any replies so far,
-the commits that touched the anchored file since the review, and that file's
-current contents around the anchor.
+the commits since the review (the anchored file, the whole branch, and the
+files the thread names), and that file's current contents around the
+anchor.
 
 Decide what the code as it now stands says about the reviewer's point, then
 write the reply you would post on the thread. Say, in this order: what
@@ -88,14 +90,22 @@ see in the evidence. Never claim a change you cannot point to. If the
 reviewer is right and nothing has changed yet, say so plainly and say what
 you will do -- do not argue the thread closed.
 
-An AUTHOR VERDICTS section after the evidence holds the author's decided
-position from the session that armed this run. Where it covers this thread,
-your job is to transfer that position onto the thread: state the verdict,
-give the author's reason and what was checked, and set resolve accordingly.
-Do not re-litigate, contradict, or soften a rejection into a promise to
-fix. A claim the author checked and rejected closes the point -- resolve
-true, with the check as the reason. Threads no verdict covers you decide
-from the evidence as above.
+An AUTHOR VERDICTS section after the evidence holds the author's latest
+stated positions from the session that armed this run -- the verdicts this
+reply exists to transfer onto the thread. The session did the research and
+the writing; your job is to carry its conclusions over, not to re-review
+the code and not to substitute your own judgement for its. Where the
+section covers this thread, state the author's verdict and the author's
+reason, and set resolve as the verdict directs. Earlier statements on the
+same thread are superseded by later ones: when the author first wrote
+"will fix" and later wrote "fixed in <commit>", the later one is the
+verdict -- never resurrect an interim position the session already moved
+past. Do not re-litigate, contradict, or soften a rejection into a promise
+to fix, and do not downgrade a "fixed, close" into a "still wrong". Use
+the evidence to ground the reply -- cite files and lines you can see, name
+the fixing commit -- but a recheck never overrules the verdict: when the
+evidence seems to disagree, the verdict still stands as written. Threads
+no verdict covers you decide from the evidence as above.
 
 Answer in the language the reviewer's note is written in.
 
@@ -286,6 +296,62 @@ def read_findings(transcript, limit=60000):
         return None
 
 
+def read_author_verdicts(transcript, budget=12000):
+    """The author's last words as text, without the tool noise around them.
+
+    The verdicts the worker must transfer are what the session SAID, and
+    the raw transcript tail is mostly tool output: verdicts drown in it,
+    and the worker ends up transferring whatever interim statement happens
+    to sit in the window instead of the final one. The transcript is JSONL;
+    user and assistant text lines are the verdicts, tool results and
+    sidechains are not. Returns the tail of that text within budget, or
+    None when there is nothing usable (the caller falls back to the raw
+    tail rather than sending no verdicts at all).
+    """
+    try:
+        texts = []
+        with open(transcript, errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(e, dict):
+                    continue
+                if e.get("toolUseResult") is not None:
+                    continue
+                if e.get("isSidechain") is True:
+                    continue
+                msg = e.get("message") or {}
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") not in ("user", "assistant"):
+                    continue
+                content = msg.get("content") or []
+                if isinstance(content, list):
+                    text = "\n".join(
+                        (c.get("text") or "") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text")
+                else:
+                    text = str(content)
+                if text.strip():
+                    texts.append(text.strip())
+    except OSError:
+        return None
+    if not texts:
+        return None
+    out, total = [], 0
+    for t in reversed(texts):
+        total += len(t) + 2
+        if total > budget and out:
+            break
+        out.append(t)
+    return "\n\n".join(reversed(out))
+
+
 def first_round(iid, session, transcript):
     """gitlab-review with no threads of mine: open new ones from findings."""
     if not transcript:
@@ -347,20 +413,29 @@ def main():
     os.makedirs(OUTDIR, exist_ok=True)
     path = os.path.join(OUTDIR, f"{session}.draft.json")
 
-    # Fix mode only: the author's decided positions from the arming session
-    # (checked-and-rejected claims included). The worker never saw the
-    # session, so without this a deliberately un-fixed thread reads as
-    # "valid point, unaddressed". Short tail on purpose: this block is
-    # copied into every thread's evidence, so it multiplies by batch size.
-    author = ""
-    if mode == "fix-mr-comments" and transcript:
-        tail = read_findings(transcript, 12000)
+    # Fix mode only: the author's latest stated positions from the arming
+    # session. The worker never saw the session, so without this a
+    # deliberately un-fixed thread reads as "valid point, unaddressed" --
+    # and without the LATEST positions it transfers an interim "will fix"
+    # the session already moved past. Read fresh for every group below:
+    # the session keeps writing while the draft runs, and the verdicts
+    # that matter are the last ones said. Short budget on purpose: this
+    # block is copied into every thread's evidence, so it multiplies by
+    # batch size.
+    def author_section():
+        if mode != "fix-mr-comments" or not transcript:
+            return ""
+        tail = read_author_verdicts(transcript)
+        if tail is None:
+            tail = read_findings(transcript, 12000)
         if tail and tail.strip():
-            author = ("\n\n===== AUTHOR VERDICTS: decided positions to transfer "
-                      "onto the threads, not to re-litigate =====\n"
-                      "(tail of the arming session; verdict statements near the "
-                      "end matter most, tool noise is not evidence)\n"
-                      + tail.strip())
+            return ("\n\n===== AUTHOR VERDICTS: the author's latest stated "
+                    "positions -- transfer these onto the threads, do not "
+                    "re-litigate =====\n"
+                    "(last statements win over earlier ones on the same "
+                    "thread; tool noise already removed)\n"
+                    + tail.strip())
+        return ""
 
     def flush():
         """Write what we have. The loop below can die on any thread --
@@ -384,7 +459,8 @@ def main():
     groups = [mine[i:i + BATCH] for i in range(0, len(mine), BATCH)]
     print(f"  {len(mine)} threads in {len(groups)} batch call(s)", file=sys.stderr)
     for group in groups:
-        items = [(d["id"], td.dossier(d, first_review, head) + author) for d in group]
+        items = [(d["id"], td.dossier(d, first_review, head) + author_section())
+                 for d in group]
         ids = [did for did, _ in items]
         out, diag = _call(batch_prompt(task, items), BATCH_TIMEOUT)
         batch = parse_batch(out, ids) if out is not None else {}

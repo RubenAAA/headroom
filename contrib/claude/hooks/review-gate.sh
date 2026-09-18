@@ -109,8 +109,8 @@ posted_head() {
 
 # Non-empty message when the local checkout is ahead of the MR head, so a
 # divert would draft against commits the server never saw. Compares the
-# source branch tip (fetched fresh) with the MR head SHA. Empty means push
-# state is fine or unknowable (no repo configured, fetch failed) -- the gate
+# LOCAL branch tip with the MR head SHA. Empty means push state is fine or
+# unknowable (no repo configured, no local branch, fetch failed) -- the gate
 # fails open; the poster's own head check is the backstop.
 local_ahead_of_mr() {
   local mr="$1" repo branch head_sha tip
@@ -129,7 +129,11 @@ except Exception:
   branch="$1"; head_sha="$2"
   [ -n "$branch" ] && [ -n "$head_sha" ] || return 0
   git -C "$repo" fetch origin "$branch" >/dev/null 2>&1 || return 0
-  tip=$(git -C "$repo" rev-parse "origin/$branch" 2>/dev/null) || return 0
+  # Unpushed commits live on the local branch, not on the tracking ref --
+  # and a bare `git fetch origin <branch>` leaves origin/<branch> stale
+  # anyway (explicit refspec without a colon lands in FETCH_HEAD only), so
+  # the tracking ref can never answer "is local ahead". Read the local tip.
+  tip=$(git -C "$repo" rev-parse --verify "$branch" 2>/dev/null) || return 0
   [ -n "$tip" ] || return 0
   if [ "$tip" != "$head_sha" ]; then
     # Local tip moved past the MR head: unpushed commits exist. (A tip
@@ -388,9 +392,29 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   # multibyte characters does not survive the locale this hook runs under -- it
   # silently matched nothing, so every Russian instruction and "post the
   # threads" itself went through. Two greps need no ranges at all.
+  #
+  # English halves use word boundaries: bare substrings diverted on ordinary
+  # work -- "replicate the issue" matched repl|repl, "resolve the MR
+  # pipeline failure" matched resolve|mr, and "note that the app doesn't
+  # respond" matched respond|note, each posting replies nobody asked for.
+  # Bare `review`/`mr` as the object meant any MR mention plus any nearby
+  # verb ("answer my question about the MR") fired, so they are out: every
+  # realistic instruction also names threads, comments or discussions.
+  # `note` is out for the same reason ("note that ..." is an observation,
+  # not an object), and `reply` sits on one side only -- on both, any
+  # prompt containing the word ("how do I reply to emails") matched
+  # verb+object against itself. "post the replies" still fires via the
+  # phrase rule below. Russian stays substring: Cyrillic bytes are
+  # non-word bytes under the C locale, so \b around them never matches.
   INTENT=""
-  if echo "$PROMPT" | grep -qE 'post|repl|answer|respond|resolve|close|запост|ответ|отвеч|закр' &&
-     echo "$PROMPT" | grep -qE 'thread|comment|note|discussion|review|mr|repl|тред|коммент|ветк|замечан|ответ'; then
+  if echo "$PROMPT" | grep -qE '\b(post|posts|posted|posting|reply|replies|replied|replying|answer|answers|answered|answering|respond|responds|responded|responding|resolve|resolves|resolved|resolving|close|closes|closed|closing)\b|запост|ответ|отвеч|закр' &&
+     echo "$PROMPT" | grep -qE '\b(thread|threads|comment|comments|discussion|discussions)\b|тред|коммент|ветк|замечан|ответ'; then
+    INTENT=1
+  fi
+  # "post the replies / responses" names the object with a word that lives
+  # on the verb side, so the split match above cannot see it.
+  if [ -z "$INTENT" ] &&
+     echo "$PROMPT" | grep -qE '\bpost\b.*\b(replies|responses)\b'; then
     INTENT=1
   fi
 
@@ -403,15 +427,17 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   # Or said as a yes to the model's own question about posting.
   if [ -z "$INTENT" ]; then
     BARE=$(echo "$PROMPT" | tr -d '[:punct:]' | tr -s ' ' | sed 's/^ *//;s/ *$//')
-    if echo "$BARE" | grep -qxE '(yes|y|yep|yeah|yup|ok|okay|sure|go|go ahead|do it|please do|post it|send it|post|go for it|да|ага|давай|давай да|запости|отвечай|ответь)'; then
+    if echo "$BARE" | grep -qxE '(yes|y|yep|yeah|yup|ok|okay|sure|go|go ahead|do it|please do|post it|send it|post them|send them|post|go for it|да|ага|давай|давай да|запости|отвечай|ответь)'; then
       ASKED=$(tail -c 200000 "$TRANSCRIPT" 2>/dev/null | jq -R -s '
         split("\n") | map(select(length > 0) | fromjson?)
         | map(select(.message.role == "assistant" and (.isSidechain != true)))
         | last
         | (.message.content // [] | map(select(.type == "text") | .text // "") | join("\n"))
         // ""' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+      # Word boundaries here too: bare `answer` diverted a "yes" to any
+      # question with "the answer" in it, and `repl` to "replication".
       echo "$ASKED" | grep -qE '\?' &&
-      echo "$ASKED" | grep -qE 'post|repl|answer|comment|resolv|close .*thread|отвеч|запост|закрыв' &&
+      echo "$ASKED" | grep -qE '\b(post|posts|posting|reply|replies|comment|comments|thread|threads|resolv\w*)\b|\bclose\b.*\bthread\b|отвеч|запост|закрыв' &&
         INTENT=1
     fi
   fi

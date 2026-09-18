@@ -87,6 +87,17 @@ spawn_ticket_worker() {
     echo "YOUTRACK_TOKEN is not set in the hook environment" >"$OUTDIR/$SESSION_ID.ticket.failed"
     return 1
   fi
+  # The worker needs all three; spawning with a token but no URL/project only
+  # produces a doomed worker while still blocking the manual call (exit 2).
+  # Refuse here with the same message the worker would fail with.
+  if [ -z "$YOUTRACK_URL" ]; then
+    echo "ticket filing is not configured: set YOUTRACK_URL in ~/.config/spark-poster/env (exported into the hook/worker environment alongside YOUTRACK_TOKEN)" >"$OUTDIR/$SESSION_ID.ticket.failed"
+    return 1
+  fi
+  if [ -z "$YOUTRACK_PROJECT_ID" ]; then
+    echo "ticket filing is not configured: set YOUTRACK_PROJECT_ID in ~/.config/spark-poster/env (exported into the hook/worker environment alongside YOUTRACK_TOKEN)" >"$OUTDIR/$SESSION_ID.ticket.failed"
+    return 1
+  fi
   touch "$OUTDIR/$SESSION_ID.ticket.diverted"
   # Stale state from a previous run must not leak into this one.
   rm -f "$OUTDIR/$SESSION_ID.ticket.failed" "$OUTDIR/$SESSION_ID.ticket.reported"
@@ -208,6 +219,20 @@ TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 if [ "$TOOL" = "Bash" ]; then
   CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
   LOW=$(echo "$CMD" | tr '[:upper:]' '[:lower:]')
+  # Existing-issue work is never filing: state moves, comments, links,
+  # worklogs, and field updates all name an issue that already exists --
+  # either as an ai-youtrack subcommand or as an /issues/<id> URL. Let them
+  # through before any divert check. (Without this, POST /api/issues/<id>
+  # with a State payload matches the filing shape below and gets diverted,
+  # then fails in the worker that only knows how to file new tickets.)
+  if echo "$LOW" | grep -qE 'ai-youtrack(\.py)? +(update-|add-|remove-|delete-)'; then
+    exit 0
+  fi
+  # Bare POST /api/issues (create) and POST /issues?draftId= (publish) carry
+  # no issue suffix and still fall through to the divert check.
+  if echo "$LOW" | grep -qE 'api/issues/[a-z0-9_.-]+|/issue/[a-z]+-[0-9]+'; then
+    exit 0
+  fi
   # Subject AND shape, never shape alone. `curl -X POST` to something else is
   # not ticket filing, and a heredoc about anything else is just a heredoc.
   SUBJECT=""
@@ -216,11 +241,13 @@ if [ "$TOOL" = "Bash" ]; then
   WRITES=""
   # Transport verbs, not serialization calls: -X/--data is how a write leaves
   # the machine. requests.post is the python equivalent. The filing flow
-  # goes through the skill's ai-youtrack CLI, so its mutating subcommands
-  # (create/publish/update/...) count as writes too -- while get/search/
-  # list/types/help stay reads.
+  # goes through the skill's ai-youtrack CLI, so only its filing subcommands
+  # (create-issue/create-draft/publish-draft) count as writes here --
+  # update-*/add-*/remove-*/delete-* are routine field work on an existing
+  # ticket (already exempted above) while get/search/list/types/help stay
+  # reads.
   echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|requests\.post' && WRITES=1
-  echo "$LOW" | grep -qE 'ai-youtrack +(create|publish|update|add|remove|set)' && WRITES=1
+  echo "$LOW" | grep -qE 'ai-youtrack(\.py)? +(create|publish)' && WRITES=1
 
   COMPOSES=""
   # A heredoc building the issue body: summary/description/project keys are
@@ -231,9 +258,16 @@ if [ "$TOOL" = "Bash" ]; then
   esac
 
   if [ -n "$SUBJECT" ] && { [ -n "$WRITES" ] || [ -n "$COMPOSES" ]; }; then
-    spawn_ticket_worker >/dev/null 2>&1
-    echo "TICKET WRITE DIVERTED: the ticket worker files by itself from the session turns, then pings with the ticket id. Do not compose or send the API call yourself."
-    exit 2
+    # A worker that cannot run must not brick the manual call: the spawn
+    # refuses (reason in .ticket.failed) when token/URL/project are missing,
+    # and then the call goes through instead of exit 2.
+    if spawn_ticket_worker >/dev/null 2>&1; then
+      echo "TICKET WRITE DIVERTED: the ticket worker files by itself from the session turns, then pings with the ticket id. Do not compose or send the API call yourself."
+      exit 2
+    else
+      echo "TICKET WORKER NOT STARTED: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed" 2>/dev/null). Proceeding with your own API call."
+      exit 0
+    fi
   fi
   exit 0
 fi
