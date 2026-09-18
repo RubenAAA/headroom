@@ -115,18 +115,20 @@ pub fn crush_string_array(
     config: &SmartCrusherConfig,
     bias: f64,
 ) -> (Vec<String>, String) {
-    // Strict lossless mode: dropped strings get no CCR marker, so keep them all.
-    if config.lossless_only {
-        return (
-            items.iter().map(|s| (*s).to_string()).collect(),
-            "string:lossless_only".to_string(),
-        );
-    }
     let n = items.len();
     if n <= 8 {
         return (
             items.iter().map(|s| (*s).to_string()).collect(),
             "string:passthrough".to_string(),
+        );
+    }
+
+    // Strict lossless mode: this crusher drops items without a CCR marker,
+    // so nothing it removes would be recoverable. Keep the whole array.
+    if config.lossless_only {
+        return (
+            items.iter().map(|s| (*s).to_string()).collect(),
+            "string:lossless_only".to_string(),
         );
     }
 
@@ -228,13 +230,14 @@ pub fn crush_number_array(
     config: &SmartCrusherConfig,
     bias: f64,
 ) -> (Vec<Value>, String) {
-    // Strict lossless mode: dropped numbers get no CCR marker either.
-    if config.lossless_only {
-        return (items.to_vec(), "number:lossless_only".to_string());
-    }
     let n = items.len();
     if n <= 8 {
         return (items.to_vec(), "number:passthrough".to_string());
+    }
+
+    // Strict lossless mode: dropped numbers get no CCR marker either.
+    if config.lossless_only {
+        return (items.to_vec(), "number:lossless_only".to_string());
     }
 
     // Filter to finite f64 only — Python: `isinstance(x, int|float) and math.isfinite(x)`.
@@ -391,10 +394,6 @@ pub fn crush_object(
     config: &SmartCrusherConfig,
     bias: f64,
 ) -> (Map<String, Value>, String) {
-    // Strict lossless mode: dropped keys get no CCR marker, so keep them all.
-    if config.lossless_only {
-        return (obj.clone(), "object:lossless_only".to_string());
-    }
     let n = obj.len();
     if n <= 8 {
         return (obj.clone(), "object:passthrough".to_string());
@@ -412,6 +411,11 @@ pub fn crush_object(
 
     if total_tokens < config.min_tokens_to_crush {
         return (obj.clone(), "object:passthrough".to_string());
+    }
+
+    // Strict lossless mode: dropped keys get no CCR marker, so keep them all.
+    if config.lossless_only {
+        return (obj.clone(), "object:lossless_only".to_string());
     }
 
     // Compute adaptive K on key-value string representations.
@@ -832,6 +836,65 @@ mod tests {
         );
     }
 
+    // ---------- lossless_only (#3625) ----------
+    //
+    // These crushers drop items with no CCR marker at all, so strict
+    // lossless mode must keep every item. Each test first confirms the
+    // default config really drops on the same input, so the strict
+    // assertion cannot pass vacuously.
+
+    fn lossless_only_cfg() -> SmartCrusherConfig {
+        SmartCrusherConfig {
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        }
+    }
+
+    #[test]
+    fn string_array_lossless_only_keeps_every_item() {
+        let owned: Vec<String> = (0..53).map(|i| format!("r{i}")).collect();
+        let items: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+
+        let (lossy, _) = crush_string_array(&items, &cfg(), 1.0);
+        assert!(lossy.len() < items.len(), "default config should drop");
+
+        let (out, strat) = crush_string_array(&items, &lossless_only_cfg(), 1.0);
+        assert_eq!(out, owned, "lossless_only must keep every string");
+        assert_eq!(strat, "string:lossless_only");
+    }
+
+    #[test]
+    fn number_array_lossless_only_keeps_every_item() {
+        let items: Vec<Value> = (1..=40).map(|i| json!(i)).collect();
+
+        let (lossy, _) = crush_number_array(&items, &cfg(), 1.0);
+        assert!(lossy.len() < items.len(), "default config should drop");
+
+        let (out, strat) = crush_number_array(&items, &lossless_only_cfg(), 1.0);
+        assert_eq!(out, items, "lossless_only must keep every number");
+        assert_eq!(strat, "number:lossless_only");
+    }
+
+    #[test]
+    fn object_lossless_only_keeps_every_key() {
+        let mut obj = Map::new();
+        for i in 0..40 {
+            obj.insert(
+                format!("k{i:02}"),
+                json!(format!(
+                    "long description for entry {i}, above the small-value floor"
+                )),
+            );
+        }
+
+        let (lossy, _) = crush_object(&obj, &cfg(), 1.0);
+        assert!(lossy.len() < obj.len(), "default config should drop keys");
+
+        let (out, strat) = crush_object(&obj, &lossless_only_cfg(), 1.0);
+        assert_eq!(out, obj, "lossless_only must keep every key");
+        assert_eq!(strat, "object:lossless_only");
+    }
+
     // ---------- BUG #1 documentation test ----------
 
     #[test]
@@ -847,48 +910,6 @@ mod tests {
         let (_out, strat) = crush_number_array(&items, &cfg(), 1.0);
         assert!(strat.contains("p25=3"), "got: {}", strat);
         assert!(strat.contains("p75=7"), "got: {}", strat);
-    }
-
-    // ---------- lossless_only (upstream #3628) ----------
-
-    fn lossless_only_cfg() -> SmartCrusherConfig {
-        SmartCrusherConfig {
-            lossless_only: true,
-            ..SmartCrusherConfig::default()
-        }
-    }
-
-    #[test]
-    fn string_array_lossless_only_keeps_every_item() {
-        // 53 slugs, mirroring the upstream report: strict mode must keep
-        // all of them with no CCR marker, not sample down to ~15.
-        let items: Vec<String> = (0..53).map(|i| format!("slug-number-{:03}", i)).collect();
-        let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-        let (out, strat) = crush_string_array(&refs, &lossless_only_cfg(), 1.0);
-        assert_eq!(out, items, "lossless_only must keep every string");
-        assert_eq!(strat, "string:lossless_only");
-    }
-
-    #[test]
-    fn number_array_lossless_only_keeps_every_item() {
-        let items: Vec<Value> = (0..50).map(|i| json!(i * 10)).collect();
-        let (out, strat) = crush_number_array(&items, &lossless_only_cfg(), 1.0);
-        assert_eq!(out, items, "lossless_only must keep every number");
-        assert_eq!(strat, "number:lossless_only");
-    }
-
-    #[test]
-    fn object_lossless_only_keeps_every_key() {
-        let mut obj = Map::new();
-        for i in 0..20 {
-            obj.insert(
-                format!("key_{:02}", i),
-                json!(format!("value content padding for entry {} with text", i)),
-            );
-        }
-        let (out, strat) = crush_object(&obj, &lossless_only_cfg(), 1.0);
-        assert_eq!(out, obj, "lossless_only must keep every key");
-        assert_eq!(strat, "object:lossless_only");
     }
 
     #[test]
