@@ -142,9 +142,17 @@ const IN_FLIGHT_HORIZON: Duration = Duration::from_secs(15 * 60);
 /// race suspect (see `PendingRequest::commit_race_suspect`).
 ///
 /// `complete` pops the pending entry the moment the stream ends, but the
-/// provider commits the write later: `MissedNewestWrite` landings cluster at
-/// gaps under 3s. Five seconds keeps scripted back-to-back turns (fan-out,
-/// retries) while ordinary interactive turns, which arrive slower, stay out.
+/// provider commits the write later: `MissedNewestWrite` landings peak at
+/// inter-turn gaps of 3-5s and fall away past 10s. Five seconds keeps scripted
+/// back-to-back turns (fan-out, retries) while ordinary interactive turns,
+/// which arrive slower, stay out.
+///
+/// Measured 2026-09-21 over 558 witnessed recache events (Anthropic models,
+/// 2026-09-17..21). Among `MissedNewestWrite` landings the suspect rate is
+/// 100% at every inter-turn gap below 10s, 76% at 10-60s and 20% past 60s,
+/// against a 94% base rate over all witnessed events. Five seconds already
+/// covers the whole race band — the two clocks differ, since this window ages
+/// a *sibling completion* while the gap above is time since the previous turn.
 const COMMIT_LATENCY_WINDOW: Duration = Duration::from_secs(5);
 /// How long after a clean completion a *sibling* key of the same session
 /// still counts as recently completed (see
@@ -920,6 +928,71 @@ pub fn first_turn_reason(
     } else {
         "arrived_with_history"
     }
+}
+
+/// A completed turn's fingerprint, digested for the per-stream comparison
+/// in [`UsageObserver::complete_with_cache_capability`].
+#[derive(Debug, Clone, Copy)]
+struct TurnFingerprint {
+    msgs: Option<usize>,
+    head: Option<u64>,
+    head_model: Option<u64>,
+    head_system: Option<u64>,
+    head_tools: Option<u64>,
+    beta: Option<u64>,
+    markers: Option<u64>,
+    forward_model: Option<u64>,
+}
+
+/// Billed-usage inputs for one completing turn, bundled so the stream-match
+/// helper takes four arguments instead of nine.
+/// Extracted from `complete_with_cache_capability` without behavior change.
+struct TurnUsage<'a> {
+    request_id: &'a str,
+    input_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_write_ttl_split: Option<(u64, u64)>,
+    cache_ttl: Duration,
+    now: SystemTime,
+}
+
+/// Stream match + classification for one completing turn: which tracked
+/// stream this turn continues, what the provider billed last turn, and which
+/// head components moved.
+/// Extracted from `complete_with_cache_capability` without behavior change.
+struct StreamMatch {
+    class: TurnClass,
+    expected_cache_read: u64,
+    idle_gap: Duration,
+    previous_forwarded_request_bytes: Option<u64>,
+    previous_turn_diverged: bool,
+    previous_cache_read: u64,
+    previous_previous_boundary: Option<u64>,
+    head_changed: bool,
+    head_model_changed: bool,
+    head_system_changed: bool,
+    head_tools_changed: bool,
+    beta_changed: bool,
+    markers_changed: bool,
+    model_changed: bool,
+    matched_stream_msgs: Option<usize>,
+    streams_tracked: usize,
+    matched_stream_idx: usize,
+    matched_stock_prior: u64,
+}
+
+/// Per-component head comparison between a tracked previous turn and the
+/// completing turn's fingerprint. See `compare_heads` for the rule.
+#[derive(Debug, Clone, Copy)]
+struct HeadMoves {
+    head: bool,
+    head_model: bool,
+    head_system: bool,
+    head_tools: bool,
+    beta: bool,
+    markers: bool,
+    forward_model: bool,
 }
 
 /// Request-side context parked until the response's usage arrives.
@@ -2424,20 +2497,15 @@ impl UsageObserver {
         let mut inner = self.lock();
 
         // Fleet-wide rolling hit rate (statusline ambient signal).
-        let denom = input_tokens
-            .saturating_add(cache_read_input_tokens)
-            .saturating_add(cache_creation_input_tokens);
-        if denom > 0 {
-            if inner.recent_hit_rates.len() == RECENT_SAMPLE_CAPACITY {
-                inner.recent_hit_rates.pop_front();
-            }
-            inner.recent_hit_rates.push_back(RecentHitRateSample {
-                rate: cache_read_input_tokens as f64 / denom as f64,
-                cache_capable,
-            });
-        }
+        Self::record_hit_rate(
+            &mut inner,
+            input_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_capable,
+        );
 
-        let Some(pending) = inner.pending.pop(request_id) else {
+        let Some(pending) = Self::pop_pending(&mut inner, request_id) else {
             // Request never went through the compression gate
             // (compression off, non-JSON, …) — no conversation
             // identity, so no per-turn classification. The rolling
@@ -2451,14 +2519,7 @@ impl UsageObserver {
         // session completing nearby is the re-key/fan-out join. Only clean
         // completions reach here — abandoned entries never pop — so this is
         // exactly the committed set.
-        inner.recently_completed.push_back(CompletedTurn {
-            conversation_key: pending.conversation_key.clone(),
-            session_key_hash: pending.session_key_hash.clone(),
-            completed_at: now_instant,
-        });
-        while inner.recently_completed.len() > RECENT_COMPLETION_CAPACITY {
-            inner.recently_completed.pop_front();
-        }
+        Self::note_completion(&mut inner, &pending, now_instant);
 
         // Price this turn's saving against the usage actually billed for it.
         //
@@ -2476,29 +2537,13 @@ impl UsageObserver {
         // that budget are counted as outside, so `freed_past_cache_boundary`
         // is an upper bound on the valuable share, never an overstatement of
         // the cheap one.
-        if let Some((tokens_before, tokens_after)) = pending.compression {
-            let freed = tokens_before.saturating_sub(tokens_after);
-            if freed > 0 {
-                let fresh_region = cache_creation_input_tokens.saturating_add(input_tokens);
-                let past_boundary = tokens_after <= fresh_region;
-                tracing::info!(
-                    event = "savings_placement",
-                    request_id = %request_id,
-                    conversation_key = %pending.conversation_key,
-                    tokens_freed = freed,
-                    live_zone_forwarded_tokens = tokens_after,
-                    cache_read_input_tokens = cache_read_input_tokens,
-                    cache_creation_input_tokens = cache_creation_input_tokens,
-                    input_tokens = input_tokens,
-                    // true  → the freed tokens would have been billed at the
-                    //         cache-write / fresh-input rate (the valuable case)
-                    // false → they sat in the cached prefix and would have been
-                    //         billed at the cache-read rate, worth ~1/12th
-                    freed_past_cache_boundary = past_boundary,
-                    "compression saving priced against the usage billed for this turn"
-                );
-            }
-        }
+        Self::record_savings_placement(
+            request_id,
+            &pending,
+            input_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        );
 
         // ── Ground-truth ledger ───────────────────────────────────────────
         //
@@ -2519,381 +2564,43 @@ impl UsageObserver {
         // It is NOT a savings figure. It is the denominator-free number to
         // compare between a run with compression on and one with it off; see
         // `docs/measurement.md`. Reading it alone proves nothing.
-        {
-            // Bill every round, not just the client's. When the proxy answered
-            // a retrieval itself, the rounds it added were billed too, and the
-            // baseline above deliberately excludes them.
-            let (billed_input, billed_cache_read, billed_cache_write) =
-                pending.billed_totals.unwrap_or((
-                    input_tokens,
-                    cache_read_input_tokens,
-                    cache_creation_input_tokens,
-                ));
-            let billed_fresh_equivalents = billed_input as f64
-                + (billed_cache_read as f64 * 0.1)
-                + (billed_cache_write as f64 * 1.25);
-            // Hidden continuation rounds, split out so the ledger joins to
-            // `ccr_continuation_usage` without recomputing the difference:
-            // billed totals minus the client baseline `complete` was given.
-            // Zero on the common single-round path. Existing fields stay as
-            // they are.
-            let (rounds_input_tokens, rounds_cache_read_tokens) =
-                pending.billed_totals.map_or((0, 0), |(bi, bcr, _)| {
-                    (
-                        bi.saturating_sub(input_tokens),
-                        bcr.saturating_sub(cache_read_input_tokens),
-                    )
-                });
-            // Same window as the hit rate above, and the same reason: the
-            // statusline needs it per render and cannot afford to re-read the
-            // log. Kept here rather than beside the hit rate because the
-            // forwarded size lives on `pending`, which only exists past the
-            // gate — a turn that never reached compression has no size to
-            // divide by and would price as free.
-            if inner.recent_cost_samples.len() == RECENT_SAMPLE_CAPACITY {
-                inner.recent_cost_samples.pop_front();
-            }
-            inner.recent_cost_samples.push_back(CostSample {
-                cache_read_tokens: billed_cache_read,
-                cache_write_tokens: billed_cache_write,
-                forwarded_bytes: pending.forwarded_request_bytes.unwrap_or(0),
-                billed_fresh_equivalents,
-            });
-            tracing::info!(
-                event = "turn_cost_ledger",
-                request_id = %request_id,
-                conversation_key = %pending.conversation_key,
-                // Join key for the re-key floor: a continuation under a fresh
-                // key shares the session hash, not the conversation key.
-                session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                // Anthropic's own numbers, summed over every round the proxy
-                // ran and otherwise unmodified.
-                input_tokens = billed_input,
-                cache_read_input_tokens = billed_cache_read,
-                cache_creation_input_tokens = billed_cache_write,
-                // Hidden-round split: billed totals minus the client baseline,
-                // so the ledger joins to `ccr_continuation_usage` directly.
-                rounds_input_tokens = rounds_input_tokens,
-                rounds_cache_read_tokens = rounds_cache_read_tokens,
-                // Which TTL the provider actually billed the write at. The
-                // proxy asks for the 1-hour tier on the prefix, but asking is
-                // not granting, and the flat creation count above cannot tell
-                // the two apart — a 1-hour write costs 2.0x input against the
-                // 5-minute tier's 1.25x, so a silently downgraded request is a
-                // price change the ledger would otherwise miss. `-1` where the
-                // provider publishes no breakdown, so "absent" stays distinct
-                // from "wrote nothing at that tier".
-                cache_write_5m_tokens = cache_write_ttl_split.map_or(-1_i64, |(m5, _)| m5 as i64),
-                cache_write_1h_tokens = cache_write_ttl_split.map_or(-1_i64, |(_, h1)| h1 as i64),
-                // `-1` where the path that booked this turn never reported an
-                // output count, same convention as the TTL split above.
-                output_tokens = pending.billed_output.map_or(-1_i64, |o| o as i64),
-                billed_fresh_equivalents = billed_fresh_equivalents,
-                // What the client handed us, before anything we did.
-                client_request_bytes = pending.client_request_bytes.unwrap_or(0),
-                forwarded_request_bytes = pending.forwarded_request_bytes.unwrap_or(0),
-                // The arm this turn ran under, so on/off runs are separable.
-                compression_mode = pending.compression_mode.unwrap_or("unknown"),
-                "billed usage against the work the client asked for"
-            );
-        }
+        Self::record_cost_ledger(
+            &mut inner,
+            request_id,
+            &pending,
+            input_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_write_ttl_split,
+        );
 
         // Classify against the stream this turn continues, not against
         // whatever turn happened to arrive last under the same key.
-        let turn_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs);
-        // `head` is the hex of eight digest bytes (see `hex16`), so it reads
-        // back as the `u64` the record holds. Same for the per-component
-        // heads: unknown on either side compares as "not known", never moved.
-        let turn_head = pending
-            .prefix
-            .as_ref()
-            .and_then(|p| u64::from_str_radix(&p.head, 16).ok());
-        let turn_head_model = pending
-            .prefix
-            .as_ref()
-            .and_then(|p| u64::from_str_radix(&p.head_model, 16).ok());
-        let turn_head_system = pending
-            .prefix
-            .as_ref()
-            .and_then(|p| u64::from_str_radix(&p.head_system, 16).ok());
-        let turn_head_tools = pending
-            .prefix
-            .as_ref()
-            .and_then(|p| u64::from_str_radix(&p.head_tools, 16).ok());
-        // Forwarded beta/marker witnesses, digested for the per-stream
-        // comparison below. Same "both known and different" rule as the head:
-        // a turn that never reached the fingerprint stage compares as "not
-        // known", never as moved. Markers compare on normalized shape
-        // (count + kind + TTL), not raw indices — the tail breakpoint
-        // renumbers with every appended message, so raw strings differ on
-        // any growing conversation (see `normalize_marker_layout`).
-        let turn_beta = pending.forward_beta.as_deref().map(Self::witness_digest);
-        let turn_markers = pending
-            .forward_markers
-            .as_deref()
-            .map(Self::marker_layout_digest);
-        // Forwarded (post-router) model, same rule. The router can rewrite
-        // the model after the compared fingerprint is taken, so only this
-        // value says what the provider keyed on.
-        let turn_forward_model = pending.forward_model.as_deref().map(Self::witness_digest);
-        let (
-            class,
-            expected_cache_read,
-            idle_gap,
-            previous_forwarded_request_bytes,
-            previous_turn_diverged,
-            previous_cache_read,
-            previous_previous_boundary,
-            head_changed,
-            head_model_changed,
-            head_system_changed,
-            head_tools_changed,
-            beta_changed,
-            markers_changed,
-            model_changed,
-            matched_stream_msgs,
-            streams_tracked,
-            matched_stream_idx,
-            matched_stock_prior,
-        ) = {
-            if inner.conversations.get(&pending.conversation_key).is_none() {
-                if let Some(evicted_footprint) = inner.forgotten.pop(&pending.conversation_key) {
-                    inner.forgotten_conversations_total += 1;
-                    tracing::warn!(
-                        event = "cache_conversation_forgotten",
-                        conversation_key = %pending.conversation_key,
-                        session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                        capacity = CONVERSATION_CAPACITY,
-                        forgotten_total = inner.forgotten_conversations_total,
-                        evicted_footprint_tokens = evicted_footprint,
-                        cache_creation_input_tokens,
-                        cache_read_input_tokens,
-                        "conversation evicted before its next turn; booked as a first turn, \
-                         so any cache write it just paid for goes uncounted"
-                    );
-                }
-                // `push` reports what fell off the end; `put` does not, and the
-                // eviction is the whole signal. Park the evicted prefix
-                // footprint with the key so the forgotten line above can size
-                // the floor it reports.
-                if let Some((evicted, evicted_streams)) = inner
-                    .conversations
-                    .push(pending.conversation_key.clone(), Vec::new())
-                {
-                    if evicted != pending.conversation_key {
-                        let footprint = evicted_streams
-                            .last()
-                            .map(|r| {
-                                r.cache_read_input_tokens
-                                    .saturating_add(r.cache_creation_input_tokens)
-                            })
-                            .unwrap_or(0);
-                        inner.forgotten.put(evicted, footprint);
-                    }
-                }
-            }
-            let streams = inner
-                .conversations
-                .get_mut(&pending.conversation_key)
-                .expect("just inserted");
-            let matched = match_stream(streams, turn_msgs);
-            // A turn shorter than every tracked stream matches nothing and is
-            // filed `FirstTurn`, which reports no waste however much the
-            // provider re-wrote. That is right for a subagent forking off a
-            // shared opener — it had no prefix to reuse — and wrong for
-            // anything that shortened a conversation it meant to continue.
-            //
-            // The two are indistinguishable from here, so this does not guess:
-            // it makes the case countable. Silence was the problem; a turn that
-            // re-wrote a large prefix and reported nothing looked identical to
-            // a turn that cost nothing.
-            if matched.is_none() && !streams.is_empty() {
-                tracing::info!(
-                    event = "cache_stream_unmatched",
-                    request_id = %request_id,
-                    conversation_key = %pending.conversation_key,
-                    session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                    turn_msgs = turn_msgs.unwrap_or(0),
-                    longest_tracked = streams.iter().filter_map(|r| r.msgs).max().unwrap_or(0),
-                    streams_tracked = streams.len(),
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    "turn was shorter than every tracked stream; booked as a \
-                     first turn, so its cache write is not counted as waste"
-                );
-            }
-            // Which stream this turn was paired against, carried out so the
-            // booking event can name it. Without this a recache says only that
-            // the numbers did not add up, never which prefix the arithmetic
-            // was done against — and with up to 8 streams per key, that is the
-            // difference between a finding and an argument.
-            let matched_stream_msgs = matched.and_then(|i| streams[i].msgs);
-            let streams_tracked = streams.len();
-            // The stock arm's prior is this stream's own footprint, not the
-            // conversation's last write: sibling streams sharing a key must
-            // not price against each other. A new lineage starts at 0.
-            let matched_stock_prior = matched.map(|i| streams[i].stock_footprint).unwrap_or(0);
-            let outcome = match matched {
-                None => (
-                    TurnClass::FirstTurn,
-                    0,
-                    Duration::ZERO,
-                    None,
-                    false,
-                    0,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                ),
-                Some(i) => {
-                    let prev = streams[i];
-                    (
-                        classify_turn(
-                            &prev,
-                            now,
-                            input_tokens,
-                            cache_read_input_tokens,
-                            cache_creation_input_tokens,
-                            cache_ttl,
-                        ),
-                        prev.cache_read_input_tokens
-                            .saturating_add(prev.cache_creation_input_tokens),
-                        // How long this stream sat idle. On a TTL expiry it is
-                        // the whole story: a five-minute-plus gap means the
-                        // provider's cache died on its own.
-                        now.duration_since(prev.at).unwrap_or(Duration::ZERO),
-                        prev.forwarded_request_bytes,
-                        prev.diverged,
-                        prev.cache_read_input_tokens,
-                        prev.previous_boundary,
-                        // Both sides known and different. An unknown head on
-                        // either side is not comparable, and reporting a change
-                        // from it would blame the client for a missing
-                        // measurement. Same rule per component below.
-                        matches!((prev.head, turn_head), (Some(p), Some(c)) if p != c),
-                        matches!((prev.head_model, turn_head_model), (Some(p), Some(c)) if p != c),
-                        matches!((prev.head_system, turn_head_system), (Some(p), Some(c)) if p != c),
-                        matches!((prev.head_tools, turn_head_tools), (Some(p), Some(c)) if p != c),
-                        // Same rule for the forwarded beta/marker witnesses:
-                        // unknown on either side is not a move.
-                        matches!((prev.beta, turn_beta), (Some(p), Some(c)) if p != c),
-                        matches!((prev.markers, turn_markers), (Some(p), Some(c)) if p != c),
-                        // Same rule for the forwarded model: unknown on
-                        // either side is not a flap.
-                        matches!((prev.forward_model, turn_forward_model), (Some(p), Some(c)) if p != c),
-                    )
-                }
-            };
-            let record = TurnRecord {
-                cache_read_input_tokens,
-                cache_creation_input_tokens,
-                at: now,
-                forwarded_request_bytes: pending.forwarded_request_bytes,
-                msgs: turn_msgs,
-                // Read straight off the skip evidence rather than off the
-                // attribution below, which is computed after this record is
-                // stored. Same source either way: `recache_attribution` derives
-                // `prefix_content_diverged` from this very field.
-                diverged: pending
-                    .replay_skip
-                    .as_ref()
-                    .is_some_and(|e| e.reason.as_str() == "prefix_content_diverged"),
-                previous_boundary: matched.map(|i| {
-                    streams[i]
-                        .cache_read_input_tokens
-                        .saturating_add(streams[i].cache_creation_input_tokens)
-                }),
-                head: turn_head,
-                head_model: turn_head_model,
-                head_system: turn_head_system,
-                head_tools: turn_head_tools,
-                beta: turn_beta,
-                markers: turn_markers,
-                forward_model: turn_forward_model,
-                // Patched below once the stock arm prices this turn; 0 until
-                // then so a turn that never reaches the stock arm (empty
-                // prompt) leaves a rebuild, never a phantom hit.
-                stock_footprint: 0,
-            };
-            // Index of the record just stored, carried out so the stock arm
-            // can file this turn's footprint on the stream it priced.
-            let matched_stream_idx = match matched {
-                Some(i) => {
-                    streams[i] = record;
-                    i
-                }
-                None => {
-                    if streams.len() >= MAX_STREAMS_PER_CONVERSATION {
-                        if let Some(oldest) = streams
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|(_, r)| r.at)
-                            .map(|(i, _)| i)
-                        {
-                            streams.remove(oldest);
-                        }
-                    }
-                    streams.push(record);
-                    streams.len() - 1
-                }
-            };
-            let (
-                class,
-                expected,
-                gap,
-                bytes,
-                diverged,
-                prev_read,
-                prevprev_boundary,
-                head_moved,
-                head_model_moved,
-                head_system_moved,
-                head_tools_moved,
-                beta_moved,
-                markers_moved,
-                model_moved,
-            ) = outcome;
-            (
-                class,
-                expected,
-                gap,
-                bytes,
-                diverged,
-                prev_read,
-                prevprev_boundary,
-                head_moved,
-                head_model_moved,
-                head_system_moved,
-                head_tools_moved,
-                beta_moved,
-                markers_moved,
-                model_moved,
-                matched_stream_msgs,
-                streams_tracked,
-                matched_stream_idx,
-                matched_stock_prior,
-            )
+        let fingerprint = Self::fingerprint_turn(&pending);
+        let turn_msgs = fingerprint.msgs;
+        let usage = TurnUsage {
+            request_id,
+            input_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_write_ttl_split,
+            cache_ttl,
+            now,
         };
-
-        // Which head component moved, for the recache lines below. Same
-        // both-known-and-different rule as `head_changed` itself: unknown on
-        // either side is "not known", never a move. Empty when the fused head
-        // held still (or was not comparable). Additive logging only — never a
-        // re-gating input (see the absorbed-head note on `recache_attribution`).
-        let head_moved_which = [
-            ("model", head_model_changed),
-            ("system", head_system_changed),
-            ("tools", head_tools_changed),
-        ]
-        .iter()
-        .filter_map(|(name, moved)| moved.then_some(*name))
-        .collect::<Vec<_>>()
-        .join("|");
+        let stream_match =
+            Self::match_and_classify_turn(&mut inner, &pending, &fingerprint, &usage);
+        let head_moved_which = Self::head_moved_string(&stream_match);
+        Self::price_stock_arm(
+            &mut inner,
+            &pending,
+            &stream_match,
+            &usage,
+            &head_moved_which,
+        );
+        let class = &stream_match.class;
+        let expected_cache_read = stream_match.expected_cache_read;
+        let head_changed = stream_match.head_changed;
+        let streams_tracked = stream_match.streams_tracked;
 
         // A healthy turn is the one class that reports nothing, and it is by
         // far the largest: 5,747 turns and 10,935,835 written tokens on
@@ -2916,23 +2623,7 @@ impl UsageObserver {
         // the tokens, from real turns, with no counterfactual arm and no model
         // of the provider's cache.
         if head_changed {
-            inner.hot_zone_changes_total += 1;
-            match class {
-                TurnClass::Healthy => {
-                    inner.stabilization_absorbed_total += 1;
-                    // Worth the footprint that would have been rebuilt, which
-                    // is the previous turn's observed read plus write. Not an
-                    // estimate of it -- the number Anthropic billed last turn.
-                    inner.stabilization_absorbed_tokens_total += expected_cache_read;
-                }
-                TurnClass::Recache { .. } => {
-                    inner.hot_zone_recaches_total += 1;
-                }
-                // A first turn has no cache to lose, and a TTL expiry would
-                // have re-cached under any client. Neither says anything about
-                // stabilisation, so neither is counted either way.
-                TurnClass::FirstTurn | TurnClass::TtlExpiry => {}
-            }
+            Self::count_hot_zone_turn(&mut inner, class, expected_cache_read);
         }
 
         // --- the stock arm -------------------------------------------------
@@ -2963,7 +2654,1057 @@ impl UsageObserver {
         // different pricing and retention); the watchdog above still
         // scores them, but the comparison below is priced in Anthropic
         // input-equivalents and must not touch them.
-        let ours_prompt = input_tokens + cache_read_input_tokens + cache_creation_input_tokens;
+        // Every completed turn that wrote anything, not just the healthy ones.
+        // Gating on `Healthy` made this dead arithmetic: healthy means
+        // `read + RECACHE_SLACK_TOKENS >= previous footprint`, which forces
+        // `unearned <= RECACHE_SLACK_TOKENS` — under the warning floor, always.
+        // The turns actually re-writing ground they already held are the ones
+        // the gate threw away. Recache turns are counted here *and* by the
+        // recache detector; the two measure different things (this one, tokens
+        // re-written; that one, prefix not read) and must not be added up.
+        Self::record_unearned_write(
+            &mut inner,
+            request_id,
+            &pending,
+            class,
+            expected_cache_read,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        );
+        // First completed turn under this key. The recache classifier has
+        // nothing to score it against, so without this its cache write —
+        // 41% of all write tokens, live — went unattributed.
+        Self::record_first_turn_write(
+            &mut inner,
+            &pending,
+            request_id,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            streams_tracked,
+            now_instant,
+        );
+
+        // D0 diagnostic for first-turn-write-sharing.md: one line per turn
+        // classified FirstTurn, with none of the write branch's gates
+        // (`streams_tracked == 0`, >64 tokens), so tracked first turns (the
+        // arrived-with-history shape the counters never see) and tiny turns
+        // are measured too. Pure observation: no counter moves here, the
+        // fan-out table is untouched, and the `reason` from
+        // `first_turn_reason` is derived offline from the inputs below
+        // (message_zero_hash joins across conversations for the fan-out
+        // check) rather than recomputed against live tables.
+        //
+        // Deliberately joined, not self-contained: marker layout rides on
+        // `turn_cache_fingerprint`, forwarded sys/tools hashes on
+        // `prefix_composition`, and beta/auth digests on the former — all keyed
+        // by request_id. This line carries only what no other line has: the
+        // request-path cache-key controls, the outer-vs-rounds usage split the
+        // ledger folds together, and the message-0 composition sizes.
+        Self::emit_first_turn_diagnostic(&pending, request_id, &usage, class);
+
+        Self::finish_completion(
+            &mut inner,
+            &pending,
+            &stream_match,
+            &usage,
+            &head_moved_which,
+            turn_msgs,
+        )
+    }
+
+    /// Book the turn's completion class: TTL expiries pass through, recaches
+    /// are attributed, booked as events, and mapped to a durable class.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn finish_completion(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+        turn_msgs: Option<usize>,
+    ) -> Option<CompletionClass> {
+        match m.class.clone() {
+            TurnClass::FirstTurn | TurnClass::Healthy => None,
+            TurnClass::TtlExpiry => Self::book_ttl_expiry(inner, pending, m, usage, turn_msgs),
+            TurnClass::Recache { wasted_tokens } => Self::book_recache_completion(
+                inner,
+                pending,
+                m,
+                usage,
+                head_moved_which,
+                turn_msgs,
+                wasted_tokens,
+            ),
+        }
+    }
+
+    /// Book a TTL-expiry turn: legitimate cache loss, counted but never a
+    /// defect. Raised from `debug!` deliberately — at the proxy's `info`
+    /// level this event could never appear, so its count read zero whether
+    /// TTL expiries happened constantly or never.
+    /// Extracted from `finish_completion` without behavior change.
+    fn book_ttl_expiry(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        turn_msgs: Option<usize>,
+    ) -> Option<CompletionClass> {
+        inner.ttl_expiries_total += 1;
+        record_cache_miss_attribution(MISS_ATTRIBUTION_PROVIDER, "ttl_expiry");
+        // A TTL expiry is the *legitimate* cache loss: Anthropic's prefix
+        // cache lives 5 minutes, so coming back to a session after a
+        // break costs a full re-cache that is nobody's defect. Telling
+        // that apart from a real bust is the difference between waste
+        // the proxy caused and waste it merely witnessed.
+        tracing::info!(
+            event = "cache_recache_ttl_expiry",
+            request_id = %usage.request_id,
+            conversation_key = %pending.conversation_key,
+            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+            // Which tracked stream the arithmetic was done against.
+            // `-1` = matched nothing, so this was booked a first turn.
+            matched_stream_msgs = m.matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+            turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+            streams_tracked = m.streams_tracked,
+            cache_creation_input_tokens = usage.cache_creation_input_tokens,
+            idle_seconds = m.idle_gap.as_secs(),
+            "prefix re-written after cache TTL expiry (idle > 5 min); expected, not a defect"
+        );
+        Some(CompletionClass::TtlExpiry)
+    }
+
+    /// Attribute a recache turn, book its event, and map it to a durable
+    /// completion class.
+    /// Extracted from `finish_completion` without behavior change.
+    fn book_recache_completion(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+        turn_msgs: Option<usize>,
+        wasted_tokens: u64,
+    ) -> Option<CompletionClass> {
+        inner.recache_events_total += 1;
+        let (event, event_kind, counts_as_waste) =
+            Self::attribute_recache_event(inner, pending, m, usage, wasted_tokens);
+        // Whether the *forwarded* prefix head moved, which is the
+        // question `rebuild_boundary` is asked on the request side and
+        // answers from the client's body instead. Derived from the
+        // outbound dims rather than the inbound ones, and deliberately
+        // ignoring `early_messages`: the prior-thinking drop and the
+        // history offload rewrite messages, so on a turn where they
+        // fired that dimension is partly our own doing and cannot be
+        // used to judge whether the boundary that unlocked them was
+        // real. `system` and `tools` are untouched by both, so they
+        // still speak for the provider. `-1` where no comparison was
+        // available.
+        let forwarded_head_moved = event.outbound_drift_dims.as_deref().map_or(-1_i64, |dims| {
+            i64::from(dims.split(',').any(|dim| matches!(dim, "system" | "tools")))
+        });
+        Self::emit_recache_event(
+            &event,
+            pending,
+            m,
+            usage,
+            head_moved_which,
+            turn_msgs,
+            forwarded_head_moved,
+            wasted_tokens,
+        );
+        crate::observability::observe_recache_event(
+            event.attribution_reason.as_deref(),
+            counts_as_waste.then_some(wasted_tokens),
+        );
+        inner.last_event = Some(event);
+        Some(match event_kind {
+            // A structural bust: bytes inside the cached prefix moved,
+            // and `wasted_tokens` is what that cost.
+            RecacheEventKind::Drift => CompletionClass::PrefixChange { wasted_tokens },
+            RecacheEventKind::Unexplained => {
+                CompletionClass::UnexplainedAfterReplay { wasted_tokens }
+            }
+            // The event remains visible in cache health, but it is not
+            // a miss and therefore has no durable miss classification.
+            RecacheEventKind::Branch => return None,
+            // A re-cache with no direct causal evidence. Counted, but
+            // not charged as attributed waste.
+            RecacheEventKind::Expected => CompletionClass::Unknown,
+        })
+    }
+
+    /// Emit the booking event for a recache kind: one log line per kind with
+    /// the evidence that priced it.
+    /// Extracted from `book_recache_completion` without behavior change.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_recache_event(
+        event: &RecacheEvent,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+        turn_msgs: Option<usize>,
+        forwarded_head_moved: i64,
+        wasted_tokens: u64,
+    ) {
+        match event.event_kind {
+            RecacheEventKind::Drift => Self::emit_drift_event(
+                event,
+                pending,
+                m,
+                usage,
+                head_moved_which,
+                turn_msgs,
+                forwarded_head_moved,
+            ),
+            RecacheEventKind::Branch => Self::emit_branch_event(
+                event,
+                pending,
+                m,
+                usage,
+                head_moved_which,
+                turn_msgs,
+                forwarded_head_moved,
+                wasted_tokens,
+            ),
+            RecacheEventKind::Unexplained => Self::emit_unexplained_event(
+                event,
+                pending,
+                m,
+                usage,
+                head_moved_which,
+                turn_msgs,
+                forwarded_head_moved,
+            ),
+            RecacheEventKind::Expected => Self::emit_expected_event(
+                event,
+                pending,
+                m,
+                usage,
+                head_moved_which,
+                turn_msgs,
+                forwarded_head_moved,
+            ),
+        }
+    }
+
+    /// Emit the drift-booking line: a structural bust where bytes inside the
+    /// cached prefix moved. `event.wasted_tokens` is the charged share by
+    /// construction.
+    /// Extracted from `emit_recache_event` without behavior change.
+    fn emit_drift_event(
+        event: &RecacheEvent,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+        turn_msgs: Option<usize>,
+        forwarded_head_moved: i64,
+    ) {
+        tracing::warn!(
+            event = "cache_recache_observed",
+            request_id = %usage.request_id,
+            conversation_key = %event.conversation_key,
+            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+            // Which tracked stream the arithmetic was done against.
+            // `-1` = matched nothing, so this was booked a first turn.
+            matched_stream_msgs = m.matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+            turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+            streams_tracked = m.streams_tracked,
+            drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+            outbound_drift_dims =
+                event.outbound_drift_dims.as_deref().unwrap_or("?"),
+            forwarded_head_moved = forwarded_head_moved,
+            // Which client-head component moved (model|system|tools),
+            // same both-known rule as `head_changed`. Empty when the
+            // fused head held still or was not comparable.
+            head_moved = head_moved_which,
+            replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
+            // `-1` for "not a divergence". The index says how much
+            // of the prefix died: an edit near the opener costs far
+            // more than one near the tail, and the message counts
+            // separate a mid-history deletion (count steady or
+            // falling) from ordinary appending.
+            first_diff_index = pending
+                .replay_skip
+                .and_then(|e| e.first_diff_index())
+                .map_or(-1_i64, |i| i as i64),
+            prior_message_count = pending
+                .replay_skip
+                .and_then(|e| e.message_counts().0)
+                .map_or(-1_i64, |n| n as i64),
+            current_message_count = pending
+                .replay_skip
+                .map_or(-1_i64, |e| e.message_counts().1 as i64),
+            attribution_reason = event.attribution_reason.as_deref().unwrap_or(""),
+            origin = event.origin.as_deref().unwrap_or(""),
+            scope = event.scope.as_deref().unwrap_or(""),
+            event_kind = "drift",
+            wasted_tokens = event.wasted_tokens,
+            prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
+            prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
+            prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
+            prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
+            // Same key witnesses as the unexplained arm: a drift
+            // event can ride alongside a beta rotation or a commit
+            // race, and the line should say so.
+            forward_beta = event.forward_beta.as_deref().unwrap_or(""),
+            forward_markers = event.forward_markers.as_deref().unwrap_or(""),
+            beta_changed = event.beta_changed,
+            markers_changed = event.markers_changed,
+            // Forwarded (post-router) model: the router can rewrite
+            // it after the compared fingerprint is taken, so this
+            // is the only line that says what the provider keyed
+            // on. Witness only, unranked.
+            forward_model = event.forward_model.as_deref().unwrap_or(""),
+            model_changed = event.model_changed,
+            commit_race_suspect = event.commit_race_suspect,
+            sibling_completed_recently = event.sibling_completed_recently,
+            expected_cache_read = m.expected_cache_read,
+            // Float, unlike the TTL line's truncated int: the 5s
+            // commit window is queryable only with sub-second gap.
+            idle_seconds = m.idle_gap.as_secs_f64(),
+            actual_cache_read = usage.cache_read_input_tokens,
+            cache_creation_input_tokens = usage.cache_creation_input_tokens,
+            "prompt cache re-written inside the TTL window: billed tokens wasted re-caching"
+        );
+    }
+
+    /// Emit the branch-creation line: the tail really did change, so the
+    /// rebuild was earned — reported uncharged so the bucket can be audited
+    /// instead of reading as a flat zero.
+    /// Extracted from `emit_recache_event` without behavior change.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_branch_event(
+        event: &RecacheEvent,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+        turn_msgs: Option<usize>,
+        forwarded_head_moved: i64,
+        wasted_tokens: u64,
+    ) {
+        tracing::info!(
+            event = "cache_recache_observed",
+            request_id = %usage.request_id,
+            conversation_key = %event.conversation_key,
+            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+            // Which tracked stream the arithmetic was done against.
+            // `-1` = matched nothing, so this was booked a first turn.
+            matched_stream_msgs = m.matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+            turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+            streams_tracked = m.streams_tracked,
+            drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+            outbound_drift_dims =
+                event.outbound_drift_dims.as_deref().unwrap_or("?"),
+            forwarded_head_moved = forwarded_head_moved,
+            head_moved = head_moved_which,
+            replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
+            attribution_reason = "inbound_tail_replaced",
+            origin = "inbound",
+            scope = "final_message",
+            event_kind = "branch",
+            wasted_tokens = 0,
+            // Branch is the one kind that charges nothing: the
+            // tail really did change, so the rebuild was earned.
+            // But `is_inbound_tail_replacement` asks only for an
+            // equal message count and a difference at the last
+            // index, which a retry that re-rendered its final
+            // message matches just as well — and then the
+            // shortfall was real money written off. Report it
+            // uncharged so the bucket can be audited instead of
+            // reading as a flat zero.
+            uncharged_shortfall_tokens = wasted_tokens,
+            prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
+            prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
+            prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
+            prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
+            expected_cache_read = m.expected_cache_read,
+            // Float, unlike the TTL line's truncated int: the 5s
+            // commit window is queryable only with sub-second gap.
+            idle_seconds = m.idle_gap.as_secs_f64(),
+            actual_cache_read = usage.cache_read_input_tokens,
+            cache_creation_input_tokens = usage.cache_creation_input_tokens,
+            "prompt cache built for an inbound final-message replacement; branch creation, not waste"
+        );
+    }
+
+    /// Emit the unexplained-booking line: attribution runs before these
+    /// fields are read, so anything reaching here was recorded as causeless
+    /// without ever being shown against the evidence. `event.wasted_tokens`
+    /// is the charged share by construction.
+    /// Extracted from `emit_recache_event` without behavior change.
+    fn emit_unexplained_event(
+        event: &RecacheEvent,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+        turn_msgs: Option<usize>,
+        forwarded_head_moved: i64,
+    ) {
+        tracing::warn!(
+            event = "cache_recache_observed",
+            request_id = %usage.request_id,
+            conversation_key = %event.conversation_key,
+            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+            // Which tracked stream the arithmetic was done against.
+            // `-1` = matched nothing, so this was booked a first turn.
+            matched_stream_msgs = m.matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+            turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+            streams_tracked = m.streams_tracked,
+            // The cause the evidence named (`unexplained_after_replay`
+            // when none did; a replay-skip reason on the uncaused
+            // path). The boundary position rides alongside in
+            // `landing` — it is not the cause.
+            attribution_reason = event.attribution_reason.as_deref().unwrap_or(""),
+            landing = event.landing.as_deref().unwrap_or(""),
+            origin = event.origin.as_deref().unwrap_or(""),
+            scope = event.scope.as_deref().unwrap_or(""),
+            event_kind = "unexplained",
+            // The same structural evidence the drift arm prints.
+            // Until this was here, "unexplained" was unexplained by
+            // construction: attribution runs before these fields
+            // are read, so anything reaching this arm was recorded
+            // as causeless without ever being shown against the
+            // evidence — 2.45M of 3.76M wasted tokens over the
+            // 2026-08-09 logs, in a field set disjoint from the
+            // drift arm's. Printing them changes no classification;
+            // it lets a later query ask how many of these turns had
+            // a structural dimension that simply went unconsulted.
+            drift_dims = event.drift_dims.as_deref().unwrap_or(""),
+            outbound_drift_dims =
+                event.outbound_drift_dims.as_deref().unwrap_or("?"),
+            forwarded_head_moved = forwarded_head_moved,
+            head_moved = head_moved_which,
+            replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
+            prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
+            prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
+            prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
+            prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
+            // Cache-key witnesses neither drift lane sees: a beta
+            // rotation or marker-layout move busts the cache with
+            // both lanes quiet. The `*_changed` flags compare
+            // against the previous completed turn of the same
+            // stream; unknown on either side reads as false.
+            // `commit_race_suspect` says the previous turn of this
+            // stream completed just before this one began, so the
+            // write may not have committed yet.
+            forward_beta = event.forward_beta.as_deref().unwrap_or(""),
+            forward_markers = event.forward_markers.as_deref().unwrap_or(""),
+            beta_changed = event.beta_changed,
+            markers_changed = event.markers_changed,
+            // Forwarded (post-router) model: the router can rewrite
+            // it after the compared fingerprint is taken, so this
+            // is the only line that says what the provider keyed
+            // on. Witness only, unranked.
+            forward_model = event.forward_model.as_deref().unwrap_or(""),
+            model_changed = event.model_changed,
+            commit_race_suspect = event.commit_race_suspect,
+            sibling_completed_recently = event.sibling_completed_recently,
+            replayed_prefix = event.replayed_prefix,
+            replay_chain_id = event.replay_chain_id.unwrap_or(0),
+            breakpoints_placed = event.breakpoints_placed.unwrap_or(0),
+            system_markers_dropped = event.system_markers_dropped.unwrap_or(0),
+            previous_forwarded_request_bytes =
+                event.previous_forwarded_request_bytes.unwrap_or(0),
+            forwarded_request_bytes = event.forwarded_request_bytes.unwrap_or(0),
+            wasted_tokens = event.wasted_tokens,
+            expected_cache_read = m.expected_cache_read,
+            // Float, unlike the TTL line's truncated int: the 5s
+            // commit window is queryable only with sub-second gap.
+            idle_seconds = m.idle_gap.as_secs_f64(),
+            actual_cache_read = usage.cache_read_input_tokens,
+            // The three boundaries the landing was read against,
+            // so the classification can be audited off the line.
+            // `-1` = no turn before the previous one.
+            previous_cache_read = m.previous_cache_read,
+            previous_boundary = m.expected_cache_read,
+            previous_previous_boundary = m
+                .previous_previous_boundary
+                .map_or(-1_i64, |b| b as i64),
+            cache_creation_input_tokens = usage.cache_creation_input_tokens,
+            "prompt cache re-written inside the TTL window without an attributed cause"
+        );
+    }
+
+    /// Emit the expected-booking line: a re-cache with no direct causal
+    /// evidence. `event.wasted_tokens` is the charged share by construction.
+    /// Extracted from `emit_recache_event` without behavior change.
+    fn emit_expected_event(
+        event: &RecacheEvent,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+        turn_msgs: Option<usize>,
+        forwarded_head_moved: i64,
+    ) {
+        tracing::info!(
+            event = "cache_recache_observed",
+            request_id = %usage.request_id,
+            conversation_key = %event.conversation_key,
+            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+            // Which tracked stream the arithmetic was done against.
+            // `-1` = matched nothing, so this was booked a first turn.
+            matched_stream_msgs = m.matched_stream_msgs.map_or(-1_i64, |m| m as i64),
+            turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
+            streams_tracked = m.streams_tracked,
+            drift_dims = "",
+            outbound_drift_dims =
+                event.outbound_drift_dims.as_deref().unwrap_or("?"),
+            forwarded_head_moved = forwarded_head_moved,
+            head_moved = head_moved_which,
+            replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
+            attribution_reason = "",
+            origin = "",
+            scope = "",
+            event_kind = "expected",
+            wasted_tokens = event.wasted_tokens,
+            prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
+            prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
+            prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
+            prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
+            expected_cache_read = m.expected_cache_read,
+            // Float, unlike the TTL line's truncated int: the 5s
+            // commit window is queryable only with sub-second gap.
+            idle_seconds = m.idle_gap.as_secs_f64(),
+            actual_cache_read = usage.cache_read_input_tokens,
+            cache_creation_input_tokens = usage.cache_creation_input_tokens,
+            "prompt cache re-written inside the TTL window with no causal evidence: cause unattributed"
+        );
+    }
+
+    /// Attribute a recache turn and build its bookable event: the cause, the
+    /// kind, and the waste charged to it. The miss-attribution line fires
+    /// here so the Python `total = ttl_expiry + prefix_change + unknown`
+    /// invariant holds.
+    /// Extracted from `book_recache_completion` without behavior change.
+    fn attribute_recache_event(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        wasted_tokens: u64,
+    ) -> (RecacheEvent, RecacheEventKind, bool) {
+        let attribution = recache_attribution(
+            pending.drift_dims.as_deref(),
+            m.head_changed,
+            m.beta_changed,
+            pending.outbound_drift_dims.as_deref(),
+            pending.replay_skip,
+            pending.replay_applied,
+            m.previous_turn_diverged,
+            pending.concurrent_with_in_flight,
+        );
+        // Where the provider's read landed against the two previous
+        // boundaries. Computed for every recache so the line is
+        // auditable, but only *stored* on the residual path: the
+        // reason keeps what the evidence named (`unexplained_after_replay`
+        // when nothing did), and the landing rides alongside it.
+        // Overwriting the reason with the landing is what used to send
+        // readers hunting a provider bug for a boundary position the
+        // evidence does not explain.
+        let landing = CacheLanding::classify(
+            usage.cache_read_input_tokens,
+            m.previous_cache_read,
+            m.expected_cache_read,
+            m.previous_previous_boundary,
+        );
+        let unexplained = attribution.reason == Some("unexplained_after_replay");
+        let landing = unexplained.then(|| landing.as_str().to_owned());
+        let charged_wasted_tokens = if attribution.counts_as_waste {
+            wasted_tokens
+        } else {
+            0
+        };
+        inner.recache_wasted_tokens_total += charged_wasted_tokens;
+        // Tokens we charged as waste and could not name used to fall
+        // through to `Expected`, which logs at INFO and reads as a
+        // benign session reset. On 2026-09-07 that hid 1,471,795
+        // tokens across 96 events — one conversation rebuilding its
+        // own cache — behind a green statusline. Nothing that cost
+        // real tokens may log below WARN. When attribution found no
+        // cause, say that in the reason and hand over what the replay
+        // decline knew, which the ranking above deliberately drops.
+        let uncaused_waste = charged_wasted_tokens > 0 && attribution.reason.is_none();
+        let attribution = if uncaused_waste {
+            RecacheAttribution {
+                reason: Some(
+                    pending
+                        .replay_skip
+                        .map(|e| e.reason.as_str())
+                        .unwrap_or("no_cause_found"),
+                ),
+                ..attribution
+            }
+        } else {
+            attribution
+        };
+        let event_kind = if attribution.reason == Some("inbound_tail_replaced") {
+            RecacheEventKind::Branch
+        } else if unexplained || uncaused_waste {
+            RecacheEventKind::Unexplained
+        } else if attribution.reason.is_some() {
+            RecacheEventKind::Drift
+        } else {
+            RecacheEventKind::Expected
+        };
+        // Python buckets every miss on an expected-cached prefix as
+        // ttl_expiry / prefix_change / unknown, and `unknown` is the
+        // fall-through: we expected a read, the content looked stable,
+        // we cannot name the cause. `Expected` is the same measurement
+        // — the extra reading that these are usually session resets is
+        // a judgement made after the fact, and it already rides on the
+        // log level and `RecacheEvent.event_kind`. Suppressing it here
+        // would break `total = ttl_expiry + prefix_change + unknown`
+        // and make the two named buckets look like the whole story.
+        if event_kind != RecacheEventKind::Branch {
+            record_cache_miss_attribution(
+                MISS_ATTRIBUTION_PROVIDER,
+                match event_kind {
+                    RecacheEventKind::Drift => "prefix_change",
+                    RecacheEventKind::Unexplained | RecacheEventKind::Expected => "unknown",
+                    RecacheEventKind::Branch => unreachable!("guarded above"),
+                },
+            );
+        }
+        let event = RecacheEvent {
+            at_unix: usage
+                .now
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs(),
+            conversation_key: pending.conversation_key.clone(),
+            session_key_hash: pending.session_key_hash.clone(),
+            drift_dims: pending.drift_dims.clone(),
+            outbound_drift_dims: pending.outbound_drift_dims.clone(),
+            attribution_reason: attribution.reason.map(str::to_owned),
+            landing,
+            origin: attribution.origin.map(str::to_owned),
+            scope: attribution.scope.map(str::to_owned),
+            replayed_prefix: pending.replay_applied.is_some(),
+            replay_chain_id: pending.replay_applied.map(|e| e.chain_id),
+            breakpoints_placed: pending.replay_applied.map(|e| e.breakpoints_placed),
+            system_markers_dropped: pending.replay_applied.map(|e| e.system_markers_dropped),
+            previous_forwarded_request_bytes: m.previous_forwarded_request_bytes,
+            forwarded_request_bytes: pending.forwarded_request_bytes,
+            event_kind,
+            forward_beta: pending.forward_beta.clone(),
+            forward_markers: pending.forward_markers.clone(),
+            forward_model: pending.forward_model.clone(),
+            beta_changed: m.beta_changed,
+            markers_changed: m.markers_changed,
+            model_changed: m.model_changed,
+            commit_race_suspect: pending.commit_race_suspect,
+            sibling_completed_recently: pending.sibling_completed_recently,
+            wasted_tokens: charged_wasted_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            expected_cache_read: m.expected_cache_read,
+            actual_cache_read: usage.cache_read_input_tokens,
+        };
+        let counts_as_waste = attribution.counts_as_waste;
+        (event, event_kind, counts_as_waste)
+    }
+
+    /// This turn's fingerprint, digested for the per-stream comparison.
+    /// `head` is the hex of eight digest bytes (see `hex16`), so it reads
+    /// back as the `u64` the record holds. Same for the per-component heads
+    /// and the forwarded witnesses: unknown on either side compares as "not
+    /// known", never moved. Markers compare on normalized shape (count +
+    /// kind + TTL), not raw indices — the tail breakpoint renumbers with
+    /// every appended message (see `normalize_marker_layout`). The forwarded
+    /// (post-router) model is what the provider keyed on, since the router
+    /// can rewrite the model after the compared fingerprint is taken.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn fingerprint_turn(pending: &PendingRequest) -> TurnFingerprint {
+        TurnFingerprint {
+            msgs: pending.prefix.as_ref().map(|p| p.stable_msgs),
+            head: pending
+                .prefix
+                .as_ref()
+                .and_then(|p| u64::from_str_radix(&p.head, 16).ok()),
+            head_model: pending
+                .prefix
+                .as_ref()
+                .and_then(|p| u64::from_str_radix(&p.head_model, 16).ok()),
+            head_system: pending
+                .prefix
+                .as_ref()
+                .and_then(|p| u64::from_str_radix(&p.head_system, 16).ok()),
+            head_tools: pending
+                .prefix
+                .as_ref()
+                .and_then(|p| u64::from_str_radix(&p.head_tools, 16).ok()),
+            beta: pending.forward_beta.as_deref().map(Self::witness_digest),
+            markers: pending
+                .forward_markers
+                .as_deref()
+                .map(Self::marker_layout_digest),
+            forward_model: pending.forward_model.as_deref().map(Self::witness_digest),
+        }
+    }
+
+    /// Match this turn against the conversation's tracked streams, file its
+    /// record, and classify it — returning everything the recache, stock and
+    /// first-turn sections below consume.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn match_and_classify_turn(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        fingerprint: &TurnFingerprint,
+        usage: &TurnUsage<'_>,
+    ) -> StreamMatch {
+        Self::ensure_conversation_entry(inner, pending, usage);
+        let streams = inner
+            .conversations
+            .get_mut(&pending.conversation_key)
+            .expect("just inserted");
+        let matched = match_stream(streams, fingerprint.msgs);
+        // A turn shorter than every tracked stream matches nothing and is
+        // filed `FirstTurn`, which reports no waste however much the
+        // provider re-wrote. That is right for a subagent forking off a
+        // shared opener — it had no prefix to reuse — and wrong for
+        // anything that shortened a conversation it meant to continue.
+        //
+        // The two are indistinguishable from here, so this does not guess:
+        // it makes the case countable. Silence was the problem; a turn that
+        // re-wrote a large prefix and reported nothing looked identical to
+        // a turn that cost nothing.
+        if matched.is_none() && !streams.is_empty() {
+            tracing::info!(
+                event = "cache_stream_unmatched",
+                request_id = %usage.request_id,
+                conversation_key = %pending.conversation_key,
+                session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                turn_msgs = fingerprint.msgs.unwrap_or(0),
+                longest_tracked = streams.iter().filter_map(|r| r.msgs).max().unwrap_or(0),
+                streams_tracked = streams.len(),
+                cache_creation_input_tokens = usage.cache_creation_input_tokens,
+                cache_read_input_tokens = usage.cache_read_input_tokens,
+                "turn was shorter than every tracked stream; booked as a \
+                 first turn, so its cache write is not counted as waste"
+            );
+        }
+        // Which stream this turn was paired against, carried out so the
+        // booking event can name it. Without this a recache says only that
+        // the numbers did not add up, never which prefix the arithmetic
+        // was done against — and with up to 8 streams per key, that is the
+        // difference between a finding and an argument.
+        let matched_stream_msgs = matched.and_then(|i| streams[i].msgs);
+        let streams_tracked = streams.len();
+        // The stock arm's prior is this stream's own footprint, not the
+        // conversation's last write: sibling streams sharing a key must
+        // not price against each other. A new lineage starts at 0.
+        let matched_stock_prior = matched.map(|i| streams[i].stock_footprint).unwrap_or(0);
+        let outcome = match matched {
+            None => (
+                TurnClass::FirstTurn,
+                0,
+                Duration::ZERO,
+                None,
+                false,
+                0,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some(i) => {
+                let prev = streams[i];
+                let moves = Self::compare_heads(&prev, fingerprint);
+                (
+                    classify_turn(
+                        &prev,
+                        usage.now,
+                        usage.input_tokens,
+                        usage.cache_read_input_tokens,
+                        usage.cache_creation_input_tokens,
+                        usage.cache_ttl,
+                    ),
+                    prev.cache_read_input_tokens
+                        .saturating_add(prev.cache_creation_input_tokens),
+                    // How long this stream sat idle. On a TTL expiry it is
+                    // the whole story: a five-minute-plus gap means the
+                    // provider's cache died on its own.
+                    usage.now.duration_since(prev.at).unwrap_or(Duration::ZERO),
+                    prev.forwarded_request_bytes,
+                    prev.diverged,
+                    prev.cache_read_input_tokens,
+                    prev.previous_boundary,
+                    moves.head,
+                    moves.head_model,
+                    moves.head_system,
+                    moves.head_tools,
+                    moves.beta,
+                    moves.markers,
+                    moves.forward_model,
+                )
+            }
+        };
+        let record = TurnRecord {
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            at: usage.now,
+            forwarded_request_bytes: pending.forwarded_request_bytes,
+            msgs: fingerprint.msgs,
+            // Read straight off the skip evidence rather than off the
+            // attribution below, which is computed after this record is
+            // stored. Same source either way: `recache_attribution` derives
+            // `prefix_content_diverged` from this very field.
+            diverged: pending
+                .replay_skip
+                .as_ref()
+                .is_some_and(|e| e.reason.as_str() == "prefix_content_diverged"),
+            previous_boundary: matched.map(|i| {
+                streams[i]
+                    .cache_read_input_tokens
+                    .saturating_add(streams[i].cache_creation_input_tokens)
+            }),
+            head: fingerprint.head,
+            head_model: fingerprint.head_model,
+            head_system: fingerprint.head_system,
+            head_tools: fingerprint.head_tools,
+            beta: fingerprint.beta,
+            markers: fingerprint.markers,
+            forward_model: fingerprint.forward_model,
+            // Patched below once the stock arm prices this turn; 0 until
+            // then so a turn that never reaches the stock arm (empty
+            // prompt) leaves a rebuild, never a phantom hit.
+            stock_footprint: 0,
+        };
+        // Index of the record just stored, carried out so the stock arm
+        // can file this turn's footprint on the stream it priced.
+        let matched_stream_idx = match matched {
+            Some(i) => {
+                streams[i] = record;
+                i
+            }
+            None => {
+                if streams.len() >= MAX_STREAMS_PER_CONVERSATION {
+                    if let Some(oldest) = streams
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, r)| r.at)
+                        .map(|(i, _)| i)
+                    {
+                        streams.remove(oldest);
+                    }
+                }
+                streams.push(record);
+                streams.len() - 1
+            }
+        };
+        let (
+            class,
+            expected,
+            gap,
+            bytes,
+            diverged,
+            prev_read,
+            prevprev_boundary,
+            head_moved,
+            head_model_moved,
+            head_system_moved,
+            head_tools_moved,
+            beta_moved,
+            markers_moved,
+            model_moved,
+        ) = outcome;
+        StreamMatch {
+            class,
+            expected_cache_read: expected,
+            idle_gap: gap,
+            previous_forwarded_request_bytes: bytes,
+            previous_turn_diverged: diverged,
+            previous_cache_read: prev_read,
+            previous_previous_boundary: prevprev_boundary,
+            head_changed: head_moved,
+            head_model_changed: head_model_moved,
+            head_system_changed: head_system_moved,
+            head_tools_changed: head_tools_moved,
+            beta_changed: beta_moved,
+            markers_changed: markers_moved,
+            model_changed: model_moved,
+            matched_stream_msgs,
+            streams_tracked,
+            matched_stream_idx,
+            matched_stock_prior,
+        }
+    }
+
+    /// Ensure this conversation has a tracked-stream entry, accounting an
+    /// eviction when one had to make room. A conversation evicted before its
+    /// next turn is booked as a first turn, so any cache write it just paid
+    /// for goes uncounted.
+    /// Extracted from `match_and_classify_turn` without behavior change.
+    fn ensure_conversation_entry(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        usage: &TurnUsage<'_>,
+    ) {
+        if inner.conversations.get(&pending.conversation_key).is_some() {
+            return;
+        }
+        if let Some(evicted_footprint) = inner.forgotten.pop(&pending.conversation_key) {
+            inner.forgotten_conversations_total += 1;
+            tracing::warn!(
+                event = "cache_conversation_forgotten",
+                conversation_key = %pending.conversation_key,
+                session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+                capacity = CONVERSATION_CAPACITY,
+                forgotten_total = inner.forgotten_conversations_total,
+                evicted_footprint_tokens = evicted_footprint,
+                cache_creation_input_tokens = usage.cache_creation_input_tokens,
+                cache_read_input_tokens = usage.cache_read_input_tokens,
+                "conversation evicted before its next turn; booked as a first turn, \
+                 so any cache write it just paid for goes uncounted"
+            );
+        }
+        // `push` reports what fell off the end; `put` does not, and the
+        // eviction is the whole signal. Park the evicted prefix
+        // footprint with the key so the forgotten line above can size
+        // the floor it reports.
+        if let Some((evicted, evicted_streams)) = inner
+            .conversations
+            .push(pending.conversation_key.clone(), Vec::new())
+        {
+            if evicted != pending.conversation_key {
+                let footprint = evicted_streams
+                    .last()
+                    .map(|r| {
+                        r.cache_read_input_tokens
+                            .saturating_add(r.cache_creation_input_tokens)
+                    })
+                    .unwrap_or(0);
+                inner.forgotten.put(evicted, footprint);
+            }
+        }
+    }
+
+    /// Per-component head comparison between the tracked previous turn and
+    /// this turn's fingerprint: both sides known and different. An unknown
+    /// head on either side is not comparable, and reporting a change from it
+    /// would blame the client for a missing measurement. Same rule for the
+    /// forwarded beta/marker witnesses (unknown is not a move) and the
+    /// forwarded model (unknown is not a flap).
+    /// Extracted from `match_and_classify_turn` without behavior change.
+    fn compare_heads(prev: &TurnRecord, fingerprint: &TurnFingerprint) -> HeadMoves {
+        HeadMoves {
+            head: matches!(
+                (prev.head, fingerprint.head),
+                (Some(p), Some(c)) if p != c
+            ),
+            head_model: matches!(
+                (prev.head_model, fingerprint.head_model),
+                (Some(p), Some(c)) if p != c
+            ),
+            head_system: matches!(
+                (prev.head_system, fingerprint.head_system),
+                (Some(p), Some(c)) if p != c
+            ),
+            head_tools: matches!(
+                (prev.head_tools, fingerprint.head_tools),
+                (Some(p), Some(c)) if p != c
+            ),
+            beta: matches!(
+                (prev.beta, fingerprint.beta),
+                (Some(p), Some(c)) if p != c
+            ),
+            markers: matches!(
+                (prev.markers, fingerprint.markers),
+                (Some(p), Some(c)) if p != c
+            ),
+            forward_model: matches!(
+                (prev.forward_model, fingerprint.forward_model),
+                (Some(p), Some(c)) if p != c
+            ),
+        }
+    }
+
+    /// Count a hot-zone move in the absorb ledger: a hot-zone change that
+    /// still read its cache is one the stabilisation absorbed; one that
+    /// re-cached is one it did not.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn count_hot_zone_turn(inner: &mut Inner, class: &TurnClass, expected_cache_read: u64) {
+        inner.hot_zone_changes_total += 1;
+        match class {
+            TurnClass::Healthy => {
+                inner.stabilization_absorbed_total += 1;
+                // Worth the footprint that would have been rebuilt, which
+                // is the previous turn's observed read plus write. Not an
+                // estimate of it -- the number Anthropic billed last turn.
+                inner.stabilization_absorbed_tokens_total += expected_cache_read;
+            }
+            TurnClass::Recache { .. } => {
+                inner.hot_zone_recaches_total += 1;
+            }
+            // A first turn has no cache to lose, and a TTL expiry would
+            // have re-cached under any client. Neither says anything about
+            // stabilisation, so neither is counted either way.
+            TurnClass::FirstTurn | TurnClass::TtlExpiry => {}
+        }
+    }
+
+    /// Which head component moved, for the recache lines below. Same
+    /// both-known-and-different rule as `head_changed` itself: unknown on
+    /// either side is "not known", never a move. Empty when the fused head
+    /// held still (or was not comparable). Additive logging only — never a
+    /// re-gating input (see the absorbed-head note on `recache_attribution`).
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn head_moved_string(m: &StreamMatch) -> String {
+        [
+            ("model", m.head_model_changed),
+            ("system", m.head_system_changed),
+            ("tools", m.head_tools_changed),
+        ]
+        .iter()
+        .filter_map(|(name, moved)| moved.then_some(*name))
+        .collect::<Vec<_>>()
+        .join("|")
+    }
+
+    /// Price this turn against a stock client: what the same turn would have
+    /// cost a plain Claude Code client with no compression, offload or holds.
+    /// It runs beside the real request rather than instead of it, so there is
+    /// no A/B split and no session is ever served the worse arm.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn price_stock_arm(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        m: &StreamMatch,
+        usage: &TurnUsage<'_>,
+        head_moved_which: &str,
+    ) {
+        // Three of the four inputs are measured, not modelled:
+        //
+        //   * our prompt is the billed `input + read + write` -- exact;
+        //   * the size the client sent and the size we forwarded are the wire
+        //     bytes from `note_wire_bytes` -- exact;
+        //   * the verdict the provider handed down on our prefix is `class`.
+        //
+        // The one model is the stock client's cache behaviour, and it is the
+        // simple one: Claude Code puts a breakpoint at the tail, so its whole
+        // prompt is cacheable and the next turn reads back as much of it as
+        // still fits. The tier and the horizon come from the turn's own
+        // markers, read before any rewrite: hour-marked traffic prices and
+        // expires like an hour entry, five-minute traffic like a five-minute
+        // one. `predicted_read_error_pct` below measures that same rule
+        // against our own observed reads every turn, which is what bounds how
+        // far to trust this arm.
+        // Anthropic-billed turns only. Routed/OpenAI turns bill from a
+        // different cache universe (no creation counter, no TTL split,
+        // different pricing and retention); the watchdog above still
+        // scores them, but the comparison below is priced in Anthropic
+        // input-equivalents and must not touch them.
+        let ours_prompt =
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
         if ours_prompt > 0 && pending.stock_eligible {
             // Bytes to tokens by proportion, either direction. Both numbers
             // are the same kind of JSON measured at the same place, so the
@@ -2992,7 +3733,7 @@ impl UsageObserver {
             // as a full rebuild below — the same assumption the classifier
             // makes when it books the turn `FirstTurn`, on the grounds that a
             // fork had no prefix to reuse.
-            let prior = matched_stock_prior;
+            let prior = m.matched_stock_prior;
             // Anything that busted our prefix would have busted theirs -- an
             // idle gap is idle for both, and a body edit is the client's own.
             // A hot-zone change is the case where the arms part: our holds may
@@ -3006,13 +3747,14 @@ impl UsageObserver {
             // benefit, both at the tier the client actually asked for.
             let stock_tier = pending.client_ttl.stock_tier();
             let stock_horizon = stock_tier.horizon();
-            let stock_kept =
-                matches!(class, TurnClass::Healthy) && !head_changed && idle_gap <= stock_horizon;
+            let stock_kept = matches!(m.class, TurnClass::Healthy)
+                && !m.head_changed
+                && m.idle_gap <= stock_horizon;
             // The tail after the last breakpoint is billed as fresh input on
             // both arms. Which message the breakpoint lands on is the client's
             // shape, not ours, so handing the stock arm a cheaper tail than we
             // got would be inventing a difference the transforms did not make.
-            let stock_cacheable = stock_prompt.saturating_sub(input_tokens);
+            let stock_cacheable = stock_prompt.saturating_sub(usage.input_tokens);
             let stock_read = if stock_kept {
                 prior.min(stock_cacheable)
             } else {
@@ -3024,7 +3766,7 @@ impl UsageObserver {
             // not by key: the index was taken from the same `Vec` above and
             // nothing between here and there touches it.
             if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key) {
-                if let Some(rec) = streams.get_mut(matched_stream_idx) {
+                if let Some(rec) = streams.get_mut(m.matched_stream_idx) {
                     rec.stock_footprint = stock_read + stock_write;
                 }
             }
@@ -3034,12 +3776,12 @@ impl UsageObserver {
             // are the same for every model, so the ratio of the two arms holds
             // whatever was routed where, and no price table has to be right
             // for the comparison to be.
-            let (w5, w1h) = match cache_write_ttl_split {
+            let (w5, w1h) = match usage.cache_write_ttl_split {
                 Some((five, hour)) => (five, hour),
-                None => (cache_creation_input_tokens, 0),
+                None => (usage.cache_creation_input_tokens, 0),
             };
-            let mut ours_effective = input_tokens as f64
-                + cache_read_input_tokens as f64 * CACHE_READ_MULTIPLIER
+            let mut ours_effective = usage.input_tokens as f64
+                + usage.cache_read_input_tokens as f64 * CACHE_READ_MULTIPLIER
                 + w5 as f64 * CACHE_WRITE_5M_MULTIPLIER
                 + w1h as f64 * CACHE_WRITE_1H_MULTIPLIER;
             // Hidden continuation rounds were billed but are not in the client
@@ -3051,10 +3793,10 @@ impl UsageObserver {
             // be higher (up to the 1-hour rate), never lower.
             let ccr_hidden_effective = match pending.billed_totals {
                 Some((billed_input, billed_read, billed_write)) => {
-                    billed_input.saturating_sub(input_tokens) as f64
-                        + billed_read.saturating_sub(cache_read_input_tokens) as f64
+                    billed_input.saturating_sub(usage.input_tokens) as f64
+                        + billed_read.saturating_sub(usage.cache_read_input_tokens) as f64
                             * CACHE_READ_MULTIPLIER
-                        + billed_write.saturating_sub(cache_creation_input_tokens) as f64
+                        + billed_write.saturating_sub(usage.cache_creation_input_tokens) as f64
                             * CACHE_WRITE_5M_MULTIPLIER
                 }
                 None => 0.0,
@@ -3062,7 +3804,7 @@ impl UsageObserver {
             ours_effective += ccr_hidden_effective;
             // The stock client pays the tier its own markers bought: hour
             // writes at 2.0x, five-minute writes at 1.25x.
-            let stock_effective = input_tokens as f64
+            let stock_effective = usage.input_tokens as f64
                 + stock_read as f64 * CACHE_READ_MULTIPLIER
                 + stock_write as f64 * stock_tier.write_multiplier();
             inner.ours_effective_tokens += ours_effective;
@@ -3089,17 +3831,17 @@ impl UsageObserver {
             // and one that shows up with `stock_kept = false` is real.
             tracing::info!(
                 event = "vs_stock_turn",
-                request_id = %request_id,
+                request_id = %usage.request_id,
                 conversation_key = %pending.conversation_key,
-                turn_class = ?class,
-                head_changed,
-                head_moved = head_moved_which.as_str(),
+                turn_class = ?m.class,
+                head_changed = m.head_changed,
+                head_moved = head_moved_which,
                 stock_kept,
                 client_ttl = ?pending.client_ttl,
                 ours_effective = ours_effective.round() as u64,
                 stock_effective = stock_effective.round() as u64,
-                ours_input = input_tokens,
-                ours_read = cache_read_input_tokens,
+                ours_input = usage.input_tokens,
+                ours_read = usage.cache_read_input_tokens,
                 ours_write_5m = w5,
                 ours_write_1h = w1h,
                 ccr_hidden_effective = ccr_hidden_effective.round() as u64,
@@ -3113,10 +3855,11 @@ impl UsageObserver {
             // against what the provider actually read back. Reported as a
             // share of the reads it was predicting, so it stays readable as
             // "the counterfactual is good to about this much".
-            let predicted_ours_read = expected_cache_read.min(ours_prompt);
+            let predicted_ours_read = m.expected_cache_read.min(ours_prompt);
             inner.predicted_read_tokens += predicted_ours_read;
-            inner.observed_read_tokens += cache_read_input_tokens;
-            inner.predicted_read_abs_error += predicted_ours_read.abs_diff(cache_read_input_tokens);
+            inner.observed_read_tokens += usage.cache_read_input_tokens;
+            inner.predicted_read_abs_error +=
+                predicted_ours_read.abs_diff(usage.cache_read_input_tokens);
         } else if ours_prompt > 0 {
             // Ineligible turn on a tracked stream: carry the eligible
             // lineage's footprint forward so the next compared turn prices
@@ -3124,582 +3867,372 @@ impl UsageObserver {
             // watchdog record above already carries this turn's own billed
             // footprint for classification; this is only the stock arm's.
             if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key) {
-                if let Some(rec) = streams.get_mut(matched_stream_idx) {
-                    rec.stock_footprint = matched_stock_prior;
+                if let Some(rec) = streams.get_mut(m.matched_stream_idx) {
+                    rec.stock_footprint = m.matched_stock_prior;
                 }
             }
         }
+    }
 
-        // Every completed turn that wrote anything, not just the healthy ones.
-        // Gating on `Healthy` made this dead arithmetic: healthy means
-        // `read + RECACHE_SLACK_TOKENS >= previous footprint`, which forces
-        // `unearned <= RECACHE_SLACK_TOKENS` — under the warning floor, always.
-        // The turns actually re-writing ground they already held are the ones
-        // the gate threw away. Recache turns are counted here *and* by the
-        // recache detector; the two measure different things (this one, tokens
-        // re-written; that one, prefix not read) and must not be added up.
-        if cache_creation_input_tokens > 0 {
-            let (earned, unearned) = split_cache_write(
-                expected_cache_read,
-                cache_read_input_tokens,
+    /// Count tokens re-written over ground the conversation already held.
+    /// Every completed turn that wrote anything, not just the healthy ones —
+    /// gating on `Healthy` made this dead arithmetic. Recache turns are
+    /// counted here *and* by the recache detector; the two measure different
+    /// things (this one, tokens re-written; that one, prefix not read) and
+    /// must not be added up.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn record_unearned_write(
+        inner: &mut Inner,
+        request_id: &str,
+        pending: &PendingRequest,
+        class: &TurnClass,
+        expected_cache_read: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    ) {
+        if cache_creation_input_tokens == 0 {
+            return;
+        }
+        let (earned, unearned) = split_cache_write(
+            expected_cache_read,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        );
+        inner.earned_cache_write_tokens_total += earned;
+        inner.unearned_cache_write_tokens_total += unearned;
+        if unearned > 0 {
+            inner.unearned_write_turns_total += 1;
+        }
+        if unearned > UNEARNED_WRITE_FLOOR_TOKENS {
+            tracing::warn!(
+                event = "unearned_cache_write_observed",
+                request_id = %request_id,
+                turn_class = match class {
+                    TurnClass::FirstTurn => "first_turn",
+                    TurnClass::Healthy => "healthy",
+                    TurnClass::TtlExpiry => "ttl_expiry",
+                    TurnClass::Recache { .. } => "recache",
+                },
+                conversation_key = %pending.conversation_key,
+                session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
                 cache_creation_input_tokens,
+                cache_read_input_tokens,
+                previous_footprint = expected_cache_read,
+                earned_tokens = earned,
+                unearned_tokens = unearned,
+                "cache write re-covered footprint the conversation already held"
             );
-            inner.earned_cache_write_tokens_total += earned;
-            inner.unearned_cache_write_tokens_total += unearned;
-            if unearned > 0 {
-                inner.unearned_write_turns_total += 1;
-            }
-            if unearned > UNEARNED_WRITE_FLOOR_TOKENS {
-                tracing::warn!(
-                    event = "unearned_cache_write_observed",
-                    request_id = %request_id,
-                    turn_class = match class {
-                        TurnClass::FirstTurn => "first_turn",
-                        TurnClass::Healthy => "healthy",
-                        TurnClass::TtlExpiry => "ttl_expiry",
-                        TurnClass::Recache { .. } => "recache",
-                    },
-                    conversation_key = %pending.conversation_key,
-                    session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    previous_footprint = expected_cache_read,
-                    earned_tokens = earned,
-                    unearned_tokens = unearned,
-                    "cache write re-covered footprint the conversation already held"
-                );
-            }
         }
-        // First completed turn under this key. The recache classifier has
-        // nothing to score it against, so without this its cache write —
-        // 41% of all write tokens, live — went unattributed.
-        if streams_tracked == 0 {
-            let ctx = pending.first_turn.clone().unwrap_or_default();
-            let opener_seen_elsewhere = match ctx.message_zero_hash.as_deref() {
-                Some(hash) => {
-                    let seen = inner.first_turn_openers.get(hash).is_some_and(|(at, key)| {
-                        *key != pending.conversation_key
-                            && now_instant.duration_since(*at) < IDENTICAL_PROMPT_FANOUT_WINDOW
-                    });
-                    inner.first_turn_openers.put(
-                        hash.to_string(),
-                        (now_instant, pending.conversation_key.clone()),
-                    );
-                    seen
-                }
-                None => false,
-            };
-            if cache_creation_input_tokens > RECACHE_SLACK_TOKENS {
-                let reason =
-                    first_turn_reason(&ctx, pending.adoption.as_ref(), opener_seen_elsewhere);
-                // A cold start writing cache is normal and stays uncharged.
-                // Two shapes are not cold starts and were filed as if they
-                // were: a `fresh_session` that read cache is not fresh, and an
-                // `arrived_with_history` that read none is a live conversation
-                // whose key moved under it with no compaction to explain the
-                // move. On 2026-09-07 those two accounted for 549K of the
-                // 2.73M written here, and nothing counted either.
-                let contradicts_itself = (reason == "fresh_session" && cache_read_input_tokens > 0)
-                    || (reason == "arrived_with_history" && cache_read_input_tokens == 0);
-                inner.first_turn_writes_total += 1;
-                inner.first_turn_write_tokens_total += cache_creation_input_tokens;
-                if contradicts_itself {
-                    inner.first_turn_contradictions_total += 1;
-                }
-                tracing::info!(
-                    event = "first_turn_write_observed",
-                    contradicts_itself,
-                    request_id = %request_id,
-                    conversation_key = %pending.conversation_key,
-                    session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                    msgs = ctx.msgs,
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    model = ctx.model.as_deref().unwrap_or(""),
-                    attribution_reason = reason,
-                    adopted = pending
-                        .adoption
-                        .as_ref()
-                        .map(|_| pending.replay_applied.is_some()),
-                    donor_session_key_hash = pending
-                        .adoption
-                        .as_ref()
-                        .map(|a| a.donor_session_key_hash.as_str())
-                        .unwrap_or(""),
-                    "first turn under its conversation key wrote cache"
-                );
-                crate::observability::observe_first_turn_write(reason, cache_creation_input_tokens);
-            }
-        }
+    }
 
-        // D0 diagnostic for first-turn-write-sharing.md: one line per turn
-        // classified FirstTurn, with none of the write branch's gates
-        // (`streams_tracked == 0`, >64 tokens), so tracked first turns (the
-        // arrived-with-history shape the counters never see) and tiny turns
-        // are measured too. Pure observation: no counter moves here, the
-        // fan-out table is untouched, and the `reason` from
-        // `first_turn_reason` is derived offline from the inputs below
-        // (message_zero_hash joins across conversations for the fan-out
-        // check) rather than recomputed against live tables.
-        //
-        // Deliberately joined, not self-contained: marker layout rides on
-        // `turn_cache_fingerprint`, forwarded sys/tools hashes on
-        // `prefix_composition`, and beta/auth digests on the former — all keyed
-        // by request_id. This line carries only what no other line has: the
-        // request-path cache-key controls, the outer-vs-rounds usage split the
-        // ledger folds together, and the message-0 composition sizes.
-        if matches!(&class, TurnClass::FirstTurn) {
-            let dctx = pending.first_turn.clone().unwrap_or_default();
-            let (rounds_in, rounds_read, rounds_write) =
-                pending.billed_totals.map_or((0, 0, 0), |(bi, bcr, bcw)| {
-                    (
-                        bi.saturating_sub(input_tokens),
-                        bcr.saturating_sub(cache_read_input_tokens),
-                        bcw.saturating_sub(cache_creation_input_tokens),
-                    )
+    /// Attribute the first completed turn under a conversation key. The
+    /// recache classifier has nothing to score it against, so without this
+    /// its cache write — 41% of all write tokens, live — went unattributed.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn record_first_turn_write(
+        inner: &mut Inner,
+        pending: &PendingRequest,
+        request_id: &str,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        streams_tracked: usize,
+        now_instant: Instant,
+    ) {
+        if streams_tracked != 0 {
+            return;
+        }
+        let ctx = pending.first_turn.clone().unwrap_or_default();
+        let opener_seen_elsewhere = match ctx.message_zero_hash.as_deref() {
+            Some(hash) => {
+                let seen = inner.first_turn_openers.get(hash).is_some_and(|(at, key)| {
+                    *key != pending.conversation_key
+                        && now_instant.duration_since(*at) < IDENTICAL_PROMPT_FANOUT_WINDOW
                 });
-            let (write_5m, write_1h) =
-                cache_write_ttl_split.map_or((-1_i64, -1_i64), |(m5, h1)| (m5 as i64, h1 as i64));
+                inner.first_turn_openers.put(
+                    hash.to_string(),
+                    (now_instant, pending.conversation_key.clone()),
+                );
+                seen
+            }
+            None => false,
+        };
+        if cache_creation_input_tokens > RECACHE_SLACK_TOKENS {
+            let reason = first_turn_reason(&ctx, pending.adoption.as_ref(), opener_seen_elsewhere);
+            // A cold start writing cache is normal and stays uncharged.
+            // Two shapes are not cold starts and were filed as if they
+            // were: a `fresh_session` that read cache is not fresh, and an
+            // `arrived_with_history` that read none is a live conversation
+            // whose key moved under it with no compaction to explain the
+            // move. On 2026-09-07 those two accounted for 549K of the
+            // 2.73M written here, and nothing counted either.
+            let contradicts_itself = (reason == "fresh_session" && cache_read_input_tokens > 0)
+                || (reason == "arrived_with_history" && cache_read_input_tokens == 0);
+            inner.first_turn_writes_total += 1;
+            inner.first_turn_write_tokens_total += cache_creation_input_tokens;
+            if contradicts_itself {
+                inner.first_turn_contradictions_total += 1;
+            }
             tracing::info!(
-                event = "first_turn_prefix_diagnostic",
+                event = "first_turn_write_observed",
+                contradicts_itself,
                 request_id = %request_id,
                 conversation_key = %pending.conversation_key,
                 session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                model = dctx.model.as_deref().unwrap_or(""),
-                msgs = dctx.msgs,
-                message_zero_hash = dctx.message_zero_hash.as_deref().unwrap_or(""),
-                compaction_restart = dctx.compaction_restart,
-                adopted = pending.adoption.is_some(),
-                replay_applied = pending.replay_applied.is_some(),
-                tool_choice = dctx.tool_choice.as_deref().unwrap_or("absent"),
-                thinking = dctx.thinking.as_deref().unwrap_or("absent"),
-                effort = dctx.effort.as_deref().unwrap_or("absent"),
-                images_in_m0 = dctx.images_in_m0,
-                opens_with_scaffolding = dctx.opens_with_scaffolding,
-                m0_scaffold_bytes = dctx.m0_scaffold_bytes,
-                m0_rest_bytes = dctx.m0_rest_bytes,
-                outer_input_tokens = input_tokens,
-                outer_cache_read = cache_read_input_tokens,
-                outer_cache_write = cache_creation_input_tokens,
-                outer_write_5m = write_5m,
-                outer_write_1h = write_1h,
-                rounds_input_tokens = rounds_in,
-                rounds_cache_read = rounds_read,
-                rounds_cache_write = rounds_write,
-                "first turn under its conversation key completed; cache-key controls and outer-vs-rounds split"
+                msgs = ctx.msgs,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                model = ctx.model.as_deref().unwrap_or(""),
+                attribution_reason = reason,
+                adopted = pending
+                    .adoption
+                    .as_ref()
+                    .map(|_| pending.replay_applied.is_some()),
+                donor_session_key_hash = pending
+                    .adoption
+                    .as_ref()
+                    .map(|a| a.donor_session_key_hash.as_str())
+                    .unwrap_or(""),
+                "first turn under its conversation key wrote cache"
             );
+            crate::observability::observe_first_turn_write(reason, cache_creation_input_tokens);
         }
+    }
 
-        match class {
-            TurnClass::FirstTurn | TurnClass::Healthy => None,
-            TurnClass::TtlExpiry => {
-                inner.ttl_expiries_total += 1;
-                record_cache_miss_attribution(MISS_ATTRIBUTION_PROVIDER, "ttl_expiry");
-                // Raised from `debug!` deliberately. At the proxy's `info`
-                // level this event could never appear, so its count read zero
-                // whether TTL expiries happened constantly or never — and it
-                // was quoted as evidence that they were not happening. A TTL
-                // expiry is the *legitimate* cache loss: Anthropic's prefix
-                // cache lives 5 minutes, so coming back to a session after a
-                // break costs a full re-cache that is nobody's defect. Telling
-                // that apart from a real bust is the difference between waste
-                // the proxy caused and waste it merely witnessed.
+    /// D0 diagnostic for first-turn-write-sharing.md: one line per turn
+    /// classified FirstTurn, with none of the write branch's gates, so
+    /// tracked first turns and tiny turns are measured too. Pure observation:
+    /// no counter moves here.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn emit_first_turn_diagnostic(
+        pending: &PendingRequest,
+        request_id: &str,
+        usage: &TurnUsage<'_>,
+        class: &TurnClass,
+    ) {
+        if !matches!(class, TurnClass::FirstTurn) {
+            return;
+        }
+        let dctx = pending.first_turn.clone().unwrap_or_default();
+        let (rounds_in, rounds_read, rounds_write) =
+            pending.billed_totals.map_or((0, 0, 0), |(bi, bcr, bcw)| {
+                (
+                    bi.saturating_sub(usage.input_tokens),
+                    bcr.saturating_sub(usage.cache_read_input_tokens),
+                    bcw.saturating_sub(usage.cache_creation_input_tokens),
+                )
+            });
+        let (write_5m, write_1h) = usage
+            .cache_write_ttl_split
+            .map_or((-1_i64, -1_i64), |(m5, h1)| (m5 as i64, h1 as i64));
+        tracing::info!(
+            event = "first_turn_prefix_diagnostic",
+            request_id = %request_id,
+            conversation_key = %pending.conversation_key,
+            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+            model = dctx.model.as_deref().unwrap_or(""),
+            msgs = dctx.msgs,
+            message_zero_hash = dctx.message_zero_hash.as_deref().unwrap_or(""),
+            compaction_restart = dctx.compaction_restart,
+            adopted = pending.adoption.is_some(),
+            replay_applied = pending.replay_applied.is_some(),
+            tool_choice = dctx.tool_choice.as_deref().unwrap_or("absent"),
+            thinking = dctx.thinking.as_deref().unwrap_or("absent"),
+            effort = dctx.effort.as_deref().unwrap_or("absent"),
+            images_in_m0 = dctx.images_in_m0,
+            opens_with_scaffolding = dctx.opens_with_scaffolding,
+            m0_scaffold_bytes = dctx.m0_scaffold_bytes,
+            m0_rest_bytes = dctx.m0_rest_bytes,
+            outer_input_tokens = usage.input_tokens,
+            outer_cache_read = usage.cache_read_input_tokens,
+            outer_cache_write = usage.cache_creation_input_tokens,
+            outer_write_5m = write_5m,
+            outer_write_1h = write_1h,
+            rounds_input_tokens = rounds_in,
+            rounds_cache_read = rounds_read,
+            rounds_cache_write = rounds_write,
+            "first turn under its conversation key completed; cache-key controls and outer-vs-rounds split"
+        );
+    }
+
+    /// Fleet-wide rolling hit rate (statusline ambient signal).
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn record_hit_rate(
+        inner: &mut Inner,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_capable: bool,
+    ) {
+        let denom = input_tokens
+            .saturating_add(cache_read_input_tokens)
+            .saturating_add(cache_creation_input_tokens);
+        if denom > 0 {
+            if inner.recent_hit_rates.len() == RECENT_SAMPLE_CAPACITY {
+                inner.recent_hit_rates.pop_front();
+            }
+            inner.recent_hit_rates.push_back(RecentHitRateSample {
+                rate: cache_read_input_tokens as f64 / denom as f64,
+                cache_capable,
+            });
+        }
+    }
+
+    /// Pop this request's pending turn. `None` when the request never went
+    /// through the compression gate (compression off, non-JSON, …) — no
+    /// conversation identity, so no per-turn classification.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn pop_pending(inner: &mut Inner, request_id: &str) -> Option<PendingRequest> {
+        inner.pending.pop(request_id)
+    }
+
+    /// Log a clean completion for the recency witnesses: a same-key turn
+    /// beginning within `COMMIT_LATENCY_WINDOW` may be racing the provider's
+    /// commit of this write, and a sibling key of the same session completing
+    /// nearby is the re-key/fan-out join. Only clean completions reach here —
+    /// abandoned entries never pop — so this is exactly the committed set.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn note_completion(inner: &mut Inner, pending: &PendingRequest, now_instant: Instant) {
+        inner.recently_completed.push_back(CompletedTurn {
+            conversation_key: pending.conversation_key.clone(),
+            session_key_hash: pending.session_key_hash.clone(),
+            completed_at: now_instant,
+        });
+        while inner.recently_completed.len() > RECENT_COMPLETION_CAPACITY {
+            inner.recently_completed.pop_front();
+        }
+    }
+
+    /// Price this turn's saving against the usage actually billed for it.
+    ///
+    /// A token removed from the request is worth what it *would have cost*,
+    /// and on a cached workload that is not one number. Tokens inside the
+    /// cached prefix bill at the cache-read rate; tokens past it bill at the
+    /// cache-write or fresh-input rate, which is over 12x more. Reporting a
+    /// saving without saying which it was overstates it by that factor —
+    /// item 10, and the reason the headline figure read 10x high.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn record_savings_placement(
+        request_id: &str,
+        pending: &PendingRequest,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    ) {
+        if let Some((tokens_before, tokens_after)) = pending.compression {
+            let freed = tokens_before.saturating_sub(tokens_after);
+            if freed > 0 {
+                let fresh_region = cache_creation_input_tokens.saturating_add(input_tokens);
+                let past_boundary = tokens_after <= fresh_region;
                 tracing::info!(
-                    event = "cache_recache_ttl_expiry",
+                    event = "savings_placement",
                     request_id = %request_id,
                     conversation_key = %pending.conversation_key,
-                    session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                    // Which tracked stream the arithmetic was done against.
-                    // `-1` = matched nothing, so this was booked a first turn.
-                    matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
-                    turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
-                    streams_tracked = streams_tracked,
+                    tokens_freed = freed,
+                    live_zone_forwarded_tokens = tokens_after,
+                    cache_read_input_tokens = cache_read_input_tokens,
                     cache_creation_input_tokens = cache_creation_input_tokens,
-                    idle_seconds = idle_gap.as_secs(),
-                    "prefix re-written after cache TTL expiry (idle > 5 min); expected, not a defect"
+                    input_tokens = input_tokens,
+                    // true  → the freed tokens would have been billed at the
+                    //         cache-write / fresh-input rate (the valuable case)
+                    // false → they sat in the cached prefix and would have been
+                    //         billed at the cache-read rate, worth ~1/12th
+                    freed_past_cache_boundary = past_boundary,
+                    "compression saving priced against the usage billed for this turn"
                 );
-                Some(CompletionClass::TtlExpiry)
-            }
-            TurnClass::Recache { wasted_tokens } => {
-                inner.recache_events_total += 1;
-                let attribution = recache_attribution(
-                    pending.drift_dims.as_deref(),
-                    head_changed,
-                    beta_changed,
-                    pending.outbound_drift_dims.as_deref(),
-                    pending.replay_skip,
-                    pending.replay_applied,
-                    previous_turn_diverged,
-                    pending.concurrent_with_in_flight,
-                );
-                // Where the provider's read landed against the two previous
-                // boundaries. Computed for every recache so the line is
-                // auditable, but only *stored* on the residual path: the
-                // reason keeps what the evidence named (`unexplained_after_replay`
-                // when nothing did), and the landing rides alongside it.
-                // Overwriting the reason with the landing is what used to send
-                // readers hunting a provider bug for a boundary position the
-                // evidence does not explain.
-                let landing = CacheLanding::classify(
-                    cache_read_input_tokens,
-                    previous_cache_read,
-                    expected_cache_read,
-                    previous_previous_boundary,
-                );
-                let unexplained = attribution.reason == Some("unexplained_after_replay");
-                let landing = unexplained.then(|| landing.as_str().to_owned());
-                let charged_wasted_tokens = if attribution.counts_as_waste {
-                    wasted_tokens
-                } else {
-                    0
-                };
-                inner.recache_wasted_tokens_total += charged_wasted_tokens;
-                // Tokens we charged as waste and could not name used to fall
-                // through to `Expected`, which logs at INFO and reads as a
-                // benign session reset. On 2026-09-07 that hid 1,471,795
-                // tokens across 96 events — one conversation rebuilding its
-                // own cache — behind a green statusline. Nothing that cost
-                // real tokens may log below WARN. When attribution found no
-                // cause, say that in the reason and hand over what the replay
-                // decline knew, which the ranking above deliberately drops.
-                let uncaused_waste = charged_wasted_tokens > 0 && attribution.reason.is_none();
-                let attribution = if uncaused_waste {
-                    RecacheAttribution {
-                        reason: Some(
-                            pending
-                                .replay_skip
-                                .map(|e| e.reason.as_str())
-                                .unwrap_or("no_cause_found"),
-                        ),
-                        ..attribution
-                    }
-                } else {
-                    attribution
-                };
-                let event_kind = if attribution.reason == Some("inbound_tail_replaced") {
-                    RecacheEventKind::Branch
-                } else if unexplained || uncaused_waste {
-                    RecacheEventKind::Unexplained
-                } else if attribution.reason.is_some() {
-                    RecacheEventKind::Drift
-                } else {
-                    RecacheEventKind::Expected
-                };
-                // Python buckets every miss on an expected-cached prefix as
-                // ttl_expiry / prefix_change / unknown, and `unknown` is the
-                // fall-through: we expected a read, the content looked stable,
-                // we cannot name the cause. `Expected` is the same measurement
-                // — the extra reading that these are usually session resets is
-                // a judgement made after the fact, and it already rides on the
-                // log level and `RecacheEvent.event_kind`. Suppressing it here
-                // would break `total = ttl_expiry + prefix_change + unknown`
-                // and make the two named buckets look like the whole story.
-                if event_kind != RecacheEventKind::Branch {
-                    record_cache_miss_attribution(
-                        MISS_ATTRIBUTION_PROVIDER,
-                        match event_kind {
-                            RecacheEventKind::Drift => "prefix_change",
-                            RecacheEventKind::Unexplained | RecacheEventKind::Expected => "unknown",
-                            RecacheEventKind::Branch => unreachable!("guarded above"),
-                        },
-                    );
-                }
-                let event = RecacheEvent {
-                    at_unix: now
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or(Duration::ZERO)
-                        .as_secs(),
-                    conversation_key: pending.conversation_key.clone(),
-                    session_key_hash: pending.session_key_hash.clone(),
-                    drift_dims: pending.drift_dims.clone(),
-                    outbound_drift_dims: pending.outbound_drift_dims.clone(),
-                    attribution_reason: attribution.reason.map(str::to_owned),
-                    landing,
-                    origin: attribution.origin.map(str::to_owned),
-                    scope: attribution.scope.map(str::to_owned),
-                    replayed_prefix: pending.replay_applied.is_some(),
-                    replay_chain_id: pending.replay_applied.map(|e| e.chain_id),
-                    breakpoints_placed: pending.replay_applied.map(|e| e.breakpoints_placed),
-                    system_markers_dropped: pending
-                        .replay_applied
-                        .map(|e| e.system_markers_dropped),
-                    previous_forwarded_request_bytes,
-                    forwarded_request_bytes: pending.forwarded_request_bytes,
-                    event_kind,
-                    forward_beta: pending.forward_beta.clone(),
-                    forward_markers: pending.forward_markers.clone(),
-                    forward_model: pending.forward_model.clone(),
-                    beta_changed,
-                    markers_changed,
-                    model_changed,
-                    commit_race_suspect: pending.commit_race_suspect,
-                    sibling_completed_recently: pending.sibling_completed_recently,
-                    wasted_tokens: charged_wasted_tokens,
-                    cache_creation_input_tokens,
-                    expected_cache_read,
-                    actual_cache_read: cache_read_input_tokens,
-                };
-                // Whether the *forwarded* prefix head moved, which is the
-                // question `rebuild_boundary` is asked on the request side and
-                // answers from the client's body instead. Derived from the
-                // outbound dims rather than the inbound ones, and deliberately
-                // ignoring `early_messages`: the prior-thinking drop and the
-                // history offload rewrite messages, so on a turn where they
-                // fired that dimension is partly our own doing and cannot be
-                // used to judge whether the boundary that unlocked them was
-                // real. `system` and `tools` are untouched by both, so they
-                // still speak for the provider. `-1` where no comparison was
-                // available.
-                let forwarded_head_moved =
-                    event.outbound_drift_dims.as_deref().map_or(-1_i64, |dims| {
-                        i64::from(dims.split(',').any(|dim| matches!(dim, "system" | "tools")))
-                    });
-                match event_kind {
-                    RecacheEventKind::Drift => tracing::warn!(
-                        event = "cache_recache_observed",
-                        request_id = %request_id,
-                        conversation_key = %event.conversation_key,
-                        session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                        // Which tracked stream the arithmetic was done against.
-                        // `-1` = matched nothing, so this was booked a first turn.
-                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
-                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
-                        streams_tracked = streams_tracked,
-                        drift_dims = event.drift_dims.as_deref().unwrap_or(""),
-                        outbound_drift_dims =
-                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
-                        forwarded_head_moved = forwarded_head_moved,
-                        // Which client-head component moved (model|system|tools),
-                        // same both-known rule as `head_changed`. Empty when the
-                        // fused head held still or was not comparable.
-                        head_moved = head_moved_which.as_str(),
-                        replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
-                        // `-1` for "not a divergence". The index says how much
-                        // of the prefix died: an edit near the opener costs far
-                        // more than one near the tail, and the message counts
-                        // separate a mid-history deletion (count steady or
-                        // falling) from ordinary appending.
-                        first_diff_index = pending
-                            .replay_skip
-                            .and_then(|e| e.first_diff_index())
-                            .map_or(-1_i64, |i| i as i64),
-                        prior_message_count = pending
-                            .replay_skip
-                            .and_then(|e| e.message_counts().0)
-                            .map_or(-1_i64, |n| n as i64),
-                        current_message_count = pending
-                            .replay_skip
-                            .map_or(-1_i64, |e| e.message_counts().1 as i64),
-                        attribution_reason = event.attribution_reason.as_deref().unwrap_or(""),
-                        origin = event.origin.as_deref().unwrap_or(""),
-                        scope = event.scope.as_deref().unwrap_or(""),
-                        event_kind = "drift",
-                        wasted_tokens = charged_wasted_tokens,
-                        prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
-                        prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
-                        prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
-                        prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
-                        // Same key witnesses as the unexplained arm: a drift
-                        // event can ride alongside a beta rotation or a commit
-                        // race, and the line should say so.
-                        forward_beta = event.forward_beta.as_deref().unwrap_or(""),
-                        forward_markers = event.forward_markers.as_deref().unwrap_or(""),
-                        beta_changed = event.beta_changed,
-                        markers_changed = event.markers_changed,
-                        // Forwarded (post-router) model: the router can rewrite
-                        // it after the compared fingerprint is taken, so this
-                        // is the only line that says what the provider keyed
-                        // on. Witness only, unranked.
-                        forward_model = event.forward_model.as_deref().unwrap_or(""),
-                        model_changed = event.model_changed,
-                        commit_race_suspect = event.commit_race_suspect,
-                        sibling_completed_recently = event.sibling_completed_recently,
-                        expected_cache_read = expected_cache_read,
-                        // Float, unlike the TTL line's truncated int: the 5s
-                        // commit window is queryable only with sub-second gap.
-                        idle_seconds = idle_gap.as_secs_f64(),
-                        actual_cache_read = cache_read_input_tokens,
-                        cache_creation_input_tokens = cache_creation_input_tokens,
-                        "prompt cache re-written inside the TTL window: billed tokens wasted re-caching"
-                    ),
-                    RecacheEventKind::Branch => tracing::info!(
-                        event = "cache_recache_observed",
-                        request_id = %request_id,
-                        conversation_key = %event.conversation_key,
-                        session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                        // Which tracked stream the arithmetic was done against.
-                        // `-1` = matched nothing, so this was booked a first turn.
-                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
-                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
-                        streams_tracked = streams_tracked,
-                        drift_dims = event.drift_dims.as_deref().unwrap_or(""),
-                        outbound_drift_dims =
-                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
-                        forwarded_head_moved = forwarded_head_moved,
-                        head_moved = head_moved_which.as_str(),
-                        replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
-                        attribution_reason = "inbound_tail_replaced",
-                        origin = "inbound",
-                        scope = "final_message",
-                        event_kind = "branch",
-                        wasted_tokens = 0,
-                        // Branch is the one kind that charges nothing: the
-                        // tail really did change, so the rebuild was earned.
-                        // But `is_inbound_tail_replacement` asks only for an
-                        // equal message count and a difference at the last
-                        // index, which a retry that re-rendered its final
-                        // message matches just as well — and then the
-                        // shortfall was real money written off. Report it
-                        // uncharged so the bucket can be audited instead of
-                        // reading as a flat zero.
-                        uncharged_shortfall_tokens = wasted_tokens,
-                        prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
-                        prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
-                        prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
-                        prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
-                        expected_cache_read = expected_cache_read,
-                        // Float, unlike the TTL line's truncated int: the 5s
-                        // commit window is queryable only with sub-second gap.
-                        idle_seconds = idle_gap.as_secs_f64(),
-                        actual_cache_read = cache_read_input_tokens,
-                        cache_creation_input_tokens = cache_creation_input_tokens,
-                        "prompt cache built for an inbound final-message replacement; branch creation, not waste"
-                    ),
-                    RecacheEventKind::Unexplained => tracing::warn!(
-                        event = "cache_recache_observed",
-                        request_id = %request_id,
-                        conversation_key = %event.conversation_key,
-                        session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                        // Which tracked stream the arithmetic was done against.
-                        // `-1` = matched nothing, so this was booked a first turn.
-                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
-                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
-                        streams_tracked = streams_tracked,
-                        // The cause the evidence named (`unexplained_after_replay`
-                        // when none did; a replay-skip reason on the uncaused
-                        // path). The boundary position rides alongside in
-                        // `landing` — it is not the cause.
-                        attribution_reason = event.attribution_reason.as_deref().unwrap_or(""),
-                        landing = event.landing.as_deref().unwrap_or(""),
-                        origin = event.origin.as_deref().unwrap_or(""),
-                        scope = event.scope.as_deref().unwrap_or(""),
-                        event_kind = "unexplained",
-                        // The same structural evidence the drift arm prints.
-                        // Until this was here, "unexplained" was unexplained by
-                        // construction: attribution runs before these fields
-                        // are read, so anything reaching this arm was recorded
-                        // as causeless without ever being shown against the
-                        // evidence — 2.45M of 3.76M wasted tokens over the
-                        // 2026-08-09 logs, in a field set disjoint from the
-                        // drift arm's. Printing them changes no classification;
-                        // it lets a later query ask how many of these turns had
-                        // a structural dimension that simply went unconsulted.
-                        drift_dims = event.drift_dims.as_deref().unwrap_or(""),
-                        outbound_drift_dims =
-                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
-                        forwarded_head_moved = forwarded_head_moved,
-                        head_moved = head_moved_which.as_str(),
-                        replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
-                        prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
-                        prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
-                        prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
-                        prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
-                        // Cache-key witnesses neither drift lane sees: a beta
-                        // rotation or marker-layout move busts the cache with
-                        // both lanes quiet. The `*_changed` flags compare
-                        // against the previous completed turn of the same
-                        // stream; unknown on either side reads as false.
-                        // `commit_race_suspect` says the previous turn of this
-                        // stream completed just before this one began, so the
-                        // write may not have committed yet.
-                        forward_beta = event.forward_beta.as_deref().unwrap_or(""),
-                        forward_markers = event.forward_markers.as_deref().unwrap_or(""),
-                        beta_changed = event.beta_changed,
-                        markers_changed = event.markers_changed,
-                        // Forwarded (post-router) model: the router can rewrite
-                        // it after the compared fingerprint is taken, so this
-                        // is the only line that says what the provider keyed
-                        // on. Witness only, unranked.
-                        forward_model = event.forward_model.as_deref().unwrap_or(""),
-                        model_changed = event.model_changed,
-                        commit_race_suspect = event.commit_race_suspect,
-                        sibling_completed_recently = event.sibling_completed_recently,
-                        replayed_prefix = event.replayed_prefix,
-                        replay_chain_id = event.replay_chain_id.unwrap_or(0),
-                        breakpoints_placed = event.breakpoints_placed.unwrap_or(0),
-                        system_markers_dropped = event.system_markers_dropped.unwrap_or(0),
-                        previous_forwarded_request_bytes = event.previous_forwarded_request_bytes.unwrap_or(0),
-                        forwarded_request_bytes = event.forwarded_request_bytes.unwrap_or(0),
-                        wasted_tokens = charged_wasted_tokens,
-                        expected_cache_read = expected_cache_read,
-                        // Float, unlike the TTL line's truncated int: the 5s
-                        // commit window is queryable only with sub-second gap.
-                        idle_seconds = idle_gap.as_secs_f64(),
-                        actual_cache_read = cache_read_input_tokens,
-                        // The three boundaries the landing was read against,
-                        // so the classification can be audited off the line.
-                        // `-1` = no turn before the previous one.
-                        previous_cache_read = previous_cache_read,
-                        previous_boundary = expected_cache_read,
-                        previous_previous_boundary = previous_previous_boundary.map_or(-1_i64, |b| b as i64),
-                        cache_creation_input_tokens = cache_creation_input_tokens,
-                        "prompt cache re-written inside the TTL window without an attributed cause"
-                    ),
-                    RecacheEventKind::Expected => tracing::info!(
-                        event = "cache_recache_observed",
-                        request_id = %request_id,
-                        conversation_key = %event.conversation_key,
-                        session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                        // Which tracked stream the arithmetic was done against.
-                        // `-1` = matched nothing, so this was booked a first turn.
-                        matched_stream_msgs = matched_stream_msgs.map_or(-1_i64, |m| m as i64),
-                        turn_msgs = turn_msgs.map_or(-1_i64, |m| m as i64),
-                        streams_tracked = streams_tracked,
-                        drift_dims = "",
-                        outbound_drift_dims =
-                            event.outbound_drift_dims.as_deref().unwrap_or("?"),
-                        forwarded_head_moved = forwarded_head_moved,
-                        head_moved = head_moved_which.as_str(),
-                        replay_skipped = pending.replay_skip.map(|e| e.reason.as_str()).unwrap_or(""),
-                        attribution_reason = "",
-                        origin = "",
-                        scope = "",
-                        event_kind = "expected",
-                        wasted_tokens = charged_wasted_tokens,
-                        prefix_head = pending.prefix.as_ref().map(|p| p.head.as_str()).unwrap_or(""),
-                        prefix_body = pending.prefix.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
-                        prefix_stable = pending.prefix.as_ref().map(|p| p.stable.as_str()).unwrap_or(""),
-                        prefix_stable_msgs = pending.prefix.as_ref().map(|p| p.stable_msgs).unwrap_or(0),
-                        expected_cache_read = expected_cache_read,
-                        // Float, unlike the TTL line's truncated int: the 5s
-                        // commit window is queryable only with sub-second gap.
-                        idle_seconds = idle_gap.as_secs_f64(),
-                        actual_cache_read = cache_read_input_tokens,
-                        cache_creation_input_tokens = cache_creation_input_tokens,
-                        "prompt cache re-written inside the TTL window with no causal evidence: cause unattributed"
-                    ),
-                }
-                crate::observability::observe_recache_event(
-                    event.attribution_reason.as_deref(),
-                    attribution.counts_as_waste.then_some(wasted_tokens),
-                );
-                inner.last_event = Some(event);
-                Some(match event_kind {
-                    // A structural bust: bytes inside the cached prefix moved,
-                    // and `wasted_tokens` is what that cost.
-                    RecacheEventKind::Drift => CompletionClass::PrefixChange { wasted_tokens },
-                    RecacheEventKind::Unexplained => {
-                        CompletionClass::UnexplainedAfterReplay { wasted_tokens }
-                    }
-                    // The event remains visible in cache health, but it is not
-                    // a miss and therefore has no durable miss classification.
-                    RecacheEventKind::Branch => return None,
-                    // A re-cache with no direct causal evidence. Counted, but
-                    // not charged as attributed waste.
-                    RecacheEventKind::Expected => CompletionClass::Unknown,
-                })
             }
         }
+    }
+
+    /// Ground-truth cost ledger, built from figures the proxy cannot
+    /// influence — the `usage` block Anthropic returns, which is the bill.
+    /// `billed_fresh_equivalents` restates that bill in one comparable unit,
+    /// weighting each class by its published price relative to fresh input.
+    /// Extracted from `complete_with_cache_capability` without behavior change.
+    fn record_cost_ledger(
+        inner: &mut Inner,
+        request_id: &str,
+        pending: &PendingRequest,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_write_ttl_split: Option<(u64, u64)>,
+    ) {
+        // Bill every round, not just the client's. When the proxy answered
+        // a retrieval itself, the rounds it added were billed too, and the
+        // baseline above deliberately excludes them.
+        let (billed_input, billed_cache_read, billed_cache_write) =
+            pending.billed_totals.unwrap_or((
+                input_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            ));
+        let billed_fresh_equivalents = billed_input as f64
+            + (billed_cache_read as f64 * 0.1)
+            + (billed_cache_write as f64 * 1.25);
+        // Hidden continuation rounds, split out so the ledger joins to
+        // `ccr_continuation_usage` without recomputing the difference:
+        // billed totals minus the client baseline `complete` was given.
+        // Zero on the common single-round path. Existing fields stay as
+        // they are.
+        let (rounds_input_tokens, rounds_cache_read_tokens) =
+            pending.billed_totals.map_or((0, 0), |(bi, bcr, _)| {
+                (
+                    bi.saturating_sub(input_tokens),
+                    bcr.saturating_sub(cache_read_input_tokens),
+                )
+            });
+        // Same window as the hit rate above, and the same reason: the
+        // statusline needs it per render and cannot afford to re-read the
+        // log. Kept here rather than beside the hit rate because the
+        // forwarded size lives on `pending`, which only exists past the
+        // gate — a turn that never reached compression has no size to
+        // divide by and would price as free.
+        if inner.recent_cost_samples.len() == RECENT_SAMPLE_CAPACITY {
+            inner.recent_cost_samples.pop_front();
+        }
+        inner.recent_cost_samples.push_back(CostSample {
+            cache_read_tokens: billed_cache_read,
+            cache_write_tokens: billed_cache_write,
+            forwarded_bytes: pending.forwarded_request_bytes.unwrap_or(0),
+            billed_fresh_equivalents,
+        });
+        tracing::info!(
+            event = "turn_cost_ledger",
+            request_id = %request_id,
+            conversation_key = %pending.conversation_key,
+            // Join key for the re-key floor: a continuation under a fresh
+            // key shares the session hash, not the conversation key.
+            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
+            // Anthropic's own numbers, summed over every round the proxy
+            // ran and otherwise unmodified.
+            input_tokens = billed_input,
+            cache_read_input_tokens = billed_cache_read,
+            cache_creation_input_tokens = billed_cache_write,
+            // Hidden-round split: billed totals minus the client baseline,
+            // so the ledger joins to `ccr_continuation_usage` directly.
+            rounds_input_tokens = rounds_input_tokens,
+            rounds_cache_read_tokens = rounds_cache_read_tokens,
+            // Which TTL the provider actually billed the write at. The
+            // proxy asks for the 1-hour tier on the prefix, but asking is
+            // not granting, and the flat creation count above cannot tell
+            // the two apart — a 1-hour write costs 2.0x input against the
+            // 5-minute tier's 1.25x, so a silently downgraded request is a
+            // price change the ledger would otherwise miss. `-1` where the
+            // provider publishes no breakdown, so "absent" stays distinct
+            // from "wrote nothing at that tier".
+            cache_write_5m_tokens = cache_write_ttl_split.map_or(-1_i64, |(m5, _)| m5 as i64),
+            cache_write_1h_tokens = cache_write_ttl_split.map_or(-1_i64, |(_, h1)| h1 as i64),
+            // `-1` where the path that booked this turn never reported an
+            // output count, same convention as the TTL split above.
+            output_tokens = pending.billed_output.map_or(-1_i64, |o| o as i64),
+            billed_fresh_equivalents = billed_fresh_equivalents,
+            // What the client handed us, before anything we did.
+            client_request_bytes = pending.client_request_bytes.unwrap_or(0),
+            forwarded_request_bytes = pending.forwarded_request_bytes.unwrap_or(0),
+            // The arm this turn ran under, so on/off runs are separable.
+            compression_mode = pending.compression_mode.unwrap_or("unknown"),
+            "billed usage against the work the client asked for"
+        );
     }
 
     /// One cheap in-memory snapshot for `GET /cache-health`.

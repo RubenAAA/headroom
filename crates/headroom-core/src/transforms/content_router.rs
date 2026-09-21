@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::compressor_registry::{
-    CompressInput, Compressor, CompressorDescriptor, CompressorRegistry,
+    CompressInput, CompressOutput, Compressor, CompressorDescriptor, CompressorRegistry,
 };
 use super::content_detector::ContentType;
 
@@ -936,11 +936,13 @@ fn search_result_pattern() -> &'static Regex {
 /// True for grep match lines and `grep -A`/`-B`/`-C` context lines.
 ///
 /// Unions the legacy splitter pattern above (kept so every previously
-/// carved line still carves) with the guarded context predicate from the
+/// carved line still carves) with both guarded context predicates from the
 /// detector, so code in context lines routes to the search compressor
 /// instead of the prose path (upstream #3599).
 fn is_search_section_line(line: &str) -> bool {
-    search_result_pattern().is_match(line) || super::content_detector::is_grep_context_line(line)
+    search_result_pattern().is_match(line)
+        || super::content_detector::is_grep_context_line(line)
+        || super::content_detector::is_grep_colon_dash_line(line)
 }
 
 fn prose_pattern() -> &'static Regex {
@@ -950,11 +952,19 @@ fn prose_pattern() -> &'static Regex {
 
 /// Detect if content contains multiple distinct types.
 pub fn is_mixed_content(content: &str) -> bool {
+    // Mirror Python's `has_search_results`: legacy pattern or any guarded
+    // grep context line, so pure-context-lines-plus-prose reads mixed on
+    // both ports.
+    let has_search = search_result_pattern().is_match(content)
+        || content.lines().any(|l| {
+            super::content_detector::is_grep_context_line(l)
+                || super::content_detector::is_grep_colon_dash_line(l)
+        });
     let indicators = [
         code_fence_pattern().is_match(content),
         json_block_start().is_match(content),
         prose_pattern().find_iter(content).count() > 5,
-        search_result_pattern().is_match(content),
+        has_search,
     ];
     indicators.iter().filter(|&&x| x).count() >= 2
 }
@@ -1647,6 +1657,60 @@ fn external_compressor_matches(descriptor: &CompressorDescriptor, content_mime: 
         .any(|d| d == "*" || d == "*/*" || *d == type_wildcard)
 }
 
+/// True if `out` must be discarded in favour of the built-in path, logging why.
+fn external_output_rejected(name: &str, content: &str, out: &CompressOutput) -> bool {
+    // Never blank out a non-empty block (an empty user/tool block makes
+    // providers reject the request); fall back so the built-in path runs.
+    if !content.trim().is_empty() && out.content.trim().is_empty() {
+        tracing::warn!(
+            compressor = %name,
+            "external compressor produced empty output; falling back to built-in"
+        );
+        return true;
+    }
+    // Never let an external compressor expand a block; fall back so the built-in
+    // path (or passthrough) can do better.
+    if out.content.len() > content.len() {
+        tracing::debug!(
+            compressor = %name,
+            before = content.len(),
+            after = out.content.len(),
+            "external compressor expanded content; falling back"
+        );
+        return true;
+    }
+    false
+}
+
+/// Persist each `hash -> original` recovery entry, warning on a store failure.
+fn store_external_recoverables(
+    name: &str,
+    out: &CompressOutput,
+    strategy_label: &str,
+    store_recoverable: &dyn Fn(&str, &str, &str) -> bool,
+) {
+    for (ccr_hash, original) in &out.recoverable {
+        if !store_recoverable(ccr_hash, original, strategy_label) {
+            tracing::warn!(
+                compressor = %name,
+                hash = %ccr_hash,
+                "external compressor recoverable entry was not stored"
+            );
+        }
+    }
+}
+
+/// Emit the compressor's non-fatal warnings, if it reported any.
+fn log_external_warnings(name: &str, out: &CompressOutput) {
+    if !out.warnings.is_empty() {
+        tracing::debug!(
+            compressor = %name,
+            warnings = %out.warnings.join("; "),
+            "external compressor warnings"
+        );
+    }
+}
+
 /// Invoke one external compressor via the contract; fail open to `None`.
 fn run_external_compressor(
     compressor: &Arc<dyn Compressor>,
@@ -1671,24 +1735,7 @@ fn run_external_compressor(
     // has to check for at runtime, so that branch has no counterpart here.
     let out = compressor.compress(&input);
 
-    // Never blank out a non-empty block (an empty user/tool block makes
-    // providers reject the request); fall back so the built-in path runs.
-    if !content.trim().is_empty() && out.content.trim().is_empty() {
-        tracing::warn!(
-            compressor = %name,
-            "external compressor produced empty output; falling back to built-in"
-        );
-        return None;
-    }
-    // Never let an external compressor expand a block; fall back so the built-in
-    // path (or passthrough) can do better.
-    if out.content.len() > content.len() {
-        tracing::debug!(
-            compressor = %name,
-            before = content.len(),
-            after = out.content.len(),
-            "external compressor expanded content; falling back"
-        );
+    if external_output_rejected(name, content, &out) {
         return None;
     }
 
@@ -1699,23 +1746,9 @@ fn run_external_compressor(
     // each hash. Best-effort: a store failure leaves that entry unretrievable
     // but never breaks the request.
     let strategy_label = format!("external:{name}");
-    for (ccr_hash, original) in &out.recoverable {
-        if !store_recoverable(ccr_hash, original, &strategy_label) {
-            tracing::warn!(
-                compressor = %name,
-                hash = %ccr_hash,
-                "external compressor recoverable entry was not stored"
-            );
-        }
-    }
+    store_external_recoverables(name, &out, &strategy_label, store_recoverable);
 
-    if !out.warnings.is_empty() {
-        tracing::debug!(
-            compressor = %name,
-            warnings = %out.warnings.join("; "),
-            "external compressor warnings"
-        );
-    }
+    log_external_warnings(name, &out);
 
     Some((out.content, compressed_tokens, vec![strategy_label]))
 }
@@ -3089,6 +3122,17 @@ mod tests {
         // Upstream #3599: match lines and -A/-B/-C context lines carve as
         // search sections so code in them avoids the prose path.
         let content = "src/a.py:42:def f():\nsrc/a.py-43-    return 1\nsrc/b.py:10: other";
+        let sections = split_into_sections(content);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].content_type, ContentType::SearchResults);
+    }
+
+    #[test]
+    fn split_into_sections_carves_colon_dash_context_lines() {
+        // The `path:NN-content` context shape the detector claims must carve
+        // too, or it strands in prose/code sections (the #3599 misroute for
+        // that shape).
+        let content = "src/a.py:42:def f():\nsrc/a.py:43-    return 1\nsrc/b.py:10: other";
         let sections = split_into_sections(content);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].content_type, ContentType::SearchResults);

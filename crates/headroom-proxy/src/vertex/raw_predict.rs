@@ -77,9 +77,111 @@ pub(crate) async fn forward_vertex_request(
     let path_for_log = uri.path().to_string();
 
     // ─── 1. BUFFER BODY ────────────────────────────────────────────────
-    let max = state.config.compression_max_body_bytes as usize;
-    let buffered = match to_bytes(body, max).await {
+    let buffered = match buffer_vertex_body(&state, body, &request_id, &path_for_log).await {
         Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
+    // ─── 2. ENVELOPE PARSE ─────────────────────────────────────────────
+    if let Err(resp) = check_vertex_envelope(&buffered, &ctx, &request_id, &path_for_log) {
+        return resp;
+    }
+
+    // ─── 3. LIVE-ZONE COMPRESSION (when enabled) ───────────────────────
+    //
+    // Vertex bodies are Anthropic-shape; we feed the same
+    // `compress_anthropic_request` dispatcher that runs on /v1/messages.
+    // The dispatcher uses RawValue-based surgery so `anthropic_version`
+    // (and any other non-`messages` top-level field) round-trips
+    // byte-equal. Compression off → buffered bytes used unchanged.
+    let body_to_send = compress_vertex_body(&state, buffered, &request_id, &path_for_log);
+
+    // ─── 4. RESOLVE BEARER TOKEN ───────────────────────────────────────
+    let bearer = match fetch_vertex_bearer(&state, &ctx, &request_id, &path_for_log).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
+    // ─── 5. BUILD UPSTREAM URL ─────────────────────────────────────────
+    //
+    // The Vertex endpoint pattern is
+    // `https://{region}-aiplatform.googleapis.com/<path-and-query>`.
+    // We honour the same `Config::upstream` override pattern the
+    // rest of the proxy uses: when an operator sets `upstream` to the
+    // mock server (typical in tests), we forward there and the
+    // request still carries the canonical Vertex path.
+    //
+    // For production, the operator should set `upstream` to the
+    // regional Vertex host. We do NOT auto-construct the regional
+    // URL from `vertex_region` — that would be a hardcoded provider
+    // routing decision. The region setting is exposed for
+    // observability only.
+    let upstream_url = match build_vertex_upstream_url(&state, &uri, &request_id) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    // ─── 6. BUILD HEADERS ──────────────────────────────────────────────
+    let outgoing_headers =
+        match build_vertex_headers(&state, &headers, client_addr, &bearer, &request_id) {
+            Ok(h) => h,
+            Err(resp) => return resp,
+        };
+
+    // ─── 6b. REDACTION SEAM ──────────────────────────────────────────
+    // Request-id keyed: Vertex has no ApiKind variant for conversation
+    // keys (same rule as the gemini/batch seam). The response restores
+    // through the seam at the end, streaming or not.
+    let gate = crate::redact::RedactGate::new(
+        state.config.redact_sensitive,
+        &state.redact_store,
+        &request_id,
+    );
+    let (body_to_send, seam) = gate.seam_bytes(body_to_send);
+
+    // ─── 7. FORWARD ────────────────────────────────────────────────────
+    let upstream_resp = match send_vertex_request(
+        &state,
+        method,
+        upstream_url,
+        outgoing_headers,
+        body_to_send,
+        &request_id,
+        &path_for_log,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // ─── 8. STREAM RESPONSE ────────────────────────────────────────────
+    stream_vertex_response(
+        upstream_resp,
+        seam,
+        request_id,
+        path_for_log,
+        &ctx,
+        attach_sse_tee,
+    )
+}
+
+/// Buffer the inbound body within the compression limit.
+/// Extracted from `forward_vertex_request` without behavior change.
+///
+// The `Response` error keeps the convention of every sibling arm on the
+// routed paths (cf. `routed::translation`); boxing it would save nothing
+// measurable and diverge from all of them.
+#[allow(clippy::result_large_err)]
+async fn buffer_vertex_body(
+    state: &AppState,
+    body: Body,
+    request_id: &str,
+    path_for_log: &str,
+) -> Result<bytes::Bytes, Response> {
+    let max = state.config.compression_max_body_bytes as usize;
+    match to_bytes(body, max).await {
+        Ok(b) => Ok(b),
         Err(e) => {
             tracing::warn!(
                 event = "vertex_body_too_large",
@@ -89,15 +191,26 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "vertex request body exceeds compression buffer limit; failing loudly"
             );
-            return error_response(
+            Err(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body exceeds buffer limit",
-            );
+            ))
         }
-    };
+    }
+}
 
-    // ─── 2. ENVELOPE PARSE ─────────────────────────────────────────────
-    match envelope::parse(&buffered) {
+/// Reject bodies whose envelope does not match the expected Vertex shape.
+/// Extracted from `forward_vertex_request` without behavior change.
+///
+// See `buffer_vertex_body` for why the `Response` error is not boxed.
+#[allow(clippy::result_large_err)]
+fn check_vertex_envelope(
+    buffered: &[u8],
+    ctx: &VertexCallContext,
+    request_id: &str,
+    path_for_log: &str,
+) -> Result<(), Response> {
+    match envelope::parse(buffered) {
         Ok(env) => {
             tracing::info!(
                 event = "vertex_envelope_parsed",
@@ -111,6 +224,7 @@ pub(crate) async fn forward_vertex_request(
                 has_messages = env.has_messages,
                 "vertex envelope detected"
             );
+            Ok(())
         }
         Err(e) => {
             tracing::warn!(
@@ -122,89 +236,26 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "vertex envelope did not match expected shape; rejecting with 400"
             );
-            return error_response(StatusCode::BAD_REQUEST, "vertex envelope invalid");
+            Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "vertex envelope invalid",
+            ))
         }
     }
+}
 
-    // ─── 3. LIVE-ZONE COMPRESSION (when enabled) ───────────────────────
-    //
-    // Vertex bodies are Anthropic-shape; we feed the same
-    // `compress_anthropic_request` dispatcher that runs on /v1/messages.
-    // The dispatcher uses RawValue-based surgery so `anthropic_version`
-    // (and any other non-`messages` top-level field) round-trips
-    // byte-equal. Compression off → buffered bytes used unchanged.
-    let body_to_send = if state.config.compression {
-        // PR-E3: Vertex uses GCP ADC bearer-token auth downstream, not
-        // Anthropic credentials, so the PAYG/OAuth/subscription
-        // classification doesn't apply. Hard-code `AuthMode::OAuth` to
-        // skip E3 cache_control auto-placement (and any other PAYG-only
-        // mutation). Live-zone compression itself continues to run.
-        let outcome = compression::compress_anthropic_request(
-            &buffered,
-            state.config.compression_mode,
-            state.config.cache_control_auto_frozen,
-            headroom_core::auth_mode::AuthMode::OAuth,
-            &request_id,
-            &state.config.exclude_tools,
-            // No CCR store: this path never injects `headroom_retrieve`, so a
-            // marker here would advertise a recovery route the model cannot
-            // take.
-            None,
-        );
-        // Cross-turn verbatim de-dup post-pass (no-op unless
-        // `--enable-cross-turn-dedup` is set).
-        let outcome = compression::apply_cross_turn_dedup(
-            outcome,
-            &buffered,
-            &state.config,
-            "/vertex/rawPredict",
-            &request_id,
-        );
-        match outcome {
-            compression::Outcome::NoCompression => {
-                tracing::info!(
-                    event = "vertex_compression_skipped",
-                    request_id = %request_id,
-                    path = %path_for_log,
-                    compression_mode = state.config.compression_mode.as_str(),
-                    reason = "no_compression",
-                    "vertex live-zone dispatcher returned NoCompression"
-                );
-                buffered
-            }
-            compression::Outcome::Compressed {
-                body,
-                tokens_before,
-                tokens_after,
-                strategies_applied,
-                markers_inserted,
-                ..
-            } => {
-                tracing::info!(
-                    event = "vertex_compression_applied",
-                    request_id = %request_id,
-                    path = %path_for_log,
-                    tokens_before = tokens_before,
-                    tokens_after = tokens_after,
-                    tokens_freed = tokens_before.saturating_sub(tokens_after),
-                    strategies = ?strategies_applied,
-                    markers = markers_inserted.len(),
-                    "vertex live-zone compression applied"
-                );
-                body
-            }
-            compression::Outcome::Passthrough { reason } => {
-                tracing::warn!(
-                    event = "vertex_compression_passthrough",
-                    request_id = %request_id,
-                    path = %path_for_log,
-                    reason = ?reason,
-                    "vertex live-zone dispatcher passthrough on parse/serialize"
-                );
-                buffered
-            }
-        }
-    } else {
+/// Run live-zone compression when enabled, else pass the bytes through.
+/// Vertex uses GCP ADC bearer-token auth downstream, not Anthropic
+/// credentials, so the PAYG/OAuth/subscription classification doesn't apply:
+/// hard-code `AuthMode::OAuth` (PR-E3).
+/// Extracted from `forward_vertex_request` without behavior change.
+fn compress_vertex_body(
+    state: &AppState,
+    buffered: bytes::Bytes,
+    request_id: &str,
+    path_for_log: &str,
+) -> bytes::Bytes {
+    if !state.config.compression {
         tracing::info!(
             event = "vertex_compression_skipped",
             request_id = %request_id,
@@ -212,12 +263,106 @@ pub(crate) async fn forward_vertex_request(
             reason = "compression_off",
             "compression master switch off; vertex body forwarded unchanged"
         );
-        buffered
-    };
+        return buffered;
+    }
+    // PR-E3: Vertex uses GCP ADC bearer-token auth downstream, not
+    // Anthropic credentials, so the PAYG/OAuth/subscription
+    // classification doesn't apply. Hard-code `AuthMode::OAuth` to
+    // skip E3 cache_control auto-placement (and any other PAYG-only
+    // mutation). Live-zone compression itself continues to run.
+    let outcome = compression::compress_anthropic_request(
+        &buffered,
+        state.config.compression_mode,
+        state.config.cache_control_auto_frozen,
+        headroom_core::auth_mode::AuthMode::OAuth,
+        request_id,
+        &state.config.exclude_tools,
+        // No CCR store: this path never injects `headroom_retrieve`, so a
+        // marker here would advertise a recovery route the model cannot
+        // take.
+        None,
+    );
+    // Cross-turn verbatim de-dup post-pass (no-op unless
+    // `--enable-cross-turn-dedup` is set).
+    let outcome = compression::apply_cross_turn_dedup(
+        outcome,
+        &buffered,
+        &state.config,
+        "/vertex/rawPredict",
+        request_id,
+    );
+    report_compression_outcome(outcome, buffered, state, request_id, path_for_log)
+}
 
-    // ─── 4. RESOLVE BEARER TOKEN ───────────────────────────────────────
-    let bearer = match state.vertex_token_source.bearer().await {
-        Ok(t) => t,
+/// Log the live-zone outcome and select the bytes to forward.
+/// Extracted from `compress_vertex_body` without behavior change.
+fn report_compression_outcome(
+    outcome: compression::Outcome,
+    buffered: bytes::Bytes,
+    state: &AppState,
+    request_id: &str,
+    path_for_log: &str,
+) -> bytes::Bytes {
+    match outcome {
+        compression::Outcome::NoCompression => {
+            tracing::info!(
+                event = "vertex_compression_skipped",
+                request_id = %request_id,
+                path = %path_for_log,
+                compression_mode = state.config.compression_mode.as_str(),
+                reason = "no_compression",
+                "vertex live-zone dispatcher returned NoCompression"
+            );
+            buffered
+        }
+        compression::Outcome::Compressed {
+            body,
+            tokens_before,
+            tokens_after,
+            strategies_applied,
+            markers_inserted,
+            ..
+        } => {
+            tracing::info!(
+                event = "vertex_compression_applied",
+                request_id = %request_id,
+                path = %path_for_log,
+                tokens_before = tokens_before,
+                tokens_after = tokens_after,
+                tokens_freed = tokens_before.saturating_sub(tokens_after),
+                strategies = ?strategies_applied,
+                markers = markers_inserted.len(),
+                "vertex live-zone compression applied"
+            );
+            body
+        }
+        compression::Outcome::Passthrough { reason } => {
+            tracing::warn!(
+                event = "vertex_compression_passthrough",
+                request_id = %request_id,
+                path = %path_for_log,
+                reason = ?reason,
+                "vertex live-zone dispatcher passthrough on parse/serialize"
+            );
+            buffered
+        }
+    }
+}
+
+/// Fetch the GCP ADC bearer token. Per project rule "no silent fallbacks":
+/// never forward unauthenticated — surface the failure as a structured 502.
+/// Extracted from `forward_vertex_request` without behavior change.
+///
+// See `buffer_vertex_body` for why the `Response` error is not boxed.
+#[allow(clippy::result_large_err)]
+async fn fetch_vertex_bearer(
+    state: &AppState,
+    ctx: &VertexCallContext,
+    request_id: &str,
+    path_for_log: &str,
+) -> Result<String, Response> {
+    match state.vertex_token_source.bearer().await {
+        Ok(t) => Ok(t),
         Err(e) => {
             // Per project rule "no silent fallbacks": never forward
             // unauthenticated. Surface the failure as a structured
@@ -235,26 +380,24 @@ pub(crate) async fn forward_vertex_request(
                 TokenSourceError::ProviderInit(_) => StatusCode::BAD_GATEWAY,
                 TokenSourceError::Fetch(_) => StatusCode::BAD_GATEWAY,
             };
-            return error_response(status, "vertex ADC token fetch failed");
+            Err(error_response(status, "vertex ADC token fetch failed"))
         }
-    };
+    }
+}
 
-    // ─── 5. BUILD UPSTREAM URL ─────────────────────────────────────────
-    //
-    // The Vertex endpoint pattern is
-    // `https://{region}-aiplatform.googleapis.com/<path-and-query>`.
-    // We honour the same `Config::upstream` override pattern the
-    // rest of the proxy uses: when an operator sets `upstream` to the
-    // mock server (typical in tests), we forward there and the
-    // request still carries the canonical Vertex path.
-    //
-    // For production, the operator should set `upstream` to the
-    // regional Vertex host. We do NOT auto-construct the regional
-    // URL from `vertex_region` — that would be a hardcoded provider
-    // routing decision. The region setting is exposed for
-    // observability only.
-    let upstream_url = match crate::proxy::build_upstream_url(&state.config.upstream, &uri) {
-        Ok(u) => u,
+/// Build the upstream URL, honouring the `Config::upstream` override pattern
+/// (a mock server in tests still carries the canonical Vertex path).
+/// Extracted from `forward_vertex_request` without behavior change.
+///
+// See `buffer_vertex_body` for why the `Response` error is not boxed.
+#[allow(clippy::result_large_err)]
+fn build_vertex_upstream_url(
+    state: &AppState,
+    uri: &Uri,
+    request_id: &str,
+) -> Result<url::Url, Response> {
+    match crate::proxy::build_upstream_url(&state.config.upstream, uri) {
+        Ok(u) => Ok(u),
         Err(e) => {
             tracing::error!(
                 event = "vertex_upstream_url_failed",
@@ -262,11 +405,28 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "could not construct vertex upstream URL"
             );
-            return error_response(StatusCode::BAD_GATEWAY, "vertex upstream URL build failed");
+            Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "vertex upstream URL build failed",
+            ))
         }
-    };
+    }
+}
 
-    // ─── 6. BUILD HEADERS ──────────────────────────────────────────────
+/// Build the outbound headers: forwarded host/proto handling plus the ADC
+/// bearer (which replaces any client-sent Authorization — Vertex rejects
+/// the wrong Auth flavour, so keeping it would silently break the call).
+/// Extracted from `forward_vertex_request` without behavior change.
+///
+// See `buffer_vertex_body` for why the `Response` error is not boxed.
+#[allow(clippy::result_large_err)]
+fn build_vertex_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    client_addr: SocketAddr,
+    bearer: &str,
+    request_id: &str,
+) -> Result<HeaderMap, Response> {
     let strip_internal = state.config.strip_internal_headers.is_enabled();
     let forwarded_host = headers
         .get(http::header::HOST)
@@ -282,11 +442,11 @@ pub(crate) async fn forward_vertex_request(
     // PR-F4 (P5-53): Vertex is always ADC/OAuth downstream (see the
     // compression call above), and OAuth keeps X-Forwarded-* per spec.
     let mut outgoing_headers = build_forward_request_headers(
-        &headers,
+        headers,
         client_addr.ip(),
         forwarded_proto,
         forwarded_host.as_deref(),
-        &request_id,
+        request_id,
         strip_internal,
         headroom_core::auth_mode::AuthMode::OAuth,
     );
@@ -302,6 +462,7 @@ pub(crate) async fn forward_vertex_request(
     match http::HeaderValue::from_str(&format!("Bearer {bearer}")) {
         Ok(v) => {
             outgoing_headers.insert(http::header::AUTHORIZATION, v);
+            Ok(outgoing_headers)
         }
         Err(e) => {
             tracing::error!(
@@ -310,22 +471,28 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "ADC bearer token contained invalid header bytes; refusing to forward"
             );
-            return error_response(StatusCode::BAD_GATEWAY, "vertex auth header build failed");
+            Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "vertex auth header build failed",
+            ))
         }
     }
+}
 
-    // ─── 6b. REDACTION SEAM ──────────────────────────────────────────
-    // Request-id keyed: Vertex has no ApiKind variant for conversation
-    // keys (same rule as the gemini/batch seam). The response restores
-    // through the seam at the end, streaming or not.
-    let gate = crate::redact::RedactGate::new(
-        state.config.redact_sensitive,
-        &state.redact_store,
-        &request_id,
-    );
-    let (body_to_send, seam) = gate.seam_bytes(body_to_send);
-
-    // ─── 7. FORWARD ────────────────────────────────────────────────────
+/// Send the prepared request upstream.
+/// Extracted from `forward_vertex_request` without behavior change.
+///
+// See `buffer_vertex_body` for why the `Response` error is not boxed.
+#[allow(clippy::result_large_err)]
+async fn send_vertex_request(
+    state: &AppState,
+    method: Method,
+    upstream_url: url::Url,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    request_id: &str,
+    path_for_log: &str,
+) -> Result<reqwest::Response, Response> {
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,
         Err(e) => {
@@ -336,18 +503,21 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "could not convert axum method to reqwest method"
             );
-            return error_response(StatusCode::BAD_REQUEST, "vertex method invalid");
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "vertex method invalid",
+            ));
         }
     };
-    let upstream_resp = match state
+    match state
         .client
         .request(reqwest_method, upstream_url.clone())
-        .headers(outgoing_headers)
-        .body(body_to_send)
+        .headers(headers)
+        .body(body)
         .send()
         .await
     {
-        Ok(r) => r,
+        Ok(r) => Ok(r),
         Err(e) => {
             tracing::warn!(
                 event = "vertex_upstream_error",
@@ -356,11 +526,25 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "vertex upstream call failed"
             );
-            return error_response(StatusCode::BAD_GATEWAY, "vertex upstream error");
+            Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "vertex upstream error",
+            ))
         }
-    };
+    }
+}
 
-    // ─── 8. STREAM RESPONSE ────────────────────────────────────────────
+/// Stream the upstream response back, teeing SSE bytes for telemetry when
+/// asked, then restoring redaction placeholders on the way out.
+/// Extracted from `forward_vertex_request` without behavior change.
+fn stream_vertex_response(
+    upstream_resp: reqwest::Response,
+    seam: Option<crate::redact::Seam>,
+    request_id: String,
+    path_for_log: String,
+    ctx: &VertexCallContext,
+    attach_sse_tee: bool,
+) -> Response {
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = filter_response_headers(upstream_resp.headers());
@@ -371,28 +555,7 @@ pub(crate) async fn forward_vertex_request(
     // as the `/v1/messages` SSE telemetry tee in
     // `crate::proxy::forward_http`. The byte-passthrough path is
     // unaffected by the tee (best-effort `try_send`, bounded channel).
-    let is_sse = upstream_resp
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            let media = s.split(';').next().unwrap_or("").trim();
-            media.eq_ignore_ascii_case("text/event-stream")
-        })
-        .unwrap_or(false);
-    let parser_tx = if attach_sse_tee && is_sse {
-        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(VERTEX_SSE_QUEUE_DEPTH);
-        let rid = request_id.clone();
-        tokio::spawn(run_anthropic_sse_state_machine(rx, rid));
-        tracing::info!(
-            event = "vertex_sse_tee_engaged",
-            request_id = %request_id,
-            "vertex stream_raw_predict SSE telemetry tee engaged"
-        );
-        Some(tx)
-    } else {
-        None
-    };
+    let parser_tx = engage_sse_tee(attach_sse_tee, &upstream_resp, &request_id);
 
     use futures_util::StreamExt as _;
     let rid_for_stream = request_id.clone();
@@ -470,6 +633,38 @@ fn error_response(status: StatusCode, msg: &'static str) -> Response {
 /// rate; keeps memory bounded even if the parser stalls).
 const VERTEX_SSE_QUEUE_DEPTH: usize = 256;
 
+/// Engage the SSE telemetry tee when asked and the upstream response is
+/// `text/event-stream`: bounded channel, spawned state machine, best-effort
+/// sends that never block the byte path.
+/// Extracted from `stream_vertex_response` without behavior change.
+fn engage_sse_tee(
+    attach_sse_tee: bool,
+    upstream_resp: &reqwest::Response,
+    request_id: &str,
+) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
+    let is_sse = upstream_resp
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            let media = s.split(';').next().unwrap_or("").trim();
+            media.eq_ignore_ascii_case("text/event-stream")
+        })
+        .unwrap_or(false);
+    if !(attach_sse_tee && is_sse) {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(VERTEX_SSE_QUEUE_DEPTH);
+    let rid = request_id.to_string();
+    tokio::spawn(run_anthropic_sse_state_machine(rx, rid));
+    tracing::info!(
+        event = "vertex_sse_tee_engaged",
+        request_id = %request_id,
+        "vertex stream_raw_predict SSE telemetry tee engaged"
+    );
+    Some(tx)
+}
+
 /// Drive the Anthropic SSE state machine over a stream of byte
 /// chunks. Lives in its own spawned task; the byte path is fed via a
 /// best-effort tee from [`forward_vertex_request`] and never blocks
@@ -484,24 +679,7 @@ async fn run_anthropic_sse_state_machine(
     while let Some(chunk) = rx.recv().await {
         framer.push(&chunk);
         while let Some(ev_result) = framer.next_event() {
-            match ev_result {
-                Ok(ev) => {
-                    if let Err(e) = state.apply(ev) {
-                        tracing::warn!(
-                            request_id = %request_id,
-                            error = %e,
-                            "vertex sse anthropic state-machine apply error"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        error = %e,
-                        "vertex sse framer error"
-                    );
-                }
-            }
+            apply_framed_event(&mut state, ev_result, &request_id);
         }
     }
     tracing::info!(
@@ -516,4 +694,31 @@ async fn run_anthropic_sse_state_machine(
         blocks = state.blocks.len(),
         "vertex sse stream closed"
     );
+}
+
+/// Apply one framed SSE event to the telemetry state machine.
+/// Extracted from `run_anthropic_sse_state_machine` without behavior change.
+fn apply_framed_event(
+    state: &mut crate::sse::anthropic::AnthropicStreamState,
+    ev_result: Result<crate::sse::framing::SseEvent, crate::sse::framing::FramingError>,
+    request_id: &str,
+) {
+    match ev_result {
+        Ok(ev) => {
+            if let Err(e) = state.apply(ev) {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    "vertex sse anthropic state-machine apply error"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %e,
+                "vertex sse framer error"
+            );
+        }
+    }
 }

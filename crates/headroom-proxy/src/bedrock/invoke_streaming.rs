@@ -178,21 +178,9 @@ pub async fn handle_invoke_streaming(
 
     // 2. Resolve the Bedrock streaming action from the inbound path and
     // build the upstream URL.
-    let action = match extract_streaming_action(uri.path()) {
-        Some(a) => a,
-        None => {
-            tracing::error!(
-                event = "bedrock_streaming_action_invalid",
-                request_id = %request_id,
-                path = %uri.path(),
-                "bedrock invoke-streaming: unrecognized streaming action path"
-            );
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "bedrock_streaming_action_invalid",
-                "Unsupported Bedrock streaming action path",
-            );
-        }
+    let action = match resolve_streaming_action(&uri, &request_id) {
+        Ok(a) => a,
+        Err(resp) => return resp,
     };
 
     // Operator override (HEADROOM_BEDROCK_MODEL_MAP): redirect the
@@ -201,30 +189,149 @@ pub async fn handle_invoke_streaming(
     // the converse route (the invoke route rejects ARNs with HTTP 400),
     // so force CONVERSE_STREAM_ACTION when the target is an ARN. Purely
     // additive: no matching key leaves model_id + action untouched.
-    let (model_id, action) =
-        match resolve_bedrock_model_override(&state.config.bedrock_model_map, &model_id) {
-            Some((target, is_arn)) => {
-                let effective_action = if is_arn {
-                    CONVERSE_STREAM_ACTION
-                } else {
-                    action
-                };
-                tracing::info!(
-                    event = "bedrock_model_override_applied",
-                    request_id = %request_id,
-                    from_model_id = %model_id,
-                    to_model_id = %target,
-                    is_arn = is_arn,
-                    action = %effective_action,
-                    "bedrock invoke-streaming: applied HEADROOM_BEDROCK_MODEL_MAP override"
-                );
-                (target, effective_action)
-            }
-            None => (model_id, action),
+    let (model_id, action) = apply_streaming_model_override(
+        &state.config.bedrock_model_map,
+        model_id,
+        action,
+        &request_id,
+    );
+
+    let upstream_url =
+        match build_streaming_upstream_url(&state, &model_id, &uri, action, &request_id) {
+            Ok(u) => u,
+            Err(resp) => return resp,
         };
 
-    let upstream_url = match build_bedrock_streaming_upstream(&state, &model_id, &uri, action) {
-        Ok(u) => u,
+    // 3. Resolve credentials. No silent fallback.
+    let creds = match resolve_streaming_credentials(&state, &model_id, &request_id) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    // 4. Build the headers we sign + forward.
+    let outbound_headers = match sign_streaming_request(
+        &headers,
+        &upstream_url,
+        &state.config.bedrock_region,
+        creds.as_ref(),
+        &outbound_body,
+        &request_id,
+        &model_id,
+        &method,
+    ) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+
+    // 5. Forward.
+    let upstream_resp = match send_streaming_request(
+        &state,
+        method,
+        &upstream_url,
+        outbound_headers,
+        outbound_body,
+        &request_id,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // 6. Decide output mode, translate if asked, and finish.
+    finish_streaming_response(
+        upstream_resp,
+        seam,
+        request_id,
+        model_id,
+        upstream_url,
+        &headers,
+        &state,
+    )
+}
+
+/// Resolve the Bedrock streaming action from the inbound path.
+/// Extracted from `handle_invoke_streaming` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::result_large_err)]
+fn resolve_streaming_action(uri: &Uri, request_id: &str) -> Result<&'static str, Response> {
+    match extract_streaming_action(uri.path()) {
+        Some(a) => Ok(a),
+        None => {
+            tracing::error!(
+                event = "bedrock_streaming_action_invalid",
+                request_id = %request_id,
+                path = %uri.path(),
+                "bedrock invoke-streaming: unrecognized streaming action path"
+            );
+            Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "bedrock_streaming_action_invalid",
+                "Unsupported Bedrock streaming action path",
+            ))
+        }
+    }
+}
+
+/// Operator override (HEADROOM_BEDROCK_MODEL_MAP): redirect the inbound
+/// model_id to a pinned target. ARN targets must use the converse route
+/// (the invoke route rejects ARNs with HTTP 400), so force
+/// CONVERSE_STREAM_ACTION then. Purely additive: no matching key leaves
+/// model_id + action untouched.
+/// Extracted from `handle_invoke_streaming` without behavior change.
+fn apply_streaming_model_override(
+    model_map: &std::collections::HashMap<String, String>,
+    model_id: String,
+    action: &'static str,
+    request_id: &str,
+) -> (String, &'static str) {
+    // Operator override (HEADROOM_BEDROCK_MODEL_MAP): redirect the
+    // inbound model_id to a pinned target — e.g. a per-user application
+    // inference profile ARN for cost attribution. ARN targets must use
+    // the converse route (the invoke route rejects ARNs with HTTP 400),
+    // so force CONVERSE_STREAM_ACTION when the target is an ARN. Purely
+    // additive: no matching key leaves model_id + action untouched.
+    match resolve_bedrock_model_override(model_map, &model_id) {
+        Some((target, is_arn)) => {
+            let effective_action = if is_arn {
+                CONVERSE_STREAM_ACTION
+            } else {
+                action
+            };
+            tracing::info!(
+                event = "bedrock_model_override_applied",
+                request_id = %request_id,
+                from_model_id = %model_id,
+                to_model_id = %target,
+                is_arn = is_arn,
+                action = %effective_action,
+                "bedrock invoke-streaming: applied HEADROOM_BEDROCK_MODEL_MAP override"
+            );
+            (target, effective_action)
+        }
+        None => (model_id, action),
+    }
+}
+
+/// Build the Bedrock streaming upstream URL.
+/// Extracted from `handle_invoke_streaming` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::result_large_err)]
+fn build_streaming_upstream_url(
+    state: &AppState,
+    model_id: &str,
+    uri: &Uri,
+    action: &str,
+    request_id: &str,
+) -> Result<url::Url, Response> {
+    match build_bedrock_streaming_upstream(state, model_id, uri, action) {
+        Ok(u) => Ok(u),
         Err(msg) => {
             tracing::error!(
                 event = "bedrock_endpoint_invalid",
@@ -232,17 +339,29 @@ pub async fn handle_invoke_streaming(
                 error = %msg,
                 "bedrock invoke-streaming: failed to construct upstream URL"
             );
-            return error_response(
+            Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_endpoint_invalid",
                 &msg,
-            );
+            ))
         }
-    };
+    }
+}
 
-    // 3. Resolve credentials. No silent fallback.
-    let creds = match state.bedrock_credentials.as_ref() {
-        Some(c) => c.clone(),
+/// Resolve AWS credentials. No silent fallback: refuse to forward unsigned.
+/// Extracted from `handle_invoke_streaming` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::result_large_err)]
+fn resolve_streaming_credentials(
+    state: &AppState,
+    model_id: &str,
+    request_id: &str,
+) -> Result<std::sync::Arc<aws_credential_types::Credentials>, Response> {
+    match state.bedrock_credentials.as_ref() {
+        Some(c) => Ok(c.clone()),
         None => {
             tracing::warn!(
                 event = "bedrock_credentials_missing",
@@ -250,16 +369,34 @@ pub async fn handle_invoke_streaming(
                 model_id = %model_id,
                 "bedrock invoke-streaming: refusing to forward without AWS credentials"
             );
-            return error_response(
+            Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_credentials_missing",
                 "AWS credentials not configured; refusing to forward unsigned",
-            );
+            ))
         }
-    };
+    }
+}
 
-    // 4. Build the headers we sign + forward.
-    let extra_signed: Vec<(String, String)> = collect_signed_headers(&headers, &upstream_url);
+/// Sign the request (SigV4) and build the outbound header map.
+/// Extracted from `handle_invoke_streaming` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+fn sign_streaming_request(
+    headers: &HeaderMap,
+    upstream_url: &url::Url,
+    region: &str,
+    credentials: &aws_credential_types::Credentials,
+    outbound_body: &Bytes,
+    request_id: &str,
+    model_id: &str,
+    method: &Method,
+) -> Result<HeaderMap, Response> {
+    let extra_signed: Vec<(String, String)> = collect_signed_headers(headers, upstream_url);
     let extra_signed_refs: Vec<(&str, &str)> = extra_signed
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -267,10 +404,10 @@ pub async fn handle_invoke_streaming(
 
     let sign_inputs = SigningInputs {
         method: method.as_str(),
-        url: &upstream_url,
-        region: &state.config.bedrock_region,
-        credentials: creds.as_ref(),
-        body: &outbound_body,
+        url: upstream_url,
+        region,
+        credentials,
+        body: outbound_body,
         extra_signed_headers: &extra_signed_refs,
         time: SystemTime::now(),
     };
@@ -284,11 +421,11 @@ pub async fn handle_invoke_streaming(
                 error = %e,
                 "bedrock invoke-streaming: SigV4 signing failed"
             );
-            return error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_sigv4_failed",
                 &e.to_string(),
-            );
+            ));
         }
     };
 
@@ -310,8 +447,20 @@ pub async fn handle_invoke_streaming(
             outbound_headers.insert(n, v);
         }
     }
+    Ok(outbound_headers)
+}
 
-    // 5. Forward.
+/// Convert the method, send upstream, and map transport failures
+/// (timeouts become 504 so the client retries).
+/// Extracted from `handle_invoke_streaming` without behavior change.
+async fn send_streaming_request(
+    state: &AppState,
+    method: Method,
+    upstream_url: &url::Url,
+    headers: HeaderMap,
+    body: Bytes,
+    request_id: &str,
+) -> Result<reqwest::Response, Response> {
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,
         Err(e) => {
@@ -321,24 +470,23 @@ pub async fn handle_invoke_streaming(
                 error = %e,
                 "bedrock invoke-streaming: invalid HTTP method"
             );
-            return error_response(
+            return Err(error_response(
                 StatusCode::BAD_REQUEST,
                 "bedrock_invalid_method",
                 &e.to_string(),
-            );
+            ));
         }
     };
 
-    let upstream_resp = state
+    match state
         .client
         .request(reqwest_method, upstream_url.clone())
-        .headers(outbound_headers)
-        .body(outbound_body.clone())
+        .headers(headers)
+        .body(body)
         .send()
-        .await;
-
-    let upstream_resp = match upstream_resp {
-        Ok(r) => r,
+        .await
+    {
+        Ok(r) => Ok(r),
         Err(e) => {
             tracing::warn!(
                 event = "bedrock_upstream_error",
@@ -351,10 +499,27 @@ pub async fn handle_invoke_streaming(
             } else {
                 StatusCode::BAD_GATEWAY
             };
-            return error_response(status, "bedrock_upstream_error", &e.to_string());
+            Err(error_response(
+                status,
+                "bedrock_upstream_error",
+                &e.to_string(),
+            ))
         }
-    };
+    }
+}
 
+/// Decide the output mode from the client's `Accept` header, translate to
+/// SSE when asked, and finish the response (restoring redaction).
+/// Extracted from `handle_invoke_streaming` without behavior change.
+fn finish_streaming_response(
+    upstream_resp: reqwest::Response,
+    seam: Option<crate::redact::Seam>,
+    request_id: String,
+    model_id: String,
+    upstream_url: url::Url,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Response {
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_content_type = upstream_resp
@@ -363,9 +528,9 @@ pub async fn handle_invoke_streaming(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // 6. Decide output mode based on the client's `Accept` header.
+    // Decide output mode based on the client's `Accept` header.
     let accept_values = OutputMode::default_eventstream_accept_values();
-    let output_mode = OutputMode::from_accept(&headers, &accept_values);
+    let output_mode = OutputMode::from_accept(headers, &accept_values);
 
     // If upstream is NOT vnd.amazon.eventstream (e.g. it returned an
     // application/json error), forward verbatim regardless of Accept.
@@ -450,7 +615,7 @@ pub async fn handle_invoke_streaming(
                 state.config.bedrock_validate_eventstream_crc,
                 request_id.clone(),
                 model_id.clone(),
-                region.clone(),
+                state.config.bedrock_region.clone(),
             );
             let translated = tee_to_anthropic_state(translated, request_id.clone());
             let body_out = Body::from_stream(crate::proxy::track_streaming(translated));
@@ -788,24 +953,7 @@ async fn run_anthropic_state_machine(
     while let Some(chunk) = rx.recv().await {
         framer.push(&chunk);
         while let Some(ev_result) = framer.next_event() {
-            match ev_result {
-                Ok(ev) => {
-                    if let Err(e) = state.apply(ev) {
-                        tracing::warn!(
-                            request_id = %request_id,
-                            error = %e,
-                            "bedrock translated stream: anthropic state-machine apply error"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        error = %e,
-                        "bedrock translated stream: sse framer error"
-                    );
-                }
-            }
+            apply_translated_event(&mut state, ev_result, &request_id);
         }
     }
     tracing::info!(
@@ -819,6 +967,33 @@ async fn run_anthropic_state_machine(
         blocks = state.blocks.len(),
         "bedrock translated stream: closed"
     );
+}
+
+/// Apply one translated SSE event to the telemetry state machine.
+/// Extracted from `run_anthropic_state_machine` without behavior change.
+fn apply_translated_event(
+    state: &mut crate::sse::anthropic::AnthropicStreamState,
+    ev_result: Result<crate::sse::framing::SseEvent, crate::sse::framing::FramingError>,
+    request_id: &str,
+) {
+    match ev_result {
+        Ok(ev) => {
+            if let Err(e) = state.apply(ev) {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    "bedrock translated stream: anthropic state-machine apply error"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %e,
+                "bedrock translated stream: sse framer error"
+            );
+        }
+    }
 }
 
 /// True when the content-type is `application/vnd.amazon.eventstream`
@@ -942,6 +1117,19 @@ fn run_anthropic_compression(
         "/bedrock/invoke-with-response-stream",
         request_id,
     );
+    report_bedrock_compression_outcome(outcome, body, parsed_envelope, request_id)
+}
+
+/// Log the compression outcome and select the bytes to forward.
+/// Extracted from `run_anthropic_compression` without behavior change.
+fn report_bedrock_compression_outcome(
+    outcome: AnthropicOutcome,
+    body: &Bytes,
+    parsed_envelope: bool,
+    request_id: &str,
+) -> Bytes {
+    use crate::bedrock::envelope::BedrockEnvelope;
+
     match outcome {
         AnthropicOutcome::NoCompression => body.clone(),
         AnthropicOutcome::Passthrough { reason } => {

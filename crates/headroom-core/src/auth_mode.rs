@@ -119,11 +119,40 @@ const SUBSCRIPTION_UA_PREFIXES: &[&str] = &[
 /// `str::split('.').count()`. Bench at
 /// `crates/headroom-core/benches/auth_mode.rs` asserts <10us / call.
 pub fn classify(headers: &HeaderMap) -> AuthMode {
+    if let Some(mode) = classify_by_user_agent(headers) {
+        return mode;
+    }
+    if let Some(mode) = classify_by_authorization(headers) {
+        return mode;
+    }
+
+    // ── Vendor-specific API-key headers ──────────────────────────
+    // Anthropic API-key style. Direct PAYG; same compression policy
+    // as a `Bearer sk-ant-api...`.
+    if headers.contains_key("x-api-key") {
+        return AuthMode::Payg;
+    }
+    // Gemini API key. Same PAYG semantics.
+    if headers.contains_key("x-goog-api-key") {
+        return AuthMode::Payg;
+    }
+
+    // ── Default ──────────────────────────────────────────────────
+    // Anything else: assume PAYG. Misclassifying a non-PAYG client
+    // as PAYG only over-compresses; under-compressing a PAYG client
+    // would leave money on the table, which is worse for the
+    // OSS-default user.
+    AuthMode::Payg
+}
+
+/// Subscription clients identify by UA prefix; this is the most
+/// specific signal because the same OAuth token shape appears in
+/// both Claude Pro (web) and Claude Code (CLI), and only the UA
+/// tells them apart. Read once, lowercase once. `None` means no
+/// subscription signal — keep classifying.
+/// Extracted from `classify` without behavior change.
+fn classify_by_user_agent(headers: &HeaderMap) -> Option<AuthMode> {
     // ── User-Agent ───────────────────────────────────────────────
-    // Subscription clients identify by UA prefix; this is the most
-    // specific signal because the same OAuth token shape appears in
-    // both Claude Pro (web) and Claude Code (CLI), and only the UA
-    // tells them apart. Read once, lowercase once.
     let ua_owned = match headers.get("user-agent") {
         Some(value) => match value.to_str() {
             Ok(s) => s.to_ascii_lowercase(),
@@ -141,9 +170,16 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
         .iter()
         .any(|prefix| ua_owned.contains(prefix))
     {
-        return AuthMode::Subscription;
+        return Some(AuthMode::Subscription);
     }
+    None
+}
 
+/// Bearer-token and auth-scheme shapes. `None` means no decisive signal —
+/// keep classifying (unknown bearer shapes fall through to header-based
+/// detection below; ultimately the default).
+/// Extracted from `classify` without behavior change.
+fn classify_by_authorization(headers: &HeaderMap) -> Option<AuthMode> {
     // ── Authorization header ─────────────────────────────────────
     // We must NOT log the value. `to_str` returns an `&str` with the
     // same lifetime as the `HeaderMap`, so no copy here.
@@ -177,16 +213,16 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
         // the OAuth shape FIRST. Real OAuth access tokens are
         // `sk-ant-oat01-...` (version number, no dash after `oat`).
         if token.starts_with("sk-ant-oat") {
-            return AuthMode::OAuth;
+            return Some(AuthMode::OAuth);
         }
         if token.starts_with("sk-ant-api") || token.starts_with("sk-") {
-            return AuthMode::Payg;
+            return Some(AuthMode::Payg);
         }
         // JWT: classic three-segment `header.payload.signature`.
         // We don't validate the JWT — just count dot-separated
         // segments. This catches Codex / Cursor / Copilot OAuth.
         if token.split('.').count() >= 3 {
-            return AuthMode::OAuth;
+            return Some(AuthMode::OAuth);
         }
         // Unknown bearer shape — fall through to header-based
         // detection below; ultimately defaults to Payg.
@@ -197,26 +233,9 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
         // treat all such non-Bearer schemes as passthrough-prefer.
         // The IAM / signed flow is opaque to us; we never strip or
         // mutate the value — just classify the policy.
-        return AuthMode::OAuth;
+        return Some(AuthMode::OAuth);
     }
-
-    // ── Vendor-specific API-key headers ──────────────────────────
-    // Anthropic API-key style. Direct PAYG; same compression policy
-    // as a `Bearer sk-ant-api...`.
-    if headers.contains_key("x-api-key") {
-        return AuthMode::Payg;
-    }
-    // Gemini API key. Same PAYG semantics.
-    if headers.contains_key("x-goog-api-key") {
-        return AuthMode::Payg;
-    }
-
-    // ── Default ──────────────────────────────────────────────────
-    // Anything else: assume PAYG. Misclassifying a non-PAYG client
-    // as PAYG only over-compresses; under-compressing a PAYG client
-    // would leave money on the table, which is worse for the
-    // OSS-default user.
-    AuthMode::Payg
+    None
 }
 
 #[cfg(test)]

@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn does_not_exceed_ceiling() {
-        let state = run(&vec![Signal::TooMuch; 30], 4);
+        let state = run(&[Signal::TooMuch; 30], 4);
         assert_eq!(state.level, 4);
     }
 
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn does_not_go_below_floor() {
-        let state = run(&vec![Signal::TooLittle; 10], 2);
+        let state = run(&[Signal::TooLittle; 10], 2);
         assert_eq!(state.level, 1);
     }
 

@@ -309,35 +309,20 @@ pub(crate) fn restore_codex_additional_tools_body(
     }
 }
 
-/// Axum POST handler for `/v1/responses`. Buffers the body, stitches
-/// a fresh `Request<Body>` together, and forwards via
-/// [`forward_http`]. Compression dispatch + SSE telemetry is handled
-/// inside `forward_http`'s shared gate (PR-C1 + PR-C2 + PR-C3).
-pub async fn handle_responses(
-    State(state): State<AppState>,
-    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    // Rate-limit gate: check before buffering the body.
-    if let Some(rejected) = super::chat_completions::check_rate_limit(&state, &headers) {
-        return rejected;
-    }
-
-    // PR-C4: streaming pipeline confirmation. When the client asks
-    // for SSE, log a structured breadcrumb so dashboards can confirm
-    // the streaming pipeline is engaged (the SSE framer +
-    // ResponseState machine in `forward_http`'s tee). The
-    // `enable_responses_streaming` switch is honoured here — when
-    // disabled, we still forward but emit a distinct event so the
-    // operator sees the rollback take effect.
-    //
-    // Why log INFO (not WARN)? PR-C3 used WARN as a "this path is
-    // half-built" signal. PR-C4 wires the streaming state machine
-    // through, so the previous WARN is no longer accurate.
-    if accepts_sse(&headers) {
+/// PR-C4: streaming pipeline confirmation. When the client asks
+/// for SSE, log a structured breadcrumb so dashboards can confirm
+/// the streaming pipeline is engaged (the SSE framer +
+/// ResponseState machine in `forward_http`'s tee). The
+/// `enable_responses_streaming` switch is honoured here — when
+/// disabled, we still forward but emit a distinct event so the
+/// operator sees the rollback take effect.
+///
+/// Why log INFO (not WARN)? PR-C3 used WARN as a "this path is
+/// half-built" signal. PR-C4 wires the streaming state machine
+/// through, so the previous WARN is no longer accurate.
+/// Extracted from `handle_responses` without behavior change.
+fn note_streaming_pipeline(state: &AppState, headers: &HeaderMap, method: &Method, uri: &Uri) {
+    if accepts_sse(headers) {
         if state.config.enable_responses_streaming {
             tracing::info!(
                 event = "responses_streaming_pipeline_active",
@@ -357,21 +342,24 @@ pub async fn handle_responses(
             );
         }
     }
+}
 
-    // Phase G PR-G3: extract the request-side `service_tier` so we
-    // can count tier distribution on the inbound shape too. The
-    // response-side tier (from `response.completed`) is captured by
-    // the SSE state machine at stream-close; this counter increment
-    // pairs them. Body is parsed best-effort; missing/non-JSON
-    // bodies do NOT fabricate a tier — per realignment build-
-    // constraint "no silent fallbacks", we just skip the emit and
-    // log at debug.
-    //
-    // C1 fix: every raw value is validated against the bounded
-    // `service_tier` vocabulary BEFORE being used as a label so a
-    // malicious client cannot blow up label cardinality with
-    // arbitrary strings.
-    if let Some(tier) = extract_request_service_tier(&body) {
+/// Phase G PR-G3: extract the request-side `service_tier` so we
+/// can count tier distribution on the inbound shape too. The
+/// response-side tier (from `response.completed`) is captured by
+/// the SSE state machine at stream-close; this counter increment
+/// pairs them. Body is parsed best-effort; missing/non-JSON
+/// bodies do NOT fabricate a tier — per realignment build-
+/// constraint "no silent fallbacks", we just skip the emit and
+/// log at debug.
+///
+/// C1 fix: every raw value is validated against the bounded
+/// `service_tier` vocabulary BEFORE being used as a label so a
+/// malicious client cannot blow up label cardinality with
+/// arbitrary strings.
+/// Extracted from `handle_responses` without behavior change.
+fn note_request_service_tier(body: &Bytes, headers: &HeaderMap, uri: &Uri) {
+    if let Some(tier) = extract_request_service_tier(body) {
         let request_id_for_metric = headers
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
@@ -386,35 +374,53 @@ pub async fn handle_responses(
             "request body had no parseable service_tier; counter not emitted"
         );
     }
+}
 
-    // Reversible redaction seam. No-op when the flag is off, when the body
-    // is not JSON, or when it holds nothing sensitive. Keyed on the
-    // conversation (not the request id) so one turn's placeholders stay
-    // valid — and byte-identical upstream — for the next.
+/// Reversible redaction seam. No-op when the flag is off, when the body
+/// is not JSON, or when it holds nothing sensitive. Keyed on the
+/// conversation (not the request id) so one turn's placeholders stay
+/// valid — and byte-identical upstream — for the next.
+/// Extracted from `handle_responses` without behavior change.
+fn seam_redaction_body(
+    state: &AppState,
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+    body: Bytes,
+) -> (Bytes, Option<crate::redact::Seam>) {
     let session_key = if state.config.redact_sensitive {
         crate::proxy::redact_session_key(
-            &headers,
-            &client_addr,
+            headers,
+            client_addr,
             &body,
             crate::cache_stabilization::drift_detector::ApiKind::OpenAiResponses,
         )
     } else {
-        crate::proxy::ensure_request_id(&headers)
+        crate::proxy::ensure_request_id(headers)
     };
     let gate = crate::redact::RedactGate::new(
         state.config.redact_sensitive,
         &state.redact_store,
         &session_key,
     );
-    let (body, seam) = gate.seam_bytes(body);
+    gate.seam_bytes(body)
+}
 
-    // Reconstruct the Request<Body> shape forward_http expects.
+/// Reconstruct the `Request<Body>` shape `forward_http` expects. `Err` is
+/// the 500 to return when the rebuild itself fails.
+/// Extracted from `handle_responses` without behavior change.
+#[allow(clippy::result_large_err)]
+fn rebuild_forward_request(
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Request<Body>, Response> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(hs) = builder.headers_mut() {
         *hs = headers;
     }
-    let req = match builder.body(Body::from(body)) {
-        Ok(r) => r,
+    match builder.body(Body::from(body)) {
+        Ok(r) => Ok(r),
         Err(e) => {
             tracing::error!(
                 event = "handler_error",
@@ -422,11 +428,42 @@ pub async fn handle_responses(
                 error = %e,
                 "failed to reconstruct request from buffered body"
             );
-            return Response::builder()
+            Err(Response::builder()
                 .status(http::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from("internal handler error"))
-                .expect("static response");
+                .expect("static response"))
         }
+    }
+}
+
+/// Axum POST handler for `/v1/responses`. Buffers the body, stitches
+/// a fresh `Request<Body>` together, and forwards via
+/// [`forward_http`]. Compression dispatch + SSE telemetry is handled
+/// inside `forward_http`'s shared gate (PR-C1 + PR-C2 + PR-C3).
+pub async fn handle_responses(
+    State(state): State<AppState>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Rate-limit gate: check before buffering the body.
+    if let Some(rejected) = super::chat_completions::check_rate_limit(&state, &headers) {
+        return rejected;
+    }
+
+    note_streaming_pipeline(&state, &headers, &method, &uri);
+
+    note_request_service_tier(&body, &headers, &uri);
+
+    // Reversible redaction seam.
+    let (body, seam) = seam_redaction_body(&state, &headers, &client_addr, body);
+
+    // Reconstruct the Request<Body> shape forward_http expects.
+    let req = match rebuild_forward_request(method, uri, headers, body) {
+        Ok(r) => r,
+        Err(response) => return response,
     };
 
     let response = forward_http(state, client_addr, req)

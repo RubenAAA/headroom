@@ -153,29 +153,38 @@ struct Inner {
 }
 
 impl Inner {
-    /// One reconcile pass. Returns true if it rewrote settings.json.
-    fn tick(&mut self) -> bool {
+    /// Read and parse settings.json through the freshness guard chain:
+    /// metadata → mtime-change check → read → parse → mark processed →
+    /// object shape. Returns the object plus its `env` table. Any
+    /// transient failure returns `None` for a retry next tick.
+    /// Extracted from `tick` without behavior change.
+    fn read_settings(
+        &self,
+    ) -> Option<(
+        serde_json::Map<String, Value>,
+        serde_json::Map<String, Value>,
+    )> {
         let mtime_ns = match std::fs::metadata(&self.path) {
             Ok(m) => m_modified_ns(&m),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-            Err(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return None,
         };
 
         {
             let last = self.last_mtime_ns.lock().unwrap();
             if *last == Some(mtime_ns) {
-                return false;
+                return None;
             }
         }
 
         let content = match std::fs::read_to_string(&self.path) {
             Ok(c) => c,
-            Err(_) => return false, // transient read failure; retry next tick
+            Err(_) => return None, // transient read failure; retry next tick
         };
 
         let data: Value = match serde_json::from_str(&content) {
             Ok(v) => v,
-            Err(_) => return false, // transient parse failure; retry next tick
+            Err(_) => return None, // transient parse failure; retry next tick
         };
 
         // Read succeeded: mark this mtime processed.
@@ -185,8 +194,8 @@ impl Inner {
         }
 
         let obj = match data.as_object() {
-            Some(o) => o,
-            None => return false,
+            Some(o) => o.clone(),
+            None => return None,
         };
 
         let env = obj
@@ -194,6 +203,51 @@ impl Inner {
             .and_then(|e| e.as_object())
             .cloned()
             .unwrap_or_default();
+        Some((obj, env))
+    }
+
+    /// Point Claude at the proxy, preserving the rest of settings.json.
+    /// Extracted from `tick` without behavior change.
+    fn point_at_proxy(
+        &self,
+        obj: &serde_json::Map<String, Value>,
+        env: &serde_json::Map<String, Value>,
+    ) {
+        let mut new_env = env.clone();
+        new_env.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            Value::String(self.proxy_url.clone()),
+        );
+        let mut new_data = obj.clone();
+        new_data.insert("env".into(), Value::Object(new_env));
+        self.atomic_write(&Value::Object(new_data));
+    }
+
+    /// Empty / official: cc-switch wrote {"env": {}} (Claude Official,
+    /// OAuth). When routing official, capture the default upstream and
+    /// point Claude at us. Returns true if it rewrote settings.json.
+    /// Extracted from `tick` without behavior change.
+    fn route_official_upstream(
+        &self,
+        obj: &serde_json::Map<String, Value>,
+        env: &serde_json::Map<String, Value>,
+    ) -> bool {
+        if self.route_official {
+            if let Ok(upstream) = Url::parse(&self.default_upstream) {
+                *self.dynamic_upstream.blocking_write() = Some(upstream);
+            }
+            self.point_at_proxy(obj, env);
+            tracing::info!("cc-switch reconciler: official -> route via Headroom");
+            return true;
+        }
+        false
+    }
+
+    /// One reconcile pass. Returns true if it rewrote settings.json.
+    fn tick(&mut self) -> bool {
+        let Some((obj, env)) = self.read_settings() else {
+            return false;
+        };
 
         let url = env
             .get("ANTHROPIC_BASE_URL")
@@ -203,22 +257,7 @@ impl Inner {
 
         // Empty / official: cc-switch wrote {"env": {}} (Claude Official, OAuth).
         if url.is_empty() {
-            if self.route_official {
-                if let Ok(upstream) = Url::parse(&self.default_upstream) {
-                    *self.dynamic_upstream.blocking_write() = Some(upstream);
-                }
-                let mut new_env = env.clone();
-                new_env.insert(
-                    "ANTHROPIC_BASE_URL".into(),
-                    Value::String(self.proxy_url.clone()),
-                );
-                let mut new_data = obj.clone();
-                new_data.insert("env".into(), Value::Object(new_env));
-                self.atomic_write(&Value::Object(new_data));
-                tracing::info!("cc-switch reconciler: official -> route via Headroom");
-                return true;
-            }
-            return false;
+            return self.route_official_upstream(&obj, &env);
         }
 
         // Already pointing at us: nothing to do (loop guard).
@@ -239,14 +278,7 @@ impl Inner {
             }
         };
         *self.dynamic_upstream.blocking_write() = Some(upstream);
-        let mut new_env = env.clone();
-        new_env.insert(
-            "ANTHROPIC_BASE_URL".into(),
-            Value::String(self.proxy_url.clone()),
-        );
-        let mut new_data = obj.clone();
-        new_data.insert("env".into(), Value::Object(new_env));
-        self.atomic_write(&Value::Object(new_data));
+        self.point_at_proxy(&obj, &env);
         tracing::info!(
             captured_upstream = %url,
             proxy_url = %self.proxy_url,

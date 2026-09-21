@@ -964,24 +964,81 @@ pub fn format_report(report: &PerfReport, cli: Option<&CliFiltering>) -> String 
     let mut lines: Vec<String> = Vec::new();
     let cli_lines = cli_filtering_report_lines(cli);
 
-    if report.perf_records.is_empty() && report.router_records.is_empty() {
-        if !cli_lines.is_empty() {
-            // RTK savings are independent of proxy logs — surface them even
-            // when there is no proxy traffic in the window.
-            lines.push(
-                "No proxy performance data in ~/.headroom/logs/ for this window.".to_string(),
-            );
-            lines.push(String::new());
-            lines.extend(cli_lines);
-        } else {
-            lines.push("No performance data found in ~/.headroom/logs/".to_string());
-            lines.push(String::new());
-            lines.push("Start the proxy to begin collecting data:".to_string());
-            lines.push("  headroom proxy".to_string());
-        }
-        return lines.join("\n");
+    if let Some(text) = empty_report_text(report, &cli_lines) {
+        return text;
     }
 
+    push_header_lines(report, &mut lines);
+    lines.push(String::new());
+
+    let records = &report.perf_records;
+    if !records.is_empty() {
+        push_headline_lines(records, &mut lines);
+        push_per_model_lines(records, &mut lines);
+        lines.push("  * Actual bill savings depend on provider caching behavior".to_string());
+        lines.push(String::new());
+
+        push_cache_lines(records, &mut lines);
+
+        push_overhead_lines(records, &mut lines);
+
+        push_throughput_lines(report, &mut lines);
+
+        push_conversation_size_lines(records, &mut lines);
+    }
+
+    push_transform_lines(report, &mut lines);
+
+    push_router_lines(report, &mut lines);
+
+    push_toin_lines(report, &mut lines);
+
+    let recommendations = generate_recommendations(report);
+    if !recommendations.is_empty() {
+        lines.push("Recommendations".to_string());
+        lines.push("-".repeat(40));
+        for (i, rec) in recommendations.iter().enumerate() {
+            lines.push(format!("  {}. {rec}", i + 1));
+        }
+        lines.push(String::new());
+    }
+
+    lines.extend(cli_lines);
+
+    lines.push(format!(
+        "Log files: {} | Lines parsed: {}",
+        report.log_files_read,
+        commafy(report.total_lines_parsed)
+    ));
+    lines.push(format!("Log dir: {}", log_dir().display()));
+
+    lines.join("\n")
+}
+
+/// Text for a window with no proxy or router traffic. `None` when the report
+/// has traffic to show. Extracted from `format_report` without behavior change.
+fn empty_report_text(report: &PerfReport, cli_lines: &[String]) -> Option<String> {
+    if !report.perf_records.is_empty() || !report.router_records.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    if !cli_lines.is_empty() {
+        // RTK savings are independent of proxy logs — surface them even
+        // when there is no proxy traffic in the window.
+        lines.push("No proxy performance data in ~/.headroom/logs/ for this window.".to_string());
+        lines.push(String::new());
+        lines.extend(cli_lines.iter().cloned());
+    } else {
+        lines.push("No performance data found in ~/.headroom/logs/".to_string());
+        lines.push(String::new());
+        lines.push("Start the proxy to begin collecting data:".to_string());
+        lines.push("  headroom proxy".to_string());
+    }
+    Some(lines.join("\n"))
+}
+
+/// Title plus the window line. Extracted from `format_report` without behavior change.
+fn push_header_lines(report: &PerfReport, lines: &mut Vec<String>) {
     lines.push("Headroom Performance Report".to_string());
     lines.push("=".repeat(60));
     if let Some(hours) = report.requested_hours {
@@ -1007,308 +1064,314 @@ pub fn format_report(report: &PerfReport, cli: Option<&CliFiltering>) -> String 
             ));
         }
     }
-    lines.push(String::new());
+}
 
-    let records = &report.perf_records;
-    if !records.is_empty() {
-        let total_before: i64 = records.iter().map(|r| r.tokens_before).sum();
-        let total_after: i64 = records.iter().map(|r| r.tokens_after).sum();
-        // Headline: message compression plus tool-schema tokens that never
-        // entered context. The denominator moves with the numerator — tool
-        // tokens were never in `tokens_before`.
-        let total_saved: i64 = records.iter().map(|r| r.headline_saved()).sum();
-        let total_tool: i64 = records.iter().map(|r| r.tool_saved).sum();
-        let headline_before: i64 = records.iter().map(|r| r.headline_before()).sum();
-        let pct = if headline_before > 0 {
-            total_saved as f64 / headline_before as f64 * 100.0
+/// Headline request/token/saved counts. Extracted from `format_report` without behavior change.
+fn push_headline_lines(records: &[PerfRecord], lines: &mut Vec<String>) {
+    let total_before: i64 = records.iter().map(|r| r.tokens_before).sum();
+    let total_after: i64 = records.iter().map(|r| r.tokens_after).sum();
+    // Headline: message compression plus tool-schema tokens that never
+    // entered context. The denominator moves with the numerator — tool
+    // tokens were never in `tokens_before`.
+    let total_saved: i64 = records.iter().map(|r| r.headline_saved()).sum();
+    let total_tool: i64 = records.iter().map(|r| r.tool_saved).sum();
+    let headline_before: i64 = records.iter().map(|r| r.headline_before()).sum();
+    let pct = if headline_before > 0 {
+        total_saved as f64 / headline_before as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    lines.push(format!("Requests:     {}", records.len()));
+    lines.push(format!(
+        "Tokens:       {} -> {} ({pct:.1}% reduction)",
+        commafy(total_before),
+        commafy(total_after)
+    ));
+    lines.push(format!("Total saved:  {} tokens", commafy(total_saved)));
+    if total_tool > 0 {
+        let total_msg = total_saved - total_tool;
+        lines.push(format!(
+            "  · messages {} / · tool schemas {}",
+            commafy(total_msg),
+            commafy(total_tool)
+        ));
+    }
+    lines.push(String::new());
+}
+
+/// Per-model savings table. Extracted from `format_report` without behavior change.
+fn push_per_model_lines(records: &[PerfRecord], lines: &mut Vec<String>) {
+    let mut by_model: std::collections::BTreeMap<&str, Vec<&PerfRecord>> = Default::default();
+    for r in records {
+        by_model.entry(r.model.as_str()).or_default().push(r);
+    }
+    lines.push("Per-Model Breakdown".to_string());
+    lines.push("-".repeat(40));
+    for (model, model_recs) in &by_model {
+        let m_saved: i64 = model_recs.iter().map(|r| r.headline_saved()).sum();
+        let m_before: i64 = model_recs.iter().map(|r| r.headline_before()).sum();
+        let m_pct = if m_before > 0 {
+            m_saved as f64 / m_before as f64 * 100.0
         } else {
             0.0
         };
-
-        lines.push(format!("Requests:     {}", records.len()));
+        let list_price = get_list_price(model);
+        let price_str = match list_price {
+            Some(p) => format!("${p:.2}/MTok"),
+            None => "unknown".to_string(),
+        };
+        let est_str = match list_price {
+            Some(p) => format!("  ~${:.2} at list price", m_saved as f64 * p / 1_000_000.0),
+            None => String::new(),
+        };
         lines.push(format!(
-            "Tokens:       {} -> {} ({pct:.1}% reduction)",
-            commafy(total_before),
-            commafy(total_after)
+            "  {model}: {} reqs, {} tokens saved ({m_pct:.0}%), list price {price_str}{est_str}",
+            model_recs.len(),
+            commafy(m_saved)
         ));
-        lines.push(format!("Total saved:  {} tokens", commafy(total_saved)));
-        if total_tool > 0 {
-            let total_msg = total_saved - total_tool;
-            lines.push(format!(
-                "  · messages {} / · tool schemas {}",
-                commafy(total_msg),
-                commafy(total_tool)
-            ));
-        }
-        lines.push(String::new());
+    }
+}
 
-        let mut by_model: std::collections::BTreeMap<&str, Vec<&PerfRecord>> = Default::default();
-        for r in records {
-            by_model.entry(r.model.as_str()).or_default().push(r);
-        }
-        lines.push("Per-Model Breakdown".to_string());
-        lines.push("-".repeat(40));
-        for (model, model_recs) in &by_model {
-            let m_saved: i64 = model_recs.iter().map(|r| r.headline_saved()).sum();
-            let m_before: i64 = model_recs.iter().map(|r| r.headline_before()).sum();
-            let m_pct = if m_before > 0 {
-                m_saved as f64 / m_before as f64 * 100.0
-            } else {
-                0.0
-            };
-            let list_price = get_list_price(model);
-            let price_str = match list_price {
-                Some(p) => format!("${p:.2}/MTok"),
-                None => "unknown".to_string(),
-            };
-            let est_str = match list_price {
-                Some(p) => format!("  ~${:.2} at list price", m_saved as f64 * p / 1_000_000.0),
-                None => String::new(),
-            };
-            lines.push(format!(
-                "  {model}: {} reqs, {} tokens saved ({m_pct:.0}%), list price {price_str}{est_str}",
-                model_recs.len(),
-                commafy(m_saved)
-            ));
-        }
-        lines.push("  * Actual bill savings depend on provider caching behavior".to_string());
-        lines.push(String::new());
+/// Cache hit-rate section. Extracted from `format_report` without behavior change.
+fn push_cache_lines(records: &[PerfRecord], lines: &mut Vec<String>) {
+    let cache_records: Vec<&PerfRecord> = records
+        .iter()
+        .filter(|r| r.cache_read + r.cache_write > 0)
+        .collect();
+    if cache_records.is_empty() {
+        return;
+    }
+    lines.push("Cache Performance".to_string());
+    lines.push("-".repeat(40));
+    let total_cr: i64 = cache_records.iter().map(|r| r.cache_read).sum();
+    let total_cw: i64 = cache_records.iter().map(|r| r.cache_write).sum();
+    let total_cache = total_cr + total_cw;
+    let hit_pct = if total_cache > 0 {
+        total_cr as f64 / total_cache as f64 * 100.0
+    } else {
+        0.0
+    };
+    lines.push(format!("  Cache read:    {} tokens", commafy(total_cr)));
+    lines.push(format!("  Cache write:   {} tokens", commafy(total_cw)));
+    lines.push(format!("  Hit rate:      {hit_pct:.1}%"));
 
-        let cache_records: Vec<&PerfRecord> = records
-            .iter()
-            .filter(|r| r.cache_read + r.cache_write > 0)
-            .collect();
-        if !cache_records.is_empty() {
-            lines.push("Cache Performance".to_string());
-            lines.push("-".repeat(40));
-            let total_cr: i64 = cache_records.iter().map(|r| r.cache_read).sum();
-            let total_cw: i64 = cache_records.iter().map(|r| r.cache_write).sum();
-            let total_cache = total_cr + total_cw;
-            let hit_pct = if total_cache > 0 {
-                total_cr as f64 / total_cache as f64 * 100.0
-            } else {
-                0.0
-            };
-            lines.push(format!("  Cache read:    {} tokens", commafy(total_cr)));
-            lines.push(format!("  Cache write:   {} tokens", commafy(total_cw)));
-            lines.push(format!("  Hit rate:      {hit_pct:.1}%"));
-
-            let unstable = cache_records
-                .iter()
-                .filter(|r| r.cache_write > r.cache_read * 2)
-                .count();
-            if unstable > 0 {
-                lines.push(format!(
-                    "  Unstable:      {unstable}/{} requests had cache_write > 2x cache_read",
-                    cache_records.len()
-                ));
-            }
-
-            if cache_records.len() >= 10 {
-                let first5 = &cache_records[..5];
-                let last5 = &cache_records[cache_records.len() - 5..];
-                let first5_cr: i64 = first5.iter().map(|r| r.cache_read).sum();
-                let first5_cw: i64 = first5.iter().map(|r| r.cache_write).sum();
-                let last5_cr: i64 = last5.iter().map(|r| r.cache_read).sum();
-                let last5_cw: i64 = last5.iter().map(|r| r.cache_write).sum();
-                lines.push(format!(
-                    "  First 5 avg:   read={} write={}",
-                    commafy(first5_cr / 5),
-                    commafy(first5_cw / 5)
-                ));
-                lines.push(format!(
-                    "  Last 5 avg:    read={} write={}",
-                    commafy(last5_cr / 5),
-                    commafy(last5_cw / 5)
-                ));
-                if last5_cr > first5_cr * 2 {
-                    lines.push("  -> Cache stabilizing over conversation lifetime".to_string());
-                } else if first5_cw > first5_cr * 3 {
-                    lines.push(
-                        "  ! Early turns have poor cache hits — compression decisions may be \
-                         flipping"
-                            .to_string(),
-                    );
-                }
-            }
-            lines.push(String::new());
-        }
-
-        let opt_times: Vec<f64> = records
-            .iter()
-            .filter(|r| r.optimization_ms > 0.0)
-            .map(|r| r.optimization_ms)
-            .collect();
-        if !opt_times.is_empty() {
-            let avg_opt = opt_times.iter().sum::<f64>() / opt_times.len() as f64;
-            let max_opt = opt_times.iter().cloned().fold(f64::MIN, f64::max);
-            lines.push("Optimization Overhead".to_string());
-            lines.push("-".repeat(40));
-            lines.push(format!("  Average:  {avg_opt:.0}ms"));
-            lines.push(format!("  Max:      {max_opt:.0}ms"));
-            let slow = opt_times.iter().filter(|t| **t > 500.0).count();
-            if slow > 0 {
-                lines.push(format!("  >500ms:   {slow} requests"));
-            }
-            lines.push(String::new());
-        }
-
-        let tp = calculate_throughput(report);
-        let (rolling, current) = (&tp.rolling, &tp.current);
-        if rolling.input_wall_clock > 0.0 || rolling.input_active_p50 > 0.0 {
-            lines.push("Throughput".to_string());
-            lines.push("-".repeat(40));
-            lines.push(format!(
-                "  Input (wall-clock):   {:.1} tok/s (current: {:.1} tok/s)",
-                rolling.input_wall_clock, current.input_wall_clock
-            ));
-            lines.push(format!(
-                "  Input (active p50/95): {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
-                rolling.input_active_p50,
-                rolling.input_active_p95,
-                current.input_active_p50,
-                current.input_active_p95
-            ));
-            if rolling.compression_p50 > 0.0 {
-                lines.push(format!(
-                    "  Compression (p50/95):  {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
-                    rolling.compression_p50,
-                    rolling.compression_p95,
-                    current.compression_p50,
-                    current.compression_p95
-                ));
-            }
-            lines.push(format!(
-                "  Forward (p50/95):      {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
-                rolling.forward_p50, rolling.forward_p95, current.forward_p50, current.forward_p95
-            ));
-            if rolling.generation_p50 > 0.0 {
-                lines.push(format!(
-                    "  Generation (p50/95):   {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
-                    rolling.generation_p50,
-                    rolling.generation_p95,
-                    current.generation_p50,
-                    current.generation_p95
-                ));
-            }
-            lines.push(String::new());
-        }
-
-        let msg_counts: Vec<i64> = records
-            .iter()
-            .filter(|r| r.num_messages > 0)
-            .map(|r| r.num_messages)
-            .collect();
-        if !msg_counts.is_empty() {
-            lines.push("Conversation Size".to_string());
-            lines.push("-".repeat(40));
-            lines.push(format!("  Min msgs:  {}", msg_counts.iter().min().unwrap()));
-            lines.push(format!("  Max msgs:  {}", msg_counts.iter().max().unwrap()));
-            lines.push(format!(
-                "  Avg msgs:  {}",
-                msg_counts.iter().sum::<i64>() / msg_counts.len() as i64
-            ));
-            lines.push(String::new());
-        }
+    let unstable = cache_records
+        .iter()
+        .filter(|r| r.cache_write > r.cache_read * 2)
+        .count();
+    if unstable > 0 {
+        lines.push(format!(
+            "  Unstable:      {unstable}/{} requests had cache_write > 2x cache_read",
+            cache_records.len()
+        ));
     }
 
-    if !report.transform_records.is_empty() {
-        lines.push("Transform Effectiveness".to_string());
-        lines.push("-".repeat(40));
-        let mut by_name: HashMap<&str, Vec<&TransformRecord>> = HashMap::new();
-        for tr in &report.transform_records {
-            by_name.entry(tr.name.as_str()).or_default().push(tr);
-        }
-        let mut entries: Vec<(&str, Vec<&TransformRecord>)> = by_name.into_iter().collect();
-        entries.sort_by_key(|(_, recs)| -recs.iter().map(|r| r.tokens_saved).sum::<i64>());
-        for (name, recs) in entries {
-            let total_s: i64 = recs.iter().map(|r| r.tokens_saved).sum();
-            let total_b: i64 = recs.iter().map(|r| r.tokens_before).sum();
-            let avg_pct = if total_b > 0 {
-                total_s as f64 / total_b as f64 * 100.0
-            } else {
-                0.0
-            };
-            lines.push(format!(
-                "  {name}: {avg_pct:.1}% avg reduction, {} uses, {} saved",
-                recs.len(),
-                commafy(total_s)
-            ));
-        }
-        lines.push(String::new());
-    }
-
-    if !report.router_records.is_empty() {
-        lines.push("Content Router Routing".to_string());
-        lines.push("-".repeat(40));
-        let total_compressed: i64 = report.router_records.iter().map(|r| r.compressed).sum();
-        let total_excluded: i64 = report.router_records.iter().map(|r| r.excluded).sum();
-        let total_skipped: i64 = report.router_records.iter().map(|r| r.skipped).sum();
-        let total_unchanged: i64 = report.router_records.iter().map(|r| r.unchanged).sum();
-        let total_all = total_compressed + total_excluded + total_skipped + total_unchanged;
-        if total_all > 0 {
-            let share = |n: i64| n as f64 / total_all as f64 * 100.0;
-            lines.push(format!(
-                "  Compressed:  {total_compressed} ({:.0}%)",
-                share(total_compressed)
-            ));
-            lines.push(format!(
-                "  Excluded:    {total_excluded} ({:.0}%) — Read/Glob outputs",
-                share(total_excluded)
-            ));
-            lines.push(format!(
-                "  Skipped:     {total_skipped} ({:.0}%) — <50 words",
-                share(total_skipped)
-            ));
-            lines.push(format!(
-                "  Unchanged:   {total_unchanged} ({:.0}%) — ratio too high",
-                share(total_unchanged)
-            ));
-        }
-        if total_excluded > total_compressed * 3 {
+    if cache_records.len() >= 10 {
+        let first5 = &cache_records[..5];
+        let last5 = &cache_records[cache_records.len() - 5..];
+        let first5_cr: i64 = first5.iter().map(|r| r.cache_read).sum();
+        let first5_cw: i64 = first5.iter().map(|r| r.cache_write).sum();
+        let last5_cr: i64 = last5.iter().map(|r| r.cache_read).sum();
+        let last5_cw: i64 = last5.iter().map(|r| r.cache_write).sum();
+        lines.push(format!(
+            "  First 5 avg:   read={} write={}",
+            commafy(first5_cr / 5),
+            commafy(first5_cw / 5)
+        ));
+        lines.push(format!(
+            "  Last 5 avg:    read={} write={}",
+            commafy(last5_cr / 5),
+            commafy(last5_cw / 5)
+        ));
+        if last5_cr > first5_cr * 2 {
+            lines.push("  -> Cache stabilizing over conversation lifetime".to_string());
+        } else if first5_cw > first5_cr * 3 {
             lines.push(
-                "  ! Excluded tools dominate — consider compressing stale Read outputs".to_string(),
+                "  ! Early turns have poor cache hits — compression decisions may be \
+                 flipping"
+                    .to_string(),
             );
         }
-        lines.push(String::new());
     }
+    lines.push(String::new());
+}
 
-    if let Some(latest) = report.toin_records.last() {
-        lines.push("TOIN Learning".to_string());
+/// Optimization overhead section. Extracted from `format_report` without behavior change.
+fn push_overhead_lines(records: &[PerfRecord], lines: &mut Vec<String>) {
+    let opt_times: Vec<f64> = records
+        .iter()
+        .filter(|r| r.optimization_ms > 0.0)
+        .map(|r| r.optimization_ms)
+        .collect();
+    if opt_times.is_empty() {
+        return;
+    }
+    let avg_opt = opt_times.iter().sum::<f64>() / opt_times.len() as f64;
+    let max_opt = opt_times.iter().cloned().fold(f64::MIN, f64::max);
+    lines.push("Optimization Overhead".to_string());
+    lines.push("-".repeat(40));
+    lines.push(format!("  Average:  {avg_opt:.0}ms"));
+    lines.push(format!("  Max:      {max_opt:.0}ms"));
+    let slow = opt_times.iter().filter(|t| **t > 500.0).count();
+    if slow > 0 {
+        lines.push(format!("  >500ms:   {slow} requests"));
+    }
+    lines.push(String::new());
+}
+
+/// Throughput section. Extracted from `format_report` without behavior change.
+fn push_throughput_lines(report: &PerfReport, lines: &mut Vec<String>) {
+    let tp = calculate_throughput(report);
+    let (rolling, current) = (&tp.rolling, &tp.current);
+    if rolling.input_wall_clock > 0.0 || rolling.input_active_p50 > 0.0 {
+        lines.push("Throughput".to_string());
         lines.push("-".repeat(40));
-        lines.push(format!("  Patterns:     {}", latest.patterns));
-        lines.push(format!("  Compressions: {}", commafy(latest.compressions)));
         lines.push(format!(
-            "  Retrievals:   {} ({}%)",
-            latest.retrievals,
-            fmt_py_float(latest.retrieval_rate)
+            "  Input (wall-clock):   {:.1} tok/s (current: {:.1} tok/s)",
+            rolling.input_wall_clock, current.input_wall_clock
         ));
-        if latest.retrieval_rate == 0.0 && latest.compressions > 100 {
-            lines.push("  ! 0% retrieval rate — TOIN learning but never used".to_string());
+        lines.push(format!(
+            "  Input (active p50/95): {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
+            rolling.input_active_p50,
+            rolling.input_active_p95,
+            current.input_active_p50,
+            current.input_active_p95
+        ));
+        if rolling.compression_p50 > 0.0 {
+            lines.push(format!(
+                "  Compression (p50/95):  {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
+                rolling.compression_p50,
+                rolling.compression_p95,
+                current.compression_p50,
+                current.compression_p95
+            ));
+        }
+        lines.push(format!(
+            "  Forward (p50/95):      {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
+            rolling.forward_p50, rolling.forward_p95, current.forward_p50, current.forward_p95
+        ));
+        if rolling.generation_p50 > 0.0 {
+            lines.push(format!(
+                "  Generation (p50/95):   {:.1} / {:.1} tok/s (current: {:.1} / {:.1} tok/s)",
+                rolling.generation_p50,
+                rolling.generation_p95,
+                current.generation_p50,
+                current.generation_p95
+            ));
         }
         lines.push(String::new());
     }
+}
 
-    let recommendations = generate_recommendations(report);
-    if !recommendations.is_empty() {
-        lines.push("Recommendations".to_string());
-        lines.push("-".repeat(40));
-        for (i, rec) in recommendations.iter().enumerate() {
-            lines.push(format!("  {}. {rec}", i + 1));
-        }
-        lines.push(String::new());
+/// Conversation-size section. Extracted from `format_report` without behavior change.
+fn push_conversation_size_lines(records: &[PerfRecord], lines: &mut Vec<String>) {
+    let msg_counts: Vec<i64> = records
+        .iter()
+        .filter(|r| r.num_messages > 0)
+        .map(|r| r.num_messages)
+        .collect();
+    if msg_counts.is_empty() {
+        return;
     }
-
-    lines.extend(cli_lines);
-
+    lines.push("Conversation Size".to_string());
+    lines.push("-".repeat(40));
+    lines.push(format!("  Min msgs:  {}", msg_counts.iter().min().unwrap()));
+    lines.push(format!("  Max msgs:  {}", msg_counts.iter().max().unwrap()));
     lines.push(format!(
-        "Log files: {} | Lines parsed: {}",
-        report.log_files_read,
-        commafy(report.total_lines_parsed)
+        "  Avg msgs:  {}",
+        msg_counts.iter().sum::<i64>() / msg_counts.len() as i64
     ));
-    lines.push(format!("Log dir: {}", log_dir().display()));
+    lines.push(String::new());
+}
 
-    lines.join("\n")
+/// Per-transform effectiveness table. Extracted from `format_report` without behavior change.
+fn push_transform_lines(report: &PerfReport, lines: &mut Vec<String>) {
+    if report.transform_records.is_empty() {
+        return;
+    }
+    lines.push("Transform Effectiveness".to_string());
+    lines.push("-".repeat(40));
+    let mut by_name: HashMap<&str, Vec<&TransformRecord>> = HashMap::new();
+    for tr in &report.transform_records {
+        by_name.entry(tr.name.as_str()).or_default().push(tr);
+    }
+    let mut entries: Vec<(&str, Vec<&TransformRecord>)> = by_name.into_iter().collect();
+    entries.sort_by_key(|(_, recs)| -recs.iter().map(|r| r.tokens_saved).sum::<i64>());
+    for (name, recs) in entries {
+        let total_s: i64 = recs.iter().map(|r| r.tokens_saved).sum();
+        let total_b: i64 = recs.iter().map(|r| r.tokens_before).sum();
+        let avg_pct = if total_b > 0 {
+            total_s as f64 / total_b as f64 * 100.0
+        } else {
+            0.0
+        };
+        lines.push(format!(
+            "  {name}: {avg_pct:.1}% avg reduction, {} uses, {} saved",
+            recs.len(),
+            commafy(total_s)
+        ));
+    }
+    lines.push(String::new());
+}
+
+/// Content-router routing section. Extracted from `format_report` without behavior change.
+fn push_router_lines(report: &PerfReport, lines: &mut Vec<String>) {
+    if report.router_records.is_empty() {
+        return;
+    }
+    lines.push("Content Router Routing".to_string());
+    lines.push("-".repeat(40));
+    let total_compressed: i64 = report.router_records.iter().map(|r| r.compressed).sum();
+    let total_excluded: i64 = report.router_records.iter().map(|r| r.excluded).sum();
+    let total_skipped: i64 = report.router_records.iter().map(|r| r.skipped).sum();
+    let total_unchanged: i64 = report.router_records.iter().map(|r| r.unchanged).sum();
+    let total_all = total_compressed + total_excluded + total_skipped + total_unchanged;
+    if total_all > 0 {
+        let share = |n: i64| n as f64 / total_all as f64 * 100.0;
+        lines.push(format!(
+            "  Compressed:  {total_compressed} ({:.0}%)",
+            share(total_compressed)
+        ));
+        lines.push(format!(
+            "  Excluded:    {total_excluded} ({:.0}%) — Read/Glob outputs",
+            share(total_excluded)
+        ));
+        lines.push(format!(
+            "  Skipped:     {total_skipped} ({:.0}%) — <50 words",
+            share(total_skipped)
+        ));
+        lines.push(format!(
+            "  Unchanged:   {total_unchanged} ({:.0}%) — ratio too high",
+            share(total_unchanged)
+        ));
+    }
+    if total_excluded > total_compressed * 3 {
+        lines.push(
+            "  ! Excluded tools dominate — consider compressing stale Read outputs".to_string(),
+        );
+    }
+    lines.push(String::new());
+}
+
+/// TOIN learning section. Extracted from `format_report` without behavior change.
+fn push_toin_lines(report: &PerfReport, lines: &mut Vec<String>) {
+    let Some(latest) = report.toin_records.last() else {
+        return;
+    };
+    lines.push("TOIN Learning".to_string());
+    lines.push("-".repeat(40));
+    lines.push(format!("  Patterns:     {}", latest.patterns));
+    lines.push(format!("  Compressions: {}", commafy(latest.compressions)));
+    lines.push(format!(
+        "  Retrievals:   {} ({}%)",
+        latest.retrievals,
+        fmt_py_float(latest.retrieval_rate)
+    ));
+    if latest.retrieval_rate == 0.0 && latest.compressions > 100 {
+        lines.push("  ! 0% retrieval rate — TOIN learning but never used".to_string());
+    }
+    lines.push(String::new());
 }
 
 // ---------------------------------------------------------------------------

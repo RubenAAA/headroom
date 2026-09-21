@@ -198,6 +198,9 @@ pub fn custom_tool_call_commands(script: &str) -> Vec<String> {
             Some(Ok(v)) => v,
             _ => continue,
         };
+        // Skip past the consumed object so an `exec_command(` substring
+        // inside a `cmd` string value is not rescanned as a call site.
+        pos += brace + stream.byte_offset();
         let command = tool_call_command_text(&args);
         if !command.is_empty() {
             commands.push(command);
@@ -429,5 +432,16 @@ mod tests {
         assert!(custom_tool_call_commands("tools.exec_command({cmd: 'cat f'})").is_empty());
         // No exec_command call at all.
         assert!(custom_tool_call_commands(r#"{"command": "cat f"}"#).is_empty());
+    }
+
+    #[test]
+    fn custom_tool_call_commands_skips_substrings_inside_parsed_args() {
+        // An `exec_command(` substring inside an already-parsed `cmd`
+        // value must not be rescanned as a second call site.
+        let script = r#"tools.exec_command({"cmd": "echo exec_command(hi)"})"#;
+        assert_eq!(
+            custom_tool_call_commands(script),
+            vec!["echo exec_command(hi)".to_string()]
+        );
     }
 }

@@ -311,7 +311,7 @@ mod tests {
         ]))
         .active());
         // Nameless entries are skipped, not fatal.
-        assert!(ToolAlias::derive(Some(&vec![json!({"description": "x"})])).active() == false);
+        assert!(!ToolAlias::derive(Some(&vec![json!({"description": "x"})])).active());
     }
 
     #[test]

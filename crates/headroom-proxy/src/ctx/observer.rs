@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
 
-use headroom_core::ctx::{NewEvent, SessionsStore};
+use headroom_core::ctx::{NewEvent, PrefixTurn, SessionsStore};
 use serde_json::Value;
 
 use super::extract::{self, ExtractedEvent};
@@ -261,20 +261,45 @@ fn should_report(n: u64) -> bool {
 fn process(store: &SessionsStore, parsed: &Value, session_key: &str) {
     let conv_id = identity::conversation_key(parsed, session_key);
 
-    let prev = match store.last_prefix(&conv_id) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(event = "ctx_last_prefix_failed", conv = %conv_id, error = %e);
-            None
-        }
-    };
+    let prev = load_prev_prefix(store, &conv_id);
 
     let class = identity::classify(prev.as_ref(), parsed);
     let from_index = identity::extract_from_index(class, prev.as_ref());
     let events = extract::extract_new_messages(parsed, from_index);
 
-    for ev in &events {
-        match store.insert_event(&to_new_event(&conv_id, ev)) {
+    persist_events(store, &conv_id, &events);
+
+    let turn_n = identity::message_count(parsed);
+    let hash = identity::prefix_hash(parsed, turn_n);
+    record_turn_state(store, session_key, &conv_id, turn_n, &hash);
+
+    tracing::debug!(
+        event = "ctx_observed",
+        conv = %conv_id,
+        class = ?class,
+        turn = turn_n,
+        new_events = events.len(),
+    );
+}
+
+/// Previous turn's prefix, if the store can provide one. Failures are logged
+/// loudly and swallowed so capture never crashes the worker.
+/// Extracted from `process` without behavior change.
+fn load_prev_prefix(store: &SessionsStore, conv_id: &str) -> Option<PrefixTurn> {
+    match store.last_prefix(conv_id) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(event = "ctx_last_prefix_failed", conv = %conv_id, error = %e);
+            None
+        }
+    }
+}
+
+/// Insert fresh events, counting replays as dedupes.
+/// Extracted from `process` without behavior change.
+fn persist_events(store: &SessionsStore, conv_id: &str, events: &[ExtractedEvent]) {
+    for ev in events {
+        match store.insert_event(&to_new_event(conv_id, ev)) {
             Ok(ins) if ins.duplicate => {
                 crate::observability::ctx_metrics::observe_event_deduped();
                 tracing::debug!(
@@ -291,26 +316,27 @@ fn process(store: &SessionsStore, parsed: &Value, session_key: &str) {
             }
         }
     }
+}
 
-    let turn_n = identity::message_count(parsed);
-    let hash = identity::prefix_hash(parsed, turn_n);
-    if let Err(e) = store.record_prefix(&conv_id, turn_n, &hash) {
+/// Record this turn's prefix hash and link the conversation to its client
+/// session key for later resume/compaction.
+/// Extracted from `process` without behavior change.
+fn record_turn_state(
+    store: &SessionsStore,
+    session_key: &str,
+    conv_id: &str,
+    turn_n: u64,
+    hash: &str,
+) {
+    if let Err(e) = store.record_prefix(conv_id, turn_n, hash) {
         tracing::warn!(event = "ctx_record_prefix_failed", conv = %conv_id, error = %e);
     }
 
     // CTX-4: index this conversation under its client session key so a later
     // resume/compaction request can link back to it.
-    if let Err(e) = store.record_conversation(session_key, &conv_id) {
+    if let Err(e) = store.record_conversation(session_key, conv_id) {
         tracing::warn!(event = "ctx_record_conversation_failed", conv = %conv_id, error = %e);
     }
-
-    tracing::debug!(
-        event = "ctx_observed",
-        conv = %conv_id,
-        class = ?class,
-        turn = turn_n,
-        new_events = events.len(),
-    );
 }
 
 /// Map an extractor output to a sessions-DB row, grouped under the conversation

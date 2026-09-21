@@ -140,16 +140,21 @@ impl ProjectResolver {
             }
         }
 
-        // Tier 3: CLI override
-        if let Some(ref override_root) = ctx.project_root_override {
-            if let Some(ident) = Self::identity_from_cwd(override_root) {
+        // Tier 3: parse system prompt for cwd
+        if let Some(sys_cwd) = Self::extract_cwd_from_system_prompt(&ctx.system_prompt) {
+            if let Some(ident) = Self::identity_from_cwd(&sys_cwd) {
                 return Some(ident);
             }
         }
 
-        // Tier 4: parse system prompt for cwd
-        if let Some(sys_cwd) = Self::extract_cwd_from_system_prompt(&ctx.system_prompt) {
-            if let Some(ident) = Self::identity_from_cwd(&sys_cwd) {
+        // Tier 4: CLI override, last resort. `--memory-project-root` documents
+        // itself as catching requests that carry *no* cwd metadata ("no header,
+        // no system-prompt cwd"), so it has to sit below the system-prompt tier.
+        // Above it, one operator setting would capture every project's turns —
+        // the cross-project bleed this module exists to prevent — because only
+        // a request with an explicit header could escape it.
+        if let Some(ref override_root) = ctx.project_root_override {
+            if let Some(ident) = Self::identity_from_cwd(override_root) {
                 return Some(ident);
             }
         }
@@ -547,6 +552,47 @@ mod tests {
         assert!(root.starts_with("shopkit-"), "unexpected key {root}");
     }
 
+    /// `--memory-project-root` is a last resort, not an override. A request
+    /// that names its own cwd in the system prompt must keep its own project,
+    /// or one operator setting would pull every repo's turns into one
+    /// workspace — exactly the bleed this module exists to stop.
+    #[test]
+    fn system_prompt_cwd_outranks_the_cli_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = tmp.path().join("its-own-repo");
+        let fallback = tmp.path().join("operator-fallback");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        let resolve = |system_prompt: &str| {
+            ProjectResolver::resolve(&RequestContext {
+                headers: HashMap::new(),
+                system_prompt: system_prompt.to_string(),
+                base_user_id: "default".to_string(),
+                project_root_override: Some(fallback.display().to_string()),
+            })
+            .expect("resolves")
+            .0
+        };
+        let with_cwd = resolve(&format!("Primary working directory: {}", own.display()));
+        let without_cwd = resolve("You are a helpful assistant.");
+        assert_ne!(
+            with_cwd, without_cwd,
+            "a request naming its own cwd must not collapse into the override"
+        );
+        assert_eq!(
+            without_cwd,
+            ProjectResolver::resolve(&RequestContext {
+                headers: HashMap::new(),
+                system_prompt: String::new(),
+                base_user_id: "default".to_string(),
+                project_root_override: Some(fallback.display().to_string()),
+            })
+            .expect("resolves")
+            .0,
+            "a request with no cwd anywhere must land on the override"
+        );
+    }
+
     /// A directory with no repository above it is still its own project —
     /// separation is the point, and collapsing everything into one pool would
     /// be worse than a spare partition.
@@ -842,9 +888,9 @@ mod tests {
             ..Default::default()
         };
         let router = BackendRouter::new(config);
-        router.touch(&Path::new("/a"));
-        router.touch(&Path::new("/b"));
-        router.touch(&Path::new("/c"));
+        router.touch(Path::new("/a"));
+        router.touch(Path::new("/b"));
+        router.touch(Path::new("/c"));
         let open = router.open_backends();
         assert_eq!(open.len(), 2);
         assert!(!open.contains(&PathBuf::from("/a"))); // evicted

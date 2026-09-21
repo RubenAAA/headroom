@@ -428,15 +428,23 @@ impl CtxStore {
     /// round-trip byte-exact and multi-chunk ones drift by the join.
     ///
     /// `None` when no source carries the hash, or when it carries no chunks.
+    ///
+    /// A pre-`content_hash` DB opened read-only (the cold-tier sweep never
+    /// migrates) has no such column: that is a miss, not a failure.
     pub fn content_by_hash(&self, content_hash: &str) -> rusqlite::Result<Option<String>> {
         let conn = self.conn();
-        let source_id: Option<i64> = conn
+        let source_id: Option<i64> = match conn
             .query_row(
                 "SELECT id FROM sources WHERE content_hash = ?1 ORDER BY id DESC LIMIT 1",
                 params![content_hash],
                 |row| row.get(0),
             )
-            .optional()?;
+            .optional()
+        {
+            Ok(v) => v,
+            Err(e) if is_missing_column(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let Some(source_id) = source_id else {
             return Ok(None);
         };
@@ -877,6 +885,20 @@ enum FtsTable {
     Trigram,
 }
 
+/// True for a missing-`content_hash` failure against a pre-migration DB.
+///
+/// `open_read_only` never migrates, so the cold-tier sweep can meet a
+/// `sources` table with no `content_hash` column. Callers treat that as a
+/// miss, not a failure.
+///
+/// Named rather than matching any `no such column`: `fts_search` selects
+/// several columns, and a typo in one of those must surface as an error
+/// instead of quietly reading as "no hits".
+fn is_missing_column(err: &rusqlite::Error) -> bool {
+    let text = err.to_string();
+    text.contains("no such column") && text.contains("content_hash")
+}
+
 /// One FTS5 table query with `bm25(<table>, 5.0, 1.0)` ranking and the
 /// optional source/content_type filters. Ports `search` / `searchTrigram`
 /// (store.ts:1122 / :1158) in "OR" mode (the mode `#rrfSearch` uses).
@@ -924,7 +946,12 @@ fn fts_search(
     sql.push_str(&format!(" ORDER BY rank LIMIT ?{next_idx}"));
     vals.push(rusqlite::types::Value::Integer(limit as i64));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        // Pre-`content_hash` DB opened read-only: no column, no hits.
+        Err(e) if is_missing_column(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
     let rows = stmt.query_map(params_from_iter(vals.iter()), |row| {
         Ok(SearchHit {
             title: row.get(0)?,

@@ -8,6 +8,20 @@ use bytes::Bytes;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// Spark keeps Headroom's proxy tools, but its hidden continuation path must
+/// not inherit the full Claude-side loop. A long chain is invisible to
+/// Claude Code and can hold the session even when every upstream call is a
+/// successful HTTP 200.
+const ZEN_PROXY_TOOL_ROUND_CAP: usize = 2;
+const ZEN_PROXY_TOOL_ALTERNATION_CAP: usize = 2;
+
+fn is_zen_route(url: &str) -> bool {
+    url::Url::parse(url).ok().is_some_and(|url| {
+        crate::routed::quirks::classify_upstream(&url, false)
+            == crate::routed::quirks::UpstreamKind::OpenCodeZen
+    })
+}
+
 /// Resolve `headroom_retrieve` on a buffered routed reply, in the upstream's
 /// own shape. Returns the resolved response and the usage of the rounds the
 /// client never saw.
@@ -32,6 +46,7 @@ pub(crate) async fn resolve_routed_ccr(
         Ok(b) => Bytes::from(b),
         Err(_) => return (response.clone(), crate::proxy::CcrRoundUsage::default()),
     };
+    let config = ccr.resolver_config();
     let (resolved, usage) = crate::proxy::handle_ccr_response(
         &body,
         &ccr.request_body,
@@ -39,7 +54,7 @@ pub(crate) async fn resolve_routed_ccr(
         &ccr.client,
         ccr.store.as_ref(),
         ccr.stores.as_ref(),
-        &ccr.config,
+        &config,
         &ccr.request_id,
         &ccr.headers,
         provider,
@@ -65,7 +80,12 @@ pub(crate) async fn resolve_routed_proxy_tools(
 ) -> (Value, crate::proxy::CcrRoundUsage) {
     let mut body = response.clone();
     let mut rounds = crate::proxy::CcrRoundUsage::default();
-    for _ in 0..crate::proxy::MAX_RESOLVER_ALTERNATIONS {
+    let alternations = if is_zen_route(&ccr.upstream_url) {
+        ZEN_PROXY_TOOL_ALTERNATION_CAP
+    } else {
+        crate::proxy::MAX_RESOLVER_ALTERNATIONS
+    };
+    for _ in 0..alternations {
         let before = body.clone();
 
         let (next, ccr_rounds) = resolve_routed_ccr(&body, ccr).await;
@@ -111,13 +131,14 @@ pub(crate) async fn resolve_routed_memory(
         Ok(b) => Bytes::from(b),
         Err(_) => return (response.clone(), crate::proxy::CcrRoundUsage::default()),
     };
+    let config = ccr.resolver_config();
     let (resolved, usage) = crate::proxy::handle_memory_response(
         &body,
         &ccr.request_body,
         &url,
         &ccr.client,
         memory,
-        &ccr.config,
+        &config,
         &ccr.request_id,
         &ccr.headers,
         provider,
@@ -162,6 +183,21 @@ pub(crate) struct RoutedCcr {
 }
 
 impl RoutedCcr {
+    /// Use a bounded copy of the config for Spark's hidden proxy-tool work.
+    /// The normal Claude path keeps the operator's configured budget; this
+    /// only stops a routed Spark turn from waiting through the global six
+    /// round budget before its client-visible turn can finish.
+    pub(crate) fn resolver_config(&self) -> Arc<crate::config::Config> {
+        if !is_zen_route(&self.upstream_url)
+            || self.config.ccr_max_retrieval_rounds <= ZEN_PROXY_TOOL_ROUND_CAP
+        {
+            return self.config.clone();
+        }
+        let mut config = (*self.config).clone();
+        config.ccr_max_retrieval_rounds = ZEN_PROXY_TOOL_ROUND_CAP;
+        Arc::new(config)
+    }
+
     /// Assemble what the routed response arms need to resolve the model's
     /// tool calls. Built at the dispatch point because the request shape, URL
     /// and headers are only in scope there.

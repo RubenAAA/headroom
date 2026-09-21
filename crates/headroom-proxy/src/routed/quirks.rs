@@ -228,27 +228,27 @@ impl UpstreamKind {
 pub(crate) fn inject_opencode_headers(
     headers: &mut HeaderMap,
     request_id: &str,
-    session_key: Option<&str>,
+    _session_key: Option<&str>,
 ) {
     let session = resolve_zen_session(request_id);
     if let Ok(v) = http::HeaderValue::from_str(&session) {
         headers.insert(http::HeaderName::from_static("x-opencode-session"), v);
     }
-    if let Ok(v) = http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
+    if let Ok(v) = http::HeaderValue::from_str(&mint_zen_request_id(request_id)) {
         headers.insert(http::HeaderName::from_static("x-opencode-request"), v);
     }
     headers.insert(
         http::HeaderName::from_static("x-opencode-client"),
-        http::HeaderValue::from_static("opencode"),
+        http::HeaderValue::from_static("cli"),
     );
     headers.insert(
         http::header::USER_AGENT,
-        http::HeaderValue::from_static("opencode/1.18.29"),
+        http::HeaderValue::from_static(
+            "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+        ),
     );
-    if let Some(sk) = session_key {
-        // Best-effort project correlation; not required for the gate, but
-        // mirrors what OpenCode sends (`x-opencode-project`).
-        if let Ok(v) = http::HeaderValue::from_str(sk) {
+    if let Some(project) = resolve_zen_project(&session) {
+        if let Ok(v) = http::HeaderValue::from_str(&project) {
             headers.insert(http::HeaderName::from_static("x-opencode-project"), v);
         }
     }
@@ -256,12 +256,12 @@ pub(crate) fn inject_opencode_headers(
 
 /// Mint a fresh `x-opencode-request` id on headers that already carry one.
 ///
-/// The real OpenCode CLI mints one UUID per POST. Proxy continuations
+/// The real OpenCode CLI mints one message id per POST. Proxy continuations
 /// (CCR/memory rounds) re-send with the forward path's header map, which
 /// replays the original request's UUID; on 2026-09-17 eleven zen-route
 /// continuations 403'd (`FreeTierError`) while same-shape originals passed.
-/// UUID replay is unproven as the trigger (25 same-path continuations passed
-/// with replayed UUIDs), but per-POST freshness is client-faithful and costs
+/// message-id replay is unproven as the trigger (25 same-path continuations
+/// passed with replayed ids), but per-POST freshness is client-faithful and costs
 /// nothing, so continuations refresh before every send. Presence-gated: maps
 /// without the header (non-zen routes) are untouched. Session, client, UA
 /// and project headers are preserved — only the request nonce rotates.
@@ -271,7 +271,7 @@ pub(crate) fn refresh_zen_request_id(headers: &mut HeaderMap) -> bool {
     if !headers.contains_key(REQ) {
         return false;
     }
-    match http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
+    match http::HeaderValue::from_str(&mint_zen_request_id(&uuid::Uuid::new_v4().to_string())) {
         Ok(v) => {
             headers.insert(http::HeaderName::from_static(REQ), v);
             true
@@ -299,6 +299,10 @@ const ZEN_SESSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_sec
 /// Explicit override for the Zen session header, read per resolution (not
 /// cached) so an operator can rotate it without restarting the proxy.
 const ZEN_SESSION_ENV: &str = "HEADROOM_ZEN_SESSION";
+
+/// Explicit override for the OpenCode project header. When unset, the
+/// project id is read alongside the selected session from OpenCode's DB.
+const ZEN_PROJECT_ENV: &str = "HEADROOM_ZEN_PROJECT";
 
 /// Resolve the `x-opencode-session` value for a Zen request.
 ///
@@ -342,15 +346,17 @@ pub(crate) fn resolve_zen_session(request_id: &str) -> String {
 /// The legacy minted id, kept as the last-resort fallback. Well-formed
 /// but unknown to Zen, so the free tier gates it — better than no
 /// header (which fails closed as `MissingSessionID`), worse than a real
-/// id. Derive from the request id so retries within one logical request
-/// share the session but different requests don't collide.
+/// id. The sha256 of the request id, so the shape is always `ses_<64hex>`
+/// regardless of the request-id format (UUID in production, `req-N` in
+/// tests), retries within one logical request share the session, and
+/// different requests don't collide.
 fn mint_zen_session(request_id: &str) -> String {
-    let raw = request_id.replace('-', "");
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(request_id.as_bytes());
     let mut hex = String::with_capacity(64);
-    while hex.len() < 64 {
-        hex.push_str(&raw);
+    for b in digest {
+        hex.push_str(&format!("{b:02x}"));
     }
-    hex.truncate(64);
     format!("ses_{hex}")
 }
 
@@ -371,10 +377,11 @@ fn cached_zen_session() -> Option<String> {
 }
 
 fn store_cached_zen_session(session: String) {
-    if let Some(lock) = ZEN_SESSION_CACHE.get() {
-        if let Ok(mut guard) = lock.lock() {
-            *guard = (Some(session), std::time::Instant::now());
-        }
+    let lock = ZEN_SESSION_CACHE.get_or_init(|| {
+        std::sync::Mutex::new((None, std::time::Instant::now() - ZEN_SESSION_CACHE_TTL))
+    });
+    if let Ok(mut guard) = lock.lock() {
+        *guard = (Some(session), std::time::Instant::now());
     }
 }
 
@@ -418,6 +425,44 @@ fn read_zen_session_from_db() -> Option<String> {
     } else {
         None
     }
+}
+
+/// Read the OpenCode project id belonging to the selected session. The
+/// Claude metadata `user_id` is not an OpenCode project id, so never use it
+/// as a substitute: Zen now validates this header against the session's
+/// actual project.
+fn resolve_zen_project(session: &str) -> Option<String> {
+    if let Ok(pinned) = std::env::var(ZEN_PROJECT_ENV) {
+        let pinned = pinned.trim().to_string();
+        if !pinned.is_empty() {
+            return Some(pinned);
+        }
+    }
+    let path = zen_session_db_path()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row(
+        "SELECT project_id FROM session WHERE id = ?1",
+        rusqlite::params![session],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .filter(|project| !project.trim().is_empty())
+}
+
+/// OpenCode message ids use the `msg_` prefix and a 25-character opaque
+/// suffix. Derive a stable-looking id from a per-POST nonce; it need not be
+/// persisted locally because Zen only needs the client-shaped request id.
+fn mint_zen_request_id(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(seed.as_bytes());
+    let mut suffix = String::with_capacity(25);
+    for b in digest.iter().take(13) {
+        suffix.push_str(&format!("{b:02x}"));
+    }
+    suffix.truncate(25);
+    format!("msg_{suffix}")
 }
 
 /// Locate the local OpenCode database. `$HEADROOM_OPENCODE_DB` wins when
@@ -729,7 +774,9 @@ mod tests {
 
     #[test]
     fn refresh_zen_request_id_rotates_only_the_nonce() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let _mint = hold_mint_for_test();
+        let prev_project = with_env(ZEN_PROJECT_ENV, Some("proj"));
         let zen_upstream: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
         let zen = classify_upstream(&zen_upstream, false);
         let mut h = HeaderMap::new();
@@ -740,13 +787,13 @@ mod tests {
         assert!(refresh_zen_request_id(&mut h));
         let after = header(&h, "x-opencode-request").expect("still present");
         assert_ne!(before, after, "nonce must rotate");
-        // UUID v4 shape: 36 chars, version nibble `4`.
-        assert_eq!(after.len(), 36);
-        assert_eq!(after.chars().nth(14), Some('4'));
+        assert!(after.starts_with("msg_"));
+        assert_eq!(after.len(), 29);
         // Everything else untouched.
         assert_eq!(header(&h, "x-opencode-session"), Some(session));
-        assert_eq!(header(&h, "x-opencode-client").as_deref(), Some("opencode"));
+        assert_eq!(header(&h, "x-opencode-client").as_deref(), Some("cli"));
         assert_eq!(header(&h, "x-opencode-project").as_deref(), Some("proj"));
+        restore_env(ZEN_PROJECT_ENV, prev_project);
     }
 
     #[test]
@@ -902,10 +949,7 @@ mod tests {
         let mut zh = HeaderMap::new();
         zen.inject_extra_headers(&mut zh, "req-1", None);
         assert!(header(&zh, "x-opencode-session").is_some_and(|s| s.starts_with("ses_")));
-        assert_eq!(
-            header(&zh, "x-opencode-client").as_deref(),
-            Some("opencode")
-        );
+        assert_eq!(header(&zh, "x-opencode-client").as_deref(), Some("cli"));
 
         // Neutral third party: plain endpoint, no extra headers.
         let xai_upstream: url::Url = "https://api.x.ai/v1".parse().unwrap();
@@ -1070,6 +1114,23 @@ mod tests {
         restore_env("HEADROOM_OPENCODE_DB", prev_db);
         restore_env(ZEN_SESSION_ENV, prev_env);
         clear_zen_session_cache();
+    }
+
+    /// Non-UUID request ids (tests use `req-N`) still mint a well-formed
+    /// `ses_<64hex>`: the sha256 derivation never emits non-hex.
+    #[test]
+    fn zen_mint_is_hex_for_non_uuid_request_ids() {
+        for id in ["req-1", "roundtrip-test", ""] {
+            let minted = mint_zen_session(id);
+            assert!(minted.starts_with("ses_"), "{id} -> {minted}");
+            assert_eq!(minted.len(), 4 + 64, "{id} -> {minted}");
+            assert!(
+                minted[4..].chars().all(|c| c.is_ascii_hexdigit()),
+                "{id} -> {minted}"
+            );
+        }
+        assert_eq!(mint_zen_session("req-1"), mint_zen_session("req-1"));
+        assert_ne!(mint_zen_session("req-1"), mint_zen_session("req-2"));
     }
 
     /// The mint guard hands out one mint, then suppresses repeats until

@@ -63,21 +63,8 @@ pub fn compress_openai_chat_request(
     request_id: &str,
     exclude_tools: &[String],
 ) -> Outcome {
-    if matches!(mode, CompressionMode::Off) {
-        tracing::info!(
-            event = "compression_decision",
-            request_id = %request_id,
-            path = "/v1/chat/completions",
-            method = "POST",
-            compression_mode = mode.as_str(),
-            decision = "passthrough",
-            reason = "mode_off",
-            body_bytes = body.len(),
-            "openai chat compression decision"
-        );
-        return Outcome::Passthrough {
-            reason: PassthroughReason::ModeOff,
-        };
+    if let Some(outcome) = mode_off_passthrough(&mode, body, request_id) {
+        return outcome;
     }
 
     // Inspect the body shape only enough to gate. The dispatcher does
@@ -146,81 +133,158 @@ pub fn compress_openai_chat_request(
         model,
         &dispatch_config,
     ) {
-        Ok(LiveZoneOutcome::NoChange { manifest }) => {
-            tracing::info!(
-                event = "compression_decision",
-                request_id = %request_id,
-                path = "/v1/chat/completions",
-                method = "POST",
-                compression_mode = mode.as_str(),
-                decision = "no_change",
-                reason = "no_block_compressed",
-                body_bytes = body.len(),
-                messages_total = manifest.messages_total,
-                latest_user_message_index = ?manifest.latest_user_message_index,
-                live_zone_blocks = manifest.block_outcomes.len(),
-                model = model,
-                "openai chat live-zone dispatch"
-            );
-            if normalization_applied.any() {
-                return Outcome::Compressed {
-                    body: dispatch_body,
-                    tokens_before: 0,
-                    tokens_after: 0,
-                    strategies_applied: normalization_applied.strategies(),
-                    markers_inserted: Vec::new(),
-                    per_strategy_tokens: Vec::new(),
-                };
-            }
-            Outcome::NoCompression
-        }
-        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
-            let mut totals = crate::compression::manifest_totals::aggregate(
-                &manifest,
-                request_id,
-                "/v1/chat/completions",
-            );
-            // Stitch in PR-E1 strategy tags so dashboards see the
-            // tool-array sort separately from live-zone compressors.
-            for strategy in normalization_applied.strategies() {
-                totals.push_strategy(strategy);
-            }
-            let body_bytes_in = body.len();
-            let new_body_bytes = Bytes::copy_from_slice(new_body.get().as_bytes());
-            let body_bytes_out = new_body_bytes.len();
-            tracing::info!(
-                event = "compression_decision",
-                request_id = %request_id,
-                path = "/v1/chat/completions",
-                method = "POST",
-                compression_mode = mode.as_str(),
-                decision = "compressed",
-                reason = "live_zone_blocks_rewritten",
-                body_bytes_in = body_bytes_in,
-                body_bytes_out = body_bytes_out,
-                bytes_freed = body_bytes_in.saturating_sub(body_bytes_out),
-                messages_total = manifest.messages_total,
-                latest_user_message_index = ?manifest.latest_user_message_index,
-                live_zone_blocks = manifest.block_outcomes.len(),
-                live_zone_strategies = ?totals.strategies,
-                live_zone_block_original_bytes = totals.original_bytes,
-                live_zone_block_compressed_bytes = totals.compressed_bytes,
-                live_zone_block_original_tokens = totals.original_tokens,
-                live_zone_block_compressed_tokens = totals.compressed_tokens,
-                had_compressor_error = totals.had_compressor_error,
-                model = model,
-                "openai chat live-zone dispatch"
-            );
-            Outcome::Compressed {
-                body: new_body_bytes,
-                tokens_before: totals.original_tokens,
-                tokens_after: totals.compressed_tokens,
-                strategies_applied: totals.strategies,
-                markers_inserted: Vec::new(),
-                per_strategy_tokens: totals.per_strategy_tokens,
-            }
-        }
-        Err(LiveZoneError::BodyNotJson(_)) => {
+        Ok(LiveZoneOutcome::NoChange { manifest }) => report_openai_no_change(
+            manifest,
+            normalization_applied,
+            dispatch_body,
+            body.len(),
+            &mode,
+            model,
+            request_id,
+        ),
+        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => report_openai_modified(
+            manifest,
+            &new_body,
+            body.len(),
+            &mode,
+            model,
+            request_id,
+            normalization_applied,
+        ),
+        Err(err) => report_openai_dispatch_error(err, &mode, body.len(), request_id),
+    }
+}
+
+/// Mode-off short-circuit: report passthrough without parsing.
+/// Extracted from `compress_openai_chat_request` without behavior change.
+fn mode_off_passthrough(mode: &CompressionMode, body: &Bytes, request_id: &str) -> Option<Outcome> {
+    if !matches!(mode, CompressionMode::Off) {
+        return None;
+    }
+    tracing::info!(
+        event = "compression_decision",
+        request_id = %request_id,
+        path = "/v1/chat/completions",
+        method = "POST",
+        compression_mode = mode.as_str(),
+        decision = "passthrough",
+        reason = "mode_off",
+        body_bytes = body.len(),
+        "openai chat compression decision"
+    );
+    Some(Outcome::Passthrough {
+        reason: PassthroughReason::ModeOff,
+    })
+}
+
+/// Report a no-change dispatch, recovering Phase E byte rewrites when the
+/// normalizer (but not the live zone) mutated the body.
+/// Extracted from `compress_openai_chat_request` without behavior change.
+#[allow(clippy::too_many_arguments)]
+fn report_openai_no_change(
+    manifest: headroom_core::transforms::live_zone::CompressionManifest,
+    normalization_applied: NormalizationApplied,
+    dispatch_body: Bytes,
+    body_len: usize,
+    mode: &CompressionMode,
+    model: &str,
+    request_id: &str,
+) -> Outcome {
+    tracing::info!(
+        event = "compression_decision",
+        request_id = %request_id,
+        path = "/v1/chat/completions",
+        method = "POST",
+        compression_mode = mode.as_str(),
+        decision = "no_change",
+        reason = "no_block_compressed",
+        body_bytes = body_len,
+        messages_total = manifest.messages_total,
+        latest_user_message_index = ?manifest.latest_user_message_index,
+        live_zone_blocks = manifest.block_outcomes.len(),
+        model = model,
+        "openai chat live-zone dispatch"
+    );
+    if normalization_applied.any() {
+        return Outcome::Compressed {
+            body: dispatch_body,
+            tokens_before: 0,
+            tokens_after: 0,
+            strategies_applied: normalization_applied.strategies(),
+            markers_inserted: Vec::new(),
+            per_strategy_tokens: Vec::new(),
+        };
+    }
+    Outcome::NoCompression
+}
+
+/// Report a rewritten live zone with stitched-in normalization tags.
+/// Extracted from `compress_openai_chat_request` without behavior change.
+#[allow(clippy::too_many_arguments)]
+fn report_openai_modified(
+    manifest: headroom_core::transforms::live_zone::CompressionManifest,
+    new_body: &serde_json::value::RawValue,
+    body_len: usize,
+    mode: &CompressionMode,
+    model: &str,
+    request_id: &str,
+    normalization_applied: NormalizationApplied,
+) -> Outcome {
+    let mut totals = crate::compression::manifest_totals::aggregate(
+        &manifest,
+        request_id,
+        "/v1/chat/completions",
+    );
+    // Stitch in PR-E1 strategy tags so dashboards see the
+    // tool-array sort separately from live-zone compressors.
+    for strategy in normalization_applied.strategies() {
+        totals.push_strategy(strategy);
+    }
+    let new_body_bytes = Bytes::copy_from_slice(new_body.get().as_bytes());
+    let body_bytes_out = new_body_bytes.len();
+    tracing::info!(
+        event = "compression_decision",
+        request_id = %request_id,
+        path = "/v1/chat/completions",
+        method = "POST",
+        compression_mode = mode.as_str(),
+        decision = "compressed",
+        reason = "live_zone_blocks_rewritten",
+        body_bytes_in = body_len,
+        body_bytes_out = body_bytes_out,
+        bytes_freed = body_len.saturating_sub(body_bytes_out),
+        messages_total = manifest.messages_total,
+        latest_user_message_index = ?manifest.latest_user_message_index,
+        live_zone_blocks = manifest.block_outcomes.len(),
+        live_zone_strategies = ?totals.strategies,
+        live_zone_block_original_bytes = totals.original_bytes,
+        live_zone_block_compressed_bytes = totals.compressed_bytes,
+        live_zone_block_original_tokens = totals.original_tokens,
+        live_zone_block_compressed_tokens = totals.compressed_tokens,
+        had_compressor_error = totals.had_compressor_error,
+        model = model,
+        "openai chat live-zone dispatch"
+    );
+    Outcome::Compressed {
+        body: new_body_bytes,
+        tokens_before: totals.original_tokens,
+        tokens_after: totals.compressed_tokens,
+        strategies_applied: totals.strategies,
+        markers_inserted: Vec::new(),
+        per_strategy_tokens: totals.per_strategy_tokens,
+    }
+}
+
+/// Report a dispatcher-level failure as passthrough.
+/// Extracted from `compress_openai_chat_request` without behavior change.
+fn report_openai_dispatch_error(
+    err: LiveZoneError,
+    mode: &CompressionMode,
+    body_len: usize,
+    request_id: &str,
+) -> Outcome {
+    match err {
+        LiveZoneError::BodyNotJson(_) => {
             tracing::warn!(
                 event = "compression_decision",
                 request_id = %request_id,
@@ -231,7 +295,7 @@ pub fn compress_openai_chat_request(
                 reason: PassthroughReason::NotJson,
             }
         }
-        Err(LiveZoneError::NoMessagesArray) => {
+        LiveZoneError::NoMessagesArray => {
             tracing::info!(
                 event = "compression_decision",
                 request_id = %request_id,
@@ -240,7 +304,7 @@ pub fn compress_openai_chat_request(
                 compression_mode = mode.as_str(),
                 decision = "passthrough",
                 reason = "no_messages",
-                body_bytes = body.len(),
+                body_bytes = body_len,
                 "openai chat compression decision"
             );
             Outcome::Passthrough {
@@ -291,23 +355,7 @@ fn normalize_tool_definitions_openai_chat(
     auth_mode: RequestAuthMode,
     request_id: &str,
 ) -> (Bytes, NormalizationApplied) {
-    if !matches!(auth_mode, RequestAuthMode::Payg) {
-        tracing::info!(
-            event = "e1_skipped",
-            request_id = %request_id,
-            path = "/v1/chat/completions",
-            reason = "auth_mode",
-            auth_mode = auth_mode.as_str(),
-            "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
-        );
-        tracing::info!(
-            event = "e2_skipped",
-            request_id = %request_id,
-            path = "/v1/chat/completions",
-            reason = "auth_mode",
-            auth_mode = auth_mode.as_str(),
-            "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
-        );
+    if !is_payg_for_normalization_openai(auth_mode, request_id) {
         return (body.clone(), NormalizationApplied::default());
     }
 
@@ -319,17 +367,6 @@ fn normalize_tool_definitions_openai_chat(
     }
 
     let marker_present = any_tool_has_cache_control(tools_in);
-    if marker_present {
-        tracing::info!(
-            event = "e1_skipped",
-            request_id = %request_id,
-            path = "/v1/chat/completions",
-            reason = "marker_present",
-            tool_count = tools_in.len(),
-            "tool-array sort skipped: customer cache_control marker present \
-             on at least one tool; preserving customer-intentional order"
-        );
-    }
 
     let mut working = parsed.clone();
     let tools = working
@@ -337,34 +374,10 @@ fn normalize_tool_definitions_openai_chat(
         .and_then(Value::as_array_mut)
         .expect("tools array verified above");
 
-    let mut applied = NormalizationApplied::default();
-
-    if !marker_present {
-        applied.e1_tool_sort = sort_tools_deterministically(tools);
-        if applied.e1_tool_sort {
-            tracing::info!(
-                event = "e1_applied",
-                request_id = %request_id,
-                path = "/v1/chat/completions",
-                tool_count = tools.len(),
-                "tool-array sort applied: tools reordered alphabetically by name"
-            );
-        }
-    }
-
-    // PR-E2: OpenAI tool schema lives at `tool.function.parameters`.
-    for tool in tools.iter_mut() {
-        let Some(parameters) = tool
-            .get_mut("function")
-            .and_then(|f| f.get_mut("parameters"))
-        else {
-            continue;
-        };
-        // `sort_schema_keys_recursive` reports whether it moved anything,
-        // so no before/after byte-compare is needed. `|=`, not `||`:
-        // every tool must still be visited even after one changed.
-        applied.e2_schema_sort |= sort_schema_keys_recursive(parameters);
-    }
+    let applied = NormalizationApplied {
+        e1_tool_sort: sort_openai_tools_if_unmarked(tools, marker_present, request_id),
+        e2_schema_sort: sort_all_parameters(tools),
+    };
     if applied.e2_schema_sort {
         tracing::info!(
             event = "e2_applied",
@@ -375,6 +388,98 @@ fn normalize_tool_definitions_openai_chat(
         );
     }
 
+    reserialize_normalized_body(working, applied, body, request_id)
+}
+
+/// Auth-mode gate for OpenAI normalization: PAYG-only, like the Anthropic
+/// walker. Returns true when normalization may proceed.
+/// Extracted from `normalize_tool_definitions_openai_chat` without behavior change.
+fn is_payg_for_normalization_openai(auth_mode: RequestAuthMode, request_id: &str) -> bool {
+    if matches!(auth_mode, RequestAuthMode::Payg) {
+        return true;
+    }
+    tracing::info!(
+        event = "e1_skipped",
+        request_id = %request_id,
+        path = "/v1/chat/completions",
+        reason = "auth_mode",
+        auth_mode = auth_mode.as_str(),
+        "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
+    );
+    tracing::info!(
+        event = "e2_skipped",
+        request_id = %request_id,
+        path = "/v1/chat/completions",
+        reason = "auth_mode",
+        auth_mode = auth_mode.as_str(),
+        "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
+    );
+    false
+}
+
+/// PR-E1: sort tools alphabetically unless a `cache_control` marker is
+/// present. Returns whether the sort moved anything.
+/// Extracted from `normalize_tool_definitions_openai_chat` without behavior change.
+fn sort_openai_tools_if_unmarked(
+    tools: &mut [Value],
+    marker_present: bool,
+    request_id: &str,
+) -> bool {
+    if marker_present {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/chat/completions",
+            reason = "marker_present",
+            tool_count = tools.len(),
+            "tool-array sort skipped: customer cache_control marker present \
+             on at least one tool; preserving customer-intentional order"
+        );
+        return false;
+    }
+    let sorted = sort_tools_deterministically(tools);
+    if sorted {
+        tracing::info!(
+            event = "e1_applied",
+            request_id = %request_id,
+            path = "/v1/chat/completions",
+            tool_count = tools.len(),
+            "tool-array sort applied: tools reordered alphabetically by name"
+        );
+    }
+    sorted
+}
+
+/// PR-E2: sort each tool's `function.parameters` keys recursively. Tools
+/// without one are silently skipped. Returns whether anything moved.
+/// Extracted from `normalize_tool_definitions_openai_chat` without behavior change.
+fn sort_all_parameters(tools: &mut [Value]) -> bool {
+    // PR-E2: OpenAI tool schema lives at `tool.function.parameters`.
+    let mut changed = false;
+    for tool in tools.iter_mut() {
+        let Some(parameters) = tool
+            .get_mut("function")
+            .and_then(|f| f.get_mut("parameters"))
+        else {
+            continue;
+        };
+        // `sort_schema_keys_recursive` reports whether it moved anything,
+        // so no before/after byte-compare is needed. `|=`, not `||`:
+        // every tool must still be visited even after one changed.
+        changed |= sort_schema_keys_recursive(parameters);
+    }
+    changed
+}
+
+/// Re-serialize the normalized body, falling back to the original bytes
+/// (and a reset flag set) when serialization fails.
+/// Extracted from `normalize_tool_definitions_openai_chat` without behavior change.
+fn reserialize_normalized_body(
+    working: Value,
+    applied: NormalizationApplied,
+    body: &Bytes,
+    request_id: &str,
+) -> (Bytes, NormalizationApplied) {
     if !applied.any() {
         return (body.clone(), applied);
     }

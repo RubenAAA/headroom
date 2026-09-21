@@ -108,27 +108,15 @@ pub async fn handle_messages(
         Ok(v) => v,
         Err(_) => {
             // Not JSON — can't be a model-routed request, delegate to forward_http.
-            let mut builder = Request::builder().method(method).uri(uri);
-            if let Some(hs) = builder.headers_mut() {
-                *hs = headers;
-            }
-            let req = builder.body(Body::from(body)).expect("valid request");
-            return forward_http(state, client_addr, req)
-                .await
-                .unwrap_or_else(|e| e.into_response());
+            return forward_raw_to_forwarder(state, client_addr, method, uri, headers, body).await;
         }
     };
 
-    // Claude Code's spinner-text sidecar is answered here and goes no further:
-    // it must not reach route matching, the replay store, or the cache tracker,
-    // because the whole point is that it leaves no per-conversation state for
-    // the next real turn to be measured against. See `crate::sidecar`.
-    if crate::sidecar::is_describe_action_sidecar(&parsed) {
-        if let Some(resp) =
-            handle_sidecar(&state, &headers, &client_addr, &uri, &parsed, &request_id).await
-        {
-            return resp;
-        }
+    // Claude Code's spinner-text sidecar is answered here and goes no further.
+    if let Some(resp) =
+        maybe_answer_sidecar(&state, &headers, &client_addr, &uri, &parsed, &request_id).await
+    {
+        return resp;
     }
 
     // Cost-aware model routing (#1706): the same helper the passthrough path
@@ -157,26 +145,12 @@ pub async fn handle_messages(
     let target =
         match crate::handlers::route_resolve::resolve_route(&state.config, &parsed, body_model) {
             crate::handlers::route_resolve::RouteDecision::Cursor { cursor_model } => {
-                let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
+                return dispatch_cursor_route(
+                    state,
                     &headers,
                     &client_addr,
                     &parsed,
-                    crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
-                );
-                // TEMPORARY: source port distinguishes a pipelined follow-up
-                // (same connection) from a concurrent sender (new
-                // connection). Drop once the poll source is identified.
-                tracing::info!(
-                    event = "cursor_route",
-                    from = %client_addr,
                     body_model,
-                    cursor_model = %cursor_model,
-                    "routed to cursor agent"
-                );
-                return crate::cursor::handler::handle(
-                    state,
-                    &parsed,
-                    &session_key,
                     &cursor_model,
                     &request_id,
                 )
@@ -185,28 +159,15 @@ pub async fn handle_messages(
             crate::handlers::route_resolve::RouteDecision::Route { target } => target,
             crate::handlers::route_resolve::RouteDecision::NoMatch => {
                 // No route matched — delegate to standard forwarder.
-                let mut builder = Request::builder().method(method).uri(uri);
-                if let Some(hs) = builder.headers_mut() {
-                    *hs = headers;
-                }
-                let req = match builder.body(Body::from(body)) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!(
-                            event = "handler_error",
-                            handler = "messages_local_model",
-                            error = %e,
-                            "failed to reconstruct request"
-                        );
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Body::from("internal handler error"))
-                            .expect("static response");
-                    }
-                };
-                return forward_http(state, client_addr, req)
-                    .await
-                    .unwrap_or_else(|e| e.into_response());
+                return delegate_unmatched_to_forwarder(
+                    state,
+                    client_addr,
+                    method,
+                    uri,
+                    headers,
+                    body,
+                )
+                .await;
             }
         };
     let RouteTarget {
@@ -217,49 +178,28 @@ pub async fn handle_messages(
     } = target;
 
     let anthropic_target = !translate && target_model.is_some();
-    let auth = if anthropic_target {
-        crate::routed::auth::anthropic_auth_headers(
-            auth_env.as_deref(),
-            &headers,
-            Some(&upstream),
-            &request_id,
-        )
-        .map(|headers| (headers, false))
-    } else {
-        crate::routed::auth::auth_headers(
-            auth_env.as_deref(),
-            &headers,
-            state.config.codex_auth_file.as_deref(),
-            &upstream,
-            &request_id,
-            None,
-        )
-    };
+    let auth = resolve_upstream_auth(
+        &state,
+        auth_env.as_deref(),
+        &headers,
+        &upstream,
+        &request_id,
+        anthropic_target,
+    );
     let (upstream_headers, is_chatgpt_auth) = match auth {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
 
     if !translate {
-        let body = if let Some(target_model) = target_model {
-            let mut parsed = parsed;
-            parsed["model"] = Value::String(target_model);
-            match serde_json::to_vec(&parsed) {
-                Ok(body) => Bytes::from(body),
-                Err(_) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "serialization error")
-                        .into_response();
-                }
-            }
-        } else {
-            body
-        };
-        return handle_passthrough(
+        return serve_untranslated_target(
             &state,
+            parsed,
+            body,
+            target_model,
             &upstream,
             &uri,
             upstream_headers,
-            body,
             body_model,
             &request_id,
             anthropic_target,
@@ -280,7 +220,7 @@ pub async fn handle_messages(
         Ok(prepared) => prepared,
         Err(resp) => return resp,
     };
-    let mut parsed = prepared.parsed;
+    let parsed = prepared.parsed;
 
     let translated = match translate_routed_request(
         &parsed,
@@ -348,45 +288,15 @@ pub async fn handle_messages(
         forwarded_tokens_estimate,
         openai_body_vec.len() as u64,
     );
-    // `build_routed_outcome_context` leaves this `None` because it cannot see
-    // the routing decision; this is the handler that made it. Without it the
-    // `model_route_served` line never fires and the savings ledger has no way
-    // to price what the reroute avoided — the turn books at the free model's
-    // rate and the offload looks like it saved nothing.
-    if let (Some(ctx), Some(from_model)) = (outcome_ctx.as_mut(), identity_model.as_deref()) {
-        ctx.reroute = Some(RerouteOrigin {
-            from_model: from_model.to_string(),
-            to_model: body_model.to_string(),
-        });
-    }
-    // Novel-vs-repeat savings attribution (upstream `427fa76f`): on a
-    // Responses-shape translation the booked per-turn diff is the
-    // conversation's running removed-total, so carry the ledger key. Derived
-    // from the translated body, whose `input` shape the key rules inspect;
-    // identity itself (explicit body ids, session headers) is
-    // transform-stable, so deriving post-translation cannot move the key
-    // mid-conversation the way content-derived identity could. Chat-shape
-    // translations yield `None` by the shape rules and keep per-request
-    // accounting, which is already novel-only there.
-    if let Some(ctx) = outcome_ctx.as_mut() {
-        let session_id = headers
-            .get("conversation_id")
-            .or_else(|| headers.get("session_id"))
-            .or_else(|| headers.get("x-headroom-session-id"))
-            .and_then(|v| v.to_str().ok());
-        ctx.conversation_key =
-            headroom_core::conversation_savings::savings_conversation_key(&openai_body, session_id);
-    }
-    // Hand the response arms the redaction memory whenever the flag is on —
-    // not only when the outbound body had spans. A clean prompt can still
-    // pull secrets mid-turn (memory answers, cold-tier blocks), and the
-    // continuations must redact those too. Empty map snapshots are a
-    // passthrough, so clean turns keep the zero-overhead path.
-    if state.config.redact_sensitive {
-        if let Some(ctx) = outcome_ctx.as_mut() {
-            ctx.redact_store = Some(state.redact_store.clone());
-        }
-    }
+    note_routing_attribution(
+        &mut outcome_ctx,
+        identity_model.as_deref(),
+        &headers,
+        &openai_body,
+        body_model,
+        state.config.redact_sensitive,
+        &state.redact_store,
+    );
 
     let openai_body_bytes = Bytes::from(openai_body_vec);
 
@@ -423,14 +333,7 @@ pub async fn handle_messages(
         ),
         Err(resp) => return resp,
     };
-    if let (Some(ctx), Some(stripped)) = (outcome_ctx.as_mut(), replay_stripped_bytes) {
-        // The 413 retry below re-sent without the replay prefix: the refused
-        // byte count is this smaller body, not the first attempt's.
-        ctx.outbound_bytes = stripped;
-    }
-    if let Some(ctx) = outcome_ctx.as_mut() {
-        ctx.upstream_attempts = i64::from(attempt.max(1));
-    }
+    note_send_outcome(&mut outcome_ctx, replay_stripped_bytes, attempt);
 
     quirks.capture_turn_state(&upstream_resp, session_key.as_deref());
 
@@ -449,6 +352,364 @@ pub async fn handle_messages(
     )
     .await;
 
+    dispatch_upstream_answer(
+        state,
+        client_addr,
+        method,
+        uri,
+        headers,
+        parsed,
+        prepared.redacted,
+        &prepared.redact_session_key,
+        body_model,
+        identity_model,
+        upstream_resp,
+        upstream_status,
+        downstream_is_stream,
+        is_responses,
+        outcome_ctx,
+        ccr,
+        &request_id,
+    )
+    .await
+}
+
+/// Non-JSON bodies can't be model-routed: rebuild the raw request and
+/// delegate to the standard forwarder.
+/// Extracted from `handle_messages` without behavior change.
+async fn forward_raw_to_forwarder(
+    state: AppState,
+    client_addr: SocketAddr,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(hs) = builder.headers_mut() {
+        *hs = headers;
+    }
+    let req = builder.body(Body::from(body)).expect("valid request");
+    forward_http(state, client_addr, req)
+        .await
+        .unwrap_or_else(|e| e.into_response())
+}
+
+/// No route matched: rebuild the raw request and delegate to the standard
+/// forwarder. A rebuild failure (not a send failure) is a 500.
+/// Extracted from `handle_messages` without behavior change.
+async fn delegate_unmatched_to_forwarder(
+    state: AppState,
+    client_addr: SocketAddr,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(hs) = builder.headers_mut() {
+        *hs = headers;
+    }
+    let req = match builder.body(Body::from(body)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                event = "handler_error",
+                handler = "messages_local_model",
+                error = %e,
+                "failed to reconstruct request"
+            );
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal handler error"))
+                .expect("static response");
+        }
+    };
+    forward_http(state, client_addr, req)
+        .await
+        .unwrap_or_else(|e| e.into_response())
+}
+
+/// Claude Code's spinner-text sidecar is answered here and goes no further:
+/// it must not reach route matching, the replay store, or the cache tracker,
+/// because the whole point is that it leaves no per-conversation state for
+/// the next real turn to be measured against. See `crate::sidecar`.
+/// Extracted from `handle_messages` without behavior change.
+async fn maybe_answer_sidecar(
+    state: &AppState,
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+    uri: &Uri,
+    parsed: &Value,
+    request_id: &str,
+) -> Option<Response> {
+    if crate::sidecar::is_describe_action_sidecar(parsed) {
+        return handle_sidecar(state, headers, client_addr, uri, parsed, request_id).await;
+    }
+    None
+}
+
+/// Cursor route: derive the session key and run the Cursor agent CLI.
+/// Extracted from `handle_messages` without behavior change.
+async fn dispatch_cursor_route(
+    state: AppState,
+    headers: &HeaderMap,
+    client_addr: &SocketAddr,
+    parsed: &Value,
+    body_model: &str,
+    cursor_model: &str,
+    request_id: &str,
+) -> Response {
+    let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
+        headers,
+        client_addr,
+        parsed,
+        crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
+    );
+    // TEMPORARY: source port distinguishes a pipelined follow-up
+    // (same connection) from a concurrent sender (new
+    // connection). Drop once the poll source is identified.
+    tracing::info!(
+        event = "cursor_route",
+        from = %client_addr,
+        body_model,
+        cursor_model = %cursor_model,
+        "routed to cursor agent"
+    );
+    crate::cursor::handler::handle(state, parsed, &session_key, cursor_model, request_id).await
+}
+
+/// Upstream auth for the routed turn: Anthropic-key headers for untranslated
+/// Anthropic targets, the shared auth-header builder otherwise. `Err` is the
+/// response to return directly.
+/// Extracted from `handle_messages` without behavior change.
+#[allow(clippy::result_large_err)]
+fn resolve_upstream_auth(
+    state: &AppState,
+    auth_env: Option<&str>,
+    headers: &HeaderMap,
+    upstream: &url::Url,
+    request_id: &str,
+    anthropic_target: bool,
+) -> Result<(HeaderMap, bool), Response> {
+    if anthropic_target {
+        crate::routed::auth::anthropic_auth_headers(auth_env, headers, Some(upstream), request_id)
+            .map(|headers| (headers, false))
+    } else {
+        crate::routed::auth::auth_headers(
+            auth_env,
+            headers,
+            state.config.codex_auth_file.as_deref(),
+            upstream,
+            request_id,
+            None,
+        )
+    }
+}
+
+/// Untranslated route (`translate == false`): optionally rewrite the model id
+/// in place, then serve straight through the passthrough arm.
+/// Extracted from `handle_messages` without behavior change.
+#[allow(clippy::too_many_arguments)]
+async fn serve_untranslated_target(
+    state: &AppState,
+    parsed: Value,
+    body: Bytes,
+    target_model: Option<String>,
+    upstream: &url::Url,
+    uri: &Uri,
+    upstream_headers: HeaderMap,
+    body_model: &str,
+    request_id: &str,
+    anthropic_target: bool,
+) -> Response {
+    let body = if let Some(target_model) = target_model {
+        let mut parsed = parsed;
+        parsed["model"] = Value::String(target_model);
+        match serde_json::to_vec(&parsed) {
+            Ok(body) => Bytes::from(body),
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "serialization error").into_response();
+            }
+        }
+    } else {
+        body
+    };
+    handle_passthrough(
+        state,
+        upstream,
+        uri,
+        upstream_headers,
+        body,
+        body_model,
+        request_id,
+        anthropic_target,
+    )
+    .await
+}
+
+/// Routing attribution on the outcome context: the reroute origin (so the
+/// savings ledger can price what the reroute avoided), the conversation
+/// savings key (Responses shape only), and the redaction memory for
+/// continuations whenever the flag is on.
+/// Extracted from `handle_messages` without behavior change.
+#[allow(clippy::too_many_arguments)]
+fn note_routing_attribution(
+    outcome_ctx: &mut Option<crate::routed::outcome::RoutedOutcomeContext>,
+    identity_model: Option<&str>,
+    headers: &HeaderMap,
+    openai_body: &Value,
+    body_model: &str,
+    redact_sensitive: bool,
+    redact_store: &crate::redact::RedactStore,
+) {
+    // `build_routed_outcome_context` leaves this `None` because it cannot see
+    // the routing decision; this is the handler that made it. Without it the
+    // `model_route_served` line never fires and the savings ledger has no way
+    // to price what the reroute avoided — the turn books at the free model's
+    // rate and the offload looks like it saved nothing.
+    if let (Some(ctx), Some(from_model)) = (outcome_ctx.as_mut(), identity_model) {
+        ctx.reroute = Some(RerouteOrigin {
+            from_model: from_model.to_string(),
+            to_model: body_model.to_string(),
+        });
+    }
+    // Novel-vs-repeat savings attribution (upstream `427fa76f`): on a
+    // Responses-shape translation the booked per-turn diff is the
+    // conversation's running removed-total, so carry the ledger key. Derived
+    // from the translated body, whose `input` shape the key rules inspect;
+    // identity itself (explicit body ids, session headers) is
+    // transform-stable, so deriving post-translation cannot move the key
+    // mid-conversation the way content-derived identity could. Chat-shape
+    // translations yield `None` by the shape rules and keep per-request
+    // accounting, which is already novel-only there.
+    if let Some(ctx) = outcome_ctx.as_mut() {
+        let session_id = headers
+            .get("conversation_id")
+            .or_else(|| headers.get("session_id"))
+            .or_else(|| headers.get("x-headroom-session-id"))
+            .and_then(|v| v.to_str().ok());
+        ctx.conversation_key =
+            headroom_core::conversation_savings::savings_conversation_key(openai_body, session_id);
+    }
+    // Hand the response arms the redaction memory whenever the flag is on —
+    // not only when the outbound body had spans. A clean prompt can still
+    // pull secrets mid-turn (memory answers, cold-tier blocks), and the
+    // continuations must redact those too. Empty map snapshots are a
+    // passthrough, so clean turns keep the zero-overhead path.
+    if redact_sensitive {
+        if let Some(ctx) = outcome_ctx.as_mut() {
+            ctx.redact_store = Some(redact_store.clone());
+        }
+    }
+}
+
+/// Error-path fallback: the router chose this upstream and the upstream will
+/// not serve the turn. The client asked for its own model and is owed an
+/// answer on it, so park the target and re-dispatch rather than passing the
+/// failure down. Only a turn the router moved can come back this way: when
+/// the client named the alias itself there is nothing to fall back to and
+/// the error is the honest answer.
+/// Extracted from `handle_messages` without behavior change.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_model_fallback(
+    state: AppState,
+    client_addr: SocketAddr,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    mut parsed: Value,
+    redacted: bool,
+    redact_session_key: &str,
+    body_model: &str,
+    client_model: &str,
+    upstream_status: StatusCode,
+    request_id: &str,
+    outcome_ctx: Option<crate::routed::outcome::RoutedOutcomeContext>,
+    upstream_resp: reqwest::Response,
+) -> Response {
+    let window = state.config.model_router.cooldown();
+    let parked = state.model_route_cooldowns.start(body_model, window);
+    tracing::warn!(
+        event = "model_route_fallback",
+        request_id = %request_id,
+        routed_model = %body_model,
+        client_model = %client_model,
+        status = upstream_status.as_u16(),
+        cooldown_secs = window.as_secs(),
+        parked,
+        "routed upstream refused the turn; re-dispatching on the client's model"
+    );
+    // The failed attempt is deliberately not booked: it never
+    // produced a turn, and the fallback dispatch books this request
+    // once, under the model the client actually got served on.
+    drop(outcome_ctx);
+    drop(upstream_resp);
+    if redacted {
+        // The fallback serves the client's own model, whose client
+        // must see real paths — unredact first, or every tool call
+        // lands on a placeholder file that does not exist.
+        crate::redact::unredact_body(&state.redact_store, redact_session_key, &mut parsed);
+        tracing::info!(
+            event = "routed_redact_fallback_unredacted",
+            request_id = %request_id,
+            "fallback serves the client's model on restored text"
+        );
+    }
+    dispatch_route_fallback(
+        state,
+        client_addr,
+        method,
+        uri,
+        headers,
+        parsed,
+        client_model,
+        request_id,
+    )
+    .await
+}
+
+/// Post-send bookkeeping: the refused byte count on a 413 replay-strip
+/// retry, and the attempt count (at least one — the send happened).
+/// Extracted from `handle_messages` without behavior change.
+fn note_send_outcome(
+    outcome_ctx: &mut Option<crate::routed::outcome::RoutedOutcomeContext>,
+    replay_stripped_bytes: Option<u64>,
+    attempt: u32,
+) {
+    if let (Some(ctx), Some(stripped)) = (outcome_ctx.as_mut(), replay_stripped_bytes) {
+        // The 413 retry below re-sent without the replay prefix: the refused
+        // byte count is this smaller body, not the first attempt's.
+        ctx.outbound_bytes = stripped;
+    }
+    if let Some(ctx) = outcome_ctx.as_mut() {
+        ctx.upstream_attempts = i64::from(attempt.max(1));
+    }
+}
+
+/// Fan out on the upstream answer: fallback re-dispatch on a refused routed
+/// turn, streaming fold, or buffered fold.
+/// Extracted from `handle_messages` without behavior change.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_upstream_answer(
+    state: AppState,
+    client_addr: SocketAddr,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    parsed: Value,
+    prepared_redacted: bool,
+    prepared_redact_session_key: &str,
+    body_model: &str,
+    identity_model: Option<String>,
+    upstream_resp: reqwest::Response,
+    upstream_status: StatusCode,
+    downstream_is_stream: bool,
+    is_responses: bool,
+    outcome_ctx: Option<crate::routed::outcome::RoutedOutcomeContext>,
+    ccr: Option<RoutedCcr>,
+    request_id: &str,
+) -> Response {
     if upstream_status != StatusCode::OK {
         // The router chose this upstream and the upstream will not serve the
         // turn. The client asked for its own model and is owed an answer on
@@ -457,47 +718,21 @@ pub async fn handle_messages(
         // when the client named the alias itself there is nothing to fall
         // back to and the error is the honest answer.
         if let Some(client_model) = identity_model.clone() {
-            let window = state.config.model_router.cooldown();
-            let parked = state.model_route_cooldowns.start(body_model, window);
-            tracing::warn!(
-                event = "model_route_fallback",
-                request_id = %request_id,
-                routed_model = %body_model,
-                client_model = %client_model,
-                status = upstream_status.as_u16(),
-                cooldown_secs = window.as_secs(),
-                parked,
-                "routed upstream refused the turn; re-dispatching on the client's model"
-            );
-            // The failed attempt is deliberately not booked: it never
-            // produced a turn, and the fallback dispatch books this request
-            // once, under the model the client actually got served on.
-            drop(outcome_ctx);
-            drop(upstream_resp);
-            if prepared.redacted {
-                // The fallback serves the client's own model, whose client
-                // must see real paths — unredact first, or every tool call
-                // lands on a placeholder file that does not exist.
-                crate::redact::unredact_body(
-                    &state.redact_store,
-                    &prepared.redact_session_key,
-                    &mut parsed,
-                );
-                tracing::info!(
-                    event = "routed_redact_fallback_unredacted",
-                    request_id = %request_id,
-                    "fallback serves the client's model on restored text"
-                );
-            }
-            return dispatch_route_fallback(
+            return dispatch_model_fallback(
                 state,
                 client_addr,
                 method,
                 uri,
                 headers,
                 parsed,
+                prepared_redacted,
+                prepared_redact_session_key,
+                body_model,
                 &client_model,
-                &request_id,
+                upstream_status,
+                request_id,
+                outcome_ctx,
+                upstream_resp,
             )
             .await;
         }

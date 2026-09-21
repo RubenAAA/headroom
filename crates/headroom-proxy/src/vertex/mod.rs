@@ -92,6 +92,71 @@ use std::net::SocketAddr;
 
 use crate::proxy::AppState;
 
+/// Split the trailing `model_action` segment, 404ing when it carries no
+/// `:verb` separator (unknown shape).
+/// Extracted from `handle_vertex_predict_dispatch` without behavior change.
+#[allow(clippy::result_large_err)]
+fn parse_model_action<'a>(
+    model_action: &'a str,
+    uri: &Uri,
+    request_id: &str,
+) -> Result<(&'a str, &'a str), Response> {
+    match split_model_action(model_action) {
+        Some(parts) => Ok(parts),
+        None => {
+            tracing::warn!(
+                event = "vertex_path_parse_failed",
+                request_id = %request_id,
+                path = %uri.path(),
+                segment = %model_action,
+                "vertex path final segment missing `:verb` separator"
+            );
+            Err(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("vertex path: bad model_action"))
+                .expect("static"))
+        }
+    }
+}
+
+/// Parse the verb, 404ing on anything but `rawPredict` / `streamRawPredict`
+/// — never a silent fallback to a "default" verb.
+/// Extracted from `handle_vertex_predict_dispatch` without behavior change.
+#[allow(clippy::result_large_err)]
+fn parse_vertex_verb(verb_str: &str, request_id: &str) -> Result<VertexVerb, Response> {
+    match VertexVerb::parse(verb_str) {
+        Some(v) => Ok(v),
+        None => {
+            tracing::warn!(
+                event = "vertex_unknown_verb",
+                request_id = %request_id,
+                verb = %verb_str,
+                "vertex path verb not recognized; only rawPredict / streamRawPredict are supported"
+            );
+            Err(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("vertex: unknown verb"))
+                .expect("static"))
+        }
+    }
+}
+
+/// Streaming pipeline breadcrumb for the streaming verb.
+/// Extracted from `handle_vertex_predict_dispatch` without behavior change.
+fn note_vertex_streaming(attach_sse_tee: bool, request_id: &str, method: &Method, uri: &Uri) {
+    if attach_sse_tee {
+        tracing::info!(
+            event = "vertex_streaming_pipeline_active",
+            request_id = %request_id,
+            method = %method,
+            path = %uri.path(),
+            framer = "byte_level_sse",
+            state_machine = "anthropic",
+            "vertex streaming pipeline engaged: SSE framer + AnthropicStreamState telemetry tee"
+        );
+    }
+}
+
 /// Single axum handler mounted at the
 /// `/v1beta1/projects/{project}/locations/{location}/publishers/anthropic/models/{model_action}`
 /// path. The trailing `model_action` segment carries `<model>:<verb>`
@@ -120,51 +185,18 @@ pub async fn handle_vertex_predict_dispatch(
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let (model_id, verb_str) = match split_model_action(&model_action) {
-        Some(parts) => parts,
-        None => {
-            tracing::warn!(
-                event = "vertex_path_parse_failed",
-                request_id = %request_id,
-                path = %uri.path(),
-                segment = %model_action,
-                "vertex path final segment missing `:verb` separator"
-            );
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("vertex path: bad model_action"))
-                .expect("static");
-        }
+    let (model_id, verb_str) = match parse_model_action(&model_action, &uri, &request_id) {
+        Ok(parts) => parts,
+        Err(response) => return response,
     };
 
-    let verb = match VertexVerb::parse(verb_str) {
-        Some(v) => v,
-        None => {
-            tracing::warn!(
-                event = "vertex_unknown_verb",
-                request_id = %request_id,
-                verb = %verb_str,
-                "vertex path verb not recognized; only rawPredict / streamRawPredict are supported"
-            );
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("vertex: unknown verb"))
-                .expect("static");
-        }
+    let verb = match parse_vertex_verb(verb_str, &request_id) {
+        Ok(v) => v,
+        Err(response) => return response,
     };
 
     let attach_sse_tee = matches!(verb, VertexVerb::StreamRawPredict);
-    if attach_sse_tee {
-        tracing::info!(
-            event = "vertex_streaming_pipeline_active",
-            request_id = %request_id,
-            method = %method,
-            path = %uri.path(),
-            framer = "byte_level_sse",
-            state_machine = "anthropic",
-            "vertex streaming pipeline engaged: SSE framer + AnthropicStreamState telemetry tee"
-        );
-    }
+    note_vertex_streaming(attach_sse_tee, &request_id, &method, &uri);
 
     raw_predict::forward_vertex_request(
         state,

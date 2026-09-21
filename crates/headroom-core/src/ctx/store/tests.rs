@@ -547,6 +547,71 @@ fn opens_ts_created_db() {
     assert_eq!(hits[0].timestamp.as_deref(), Some("2026-01-01T00:00:00Z"));
 }
 
+#[test]
+fn legacy_db_without_content_hash_reads_as_miss() {
+    // A DB created before `content_hash` existed, opened read-only (the
+    // cold-tier sweep never migrates). Hash lookup and FTS must report a
+    // miss — not `no such column`.
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("legacy.db");
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sources (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              label TEXT NOT NULL,
+              chunk_count INTEGER NOT NULL DEFAULT 0,
+              code_chunk_count INTEGER NOT NULL DEFAULT 0,
+              indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
+              file_path TEXT
+            );
+            CREATE VIRTUAL TABLE chunks USING fts5(
+              title, content, source_id UNINDEXED, content_type UNINDEXED,
+              source_category UNINDEXED, session_id UNINDEXED, event_id UNINDEXED,
+              timestamp UNINDEXED, tokenize='porter unicode61'
+            );
+            CREATE VIRTUAL TABLE chunks_trigram USING fts5(
+              title, content, source_id UNINDEXED, content_type UNINDEXED,
+              source_category UNINDEXED, session_id UNINDEXED, event_id UNINDEXED,
+              timestamp UNINDEXED, tokenize='trigram'
+            );
+            CREATE TABLE vocabulary (word TEXT PRIMARY KEY);
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sources (label, chunk_count, code_chunk_count, indexed_at) VALUES ('legacy', 1, 0, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let sid = conn.last_insert_rowid();
+        for tbl in ["chunks", "chunks_trigram"] {
+            conn.execute(
+                &format!("INSERT INTO {tbl} (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES ('Intro', 'legacy indexed words', ?1, 'prose', NULL, '', '', '2026-01-01T00:00:00Z')"),
+                params![sid],
+            )
+            .unwrap();
+        }
+    }
+
+    let store = CtxStore::open_read_only(&db).unwrap();
+    assert_eq!(
+        store.content_by_hash("0123456789abcdef01234567").unwrap(),
+        None
+    );
+    let hits = store
+        .search(
+            &["legacy indexed".to_string()],
+            &SearchOpts {
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(hits.is_empty(), "legacy DB without hash column must miss");
+}
+
 // Re-export a small chunk-testing hook and the cap constant for the tests that
 // exercise the private chunker.
 const MAX_CHUNK_BYTES_TEST: usize = 4096;

@@ -115,50 +115,20 @@ pub(crate) async fn try_routed_sidecar(
     let target = route.target_model.clone()?;
     let upstream = route.upstream.clone()?;
 
-    // Redact before route, not after: the shrunk body is redacted here, on
-    // the Anthropic shape, with the same session key the routed path will
-    // derive for this conversation — so the placeholders Zen sees are the
-    // ones the next real turn already uses, and one turn's map stays valid
-    // for the next. The 4-word reply is restored at the edge below.
-    //
-    // The key must match `prepare_turn`'s: it fingerprints the first message
-    // of the body it sees, so derive from the unshrunk `parsed` (the same
-    // bytes the real turn derives from), not the tail-only shrunk copy.
-    let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
+    let (shrunk, redact_table) = shrink_and_redact_sidecar(
+        state,
         headers,
         client_addr,
         parsed,
-        crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
+        &sidecar_model,
+        request_id,
     );
-    let mut shrunk = crate::sidecar::rewrite_sidecar(parsed, &sidecar_model);
-    let redact_table = if state.config.redact_sensitive {
-        let report = crate::redact::redact_body(&state.redact_store, &session_key, &mut shrunk);
-        if report.spans_redacted > 0 {
-            tracing::info!(
-                event = "sidecar_routed_redacted",
-                request_id = %request_id,
-                spans_redacted = report.spans_redacted,
-                "redacted sensitive spans before the routed sidecar"
-            );
-        }
-        crate::redact::restore_table(&state.redact_store, &session_key)
-    } else {
-        None
-    };
     let downstream_stream = shrunk
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // `false`: the client's 64-token cap is not forwarded — a reasoning
-    // model spends the budget on thinking first (see
-    // [`SIDECAR_ROUTED_MAX_TOKENS`]). The routed budget is set explicitly
-    // below.
-    let mut openai_body = anthropic_to_openai_responses_request(&shrunk, false).ok()?;
-    openai_body = apply_target_model_override(openai_body, Some(&target), true, true);
-    classify_upstream(&upstream, false).strip_unreplayable_reasoning(&mut openai_body);
-    shape_sidecar_request(&mut openai_body);
-    let openai_bytes = serde_json::to_vec(&openai_body).ok()?;
+    let openai_bytes = sidecar_request_bytes(&shrunk, &target, &upstream)?;
 
     let (upstream_headers, _) = auth_headers(
         route.auth_env.as_deref(),
@@ -183,71 +153,20 @@ pub(crate) async fn try_routed_sidecar(
         "trying the spinner sidecar on a routed Responses upstream"
     );
 
-    let upstream_resp = state
-        .client
-        .post(&upstream_url)
-        .headers(upstream_headers)
-        .body(openai_bytes)
-        .timeout(state.config.sidecar_route_timeout)
-        .send()
-        .await
-        .ok()?;
-    if upstream_resp.status() != StatusCode::OK {
-        tracing::warn!(
-            event = "sidecar_routed_fallback",
-            request_id = %request_id,
-            status = upstream_resp.status().as_u16(),
-            "routed sidecar failed; falling back to the direct path"
-        );
-        return None;
-    }
+    let upstream_resp = send_sidecar_request(
+        state,
+        &upstream_url,
+        upstream_headers,
+        openai_bytes,
+        request_id,
+    )
+    .await?;
 
-    let shape = crate::sidecar::SidecarShape {
-        original_messages: parsed
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map_or(0, |m| m.len()),
-        forwarded_messages: shrunk
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map_or(0, |m| m.len()),
-        model_from: parsed
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        model_to: sidecar_model.clone(),
-        routed: true,
-    };
+    let shape = routed_sidecar_shape(parsed, &shrunk, &sidecar_model);
 
     if downstream_stream {
-        let stream = upstream_resp.bytes_stream();
-        // A fresh quota store, not the shared one: Zen's rate-limit headers
-        // must never pollute Codex quota tracking.
-        let translated = translate_openai_stream_to_anthropic(
-            stream,
-            sidecar_model,
-            crate::codex_rate_limits::CodexRateLimitStore::new(),
-            false,
-            None,
-            // Sidecars never book: the direct path they fall back to owns
-            // the turn's outcome, and a routed attempt must not book twice.
-            None,
-            // A sidecar carries no tools, so there is nothing to rename.
-            None,
-        );
-        // Same close-on-drop as the main routed path: a mid-response death
-        // ends `end_turn` with a marker instead of a reset socket.
-        let finished =
-            crate::sse::stream_finisher::finish_on_drop(translated, request_id.to_string());
-        // Restore before the client: Zen echoed placeholders back for the
-        // paths and secrets it saw, and the 4 words go to the spinner.
-        let body = match redact_table {
-            Some(table) => axum::body::Body::from_stream(crate::proxy::track_streaming(
-                crate::redact::restore_stream(finished, table),
-            )),
-            None => axum::body::Body::from_stream(crate::proxy::track_streaming(finished)),
-        };
+        let body =
+            routed_sidecar_stream_body(upstream_resp, sidecar_model, redact_table, request_id);
         crate::sidecar::record_sidecar(request_id, &shape);
         return Some(streaming_body_response(body));
     }
@@ -267,7 +186,164 @@ pub(crate) async fn try_routed_sidecar(
     }
     crate::sidecar::record_sidecar(request_id, &shape);
 
-    let mut body_bytes = serde_json::to_vec(&anthropic_response).ok()?;
+    routed_sidecar_json_response(&anthropic_response, redact_table)
+}
+
+/// Make the one bounded sidecar attempt, or `None` when it fails or the
+/// upstream answers with anything but 200.
+async fn send_sidecar_request(
+    state: &AppState,
+    upstream_url: &str,
+    upstream_headers: HeaderMap,
+    openai_bytes: Vec<u8>,
+    request_id: &str,
+) -> Option<reqwest::Response> {
+    let upstream_resp = state
+        .client
+        .post(upstream_url)
+        .headers(upstream_headers)
+        .body(openai_bytes)
+        .timeout(state.config.sidecar_route_timeout)
+        .send()
+        .await
+        .ok()?;
+    if upstream_resp.status() != StatusCode::OK {
+        tracing::warn!(
+            event = "sidecar_routed_fallback",
+            request_id = %request_id,
+            status = upstream_resp.status().as_u16(),
+            "routed sidecar failed; falling back to the direct path"
+        );
+        return None;
+    }
+    Some(upstream_resp)
+}
+
+/// Shrink the turn to what the sidecar needs and redact it, returning the body
+/// to forward and the table that restores the reply.
+fn shrink_and_redact_sidecar(
+    state: &AppState,
+    headers: &HeaderMap,
+    client_addr: &std::net::SocketAddr,
+    parsed: &Value,
+    sidecar_model: &str,
+    request_id: &str,
+) -> (Value, Option<crate::redact::RestoreTable>) {
+    // Redact before route, not after: the shrunk body is redacted here, on
+    // the Anthropic shape, with the same session key the routed path will
+    // derive for this conversation — so the placeholders Zen sees are the
+    // ones the next real turn already uses, and one turn's map stays valid
+    // for the next. The 4-word reply is restored at the edge below.
+    //
+    // The key must match `prepare_turn`'s: it fingerprints the first message
+    // of the body it sees, so derive from the unshrunk `parsed` (the same
+    // bytes the real turn derives from), not the tail-only shrunk copy.
+    let session_key = crate::cache_stabilization::drift_detector::derive_session_key(
+        headers,
+        client_addr,
+        parsed,
+        crate::cache_stabilization::drift_detector::ApiKind::Anthropic,
+    );
+    let mut shrunk = crate::sidecar::rewrite_sidecar(parsed, sidecar_model);
+    let redact_table = if state.config.redact_sensitive {
+        let report = crate::redact::redact_body(&state.redact_store, &session_key, &mut shrunk);
+        if report.spans_redacted > 0 {
+            tracing::info!(
+                event = "sidecar_routed_redacted",
+                request_id = %request_id,
+                spans_redacted = report.spans_redacted,
+                "redacted sensitive spans before the routed sidecar"
+            );
+        }
+        crate::redact::restore_table(&state.redact_store, &session_key)
+    } else {
+        None
+    };
+    (shrunk, redact_table)
+}
+
+/// Translate the shrunk sidecar turn into the Responses request bytes to send,
+/// or `None` if any step of the translation fails.
+fn sidecar_request_bytes(shrunk: &Value, target: &str, upstream: &url::Url) -> Option<Vec<u8>> {
+    // `false`: the client's 64-token cap is not forwarded — a reasoning
+    // model spends the budget on thinking first (see
+    // [`SIDECAR_ROUTED_MAX_TOKENS`]). The routed budget is set explicitly
+    // below.
+    let mut openai_body = anthropic_to_openai_responses_request(shrunk, false).ok()?;
+    openai_body = apply_target_model_override(openai_body, Some(target), true, true);
+    classify_upstream(upstream, false).strip_unreplayable_reasoning(&mut openai_body);
+    shape_sidecar_request(&mut openai_body);
+    serde_json::to_vec(&openai_body).ok()
+}
+
+/// Describe what the sidecar rewrite did, for the `sidecar_detected` line.
+fn routed_sidecar_shape(
+    parsed: &Value,
+    shrunk: &Value,
+    sidecar_model: &str,
+) -> crate::sidecar::SidecarShape {
+    crate::sidecar::SidecarShape {
+        original_messages: parsed
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map_or(0, |m| m.len()),
+        forwarded_messages: shrunk
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map_or(0, |m| m.len()),
+        model_from: parsed
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        model_to: sidecar_model.to_string(),
+        routed: true,
+    }
+}
+
+/// Translate the upstream stream back to Anthropic shape and restore the
+/// redacted spans on the way to the spinner.
+fn routed_sidecar_stream_body(
+    upstream_resp: reqwest::Response,
+    sidecar_model: String,
+    redact_table: Option<crate::redact::RestoreTable>,
+    request_id: &str,
+) -> Body {
+    let stream = upstream_resp.bytes_stream();
+    // A fresh quota store, not the shared one: Zen's rate-limit headers
+    // must never pollute Codex quota tracking.
+    let translated = translate_openai_stream_to_anthropic(
+        stream,
+        sidecar_model,
+        crate::codex_rate_limits::CodexRateLimitStore::new(),
+        false,
+        None,
+        // Sidecars never book: the direct path they fall back to owns
+        // the turn's outcome, and a routed attempt must not book twice.
+        None,
+        // A sidecar carries no tools, so there is nothing to rename.
+        None,
+    );
+    // Same close-on-drop as the main routed path: a mid-response death
+    // ends `end_turn` with a marker instead of a reset socket.
+    let finished = crate::sse::stream_finisher::finish_on_drop(translated, request_id.to_string());
+    // Restore before the client: Zen echoed placeholders back for the
+    // paths and secrets it saw, and the 4 words go to the spinner.
+    match redact_table {
+        Some(table) => axum::body::Body::from_stream(crate::proxy::track_streaming(
+            crate::redact::restore_stream(finished, table),
+        )),
+        None => axum::body::Body::from_stream(crate::proxy::track_streaming(finished)),
+    }
+}
+
+/// Serialise the sidecar's turn, restoring redacted spans before the client
+/// sees it.
+fn routed_sidecar_json_response(
+    anthropic_response: &Value,
+    redact_table: Option<crate::redact::RestoreTable>,
+) -> Option<Response> {
+    let mut body_bytes = serde_json::to_vec(anthropic_response).ok()?;
     // Same restore as the stream arm: placeholders Zen echoed go back to
     // originals before the reply reaches the spinner.
     if let Some(table) = redact_table {

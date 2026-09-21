@@ -373,18 +373,24 @@ pub fn record_sidecar(request_id: &str, shape: &SidecarShape) {
 /// round trip to every turn.
 const DIRECT_404_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
 
-static DIRECT_HELD_UNTIL: std::sync::Mutex<Option<std::time::Instant>> =
+static DIRECT_HELD: std::sync::Mutex<Option<(String, std::time::Instant)>> =
     std::sync::Mutex::new(None);
 
-fn direct_hold_remaining() -> Option<std::time::Duration> {
-    let guard = DIRECT_HELD_UNTIL.lock().ok()?;
-    let until = (*guard)?;
+fn direct_hold_remaining(model: &str) -> Option<std::time::Duration> {
+    let guard = DIRECT_HELD.lock().ok()?;
+    let (held_model, until) = guard.as_ref()?;
+    if held_model != model {
+        return None;
+    }
     until.checked_duration_since(std::time::Instant::now())
 }
 
-fn note_direct_404() {
-    if let Ok(mut guard) = DIRECT_HELD_UNTIL.lock() {
-        *guard = Some(std::time::Instant::now() + DIRECT_404_HOLD);
+fn note_direct_404(model: &str) {
+    if let Ok(mut guard) = DIRECT_HELD.lock() {
+        *guard = Some((
+            model.to_string(),
+            std::time::Instant::now() + DIRECT_404_HOLD,
+        ));
     }
 }
 
@@ -427,7 +433,7 @@ pub async fn try_handle(
     if !is_describe_action_sidecar(body) {
         return None;
     }
-    if let Some(remaining) = direct_hold_remaining() {
+    if let Some(remaining) = direct_hold_remaining(sidecar_model) {
         tracing::info!(
             event = "sidecar_direct_skipped",
             reason = "recent_404",
@@ -617,15 +623,27 @@ async fn forward(
         axum::http::HeaderValue::from_static("identity"),
     );
 
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
     let payload = match serde_json::to_vec(body) {
         Ok(p) => p,
-        Err(e) => return fall_back(request_id, None, &format!("serialising sidecar body: {e}")),
+        Err(e) => {
+            return fall_back(
+                request_id,
+                &model,
+                None,
+                &format!("serialising sidecar body: {e}"),
+            )
+        }
     };
 
     let upstream_resp =
         match send_with_retry(client, upstream_url, request_id, headers, payload, retry).await {
             Ok(r) => r,
-            Err(e) => return fall_back(request_id, None, &e.to_string()),
+            Err(e) => return fall_back(request_id, &model, None, &e.to_string()),
         };
 
     // Anything but a 2xx means the shrunk request did not work — a model id the
@@ -635,7 +653,7 @@ async fn forward(
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status().as_u16();
         let detail = upstream_resp.text().await.unwrap_or_default();
-        return fall_back(request_id, Some(status), &detail);
+        return fall_back(request_id, &model, Some(status), &detail);
     }
 
     let status =
@@ -656,7 +674,12 @@ async fn forward(
         upstream_resp.bytes_stream(),
     ))) {
         Ok(response) => Some(response),
-        Err(e) => fall_back(request_id, None, &format!("building sidecar response: {e}")),
+        Err(e) => fall_back(
+            request_id,
+            &model,
+            None,
+            &format!("building sidecar response: {e}"),
+        ),
     }
 }
 
@@ -664,9 +687,9 @@ async fn forward(
 ///
 /// Always returns `None`: the caller reads that as "not handled" and forwards
 /// the client's original body untouched.
-fn fall_back(request_id: &str, status: Option<u16>, detail: &str) -> Option<Response> {
+fn fall_back(request_id: &str, model: &str, status: Option<u16>, detail: &str) -> Option<Response> {
     if status == Some(404) {
-        note_direct_404();
+        note_direct_404(model);
     }
     tracing::warn!(
         event = "sidecar_fallback",
@@ -737,10 +760,12 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(direct_hold_remaining().is_none());
-        note_direct_404();
-        let remaining = direct_hold_remaining().expect("held");
+        assert!(direct_hold_remaining("m").is_none());
+        note_direct_404("m");
+        let remaining = direct_hold_remaining("m").expect("held");
         assert!(remaining <= DIRECT_404_HOLD);
+        // A different model is unaffected by the hold.
+        assert!(direct_hold_remaining("other").is_none());
         // Held: no attempt is made (port 9 would refuse anyway; the point is
         // the early return leaves the hold untouched and answers `None`).
         assert!(
@@ -748,7 +773,9 @@ mod tests {
                 .await
                 .is_none()
         );
-        if let Ok(mut guard) = DIRECT_HELD_UNTIL.lock() {
+        // Switching models bypasses the hold.
+        assert!(direct_hold_remaining("other").is_none());
+        if let Ok(mut guard) = DIRECT_HELD.lock() {
             *guard = None;
         }
     }

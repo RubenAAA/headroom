@@ -202,21 +202,9 @@ pub async fn handle_invoke(
     // forwards to the upstream Converse endpoint instead of `/invoke`.
     // Both paths mount this handler (see `proxy.rs`); the streaming
     // sibling resolves its action the same way.
-    let action = match extract_invoke_action(uri.path()) {
-        Some(a) => a,
-        None => {
-            tracing::error!(
-                event = "bedrock_invoke_action_invalid",
-                request_id = %request_id,
-                path = %uri.path(),
-                "bedrock invoke: unrecognized action path"
-            );
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "bedrock_invoke_action_invalid",
-                "Unsupported Bedrock action path",
-            );
-        }
+    let action = match resolve_invoke_action(&uri, &request_id) {
+        Ok(a) => a,
+        Err(resp) => return resp,
     };
 
     // Operator override (HEADROOM_BEDROCK_MODEL_MAP): redirect the
@@ -226,28 +214,134 @@ pub async fn handle_invoke(
     // (the invoke route rejects ARNs with HTTP 400), so force
     // CONVERSE_ACTION when the target is an ARN. Purely additive: no
     // matching key leaves model_id + action untouched.
-    let (model_id, action) =
-        match resolve_bedrock_model_override(&state.config.bedrock_model_map, &model_id) {
-            Some((target, is_arn)) => {
-                let effective_action = if is_arn { CONVERSE_ACTION } else { action };
-                tracing::info!(
-                    event = "bedrock_model_override_applied",
-                    request_id = %request_id,
-                    from_model_id = %model_id,
-                    to_model_id = %target,
-                    is_arn = is_arn,
-                    action = %effective_action,
-                    "bedrock invoke: applied HEADROOM_BEDROCK_MODEL_MAP override"
-                );
-                (target, effective_action)
-            }
-            None => (model_id, action),
-        };
+    let (model_id, action) = apply_invoke_model_override(
+        &state.config.bedrock_model_map,
+        model_id,
+        action,
+        &request_id,
+    );
 
     // Build the upstream URL based on configured endpoint or
     // region-derived default.
-    let upstream_url = match build_bedrock_upstream(&state, &model_id, &uri, action) {
+    let upstream_url = match build_invoke_upstream_url(&state, &model_id, &uri, action, &request_id)
+    {
         Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    // Resolve credentials. No silent fallback: missing creds → 5xx.
+    let creds = match resolve_invoke_credentials(&state, &model_id, &request_id) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    // Build the headers we sign + forward. Start from the inbound
+    // headers, drop the ones the upstream client manages, then sign.
+    let outbound_headers = match sign_invoke_request(
+        &headers,
+        &upstream_url,
+        &state.config.bedrock_region,
+        creds.as_ref(),
+        &outbound_body,
+        &request_id,
+        &model_id,
+        &method,
+    ) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+
+    // Forward. We surface upstream errors as 502; the byte path
+    // streams the response back to the client.
+    let upstream_resp = match send_invoke_request(
+        &state,
+        method,
+        &upstream_url,
+        outbound_headers,
+        outbound_body,
+        &request_id,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    finish_invoke_response(upstream_resp, seam, request_id, model_id, upstream_url)
+}
+
+/// Resolve the Bedrock action from the inbound path.
+/// Extracted from `handle_invoke` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::result_large_err)]
+fn resolve_invoke_action(uri: &Uri, request_id: &str) -> Result<&'static str, Response> {
+    match extract_invoke_action(uri.path()) {
+        Some(a) => Ok(a),
+        None => {
+            tracing::error!(
+                event = "bedrock_invoke_action_invalid",
+                request_id = %request_id,
+                path = %uri.path(),
+                "bedrock invoke: unrecognized action path"
+            );
+            Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "bedrock_invoke_action_invalid",
+                "Unsupported Bedrock action path",
+            ))
+        }
+    }
+}
+
+/// Operator override (HEADROOM_BEDROCK_MODEL_MAP): redirect the inbound
+/// model_id to a pinned target. ARN targets must use the converse route
+/// (the invoke route rejects ARNs with HTTP 400), so force CONVERSE_ACTION
+/// then. Purely additive: no matching key leaves model_id + action untouched.
+/// Extracted from `handle_invoke` without behavior change.
+fn apply_invoke_model_override(
+    model_map: &std::collections::HashMap<String, String>,
+    model_id: String,
+    action: &'static str,
+    request_id: &str,
+) -> (String, &'static str) {
+    match resolve_bedrock_model_override(model_map, &model_id) {
+        Some((target, is_arn)) => {
+            let effective_action = if is_arn { CONVERSE_ACTION } else { action };
+            tracing::info!(
+                event = "bedrock_model_override_applied",
+                request_id = %request_id,
+                from_model_id = %model_id,
+                to_model_id = %target,
+                is_arn = is_arn,
+                action = %effective_action,
+                "bedrock invoke: applied HEADROOM_BEDROCK_MODEL_MAP override"
+            );
+            (target, effective_action)
+        }
+        None => (model_id, action),
+    }
+}
+
+/// Build the upstream URL based on configured endpoint or region-derived
+/// default.
+/// Extracted from `handle_invoke` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::result_large_err)]
+fn build_invoke_upstream_url(
+    state: &AppState,
+    model_id: &str,
+    uri: &Uri,
+    action: &str,
+    request_id: &str,
+) -> Result<url::Url, Response> {
+    match build_bedrock_upstream(state, model_id, uri, action) {
+        Ok(u) => Ok(u),
         Err(msg) => {
             tracing::error!(
                 event = "bedrock_endpoint_invalid",
@@ -255,17 +349,29 @@ pub async fn handle_invoke(
                 error = %msg,
                 "bedrock invoke: failed to construct upstream URL"
             );
-            return error_response(
+            Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_endpoint_invalid",
                 &msg,
-            );
+            ))
         }
-    };
+    }
+}
 
-    // Resolve credentials. No silent fallback: missing creds → 5xx.
-    let creds = match state.bedrock_credentials.as_ref() {
-        Some(c) => c.clone(),
+/// Resolve AWS credentials. No silent fallback: missing creds → 5xx.
+/// Extracted from `handle_invoke` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::result_large_err)]
+fn resolve_invoke_credentials(
+    state: &AppState,
+    model_id: &str,
+    request_id: &str,
+) -> Result<std::sync::Arc<aws_credential_types::Credentials>, Response> {
+    match state.bedrock_credentials.as_ref() {
+        Some(c) => Ok(c.clone()),
         None => {
             tracing::warn!(
                 event = "bedrock_credentials_missing",
@@ -273,17 +379,35 @@ pub async fn handle_invoke(
                 model_id = %model_id,
                 "bedrock invoke: refusing to forward without AWS credentials"
             );
-            return error_response(
+            Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_credentials_missing",
                 "AWS credentials not configured; refusing to forward unsigned",
-            );
+            ))
         }
-    };
+    }
+}
 
-    // Build the headers we sign + forward. Start from the inbound
-    // headers, drop the ones the upstream client manages, then sign.
-    let extra_signed: Vec<(String, String)> = collect_signed_headers(&headers, &upstream_url);
+/// Sign the request (SigV4) and compose the outbound header map: the
+/// headers we'll forward, then the SigV4 outputs layered on top.
+/// Extracted from `handle_invoke` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+fn sign_invoke_request(
+    headers: &HeaderMap,
+    upstream_url: &url::Url,
+    region: &str,
+    credentials: &aws_credential_types::Credentials,
+    outbound_body: &Bytes,
+    request_id: &str,
+    model_id: &str,
+    method: &Method,
+) -> Result<HeaderMap, Response> {
+    let extra_signed: Vec<(String, String)> = collect_signed_headers(headers, upstream_url);
     let extra_signed_refs: Vec<(&str, &str)> = extra_signed
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -291,10 +415,10 @@ pub async fn handle_invoke(
 
     let sign_inputs = SigningInputs {
         method: method.as_str(),
-        url: &upstream_url,
-        region: &state.config.bedrock_region,
-        credentials: creds.as_ref(),
-        body: &outbound_body,
+        url: upstream_url,
+        region,
+        credentials,
+        body: outbound_body,
         extra_signed_headers: &extra_signed_refs,
         time: SystemTime::now(),
     };
@@ -308,11 +432,11 @@ pub async fn handle_invoke(
                 error = %e,
                 "bedrock invoke: SigV4 signing failed; refusing to forward"
             );
-            return error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_sigv4_failed",
                 &e.to_string(),
-            );
+            ));
         }
     };
 
@@ -337,9 +461,25 @@ pub async fn handle_invoke(
             outbound_headers.insert(n, v);
         }
     }
+    Ok(outbound_headers)
+}
 
-    // Forward. We surface upstream errors as 502; the byte path
-    // streams the response back to the client.
+/// Convert the method, send upstream, and map transport failures
+/// (timeouts become 504 so the client retries).
+/// Extracted from `handle_invoke` without behavior change.
+///
+/// The `Response` error keeps the convention of every sibling arm on the
+/// routed paths; boxing it would save nothing measurable and diverge
+/// from all of them.
+#[allow(clippy::result_large_err)]
+async fn send_invoke_request(
+    state: &AppState,
+    method: Method,
+    upstream_url: &url::Url,
+    headers: HeaderMap,
+    body: Bytes,
+    request_id: &str,
+) -> Result<reqwest::Response, Response> {
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,
         Err(e) => {
@@ -349,24 +489,23 @@ pub async fn handle_invoke(
                 error = %e,
                 "bedrock invoke: invalid HTTP method"
             );
-            return error_response(
+            return Err(error_response(
                 StatusCode::BAD_REQUEST,
                 "bedrock_invalid_method",
                 &e.to_string(),
-            );
+            ));
         }
     };
 
-    let upstream_resp = state
+    match state
         .client
         .request(reqwest_method, upstream_url.clone())
-        .headers(outbound_headers)
-        .body(outbound_body.clone())
+        .headers(headers)
+        .body(body)
         .send()
-        .await;
-
-    let upstream_resp = match upstream_resp {
-        Ok(r) => r,
+        .await
+    {
+        Ok(r) => Ok(r),
         Err(e) => {
             tracing::warn!(
                 event = "bedrock_upstream_error",
@@ -379,10 +518,25 @@ pub async fn handle_invoke(
             } else {
                 StatusCode::BAD_GATEWAY
             };
-            return error_response(status, "bedrock_upstream_error", &e.to_string());
+            Err(error_response(
+                status,
+                "bedrock_upstream_error",
+                &e.to_string(),
+            ))
         }
-    };
+    }
+}
 
+/// Stream the upstream response back without buffering (tracked so the
+/// rotation drain sees it until the last byte), restoring redaction.
+/// Extracted from `handle_invoke` without behavior change.
+fn finish_invoke_response(
+    upstream_resp: reqwest::Response,
+    seam: Option<crate::redact::Seam>,
+    request_id: String,
+    model_id: String,
+    upstream_url: url::Url,
+) -> Response {
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = filter_response_headers(upstream_resp.headers());
@@ -490,6 +644,17 @@ fn run_anthropic_compression(
         "/bedrock/invoke",
         request_id,
     );
+    report_invoke_compression_outcome(outcome, body, parsed_envelope, request_id)
+}
+
+/// Log the compression outcome and select the bytes to forward.
+/// Extracted from `run_anthropic_compression` without behavior change.
+fn report_invoke_compression_outcome(
+    outcome: AnthropicOutcome,
+    body: &Bytes,
+    parsed_envelope: bool,
+    request_id: &str,
+) -> Bytes {
     match outcome {
         AnthropicOutcome::NoCompression => body.clone(),
         AnthropicOutcome::Passthrough { reason } => {

@@ -47,7 +47,11 @@ fn clone_store(state: &AppState) -> Result<Arc<OffloadStore>, StatusCode> {
 /// search run inside a project searches that project. A caller that sends
 /// neither header gets the shared bucket — the same one every request used
 /// before the stores were sharded.
-fn request_project(headers: &axum::http::HeaderMap) -> String {
+///
+/// `project_root_override` is `--memory-project-root`: when set it outranks
+/// header-derived resolution, matching the model path
+/// (`resolve_ctx_project`).
+fn request_project(headers: &axum::http::HeaderMap, project_root_override: Option<&str>) -> String {
     let ctx = crate::memory::router::RequestContext {
         headers: headers
             .iter()
@@ -59,7 +63,7 @@ fn request_project(headers: &axum::http::HeaderMap) -> String {
             .collect(),
         system_prompt: String::new(),
         base_user_id: String::new(),
-        project_root_override: None,
+        project_root_override: project_root_override.map(str::to_string),
     };
     crate::memory::router::ProjectResolver::resolve_project_dir(&ctx)
         .unwrap_or_else(|| super::projects::UNRESOLVED_PROJECT.to_string())
@@ -70,9 +74,10 @@ fn request_project(headers: &axum::http::HeaderMap) -> String {
 fn content_for(
     store: &OffloadStore,
     headers: &axum::http::HeaderMap,
+    project_root_override: Option<&str>,
 ) -> Result<Arc<headroom_core::ctx::CtxStore>, StatusCode> {
     store
-        .content_for(&request_project(headers))
+        .content_for(&request_project(headers, project_root_override))
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
@@ -132,7 +137,11 @@ async fn handle_search(
     let limit = params.limit.unwrap_or(10).min(50);
     let queries = vec![params.q];
 
-    let content = content_for(&store, &headers)?;
+    let content = content_for(
+        &store,
+        &headers,
+        state.config.memory_project_root.as_deref(),
+    )?;
     let hits = tokio::task::spawn_blocking(move || {
         let opts = SearchOpts {
             limit,
@@ -201,7 +210,7 @@ async fn handle_get(
         Some(content) => Some(content),
         None if headroom_core::ccr::response_handler::is_plausible_ccr_hash(&hash) => {
             let stores = store.stores();
-            let project = request_project(&headers);
+            let project = request_project(&headers, state.config.memory_project_root.as_deref());
             let hash_str = hash.clone();
             let project_for_lookup = project.clone();
             let (recovered, local) = tokio::task::spawn_blocking(move || {
@@ -277,7 +286,11 @@ async fn handle_index(
 ) -> Result<Json<IndexResponse>, StatusCode> {
     let store = clone_store(&state)?;
 
-    let content = content_for(&store, &headers)?;
+    let content = content_for(
+        &store,
+        &headers,
+        state.config.memory_project_root.as_deref(),
+    )?;
     let label = req.label;
     let raw = req.content;
     let opts = headroom_core::ctx::IndexOpts {
@@ -333,7 +346,11 @@ async fn handle_fetch(
     Json(req): Json<FetchRequest>,
 ) -> Result<Json<FetchResponse>, StatusCode> {
     let store = clone_store(&state)?;
-    let content = content_for(&store, &headers)?;
+    let content = content_for(
+        &store,
+        &headers,
+        state.config.memory_project_root.as_deref(),
+    )?;
 
     let ttl = req.ttl.map(std::time::Duration::from_secs);
     let result =
@@ -460,7 +477,8 @@ async fn handle_doctor(
             });
 
             // Check: content DB accessible + FTS5 probe
-            let content = content_for(store, &headers)?;
+            let content =
+                content_for(store, &headers, state.config.memory_project_root.as_deref())?;
             let fts_ok = tokio::task::spawn_blocking(move || {
                 content
                     .search(
@@ -485,7 +503,11 @@ async fn handle_doctor(
             });
 
             // Check: content DB path
-            let db_path = content_for(store, &headers)?.path().display().to_string();
+            let db_path =
+                content_for(store, &headers, state.config.memory_project_root.as_deref())?
+                    .path()
+                    .display()
+                    .to_string();
             checks.push(DoctorCheck {
                 name: "content_db_path".into(),
                 ok: true,
@@ -539,7 +561,11 @@ async fn handle_purge(
     match req.scope.as_str() {
         "session" => {
             let store = clone_store(&state)?;
-            let content = content_for(&store, &headers)?;
+            let content = content_for(
+                &store,
+                &headers,
+                state.config.memory_project_root.as_deref(),
+            )?;
             let detail = tokio::task::spawn_blocking(move || match content.purge_all() {
                 Ok(n) => format!("purged {n} chunks from content DB"),
                 Err(e) => format!("purge failed: {e}"),
@@ -554,7 +580,13 @@ async fn handle_purge(
         }
         "project" => {
             let store = clone_store(&state)?;
-            let content_path = content_for(&store, &headers)?.path().to_path_buf();
+            let content_path = content_for(
+                &store,
+                &headers,
+                state.config.memory_project_root.as_deref(),
+            )?
+            .path()
+            .to_path_buf();
             let ccr_path = content_path
                 .parent()
                 .map(|p| p.join("ccr.db"))

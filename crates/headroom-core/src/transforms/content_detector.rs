@@ -840,11 +840,29 @@ fn try_detect_html(content: &str) -> Option<DetectionResult> {
 /// those lines read as prose and code in them reaches the word-dropping
 /// Kompress compressor. The colon branch runs first; context is tried after.
 fn is_search_result_line(line: &str) -> bool {
-    if SEARCH_RESULT_PATTERN.is_match(line) || GREP_COLON_DASH_PATTERN.is_match(line) {
+    if SEARCH_RESULT_PATTERN.is_match(line) {
         let prefix = line.split(':').next().unwrap_or("");
         return prefix_looks_like_path(prefix);
     }
+    if is_grep_colon_dash_line(line) {
+        return true;
+    }
     is_grep_context_line(line)
+}
+
+/// True when a line looks like `path:NN-content` grep context output.
+///
+/// Same idea as [`is_grep_context_line`] with the path/line separator left
+/// as `:`. Real GNU grep emits dashes in both positions, but the reported
+/// repro builds context lines this way, so both shapes must route
+/// identically (upstream #3599). Split out so the section splitter in
+/// `content_router` carves the same lines the detector claims.
+pub(crate) fn is_grep_colon_dash_line(line: &str) -> bool {
+    if !GREP_COLON_DASH_PATTERN.is_match(line) {
+        return false;
+    }
+    let prefix = line.split(':').next().unwrap_or("");
+    prefix_looks_like_path(prefix)
 }
 
 /// True when a line looks like `path-NN-content` grep context output.

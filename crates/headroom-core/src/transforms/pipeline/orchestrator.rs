@@ -146,50 +146,13 @@ impl CompressionPipeline {
         // current (post-reformat, post-prior-offload) buffer.
         let mut cache_keys: Vec<String> = Vec::new();
         for (offload, score) in offloads.iter().zip(bloat_scores.iter()) {
-            let above_threshold = *score >= self.config.pipeline.bloat_threshold;
-            let reformat_underwhelmed =
-                reformat_ratio > self.config.pipeline.offload_fallback_ratio && *score > 0.0;
-            if !(above_threshold || reformat_underwhelmed) {
-                tracing::trace!(
-                    target: "headroom::pipeline",
-                    offload = offload.name(),
-                    score,
-                    reformat_ratio,
-                    "offload skipped: bloat below threshold and reformat sufficient"
-                );
-                continue;
-            }
-            match offload.apply(&current, ctx, store) {
-                Ok(out) => {
-                    if out.bytes_saved == 0 {
-                        tracing::trace!(
-                            target: "headroom::pipeline",
-                            offload = offload.name(),
-                            "offload accepted but saved zero bytes — discarding"
-                        );
-                        continue;
-                    }
-                    total_saved = total_saved.saturating_add(out.bytes_saved);
-                    current = out.output;
-                    steps.push(offload.name().to_string());
-                    cache_keys.push(out.cache_key);
-                }
-                Err(TransformError::Internal { message, .. }) => {
-                    tracing::warn!(
-                        target: "headroom::pipeline",
-                        offload = offload.name(),
-                        error = %message,
-                        "offload internal error"
-                    );
-                }
-                Err(e) => {
-                    tracing::trace!(
-                        target: "headroom::pipeline",
-                        offload = offload.name(),
-                        error = %e,
-                        "offload skipped"
-                    );
-                }
+            if let Some(applied) =
+                self.maybe_apply_offload(offload, *score, reformat_ratio, &current, ctx, store)
+            {
+                total_saved = total_saved.saturating_add(applied.bytes_saved);
+                current = applied.output;
+                steps.push(applied.step);
+                cache_keys.push(applied.cache_key);
             }
         }
 
@@ -199,6 +162,167 @@ impl CompressionPipeline {
             steps_applied: steps,
             cache_keys,
         }
+    }
+
+    /// Gate one offload against the bloat threshold and the reformat
+    /// fallback ratio. Logs the skip and returns `false` when the offload
+    /// must not run.
+    /// Extracted from `maybe_apply_offload` without behavior change.
+    fn offload_passes_gate(
+        &self,
+        offload: &Arc<dyn OffloadTransform>,
+        score: f32,
+        reformat_ratio: f64,
+    ) -> bool {
+        let above_threshold = score >= self.config.pipeline.bloat_threshold;
+        let reformat_underwhelmed =
+            reformat_ratio > self.config.pipeline.offload_fallback_ratio && score > 0.0;
+        if above_threshold || reformat_underwhelmed {
+            return true;
+        }
+        tracing::trace!(
+            target: "headroom::pipeline",
+            offload = offload.name(),
+            score,
+            reformat_ratio,
+            "offload skipped: bloat below threshold and reformat sufficient"
+        );
+        false
+    }
+
+    /// Decide and run one gated offload against the current buffer.
+    /// Returns the new buffer plus its booking triple when the offload ran
+    /// and saved bytes, or `None` when it was skipped, errored, or saved
+    /// nothing. Failures are recorded as skips, never propagated.
+    /// Extracted from `run` without behavior change.
+    fn maybe_apply_offload(
+        &self,
+        offload: &Arc<dyn OffloadTransform>,
+        score: f32,
+        reformat_ratio: f64,
+        current: &str,
+        ctx: &CompressionContext,
+        store: &dyn CcrStore,
+    ) -> Option<OffloadApplication> {
+        if !self.offload_passes_gate(offload, score, reformat_ratio) {
+            return None;
+        }
+        match offload.apply(current, ctx, store) {
+            Ok(out) => {
+                if out.bytes_saved == 0 {
+                    tracing::trace!(
+                        target: "headroom::pipeline",
+                        offload = offload.name(),
+                        "offload accepted but saved zero bytes — discarding"
+                    );
+                    return None;
+                }
+                Some(OffloadApplication {
+                    output: out.output,
+                    bytes_saved: out.bytes_saved,
+                    step: offload.name().to_string(),
+                    cache_key: out.cache_key,
+                })
+            }
+            Err(TransformError::Internal { message, .. }) => {
+                tracing::warn!(
+                    target: "headroom::pipeline",
+                    offload = offload.name(),
+                    error = %message,
+                    "offload internal error"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::trace!(
+                    target: "headroom::pipeline",
+                    offload = offload.name(),
+                    error = %e,
+                    "offload skipped"
+                );
+                None
+            }
+        }
+    }
+
+    /// Stop-early gate: true once `current_len / original_len` reaches the
+    /// reformat target ratio, skipping the remaining reformats.
+    /// Extracted from `apply_reformat_step` without behavior change.
+    fn reformat_target_reached(
+        &self,
+        transform: &Arc<dyn ReformatTransform>,
+        current: &str,
+        original_len: usize,
+    ) -> bool {
+        // Stop-early gate: target reached.
+        let ratio = current.len() as f64 / original_len.max(1) as f64;
+        if ratio <= self.config.pipeline.reformat_target_ratio {
+            tracing::trace!(
+                target: "headroom::pipeline",
+                transform = transform.name(),
+                ratio,
+                "reformat target reached, skipping remaining reformats"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Run one reformat transform against the current buffer, stopping the
+    /// whole phase once the target ratio is reached. Returns `false` when
+    /// the caller must break. Failures are recorded as skips, never
+    /// propagated.
+    /// Extracted from `run_reformats` without behavior change.
+    fn apply_reformat_step(
+        &self,
+        transform: &Arc<dyn ReformatTransform>,
+        current: &mut String,
+        total_saved: &mut usize,
+        steps: &mut Vec<String>,
+        original_len: usize,
+    ) -> bool {
+        if self.reformat_target_reached(transform, current, original_len) {
+            return false;
+        }
+        match transform.apply(current) {
+            Ok(out) => {
+                tracing::debug!(
+                    target: "headroom::pipeline",
+                    event = "transform_byte_integrity",
+                    transform = transform.name(),
+                    input_bytes = current.len(),
+                    output_bytes = out.output.len(),
+                    bytes_saved = out.bytes_saved,
+                    input_hash = %short_hash(current),
+                    output_hash = %short_hash(&out.output),
+                    changed = *current != out.output,
+                    "reformat transform output boundary"
+                );
+                if out.bytes_saved == 0 {
+                    return true;
+                }
+                *total_saved = total_saved.saturating_add(out.bytes_saved);
+                *current = out.output;
+                steps.push(transform.name().to_string());
+            }
+            Err(TransformError::Internal { message, .. }) => {
+                tracing::warn!(
+                    target: "headroom::pipeline",
+                    transform = transform.name(),
+                    error = %message,
+                    "reformat internal error"
+                );
+            }
+            Err(e) => {
+                tracing::trace!(
+                    target: "headroom::pipeline",
+                    transform = transform.name(),
+                    error = %e,
+                    "reformat skipped"
+                );
+            }
+        }
+        true
     }
 
     /// Run reformat transforms in registration order against `content`.
@@ -214,54 +338,14 @@ impl CompressionPipeline {
         let mut steps: Vec<String> = Vec::new();
 
         for transform in reformats {
-            // Stop-early gate: target reached.
-            let ratio = current.len() as f64 / original_len.max(1) as f64;
-            if ratio <= self.config.pipeline.reformat_target_ratio {
-                tracing::trace!(
-                    target: "headroom::pipeline",
-                    transform = transform.name(),
-                    ratio,
-                    "reformat target reached, skipping remaining reformats"
-                );
+            if !self.apply_reformat_step(
+                transform,
+                &mut current,
+                &mut total_saved,
+                &mut steps,
+                original_len,
+            ) {
                 break;
-            }
-            match transform.apply(&current) {
-                Ok(out) => {
-                    tracing::debug!(
-                        target: "headroom::pipeline",
-                        event = "transform_byte_integrity",
-                        transform = transform.name(),
-                        input_bytes = current.len(),
-                        output_bytes = out.output.len(),
-                        bytes_saved = out.bytes_saved,
-                        input_hash = %short_hash(&current),
-                        output_hash = %short_hash(&out.output),
-                        changed = current != out.output,
-                        "reformat transform output boundary"
-                    );
-                    if out.bytes_saved == 0 {
-                        continue;
-                    }
-                    total_saved = total_saved.saturating_add(out.bytes_saved);
-                    current = out.output;
-                    steps.push(transform.name().to_string());
-                }
-                Err(TransformError::Internal { message, .. }) => {
-                    tracing::warn!(
-                        target: "headroom::pipeline",
-                        transform = transform.name(),
-                        error = %message,
-                        "reformat internal error"
-                    );
-                }
-                Err(e) => {
-                    tracing::trace!(
-                        target: "headroom::pipeline",
-                        transform = transform.name(),
-                        error = %e,
-                        "reformat skipped"
-                    );
-                }
             }
         }
 
@@ -290,6 +374,14 @@ struct ReformatAccumulator {
     output: String,
     bytes_saved: usize,
     steps: Vec<String>,
+}
+
+/// One accepted offload application: the new buffer plus its booking triple.
+struct OffloadApplication {
+    output: String,
+    bytes_saved: usize,
+    step: String,
+    cache_key: String,
 }
 
 /// Fluent builder for [`CompressionPipeline`].

@@ -1158,7 +1158,7 @@ mod tests {
     #[test]
     fn estimate_tokens_basic() {
         let count = estimate_tokens("hello world");
-        assert!(count >= 1 && count <= 3);
+        assert!((1..=3).contains(&count));
     }
 
     #[test]

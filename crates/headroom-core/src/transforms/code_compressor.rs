@@ -2236,64 +2236,58 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Compress a function/method body. Mirrors `_compress_function_ast`.
-    fn compress_function_ast(&self, node: Node) -> String {
-        let start_row = node.start_position().row;
-        let end_row = node.end_position().row;
-        let node_lines: Vec<&str> = self.code_lines[start_row..=end_row].to_vec();
-        let node_text = node_lines.join("\n");
-
-        let func_name = get_definition_name(node, self.code);
-        let body_limit = get_body_limit(
-            func_name.as_deref(),
-            self.body_limits,
-            self.config.max_body_lines,
-        );
-
-        if node_lines.len() as i64 <= body_limit + 2 {
-            return node_text;
-        }
-
-        // Find the body node.
-        let mut body_node: Option<Node> = None;
+    /// Find the body child of a function/method node.
+    /// Extracted from `compress_function_ast` without behavior change.
+    fn find_child_body(&self, node: Node<'a>) -> Option<Node<'a>> {
+        let mut found = None;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if self.lang.is_body(child.kind()) {
-                body_node = Some(child);
+                found = Some(child);
                 break;
             }
         }
-        let Some(body_node) = body_node else {
-            return node_text;
-        };
+        found
+    }
 
-        let node_start_line = start_row;
-        let body_start_line = body_node.start_position().row;
-        let body_end_line = body_node.end_position().row;
-        let sig_end = body_start_line - node_start_line; // exclusive
-        let body_end_rel = body_end_line - node_start_line + 1; // inclusive
-
-        let signature_lines: Vec<&str>;
-        let mut body_lines: Vec<&str>;
-        let after_lines: Vec<&str>;
-        let brace_in_signature: bool;
-
+    /// Split the node's lines into signature / body / after slices, plus
+    /// whether the opening brace already sits in the signature line.
+    /// Extracted from `compress_function_ast` without behavior change.
+    fn split_sig_body<'s>(
+        &self,
+        node_lines: &[&'s str],
+        sig_end: usize,
+        body_end_rel: usize,
+    ) -> (Vec<&'s str>, Vec<&'s str>, Vec<&'s str>, bool) {
         if sig_end == 0 && !self.lang.uses_colon_after_signature {
             let first_line = node_lines[0];
-            signature_lines = vec![first_line.trim_end()];
-            body_lines = node_lines[1..body_end_rel].to_vec();
-            after_lines = node_lines[body_end_rel..].to_vec();
-            brace_in_signature = true;
+            (
+                vec![first_line.trim_end()],
+                node_lines[1..body_end_rel].to_vec(),
+                node_lines[body_end_rel..].to_vec(),
+                true,
+            )
         } else {
-            signature_lines = node_lines[..sig_end].to_vec();
-            body_lines = node_lines[sig_end..body_end_rel].to_vec();
-            after_lines = node_lines[body_end_rel..].to_vec();
-            brace_in_signature = false;
+            (
+                node_lines[..sig_end].to_vec(),
+                node_lines[sig_end..body_end_rel].to_vec(),
+                node_lines[body_end_rel..].to_vec(),
+                false,
+            )
         }
+    }
 
-        // Brace detection for non-colon languages.
-        let mut opening_brace_line: Option<&str> = None;
-        let mut closing_brace_line: Option<&str> = None;
+    /// Brace detection for non-colon languages: lift the opening/closing
+    /// brace lines off the body slice and return them alongside the
+    /// remainder.
+    /// Extracted from `compress_function_ast` without behavior change.
+    fn split_braces<'s>(
+        &self,
+        brace_in_signature: bool,
+        mut body_lines: Vec<&'s str>,
+    ) -> (Vec<&'s str>, Option<&'s str>, Option<&'s str>) {
+        let mut opening_brace_line: Option<&'s str> = None;
+        let mut closing_brace_line: Option<&'s str> = None;
         if !self.lang.uses_colon_after_signature {
             if brace_in_signature {
                 // opening brace already in signature line.
@@ -2316,8 +2310,14 @@ impl<'a> Ctx<'a> {
                 body_lines = body_lines[..body_lines.len() - 1].to_vec();
             }
         }
+        (body_lines, opening_brace_line, closing_brace_line)
+    }
 
-        // Python docstring handling via AST.
+    /// Python docstring handling via AST: the kept docstring text plus the
+    /// number of body-relative lines it covers (so statement collection
+    /// below can skip them).
+    /// Extracted from `compress_function_ast` without behavior change.
+    fn extract_docstring(&self, body_node: Node, body_lines: &[&str]) -> (String, usize) {
         let mut docstring_text = String::new();
         let mut ds_skip_lines: usize = 0;
         if self.language == CodeLanguage::Python && body_node.child_count() > 0 {
@@ -2351,7 +2351,7 @@ impl<'a> Ctx<'a> {
                             }
                         } else if let Some(first_ds_line) = body_lines.get(ds_start_rel).copied() {
                             docstring_text =
-                                first_line_docstring(first_ds_line, &body_lines, ds_start_rel);
+                                first_line_docstring(first_ds_line, body_lines, ds_start_rel);
                         }
                     }
                     DocstringMode::Remove | DocstringMode::None => {}
@@ -2359,14 +2359,18 @@ impl<'a> Ctx<'a> {
                 ds_skip_lines = ds_start_rel + ds_lines_count;
             }
         }
+        (docstring_text, ds_skip_lines)
+    }
 
-        // Statement-based body truncation.
-        let indent = if !body_lines.is_empty() {
-            detect_indent(&body_lines)
-        } else {
-            "    ".to_string()
-        };
-
+    /// Statement-based body collection: row ranges of the body's named
+    /// statements, skipping the docstring rows, punctuation/comment nodes,
+    /// anonymous nodes, and unwrapping single-wrapper statement lists
+    /// (some grammars, e.g. Go, wrap all body statements in one generic
+    /// list node — treating that wrapper as a single statement makes its
+    /// row range swallow the block's own closing brace line, causing a
+    /// duplicated `}` later).
+    /// Extracted from `compress_function_ast` without behavior change.
+    fn collect_body_stmts(body_node: Node, ds_skip_lines: usize) -> Vec<(usize, usize)> {
         let mut ds_end_row: i64 = -1;
         if ds_skip_lines > 0 && body_node.child_count() > 0 {
             ds_end_row = (body_node.start_position().row + ds_skip_lines) as i64 - 1;
@@ -2411,13 +2415,24 @@ impl<'a> Ctx<'a> {
             }
             body_stmts.push((child.start_position().row, child.end_position().row));
         }
+        body_stmts
+    }
 
+    /// Keep head statements within the body limit (always keeping at least
+    /// the first statement). Returns the kept lines plus the total and kept
+    /// line counts for the omission comment.
+    /// Extracted from `compress_function_ast` without behavior change.
+    fn keep_head_stmts(
+        &self,
+        body_stmts: &[(usize, usize)],
+        body_limit: i64,
+    ) -> (Vec<&str>, i64, i64) {
         let total_body_lines_count: i64 =
             body_stmts.iter().map(|(s, e)| (*e - *s + 1) as i64).sum();
 
         let mut kept_lines: Vec<&str> = Vec::new();
         let mut kept_line_count: i64 = 0;
-        for (s_row, e_row) in &body_stmts {
+        for (s_row, e_row) in body_stmts {
             let stmt_lines: Vec<&str> = self.code_lines[*s_row..=*e_row].to_vec();
             let stmt_line_count = stmt_lines.len() as i64;
             // `!kept_lines.is_empty()` == Python's `stmts_kept > 0` guard:
@@ -2428,10 +2443,26 @@ impl<'a> Ctx<'a> {
             kept_lines.extend(stmt_lines);
             kept_line_count += stmt_line_count;
         }
+        (kept_lines, total_body_lines_count, kept_line_count)
+    }
 
-        let omitted_lines = total_body_lines_count - kept_line_count;
-
-        // Assemble.
+    /// Assemble the compressed function text from its parts.
+    /// Extracted from `compress_function_ast` without behavior change.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_function(
+        &self,
+        node: Node,
+        body_node: Node,
+        signature_lines: &[&str],
+        opening_brace_line: Option<&str>,
+        docstring_text: String,
+        kept_lines: &[&str],
+        omitted_lines: i64,
+        indent: &str,
+        after_lines: &[&str],
+        closing_brace_line: Option<&str>,
+        func_name: Option<&str>,
+    ) -> String {
         let mut result_parts: Vec<String> = Vec::new();
         if !signature_lines.is_empty() {
             result_parts.extend(signature_lines.iter().map(|s| s.to_string()));
@@ -2453,9 +2484,9 @@ impl<'a> Ctx<'a> {
         }
         if omitted_lines > 0 {
             result_parts.push(make_omitted_comment(
-                func_name.as_deref(),
+                func_name,
                 omitted_lines,
-                &indent,
+                indent,
                 self.lang.comment_prefix,
                 self.analysis,
             ));
@@ -2470,6 +2501,73 @@ impl<'a> Ctx<'a> {
         }
 
         result_parts.join("\n")
+    }
+
+    /// Compress a function/method body. Mirrors `_compress_function_ast`.
+    fn compress_function_ast(&self, node: Node) -> String {
+        let start_row = node.start_position().row;
+        let end_row = node.end_position().row;
+        let node_lines: Vec<&str> = self.code_lines[start_row..=end_row].to_vec();
+        let node_text = node_lines.join("\n");
+
+        let func_name = get_definition_name(node, self.code);
+        let body_limit = get_body_limit(
+            func_name.as_deref(),
+            self.body_limits,
+            self.config.max_body_lines,
+        );
+
+        if node_lines.len() as i64 <= body_limit + 2 {
+            return node_text;
+        }
+
+        // Find the body node.
+        let Some(body_node) = self.find_child_body(node) else {
+            return node_text;
+        };
+
+        let node_start_line = start_row;
+        let body_start_line = body_node.start_position().row;
+        let body_end_line = body_node.end_position().row;
+        let sig_end = body_start_line - node_start_line; // exclusive
+        let body_end_rel = body_end_line - node_start_line + 1; // inclusive
+
+        let (signature_lines, body_lines, after_lines, brace_in_signature) =
+            self.split_sig_body(&node_lines, sig_end, body_end_rel);
+
+        // Brace detection for non-colon languages.
+        let (body_lines, opening_brace_line, closing_brace_line) =
+            self.split_braces(brace_in_signature, body_lines);
+
+        // Python docstring handling via AST.
+        let (docstring_text, ds_skip_lines) = self.extract_docstring(body_node, &body_lines);
+
+        // Statement-based body truncation.
+        let indent = if !body_lines.is_empty() {
+            detect_indent(&body_lines)
+        } else {
+            "    ".to_string()
+        };
+
+        let body_stmts = Self::collect_body_stmts(body_node, ds_skip_lines);
+        let (kept_lines, total_body_lines_count, kept_line_count) =
+            self.keep_head_stmts(&body_stmts, body_limit);
+        let omitted_lines = total_body_lines_count - kept_line_count;
+
+        // Assemble.
+        self.assemble_function(
+            node,
+            body_node,
+            &signature_lines,
+            opening_brace_line,
+            docstring_text,
+            &kept_lines,
+            omitted_lines,
+            &indent,
+            &after_lines,
+            closing_brace_line,
+            func_name.as_deref(),
+        )
     }
 
     /// Compress a class by compressing each method individually. Mirrors

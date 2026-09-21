@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(parsed.input_tokens_original, 5000);
         assert_eq!(parsed.tokens_saved, 1000);
         assert_eq!(parsed.savings_percent, 20.0);
-        assert_eq!(parsed.cache_hit, true);
+        assert!(parsed.cache_hit);
         assert_eq!(parsed.transforms_applied.len(), 2);
         assert_eq!(parsed.turn_id.as_deref(), Some("turn-42"));
         assert!(parsed.error.is_none());

@@ -982,6 +982,175 @@ fn session_tags(
 
 type UpstreamWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Pre-upgrade origin check: refuse with 403 when the origin is not
+/// allowed (Python closes 1008 without accepting; over HTTP the equivalent
+/// is refusing the upgrade). Returns the refusal, or `None` to proceed.
+/// Extracted from `ws_codex_handler` without behavior change.
+fn refuse_disallowed_origin(
+    request_id: &str,
+    session_id: &str,
+    path: &str,
+    origin: Option<&str>,
+    allowed: Option<&[String]>,
+) -> Option<Response<Body>> {
+    if is_allowed_websocket_origin(origin, allowed) {
+        return None;
+    }
+    tracing::warn!(
+        event = "websocket_origin_not_allowed",
+        request_id = %request_id,
+        session_id = %session_id,
+        path = %path,
+        origin = ?origin,
+        "codex ws origin refused"
+    );
+    Some(
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("origin not allowed"))
+            .expect("static response"),
+    )
+}
+
+/// Upstream header build (openai.py 3936-3981): forward client headers
+/// except the WS-skipped and internal ones, stamp `x-client: codex`, route
+/// ChatGPT subscription vs API key, and drop the client-only lite header
+/// OpenAI rejects on newer Codex models (openai.py 3976-3981). Returns the
+/// headers plus the ChatGPT routing decision.
+/// Extracted from `ws_codex_handler` without behavior change.
+fn build_codex_upstream_headers(
+    headers: &HeaderMap,
+    strip_internal: bool,
+    stamped: bool,
+) -> (HeaderMap, bool) {
+    let mut upstream_headers = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if WS_SKIP_HEADERS.contains(&lower.as_str()) {
+            continue;
+        }
+        if strip_internal && lower.starts_with(crate::headers::INTERNAL_HEADER_PREFIX) {
+            continue;
+        }
+        upstream_headers.append(name.clone(), value.clone());
+    }
+    if stamped {
+        upstream_headers.insert(
+            HeaderName::from_static("x-client"),
+            HeaderValue::from_static("codex"),
+        );
+    }
+    let is_chatgpt = resolve_codex_routing(&mut upstream_headers);
+    // OpenAI rejects newer Codex models when this client-only lite header
+    // leaks upstream (openai.py 3976-3981).
+    upstream_headers.remove(CODEX_LITE_HEADER);
+    (upstream_headers, is_chatgpt)
+}
+
+/// Auth fallback: inject OPENAI_API_KEY when the client sent none.
+/// Extracted from `ws_codex_handler` without behavior change.
+fn inject_api_key_fallback(upstream_headers: &mut HeaderMap, request_id: &str) {
+    if upstream_headers.contains_key(http::header::AUTHORIZATION) {
+        return;
+    }
+    match std::env::var("OPENAI_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => {
+            if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", key.trim())) {
+                upstream_headers.insert(http::header::AUTHORIZATION, v);
+            }
+        }
+        _ => {
+            tracing::warn!(
+                request_id = %request_id,
+                "codex ws: no authorization header and OPENAI_API_KEY unset"
+            );
+        }
+    }
+}
+
+/// OpenAI-Beta merge (openai.py 4034-4087). SessionBetaTracker skipped:
+/// WS session ids are fresh uuids so stickiness is a per-connection no-op;
+/// the deterministic merge is the effective behavior.
+/// Extracted from `ws_codex_handler` without behavior change.
+fn merge_codex_beta(upstream_headers: &mut HeaderMap) {
+    let client_beta = upstream_headers
+        .get("openai-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let merged =
+        crate::headers::merge_beta_tokens(client_beta.as_deref(), &[RESPONSES_WS_REQUIRED_BETA]);
+    if !merged.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&merged) {
+            upstream_headers.insert(HeaderName::from_static("openai-beta"), v);
+        }
+    }
+}
+
+/// Upstream URL (openai.py 3984-3995): the ChatGPT WS endpoint for ChatGPT
+/// landings, otherwise this route's own upstream re-pointed at
+/// `/v1/responses` over ws/wss.
+/// Extracted from `ws_codex_handler` without behavior change.
+fn codex_upstream_url(is_chatgpt: bool, upstream: &url::Url) -> url::Url {
+    if is_chatgpt {
+        CHATGPT_CODEX_WS_URL.parse().expect("static url")
+    } else {
+        let mut u = upstream.clone();
+        let scheme = match u.scheme() {
+            "https" | "wss" => "wss",
+            _ => "ws",
+        };
+        let _ = u.set_scheme(scheme);
+        u.set_path("/v1/responses");
+        u.set_query(None);
+        u
+    }
+}
+
+/// Split the upstream handshake: forward `x-codex-*` (subscription
+/// rate-limit window, openai.py:614-640) AND `set-cookie` (session affinity —
+/// asserted by e2e_ws_codex_usage_headers.py) from the upstream handshake
+/// onto the client 101. NEVER `authorization` or anything else. A failed
+/// connect yields no stream and no headers — the session falls back to HTTP
+/// streaming. The codex rate-limit state + usage poll subsystems have no
+/// Rust counterpart — skipped.
+/// Extracted from `ws_codex_handler` without behavior change.
+fn split_handshake_headers(
+    connect_result: Result<
+        (
+            UpstreamWs,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        String,
+    >,
+    request_id: &str,
+    session_id: &str,
+    upstream_url: &url::Url,
+) -> (Option<UpstreamWs>, Vec<(HeaderName, HeaderValue)>) {
+    match connect_result {
+        Ok((stream, resp)) => {
+            let codex_headers = resp
+                .headers()
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str().starts_with("x-codex-") || *name == http::header::SET_COOKIE
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            (Some(stream), codex_headers)
+        }
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                session_id = %session_id,
+                upstream = %upstream_url,
+                error = %e,
+                "codex ws upstream connect failed; will fall back to HTTP streaming"
+            );
+            (None, Vec::new())
+        }
+    }
+}
+
 /// Entry point for the four Codex responses WS paths. Performs the
 /// pre-upgrade origin check, header prep, and — critically — connects the
 /// upstream BEFORE returning the 101 so the upstream's `x-codex-*`
@@ -1008,19 +1177,10 @@ pub async fn ws_codex_handler(
     // accepting; over HTTP the equivalent is refusing the upgrade). ──
     let origin = headers.get("origin").and_then(|v| v.to_str().ok());
     let allowed = allowed_ws_origins_from_env();
-    if !is_allowed_websocket_origin(origin, allowed.as_deref()) {
-        tracing::warn!(
-            event = "websocket_origin_not_allowed",
-            request_id = %request_id,
-            session_id = %session_id,
-            path = %path,
-            origin = ?origin,
-            "codex ws origin refused"
-        );
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from("origin not allowed"))
-            .expect("static response");
+    if let Some(refusal) =
+        refuse_disallowed_origin(&request_id, &session_id, &path, origin, allowed.as_deref())
+    {
+        return refusal;
     }
 
     // ── Client classification + codex stamping (auth_mode.py:267-282) ──
@@ -1041,74 +1201,17 @@ pub async fn ws_codex_handler(
 
     // ── Upstream header build (openai.py 3936-3981) ──
     let strip_internal = state.config.strip_internal_headers.is_enabled();
-    let mut upstream_headers = HeaderMap::new();
-    for (name, value) in headers.iter() {
-        let lower = name.as_str().to_ascii_lowercase();
-        if WS_SKIP_HEADERS.contains(&lower.as_str()) {
-            continue;
-        }
-        if strip_internal && lower.starts_with(crate::headers::INTERNAL_HEADER_PREFIX) {
-            continue;
-        }
-        upstream_headers.append(name.clone(), value.clone());
-    }
-    if stamped {
-        upstream_headers.insert(
-            HeaderName::from_static("x-client"),
-            HeaderValue::from_static("codex"),
-        );
-    }
-    let is_chatgpt = resolve_codex_routing(&mut upstream_headers);
-    // OpenAI rejects newer Codex models when this client-only lite header
-    // leaks upstream (openai.py 3976-3981).
-    upstream_headers.remove(CODEX_LITE_HEADER);
+    let (mut upstream_headers, is_chatgpt) =
+        build_codex_upstream_headers(&headers, strip_internal, stamped);
 
     // Auth fallback: inject OPENAI_API_KEY when the client sent none.
-    if !upstream_headers.contains_key(http::header::AUTHORIZATION) {
-        match std::env::var("OPENAI_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => {
-                if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", key.trim())) {
-                    upstream_headers.insert(http::header::AUTHORIZATION, v);
-                }
-            }
-            _ => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    "codex ws: no authorization header and OPENAI_API_KEY unset"
-                );
-            }
-        }
-    }
+    inject_api_key_fallback(&mut upstream_headers, &request_id);
 
-    // OpenAI-Beta merge (openai.py 4034-4087). SessionBetaTracker skipped:
-    // WS session ids are fresh uuids so stickiness is a per-connection no-op;
-    // the deterministic merge is the effective behavior.
-    let client_beta = upstream_headers
-        .get("openai-beta")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let merged =
-        crate::headers::merge_beta_tokens(client_beta.as_deref(), &[RESPONSES_WS_REQUIRED_BETA]);
-    if !merged.is_empty() {
-        if let Ok(v) = HeaderValue::from_str(&merged) {
-            upstream_headers.insert(HeaderName::from_static("openai-beta"), v);
-        }
-    }
+    // OpenAI-Beta merge (openai.py 4034-4087).
+    merge_codex_beta(&mut upstream_headers);
 
     // ── Upstream URL (openai.py 3984-3995) ──
-    let upstream_url: url::Url = if is_chatgpt {
-        CHATGPT_CODEX_WS_URL.parse().expect("static url")
-    } else {
-        let mut u = state.config.upstream.clone();
-        let scheme = match u.scheme() {
-            "https" | "wss" => "wss",
-            _ => "ws",
-        };
-        let _ = u.set_scheme(scheme);
-        u.set_path("/v1/responses");
-        u.set_query(None);
-        u
-    };
+    let upstream_url: url::Url = codex_upstream_url(is_chatgpt, &state.config.upstream);
 
     let subprotocols: Vec<String> = headers
         .get("sec-websocket-protocol")
@@ -1128,36 +1231,7 @@ pub async fn ws_codex_handler(
     let upstream_connect_ms = connect_started.elapsed().as_secs_f64() * 1000.0;
 
     let (upstream, codex_headers): (Option<UpstreamWs>, Vec<(HeaderName, HeaderValue)>) =
-        match connect_result {
-            Ok((stream, resp)) => {
-                // Forward `x-codex-*` (subscription rate-limit window,
-                // openai.py:614-640) AND `set-cookie` (session affinity —
-                // asserted by e2e_ws_codex_usage_headers.py) from the
-                // upstream handshake onto the client 101. NEVER
-                // `authorization` or anything else. The codex rate-limit
-                // state + usage poll subsystems have no Rust counterpart —
-                // skipped.
-                let codex_headers = resp
-                    .headers()
-                    .iter()
-                    .filter(|(name, _)| {
-                        name.as_str().starts_with("x-codex-") || *name == http::header::SET_COOKIE
-                    })
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect();
-                (Some(stream), codex_headers)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    session_id = %session_id,
-                    upstream = %upstream_url,
-                    error = %e,
-                    "codex ws upstream connect failed; will fall back to HTTP streaming"
-                );
-                (None, Vec::new())
-            }
-        };
+        split_handshake_headers(connect_result, &request_id, &session_id, &upstream_url);
 
     let ctx = SessionCtx {
         state,
@@ -1460,182 +1534,31 @@ async fn run_codex_session_inner(
     let session_started = Instant::now();
 
     // ── First frame (openai.py 4246-4331) ──
-    let first_msg = match tokio::time::timeout(
-        first_frame_timeout(),
-        recv_first_text(&mut client_stream),
-    )
-    .await
-    {
-        Err(_elapsed) => {
-            let _ = client_sink
-                .send(AxMsg::Close(Some(CloseFrame {
-                    code: 1001,
-                    reason: "first-frame timeout".into(),
-                })))
-                .await;
-            // Idempotent upstream close backstop (openai.py 5990-5992):
-            // the upstream connected but the client never spoke.
-            if let Some(mut up) = upstream {
-                let _ = up.close(None).await;
-            }
-            return SessionEnd::of(TerminationCause::ClientTimeout);
-        }
-        Ok(None) => {
-            if let Some(mut up) = upstream {
-                let _ = up.close(None).await;
-            }
-            let mut t = totals.lock().expect("totals lock");
-            t.ws_client_disconnect_seen = true;
-            return SessionEnd::of(TerminationCause::ClientDisconnect);
-        }
-        Ok(Some(text)) => text,
-    };
+    let (first_msg, upstream) =
+        match receive_first_frame(&mut client_stream, &mut client_sink, upstream, totals).await {
+            Ok(pair) => pair,
+            Err(end) => return end,
+        };
     *first_client_frame_ms = Some(session_started.elapsed().as_secs_f64() * 1000.0);
 
     // Best-effort parse for model + num_messages (openai.py 4310-4314).
-    {
-        let mut t = totals.lock().expect("totals lock");
-        if let Ok(parsed) = serde_json::from_str::<Value>(&first_msg) {
-            let inner = parsed
-                .get("response")
-                .filter(|v| v.is_object())
-                .unwrap_or(&parsed);
-            t.model = inner
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            t.num_messages = inner
-                .get("messages")
-                .or_else(|| inner.get("input"))
-                .and_then(Value::as_array)
-                .map(|a| a.len() as i64)
-                .unwrap_or(0);
-        }
-        t.ws_client_frames_total += 1;
-        if let Ok(parsed) = serde_json::from_str::<Value>(&first_msg) {
-            if let Some(ty) = parsed.get("type").and_then(Value::as_str) {
-                t.ws_last_client_frame_type = Some(ty.to_string());
-                if ty == "response.create" {
-                    t.ws_response_create_frames += 1;
-                }
-            }
-        }
-    }
+    note_first_frame_shape(totals, &first_msg);
 
     // ── First-frame compression: fail-CLOSED via the decision matrix
     // (openai.py 4647-4859) ──
-    let mut first_msg_raw = first_msg;
-    if ctx.bypass {
-        tracing::info!(
-            request_id = %ctx.request_id,
-            reason = "bypass_header",
-            "codex ws first-frame compression skipped"
-        );
-    } else {
-        let comp_started = Instant::now();
-        let attempt = compress_frame_bounded(
-            first_msg_raw.clone(),
-            ctx.mode,
-            ctx.auth_mode,
-            ctx.request_id.clone(),
-            ctx.state.config.exclude_tools.clone(),
-        )
-        .await;
-        let elapsed_ms = comp_started.elapsed().as_secs_f64() * 1000.0;
-        *compression_ms = Some(elapsed_ms);
-        match attempt {
-            CompressAttempt::Done(FrameCompression::Compressed {
-                text,
-                tokens_before,
-                tokens_after,
-                strategies,
-                bytes_before,
-                bytes_after,
-            }) => {
-                let mut t = totals.lock().expect("totals lock");
-                t.add_compression(tokens_before, tokens_after, &strategies);
-                t.overhead_ms_total += elapsed_ms;
-                tracing::info!(
-                    request_id = %ctx.request_id,
-                    bytes_before,
-                    bytes_after,
-                    tokens_before,
-                    tokens_after,
-                    "codex ws first frame compressed"
-                );
-                first_msg_raw = text;
-            }
-            CompressAttempt::Done(FrameCompression::Passthrough { reason }) => {
-                let mut t = totals.lock().expect("totals lock");
-                t.overhead_ms_total += elapsed_ms;
-                tracing::debug!(
-                    request_id = %ctx.request_id,
-                    reason,
-                    "codex ws first frame passthrough"
-                );
-            }
-            failure @ (CompressAttempt::Timeout | CompressAttempt::Panicked) => {
-                let is_timeout = matches!(failure, CompressAttempt::Timeout);
-                // The fail-open env override was resolved once at startup
-                // into `AppState.compression_failure_action` (proxy.rs) —
-                // its reason is `env_override:fail_open` iff the operator
-                // opted back into legacy fail-open. Per-request inputs
-                // (codex client, timeout, frame size) are resolved here.
-                // The threshold is not carried by the startup struct, so it
-                // comes from the same module's env parser (Python also
-                // reads it at decision time).
-                let fail_open =
-                    ctx.state.compression_failure_action.reason == "env_override:fail_open";
-                let threshold = oversize_threshold_bytes(
-                    std::env::var(WS_COMPRESSION_OVERSIZE_BYTES_ENV)
-                        .ok()
-                        .as_deref(),
-                );
-                let is_codex = ctx.client.as_deref() == Some("codex");
-                let action = decide_compression_failure_action(
-                    fail_open,
-                    is_codex,
-                    is_timeout,
-                    first_msg_raw.len(),
-                    threshold,
-                );
-                tracing::warn!(
-                    request_id = %ctx.request_id,
-                    refuse = action.refuse,
-                    reason = %action.reason,
-                    frame_bytes = action.frame_bytes,
-                    "codex ws first-frame compression failed"
-                );
-                crate::observability::proxy_counters::record_compression_failed(
-                    compression_failure_metric_reason(&action.reason),
-                );
-                if action.refuse {
-                    let reason = format!(
-                        "headroom: compression {} — please compact context and retry",
-                        action.reason
-                    );
-                    let _ = client_sink
-                        .send(AxMsg::Close(Some(CloseFrame {
-                            code: 1009,
-                            reason: reason.into(),
-                        })))
-                        .await;
-                    if let Some(mut up) = upstream {
-                        let _ = up.close(None).await;
-                    }
-                    // The registry TerminationCause enum has no
-                    // `compression_refused` variant; register as ClientError
-                    // and keep the Python label for tags/logs.
-                    return SessionEnd {
-                        cause: TerminationCause::ClientError,
-                        cause_label: "compression_refused".to_string(),
-                    };
-                }
-                // forward original (fail-open branch of the matrix)
-            }
-        }
-    }
+    let (first_msg_raw, upstream) = match compress_first_frame(
+        &mut client_sink,
+        ctx,
+        totals,
+        first_msg,
+        upstream,
+        compression_ms,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(end) => return end,
+    };
 
     // ── HTTP fallback when upstream WS never connected (openai.py
     // 5779-5797, 6052+) ──
@@ -1918,26 +1841,243 @@ async fn run_codex_session_inner(
     ))
 }
 
+/// Receive the client's first frame within the open timeout, closing the
+/// upstream backstop on every dead end. Returns the frame text (with the
+/// upstream back for the relay) or the terminal end.
+/// Extracted from `run_codex_session_inner` without behavior change.
+async fn receive_first_frame(
+    client_stream: &mut SplitStream<WebSocket>,
+    client_sink: &mut SplitSink<WebSocket, AxMsg>,
+    upstream: Option<UpstreamWs>,
+    totals: &Arc<Mutex<SessionTotals>>,
+) -> Result<(String, Option<UpstreamWs>), SessionEnd> {
+    match tokio::time::timeout(first_frame_timeout(), recv_first_text(client_stream)).await {
+        Err(_elapsed) => {
+            let _ = client_sink
+                .send(AxMsg::Close(Some(CloseFrame {
+                    code: 1001,
+                    reason: "first-frame timeout".into(),
+                })))
+                .await;
+            // Idempotent upstream close backstop (openai.py 5990-5992):
+            // the upstream connected but the client never spoke.
+            if let Some(mut up) = upstream {
+                let _ = up.close(None).await;
+            }
+            Err(SessionEnd::of(TerminationCause::ClientTimeout))
+        }
+        Ok(None) => {
+            if let Some(mut up) = upstream {
+                let _ = up.close(None).await;
+            }
+            let mut t = totals.lock().expect("totals lock");
+            t.ws_client_disconnect_seen = true;
+            Err(SessionEnd::of(TerminationCause::ClientDisconnect))
+        }
+        Ok(Some(text)) => Ok((text, upstream)),
+    }
+}
+
+/// Best-effort census of the first frame for model + message counts.
+/// Extracted from `run_codex_session_inner` without behavior change.
+fn note_first_frame_shape(totals: &Arc<Mutex<SessionTotals>>, first_msg: &str) {
+    // Best-effort parse for model + num_messages (openai.py 4310-4314).
+    let mut t = totals.lock().expect("totals lock");
+    if let Ok(parsed) = serde_json::from_str::<Value>(first_msg) {
+        let inner = parsed
+            .get("response")
+            .filter(|v| v.is_object())
+            .unwrap_or(&parsed);
+        t.model = inner
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        t.num_messages = inner
+            .get("messages")
+            .or_else(|| inner.get("input"))
+            .and_then(Value::as_array)
+            .map(|a| a.len() as i64)
+            .unwrap_or(0);
+    }
+    t.ws_client_frames_total += 1;
+    if let Ok(parsed) = serde_json::from_str::<Value>(first_msg) {
+        if let Some(ty) = parsed.get("type").and_then(Value::as_str) {
+            t.ws_last_client_frame_type = Some(ty.to_string());
+            if ty == "response.create" {
+                t.ws_response_create_frames += 1;
+            }
+        }
+    }
+}
+
+/// Compress the first frame under the fail-CLOSED decision matrix. Returns
+/// the bytes to forward (with the upstream back for the relay) or, on a
+/// refused failure, the terminal end.
+/// Extracted from `run_codex_session_inner` without behavior change.
+async fn compress_first_frame(
+    client_sink: &mut SplitSink<WebSocket, AxMsg>,
+    ctx: &SessionCtx,
+    totals: &Arc<Mutex<SessionTotals>>,
+    first_msg: String,
+    upstream: Option<UpstreamWs>,
+    compression_ms: &mut Option<f64>,
+) -> Result<(String, Option<UpstreamWs>), SessionEnd> {
+    // ── First-frame compression: fail-CLOSED via the decision matrix
+    // (openai.py 4647-4859) ──
+    let first_msg_raw = first_msg;
+    if ctx.bypass {
+        tracing::info!(
+            request_id = %ctx.request_id,
+            reason = "bypass_header",
+            "codex ws first-frame compression skipped"
+        );
+        return Ok((first_msg_raw, upstream));
+    }
+    let comp_started = Instant::now();
+    let attempt = compress_frame_bounded(
+        first_msg_raw.clone(),
+        ctx.mode,
+        ctx.auth_mode,
+        ctx.request_id.clone(),
+        ctx.state.config.exclude_tools.clone(),
+    )
+    .await;
+    let elapsed_ms = comp_started.elapsed().as_secs_f64() * 1000.0;
+    *compression_ms = Some(elapsed_ms);
+    match attempt {
+        CompressAttempt::Done(FrameCompression::Compressed {
+            text,
+            tokens_before,
+            tokens_after,
+            strategies,
+            bytes_before,
+            bytes_after,
+        }) => {
+            let mut t = totals.lock().expect("totals lock");
+            t.add_compression(tokens_before, tokens_after, &strategies);
+            t.overhead_ms_total += elapsed_ms;
+            tracing::info!(
+                request_id = %ctx.request_id,
+                bytes_before,
+                bytes_after,
+                tokens_before,
+                tokens_after,
+                "codex ws first frame compressed"
+            );
+            Ok((text, upstream))
+        }
+        CompressAttempt::Done(FrameCompression::Passthrough { reason }) => {
+            let mut t = totals.lock().expect("totals lock");
+            t.overhead_ms_total += elapsed_ms;
+            tracing::debug!(
+                request_id = %ctx.request_id,
+                reason,
+                "codex ws first frame passthrough"
+            );
+            Ok((first_msg_raw, upstream))
+        }
+        failure @ (CompressAttempt::Timeout | CompressAttempt::Panicked) => {
+            return handle_compression_failure(client_sink, ctx, first_msg_raw, upstream, failure)
+                .await;
+        }
+    }
+}
+
+/// Resolve a first-frame compression failure through the fail-closed matrix:
+/// refuse with a client close, or fail open with the original frame.
+/// Extracted from `compress_first_frame` without behavior change.
+async fn handle_compression_failure(
+    client_sink: &mut SplitSink<WebSocket, AxMsg>,
+    ctx: &SessionCtx,
+    first_msg_raw: String,
+    upstream: Option<UpstreamWs>,
+    failure: CompressAttempt,
+) -> Result<(String, Option<UpstreamWs>), SessionEnd> {
+    let is_timeout = matches!(failure, CompressAttempt::Timeout);
+    // The fail-open env override was resolved once at startup
+    // into `AppState.compression_failure_action` (proxy.rs) —
+    // its reason is `env_override:fail_open` iff the operator
+    // opted back into legacy fail-open. Per-request inputs
+    // (codex client, timeout, frame size) are resolved here.
+    // The threshold is not carried by the startup struct, so it
+    // comes from the same module's env parser (Python also
+    // reads it at decision time).
+    let fail_open = ctx.state.compression_failure_action.reason == "env_override:fail_open";
+    let threshold = oversize_threshold_bytes(
+        std::env::var(WS_COMPRESSION_OVERSIZE_BYTES_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let is_codex = ctx.client.as_deref() == Some("codex");
+    let action = decide_compression_failure_action(
+        fail_open,
+        is_codex,
+        is_timeout,
+        first_msg_raw.len(),
+        threshold,
+    );
+    tracing::warn!(
+        request_id = %ctx.request_id,
+        refuse = action.refuse,
+        reason = %action.reason,
+        frame_bytes = action.frame_bytes,
+        "codex ws first-frame compression failed"
+    );
+    crate::observability::proxy_counters::record_compression_failed(
+        compression_failure_metric_reason(&action.reason),
+    );
+    if action.refuse {
+        let reason = format!(
+            "headroom: compression {} — please compact context and retry",
+            action.reason
+        );
+        let _ = client_sink
+            .send(AxMsg::Close(Some(CloseFrame {
+                code: 1009,
+                reason: reason.into(),
+            })))
+            .await;
+        if let Some(mut up) = upstream {
+            let _ = up.close(None).await;
+        }
+        // The registry TerminationCause enum has no
+        // `compression_refused` variant; register as ClientError
+        // and keep the Python label for tags/logs.
+        return Err(SessionEnd {
+            cause: TerminationCause::ClientError,
+            cause_label: "compression_refused".to_string(),
+        });
+    }
+    // forward original (fail-open branch of the matrix)
+    Ok((first_msg_raw, upstream))
+}
+
 /// HTTP POST + SSE→WS relay when the upstream WS connect failed entirely.
 /// Port of `_ws_http_fallback` (openai.py 6052+). The body is the
 /// already-compressed first frame with the envelope unwrapped and
 /// `stream: true` forced.
-async fn ws_http_fallback(
-    client_sink: &mut SplitSink<WebSocket, AxMsg>,
-    first_msg_raw: &str,
-    ctx: &SessionCtx,
-) {
-    let http_url = if ctx.is_chatgpt {
+/// Fallback POST target: the ChatGPT Codex HTTP endpoint for ChatGPT
+/// landings, otherwise this route's own upstream re-pointed at
+/// `/v1/responses`.
+/// Extracted from `ws_http_fallback` without behavior change.
+fn fallback_http_url(ctx: &SessionCtx) -> String {
+    if ctx.is_chatgpt {
         CHATGPT_CODEX_HTTP_URL.to_string()
     } else {
         let mut u = ctx.state.config.upstream.clone();
         u.set_path("/v1/responses");
         u.set_query(None);
         u.to_string()
-    };
+    }
+}
 
-    // Normalize the WS response.create payload into the HTTP request body.
-    let mut http_body: Value = match serde_json::from_str::<Value>(first_msg_raw) {
+/// Normalize the WS `response.create` payload into the HTTP request body:
+/// unwrap the inner `response` object when present, drop the WS envelope
+/// `type`, and fall back to an empty object when the frame is not JSON.
+/// Extracted from `ws_http_fallback` without behavior change.
+fn fallback_http_body(first_msg_raw: &str) -> Value {
+    match serde_json::from_str::<Value>(first_msg_raw) {
         Ok(parsed) => {
             if let Some(inner) = parsed.get("response").filter(|v| v.is_object()) {
                 inner.clone()
@@ -1957,51 +2097,35 @@ async fn ws_http_fallback(
             }
         }
         Err(_) => Value::Object(serde_json::Map::new()),
-    };
-    if let Some(map) = http_body.as_object_mut() {
-        map.insert("stream".to_string(), Value::Bool(true));
     }
-    let body_bytes = match serde_json::to_vec(&http_body) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(request_id = %ctx.request_id, error = %e, "ws http fallback: body serialize failed");
-            return;
-        }
-    };
+}
 
-    let mut headers = ctx.upstream_headers.clone();
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-
-    tracing::info!(
-        request_id = %ctx.request_id,
-        url = %http_url,
-        "codex ws → HTTP fallback POST"
-    );
-
+/// POST the fallback body with the route's retry budget. Bounds connect +
+/// send + response headers, the phases httpx covers with connect/write/read.
+/// The response body is deliberately outside it: a per-request reqwest
+/// timeout would cap the whole turn. Returns `None` when every attempt
+/// failed or timed out.
+/// Extracted from `ws_http_fallback` without behavior change.
+async fn post_fallback_with_retry(
+    ctx: &SessionCtx,
+    http_url: &str,
+    headers: HeaderMap,
+    body_bytes: Vec<u8>,
+) -> Option<reqwest::Response> {
     let attempts = ctx.state.config.retry_max_attempts.max(1);
-    let mut response = None;
     for attempt in 0..attempts {
-        // Bounds connect + send + response headers, the phases httpx covers
-        // with connect/write/read. The response body is deliberately outside
-        // it: a per-request reqwest timeout would cap the whole turn.
         let attempt_result = tokio::time::timeout(
             WS_HTTP_FALLBACK_READ_TIMEOUT,
             ctx.state
                 .client
-                .post(&http_url)
+                .post(http_url)
                 .headers(headers.clone())
                 .body(body_bytes.clone())
                 .send(),
         )
         .await;
         match attempt_result {
-            Ok(Ok(resp)) => {
-                response = Some(resp);
-                break;
-            }
+            Ok(Ok(resp)) => return Some(resp),
             Ok(Err(e)) => {
                 tracing::warn!(
                     request_id = %ctx.request_id,
@@ -2028,39 +2152,29 @@ async fn ws_http_fallback(
             }
         }
     }
-    let Some(response) = response else {
-        let error_event = serde_json::json!({
-            "type": "error",
-            "error": {"type": "server_error", "message": "Upstream unreachable"},
-        });
-        let _ = client_sink
-            .send(AxMsg::Text(error_event.to_string().into()))
-            .await;
-        return;
-    };
+    None
+}
 
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status().as_u16();
-        tracing::warn!(
-            request_id = %ctx.request_id,
-            status,
-            "ws http fallback got non-200"
-        );
-        let error_event = serde_json::json!({
-            "type": "error",
-            "error": {
-                "type": "server_error",
-                "message": format!("Upstream returned {status}"),
-            },
-        });
-        let _ = client_sink
-            .send(AxMsg::Text(error_event.to_string().into()))
-            .await;
-        return;
-    }
+/// Send a terminal `error` event down the client socket.
+/// Extracted from `ws_http_fallback` without behavior change.
+async fn send_fallback_error(client_sink: &mut SplitSink<WebSocket, AxMsg>, message: String) {
+    let error_event = serde_json::json!({
+        "type": "error",
+        "error": {"type": "server_error", "message": message},
+    });
+    let _ = client_sink
+        .send(AxMsg::Text(error_event.to_string().into()))
+        .await;
+}
 
-    // Relay SSE `data:` lines as WS text frames. The 120s bound is a gap
-    // between chunks, not a cap on the turn.
+/// Relay SSE `data:` lines from the fallback response as WS text frames.
+/// The 120s bound is a gap between chunks, not a cap on the turn.
+/// Extracted from `ws_http_fallback` without behavior change.
+async fn relay_fallback_sse(
+    client_sink: &mut SplitSink<WebSocket, AxMsg>,
+    response: reqwest::Response,
+    request_id: &str,
+) {
     let mut stream = Box::pin(with_idle_gap(
         Box::pin(response.bytes_stream()),
         WS_HTTP_FALLBACK_READ_TIMEOUT,
@@ -2071,7 +2185,7 @@ async fn ws_http_fallback(
             Ok(chunk) => chunk,
             Err(e) => {
                 tracing::warn!(
-                    request_id = %ctx.request_id,
+                    request_id = %request_id,
                     error = ?e,
                     "ws http fallback stream ended early"
                 );
@@ -2100,6 +2214,65 @@ async fn ws_http_fallback(
             // `event:` lines are skipped — the data line carries the type.
         }
     }
+}
+
+/// Serialize the fallback body, logging and returning `None` when it fails.
+/// Extracted from `ws_http_fallback` without behavior change.
+fn serialize_fallback_body(http_body: &Value, request_id: &str) -> Option<Vec<u8>> {
+    match serde_json::to_vec(http_body) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(request_id = %request_id, error = %e, "ws http fallback: body serialize failed");
+            None
+        }
+    }
+}
+
+async fn ws_http_fallback(
+    client_sink: &mut SplitSink<WebSocket, AxMsg>,
+    first_msg_raw: &str,
+    ctx: &SessionCtx,
+) {
+    let http_url = fallback_http_url(ctx);
+
+    // Normalize the WS response.create payload into the HTTP request body.
+    let mut http_body: Value = fallback_http_body(first_msg_raw);
+    if let Some(map) = http_body.as_object_mut() {
+        map.insert("stream".to_string(), Value::Bool(true));
+    }
+    let Some(body_bytes) = serialize_fallback_body(&http_body, &ctx.request_id) else {
+        return;
+    };
+
+    let mut headers = ctx.upstream_headers.clone();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+
+    tracing::info!(
+        request_id = %ctx.request_id,
+        url = %http_url,
+        "codex ws → HTTP fallback POST"
+    );
+
+    let Some(response) = post_fallback_with_retry(ctx, &http_url, headers, body_bytes).await else {
+        send_fallback_error(client_sink, "Upstream unreachable".to_string()).await;
+        return;
+    };
+
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status().as_u16();
+        tracing::warn!(
+            request_id = %ctx.request_id,
+            status,
+            "ws http fallback got non-200"
+        );
+        send_fallback_error(client_sink, format!("Upstream returned {status}")).await;
+        return;
+    }
+
+    relay_fallback_sse(client_sink, response, &ctx.request_id).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

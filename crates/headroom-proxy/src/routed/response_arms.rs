@@ -204,31 +204,21 @@ pub(crate) async fn read_routed_body(
     })
 }
 
-/// One buffered fold for both wire shapes (C6). Parse and translate branch
-/// on the shape decided once in translation; the read, resolve-and-book
-/// envelope, restore, and response envelope are shared. Log strings stay
-/// per-shape so log bytes are unchanged by the merge.
-pub(crate) async fn fold_buffered(
-    upstream_resp: reqwest::Response,
-    original: &Value,
-    upstream_status: StatusCode,
-    is_responses: bool,
-    outcome: Option<RoutedOutcomeContext>,
-    ccr: Option<RoutedCcr>,
-) -> Response {
-    let body_text = match read_routed_body(upstream_resp, upstream_status, outcome.as_ref()).await {
-        Ok(text) => text,
-        Err(response) => return response,
-    };
-
-    let (parsed_body, output_tokens) = if is_responses {
+/// Parse one buffered upstream body into the turn plus its output-token
+/// count, branching on the shape decided once in translation. `Err` is the
+/// 502 to return directly (cut stream with no terminal on the Responses
+/// shape, parse failure on the chat shape).
+/// Extracted from `fold_buffered` without behavior change.
+#[allow(clippy::result_large_err)]
+fn parse_buffered_turn(body_text: &str, is_responses: bool) -> Result<(Value, i64), Response> {
+    if is_responses {
         // A gateway honoring stream:false answers buffered JSON, which the
         // SSE fold below would flatten to an empty turn. Prefer a body that
         // already is a turn.
-        match serde_json::from_str::<Value>(&body_text) {
-            Ok(v) if v.get("output").and_then(|o| o.as_array()).is_some() => (v, 0),
+        match serde_json::from_str::<Value>(body_text) {
+            Ok(v) if v.get("output").and_then(|o| o.as_array()).is_some() => Ok((v, 0)),
             _ => {
-                let (turn, tokens) = responses_stream_to_turn(&body_text);
+                let (turn, tokens) = responses_stream_to_turn(body_text);
                 let empty = turn
                     .get("output")
                     .and_then(|o| o.as_array())
@@ -251,31 +241,87 @@ pub(crate) async fn fold_buffered(
                         body_head = %body_text.chars().take(200).collect::<String>(),
                         "routed Responses body folded to zero output blocks with no terminal event"
                     );
-                    return Response::builder()
+                    return Err(Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
                         .body(Body::from(
                             "upstream response ended before producing content",
                         ))
-                        .expect("static response");
+                        .expect("static response"));
                 }
-                (turn, tokens as i64)
+                Ok((turn, tokens as i64))
             }
         }
     } else {
-        match serde_json::from_str(&body_text) {
-            Ok(v) => (v, 0),
+        match serde_json::from_str(body_text) {
+            Ok(v) => Ok((v, 0)),
             Err(e) => {
                 tracing::warn!(
                     event = "local_model_response_parse_error",
                     error = %e,
                     "failed to parse OpenAI response JSON"
                 );
-                return Response::builder()
+                Err(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
                     .body(Body::from("failed to parse upstream response"))
-                    .expect("static response");
+                    .expect("static response"))
             }
         }
+    }
+}
+
+/// Serialize the translated Anthropic turn. Log text stays per-shape so log
+/// bytes are unchanged by the merge. `Err` is the 500 to return directly.
+/// Extracted from `fold_buffered` without behavior change.
+#[allow(clippy::result_large_err)]
+fn serialize_anthropic_turn(
+    anthropic_response: &Value,
+    is_responses: bool,
+) -> Result<Vec<u8>, Response> {
+    match serde_json::to_vec(anthropic_response) {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            // Log text stays per-shape so log bytes are unchanged by the merge.
+            if is_responses {
+                tracing::warn!(
+                    event = "local_model_serialize_error",
+                    error = %e,
+                    "failed to serialize Anthropic responses translation"
+                );
+            } else {
+                tracing::warn!(
+                    event = "local_model_serialize_error",
+                    error = %e,
+                    "failed to serialize Anthropic response"
+                );
+            }
+            Err(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("serialization error"))
+                .expect("static response"))
+        }
+    }
+}
+
+/// One buffered fold for both wire shapes (C6). Parse and translate branch
+/// on the shape decided once in translation; the read, resolve-and-book
+/// envelope, restore, and response envelope are shared. Log strings stay
+/// per-shape so log bytes are unchanged by the merge.
+pub(crate) async fn fold_buffered(
+    upstream_resp: reqwest::Response,
+    original: &Value,
+    upstream_status: StatusCode,
+    is_responses: bool,
+    outcome: Option<RoutedOutcomeContext>,
+    ccr: Option<RoutedCcr>,
+) -> Response {
+    let body_text = match read_routed_body(upstream_resp, upstream_status, outcome.as_ref()).await {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
+
+    let (parsed_body, output_tokens) = match parse_buffered_turn(&body_text, is_responses) {
+        Ok(turn) => turn,
+        Err(response) => return response,
     };
 
     let resolved = resolve_and_book(parsed_body, ccr, outcome.as_ref(), output_tokens).await;
@@ -293,30 +339,11 @@ pub(crate) async fn fold_buffered(
     crate::routed::tool_alias::ToolAlias::derive(original.get("tools").and_then(|t| t.as_array()))
         .reverse_turn(&mut anthropic_response);
 
-    let mut body_bytes = match serde_json::to_vec(&anthropic_response) {
+    let body_bytes = match serialize_anthropic_turn(&anthropic_response, is_responses) {
         Ok(b) => b,
-        Err(e) => {
-            // Log text stays per-shape so log bytes are unchanged by the merge.
-            if is_responses {
-                tracing::warn!(
-                    event = "local_model_serialize_error",
-                    error = %e,
-                    "failed to serialize Anthropic responses translation"
-                );
-            } else {
-                tracing::warn!(
-                    event = "local_model_serialize_error",
-                    error = %e,
-                    "failed to serialize Anthropic response"
-                );
-            }
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("serialization error"))
-                .expect("static response");
-        }
+        Err(response) => return response,
     };
-    body_bytes = restore_buffered(outcome.as_ref(), body_bytes);
+    let body_bytes = restore_buffered(outcome.as_ref(), body_bytes);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -501,6 +528,7 @@ pub(crate) async fn handle_streaming_response(
     > = match ccr {
         Some(ccr) => {
             let anthropic_request = original.clone();
+            let resolver_config = ccr.resolver_config();
             let ctx = crate::sse::ccr_stream::CcrStreamContext {
                 ccr_stores: ccr.stores.clone(),
                 client: ccr.client,
@@ -535,7 +563,7 @@ pub(crate) async fn handle_streaming_response(
                 outgoing_headers: ccr.headers,
                 forwarded_request: ccr.request_body,
                 ccr_store: ccr.store,
-                config: ccr.config,
+                config: resolver_config,
                 request_id: ccr.request_id,
                 shape: if ccr.responses_shape {
                     crate::sse::ccr_stream::CcrShape::RoutedResponses { anthropic_request }

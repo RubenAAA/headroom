@@ -183,6 +183,15 @@ pub fn warn_if_offload_corrupts_tls() {
         .ok()
         .and_then(|table| default_route_interface(&table));
 
+    let (risky, checked) = collect_risky_interfaces();
+    report_offload_status(&risky, checked, on_route.as_deref());
+}
+
+/// Scan every interface for risky receive-offload flags. Returns the risky
+/// interfaces and how many were actually checked — `ethtool` is not installed
+/// everywhere, and a check that cannot run is not evidence of a fault.
+/// Extracted from `warn_if_offload_corrupts_tls` without behavior change.
+fn collect_risky_interfaces() -> (Vec<(String, Vec<&'static str>)>, usize) {
     let mut risky: Vec<(String, Vec<&'static str>)> = Vec::new();
     let mut checked = 0usize;
     for interface in interfaces() {
@@ -194,6 +203,18 @@ pub fn warn_if_offload_corrupts_tls() {
             risky.push((interface, offloads));
         }
     }
+    (risky, checked)
+}
+
+/// Report the scan outcome: silence when nothing could be checked, an
+/// all-clear when nothing risky was found, otherwise the warning naming the
+/// interfaces and their remedies.
+/// Extracted from `warn_if_offload_corrupts_tls` without behavior change.
+fn report_offload_status(
+    risky: &[(String, Vec<&'static str>)],
+    checked: usize,
+    on_route: Option<&str>,
+) {
     if checked == 0 {
         tracing::debug!(
             event = "nic_offload_check_skipped",
@@ -206,7 +227,7 @@ pub fn warn_if_offload_corrupts_tls() {
         tracing::info!(
             event = "nic_offload_ok",
             interfaces_checked = checked,
-            default_route = %on_route.as_deref().unwrap_or("none"),
+            default_route = %on_route.unwrap_or("none"),
             "NIC offload is off on every interface"
         );
         return;
@@ -214,9 +235,7 @@ pub fn warn_if_offload_corrupts_tls() {
     // The interface on the route is the one already costing tokens; the rest
     // are what the next network change will cost. Both go in the same warning,
     // because fixing only the first is what left the VPN armed on 2026-08-26.
-    let live = on_route
-        .as_deref()
-        .filter(|name| risky.iter().any(|(interface, _)| interface == name));
+    let live = on_route.filter(|name| risky.iter().any(|(interface, _)| interface == name));
     let commands = risky
         .iter()
         .map(|(interface, offloads)| remedy(interface, offloads))

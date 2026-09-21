@@ -161,26 +161,8 @@ pub(crate) async fn handle_count_tokens(
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or_default();
-    // Cursor routes run a subprocess, not HTTP: no upstream could count
-    // these, so answer locally like translated routes (forwarding would hit
-    // the default Anthropic upstream with an unknown id: 404 plus the same
-    // health-window pollution this endpoint exists to avoid).
-    if let Some(agent) = state
-        .config
-        .model_routes
-        .iter()
-        .find(|r| r.matches(model))
-        .and_then(|r| r.resolve_cursor_agent(crate::output_shaper::requested_effort(&parsed)))
-    {
-        let input_tokens = estimate_input_tokens(&parsed, &agent);
-        tracing::info!(
-            event = "count_tokens_local",
-            model = %model,
-            agent = %agent,
-            input_tokens = input_tokens,
-            "count_tokens for a cursor route answered locally"
-        );
-        return axum::Json(serde_json::json!({ "input_tokens": input_tokens })).into_response();
+    if let Some(response) = try_answer_cursor_route(&state, &parsed, model) {
+        return response;
     }
     // Only translated routes are unservable upstream (cursor routes are
     // handled above): their target speaks another protocol, so no model
@@ -189,18 +171,8 @@ pub(crate) async fn handle_count_tokens(
     // routes) forwards byte-identical and keeps the exact upstream count.
     let target = find_route_target(&state.config, model);
     let translated = target.as_ref().is_some_and(|t| t.translate);
-    if target
-        .as_ref()
-        .is_some_and(|t| !t.translate && t.target_model.is_some())
-    {
-        let input_tokens = estimate_input_tokens(&parsed, model);
-        tracing::info!(
-            event = "count_tokens_local",
-            model = %model,
-            input_tokens = input_tokens,
-            "count_tokens for an Anthropic-target route answered locally"
-        );
-        return axum::Json(serde_json::json!({ "input_tokens": input_tokens })).into_response();
+    if let Some(response) = try_answer_passthrough_route(&parsed, model, target.as_ref()) {
+        return response;
     }
     if !translated {
         return forward_unchanged(state, client_addr, method, uri, headers, body).await;
@@ -213,6 +185,62 @@ pub(crate) async fn handle_count_tokens(
         "count_tokens for a translated route answered locally"
     );
     axum::Json(serde_json::json!({ "input_tokens": input_tokens })).into_response()
+}
+
+/// Answer locally when the model rides a cursor route: cursor routes run a
+/// subprocess, not HTTP, so no upstream could count these (forwarding would
+/// hit the default Anthropic upstream with an unknown id: 404 plus the same
+/// health-window pollution this endpoint exists to avoid).
+/// `None` when this is not a cursor route — keep deciding.
+/// Extracted from `handle_count_tokens` without behavior change.
+fn try_answer_cursor_route(state: &AppState, parsed: &Value, model: &str) -> Option<Response> {
+    // Cursor routes run a subprocess, not HTTP: no upstream could count
+    // these, so answer locally like translated routes (forwarding would hit
+    // the default Anthropic upstream with an unknown id: 404 plus the same
+    // health-window pollution this endpoint exists to avoid).
+    let agent = state
+        .config
+        .model_routes
+        .iter()
+        .find(|r| r.matches(model))
+        .and_then(|r| r.resolve_cursor_agent(crate::output_shaper::requested_effort(parsed)))?;
+    let input_tokens = estimate_input_tokens(parsed, &agent);
+    tracing::info!(
+        event = "count_tokens_local",
+        model = %model,
+        agent = %agent,
+        input_tokens = input_tokens,
+        "count_tokens for a cursor route answered locally"
+    );
+    Some(axum::Json(serde_json::json!({ "input_tokens": input_tokens })).into_response())
+}
+
+/// Answer locally for a non-translating passthrough route with a known
+/// Anthropic target: an approximate count without an upstream round trip
+/// (the calibrated estimator undercounts slightly — framing is not
+/// counted — so compaction may run a touch later than with a real
+/// upstream count; the alternative today is a 404).
+/// `None` when the route needs upstream handling — keep deciding.
+/// Extracted from `handle_count_tokens` without behavior change.
+fn try_answer_passthrough_route(
+    parsed: &Value,
+    model: &str,
+    target: Option<&crate::routed::routing::RouteTarget>,
+) -> Option<Response> {
+    let t = target?;
+    if !t.translate && t.target_model.is_some() {
+        let input_tokens = estimate_input_tokens(parsed, model);
+        tracing::info!(
+            event = "count_tokens_local",
+            model = %model,
+            input_tokens = input_tokens,
+            "count_tokens for an Anthropic-target route answered locally"
+        );
+        return Some(
+            axum::Json(serde_json::json!({ "input_tokens": input_tokens })).into_response(),
+        );
+    }
+    None
 }
 
 #[cfg(test)]

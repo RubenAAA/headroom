@@ -188,23 +188,9 @@ pub fn compress_anthropic_request(
     // first (AllMessages ignores it); this is
     // the only place the body is parsed at all when the policy is
     // Disabled (resolve_frozen_count short-circuits).
-    let mut parsed: serde_json::Value = match serde_json::from_slice(body) {
+    let mut parsed = match parse_anthropic_body(body, &mode, request_id) {
         Ok(v) => v,
-        Err(_) => {
-            tracing::warn!(
-                request_id = %request_id,
-                path = "/v1/messages",
-                method = "POST",
-                compression_mode = mode.as_str(),
-                decision = "passthrough",
-                reason = "not_json",
-                body_bytes = body.len(),
-                "anthropic compression decision"
-            );
-            return Outcome::Passthrough {
-                reason: PassthroughReason::NotJson,
-            };
-        }
+        Err(outcome) => return outcome,
     };
 
     let frozen_count = resolve_frozen_count(&parsed, cache_control_policy, request_id);
@@ -244,107 +230,15 @@ pub fn compress_anthropic_request(
     let normalization_applied = normalize_tool_definitions(&mut parsed, auth_mode, request_id);
 
     // PR-E3: auto-place anthropic cache_control on the last tool.
-    let mut e3_locations: Vec<String> = Vec::new();
-    let mut e3_applied: bool = false;
-    let e3_skipped: bool;
-    if matches!(auth_mode, RequestAuthMode::Payg) {
-        match auto_place_anthropic_cache_control(&mut parsed) {
-            AutoPlaceOutcome::Applied {
-                placed_count,
-                locations,
-            } => {
-                e3_skipped = false;
-                if placed_count > 0 {
-                    tracing::info!(
-                        event = "e3_applied",
-                        request_id = %request_id,
-                        path = "/v1/messages",
-                        placed_count = placed_count,
-                        locations = ?locations,
-                        "auto-placed anthropic cache_control marker(s)"
-                    );
-                    e3_applied = true;
-                    e3_locations = locations;
-                } else {
-                    // Applied with placed_count = 0 means "ran but
-                    // nothing to do" (no tools array, empty array,
-                    // or the last tool wasn't an object). Emit a
-                    // distinct event so dashboards can spot the
-                    // we-tried-but-no-target branch.
-                    tracing::info!(
-                        event = "e3_no_target",
-                        request_id = %request_id,
-                        path = "/v1/messages",
-                        "auto-placement ran but found no tool slot to mark"
-                    );
-                }
-            }
-            AutoPlaceOutcome::Skipped {
-                reason: SkipReason::MarkerPresent,
-            } => {
-                e3_skipped = true;
-                tracing::info!(
-                    event = "e3_skipped",
-                    request_id = %request_id,
-                    path = "/v1/messages",
-                    reason = SkipReason::MarkerPresent.as_str(),
-                    "customer-placed cache_control marker(s) present; auto-placement skipped"
-                );
-            }
-            AutoPlaceOutcome::Skipped {
-                reason: SkipReason::AuthMode,
-            } => {
-                // The function never returns AuthMode itself — that
-                // gate lives in this caller. Defensive arm so the
-                // match is exhaustive across the public enum.
-                e3_skipped = true;
-            }
-        }
-    } else {
-        e3_skipped = true;
-        tracing::info!(
-            event = "e3_skipped",
-            request_id = %request_id,
-            path = "/v1/messages",
-            reason = SkipReason::AuthMode.as_str(),
-            auth_mode = auth_mode.as_str(),
-            "non-PAYG auth mode; cache_control auto-placement skipped"
-        );
-    }
-    // FINDING-030: e3_skipped is load-bearing below — the dispatch
-    // buffer is the original bytes unless a Phase E pass mutated the
-    // parsed body, and e3_applied is one of the two mutation signals.
-    // (e3_skipped itself only distinguishes "E3 ran, no target" from
-    // "E3 gated off", which the e3_no_target / e3_skipped events already
-    // record; it carries no mutation signal and stays telemetry-only.)
-    let _ = e3_skipped;
+    let (e3_locations, e3_applied) =
+        run_phase_e3_auto_placement(&mut parsed, auth_mode, request_id);
 
     // Re-serialize the parsed value once if any Phase E pass mutated
     // it. The live-zone dispatcher will re-parse internally — this
     // costs one extra serialize on the (rare) mutated path; on the
     // all-skipped path we don't touch the bytes at all.
-    let dispatch_body: Bytes = if normalization_applied.any() || e3_applied {
-        match serde_json::to_vec(&parsed) {
-            Ok(v) => Bytes::from(v),
-            Err(err) => {
-                // We just parsed successfully; serialize failure is
-                // unreachable in practice. If it ever fires, fall
-                // back to the original body bytes — never poison the
-                // request. Loud log so operators notice.
-                tracing::error!(
-                    event = "phase_e_serialize_failed",
-                    request_id = %request_id,
-                    path = "/v1/messages",
-                    error = %err,
-                    "Phase E pass(es) mutated parsed body but \
-                     serialize-back failed; forwarding original bytes"
-                );
-                body.clone()
-            }
-        }
-    } else {
-        body.clone()
-    };
+    let dispatch_body: Bytes =
+        reserialize_if_mutated(&parsed, normalization_applied, e3_applied, body, request_id);
 
     // PR-B4: extract `body["model"]` so the live-zone dispatcher can
     // route the tokenizer registry to the right backend for the
@@ -407,121 +301,49 @@ pub fn compress_anthropic_request(
     };
     match dispatch_result {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
-            let block_count = manifest.block_outcomes.len();
-            let blocks_excluded = manifest
-                .block_outcomes
-                .iter()
-                .filter(|b| {
-                    matches!(
-                        b.action,
-                        BlockAction::Excluded {
-                            reason: ExclusionReason::HotZoneBlockType
-                        }
-                    )
-                })
-                .count();
-            tracing::info!(
-                request_id = %request_id,
-                path = "/v1/messages",
-                method = "POST",
-                compression_mode = mode.as_str(),
-                decision = "no_change",
-                reason = "no_block_compressed",
-                body_bytes = body.len(),
-                frozen_message_count = frozen_count,
-                messages_total = manifest.messages_total,
-                latest_user_message_index = ?manifest.latest_user_message_index,
-                live_zone_blocks = block_count,
-                live_zone_blocks_excluded = blocks_excluded,
-                "anthropic live-zone dispatch"
-            );
+            log_no_change_decision(&manifest, body.len(), frozen_count, &mode, request_id);
             // The live-zone dispatcher made no change — but if any
             // Phase E pass (E1 sort, E3 cache_control auto-placement)
             // rewrote bytes, the proxy must still forward the new
             // bytes. Surface as `Compressed` with the union of
             // strategies and markers so the outer log/metrics layer
             // attributes the byte change correctly.
-            if normalization_applied.any() || e3_applied {
-                let mut strategies = normalization_applied.strategies();
-                if e3_applied {
-                    strategies.push("e3_anthropic_cache_control");
-                }
-                Outcome::Compressed {
-                    body: dispatch_body,
-                    tokens_before: 0,
-                    tokens_after: 0,
-                    strategies_applied: strategies,
-                    markers_inserted: e3_locations,
-                    // H1 remediation: Phase E normalization passes
-                    // (E1 sort, E3 cache_control auto-placement)
-                    // mutate bytes but don't have per-strategy
-                    // token accounting. Empty vec → emit-site falls
-                    // back to one aggregate sample.
-                    per_strategy_tokens: Vec::new(),
-                }
-            } else {
-                Outcome::NoCompression
-            }
+            recover_phase_e_bytes(
+                normalization_applied,
+                e3_applied,
+                e3_locations,
+                dispatch_body,
+            )
         }
-        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
-            // PR-B4 reports token counts via the same tokenizer the dispatcher
-            // used to gate per-block acceptance, so the saving logged here is
-            // the saving the cache will actually see.
-            let mut totals = crate::compression::manifest_totals::aggregate(
-                &manifest,
-                request_id,
-                "/v1/messages",
-            );
-            // Stitch in the PR-E1 / PR-E2 / PR-E3 strategy tags so
-            // downstream log/metrics layers attribute the
-            // normalization / auto-placement to its distinct
-            // cache-stabilization surface rather than to a live-zone
-            // compressor that didn't actually run.
-            for strategy in normalization_applied.strategies() {
-                totals.push_strategy(strategy);
-            }
-            if e3_applied {
-                totals.push_strategy("e3_anthropic_cache_control");
-            }
-            let body_bytes_in = body.len();
-            let new_body_bytes = Bytes::copy_from_slice(new_body.get().as_bytes());
-            let body_bytes_out = new_body_bytes.len();
-            let block_count = manifest.block_outcomes.len();
-            tracing::info!(
-                request_id = %request_id,
-                path = "/v1/messages",
-                method = "POST",
-                compression_mode = mode.as_str(),
-                decision = "compressed",
-                reason = "live_zone_blocks_rewritten",
-                body_bytes_in = body_bytes_in,
-                body_bytes_out = body_bytes_out,
-                bytes_freed = body_bytes_in.saturating_sub(body_bytes_out),
-                frozen_message_count = frozen_count,
-                messages_total = manifest.messages_total,
-                latest_user_message_index = ?manifest.latest_user_message_index,
-                live_zone_blocks = block_count,
-                live_zone_strategies = ?totals.strategies,
-                live_zone_block_original_bytes = totals.original_bytes,
-                live_zone_block_compressed_bytes = totals.compressed_bytes,
-                live_zone_block_original_tokens = totals.original_tokens,
-                live_zone_block_compressed_tokens = totals.compressed_tokens,
-                had_compressor_error = totals.had_compressor_error,
-                model = model,
-                "anthropic live-zone dispatch"
-            );
-            Outcome::Compressed {
-                body: new_body_bytes,
-                tokens_before: totals.original_tokens,
-                tokens_after: totals.compressed_tokens,
-                strategies_applied: totals.strategies,
-                // PR-E3 surfaces tool-slot location(s); PR-B7 will
-                // append CCR retrieval markers when wired.
-                markers_inserted: e3_locations,
-                per_strategy_tokens: totals.per_strategy_tokens,
-            }
-        }
-        Err(LiveZoneError::BodyNotJson(_)) => {
+        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => report_modified_blocks(
+            &new_body,
+            manifest,
+            body,
+            frozen_count,
+            &mode,
+            model,
+            request_id,
+            normalization_applied,
+            e3_applied,
+            e3_locations,
+        ),
+        Err(err) => report_dispatch_error(err, &mode, body.len(), request_id),
+    }
+}
+
+/// Report a dispatcher-level failure as passthrough: the body this layer
+/// parsed is rejected by the dispatcher's independent parse (BodyNotJson),
+/// or there is no messages array to compress (NoMessagesArray). Either way
+/// forward byte-faithful.
+/// Extracted from `compress_anthropic_request` without behavior change.
+fn report_dispatch_error(
+    err: LiveZoneError,
+    mode: &CompressionMode,
+    body_len: usize,
+    request_id: &str,
+) -> Outcome {
+    match err {
+        LiveZoneError::BodyNotJson(_) => {
             // We already parsed successfully above; the dispatcher's
             // independent parse can only fail on a state we missed.
             // Pass through with the same byte-faithful guarantee.
@@ -535,7 +357,7 @@ pub fn compress_anthropic_request(
                 reason: PassthroughReason::NotJson,
             }
         }
-        Err(LiveZoneError::NoMessagesArray) => {
+        LiveZoneError::NoMessagesArray => {
             tracing::info!(
                 request_id = %request_id,
                 path = "/v1/messages",
@@ -543,13 +365,305 @@ pub fn compress_anthropic_request(
                 compression_mode = mode.as_str(),
                 decision = "passthrough",
                 reason = "no_messages",
-                body_bytes = body.len(),
+                body_bytes = body_len,
                 "anthropic compression decision"
             );
             Outcome::Passthrough {
                 reason: PassthroughReason::NoMessages,
             }
         }
+    }
+}
+
+/// PR-E3: auto-place an anthropic `cache_control` marker on the (now-sorted)
+/// last tool. PAYG-gated; OAuth and Subscription pass through byte-equal.
+/// Returns the placed locations and whether anything was marked.
+/// Extracted from `compress_anthropic_request` without behavior change.
+fn run_phase_e3_auto_placement(
+    parsed: &mut Value,
+    auth_mode: RequestAuthMode,
+    request_id: &str,
+) -> (Vec<String>, bool) {
+    if !matches!(auth_mode, RequestAuthMode::Payg) {
+        tracing::info!(
+            event = "e3_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = SkipReason::AuthMode.as_str(),
+            auth_mode = auth_mode.as_str(),
+            "non-PAYG auth mode; cache_control auto-placement skipped"
+        );
+        return (Vec::new(), false);
+    }
+    match auto_place_anthropic_cache_control(parsed) {
+        AutoPlaceOutcome::Applied {
+            placed_count,
+            locations,
+        } => log_e3_applied_outcome(placed_count, locations, request_id),
+        AutoPlaceOutcome::Skipped {
+            reason: SkipReason::MarkerPresent,
+        } => {
+            tracing::info!(
+                event = "e3_skipped",
+                request_id = %request_id,
+                path = "/v1/messages",
+                reason = SkipReason::MarkerPresent.as_str(),
+                "customer-placed cache_control marker(s) present; auto-placement skipped"
+            );
+            (Vec::new(), false)
+        }
+        AutoPlaceOutcome::Skipped {
+            reason: SkipReason::AuthMode,
+        } => {
+            // The function never returns AuthMode itself — that
+            // gate lives in this caller. Defensive arm so the
+            // match is exhaustive across the public enum.
+            (Vec::new(), false)
+        }
+    }
+}
+
+/// Surface Phase E byte rewrites when the live-zone dispatcher itself made
+/// no change: forward the new bytes as `Compressed` with the union of
+/// strategies and markers so the outer log/metrics layer attributes the
+/// byte change correctly.
+/// Extracted from `compress_anthropic_request` without behavior change.
+fn recover_phase_e_bytes(
+    normalization_applied: NormalizationApplied,
+    e3_applied: bool,
+    e3_locations: Vec<String>,
+    dispatch_body: Bytes,
+) -> Outcome {
+    if !normalization_applied.any() && !e3_applied {
+        return Outcome::NoCompression;
+    }
+    let mut strategies = normalization_applied.strategies();
+    if e3_applied {
+        strategies.push("e3_anthropic_cache_control");
+    }
+    Outcome::Compressed {
+        body: dispatch_body,
+        tokens_before: 0,
+        tokens_after: 0,
+        strategies_applied: strategies,
+        markers_inserted: e3_locations,
+        // H1 remediation: Phase E normalization passes
+        // (E1 sort, E3 cache_control auto-placement)
+        // mutate bytes but don't have per-strategy
+        // token accounting. Empty vec → emit-site falls
+        // back to one aggregate sample.
+        per_strategy_tokens: Vec::new(),
+    }
+}
+
+/// Report a rewritten live zone: token counts via the same tokenizer the
+/// dispatcher used to gate per-block acceptance, so the logged saving is
+/// the saving the cache will actually see. Stitches in the PR-E1 / PR-E2 /
+/// PR-E3 strategy tags so downstream layers attribute normalization /
+/// auto-placement to its distinct surface.
+/// Extracted from `compress_anthropic_request` without behavior change.
+#[allow(clippy::too_many_arguments)]
+fn report_modified_blocks(
+    new_body: &serde_json::value::RawValue,
+    manifest: headroom_core::transforms::live_zone::CompressionManifest,
+    body: &Bytes,
+    frozen_count: usize,
+    mode: &CompressionMode,
+    model: &str,
+    request_id: &str,
+    normalization_applied: NormalizationApplied,
+    e3_applied: bool,
+    e3_locations: Vec<String>,
+) -> Outcome {
+    // PR-B4 reports token counts via the same tokenizer the dispatcher
+    // used to gate per-block acceptance, so the saving logged here is
+    // the saving the cache will actually see.
+    let mut totals =
+        crate::compression::manifest_totals::aggregate(&manifest, request_id, "/v1/messages");
+    // Stitch in the PR-E1 / PR-E2 / PR-E3 strategy tags so
+    // downstream log/metrics layers attribute the
+    // normalization / auto-placement to its distinct
+    // cache-stabilization surface rather than to a live-zone
+    // compressor that didn't actually run.
+    for strategy in normalization_applied.strategies() {
+        totals.push_strategy(strategy);
+    }
+    if e3_applied {
+        totals.push_strategy("e3_anthropic_cache_control");
+    }
+    let body_bytes_in = body.len();
+    let new_body_bytes = Bytes::copy_from_slice(new_body.get().as_bytes());
+    let body_bytes_out = new_body_bytes.len();
+    let block_count = manifest.block_outcomes.len();
+    tracing::info!(
+        request_id = %request_id,
+        path = "/v1/messages",
+        method = "POST",
+        compression_mode = mode.as_str(),
+        decision = "compressed",
+        reason = "live_zone_blocks_rewritten",
+        body_bytes_in = body_bytes_in,
+        body_bytes_out = body_bytes_out,
+        bytes_freed = body_bytes_in.saturating_sub(body_bytes_out),
+        frozen_message_count = frozen_count,
+        messages_total = manifest.messages_total,
+        latest_user_message_index = ?manifest.latest_user_message_index,
+        live_zone_blocks = block_count,
+        live_zone_strategies = ?totals.strategies,
+        live_zone_block_original_bytes = totals.original_bytes,
+        live_zone_block_compressed_bytes = totals.compressed_bytes,
+        live_zone_block_original_tokens = totals.original_tokens,
+        live_zone_block_compressed_tokens = totals.compressed_tokens,
+        had_compressor_error = totals.had_compressor_error,
+        model = model,
+        "anthropic live-zone dispatch"
+    );
+    Outcome::Compressed {
+        body: new_body_bytes,
+        tokens_before: totals.original_tokens,
+        tokens_after: totals.compressed_tokens,
+        strategies_applied: totals.strategies,
+        // PR-E3 surfaces tool-slot location(s); PR-B7 will
+        // append CCR retrieval markers when wired.
+        markers_inserted: e3_locations,
+        per_strategy_tokens: totals.per_strategy_tokens,
+    }
+}
+
+/// Log a no-change dispatch: how many blocks were considered and how many
+/// the hot-zone filter excluded.
+/// Extracted from `compress_anthropic_request` without behavior change.
+fn log_no_change_decision(
+    manifest: &headroom_core::transforms::live_zone::CompressionManifest,
+    body_len: usize,
+    frozen_count: usize,
+    mode: &CompressionMode,
+    request_id: &str,
+) {
+    let block_count = manifest.block_outcomes.len();
+    let blocks_excluded = manifest
+        .block_outcomes
+        .iter()
+        .filter(|b| {
+            matches!(
+                b.action,
+                BlockAction::Excluded {
+                    reason: ExclusionReason::HotZoneBlockType
+                }
+            )
+        })
+        .count();
+    tracing::info!(
+        request_id = %request_id,
+        path = "/v1/messages",
+        method = "POST",
+        compression_mode = mode.as_str(),
+        decision = "no_change",
+        reason = "no_block_compressed",
+        body_bytes = body_len,
+        frozen_message_count = frozen_count,
+        messages_total = manifest.messages_total,
+        latest_user_message_index = ?manifest.latest_user_message_index,
+        live_zone_blocks = block_count,
+        live_zone_blocks_excluded = blocks_excluded,
+        "anthropic live-zone dispatch"
+    );
+}
+
+/// Parse the request body, passing through on non-JSON.
+/// Extracted from `compress_anthropic_request` without behavior change.
+fn parse_anthropic_body(
+    body: &Bytes,
+    mode: &CompressionMode,
+    request_id: &str,
+) -> Result<serde_json::Value, Outcome> {
+    match serde_json::from_slice(body) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            tracing::warn!(
+                request_id = %request_id,
+                path = "/v1/messages",
+                method = "POST",
+                compression_mode = mode.as_str(),
+                decision = "passthrough",
+                reason = "not_json",
+                body_bytes = body.len(),
+                "anthropic compression decision"
+            );
+            Err(Outcome::Passthrough {
+                reason: PassthroughReason::NotJson,
+            })
+        }
+    }
+}
+
+/// Re-serialize the parsed value once if any Phase E pass mutated it.
+/// The live-zone dispatcher re-parses internally; on the all-skipped path
+/// the bytes pass through untouched. Serialize failure is unreachable in
+/// practice (we just parsed successfully) — fall back to the original
+/// bytes rather than poisoning the request.
+/// Extracted from `compress_anthropic_request` without behavior change.
+fn reserialize_if_mutated(
+    parsed: &serde_json::Value,
+    normalization_applied: NormalizationApplied,
+    e3_applied: bool,
+    body: &Bytes,
+    request_id: &str,
+) -> Bytes {
+    if !normalization_applied.any() && !e3_applied {
+        return body.clone();
+    }
+    match serde_json::to_vec(parsed) {
+        Ok(v) => Bytes::from(v),
+        Err(err) => {
+            // We just parsed successfully; serialize failure is
+            // unreachable in practice. If it ever fires, fall
+            // back to the original body bytes — never poison the
+            // request. Loud log so operators notice.
+            tracing::error!(
+                event = "phase_e_serialize_failed",
+                request_id = %request_id,
+                path = "/v1/messages",
+                error = %err,
+                "Phase E pass(es) mutated parsed body but \
+                 serialize-back failed; forwarding original bytes"
+            );
+            body.clone()
+        }
+    }
+}
+
+/// Log an E3 auto-placement outcome and return the placed locations plus
+/// whether anything was marked.
+/// Extracted from `run_phase_e3_auto_placement` without behavior change.
+fn log_e3_applied_outcome(
+    placed_count: usize,
+    locations: Vec<String>,
+    request_id: &str,
+) -> (Vec<String>, bool) {
+    if placed_count > 0 {
+        tracing::info!(
+            event = "e3_applied",
+            request_id = %request_id,
+            path = "/v1/messages",
+            placed_count = placed_count,
+            locations = ?locations,
+            "auto-placed anthropic cache_control marker(s)"
+        );
+        (locations, true)
+    } else {
+        // Applied with placed_count = 0 means "ran but
+        // nothing to do" (no tools array, empty array,
+        // or the last tool wasn't an object). Emit a
+        // distinct event so dashboards can spot the
+        // we-tried-but-no-target branch.
+        tracing::info!(
+            event = "e3_no_target",
+            request_id = %request_id,
+            path = "/v1/messages",
+            "auto-placement ran but found no tool slot to mark"
+        );
+        (Vec::new(), false)
     }
 }
 
@@ -602,23 +716,7 @@ pub(super) fn normalize_tool_definitions(
     // bytes, which is only safe under PAYG. OAuth and Subscription
     // clients pass through byte-equal so the proxy never looks
     // like a cache-evasion intermediary to the upstream.
-    if !matches!(auth_mode, RequestAuthMode::Payg) {
-        tracing::info!(
-            event = "e1_skipped",
-            request_id = %request_id,
-            path = "/v1/messages",
-            reason = "auth_mode",
-            auth_mode = auth_mode.as_str(),
-            "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
-        );
-        tracing::info!(
-            event = "e2_skipped",
-            request_id = %request_id,
-            path = "/v1/messages",
-            reason = "auth_mode",
-            auth_mode = auth_mode.as_str(),
-            "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
-        );
+    if !is_payg_for_normalization(auth_mode, request_id) {
         return NormalizationApplied::default();
     }
 
@@ -639,38 +737,93 @@ pub(super) fn normalize_tool_definitions(
     // runs because sorting schema keys does not move the marker
     // (which lives on the tool object itself, not inside the schema).
     let marker_present = any_tool_has_cache_control(tools_in);
-    if marker_present {
-        tracing::info!(
-            event = "e1_skipped",
-            request_id = %request_id,
-            path = "/v1/messages",
-            reason = "marker_present",
-            tool_count = tools_in.len(),
-            "tool-array sort skipped: customer cache_control marker present \
-             on at least one tool; preserving customer-intentional order"
-        );
-    }
 
     let tools = parsed
         .get_mut("tools")
         .and_then(Value::as_array_mut)
         .expect("tools array verified above");
 
-    let mut applied = NormalizationApplied::default();
-
-    if !marker_present {
-        applied.e1_tool_sort = sort_tools_deterministically(tools);
-        if applied.e1_tool_sort {
-            tracing::info!(
-                event = "e1_applied",
-                request_id = %request_id,
-                path = "/v1/messages",
-                tool_count = tools.len(),
-                "tool-array sort applied: tools reordered alphabetically by name"
-            );
-        }
+    let applied = NormalizationApplied {
+        e1_tool_sort: sort_tools_if_unmarked(tools, marker_present, request_id),
+        e2_schema_sort: sort_all_schemas(tools),
+    };
+    if applied.e2_schema_sort {
+        tracing::info!(
+            event = "e2_applied",
+            request_id = %request_id,
+            path = "/v1/messages",
+            tool_count = tools.len(),
+            "schema-key sort applied: input_schema keys rewritten in alphabetic order"
+        );
     }
 
+    applied
+}
+
+/// Auth-mode gate for Phase E normalization: both PR-E1 and PR-E2 mutate
+/// request bytes, which is only safe under PAYG. OAuth and Subscription
+/// clients pass through byte-equal. Returns true when normalization may
+/// proceed.
+/// Extracted from `normalize_tool_definitions` without behavior change.
+fn is_payg_for_normalization(auth_mode: RequestAuthMode, request_id: &str) -> bool {
+    if matches!(auth_mode, RequestAuthMode::Payg) {
+        return true;
+    }
+    tracing::info!(
+        event = "e1_skipped",
+        request_id = %request_id,
+        path = "/v1/messages",
+        reason = "auth_mode",
+        auth_mode = auth_mode.as_str(),
+        "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
+    );
+    tracing::info!(
+        event = "e2_skipped",
+        request_id = %request_id,
+        path = "/v1/messages",
+        reason = "auth_mode",
+        auth_mode = auth_mode.as_str(),
+        "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
+    );
+    false
+}
+
+/// PR-E1: sort tools alphabetically unless a `cache_control` marker is
+/// present (reordering would silently change cache scope). Returns whether
+/// the sort moved anything.
+/// Extracted from `normalize_tool_definitions` without behavior change.
+fn sort_tools_if_unmarked(tools: &mut [Value], marker_present: bool, request_id: &str) -> bool {
+    if marker_present {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = "marker_present",
+            tool_count = tools.len(),
+            "tool-array sort skipped: customer cache_control marker present \
+             on at least one tool; preserving customer-intentional order"
+        );
+        return false;
+    }
+    let sorted = sort_tools_deterministically(tools);
+    if sorted {
+        tracing::info!(
+            event = "e1_applied",
+            request_id = %request_id,
+            path = "/v1/messages",
+            tool_count = tools.len(),
+            "tool-array sort applied: tools reordered alphabetically by name"
+        );
+    }
+    sorted
+}
+
+/// PR-E2: sort each tool's `input_schema` keys recursively. Tools without
+/// an `input_schema` field are silently skipped — that is a valid Anthropic
+/// shape (e.g. zero-argument tools). Returns whether anything moved.
+/// Extracted from `normalize_tool_definitions` without behavior change.
+fn sort_all_schemas(tools: &mut [Value]) -> bool {
+    let mut changed = false;
     // PR-E2: sort each tool's `input_schema` keys recursively.
     // Anthropic schema lives at `tool.input_schema`. Tools without
     // an `input_schema` field are silently skipped — that is a
@@ -683,19 +836,9 @@ pub(super) fn normalize_tool_definitions(
         // (idempotent re-runs report `false` and the caller surfaces no
         // event for the no-op). `|=`, not `||`: every tool must still
         // be visited even after one changed.
-        applied.e2_schema_sort |= sort_schema_keys_recursive(schema);
+        changed |= sort_schema_keys_recursive(schema);
     }
-    if applied.e2_schema_sort {
-        tracing::info!(
-            event = "e2_applied",
-            request_id = %request_id,
-            path = "/v1/messages",
-            tool_count = tools.len(),
-            "schema-key sort applied: input_schema keys rewritten in alphabetic order"
-        );
-    }
-
-    applied
+    changed
 }
 
 #[cfg(test)]

@@ -1141,6 +1141,21 @@ enum InflatedReplay {
 /// non-zero floor says the cache is warm), and only a zero floor sends the
 /// turn out fresh. Correctness outranks economy; the improvement lands on the
 /// next cold turn.
+/// Non-inflation bound for a replayed splice: its compact-JSON bytes must
+/// not exceed this turn's own output. Sizing unprovable: same fail
+/// direction as upstream — treat as tripped.
+/// Extracted from `split_inflated_replay_at_floor` without behavior change.
+fn replay_within_bound(spliced: &[Value], optimized_messages: &[Value]) -> bool {
+    match (
+        compact_json_len(spliced),
+        compact_json_len(optimized_messages),
+    ) {
+        (Some(replayed), Some(optimized)) => replayed <= optimized,
+        // Sizing unprovable: same fail direction as upstream — treat as tripped.
+        (None, _) | (_, None) => false,
+    }
+}
+
 fn split_inflated_replay_at_floor(
     spliced: Vec<Value>,
     prev_fwd: &[Value],
@@ -1160,15 +1175,7 @@ fn split_inflated_replay_at_floor(
         // kept, so keep the splice.
         return InflatedReplay::Whole(spliced);
     }
-    let within_bound = match (
-        compact_json_len(&spliced),
-        compact_json_len(optimized_messages),
-    ) {
-        (Some(replayed), Some(optimized)) => replayed <= optimized,
-        // Sizing unprovable: same fail direction as upstream — treat as tripped.
-        (None, _) | (_, None) => false,
-    };
-    if within_bound {
+    if replay_within_bound(&spliced, optimized_messages) {
         return InflatedReplay::Whole(spliced);
     }
     if floor == 0 {
@@ -3029,6 +3036,95 @@ impl std::fmt::Debug for SessionReplayStore {
     }
 }
 
+/// Pick the stored prefix leading this turn: first an exact canonical
+/// prefix (longest wins), then a tail-edited continuation (longest
+/// agreeing run wins, within slack). Returns the chain id plus the
+/// original/forwarded pair. `system_ok` gates candidates on the system
+/// they went out under.
+/// Extracted from `previous_turn_for` without behavior change.
+fn pick_replay_candidate<'t>(
+    tracker: &'t PrefixReplayTracker,
+    canonical_current: &[Value],
+    system_ok: &dyn Fn(&str) -> bool,
+) -> Option<(u64, &'t Vec<Value>, &'t Vec<Value>)> {
+    let best = std::iter::once((
+        tracker.primary_chain_id,
+        &tracker.last_original_messages,
+        &tracker.last_forwarded_messages,
+        tracker.last_forwarded_system_hash.as_str(),
+    ))
+    .chain(
+        tracker
+            .alternates
+            .iter()
+            .map(|(id, o, f, s)| (*id, o, f, s.as_str())),
+    )
+    .filter(|(_, o, f, s)| {
+        !f.is_empty() && matches_canonical_prefix(o, canonical_current) && system_ok(s)
+    })
+    .max_by_key(|(_, o, _, _)| o.len())
+    .map(|(id, o, f, _)| (id, o, f));
+    // Nothing leads this turn exactly. Before giving up on identity,
+    // look for a stream this turn continues with its tail edited —
+    // the client rewriting a message it already sent, which is what
+    // a content divergence is. The overlay can replay everything
+    // ahead of the edit, but only if it is told whose prefix this
+    // is, so the answer has to carry that stream's real chain id
+    // rather than the fallback's zero.
+    best.or_else(|| {
+        std::iter::once((
+            tracker.primary_chain_id,
+            &tracker.last_original_messages,
+            &tracker.last_forwarded_messages,
+            tracker.last_forwarded_system_hash.as_str(),
+        ))
+        .chain(
+            tracker
+                .alternates
+                .iter()
+                .map(|(id, o, f, s)| (*id, o, f, s.as_str())),
+        )
+        .filter_map(|(id, o, f, s)| {
+            if f.is_empty() {
+                return None;
+            }
+            let agreed = canonical_agreement_len(o, canonical_current);
+            (agreed >= MIN_AGREEING_RUN && agreed + TAIL_EDIT_SLACK >= o.len() && system_ok(s))
+                .then_some((agreed, id, o, f))
+        })
+        .max_by_key(|(agreed, ..)| *agreed)
+        .map(|(_, id, o, f)| (id, o, f))
+    })
+}
+
+/// Did a stream other than the session's most recent one win? That is
+/// this store's whole reason to exist, and the only direct evidence that
+/// interleaved streams were costing busts: under one slot per session
+/// this turn would have declined and forwarded fresh bytes over cached
+/// content.
+/// Extracted from `previous_turn_for` without behavior change.
+fn note_matched_alternate(
+    tracker: &PrefixReplayTracker,
+    o: &Vec<Value>,
+    chain_id: u64,
+    current_msgs: usize,
+) {
+    let primary_len = tracker.last_original_messages.len();
+    let matched_alternate = o.len() != primary_len || o != &tracker.last_original_messages;
+    if matched_alternate {
+        tracing::info!(
+            event = "prefix_replay_matched_alternate",
+            alternates_held = tracker.alternates.len(),
+            matched_prefix_msgs = o.len(),
+            most_recent_prefix_msgs = primary_len,
+            current_msgs = current_msgs,
+            chain_id = chain_id,
+            "replayed a stream's own prefix instead of the session's \
+             most recent one; one slot per session would have declined here"
+        );
+    }
+}
+
 impl SessionReplayStore {
     /// Build a store bounded to `capacity` sessions. Production uses
     /// [`REPLAY_STORE_CAPACITY`]; tests pass small values.
@@ -3296,81 +3392,10 @@ impl SessionReplayStore {
                 .map(|current| stored_hash == current)
                 .unwrap_or(true)
         };
-        let pick = |system_ok: &dyn Fn(&str) -> bool| -> Option<(u64, &Vec<Value>, &Vec<Value>)> {
-            let best = std::iter::once((
-                tracker.primary_chain_id,
-                &tracker.last_original_messages,
-                &tracker.last_forwarded_messages,
-                tracker.last_forwarded_system_hash.as_str(),
-            ))
-            .chain(
-                tracker
-                    .alternates
-                    .iter()
-                    .map(|(id, o, f, s)| (*id, o, f, s.as_str())),
-            )
-            .filter(|(_, o, f, s)| {
-                !f.is_empty() && matches_canonical_prefix(o, &canonical_current) && system_ok(s)
-            })
-            .max_by_key(|(_, o, _, _)| o.len())
-            .map(|(id, o, f, _)| (id, o, f));
-            // Nothing leads this turn exactly. Before giving up on identity,
-            // look for a stream this turn continues with its tail edited —
-            // the client rewriting a message it already sent, which is what
-            // a content divergence is. The overlay can replay everything
-            // ahead of the edit, but only if it is told whose prefix this
-            // is, so the answer has to carry that stream's real chain id
-            // rather than the fallback's zero.
-            best.or_else(|| {
-                std::iter::once((
-                    tracker.primary_chain_id,
-                    &tracker.last_original_messages,
-                    &tracker.last_forwarded_messages,
-                    tracker.last_forwarded_system_hash.as_str(),
-                ))
-                .chain(
-                    tracker
-                        .alternates
-                        .iter()
-                        .map(|(id, o, f, s)| (*id, o, f, s.as_str())),
-                )
-                .filter_map(|(id, o, f, s)| {
-                    if f.is_empty() {
-                        return None;
-                    }
-                    let agreed = canonical_agreement_len(o, &canonical_current);
-                    (agreed >= MIN_AGREEING_RUN
-                        && agreed + TAIL_EDIT_SLACK >= o.len()
-                        && system_ok(s))
-                    .then_some((agreed, id, o, f))
-                })
-                .max_by_key(|(agreed, ..)| *agreed)
-                .map(|(_, id, o, f)| (id, o, f))
-            })
-        };
-        let best = pick(&system_ok);
+        let best = pick_replay_candidate(tracker, &canonical_current, &system_ok);
         match best {
             Some((chain_id, o, f)) => {
-                // Did a stream other than the session's most recent one win?
-                // That is this store's whole reason to exist, and the only
-                // direct evidence that interleaved streams were costing busts:
-                // under one slot per session this turn would have declined and
-                // forwarded fresh bytes over cached content.
-                let primary_len = tracker.last_original_messages.len();
-                let matched_alternate =
-                    o.len() != primary_len || o != &tracker.last_original_messages;
-                if matched_alternate {
-                    tracing::info!(
-                        event = "prefix_replay_matched_alternate",
-                        alternates_held = tracker.alternates.len(),
-                        matched_prefix_msgs = o.len(),
-                        most_recent_prefix_msgs = primary_len,
-                        current_msgs = current_originals.len(),
-                        chain_id = chain_id,
-                        "replayed a stream's own prefix instead of the session's \
-                         most recent one; one slot per session would have declined here"
-                    );
-                }
+                note_matched_alternate(tracker, o, chain_id, current_originals.len());
                 Ok((o.clone(), f.clone(), chain_id))
             }
             None if tracker.last_forwarded_messages.is_empty() => {
@@ -3384,7 +3409,10 @@ impl SessionReplayStore {
             // carries `system_changed` and this event names the lineage.
             // Only with a system in hand; `None` callers keep the arm below
             // exactly as before.
-            None if current_system_hash.is_some() && pick(&|_: &str| true).is_some() => {
+            None if current_system_hash.is_some()
+                && pick_replay_candidate(tracker, &canonical_current, &|_: &str| true)
+                    .is_some() =>
+            {
                 tracing::info!(
                     event = "prefix_replay_system_changed",
                     session_key_hash = %super::drift_detector::session_key_log_prefix(session_key),
@@ -7155,7 +7183,7 @@ mod divergence_index_tests {
             current.to_vec(),
             current,
             Some(prev),
-            Some(&prev.to_vec()),
+            Some(prev),
             true,
             None,
         )
@@ -7302,7 +7330,7 @@ mod originals_are_the_clients_tests {
     /// an append-only turn — the client never changed a thing.
     #[test]
     fn comparing_our_own_rewrites_wrongly_declines() {
-        let client_turn1 = vec![client_msg("a")];
+        let client_turn1 = [client_msg("a")];
         // Last turn we offloaded it; this turn we did not (or vice versa).
         let ours_prev = vec![as_offloaded(&client_turn1[0])];
         let ours_now = vec![client_msg("a"), client_msg("b")];

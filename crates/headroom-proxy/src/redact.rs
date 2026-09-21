@@ -162,16 +162,28 @@ fn key_path() -> std::path::PathBuf {
 /// to a random in-memory key, which restores everything it minted itself and
 /// nothing from before it, exactly as the old map-only design did.
 fn load_or_create_key() -> ([u8; 32], bool) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let path = key_path();
     let mut key = [0u8; 32];
 
-    if let Ok(bytes) = std::fs::read(&path) {
+    if let Some(result) = read_existing_key(&path, &mut key) {
+        return result;
+    }
+
+    getrandom_key(&mut key);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    persist_key(&path, key)
+}
+
+/// A readable 32-byte key file wins immediately; a malformed one warns and
+/// falls through to minting. `None` means no usable file — keep going.
+/// Extracted from `load_or_create_key` without behavior change.
+fn read_existing_key(path: &std::path::Path, key: &mut [u8; 32]) -> Option<([u8; 32], bool)> {
+    if let Ok(bytes) = std::fs::read(path) {
         if bytes.len() == 32 {
             key.copy_from_slice(&bytes);
-            return (key, true);
+            return Some((*key, true));
         }
         tracing::warn!(
             event = "redact_key_malformed",
@@ -180,49 +192,79 @@ fn load_or_create_key() -> ([u8; 32], bool) {
             "restore key is not 32 bytes; placeholders minted before now will not restore"
         );
     }
+    None
+}
 
-    getrandom_key(&mut key);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+/// Persist a minted key with `0600` and `create_new`, so two proxies racing
+/// to start cannot write over each other — the loser re-reads the winner's
+/// key rather than minting tokens the winner cannot restore.
+/// Extracted from `load_or_create_key` without behavior change.
+fn persist_key(path: &std::path::Path, key: [u8; 32]) -> ([u8; 32], bool) {
+    use std::os::unix::fs::OpenOptionsExt;
+
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)
+        .open(path)
     {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(&key) {
-                tracing::warn!(event = "redact_key_write_failed", error = %e);
-                return (key, false);
-            }
-            tracing::info!(
-                event = "redact_key_created",
-                path = %path.display(),
-                "wrote a new restore key"
-            );
+        Ok(f) => finish_key_write(f, path, key),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => adopt_race_winner_key(path, key),
+        Err(e) => report_unavailable_key(path, key, e),
+    }
+}
+
+/// Write a freshly minted key to a newly created file.
+/// Extracted from `persist_key` without behavior change.
+fn finish_key_write(
+    mut f: std::fs::File,
+    path: &std::path::Path,
+    key: [u8; 32],
+) -> ([u8; 32], bool) {
+    use std::io::Write;
+
+    if let Err(e) = f.write_all(&key) {
+        tracing::warn!(event = "redact_key_write_failed", error = %e);
+        return (key, false);
+    }
+    tracing::info!(
+        event = "redact_key_created",
+        path = %path.display(),
+        "wrote a new restore key"
+    );
+    (key, true)
+}
+
+/// Lost the creation race: re-read the winner's key, which is the one that
+/// counts. Anything else leaves this process on its in-memory key.
+/// Extracted from `persist_key` without behavior change.
+fn adopt_race_winner_key(path: &std::path::Path, key: [u8; 32]) -> ([u8; 32], bool) {
+    // Lost the race. The winner's key is the one that counts.
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut key = key;
+            key.copy_from_slice(&bytes);
             (key, true)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lost the race. The winner's key is the one that counts.
-            match std::fs::read(&path) {
-                Ok(bytes) if bytes.len() == 32 => {
-                    key.copy_from_slice(&bytes);
-                    (key, true)
-                }
-                _ => (key, false),
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                event = "redact_key_unavailable",
-                path = %path.display(),
-                error = %e,
-                "no restore key on disk; placeholders will not survive this process"
-            );
-            (key, false)
-        }
+        _ => (key, false),
     }
+}
+
+/// No key file can be read or written: fall back to the in-memory key, which
+/// restores everything this process mints itself and nothing from before it.
+/// Extracted from `persist_key` without behavior change.
+fn report_unavailable_key(
+    path: &std::path::Path,
+    key: [u8; 32],
+    e: std::io::Error,
+) -> ([u8; 32], bool) {
+    tracing::warn!(
+        event = "redact_key_unavailable",
+        path = %path.display(),
+        error = %e,
+        "no restore key on disk; placeholders will not survive this process"
+    );
+    (key, false)
 }
 
 /// 32 bytes from the OS. `/dev/urandom` directly rather than through an RNG
@@ -1905,7 +1947,7 @@ mod tests {
         redact_body(&s, "sess", &mut body);
         let text = body["messages"][0]["content"].as_str().unwrap();
         let token = text.strip_prefix("check ").expect("shape");
-        assert_token_shape(token, "PATH", &text);
+        assert_token_shape(token, "PATH", text);
         unredact_body(&s, "sess", &mut body);
         assert!(body["messages"][0]["content"]
             .as_str()

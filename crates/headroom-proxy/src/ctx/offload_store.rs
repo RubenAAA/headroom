@@ -167,9 +167,20 @@ impl OffloadStore {
         if records.is_empty() {
             return;
         }
+        self.put_originals_inline(&records);
+        self.enqueue_for_indexing(records, project_dir);
+    }
+
+    /// Store CCR originals synchronously on the request path and time it.
+    /// A failed put is logged by the backend (`ccr_sqlite_put_failed`) and the
+    /// record is enqueued regardless, so the worker's own put retries it. The
+    /// request never fails for this: the wire bytes are already correct and a
+    /// lost original costs retrieval, not correctness.
+    /// Extracted from `persist` without behavior change.
+    fn put_originals_inline(&self, records: &[OffloadRecord]) {
         let started = std::time::Instant::now();
         let mut failed = 0usize;
-        for record in &records {
+        for record in records {
             if !self.ccr.put(&record.hash, &record.original) {
                 failed += 1;
             }
@@ -181,12 +192,17 @@ impl OffloadStore {
             put_inline_us = started.elapsed().as_micros() as u64,
             "CTX-3 CCR originals stored on the request path"
         );
+    }
 
+    /// Queue the batch for background FTS indexing, shedding first when the
+    /// worker is already `MAX_QUEUED_BYTES` behind. What is lost is the FTS
+    /// index entry, not the original: the CCR put above already happened on
+    /// this path, so `headroom ctx get` still serves every one of these
+    /// blocks by hash. Search misses them until they are re-indexed.
+    /// Extracted from `persist` without behavior change.
+    fn enqueue_for_indexing(&self, records: Vec<OffloadRecord>, project_dir: &str) {
         // Shed rather than queue when the worker is already `MAX_QUEUED_BYTES`
-        // behind. What is lost is the FTS index entry, not the original: the
-        // CCR put above already happened on this path, so `headroom ctx get`
-        // still serves every one of these blocks by hash. Search misses them
-        // until they are re-indexed.
+        // behind.
         // Charge first, refund if that broke the budget — see the same guard in
         // `ctx::observer`: a read-then-add lets a burst of threads past a check
         // none of them would pass together.

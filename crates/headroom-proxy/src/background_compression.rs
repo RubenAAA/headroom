@@ -188,12 +188,12 @@ mod tests {
 
         let job1 = CompressionJob {
             key: "dup".to_string(),
-            compress: Box::new(|| vec![]),
+            compress: Box::new(std::vec::Vec::new),
             store: Box::new(|_| {}),
         };
         let job2 = CompressionJob {
             key: "dup".to_string(),
-            compress: Box::new(|| vec![]),
+            compress: Box::new(std::vec::Vec::new),
             store: Box::new(|_| {}),
         };
 
@@ -214,7 +214,7 @@ mod tests {
         let compressor = BackgroundCompressor::new(10);
         let job = CompressionJob {
             key: "s1".to_string(),
-            compress: Box::new(|| vec![]),
+            compress: Box::new(std::vec::Vec::new),
             store: Box::new(|_| {}),
         };
         compressor.enqueue(job).await;

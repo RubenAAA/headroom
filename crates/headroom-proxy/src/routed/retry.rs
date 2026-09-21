@@ -101,17 +101,7 @@ pub(crate) async fn send_with_retry(
     is_chatgpt_auth: bool,
     is_zen: bool,
 ) -> Result<UpstreamSend, Response> {
-    // Bounds come from the same config the Claude path uses, so
-    // `--retry-max-attempts` and the backoff window mean one thing across both
-    // paths. The 401-refresh is codex-specific and sits outside the budget:
-    // it is a credential fix, not a transient failure, and always gets its one
-    // shot regardless of how retries are configured.
-    let max_attempts = if state.config.retry_enabled {
-        state.config.retry_max_attempts.max(1)
-    } else {
-        1
-    };
-    let max_delay_ms = state.config.retry_max_delay_ms;
+    let (max_attempts, max_delay_ms) = retry_bounds(state);
     let mut refreshed = false;
     let mut attempt: u32 = 0;
     // Zen in-flight cap: bound the first wave (concurrent POST starts),
@@ -132,22 +122,7 @@ pub(crate) async fn send_with_retry(
     } else {
         None
     };
-    // Shared 429 gate: a recent 429 on this host parks it until now+backoff,
-    // so turns arriving behind a known-limited upstream wait instead of
-    // re-colliding. Capped at `retry_max_delay_ms`; the request is untouched.
-    if let Some(host) = crate::routed::upstream_gate::upstream_host(upstream_url) {
-        let wait_ms = crate::routed::upstream_gate::gate_wait_ms(&host).min(max_delay_ms);
-        if wait_ms > 0 {
-            tracing::warn!(
-                event = "upstream_backoff_gate_wait",
-                upstream = %host,
-                wait_ms,
-                request_id = %request_id,
-                "upstream is parked by a recent 429; waiting behind it instead of re-colliding"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-        }
-    }
+    wait_behind_parked_host(upstream_url, max_delay_ms, request_id).await;
     let upstream_resp = loop {
         attempt += 1;
         let result = state
@@ -162,89 +137,30 @@ pub(crate) async fn send_with_retry(
             Ok(r) => {
                 let status = r.status();
                 if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed && is_chatgpt_auth {
-                    if let Some(auth_file) = state.config.codex_auth_file.as_deref() {
-                        if let Some(token) = refresh_codex_token(&state.client, auth_file).await {
-                            if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}"))
-                            {
-                                headers.insert(http::header::AUTHORIZATION, val);
-                            }
-                            refreshed = true;
-                            continue;
-                        }
-                    }
+                    let Some(r) =
+                        try_codex_token_refresh(state, &mut headers, &mut refreshed, r).await
+                    else {
+                        continue;
+                    };
                     break r;
                 }
                 if (status.as_u16() == 429 || status.is_server_error()) && attempt < max_attempts {
-                    let retry_after_uncapped = r
-                        .headers()
-                        .get(http::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(headroom_core::retry::retry_after_ms_uncapped);
-                    // A Zen 429 belongs to the hold below, which re-probes
-                    // until `retry_zen_hold_budget_ms`. Breaking out here on
-                    // a long Retry-After skipped the hold entirely, and Zen's
-                    // header is a constant (~53568, read as 14.9h) that keeps
-                    // its value while the route serves other turns fine.
-                    let zen_hold_owns_this =
-                        is_zen && status.as_u16() == 429 && state.config.retry_zen_hold_enabled;
-                    if !zen_hold_owns_this
-                        && retry_after_uncapped.is_some_and(|delay| delay > max_delay_ms as f64)
-                    {
-                        tracing::warn!(
-                            event = "local_model_retry_after_exceeds_cap",
-                            status = status.as_u16(),
-                            attempt,
-                            max_attempts,
-                            retry_after_ms = retry_after_uncapped.unwrap_or_default(),
-                            retry_max_delay_ms = max_delay_ms,
-                            request_id = %request_id,
-                            session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
-                            "upstream Retry-After exceeds the internal wait cap; returning the response without an early retry"
-                        );
-                        break r;
-                    }
-                    // Same reason: a Zen Retry-After past the cap is not a
-                    // wait, so it must not stretch the fast loop's ~1s slices
-                    // into cap-length sleeps before the hold takes over.
-                    let retry_after = match retry_after_uncapped {
-                        Some(delay) if zen_hold_owns_this && delay > max_delay_ms as f64 => None,
-                        other => other,
-                    };
-                    // Shared selection (C5); the outer min to the cap below
-                    // stays here — this loop clamps, `forward_http` does not.
-                    let backoff =
-                        std::time::Duration::from_millis(headroom_core::retry::next_delay_ms(
-                            retry_after,
-                            crate::proxy::backoff_ms(state, attempt - 1),
-                        ))
-                        .min(std::time::Duration::from_millis(max_delay_ms));
-                    tracing::warn!(
-                        event = "local_model_upstream_retry",
-                        status = status.as_u16(),
+                    match backoff_retryable_status(
+                        state,
+                        r,
                         attempt,
-                        backoff_ms = backoff.as_millis() as u64,
-                        retry_after_header = r.headers().contains_key(http::header::RETRY_AFTER),
-                        delay_source = if retry_after.is_some() { "header" } else { "backoff" },
-                        retry_after_clamped = false,
-                        request_id = %request_id,
-                        session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
-                        "retrying transient upstream error"
-                    );
-                    crate::observability::record_upstream_retry(
-                        "local_model",
-                        crate::observability::retry_reason::from_status(status.as_u16()),
-                    );
-                    // Share the pain: park this host until now+backoff so
-                    // parallel turns queue behind the limit instead of each
-                    // sleeping privately and re-colliding on the same wake.
-                    if let Some(host) = crate::routed::upstream_gate::upstream_host(upstream_url) {
-                        crate::routed::upstream_gate::gate_hold(
-                            &host,
-                            backoff.as_millis().min(u64::MAX as u128) as u64,
-                        );
+                        max_attempts,
+                        max_delay_ms,
+                        upstream_url,
+                        request_id,
+                        session_key,
+                        is_zen,
+                    )
+                    .await
+                    {
+                        StatusRetry::Waited => continue,
+                        StatusRetry::Break(r) => break r,
                     }
-                    tokio::time::sleep(backoff).await;
-                    continue;
                 }
                 // Zen rate-limit hold: the fast budget above spent itself
                 // (the 3-attempt default is ~3s) on a Zen 429, and returning
@@ -261,82 +177,32 @@ pub(crate) async fn send_with_retry(
                 // still books the outcome once.
                 if status.as_u16() == 413 && prepared_replay_applies(&body) {
                     drop(r);
-                    let stripped = strip_replay_prefix(&body);
-                    match state
-                        .client
-                        .post(upstream_url)
-                        .headers(headers.clone())
-                        .body(stripped.clone())
-                        .send()
-                        .await
-                    {
-                        Ok(r) => {
-                            tracing::warn!(
-                                event = "local_model_413_replay_stripped",
-                                request_id = %request_id,
-                                session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
-                                stripped_bytes = stripped.len() as u64,
-                                stripped_status = r.status().as_u16(),
-                                "upstream refused the replay-pinned body; retried once without the replay prefix"
-                            );
-                            return Ok(UpstreamSend {
-                                resp: r,
-                                headers,
-                                attempts: attempt + 1,
-                                retried_without_replay: Some(stripped.len() as u64),
-                            });
-                        }
-                        Err(e) => {
-                            return Err(crate::error::transient_response(format!(
-                                "local upstream error: {e}"
-                            )));
-                        }
-                    }
+                    return try_replay_stripped_resend(
+                        state,
+                        upstream_url,
+                        &headers,
+                        &body,
+                        attempt,
+                        request_id,
+                        session_key,
+                    )
+                    .await;
                 }
                 if status.as_u16() == 429 && is_zen && state.config.retry_zen_hold_enabled {
                     drop(r);
-                    // A hold sleeps for up to the hold budget (187 s seen
-                    // 2026-09-14) with nothing in flight. Holding the Zen
-                    // slot through it pinned every slot behind 429s, so the
-                    // 1,152 over-cap turns that day each waited the full
-                    // 30 s and then went without one anyway. Give it back;
-                    // the per-host gate already staggers arrivals behind
-                    // the same 429.
-                    zen_slot.take();
-                    match crate::routed::zen_hold::hold_for_rotation(
+                    match try_zen_hold(
                         state,
                         upstream_url,
-                        headers.clone(),
-                        body.clone(),
-                        attempt,
+                        &mut headers,
+                        &body,
+                        &mut attempt,
+                        &mut zen_slot,
                         request_id,
                     )
                     .await
                     {
-                        Some(held) => {
-                            headers = held.headers;
-                            attempt = held.attempts_made;
-                            break held.resp;
-                        }
-                        // The hold declined (non-retryable error inside):
-                        // the fast loop's last 429 is already dropped, so
-                        // re-send once for the honest answer rather than
-                        // inventing a status.
-                        None => match state
-                            .client
-                            .post(upstream_url)
-                            .headers(headers.clone())
-                            .body(body.clone())
-                            .send()
-                            .await
-                        {
-                            Ok(r) => break r,
-                            Err(e) => {
-                                return Err(crate::error::transient_response(format!(
-                                    "local upstream error: {e}"
-                                )));
-                            }
-                        },
+                        Ok(r) => break r,
+                        Err(resp) => return Err(resp),
                     }
                 }
                 break r;
@@ -344,68 +210,20 @@ pub(crate) async fn send_with_retry(
             Err(e) => {
                 // Same filter the Claude path uses: a decode or builder error
                 // is not transient and gets no retry, only the transport-level
-                // ones do. This arm used to retry every error alike, which
-                // spent the whole budget re-sending a request that could not
-                // succeed and delayed the 502 the caller was owed.
-                let is_retryable = crate::proxy::is_retryable_transport_error(&e);
-                if is_retryable && attempt < max_attempts {
-                    // Was a hardcoded 250ms doubling with no ceiling, which
-                    // ignored `retry_base_delay_ms` and could outrun
-                    // `retry_max_delay_ms`. Same backoff as every other site now.
-                    let backoff = std::time::Duration::from_millis(crate::proxy::backoff_ms(
-                        state,
-                        attempt - 1,
-                    ));
-                    tracing::warn!(
-                        event = "local_model_upstream_retry",
-                        error = %e,
-                        attempt,
-                        backoff_ms = backoff.as_millis() as u64,
-                        delay_source = "transport_backoff",
-                        request_id = %request_id,
-                        "retrying failed upstream connection"
-                    );
-                    crate::observability::record_upstream_retry(
-                        "local_model",
-                        crate::observability::retry_reason::TRANSPORT,
-                    );
-                    tokio::time::sleep(backoff).await;
-                    continue;
+                // ones do.
+                match handle_transport_error(
+                    state,
+                    e,
+                    attempt,
+                    max_attempts,
+                    upstream_url,
+                    request_id,
+                )
+                .await
+                {
+                    TransportOutcome::Retry => continue,
+                    TransportOutcome::Fail(resp) => return Err(resp),
                 }
-                if is_retryable {
-                    crate::observability::record_upstream_retry_exhausted(
-                        "local_model",
-                        crate::observability::retry_reason::TRANSPORT,
-                    );
-                    tracing::warn!(
-                        event = "local_model_upstream_error",
-                        error = %e,
-                        retryable = is_retryable,
-                        attempts = attempt,
-                        upstream = %upstream_url,
-                        "failed to connect to local model upstream"
-                    );
-                    // Transient (rotation RST, wifi flap, corpse-pool
-                    // first-write miss): 503 + Retry-After so the client
-                    // retries — the same contract `ProxyError::Upstream`
-                    // upholds in `crate::error`. A bare 502 here would stall
-                    // the session until a human nudges it.
-                    return Err(crate::error::transient_response(format!(
-                        "local upstream error: {e}"
-                    )));
-                }
-                tracing::warn!(
-                    event = "local_model_upstream_error",
-                    error = %e,
-                    retryable = is_retryable,
-                    attempts = attempt,
-                    upstream = %upstream_url,
-                    "failed to connect to local model upstream"
-                );
-                return Err(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from(format!("local upstream error: {e}")))
-                    .expect("static response"));
             }
         }
     };
@@ -415,6 +233,348 @@ pub(crate) async fn send_with_retry(
         attempts: attempt,
         retried_without_replay: None,
     })
+}
+
+/// Retry bounds from the same config the Claude path uses, so
+/// `--retry-max-attempts` and the backoff window mean one thing across both
+/// paths. The 401-refresh is codex-specific and sits outside the budget:
+/// it is a credential fix, not a transient failure, and always gets its one
+/// shot regardless of how retries are configured.
+/// Extracted from `send_with_retry` without behavior change.
+fn retry_bounds(state: &AppState) -> (u32, u64) {
+    let max_attempts = if state.config.retry_enabled {
+        state.config.retry_max_attempts.max(1)
+    } else {
+        1
+    };
+    (max_attempts, state.config.retry_max_delay_ms)
+}
+
+/// Shared 429 gate: a recent 429 on this host parks it until now+backoff,
+/// so turns arriving behind a known-limited upstream wait instead of
+/// re-colliding. Capped at `retry_max_delay_ms`; the request is untouched.
+/// Extracted from `send_with_retry` without behavior change.
+async fn wait_behind_parked_host(upstream_url: &str, max_delay_ms: u64, request_id: &str) {
+    if let Some(host) = crate::routed::upstream_gate::upstream_host(upstream_url) {
+        let wait_ms = crate::routed::upstream_gate::gate_wait_ms(&host).min(max_delay_ms);
+        if wait_ms > 0 {
+            tracing::warn!(
+                event = "upstream_backoff_gate_wait",
+                upstream = %host,
+                wait_ms,
+                request_id = %request_id,
+                "upstream is parked by a recent 429; waiting behind it instead of re-colliding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+    }
+}
+
+/// One-shot Codex OAuth refresh outside the retry budget. Returns `None`
+/// when the token was refreshed (caller updates headers and re-sends), or
+/// `Some(r)` to break the loop with the 401 when no refresh applied.
+/// Extracted from `send_with_retry` without behavior change.
+async fn try_codex_token_refresh(
+    state: &AppState,
+    headers: &mut HeaderMap,
+    refreshed: &mut bool,
+    r: reqwest::Response,
+) -> Option<reqwest::Response> {
+    if let Some(auth_file) = state.config.codex_auth_file.as_deref() {
+        if let Some(token) = refresh_codex_token(&state.client, auth_file).await {
+            if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
+                headers.insert(http::header::AUTHORIZATION, val);
+            }
+            *refreshed = true;
+            return None;
+        }
+    }
+    Some(r)
+}
+
+/// What the 429/5xx backoff arm decided: the turn slept and must re-send,
+/// or the loop breaks with this response.
+/// Extracted from `send_with_retry` without behavior change.
+enum StatusRetry {
+    Waited,
+    Break(reqwest::Response),
+}
+
+/// Backoff on a retryable 429/5xx inside the attempt budget: honor
+/// Retry-After (except the Zen-owned 429, which belongs to the hold), clamp
+/// to the cap, park the host for parallel turns, sleep. Breaks with the
+/// response when Retry-After exceeds the cap — unless the Zen hold owns it.
+/// Extracted from `send_with_retry` without behavior change.
+#[allow(clippy::too_many_arguments)]
+async fn backoff_retryable_status(
+    state: &AppState,
+    r: reqwest::Response,
+    attempt: u32,
+    max_attempts: u32,
+    max_delay_ms: u64,
+    upstream_url: &str,
+    request_id: &str,
+    session_key: Option<&str>,
+    is_zen: bool,
+) -> StatusRetry {
+    let status = r.status();
+    let retry_after_uncapped = r
+        .headers()
+        .get(http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(headroom_core::retry::retry_after_ms_uncapped);
+    // A Zen 429 belongs to the hold below, which re-probes
+    // until `retry_zen_hold_budget_ms`. Breaking out here on
+    // a long Retry-After skipped the hold entirely, and Zen's
+    // header is a constant (~53568, read as 14.9h) that keeps
+    // its value while the route serves other turns fine.
+    let zen_hold_owns_this =
+        is_zen && status.as_u16() == 429 && state.config.retry_zen_hold_enabled;
+    if !zen_hold_owns_this && retry_after_uncapped.is_some_and(|delay| delay > max_delay_ms as f64)
+    {
+        tracing::warn!(
+            event = "local_model_retry_after_exceeds_cap",
+            status = status.as_u16(),
+            attempt,
+            max_attempts,
+            retry_after_ms = retry_after_uncapped.unwrap_or_default(),
+            retry_max_delay_ms = max_delay_ms,
+            request_id = %request_id,
+            session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
+            "upstream Retry-After exceeds the internal wait cap; returning the response without an early retry"
+        );
+        return StatusRetry::Break(r);
+    }
+    // Same reason: a Zen Retry-After past the cap is not a
+    // wait, so it must not stretch the fast loop's ~1s slices
+    // into cap-length sleeps before the hold takes over.
+    let retry_after = match retry_after_uncapped {
+        Some(delay) if zen_hold_owns_this && delay > max_delay_ms as f64 => None,
+        other => other,
+    };
+    // Shared selection (C5); the outer min to the cap below
+    // stays here — this loop clamps, `forward_http` does not.
+    let backoff = std::time::Duration::from_millis(headroom_core::retry::next_delay_ms(
+        retry_after,
+        crate::proxy::backoff_ms(state, attempt - 1),
+    ))
+    .min(std::time::Duration::from_millis(max_delay_ms));
+    tracing::warn!(
+        event = "local_model_upstream_retry",
+        status = status.as_u16(),
+        attempt,
+        backoff_ms = backoff.as_millis() as u64,
+        retry_after_header = r.headers().contains_key(http::header::RETRY_AFTER),
+        delay_source = if retry_after.is_some() { "header" } else { "backoff" },
+        retry_after_clamped = false,
+        request_id = %request_id,
+        session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
+        "retrying transient upstream error"
+    );
+    crate::observability::record_upstream_retry(
+        "local_model",
+        crate::observability::retry_reason::from_status(status.as_u16()),
+    );
+    // Share the pain: park this host until now+backoff so
+    // parallel turns queue behind the limit instead of each
+    // sleeping privately and re-colliding on the same wake.
+    if let Some(host) = crate::routed::upstream_gate::upstream_host(upstream_url) {
+        crate::routed::upstream_gate::gate_hold(
+            &host,
+            backoff.as_millis().min(u64::MAX as u128) as u64,
+        );
+    }
+    tokio::time::sleep(backoff).await;
+    StatusRetry::Waited
+}
+
+/// 413 replay-strip: the replay prefix pins the outbound body at the session
+/// maximum, so a body the gateway refuses is retried once with the cached
+/// head dropped. Caller checked `prepared_replay_applies`; the tail keeps its
+/// order and content, so the turn reads as a continuation that cache-misses
+/// the head — not a new turn.
+/// Extracted from `send_with_retry` without behavior change.
+#[allow(clippy::too_many_arguments)]
+async fn try_replay_stripped_resend(
+    state: &AppState,
+    upstream_url: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+    attempt: u32,
+    request_id: &str,
+    session_key: Option<&str>,
+) -> Result<UpstreamSend, Response> {
+    let stripped = strip_replay_prefix(body);
+    match state
+        .client
+        .post(upstream_url)
+        .headers(headers.clone())
+        .body(stripped.clone())
+        .send()
+        .await
+    {
+        Ok(r) => {
+            tracing::warn!(
+                event = "local_model_413_replay_stripped",
+                request_id = %request_id,
+                session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
+                stripped_bytes = stripped.len() as u64,
+                stripped_status = r.status().as_u16(),
+                "upstream refused the replay-pinned body; retried once without the replay prefix"
+            );
+            Ok(UpstreamSend {
+                resp: r,
+                headers: headers.clone(),
+                attempts: attempt + 1,
+                retried_without_replay: Some(stripped.len() as u64),
+            })
+        }
+        Err(e) => Err(crate::error::transient_response(format!(
+            "local upstream error: {e}"
+        ))),
+    }
+}
+
+/// Zen rate-limit hold: the fast budget spent itself on a Zen 429, and
+/// returning it kills the turn before the watcher can rotate. Hands the
+/// turn to the hold and applies its answer to the caller's headers/attempt.
+/// Returns the response to break the loop with, or the 502 to fail with.
+/// Extracted from `send_with_retry` without behavior change.
+#[allow(clippy::too_many_arguments)]
+async fn try_zen_hold(
+    state: &AppState,
+    upstream_url: &str,
+    headers: &mut HeaderMap,
+    body: &Bytes,
+    attempt: &mut u32,
+    zen_slot: &mut Option<crate::routed::upstream_gate::ZenSlot>,
+    request_id: &str,
+) -> Result<reqwest::Response, Response> {
+    // A hold sleeps for up to the hold budget (187 s seen
+    // 2026-09-14) with nothing in flight. Holding the Zen
+    // slot through it pinned every slot behind 429s, so the
+    // 1,152 over-cap turns that day each waited the full
+    // 30 s and then went without one anyway. Give it back;
+    // the per-host gate already staggers arrivals behind
+    // the same 429.
+    zen_slot.take();
+    match crate::routed::zen_hold::hold_for_rotation(
+        state,
+        upstream_url,
+        headers.clone(),
+        body.clone(),
+        *attempt,
+        request_id,
+    )
+    .await
+    {
+        Some(held) => {
+            *headers = held.headers;
+            *attempt = held.attempts_made;
+            Ok(held.resp)
+        }
+        // The hold declined (non-retryable error inside):
+        // the fast loop's last 429 is already dropped, so
+        // re-send once for the honest answer rather than
+        // inventing a status.
+        None => match state
+            .client
+            .post(upstream_url)
+            .headers(headers.clone())
+            .body(body.clone())
+            .send()
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) => Err(crate::error::transient_response(format!(
+                "local upstream error: {e}"
+            ))),
+        },
+    }
+}
+
+/// What the transport-error arm decided: sleep and re-send, or fail now.
+/// Extracted from `send_with_retry` without behavior change.
+enum TransportOutcome {
+    Retry,
+    Fail(Response),
+}
+
+/// Transport-error arm with the same filter the Claude path uses: a decode
+/// or builder error is not transient and gets no retry, only the
+/// transport-level ones do. Exhaustion answers 503 + Retry-After so the
+/// client retries; a non-retryable error answers a bare 502.
+/// Extracted from `send_with_retry` without behavior change.
+async fn handle_transport_error(
+    state: &AppState,
+    e: reqwest::Error,
+    attempt: u32,
+    max_attempts: u32,
+    upstream_url: &str,
+    request_id: &str,
+) -> TransportOutcome {
+    // This arm used to retry every error alike, which
+    // spent the whole budget re-sending a request that could not
+    // succeed and delayed the 502 the caller was owed.
+    let is_retryable = crate::proxy::is_retryable_transport_error(&e);
+    if is_retryable && attempt < max_attempts {
+        // Was a hardcoded 250ms doubling with no ceiling, which
+        // ignored `retry_base_delay_ms` and could outrun
+        // `retry_max_delay_ms`. Same backoff as every other site now.
+        let backoff =
+            std::time::Duration::from_millis(crate::proxy::backoff_ms(state, attempt - 1));
+        tracing::warn!(
+            event = "local_model_upstream_retry",
+            error = %e,
+            attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            delay_source = "transport_backoff",
+            request_id = %request_id,
+            "retrying failed upstream connection"
+        );
+        crate::observability::record_upstream_retry(
+            "local_model",
+            crate::observability::retry_reason::TRANSPORT,
+        );
+        tokio::time::sleep(backoff).await;
+        return TransportOutcome::Retry;
+    }
+    if is_retryable {
+        crate::observability::record_upstream_retry_exhausted(
+            "local_model",
+            crate::observability::retry_reason::TRANSPORT,
+        );
+        tracing::warn!(
+            event = "local_model_upstream_error",
+            error = %e,
+            retryable = is_retryable,
+            attempts = attempt,
+            upstream = %upstream_url,
+            "failed to connect to local model upstream"
+        );
+        // Transient (rotation RST, wifi flap, corpse-pool
+        // first-write miss): 503 + Retry-After so the client
+        // retries — the same contract `ProxyError::Upstream`
+        // upholds in `crate::error`. A bare 502 here would stall
+        // the session until a human nudges it.
+        return TransportOutcome::Fail(crate::error::transient_response(format!(
+            "local upstream error: {e}"
+        )));
+    }
+    tracing::warn!(
+        event = "local_model_upstream_error",
+        error = %e,
+        retryable = is_retryable,
+        attempts = attempt,
+        upstream = %upstream_url,
+        "failed to connect to local model upstream"
+    );
+    TransportOutcome::Fail(
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(format!("local upstream error: {e}")))
+            .expect("static response"),
+    )
 }
 
 #[cfg(test)]

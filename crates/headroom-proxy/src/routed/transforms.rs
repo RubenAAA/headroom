@@ -175,6 +175,290 @@ pub(crate) struct CtxTransformReport {
 /// the session key, and through it prefix replay, the roster pin and the tool
 /// order store, plus the usage observer's prefix fingerprint — is derived from
 /// it, so a rerouted turn stays on the key its conversation already has.
+/// CTX-7: park conversation identity + drift dims under the request id so
+/// the response side can classify this turn's billed usage against the
+/// conversation's previous turn. Returns the conversation key for the report.
+///
+/// Spark turns never park: they bill from a different cache universe (no
+/// Anthropic write/TTL telemetry, translated prefix, separate per-model
+/// lineage), so scoring them against the Anthropic footprint reads as a
+/// bust on nearly every turn and drags the fleet hit rate down for no
+/// reason. Spark has its own `/spark-context` segment instead.
+/// Extracted from `apply_ctx_request_transforms` without behavior change.
+fn park_conversation_identity(
+    state: &AppState,
+    request_id: &str,
+    parsed: &Value,
+    lane_key: &str,
+    session_key: &str,
+    drift_dims: Option<String>,
+    identity_model: Option<&str>,
+) -> String {
+    // This is what feeds the re-cache watchdog that
+    // `scripts/statusline-cache-health.sh` renders — without it the cache
+    // segment simply has nothing to say about routed turns.
+    let body_model_is_spark = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.to_lowercase().contains("spark"));
+    let conversation_key =
+        crate::cache_stabilization::usage_observer::conversation_key(parsed, lane_key);
+    if !body_model_is_spark {
+        state.usage_observer.begin_request(
+            request_id,
+            conversation_key.clone(),
+            Some(session_key),
+            drift_dims,
+            Some(
+                crate::cache_stabilization::usage_observer::prefix_fingerprint_with_model(
+                    parsed,
+                    identity_model,
+                ),
+            ),
+        );
+        // Same tier read as the Claude path: `parsed` is pre-transform here, so
+        // this is what the client asked for, before translation reshapes it.
+        state.usage_observer.note_client_cache_ttl(
+            request_id,
+            crate::cache_stabilization::cache_ttl::client_ttl_shape(parsed),
+        );
+        // Translated turns bill upstream as OpenAI, not Anthropic: no
+        // creation counter, no TTL split, different pricing and retention.
+        // The watchdog still scores them; the Anthropic-priced stock arm
+        // stays out rather than inventing a premium never charged.
+        state.usage_observer.note_stock_ineligible(request_id);
+    }
+    conversation_key
+}
+
+/// CTX-2: passive session capture. Read-only — clones the body onto a
+/// detached worker; never mutates and never blocks. Returns the ctx project
+/// this turn is captured into and recalled from, also parked for
+/// `/debug/active-conversations` presence.
+/// Extracted from `apply_ctx_request_transforms` without behavior change.
+fn capture_session_turn(
+    state: &AppState,
+    parsed: &Value,
+    headers: &HeaderMap,
+    request_id: &str,
+    session_key: &str,
+) -> String {
+    // Which project's ctx stores this turn is captured into and recalled from.
+    let ctx_project = crate::proxy::resolve_ctx_project(
+        Some(headers),
+        parsed,
+        state.config.memory_project_root.as_deref(),
+    );
+    // Presence for /debug/active-conversations: same project dir the ctx
+    // stores shard on, parked under the request id.
+    state
+        .usage_observer
+        .note_project(request_id, ctx_project.clone());
+    if let Some(observer) = state.ctx_observer.as_ref() {
+        observer.observe(parsed, session_key, &ctx_project);
+    }
+    ctx_project
+}
+
+/// CCR proactive expansion: pull back previously-offloaded content the
+/// query looks like it needs, before anything else touches the body. First
+/// in the block on the Claude path too. Returns whether the report label
+/// applies.
+/// Extracted from `apply_ctx_request_transforms` without behavior change.
+fn expand_ccr_proactive(
+    state: &AppState,
+    parsed: &mut Value,
+    user_query: &str,
+    ccr_workspace: &Option<(String, Option<String>)>,
+    turn_number: u32,
+    request_id: &str,
+    injection_budget: &crate::injection_budget::InjectionBudget,
+) -> bool {
+    if let Some((workspace_key, workspace_label)) = ccr_workspace.as_ref() {
+        if crate::proxy::maybe_append_ccr_proactive_expansion(
+            state,
+            parsed,
+            user_query,
+            workspace_key,
+            workspace_label.as_deref(),
+            turn_number,
+            request_id,
+            injection_budget,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// CTX-4: recall/resume injection. Runs BEFORE offload (matching the
+/// Claude path order). Cache-safe by construction — the engine decides
+/// once per conversation and replays the exact same bytes into the first
+/// user message on every later turn (nothing volatile), so the codex
+/// prompt-cache prefix stays byte-stable after the one-time introduction.
+/// It never touches `system`/`tools`. Returns whether the report label
+/// applies.
+/// Extracted from `apply_ctx_request_transforms` without behavior change.
+fn inject_recall_block(
+    state: &AppState,
+    parsed: &mut Value,
+    session_key: &str,
+    ctx_project: &str,
+    injection_budget: &crate::injection_budget::InjectionBudget,
+    request_id: &str,
+) -> bool {
+    if let Some(engine) = state.ctx_inject.as_ref() {
+        if engine.maybe_inject_for_request(
+            parsed,
+            session_key,
+            ctx_project,
+            injection_budget,
+            request_id,
+        ) {
+            tracing::debug!(
+                event = "codex_ctx_inject",
+                "injected recall/resume block into routed-model request"
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// CTX-3: tool_result offload. Feeds the FTS search store and shrinks the
+/// body. Gated on the same `ctx_offload` flag as the Claude path. Records
+/// what was offloaded against the workspace so a later turn's proactive
+/// expansion can find it — without this the expansion above has an empty
+/// index to consult and can never fire.
+/// Extracted from `apply_ctx_request_transforms` without behavior change.
+#[allow(clippy::too_many_arguments)]
+fn offload_tool_results(
+    state: &AppState,
+    parsed: &mut Value,
+    session_key: &str,
+    rebuild_boundary: bool,
+    ccr_workspace: &Option<(String, Option<String>)>,
+    user_query: &str,
+    turn_number: u32,
+    request_id: &str,
+    ctx_project: &str,
+    report: &mut CtxTransformReport,
+) {
+    if let Some(runtime) = state.ctx_offload.as_ref() {
+        let policy = crate::compression::ctx_offload::OffloadPolicy {
+            gate: &runtime.gate,
+            session_key,
+            rebuild_boundary,
+        };
+        let out = crate::compression::ctx_offload::offload_anthropic_request(
+            parsed,
+            &runtime.config,
+            Some(&policy),
+        );
+        if out.changed() {
+            report.transforms_applied.push("ctx_offload".to_string());
+            report.tokens_saved += out.tokens_saved;
+            tracing::debug!(
+                event = "codex_ctx_offload",
+                blocks_offloaded = out.blocks_offloaded,
+                blocks_deferred = out.blocks_deferred,
+                tokens_saved = out.tokens_saved,
+                rebuild_boundary,
+                "offloaded tool_result blocks on routed-model request"
+            );
+            // Record what was offloaded against the workspace so a later turn's
+            // proactive expansion can find it. Without this the expansion above
+            // has an empty index to consult and can never fire.
+            if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
+                crate::proxy::track_ccr_context_records(
+                    state,
+                    &out.records,
+                    workspace_key,
+                    user_query,
+                    turn_number,
+                    request_id,
+                );
+            } else if state.ccr_context_tracker.is_some() {
+                // Volume the fallback would have to absorb: records and bytes
+                // that entered the store but no tracker index.
+                tracing::info!(
+                    event = "codex_ccr_workspace_unresolved",
+                    records_skipped = out.records.len(),
+                    bytes_skipped = out
+                        .records
+                        .iter()
+                        .map(|r| r.original.len() as u64)
+                        .sum::<u64>(),
+                    "CCR: workspace unresolved; skipping compression tracking"
+                );
+            }
+            runtime.store.persist(out.records, ctx_project);
+        }
+    }
+}
+
+/// Tool-definition stages on the still-Anthropic-shaped body: memory tools
+/// (without these a routed model has no way to write memories at all),
+/// the CCR `headroom_retrieve` tool (only extends an existing `tools`
+/// array, as on the Claude path), and verbosity steering (idempotent via
+/// sentinel prefix; disabled in cache mode, as on the Claude path).
+/// Extracted from `apply_ctx_request_transforms` without behavior change.
+fn inject_turn_tools(state: &AppState, parsed: &mut Value, report: &mut CtxTransformReport) {
+    // The routed body is still Anthropic-shaped here — translation runs after
+    // — so every stage below uses the Anthropic provider and the Anthropic
+    // tool shape, exactly as `forward_http` does for `/v1/messages`.
+    const PROVIDER: crate::memory::tool_adapter::Provider =
+        crate::memory::tool_adapter::Provider::Anthropic;
+
+    // Memory: inject tool definitions. Without this, a routed model has no way
+    // to write memories at all — `--memory` looked enabled and silently did
+    // nothing.
+    if let Some(handler) = state.memory_handler.as_ref() {
+        if handler.is_initialized() && inject_memory_tools(handler, parsed, PROVIDER) {
+            report.transforms_applied.push("memory_tools".to_string());
+        }
+    }
+
+    // CCR: the `headroom_retrieve` tool, so the model can pull back original
+    // content by hash from a compression marker. Only extends an existing
+    // `tools` array — same as the Claude path, which does not create one here.
+    if state.config.ccr_inject_tool && inject_ccr_retrieve_tool(parsed) {
+        report.transforms_applied.push("ccr_tool".to_string());
+    }
+
+    // Output shaping: verbosity steering. Idempotent — the
+    // steering text carries a sentinel prefix — so replaying a prefix that
+    // already contains it does not stack.
+    // Disabled in cache mode, as on the Claude path: this body is
+    // Anthropic-shaped, so steering appends to the same system-prompt tail
+    // that carries the provider prefix-cache key.
+    if state.config.output_shaper_enabled {
+        apply_output_shaper(state, parsed, &mut report.transforms_applied);
+    }
+}
+
+/// Memory recall: search and append recalled context to the latest user
+/// message. Returns whether the report label applies.
+/// Extracted from `apply_ctx_request_transforms` without behavior change.
+async fn recall_memory_context(state: &AppState, headers: &HeaderMap, parsed: &mut Value) -> bool {
+    // Same Anthropic shape as the tool stages above.
+    const PROVIDER: crate::memory::tool_adapter::Provider =
+        crate::memory::tool_adapter::Provider::Anthropic;
+
+    if let Some(handler) = state.memory_handler.as_ref() {
+        if handler.is_initialized() {
+            let user_id = headers
+                .get("x-headroom-user-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("default");
+            if append_memory_context(handler, parsed, user_id, PROVIDER).await {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) async fn apply_ctx_request_transforms(
     state: &AppState,
     parsed: &mut Value,
@@ -253,64 +537,20 @@ pub(crate) async fn apply_ctx_request_transforms(
 
     // CTX-7: park conversation identity + drift dims under the request id so
     // the response side can classify this turn's billed usage against the
-    // conversation's previous turn. This is what feeds the re-cache watchdog
-    // that `scripts/statusline-cache-health.sh` renders — without it the cache
-    // segment simply has nothing to say about routed turns.
-    //
-    // Spark turns never park: they bill from a different cache universe (no
-    // Anthropic write/TTL telemetry, translated prefix, separate per-model
-    // lineage), so scoring them against the Anthropic footprint reads as a
-    // bust on nearly every turn and drags the fleet hit rate down for no
-    // reason. Spark has its own `/spark-context` segment instead.
-    let body_model_is_spark = parsed
-        .get("model")
-        .and_then(|v| v.as_str())
-        .is_some_and(|m| m.to_lowercase().contains("spark"));
-    let conversation_key =
-        crate::cache_stabilization::usage_observer::conversation_key(parsed, &lane_key);
-    report.conversation_key = conversation_key.clone();
-    if !body_model_is_spark {
-        state.usage_observer.begin_request(
-            request_id,
-            conversation_key,
-            Some(session_key.as_str()),
-            drift_dims,
-            Some(
-                crate::cache_stabilization::usage_observer::prefix_fingerprint_with_model(
-                    parsed,
-                    identity_model,
-                ),
-            ),
-        );
-        // Same tier read as the Claude path: `parsed` is pre-transform here, so
-        // this is what the client asked for, before translation reshapes it.
-        state.usage_observer.note_client_cache_ttl(
-            request_id,
-            crate::cache_stabilization::cache_ttl::client_ttl_shape(parsed),
-        );
-        // Translated turns bill upstream as OpenAI, not Anthropic: no
-        // creation counter, no TTL split, different pricing and retention.
-        // The watchdog still scores them; the Anthropic-priced stock arm
-        // stays out rather than inventing a premium never charged.
-        state.usage_observer.note_stock_ineligible(request_id);
-    }
+    // conversation's previous turn.
+    report.conversation_key = park_conversation_identity(
+        state,
+        request_id,
+        parsed,
+        &lane_key,
+        &session_key,
+        drift_dims,
+        identity_model,
+    );
 
     // CTX-2: passive session capture. Read-only — clones the body onto a
     // detached worker; never mutates and never blocks.
-    // Which project's ctx stores this turn is captured into and recalled from.
-    let ctx_project = crate::proxy::resolve_ctx_project(
-        Some(headers),
-        parsed,
-        state.config.memory_project_root.as_deref(),
-    );
-    // Presence for /debug/active-conversations: same project dir the ctx
-    // stores shard on, parked under the request id.
-    state
-        .usage_observer
-        .note_project(request_id, ctx_project.clone());
-    if let Some(observer) = state.ctx_observer.as_ref() {
-        observer.observe(parsed, &session_key, &ctx_project);
-    }
+    let ctx_project = capture_session_turn(state, parsed, headers, request_id, &session_key);
 
     // CCR identity for this turn. All three helpers read the Anthropic
     // `messages` shape, which is exactly what `parsed` still is here.
@@ -333,142 +573,54 @@ pub(crate) async fn apply_ctx_request_transforms(
     // CCR proactive expansion: pull back previously-offloaded content the
     // query looks like it needs, before anything else touches the body. First
     // in the block on the Claude path too.
-    if let Some((workspace_key, workspace_label)) = ccr_workspace.as_ref() {
-        if crate::proxy::maybe_append_ccr_proactive_expansion(
-            state,
-            parsed,
-            &user_query,
-            workspace_key,
-            workspace_label.as_deref(),
-            turn_number,
-            request_id,
-            &injection_budget,
-        ) {
-            report
-                .transforms_applied
-                .push("ccr_proactive_expansion".to_string());
-        }
+    if expand_ccr_proactive(
+        state,
+        parsed,
+        &user_query,
+        &ccr_workspace,
+        turn_number,
+        request_id,
+        &injection_budget,
+    ) {
+        report
+            .transforms_applied
+            .push("ccr_proactive_expansion".to_string());
     }
 
     // CTX-4: recall/resume injection. Runs BEFORE offload (matching the
-    // Claude path order). Cache-safe by construction — the engine decides
-    // once per conversation and replays the exact same bytes into the first
-    // user message on every later turn (nothing volatile), so the codex
-    // prompt-cache prefix stays byte-stable after the one-time introduction.
-    // It never touches `system`/`tools`.
-    if let Some(engine) = state.ctx_inject.as_ref() {
-        if engine.maybe_inject_for_request(
-            parsed,
-            &session_key,
-            &ctx_project,
-            &injection_budget,
-            request_id,
-        ) {
-            report.transforms_applied.push("ctx_inject".to_string());
-            tracing::debug!(
-                event = "codex_ctx_inject",
-                "injected recall/resume block into routed-model request"
-            );
-        }
+    // Claude path order).
+    if inject_recall_block(
+        state,
+        parsed,
+        &session_key,
+        &ctx_project,
+        &injection_budget,
+        request_id,
+    ) {
+        report.transforms_applied.push("ctx_inject".to_string());
     }
 
     // CTX-3: tool_result offload. Feeds the FTS search store and shrinks the
     // body. Gated on the same `ctx_offload` flag as the Claude path.
-    if let Some(runtime) = state.ctx_offload.as_ref() {
-        let policy = crate::compression::ctx_offload::OffloadPolicy {
-            gate: &runtime.gate,
-            session_key: &session_key,
-            rebuild_boundary,
-        };
-        let out = crate::compression::ctx_offload::offload_anthropic_request(
-            parsed,
-            &runtime.config,
-            Some(&policy),
-        );
-        if out.changed() {
-            report.transforms_applied.push("ctx_offload".to_string());
-            report.tokens_saved += out.tokens_saved;
-            tracing::debug!(
-                event = "codex_ctx_offload",
-                blocks_offloaded = out.blocks_offloaded,
-                blocks_deferred = out.blocks_deferred,
-                tokens_saved = out.tokens_saved,
-                rebuild_boundary,
-                "offloaded tool_result blocks on routed-model request"
-            );
-            // Record what was offloaded against the workspace so a later turn's
-            // proactive expansion can find it. Without this the expansion above
-            // has an empty index to consult and can never fire.
-            if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
-                crate::proxy::track_ccr_context_records(
-                    state,
-                    &out.records,
-                    workspace_key,
-                    &user_query,
-                    turn_number,
-                    request_id,
-                );
-            } else if state.ccr_context_tracker.is_some() {
-                // Volume the fallback would have to absorb: records and bytes
-                // that entered the store but no tracker index.
-                tracing::info!(
-                    event = "codex_ccr_workspace_unresolved",
-                    records_skipped = out.records.len(),
-                    bytes_skipped = out
-                        .records
-                        .iter()
-                        .map(|r| r.original.len() as u64)
-                        .sum::<u64>(),
-                    "CCR: workspace unresolved; skipping compression tracking"
-                );
-            }
-            runtime.store.persist(out.records, &ctx_project);
-        }
-    }
+    offload_tool_results(
+        state,
+        parsed,
+        &session_key,
+        rebuild_boundary,
+        &ccr_workspace,
+        &user_query,
+        turn_number,
+        request_id,
+        &ctx_project,
+        &mut report,
+    );
 
-    // The routed body is still Anthropic-shaped here — translation runs after
-    // — so every stage below uses the Anthropic provider and the Anthropic
-    // tool shape, exactly as `forward_http` does for `/v1/messages`.
-    const PROVIDER: crate::memory::tool_adapter::Provider =
-        crate::memory::tool_adapter::Provider::Anthropic;
-
-    // Memory: inject tool definitions. Without this, a routed model has no way
-    // to write memories at all — `--memory` looked enabled and silently did
-    // nothing.
-    if let Some(handler) = state.memory_handler.as_ref() {
-        if handler.is_initialized() && inject_memory_tools(handler, parsed, PROVIDER) {
-            report.transforms_applied.push("memory_tools".to_string());
-        }
-    }
-
-    // CCR: the `headroom_retrieve` tool, so the model can pull back original
-    // content by hash from a compression marker. Only extends an existing
-    // `tools` array — same as the Claude path, which does not create one here.
-    if state.config.ccr_inject_tool && inject_ccr_retrieve_tool(parsed) {
-        report.transforms_applied.push("ccr_tool".to_string());
-    }
-
-    // Output shaping: verbosity steering. Idempotent — the
-    // steering text carries a sentinel prefix — so replaying a prefix that
-    // already contains it does not stack.
-    // Disabled in cache mode, as on the Claude path: this body is
-    // Anthropic-shaped, so steering appends to the same system-prompt tail
-    // that carries the provider prefix-cache key.
-    if state.config.output_shaper_enabled {
-        apply_output_shaper(state, parsed, &mut report.transforms_applied);
-    }
+    // Tool-definition + recall stages on the still-Anthropic-shaped body.
+    inject_turn_tools(state, parsed, &mut report);
 
     // Memory: search and append recalled context to the latest user message.
-    if let Some(handler) = state.memory_handler.as_ref() {
-        if handler.is_initialized() {
-            let user_id = headers
-                .get("x-headroom-user-id")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("default");
-            if append_memory_context(handler, parsed, user_id, PROVIDER).await {
-                report.transforms_applied.push("memory_context".to_string());
-            }
-        }
+    if recall_memory_context(state, headers, parsed).await {
+        report.transforms_applied.push("memory_context".to_string());
     }
 
     report
@@ -577,6 +729,103 @@ pub(crate) fn merge_routed_compression_report(
 /// not the bare session: same-opener streams must not share the replay
 /// tracker. Bare session keys (tests, callers without identity) work
 /// unchanged — a key with no lane suffix keys exactly one lane.
+/// Byte-mutating compression passes on the serialized routed body, booking
+/// token savings into the report. Passes the body through untouched when the
+/// decision says not to compress.
+/// Extracted from `apply_compression_and_replay` without behavior change.
+fn maybe_compress_routed_body(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: bytes::Bytes,
+    should_compress: bool,
+    request_id: &str,
+    report: &mut CompressionReport,
+) -> bytes::Bytes {
+    if !should_compress {
+        return body;
+    }
+    // PR-E3: the Phase E byte-mutating passes gate on PAYG, with the same
+    // enforcement-flag override the Claude path applies.
+    let auth_mode = if state.config.auth_mode_policy_enforcement.is_enabled() {
+        headroom_core::auth_mode::classify(headers)
+    } else {
+        headroom_core::auth_mode::AuthMode::Payg
+    };
+    let routed_ccr_store = state.ccr_store();
+    let outcome = crate::compression::compress_anthropic_request(
+        &body,
+        state.config.compression_mode,
+        state.config.cache_control_auto_frozen,
+        auth_mode,
+        request_id,
+        &state.config.exclude_tools,
+        // This path injects headroom_retrieve and resolves it on both
+        // response arms (`handle_streaming_response` through
+        // `sse::ccr_stream`, `handle_buffered_response` directly), so the
+        // marker points at a recovery route the model can actually take.
+        routed_ccr_store.as_deref(),
+    );
+    let outcome = crate::compression::apply_cross_turn_dedup(
+        outcome,
+        &body,
+        &state.config,
+        "/v1/messages",
+        request_id,
+    );
+    match outcome {
+        crate::compression::Outcome::Compressed {
+            body: compressed,
+            tokens_before,
+            tokens_after,
+            strategies_applied,
+            ..
+        } => {
+            report.tokens_saved += (tokens_before as i64 - tokens_after as i64).max(0);
+            report
+                .transforms_applied
+                .extend(strategies_applied.iter().map(|s| s.to_string()));
+            tracing::debug!(
+                event = "routed_compression_applied",
+                request_id = %request_id,
+                tokens_before,
+                tokens_after,
+                "compressed routed-model request"
+            );
+            compressed
+        }
+        _ => body,
+    }
+}
+
+/// Re-parse the compressed+replayed body back into `parsed`. A re-parse
+/// failure leaves `parsed` as it was — forwarding the pre-compression body
+/// is always safe, and is what every failure arm above already does — and
+/// resets the report.
+/// Extracted from `apply_compression_and_replay` without behavior change.
+fn reparse_compressed_body(
+    body: &bytes::Bytes,
+    parsed: &mut Value,
+    request_id: &str,
+    report: &mut CompressionReport,
+) {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(v) => *parsed = v,
+        Err(e) => {
+            // Leave `parsed` as it was — forwarding the pre-compression body is
+            // always safe, and is what every failure arm above already does.
+            tracing::warn!(
+                event = "routed_compression_reparse_failed",
+                request_id = %request_id,
+                error = %e,
+                "compressed routed body did not re-parse; forwarding uncompressed"
+            );
+            report.tokens_saved = 0;
+            report.transforms_applied.clear();
+            report.replay_parked = false;
+        }
+    }
+}
+
 pub(crate) fn apply_compression_and_replay(
     state: &AppState,
     parsed: &mut Value,
@@ -626,61 +875,14 @@ pub(crate) fn apply_compression_and_replay(
         None
     };
 
-    let body = if decision.should_compress {
-        // PR-E3: the Phase E byte-mutating passes gate on PAYG, with the same
-        // enforcement-flag override the Claude path applies.
-        let auth_mode = if state.config.auth_mode_policy_enforcement.is_enabled() {
-            headroom_core::auth_mode::classify(headers)
-        } else {
-            headroom_core::auth_mode::AuthMode::Payg
-        };
-        let routed_ccr_store = state.ccr_store();
-        let outcome = crate::compression::compress_anthropic_request(
-            &body,
-            state.config.compression_mode,
-            state.config.cache_control_auto_frozen,
-            auth_mode,
-            request_id,
-            &state.config.exclude_tools,
-            // This path injects headroom_retrieve and resolves it on both
-            // response arms (`handle_streaming_response` through
-            // `sse::ccr_stream`, `handle_buffered_response` directly), so the
-            // marker points at a recovery route the model can actually take.
-            routed_ccr_store.as_deref(),
-        );
-        let outcome = crate::compression::apply_cross_turn_dedup(
-            outcome,
-            &body,
-            &state.config,
-            "/v1/messages",
-            request_id,
-        );
-        match outcome {
-            crate::compression::Outcome::Compressed {
-                body: compressed,
-                tokens_before,
-                tokens_after,
-                strategies_applied,
-                ..
-            } => {
-                report.tokens_saved += (tokens_before as i64 - tokens_after as i64).max(0);
-                report
-                    .transforms_applied
-                    .extend(strategies_applied.iter().map(|s| s.to_string()));
-                tracing::debug!(
-                    event = "routed_compression_applied",
-                    request_id = %request_id,
-                    tokens_before,
-                    tokens_after,
-                    "compressed routed-model request"
-                );
-                compressed
-            }
-            _ => body,
-        }
-    } else {
-        body
-    };
+    let body = maybe_compress_routed_body(
+        state,
+        headers,
+        body,
+        decision.should_compress,
+        request_id,
+        &mut report,
+    );
 
     let body = match replay_original_messages {
         Some(original_messages) => {
@@ -704,22 +906,7 @@ pub(crate) fn apply_compression_and_replay(
         None => body,
     };
 
-    match serde_json::from_slice::<Value>(&body) {
-        Ok(v) => *parsed = v,
-        Err(e) => {
-            // Leave `parsed` as it was — forwarding the pre-compression body is
-            // always safe, and is what every failure arm above already does.
-            tracing::warn!(
-                event = "routed_compression_reparse_failed",
-                request_id = %request_id,
-                error = %e,
-                "compressed routed body did not re-parse; forwarding uncompressed"
-            );
-            report.tokens_saved = 0;
-            report.transforms_applied.clear();
-            report.replay_parked = false;
-        }
-    }
+    reparse_compressed_body(&body, parsed, request_id, &mut report);
 
     report
 }
@@ -904,7 +1091,7 @@ mod routed_request_tests {
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
         let mut with_tools = json!({
-            "model": "claude-codex-5.6",
+            "model": "claude-muse-spark-1.3",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
@@ -919,7 +1106,7 @@ mod routed_request_tests {
         assert!(names.contains(&"headroom_retrieve"), "got {names:?}");
 
         let mut without_tools = json!({
-            "model": "claude-codex-5.6",
+            "model": "claude-muse-spark-1.3",
             "messages": [{"role": "user", "content": "hi"}]
         });
         apply_ctx_request_transforms(

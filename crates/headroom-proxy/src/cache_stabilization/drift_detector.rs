@@ -894,129 +894,198 @@ fn observe(
         }
     };
     match cache.get(session_key).copied() {
-        None => {
-            match origin {
-                Origin::Inbound => {
-                    tracing::info!(
-                        event = "cache_drift_first_request",
-                        session_key_hash = %session_prefix,
-                        lane_key_hash = %lane_prefix,
-                        current_hash_prefix = %structural_hash_log_prefix(&current),
-                        "cache_drift detector observed a new session"
-                    );
-                    // A second lane under one session means same-opener
-                    // streams are sharing the credential (subagent fan-out).
-                    // Before lanes each alternation read as drift and dropped
-                    // the stored prefix; now it is one line per new stream.
-                    // Scan only (no recency change); first_request is rare.
-                    let session = lane_session_part(session_key);
-                    let mut siblings = 0;
-                    if session_key.contains(LANE_SEPARATOR) {
-                        for (key, _) in cache.iter() {
-                            if key.as_str() != session_key
-                                && lane_session_part(key.as_str()) == session
-                            {
-                                siblings += 1;
-                            }
-                        }
-                    }
-                    if siblings > 0 {
-                        tracing::warn!(
-                            event = "stream_lane_detected",
-                            session_key_hash = %session_prefix,
-                            lane_key_hash = %lane_prefix,
-                            lane_count = siblings + 1,
-                            "new stream lane under a known session: subagent \
-                             fan-out sharing one opener, or a rewritten \
-                             system/history. Each lane tracks its own prefix \
-                             baseline from here."
-                        );
-                    }
-                }
-                Origin::Outbound => tracing::info!(
-                    event = "cache_drift_first_request_outbound",
-                    session_key_hash = %session_prefix,
-                    lane_key_hash = %lane_prefix,
-                    current_hash_prefix = %structural_hash_log_prefix(&current),
-                    "cache_drift detector observed a new session on the forwarded body"
-                ),
-            }
-            cache.put(session_key.to_string(), current);
-            (None, true)
-        }
-        Some(previous) => {
-            let dims = drift_dims(&previous, &current);
-            if dims.is_empty() {
-                // The fix earning its keep: this turn holds still only because
-                // the early window now steps over withdrawn client scaffolding.
-                // Before 2026-08-26 it read as a rebuild boundary and dropped
-                // the session's whole stored prefix. Counted here rather than
-                // inferred from re-cache events, which are far too rare to
-                // price a change against — 9 in three days.
-                if matches!(origin, Origin::Inbound)
-                    && early_window_drifted(
-                        &previous.early_messages_legacy,
-                        &current.early_messages_legacy,
-                    )
-                {
-                    tracing::info!(
-                        event = "early_scaffolding_absorbed",
-                        session_key_hash = %session_prefix,
-                        lane_key_hash = %lane_prefix,
-                        "withdrawn client scaffolding in the early window no longer \
-                         reads as drift; the stored prefix survives"
-                    );
-                }
-                // Stable (append-only growth included). No event.
-                // Update LRU recency by reinserting.
-                cache.put(session_key.to_string(), current);
-                (None, false)
-            } else {
-                match origin {
-                    Origin::Inbound => tracing::warn!(
-                        event = "cache_drift_observed",
-                        session_key_hash = %session_prefix,
-                        lane_key_hash = %lane_prefix,
-                        drift_dims = %dims,
-                        // Empty unless the early window moved; the other two
-                        // axes are single values with nothing to break down.
-                        early_drift = %early_drift_detail(&previous, &current),
-                        // Empty unless the system block moved; see
-                        // [`system_drift_detail`] for the vocabulary.
-                        system_drift = %system_drift_detail(
-                            &previous.system_shape,
-                            &current.system_shape,
-                        ),
-                        previous_hash_prefix = %structural_hash_log_prefix(&previous),
-                        current_hash_prefix = %structural_hash_log_prefix(&current),
-                        "cache_drift detector observed structural change between turns of the same session"
-                    ),
-                    // INFO, not WARN. The forwarded hot zone moving is expected
-                    // whenever the inbound one did; only the case where the
-                    // client held still is interesting, and the classifier —
-                    // not the log reader — is what separates those.
-                    Origin::Outbound => tracing::info!(
-                        event = "cache_drift_observed_outbound",
-                        session_key_hash = %session_prefix,
-                        lane_key_hash = %lane_prefix,
-                        drift_dims = %dims,
-                        early_drift = %early_drift_detail(&previous, &current),
-                        // Empty unless the system block moved; see
-                        // [`system_drift_detail`] for the vocabulary.
-                        system_drift = %system_drift_detail(
-                            &previous.system_shape,
-                            &current.system_shape,
-                        ),
-                        previous_hash_prefix = %structural_hash_log_prefix(&previous),
-                        current_hash_prefix = %structural_hash_log_prefix(&current),
-                        "cache_drift detector observed structural change in the body the proxy forwarded"
-                    ),
-                }
-                cache.put(session_key.to_string(), current);
-                (Some(dims), false)
+        None => note_first_observation(
+            &mut cache,
+            session_key,
+            current,
+            &session_prefix,
+            &lane_prefix,
+            origin,
+        ),
+        Some(previous) => note_repeat_observation(
+            &mut cache,
+            session_key,
+            previous,
+            current,
+            &session_prefix,
+            &lane_prefix,
+            origin,
+        ),
+    }
+}
+
+/// Count sibling lanes under the same session: same-opener streams sharing
+/// one credential (subagent fan-out). Scan only (no recency change).
+/// Extracted from `note_first_observation` without behavior change.
+fn count_sibling_lanes(cache: &LruCache<String, StructuralHash>, session_key: &str) -> usize {
+    let session = lane_session_part(session_key);
+    let mut siblings = 0;
+    if session_key.contains(LANE_SEPARATOR) {
+        for (key, _) in cache.iter() {
+            if key.as_str() != session_key && lane_session_part(key.as_str()) == session {
+                siblings += 1;
             }
         }
     }
+    siblings
+}
+
+/// Record a first-seen session lane: log it (flagging subagent fan-out when
+/// a sibling lane already exists) and store the baseline.
+/// Extracted from `observe` without behavior change.
+fn note_first_observation(
+    cache: &mut LruCache<String, StructuralHash>,
+    session_key: &str,
+    current: StructuralHash,
+    session_prefix: &str,
+    lane_prefix: &str,
+    origin: Origin,
+) -> (Option<String>, bool) {
+    match origin {
+        Origin::Inbound => {
+            tracing::info!(
+                event = "cache_drift_first_request",
+                session_key_hash = %session_prefix,
+                lane_key_hash = %lane_prefix,
+                current_hash_prefix = %structural_hash_log_prefix(&current),
+                "cache_drift detector observed a new session"
+            );
+            // A second lane under one session means same-opener
+            // streams are sharing the credential (subagent fan-out).
+            // Before lanes each alternation read as drift and dropped
+            // the stored prefix; now it is one line per new stream.
+            // Scan only (no recency change); first_request is rare.
+            let siblings = count_sibling_lanes(cache, session_key);
+            if siblings > 0 {
+                tracing::warn!(
+                    event = "stream_lane_detected",
+                    session_key_hash = %session_prefix,
+                    lane_key_hash = %lane_prefix,
+                    lane_count = siblings + 1,
+                    "new stream lane under a known session: subagent \
+                     fan-out sharing one opener, or a rewritten \
+                     system/history. Each lane tracks its own prefix \
+                     baseline from here."
+                );
+            }
+        }
+        Origin::Outbound => tracing::info!(
+            event = "cache_drift_first_request_outbound",
+            session_key_hash = %session_prefix,
+            lane_key_hash = %lane_prefix,
+            current_hash_prefix = %structural_hash_log_prefix(&current),
+            "cache_drift detector observed a new session on the forwarded body"
+        ),
+    }
+    cache.put(session_key.to_string(), current);
+    (None, true)
+}
+
+/// Record a stable turn (append-only growth included): absorb withdrawn
+/// client scaffolding without dropping the stored prefix, then refresh LRU
+/// recency by reinserting. No event.
+/// Extracted from `note_repeat_observation` without behavior change.
+fn note_stable_turn(
+    cache: &mut LruCache<String, StructuralHash>,
+    session_key: &str,
+    previous: &StructuralHash,
+    current: &StructuralHash,
+    session_prefix: &str,
+    lane_prefix: &str,
+    origin: Origin,
+) {
+    // The fix earning its keep: this turn holds still only because
+    // the early window now steps over withdrawn client scaffolding.
+    // Before 2026-08-26 it read as a rebuild boundary and dropped
+    // the session's whole stored prefix. Counted here rather than
+    // inferred from re-cache events, which are far too rare to
+    // price a change against — 9 in three days.
+    if matches!(origin, Origin::Inbound)
+        && early_window_drifted(
+            &previous.early_messages_legacy,
+            &current.early_messages_legacy,
+        )
+    {
+        tracing::info!(
+            event = "early_scaffolding_absorbed",
+            session_key_hash = %session_prefix,
+            lane_key_hash = %lane_prefix,
+            "withdrawn client scaffolding in the early window no longer \
+             reads as drift; the stored prefix survives"
+        );
+    }
+    // Stable (append-only growth included). No event.
+    // Update LRU recency by reinserting.
+    cache.put(session_key.to_string(), *current);
+}
+
+/// Compare against the stored baseline: stable turns (append-only growth
+/// included) just refresh recency; drift logs the moved axes.
+/// Extracted from `observe` without behavior change.
+fn note_repeat_observation(
+    cache: &mut LruCache<String, StructuralHash>,
+    session_key: &str,
+    previous: StructuralHash,
+    current: StructuralHash,
+    session_prefix: &str,
+    lane_prefix: &str,
+    origin: Origin,
+) -> (Option<String>, bool) {
+    let dims = drift_dims(&previous, &current);
+    if dims.is_empty() {
+        note_stable_turn(
+            cache,
+            session_key,
+            &previous,
+            &current,
+            session_prefix,
+            lane_prefix,
+            origin,
+        );
+        return (None, false);
+    }
+    match origin {
+        Origin::Inbound => tracing::warn!(
+            event = "cache_drift_observed",
+            session_key_hash = %session_prefix,
+            lane_key_hash = %lane_prefix,
+            drift_dims = %dims,
+            // Empty unless the early window moved; the other two
+            // axes are single values with nothing to break down.
+            early_drift = %early_drift_detail(&previous, &current),
+            // Empty unless the system block moved; see
+            // [`system_drift_detail`] for the vocabulary.
+            system_drift = %system_drift_detail(
+                &previous.system_shape,
+                &current.system_shape,
+            ),
+            previous_hash_prefix = %structural_hash_log_prefix(&previous),
+            current_hash_prefix = %structural_hash_log_prefix(&current),
+            "cache_drift detector observed structural change between turns of the same session"
+        ),
+        // INFO, not WARN. The forwarded hot zone moving is expected
+        // whenever the inbound one did; only the case where the
+        // client held still is interesting, and the classifier —
+        // not the log reader — is what separates those.
+        Origin::Outbound => tracing::info!(
+            event = "cache_drift_observed_outbound",
+            session_key_hash = %session_prefix,
+            lane_key_hash = %lane_prefix,
+            drift_dims = %dims,
+            early_drift = %early_drift_detail(&previous, &current),
+            // Empty unless the system block moved; see
+            // [`system_drift_detail`] for the vocabulary.
+            system_drift = %system_drift_detail(
+                &previous.system_shape,
+                &current.system_shape,
+            ),
+            previous_hash_prefix = %structural_hash_log_prefix(&previous),
+            current_hash_prefix = %structural_hash_log_prefix(&current),
+            "cache_drift detector observed structural change in the body the proxy forwarded"
+        ),
+    }
+    cache.put(session_key.to_string(), current);
+    (Some(dims), false)
 }
 
 /// 16-char hex prefix of SHA-256(session_key). Bounds the log line

@@ -1680,6 +1680,12 @@ pub struct CliArgs {
     pub target_ratio: f64,
 
     /// Enable code-aware compressor for source code.
+    ///
+    /// Default off upstream (conservative rollout): the arm predates the
+    /// flag and the library default stays on to preserve historical
+    /// dispatch, but a default-config proxy boots with it OFF until the
+    /// operator opts in. Our deployment pins `--code-aware true`
+    /// (see `contrib/headroom-flags.sh`) to keep the measured behavior.
     #[arg(long = "code-aware", env = "HEADROOM_CODE_AWARE_ENABLED", default_value_t = false, action = clap::ArgAction::Set)]
     pub code_aware_enabled: bool,
 

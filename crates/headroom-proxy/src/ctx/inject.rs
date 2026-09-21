@@ -214,18 +214,8 @@ impl InjectEngine {
         let sessions = self.stores.sessions(project_dir)?;
 
         // Already decided → replay verbatim (I4).
-        match sessions.get_injection(conv_id) {
-            Ok(Some(bytes)) => return Some(bytes),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    event = "ctx_inject_get_failed",
-                    request_id = %request_id,
-                    conv = %conv_id,
-                    error = %e
-                );
-                return None;
-            }
+        if let Some(replay) = Self::replay_stored_injection(&sessions, conv_id, request_id) {
+            return replay;
         }
 
         // No injection row. Distinguish a genuine row-miss from this request
@@ -240,47 +230,7 @@ impl InjectEngine {
         // and that is the case the fail-safe exists for. Treating the race as a
         // row-miss suppressed injection for genuinely-new conversations.
         let current_turn = identity::message_count(parsed);
-        let prior_turn = match sessions.last_prefix(conv_id) {
-            Ok(Some(p)) if p.turn_n < current_turn => Some(p.turn_n),
-            _ => None,
-        };
-        if let Some(turn_n) = prior_turn {
-            // A conversation first met past the first-sight limit was declined
-            // below and no row was ever written for it, so every later turn
-            // finds a prefix chain and no injection — which reads exactly like
-            // a row that went missing. It is not one, and it will repeat for
-            // the life of the conversation. Measured 2026-08-23: all 3
-            // conversations that logged this had been declined for depth
-            // ~20 minutes earlier.
-            //
-            // Decision-free: both arms inject nothing, so the forwarded bytes
-            // are identical either way and no cache can move on this.
-            let never_eligible = sessions
-                .first_prefix_turn(conv_id)
-                .ok()
-                .flatten()
-                .is_some_and(|first| first > MAX_FIRST_SIGHT_MESSAGES);
-            if never_eligible {
-                tracing::debug!(
-                    event = "ctx_inject_declined_at_first_sight",
-                    request_id = %request_id,
-                    conv = %conv_id,
-                    last_turn = turn_n,
-                    current_turn,
-                    limit = MAX_FIRST_SIGHT_MESSAGES,
-                    "no injection row because this conversation was first seen \
-                     too deep to build one; injecting nothing"
-                );
-            } else {
-                tracing::warn!(
-                    event = "ctx_inject_row_miss",
-                    request_id = %request_id,
-                    conv = %conv_id,
-                    last_turn = turn_n,
-                    current_turn,
-                    "injection row missing for a known conversation; injecting nothing (fail-safe)"
-                );
-            }
+        if Self::resolve_row_miss(&sessions, conv_id, current_turn, request_id) {
             return None;
         }
 
@@ -300,9 +250,109 @@ impl InjectEngine {
         }
 
         // Genuine first sight → build synchronously, persist once, inject.
+        Some(self.build_and_persist(
+            &sessions,
+            conv_id,
+            parsed,
+            session_key,
+            project_dir,
+            request_id,
+        ))
+    }
+
+    /// A stored injection row replays verbatim (I4); a store error fails safe
+    /// to nothing. `None` means no row — keep deciding.
+    /// Extracted from `decide` without behavior change.
+    fn replay_stored_injection(
+        sessions: &SessionsStore,
+        conv_id: &str,
+        request_id: &str,
+    ) -> Option<Decision> {
+        match sessions.get_injection(conv_id) {
+            Ok(Some(bytes)) => Some(Some(bytes)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    event = "ctx_inject_get_failed",
+                    request_id = %request_id,
+                    conv = %conv_id,
+                    error = %e
+                );
+                Some(None)
+            }
+        }
+    }
+
+    /// Row-miss fail-safe: a prefix chain strictly behind the current turn
+    /// with no injection row means the row was lost, not absent — inject
+    /// nothing either way. Returns true when resolved here.
+    /// Extracted from `decide` without behavior change.
+    fn resolve_row_miss(
+        sessions: &SessionsStore,
+        conv_id: &str,
+        current_turn: u64,
+        request_id: &str,
+    ) -> bool {
+        let prior_turn = match sessions.last_prefix(conv_id) {
+            Ok(Some(p)) if p.turn_n < current_turn => Some(p.turn_n),
+            _ => None,
+        };
+        let Some(turn_n) = prior_turn else {
+            return false;
+        };
+        // A conversation first met past the first-sight limit was declined
+        // below and no row was ever written for it, so every later turn
+        // finds a prefix chain and no injection — which reads exactly like
+        // a row that went missing. It is not one, and it will repeat for
+        // the life of the conversation. Measured 2026-08-23: all 3
+        // conversations that logged this had been declined for depth
+        // ~20 minutes earlier.
+        //
+        // Decision-free: both arms inject nothing, so the forwarded bytes
+        // are identical either way and no cache can move on this.
+        let never_eligible = sessions
+            .first_prefix_turn(conv_id)
+            .ok()
+            .flatten()
+            .is_some_and(|first| first > MAX_FIRST_SIGHT_MESSAGES);
+        if never_eligible {
+            tracing::debug!(
+                event = "ctx_inject_declined_at_first_sight",
+                request_id = %request_id,
+                conv = %conv_id,
+                last_turn = turn_n,
+                current_turn,
+                limit = MAX_FIRST_SIGHT_MESSAGES,
+                "no injection row because this conversation was first seen \
+                 too deep to build one; injecting nothing"
+            );
+        } else {
+            tracing::warn!(
+                event = "ctx_inject_row_miss",
+                request_id = %request_id,
+                conv = %conv_id,
+                last_turn = turn_n,
+                current_turn,
+                "injection row missing for a known conversation; injecting nothing (fail-safe)"
+            );
+        }
+        true
+    }
+
+    /// Genuine first sight: build synchronously, persist once, inject.
+    /// Extracted from `decide` without behavior change.
+    fn build_and_persist(
+        &self,
+        sessions: &SessionsStore,
+        conv_id: &str,
+        parsed: &Value,
+        session_key: &str,
+        project_dir: &str,
+        request_id: &str,
+    ) -> String {
         let start = Instant::now();
         let built = self.build(
-            &sessions,
+            sessions,
             conv_id,
             parsed,
             session_key,
@@ -325,7 +375,7 @@ impl InjectEngine {
             build_us = start.elapsed().as_micros() as u64,
             "built + persisted first-sight injection"
         );
-        Some(built)
+        built
     }
 
     /// Build the injection text: resume snapshot when the request carries a

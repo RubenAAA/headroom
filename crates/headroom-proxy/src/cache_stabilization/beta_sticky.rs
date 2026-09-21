@@ -238,6 +238,117 @@ fn count_beta_tokens(value: Option<&str>) -> usize {
         .count()
 }
 
+/// Join the client's repeated beta field lines with "," per RFC 9110 §5.3
+/// list semantics BEFORE recording, so a client sending two beta lines
+/// has both recorded and a later rewrite (which `insert`s a single
+/// line, dropping the others) can never shrink the upstream token
+/// set mid-conversation. Returns `None` when the value isn't visible
+/// ASCII — forwarded verbatim, nothing recorded (never rewrite what we
+/// can't faithfully parse).
+/// Extracted from `apply_sticky_betas` without behavior change.
+fn collect_client_betas(
+    outgoing_headers: &HeaderMap,
+    header_name: &'static str,
+    provider: BetaProvider,
+    request_id: &str,
+) -> Option<Option<String>> {
+    let mut parts: Vec<&str> = Vec::new();
+    for raw in outgoing_headers.get_all(header_name) {
+        match raw.to_str() {
+            Ok(s) => parts.push(s),
+            Err(_) => {
+                tracing::debug!(
+                    event = "beta_header_merge_skipped",
+                    request_id = %request_id,
+                    provider = provider.as_str(),
+                    reason = "non_ascii_header_value",
+                    "client beta header is not visible ASCII; forwarding verbatim"
+                );
+                return None;
+            }
+        }
+    }
+    Some(if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    })
+}
+
+/// Rewrite the upstream-bound header to the session union when it differs
+/// from the client value; an absent client header gains the union; a
+/// session with no tokens anywhere stays header-less. Returns `None` when
+/// the union is unencodable (unreachable — every token came from a parsed
+/// header value): logs and the caller forwards verbatim.
+/// Extracted from `apply_sticky_betas` without behavior change.
+fn rewrite_sticky_header(
+    outgoing_headers: &mut HeaderMap,
+    header_name: &'static str,
+    sticky: &str,
+    client_value: Option<&str>,
+    provider: BetaProvider,
+    request_id: &str,
+) -> Option<bool> {
+    let rewritten = !sticky.is_empty() && sticky != client_value.unwrap_or("");
+    if !rewritten {
+        return Some(false);
+    }
+    match HeaderValue::from_str(sticky) {
+        Ok(value) => {
+            outgoing_headers.insert(header_name, value);
+            Some(true)
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "beta_header_merge_skipped",
+                request_id = %request_id,
+                provider = provider.as_str(),
+                reason = "unencodable_union",
+                error = %error,
+                "sticky beta union not encodable as a header value"
+            );
+            None
+        }
+    }
+}
+
+/// Merge logging: counts only — beta tokens can carry experiment IDs the
+/// user hasn't opted to share with Headroom logs (Python
+/// `log_beta_header_merge` contract). The no-op case drops to debug, so an
+/// info-level `beta_header_merge` always marks an actual cache-affecting
+/// rewrite.
+/// Extracted from `apply_sticky_betas` without behavior change.
+fn log_beta_merge(
+    rewritten: bool,
+    request_id: &str,
+    provider: BetaProvider,
+    session_key: &str,
+    client_betas: usize,
+    sticky_betas: usize,
+) {
+    if rewritten {
+        tracing::info!(
+            event = "beta_header_merge",
+            request_id = %request_id,
+            provider = provider.as_str(),
+            session_key_hash = %session_key_log_prefix(session_key),
+            client_betas,
+            sticky_betas,
+            "session-sticky beta merge rewrote the upstream header"
+        );
+    } else {
+        tracing::debug!(
+            event = "beta_header_merge",
+            request_id = %request_id,
+            provider = provider.as_str(),
+            session_key_hash = %session_key_log_prefix(session_key),
+            client_betas,
+            sticky_betas,
+            "session-sticky beta merge (no-op)"
+        );
+    }
+}
+
 /// Record the client's beta header for this `(provider, session)` and
 /// rewrite the upstream-bound header to the session union when they
 /// differ. The full merge site: reads `provider.header_name()` from
@@ -267,78 +378,33 @@ pub fn apply_sticky_betas(
     request_id: &str,
 ) {
     let header_name = provider.header_name();
-    // Join repeated field lines with "," per RFC 9110 §5.3 list
-    // semantics BEFORE recording, so a client sending two beta lines
-    // has both recorded and a later rewrite (which `insert`s a single
-    // line, dropping the others) can never shrink the upstream token
-    // set mid-conversation.
-    let mut parts: Vec<&str> = Vec::new();
-    for raw in outgoing_headers.get_all(header_name) {
-        match raw.to_str() {
-            Ok(s) => parts.push(s),
-            Err(_) => {
-                tracing::debug!(
-                    event = "beta_header_merge_skipped",
-                    request_id = %request_id,
-                    provider = provider.as_str(),
-                    reason = "non_ascii_header_value",
-                    "client beta header is not visible ASCII; forwarding verbatim"
-                );
-                return;
-            }
-        }
-    }
-    let client_value: Option<String> = if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(","))
+    let Some(client_value) =
+        collect_client_betas(outgoing_headers, header_name, provider, request_id)
+    else {
+        return;
     };
 
     let sticky =
         tracker.record_and_get_sticky_betas(provider, session_key, client_value.as_deref());
-    let rewritten = !sticky.is_empty() && sticky != client_value.as_deref().unwrap_or("");
-    if rewritten {
-        match HeaderValue::from_str(&sticky) {
-            Ok(value) => {
-                outgoing_headers.insert(header_name, value);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    event = "beta_header_merge_skipped",
-                    request_id = %request_id,
-                    provider = provider.as_str(),
-                    reason = "unencodable_union",
-                    error = %error,
-                    "sticky beta union not encodable as a header value"
-                );
-                return;
-            }
-        }
-    }
+    let Some(rewritten) = rewrite_sticky_header(
+        outgoing_headers,
+        header_name,
+        &sticky,
+        client_value.as_deref(),
+        provider,
+        request_id,
+    ) else {
+        return;
+    };
 
-    let client_betas = count_beta_tokens(client_value.as_deref());
-    let sticky_betas = count_beta_tokens(Some(&sticky));
-    if rewritten {
-        tracing::info!(
-            event = "beta_header_merge",
-            request_id = %request_id,
-            provider = provider.as_str(),
-            session_key_hash = %session_key_log_prefix(session_key),
-            client_betas,
-            sticky_betas,
-            "session-sticky beta merge rewrote the upstream header"
-        );
-    } else {
-        tracing::debug!(
-            event = "beta_header_merge",
-            request_id = %request_id,
-            provider = provider.as_str(),
-            session_key_hash = %session_key_log_prefix(session_key),
-            client_betas,
-            sticky_betas,
-            "session-sticky beta merge (no-op)"
-        );
-    }
+    log_beta_merge(
+        rewritten,
+        request_id,
+        provider,
+        session_key,
+        count_beta_tokens(client_value.as_deref()),
+        count_beta_tokens(Some(&sticky)),
+    );
 }
 
 #[cfg(test)]

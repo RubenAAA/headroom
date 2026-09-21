@@ -678,60 +678,26 @@ impl StreamTranslator {
 
         match event_name {
             "response.output_text.delta" | "output_text.delta" => {
-                let delta = chunk.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                if !delta.is_empty() {
-                    self.open_block(OpenBlock::Text, &mut events);
-                    events.push(self.emit_text_delta(delta));
-                    self.saw_text_delta = true;
-                }
+                self.on_output_text_delta(&chunk, &mut events);
             }
             // `output_text.done` carries the whole text. Normally the deltas
             // above already delivered it and this is a marker; when the
             // upstream sent no deltas it is the only copy, mirroring the
             // message-item recovery below.
             "response.output_text.done" | "output_text.done" => {
-                if !self.saw_text_delta {
-                    if let Some(text) = chunk.get("text").and_then(|v| v.as_str()) {
-                        if !text.is_empty() {
-                            self.open_block(OpenBlock::Text, &mut events);
-                            events.push(self.emit_text_delta(text));
-                            self.close_block(&mut events);
-                            self.saw_text_delta = true;
-                        }
-                    }
-                }
+                self.on_output_text_done(&chunk, &mut events);
             }
             // A refusal is the turn's only text. Anthropic has no refusal
             // block, so it rides as a text block; without this the client
             // receives an empty `end_turn` it cannot tell from silence.
             "response.refusal.delta" | "refusal.delta" => {
-                let delta = chunk.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                if !delta.is_empty() {
-                    self.open_block(OpenBlock::Text, &mut events);
-                    events.push(self.emit_text_delta(delta));
-                    self.saw_refusal_delta = true;
-                }
+                self.on_refusal_delta(&chunk, &mut events);
             }
             "response.refusal.done" | "refusal.done" => {
-                if !self.saw_refusal_delta {
-                    if let Some(refusal) = chunk.get("refusal").and_then(|v| v.as_str()) {
-                        if !refusal.is_empty() {
-                            self.open_block(OpenBlock::Text, &mut events);
-                            events.push(self.emit_text_delta(refusal));
-                            self.close_block(&mut events);
-                            self.saw_refusal_delta = true;
-                        }
-                    }
-                }
+                self.on_refusal_done(&chunk, &mut events);
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
-                    if !delta.is_empty() {
-                        self.open_block(OpenBlock::Thinking, &mut events);
-                        events.push(self.emit_thinking_delta(delta));
-                        self.saw_thinking_text = true;
-                    }
-                }
+                self.on_reasoning_delta(&chunk, &mut events);
             }
             "response.reasoning_summary_part.added" => {
                 // Part boundary: close the current thinking block so the next
@@ -739,257 +705,380 @@ impl StreamTranslator {
                 self.close_block_if(OpenBlock::Thinking, &mut events);
             }
             "response.output_item.added" => {
-                let item = chunk.get("item");
-                let item_type = item.and_then(|i| i.get("type")).and_then(|t| t.as_str());
-                if item_type == Some("function_call") {
-                    // `call_id` is what must round-trip back as
-                    // function_call_output; fall back to `id` if absent.
-                    self.current_tool_id = item
-                        .and_then(|i| i.get("call_id").or_else(|| i.get("id")))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let upstream_name = item
-                        .and_then(|i| i.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    self.capture_tool_name(upstream_name);
-                    self.open_tool_block(&mut events);
-                    self.saw_tool_use = true;
-                    // Per call, not per stream: `arguments.done` below may
-                    // only replay the full arguments when no delta arrived
-                    // for this call.
-                    self.saw_arg_delta = false;
-                }
-                // A reasoning item may announce its id here and carry the blob
-                // on `.done`, so start assembling as soon as it appears.
-                if item_type == Some("reasoning") {
-                    if let Some(item) = item {
-                        self.pending_reasoning.capture(item);
-                    }
-                    // Per item, not per stream: the `.done` arm judges each
-                    // item on its own visible thinking (see `saw_thinking_text`).
-                    self.saw_thinking_text = false;
-                }
+                self.on_output_item_added(&chunk, &mut events);
             }
             "response.function_call_arguments.delta" => {
-                if self.open == Some(OpenBlock::Tool) {
-                    if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
-                        if !delta.is_empty() {
-                            events.push(self.emit_input_json_delta(delta));
-                            self.saw_arg_delta = true;
-                        }
-                    }
-                }
-                // A delta arriving before `output_item.added` (no open tool
-                // block to attribute it to) is skipped rather than guessed
-                // at: the `arguments.done` fallback below replays the whole
-                // arguments, so nothing is lost.
+                self.on_function_args_delta(&chunk, &mut events);
             }
             // `arguments.done` carries the whole arguments string. Normally
             // the deltas above already delivered it; when they did not — or
             // arrived before the item announced itself — this is the only
             // copy, mirroring the message-item recovery.
             "response.function_call_arguments.done" => {
-                if self.open == Some(OpenBlock::Tool) && !self.saw_arg_delta {
-                    if let Some(args) = chunk.get("arguments").and_then(|v| v.as_str()) {
-                        if !args.is_empty() {
-                            events.push(self.emit_input_json_delta(args));
-                            self.saw_arg_delta = true;
-                        }
-                    }
-                }
+                self.on_function_args_done(&chunk, &mut events);
             }
             "response.output_item.done" => {
-                let item_type = chunk
-                    .get("item")
-                    .and_then(|i| i.get("type"))
-                    .and_then(|t| t.as_str());
-                if item_type == Some("function_call") {
-                    self.close_block_if(OpenBlock::Tool, &mut events);
-                }
-                // A finished message item carries the whole answer. Normally
-                // we have already streamed it delta by delta and this is a
-                // no-op, but a reasoning delivery that sends the message whole
-                // emits no deltas at all -- and then this event holds the only
-                // copy. Dropping it hands the client a turn containing a
-                // thought and nothing else, which Claude Code renders as a
-                // stopped turn and answers with "your previous response had no
-                // visible output": the model is fine, the text was lost here.
-                if item_type == Some("message") {
-                    if !self.saw_text_delta && !self.saw_refusal_delta {
-                        let text: String = chunk
-                            .get("item")
-                            .and_then(|i| i.get("content"))
-                            .and_then(|c| c.as_array())
-                            .map(|blocks| {
-                                blocks
-                                    .iter()
-                                    .filter_map(|b| {
-                                        b.get("text")
-                                            .and_then(|t| t.as_str())
-                                            .or_else(|| b.get("refusal").and_then(|r| r.as_str()))
-                                    })
-                                    .collect::<String>()
-                            })
-                            .unwrap_or_default();
-                        if !text.is_empty() {
-                            tracing::debug!(
-                                event = "codex_message_without_deltas",
-                                chars = text.len(),
-                                "recovered a message item the upstream never streamed"
-                            );
-                            self.open_block(OpenBlock::Text, &mut events);
-                            events.push(self.emit_text_delta(&text));
-                            self.close_block(&mut events);
-                        }
-                    }
-                    // Per item, not per stream: a second message must be
-                    // judged on its own deltas.
-                    self.saw_text_delta = false;
-                    self.saw_refusal_delta = false;
-                }
-                // The reasoning item is complete: seal its identity into the
-                // thinking block's signature so the client hands it back next
-                // turn. Without a usable pair there is nothing to replay and
-                // the block stays a plain summary.
-                if item_type == Some("reasoning") {
-                    if let Some(item) = chunk.get("item") {
-                        self.pending_reasoning.capture(item);
-                    }
-                    let signature = self
-                        .pending_reasoning
-                        .replay()
-                        .as_ref()
-                        .and_then(encode_reasoning_signature);
-                    self.pending_reasoning.reset();
-                    // Judged on this item's own visible thinking, then consumed:
-                    // a later silent item must not inherit an earlier one's.
-                    let visible_thinking = self.saw_thinking_text;
-                    self.saw_thinking_text = false;
-                    if let Some(signature) = signature {
-                        // Zen discards reasoning server-side and we strip it
-                        // client-side next turn (`strip_unreplayable_reasoning`),
-                        // so on spark a reasoning item with no visible summary
-                        // text would emit a thinking block holding nothing but
-                        // our opaque envelope: an empty thinking box in the
-                        // transcript plus prefix churn the provider never sees.
-                        // Skip the block; visible thinking still streams, and
-                        // replay-preserving upstreams (codex) are untouched.
-                        let silent_on_unreplayable =
-                            !visible_thinking && self.model.to_lowercase().contains("spark");
-                        if !silent_on_unreplayable {
-                            // Reasoning summaries can be off entirely, in which case
-                            // no block was ever opened. Open an empty one rather
-                            // than drop the only copy of the item.
-                            self.open_block(OpenBlock::Thinking, &mut events);
-                            events.push(self.emit_signature_delta(&signature));
-                            self.close_block(&mut events);
-                        }
-                    }
-                }
+                self.on_output_item_done(&chunk, &mut events);
             }
             "response.completed" => {
-                if let Some(usage) = chunk.get("response").and_then(|v| v.get("usage")) {
-                    if let Some(tokens) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                        self.total_output_tokens = tokens;
-                    }
-                    // Ground-truth cache effectiveness: how many input tokens
-                    // the codex backend served from its prompt cache this turn.
-                    let input_tokens = usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let cached = usage
-                        .get("input_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let hit_pct = if input_tokens > 0 {
-                        (cached as f64 / input_tokens as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    tracing::debug!(
-                        event = "codex_cache_usage",
-                        input_tokens,
-                        cached_tokens = cached,
-                        fresh_tokens = input_tokens.saturating_sub(cached),
-                        cache_hit_pct = format!("{hit_pct:.1}"),
-                        "codex prompt-cache effectiveness for this turn"
-                    );
-                }
-                let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
-                self.complete_replay(usage.as_ref());
-                self.complete_usage_observation(usage.as_ref());
-                self.emit_outcome(usage.as_ref(), 200);
-                self.close_block_final(&mut events);
-                // A completed response can still carry `incomplete_details`,
-                // and truncation outranks a tool call: a `tool_use` stop on a
-                // cut-off turn would have the client run a half-streamed call.
-                let truncated = chunk
-                    .get("response")
-                    .and_then(|v| v.get("incomplete_details"))
-                    .and_then(|v| v.get("reason"))
-                    .and_then(|v| v.as_str())
-                    == Some("max_output_tokens");
-                let stop_reason = if truncated {
-                    "max_tokens"
-                } else if self.saw_tool_use {
-                    "tool_use"
-                } else {
-                    "end_turn"
-                };
-                events.push(self.emit_message_delta(stop_reason));
-                events.push(self.emit_message_stop());
+                self.on_completed(&chunk, &mut events);
             }
             "response.failed" => {
-                self.close_block_final(&mut events);
-                // Booked as a 500 so the outcome funnel routes it to
-                // `record_failed` — a failed turn must not feed the save-rate.
-                let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
-                self.emit_outcome(usage.as_ref(), 500);
-                // The turn still has to end on the wire: without terminal
-                // events the client hangs, and the `[DONE]` fallback cannot
-                // rescue it — the block above already closed `open`, which is
-                // the fallback's trigger. `end_turn`, never `tool_use`: a
-                // half-streamed call must not run.
-                events.push(self.emit_message_delta("end_turn"));
-                events.push(self.emit_message_stop());
+                self.on_failed(&chunk, &mut events);
             }
             "response.incomplete" => {
-                let reason = chunk
-                    .get("response")
-                    .and_then(|v| v.get("incomplete_details"))
-                    .and_then(|v| v.get("reason"))
-                    .and_then(|v| v.as_str());
-                self.close_block_final(&mut events);
-                let stop_reason = match reason {
-                    Some("max_output_tokens") => "max_tokens",
-                    _ => "end_turn",
-                };
-                events.push(self.emit_message_delta(stop_reason));
-                events.push(self.emit_message_stop());
-                // Outside the reason: a response that stopped short still
-                // spent tokens, whether or not it said why.
-                let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
-                self.emit_outcome(usage.as_ref(), 200);
+                self.on_incomplete(&chunk, &mut events);
             }
             other => {
-                // Silence here is how the message-item gap stayed hidden: an
-                // event we do not translate is content the client never sees.
-                // Log the name so the next one is a grep, not an investigation.
-                if other.starts_with("response.") {
-                    tracing::debug!(
-                        event = "codex_unhandled_stream_event",
-                        stream_event = other,
-                        "no translation for this Responses event; nothing emitted"
-                    );
-                }
+                Self::on_unhandled_event(other);
             }
         }
 
         events
+    }
+
+    /// `response.output_text.delta`: stream a text delta into the open text block.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_output_text_delta(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        let delta = chunk.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+        if !delta.is_empty() {
+            self.open_block(OpenBlock::Text, events);
+            events.push(self.emit_text_delta(delta));
+            self.saw_text_delta = true;
+        }
+    }
+
+    /// `output_text.done` carries the whole text. Normally the deltas above
+    /// already delivered it and this is a marker; when the upstream sent no
+    /// deltas it is the only copy, mirroring the message-item recovery below.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_output_text_done(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        if !self.saw_text_delta {
+            if let Some(text) = chunk.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    self.open_block(OpenBlock::Text, events);
+                    events.push(self.emit_text_delta(text));
+                    self.close_block(events);
+                    self.saw_text_delta = true;
+                }
+            }
+        }
+    }
+
+    /// A refusal is the turn's only text. Anthropic has no refusal block, so
+    /// it rides as a text block; without this the client receives an empty
+    /// `end_turn` it cannot tell from silence.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_refusal_delta(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        let delta = chunk.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+        if !delta.is_empty() {
+            self.open_block(OpenBlock::Text, events);
+            events.push(self.emit_text_delta(delta));
+            self.saw_refusal_delta = true;
+        }
+    }
+
+    /// `refusal.done`: replay the whole refusal when no delta arrived.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_refusal_done(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        if !self.saw_refusal_delta {
+            if let Some(refusal) = chunk.get("refusal").and_then(|v| v.as_str()) {
+                if !refusal.is_empty() {
+                    self.open_block(OpenBlock::Text, events);
+                    events.push(self.emit_text_delta(refusal));
+                    self.close_block(events);
+                    self.saw_refusal_delta = true;
+                }
+            }
+        }
+    }
+
+    /// Reasoning delta: stream into the open thinking block.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_reasoning_delta(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
+            if !delta.is_empty() {
+                self.open_block(OpenBlock::Thinking, events);
+                events.push(self.emit_thinking_delta(delta));
+                self.saw_thinking_text = true;
+            }
+        }
+    }
+
+    /// `response.output_item.added`: open tool blocks and start assembling
+    /// reasoning items as soon as they are announced.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_output_item_added(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        let item = chunk.get("item");
+        let item_type = item.and_then(|i| i.get("type")).and_then(|t| t.as_str());
+        if item_type == Some("function_call") {
+            // `call_id` is what must round-trip back as
+            // function_call_output; fall back to `id` if absent.
+            self.current_tool_id = item
+                .and_then(|i| i.get("call_id").or_else(|| i.get("id")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let upstream_name = item
+                .and_then(|i| i.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            self.capture_tool_name(upstream_name);
+            self.open_tool_block(events);
+            self.saw_tool_use = true;
+            // Per call, not per stream: `arguments.done` below may
+            // only replay the full arguments when no delta arrived
+            // for this call.
+            self.saw_arg_delta = false;
+        }
+        // A reasoning item may announce its id here and carry the blob
+        // on `.done`, so start assembling as soon as it appears.
+        if item_type == Some("reasoning") {
+            if let Some(item) = item {
+                self.pending_reasoning.capture(item);
+            }
+            // Per item, not per stream: the `.done` arm judges each
+            // item on its own visible thinking (see `saw_thinking_text`).
+            self.saw_thinking_text = false;
+        }
+    }
+
+    /// `function_call_arguments.delta`: stream argument deltas into the open
+    /// tool block.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_function_args_delta(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        if self.open == Some(OpenBlock::Tool) {
+            if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
+                if !delta.is_empty() {
+                    events.push(self.emit_input_json_delta(delta));
+                    self.saw_arg_delta = true;
+                }
+            }
+        }
+        // A delta arriving before `output_item.added` (no open tool
+        // block to attribute it to) is skipped rather than guessed
+        // at: the `arguments.done` fallback below replays the whole
+        // arguments, so nothing is lost.
+    }
+
+    /// `arguments.done` carries the whole arguments string. Normally the
+    /// deltas above already delivered it; when they did not — or arrived
+    /// before the item announced itself — this is the only copy, mirroring
+    /// the message-item recovery.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_function_args_done(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        if self.open == Some(OpenBlock::Tool) && !self.saw_arg_delta {
+            if let Some(args) = chunk.get("arguments").and_then(|v| v.as_str()) {
+                if !args.is_empty() {
+                    events.push(self.emit_input_json_delta(args));
+                    self.saw_arg_delta = true;
+                }
+            }
+        }
+    }
+
+    /// `response.output_item.done`: close tool blocks, recover whole messages
+    /// the upstream never streamed, and seal reasoning signatures.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_output_item_done(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        let item_type = chunk
+            .get("item")
+            .and_then(|i| i.get("type"))
+            .and_then(|t| t.as_str());
+        if item_type == Some("function_call") {
+            self.close_block_if(OpenBlock::Tool, events);
+        }
+        // A finished message item carries the whole answer. Normally
+        // we have already streamed it delta by delta and this is a
+        // no-op, but a reasoning delivery that sends the message whole
+        // emits no deltas at all -- and then this event holds the only
+        // copy. Dropping it hands the client a turn containing a
+        // thought and nothing else, which Claude Code renders as a
+        // stopped turn and answers with "your previous response had no
+        // visible output": the model is fine, the text was lost here.
+        if item_type == Some("message") {
+            if !self.saw_text_delta && !self.saw_refusal_delta {
+                let text: String = chunk
+                    .get("item")
+                    .and_then(|i| i.get("content"))
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| {
+                                b.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .or_else(|| b.get("refusal").and_then(|r| r.as_str()))
+                            })
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    tracing::debug!(
+                        event = "codex_message_without_deltas",
+                        chars = text.len(),
+                        "recovered a message item the upstream never streamed"
+                    );
+                    self.open_block(OpenBlock::Text, events);
+                    events.push(self.emit_text_delta(&text));
+                    self.close_block(events);
+                }
+            }
+            // Per item, not per stream: a second message must be
+            // judged on its own deltas.
+            self.saw_text_delta = false;
+            self.saw_refusal_delta = false;
+        }
+        // The reasoning item is complete: seal its identity into the
+        // thinking block's signature so the client hands it back next
+        // turn. Without a usable pair there is nothing to replay and
+        // the block stays a plain summary.
+        if item_type == Some("reasoning") {
+            if let Some(item) = chunk.get("item") {
+                self.pending_reasoning.capture(item);
+            }
+            let signature = self
+                .pending_reasoning
+                .replay()
+                .as_ref()
+                .and_then(encode_reasoning_signature);
+            self.pending_reasoning.reset();
+            // Judged on this item's own visible thinking, then consumed:
+            // a later silent item must not inherit an earlier one's.
+            let visible_thinking = self.saw_thinking_text;
+            self.saw_thinking_text = false;
+            if let Some(signature) = signature {
+                // Zen discards reasoning server-side and we strip it
+                // client-side next turn (`strip_unreplayable_reasoning`),
+                // so on spark a reasoning item with no visible summary
+                // text would emit a thinking block holding nothing but
+                // our opaque envelope: an empty thinking box in the
+                // transcript plus prefix churn the provider never sees.
+                // Skip the block; visible thinking still streams, and
+                // replay-preserving upstreams (codex) are untouched.
+                let silent_on_unreplayable =
+                    !visible_thinking && self.model.to_lowercase().contains("spark");
+                if !silent_on_unreplayable {
+                    // Reasoning summaries can be off entirely, in which case
+                    // no block was ever opened. Open an empty one rather
+                    // than drop the only copy of the item.
+                    self.open_block(OpenBlock::Thinking, events);
+                    events.push(self.emit_signature_delta(&signature));
+                    self.close_block(events);
+                }
+            }
+        }
+    }
+
+    /// `response.completed`: record usage, book the outcome, and end the turn.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_completed(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        if let Some(usage) = chunk.get("response").and_then(|v| v.get("usage")) {
+            if let Some(tokens) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                self.total_output_tokens = tokens;
+            }
+            // Ground-truth cache effectiveness: how many input tokens
+            // the codex backend served from its prompt cache this turn.
+            let input_tokens = usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cached = usage
+                .get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let hit_pct = if input_tokens > 0 {
+                (cached as f64 / input_tokens as f64) * 100.0
+            } else {
+                0.0
+            };
+            tracing::debug!(
+                event = "codex_cache_usage",
+                input_tokens,
+                cached_tokens = cached,
+                fresh_tokens = input_tokens.saturating_sub(cached),
+                cache_hit_pct = format!("{hit_pct:.1}"),
+                "codex prompt-cache effectiveness for this turn"
+            );
+        }
+        let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
+        self.complete_replay(usage.as_ref());
+        self.complete_usage_observation(usage.as_ref());
+        self.emit_outcome(usage.as_ref(), 200);
+        self.close_block_final(events);
+        // A completed response can still carry `incomplete_details`,
+        // and truncation outranks a tool call: a `tool_use` stop on a
+        // cut-off turn would have the client run a half-streamed call.
+        let truncated = chunk
+            .get("response")
+            .and_then(|v| v.get("incomplete_details"))
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str())
+            == Some("max_output_tokens");
+        let stop_reason = if truncated {
+            "max_tokens"
+        } else if self.saw_tool_use {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        events.push(self.emit_message_delta(stop_reason));
+        events.push(self.emit_message_stop());
+    }
+
+    /// `response.failed`: book a 500 outcome and still end the turn on the
+    /// wire. Extracted from `process_responses_frame` without behavior change.
+    fn on_failed(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        self.close_block_final(events);
+        // Booked as a 500 so the outcome funnel routes it to
+        // `record_failed` — a failed turn must not feed the save-rate.
+        let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
+        self.emit_outcome(usage.as_ref(), 500);
+        // The turn still has to end on the wire: without terminal
+        // events the client hangs, and the `[DONE]` fallback cannot
+        // rescue it — the block above already closed `open`, which is
+        // the fallback's trigger. `end_turn`, never `tool_use`: a
+        // half-streamed call must not run.
+        events.push(self.emit_message_delta("end_turn"));
+        events.push(self.emit_message_stop());
+    }
+
+    /// `response.incomplete`: end the turn with the truncation stop reason.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_incomplete(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        let reason = chunk
+            .get("response")
+            .and_then(|v| v.get("incomplete_details"))
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str());
+        self.close_block_final(events);
+        let stop_reason = match reason {
+            Some("max_output_tokens") => "max_tokens",
+            _ => "end_turn",
+        };
+        events.push(self.emit_message_delta(stop_reason));
+        events.push(self.emit_message_stop());
+        // Outside the reason: a response that stopped short still
+        // spent tokens, whether or not it said why.
+        let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
+        self.emit_outcome(usage.as_ref(), 200);
+    }
+
+    /// Untranslated event: silence here is content the client never sees, so
+    /// log the name — the next one is a grep, not an investigation.
+    /// Extracted from `process_responses_frame` without behavior change.
+    fn on_unhandled_event(other: &str) {
+        // Silence here is how the message-item gap stayed hidden: an
+        // event we do not translate is content the client never sees.
+        // Log the name so the next one is a grep, not an investigation.
+        if other.starts_with("response.") {
+            tracing::debug!(
+                event = "codex_unhandled_stream_event",
+                stream_event = other,
+                "no translation for this Responses event; nothing emitted"
+            );
+        }
     }
 
     fn emit_message_start(&self) -> String {

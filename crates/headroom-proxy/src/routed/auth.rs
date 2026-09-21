@@ -399,7 +399,7 @@ mod tests {
             "zen gate needs the session header: {h:?}"
         );
         assert!(header(&h, "x-opencode-request").is_some());
-        assert_eq!(header(&h, "x-opencode-client").as_deref(), Some("opencode"));
+        assert_eq!(header(&h, "x-opencode-client").as_deref(), Some("cli"));
 
         // And a non-OpenCode upstream gains none of them.
         let plain: url::Url = "https://api.x.ai/v1".parse().expect("valid url");

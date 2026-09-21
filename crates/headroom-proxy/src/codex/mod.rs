@@ -118,21 +118,20 @@ pub(crate) fn derive_session_uuid(user_id: &str) -> String {
     )
 }
 
-/// Refresh the Codex OAuth token using the refresh_token in the auth file,
-/// mirroring codex-rs/login/src/auth/manager.rs. Persists the new tokens back
-/// to the auth file and returns the fresh access token.
-pub(crate) async fn refresh_codex_token(
-    client: &reqwest::Client,
-    auth_file: &str,
-) -> Option<String> {
+/// Read the stored auth file, returning the parsed document and its refresh token.
+fn read_auth_file(auth_file: &str) -> Option<(Value, String)> {
     let data = std::fs::read_to_string(auth_file).ok()?;
-    let mut parsed: Value = serde_json::from_str(&data).ok()?;
+    let parsed: Value = serde_json::from_str(&data).ok()?;
     let refresh_token = parsed
         .get("tokens")?
         .get("refresh_token")?
         .as_str()?
         .to_string();
+    Some((parsed, refresh_token))
+}
 
+/// Exchange `refresh_token` for a fresh token set, or `None` on any rejection.
+async fn request_refreshed_tokens(client: &reqwest::Client, refresh_token: &str) -> Option<Value> {
     let resp = client
         .post(CODEX_REFRESH_TOKEN_URL)
         .header("Content-Type", "application/json")
@@ -154,7 +153,14 @@ pub(crate) async fn refresh_codex_token(
         return None;
     }
 
-    let refreshed: Value = resp.json().await.ok()?;
+    resp.json().await.ok()
+}
+
+/// Fold the refreshed token set into `parsed`, returning the new access token.
+///
+/// Returns `None` — leaving `parsed` untouched — when the response carries no
+/// access token, so a malformed reply never reaches the auth file.
+fn merge_refreshed_tokens(parsed: &mut Value, refreshed: &Value) -> Option<String> {
     let access_token = refreshed.get("access_token")?.as_str()?.to_string();
 
     let tokens = parsed.get_mut("tokens")?;
@@ -166,28 +172,46 @@ pub(crate) async fn refresh_codex_token(
         tokens["id_token"] = json!(idt);
     }
     parsed["last_refresh"] = json!(chrono::Utc::now().to_rfc3339());
-    if let Ok(serialized) = serde_json::to_string_pretty(&parsed) {
-        // Write temp-in-same-dir + rename so a crash mid-write cannot leave a
-        // truncated auth file behind (same filesystem => atomic rename).
-        let persist_result = (|| -> std::io::Result<()> {
-            let parent = std::path::Path::new(auth_file)
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty());
-            let mut tmp =
-                tempfile::NamedTempFile::new_in(parent.unwrap_or(std::path::Path::new(".")))?;
-            use std::io::Write as _;
-            tmp.write_all(serialized.as_bytes())?;
-            tmp.persist(auth_file).map(|_| ()).map_err(|e| e.error)?;
-            Ok(())
-        })();
-        if let Err(e) = persist_result {
-            tracing::warn!(
-                event = "codex_token_persist_failed",
-                error = %e,
-                "refreshed codex token could not be written back to auth file"
-            );
-        }
+    Some(access_token)
+}
+
+/// Write `parsed` back over the auth file, warning rather than failing the refresh.
+fn persist_auth_file(auth_file: &str, parsed: &Value) {
+    let Ok(serialized) = serde_json::to_string_pretty(parsed) else {
+        return;
+    };
+    // Write temp-in-same-dir + rename so a crash mid-write cannot leave a
+    // truncated auth file behind (same filesystem => atomic rename).
+    let persist_result = (|| -> std::io::Result<()> {
+        let parent = std::path::Path::new(auth_file)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty());
+        let mut tmp = tempfile::NamedTempFile::new_in(parent.unwrap_or(std::path::Path::new(".")))?;
+        use std::io::Write as _;
+        tmp.write_all(serialized.as_bytes())?;
+        tmp.persist(auth_file).map(|_| ()).map_err(|e| e.error)?;
+        Ok(())
+    })();
+    if let Err(e) = persist_result {
+        tracing::warn!(
+            event = "codex_token_persist_failed",
+            error = %e,
+            "refreshed codex token could not be written back to auth file"
+        );
     }
+}
+
+/// Refresh the Codex OAuth token using the refresh_token in the auth file,
+/// mirroring codex-rs/login/src/auth/manager.rs. Persists the new tokens back
+/// to the auth file and returns the fresh access token.
+pub(crate) async fn refresh_codex_token(
+    client: &reqwest::Client,
+    auth_file: &str,
+) -> Option<String> {
+    let (mut parsed, refresh_token) = read_auth_file(auth_file)?;
+    let refreshed = request_refreshed_tokens(client, &refresh_token).await?;
+    let access_token = merge_refreshed_tokens(&mut parsed, &refreshed)?;
+    persist_auth_file(auth_file, &parsed);
     tracing::info!(
         event = "codex_token_refreshed",
         "codex OAuth access token refreshed"

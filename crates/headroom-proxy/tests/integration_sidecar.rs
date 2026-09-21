@@ -564,19 +564,30 @@ async fn a_huge_tool_result_is_capped_before_it_reaches_the_upstream() {
     let huge = "x".repeat(300_000);
     // Replace the last answered tool_result with something enormous.
     body["messages"][10]["content"][0]["content"] = json!(huge);
+    // And a text block just as large, on the same message. `repair_tool_pairs`
+    // collapses every tool_result to the orphan note, so the tool_result alone
+    // can no longer show that the cap marks what it cut — only a surviving
+    // block can. It goes here rather than on the last user message, whose
+    // trailing text block is what `is_describe_action_sidecar` matches on.
+    body["messages"][10]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "text", "text": huge}));
 
     post(&common::shared_client(), &proxy.url(), &body).await;
 
     let fwd = captured.lock().unwrap()[0].clone();
     assert!(
         fwd.len() < 20_000,
-        "forwarded {} bytes; the 300 KB tool_result was not capped",
+        "forwarded {} bytes; the 300 KB blocks were not capped",
         fwd.len()
     );
+    let got = String::from_utf8_lossy(&fwd);
     assert!(
-        String::from_utf8_lossy(&fwd).contains("[truncated]"),
-        "the cap must mark what it cut"
+        got.contains("[earlier tool result omitted]"),
+        "the tool_result must collapse to the orphan note"
     );
+    assert!(got.contains("[truncated]"), "the cap must mark what it cut");
 
     proxy.shutdown().await;
 }

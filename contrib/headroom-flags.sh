@@ -91,6 +91,23 @@ HEADROOM_FLAGS=(
   # so both start paths carry it.
   --memory true
 
+  # ON 2026-09-20. Fallback project for requests that name no cwd anywhere.
+  # Claude Code subagents get a system prompt with no environment block, so
+  # ProjectResolver had nothing to resolve and resolve_ccr_workspace returned
+  # None. That skipped track_ccr_context_records, leaving the CCR tracker index
+  # empty — and with an empty index proactive expansion "can never fire"
+  # (routed/transforms.rs). Offloaded tool output still landed in the store but
+  # nothing could put it back, so the model saw `<<ctx:...>>` pointers where its
+  # own `ls` output had been and re-ran the command instead. Measured on
+  # 2026-09-19: 4,485 codex_ccr_workspace_unresolved events, 367,425 records and
+  # 1.86 GB offloaded but never indexed, against only 794 ccr_retrieval_calls.
+  # This is a last-resort tier: a request that names its own cwd in the system
+  # prompt keeps its own project (see system_prompt_cwd_outranks_the_cli_override).
+  # Consequence worth knowing: cwd-less subagent turns from *other* repos also
+  # land here. Point it at a neutral directory instead if that matters more than
+  # keeping this repo's subagents in this repo's workspace.
+  --memory-project-root $HOME/headroom
+
   # ON 2026-08-17. The replay store is in memory, so every restart of this proxy
   # threw away the forwarded prefixes and the first turn of each live
   # conversation rebuilt its history: 352,167 tokens over 7 turns, 10% of all
@@ -507,21 +524,23 @@ HEADROOM_FLAGS=(
   --extra-model-route claude-grok-4.6-low=cursor:cursor-grok-4.6-low
 
   # Muse Spark 1.3 free via OpenCode Zen, with no key anywhere — not Meta's,
-  # not Zen's. Zen serves the contributor-free tier anonymously (verified
-  # 2026-09-06: no Authorization header at all, cost 0). `:auth=none`
-  # declares the route carries no credential, so it gets neither the Codex
-  # ChatGPT token above nor the caller's key.
+  # not Zen's. Zen serves the contributor-free tier anonymously when the
+  # request carries the real OpenCode session identity (verified 2026-09-19:
+  # the exact OpenCode Responses shape plus x-opencode headers returns 200
+  # without Authorization; the same request with either local key is 429).
+  # `:auth=none` declares the route carries no credential, so it gets neither
+  # the Codex ChatGPT token above nor the caller's key.
   #
   # The `:openai:TARGET` form matters: it selects the /v1/responses endpoint.
   # The bare `:openai` form would hit chat-completions, which Zen 500s for
   # Muse (Responses-only model). Tradeoffs of the free tier: dynamic
   # unpublished quota (429s with multi-hour retry windows — keep a paid
   # fallback) and Meta may train on prompts/completions.
-  # Free tier now requires a Zen API key (2026-09-07: anonymous MissingSessionID).
-  # Get one at https://opencode.ai/zen -> Create API key, then:
-  #   export OPENCODE_API_KEY="your-key"   (or add to ~/.bashrc)
-  # or: opencode auth login  (if you prefer the auth file, export the env var from it)
-  --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=OPENCODE_API_KEY
+  # The old key-auth form was added after a MissingSessionID probe, but it
+  # spends the authenticated free-pool quota and currently returns a long
+  # 429 window. Keep the free route anonymous; the OpenCode headers are the
+  # identity gate, not the bearer token.
+  --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none
   --extra-model-route claude-union-alpha=https://opencode.ai/zen:anthropic:union-alpha:auth=OPENCODE_API_KEY
 
   # Weaker, faster sibling for the spinner sidecar was 1.2 (~250 tokens
@@ -533,14 +552,9 @@ HEADROOM_FLAGS=(
   # fails at Zen with its own error rather than mismatching a route table
   # entry; nothing selects it anymore.
 
-  # Spinner sidecar offload: answer Claude Code's 4-word status summaries on
-  # the free tier instead of Haiku. The sidecar tries the 1.3 route above
-  # first with one bounded attempt (see --sidecar-route-timeout below) and
-  # falls back to the direct Haiku path on any failure, so the worst case is
-  # today's behavior plus one short wasted call. Offload rate is visible as
-  # `routed: true` on the sidecar_detected log lines. Revert by deleting
-  # this line: the default is Haiku.
-  --sidecar-model claude-muse-spark-1.3
+  # Keep spinner summaries on the default direct Haiku path. Zen's free tier
+  # rejects the reduced sidecar shape as not originating in OpenCode, so
+  # routing it through Spark only adds a failed request before the fallback.
 
   # ─── Defaults, written out ──────────────────────────────────────────
   #

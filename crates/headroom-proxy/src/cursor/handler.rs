@@ -115,151 +115,228 @@ pub(crate) async fn handle(
         "cursor turn received"
     );
     if !results.is_empty() {
-        match (
-            state.cursor_bridge.get(&key).await,
-            state.cursor_bridge.take_driver(&key).await,
-        ) {
-            (Some(session), Some(mut driver)) => {
-                let mut delivered = 0usize;
-                for (id, outcome) in &results {
-                    if session.answer(id, outcome.clone()).await {
-                        delivered += 1;
-                    }
-                }
-                if delivered == 0 {
-                    // Every result missed every parked call. One of these is a
-                    // restarted client replaying its transcript; a run of them
-                    // is the fresh-spawn loop, and re-parking only feeds it:
-                    // the `open()` below would replace this session, orphaning
-                    // the driver on calls nobody will ever answer. Shut it
-                    // down and start clean instead.
-                    let waiting = session.waiting_ids().await;
-                    let got: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
-                    let strikes = state.cursor_bridge.mismatch_strike(&key).await;
-                    tracing::warn!(
-                        event = "cursor_tool_result_mismatch",
-                        conversation = %key,
-                        model = %cursor_model,
-                        expected = ?waiting,
-                        got = ?got,
-                        strikes,
-                        "tool results matched no parked call; killing the orphaned agent"
-                    );
-                    driver.shutdown().await;
-                    state.cursor_bridge.close(&key).await;
-                    if strikes >= super::bridge::MAX_CONSECUTIVE_MISMATCHES {
-                        return error_response(&format!(
-                            "cursor agent tool-result mismatch {strikes} turns in a row \
-                             (got {got:?}, agent was waiting on {waiting:?}); \
-                             stopped respawning this conversation"
-                        ));
-                    }
-                    // Fall through and start fresh below.
-                } else {
-                    state.cursor_bridge.clear_mismatches(&key).await;
-                    driver.begin_response();
-                    tracing::info!(
-                        event = "cursor_turn_resumed",
-                        conversation = %key,
-                        delivered,
-                        "released parked tool calls"
-                    );
-                    if let Some(tools) = parsed.get("tools").and_then(Value::as_array) {
-                        session.set_tools(tools.clone()).await;
-                    }
-                    return drive(
-                        state.clone(),
-                        key,
-                        booking.clone(),
-                        driver,
-                        wants_stream(parsed),
-                    )
-                    .await;
-                }
-            }
-            (session_opt, driver_opt) => {
-                let got: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
-                tracing::warn!(
-                    event = "cursor_resume_half_state",
-                    conversation = %key,
-                    model = %cursor_model,
-                    has_session = session_opt.is_some(),
-                    has_driver = driver_opt.is_some(),
-                    got = ?got,
-                    "tool results arrived with only half the parked conversation; \
-                     dropping the orphan and starting fresh"
-                );
-                if let Some(mut driver) = driver_opt {
-                    driver.shutdown().await;
-                }
-                if session_opt.is_some() {
-                    state.cursor_bridge.close(&key).await;
-                }
-            }
+        if let Some(resp) = resume_parked_turn(
+            &state,
+            &key,
+            booking.clone(),
+            cursor_model,
+            &results,
+            parsed,
+        )
+        .await
+        {
+            return resp;
         }
-    } else {
-        // No results is an ordinary new turn — and the end of any miss run.
-        state.cursor_bridge.clear_mismatches(&key).await;
-        if state.cursor_bridge.has_driver(&key).await {
-            if super::turn::newest_user_message_is_content_free(parsed) {
-                // A content-free turn (Claude Code's `(no content)`
-                // placeholder plus reminders) arrives ~0.15s after every
-                // parked tool call and carries nothing for the parked agent.
-                // Orphaning here respawned a fresh agent per tool call that
-                // redid the in-flight work (the Grok echo/wc circle: 4+
-                // identical calls per task). Hold instead: answer minimally
-                // and leave the parked conversation alone, so the real
-                // tool_result turn resumes it whenever it arrives.
-                tracing::info!(
-                    event = "cursor_poll_held",
-                    conversation = %key,
-                    model = %cursor_model,
-                    "holding a content-free turn while an agent is parked mid-tool"
-                );
-                // Name the pending call so the held turn reads as status,
-                // not noise.
-                let pending = match state.cursor_bridge.get(&key).await {
-                    Some(session) => session.last_tool().await,
-                    None => String::new(),
-                };
-                // No booking: no agent ran and no upstream was called, so
-                // there are no counts to attribute.
-                return hold_response(cursor_model, wants_stream(parsed), &pending);
-            }
-            tracing::warn!(
-                event = "cursor_tool_result_abandoned",
-                conversation = %key,
-                model = %cursor_model,
-                msg_count = crate::ctx::identity::message_count(parsed),
-                last = %last_message_summary(parsed),
-                stream = ?parsed.get("stream"),
-                tool_choice = ?parsed.get("tool_choice"),
-                "new turn carries no tool results while an agent is parked \
-                 mid-tool; the parked agent waits until its deadline"
-            );
-        }
+    } else if let Some(resp) = hold_or_note_abandoned(&state, &key, parsed, cursor_model).await {
+        return resp;
     }
 
-    let (session, inbox) = state.cursor_bridge.open(&key).await;
-    let mut tool_count = 0usize;
-    if let Some(tools) = parsed.get("tools").and_then(|v| v.as_array()) {
-        tool_count = tools.len();
-        // Tool names shape what the agent reaches for: a `Skill` entry whose
-        // description enumerates shared skills (morning, graphify, …) reads,
-        // to a weak model, as an invitation. Names are safe to log.
-        let names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
-            .collect();
-        tracing::info!(
-            event = "cursor_tools_served",
-            conversation = %key,
-            tool_count,
-            names = ?names,
-            "host tools served to the agent"
-        );
-        session.set_tools(tools.clone()).await;
+    start_fresh_turn(state, key, booking, parsed, cursor_model).await
+}
+
+/// A turn carrying tool results continues a parked conversation: answer the
+/// parked calls and pick the same process back up. `None` means no parked
+/// conversation could use these results — fall through and start fresh.
+/// Extracted from `handle` without behavior change.
+async fn resume_parked_turn(
+    state: &AppState,
+    key: &str,
+    booking: CursorBooking,
+    cursor_model: &str,
+    results: &[(String, super::bridge::ToolOutcome)],
+    parsed: &Value,
+) -> Option<Response> {
+    let (session, driver) = match (
+        state.cursor_bridge.get(key).await,
+        state.cursor_bridge.take_driver(key).await,
+    ) {
+        (Some(session), Some(driver)) => (session, driver),
+        (session_opt, driver_opt) => {
+            drop_half_parked_turn(state, key, cursor_model, session_opt, driver_opt, results).await;
+            return None;
+        }
+    };
+    let mut driver = driver;
+    let mut delivered = 0usize;
+    for (id, outcome) in results {
+        if session.answer(id, outcome.clone()).await {
+            delivered += 1;
+        }
     }
+    if delivered != 0 {
+        state.cursor_bridge.clear_mismatches(key).await;
+        driver.begin_response();
+        tracing::info!(
+            event = "cursor_turn_resumed",
+            conversation = %key,
+            delivered,
+            "released parked tool calls"
+        );
+        if let Some(tools) = parsed.get("tools").and_then(Value::as_array) {
+            session.set_tools(tools.clone()).await;
+        }
+        return Some(
+            drive(
+                state.clone(),
+                key.to_string(),
+                booking,
+                driver,
+                wants_stream(parsed),
+            )
+            .await,
+        );
+    }
+    // Every result missed every parked call. One of these is a
+    // restarted client replaying its transcript; a run of them
+    // is the fresh-spawn loop, and re-parking only feeds it:
+    // the `open()` below would replace this session, orphaning
+    // the driver on calls nobody will ever answer. Shut it
+    // down and start clean instead.
+    if let Some(resp) =
+        retire_mismatched_driver(state, key, cursor_model, session, driver, results).await
+    {
+        return Some(resp);
+    }
+    // Fall through and start fresh below.
+    None
+}
+
+/// Tool results arrived with only half the parked conversation (a session
+/// without its driver or vice versa): drop the orphan and start fresh.
+/// Extracted from `resume_parked_turn` without behavior change.
+async fn drop_half_parked_turn(
+    state: &AppState,
+    key: &str,
+    cursor_model: &str,
+    session_opt: Option<std::sync::Arc<Session>>,
+    driver_opt: Option<Conversation>,
+    results: &[(String, super::bridge::ToolOutcome)],
+) {
+    let got: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    tracing::warn!(
+        event = "cursor_resume_half_state",
+        conversation = %key,
+        model = %cursor_model,
+        has_session = session_opt.is_some(),
+        has_driver = driver_opt.is_some(),
+        got = ?got,
+        "tool results arrived with only half the parked conversation; \
+         dropping the orphan and starting fresh"
+    );
+    if let Some(mut driver) = driver_opt {
+        driver.shutdown().await;
+    }
+    if session_opt.is_some() {
+        state.cursor_bridge.close(key).await;
+    }
+}
+
+/// Every result missed every parked call: shut the orphaned agent down.
+/// Returns a response only when the mismatch run hits the stop threshold —
+/// otherwise `None` to fall through and start fresh.
+/// Extracted from `resume_parked_turn` without behavior change.
+async fn retire_mismatched_driver(
+    state: &AppState,
+    key: &str,
+    cursor_model: &str,
+    session: std::sync::Arc<Session>,
+    mut driver: Conversation,
+    results: &[(String, super::bridge::ToolOutcome)],
+) -> Option<Response> {
+    // One of these is a restarted client replaying its transcript; a run of
+    // them is the fresh-spawn loop, and re-parking only feeds it: opening a
+    // new session would replace this one, orphaning the driver on calls
+    // nobody will ever answer. Shut it down and start clean instead.
+    let waiting = session.waiting_ids().await;
+    let got: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    let strikes = state.cursor_bridge.mismatch_strike(key).await;
+    tracing::warn!(
+        event = "cursor_tool_result_mismatch",
+        conversation = %key,
+        model = %cursor_model,
+        expected = ?waiting,
+        got = ?got,
+        strikes,
+        "tool results matched no parked call; killing the orphaned agent"
+    );
+    driver.shutdown().await;
+    state.cursor_bridge.close(key).await;
+    if strikes >= super::bridge::MAX_CONSECUTIVE_MISMATCHES {
+        return Some(error_response(&format!(
+            "cursor agent tool-result mismatch {strikes} turns in a row \
+             (got {got:?}, agent was waiting on {waiting:?}); \
+             stopped respawning this conversation"
+        )));
+    }
+    None
+}
+
+/// A result-free turn while an agent is parked: hold content-free polls
+/// minimally, note (but keep waiting through) anything else. `Some` response
+/// ends the turn here; `None` falls through to a fresh spawn.
+/// Extracted from `handle` without behavior change.
+async fn hold_or_note_abandoned(
+    state: &AppState,
+    key: &str,
+    parsed: &Value,
+    cursor_model: &str,
+) -> Option<Response> {
+    // No results is an ordinary new turn — and the end of any miss run.
+    state.cursor_bridge.clear_mismatches(key).await;
+    if !state.cursor_bridge.has_driver(key).await {
+        return None;
+    }
+    if !super::turn::newest_user_message_is_content_free(parsed) {
+        tracing::warn!(
+            event = "cursor_tool_result_abandoned",
+            conversation = %key,
+            model = %cursor_model,
+            msg_count = crate::ctx::identity::message_count(parsed),
+            last = %last_message_summary(parsed),
+            stream = ?parsed.get("stream"),
+            tool_choice = ?parsed.get("tool_choice"),
+            "new turn carries no tool results while an agent is parked \
+             mid-tool; the parked agent waits until its deadline"
+        );
+        return None;
+    }
+    // A content-free turn (Claude Code's `(no content)`
+    // placeholder plus reminders) arrives ~0.15s after every
+    // parked tool call and carries nothing for the parked agent.
+    // Orphaning here respawned a fresh agent per tool call that
+    // redid the in-flight work (the Grok echo/wc circle: 4+
+    // identical calls per task). Hold instead: answer minimally
+    // and leave the parked conversation alone, so the real
+    // tool_result turn resumes it whenever it arrives.
+    tracing::info!(
+        event = "cursor_poll_held",
+        conversation = %key,
+        model = %cursor_model,
+        "holding a content-free turn while an agent is parked mid-tool"
+    );
+    // Name the pending call so the held turn reads as status,
+    // not noise.
+    let pending = match state.cursor_bridge.get(key).await {
+        Some(session) => session.last_tool().await,
+        None => String::new(),
+    };
+    // No booking: no agent ran and no upstream was called, so
+    // there are no counts to attribute.
+    Some(hold_response(cursor_model, wants_stream(parsed), &pending))
+}
+
+/// No parked conversation could use this turn: open a session and spawn a
+/// fresh agent for it.
+/// Extracted from `handle` without behavior change.
+async fn start_fresh_turn(
+    state: AppState,
+    key: String,
+    booking: CursorBooking,
+    parsed: &Value,
+    cursor_model: &str,
+) -> Response {
+    let (session, inbox) = state.cursor_bridge.open(&key).await;
+    let tool_count = announce_host_tools(&session, parsed, &key).await;
     tracing::info!(
         event = "cursor_turn_started",
         conversation = %key,
@@ -278,13 +355,9 @@ pub(crate) async fn handle(
             log_system_structure(&system);
         }
     }
-    let workspace = match Workspace::create(Some(&mcp_url)) {
-        Ok(workspace) => workspace,
-        Err(e) => {
-            tracing::warn!(event = "cursor_workspace_failed", cause = ?e, "could not prepare a workspace");
-            state.cursor_bridge.close(&key).await;
-            return error_response(&format!("could not prepare a cursor workspace: {e}"));
-        }
+    let workspace = match prepare_fresh_workspace(&state, &key, &mcp_url).await {
+        Ok(w) => w,
+        Err(resp) => return resp,
     };
 
     let turn = AgentTurn {
@@ -303,17 +376,76 @@ pub(crate) async fn handle(
         sandbox: true,
     };
 
-    let running = match spawn(&state.config.cursor_agent_binary, &turn).await {
+    let running = match launch_fresh_agent(&state, &key, &turn).await {
         Ok(running) => running,
-        Err(e) => {
-            tracing::warn!(event = "cursor_agent_spawn_failed", cause = ?e, "could not start cursor-agent");
-            state.cursor_bridge.close(&key).await;
-            return error_response(&format!("cursor-agent failed to start: {e}"));
-        }
+        Err(resp) => return resp,
     };
 
     let convo = Conversation::new(session, inbox, running, workspace);
     drive(state, key, booking, convo, wants_stream(parsed)).await
+}
+
+/// Serve the host tool list to a fresh agent, logging what was served.
+/// Returns the tool count for the turn-started line.
+/// Extracted from `start_fresh_turn` without behavior change.
+async fn announce_host_tools(session: &Session, parsed: &Value, key: &str) -> usize {
+    let Some(tools) = parsed.get("tools").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    // Tool names shape what the agent reaches for: a `Skill` entry whose
+    // description enumerates shared skills (morning, graphify, …) reads,
+    // to a weak model, as an invitation. Names are safe to log.
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    tracing::info!(
+        event = "cursor_tools_served",
+        conversation = %key,
+        tool_count = tools.len(),
+        names = ?names,
+        "host tools served to the agent"
+    );
+    session.set_tools(tools.clone()).await;
+    tools.len()
+}
+
+/// Prepare a scratch workspace for a fresh agent turn.
+/// Extracted from `start_fresh_turn` without behavior change.
+async fn prepare_fresh_workspace(
+    state: &AppState,
+    key: &str,
+    mcp_url: &str,
+) -> Result<Workspace, Response> {
+    match Workspace::create(Some(mcp_url)) {
+        Ok(workspace) => Ok(workspace),
+        Err(e) => {
+            tracing::warn!(event = "cursor_workspace_failed", cause = ?e, "could not prepare a workspace");
+            state.cursor_bridge.close(key).await;
+            Err(error_response(&format!(
+                "could not prepare a cursor workspace: {e}"
+            )))
+        }
+    }
+}
+
+/// Spawn the agent subprocess for a fresh turn.
+/// Extracted from `start_fresh_turn` without behavior change.
+async fn launch_fresh_agent(
+    state: &AppState,
+    key: &str,
+    turn: &AgentTurn,
+) -> Result<super::agent::RunningTurn, Response> {
+    match spawn(&state.config.cursor_agent_binary, turn).await {
+        Ok(running) => Ok(running),
+        Err(e) => {
+            tracing::warn!(event = "cursor_agent_spawn_failed", cause = ?e, "could not start cursor-agent");
+            state.cursor_bridge.close(key).await;
+            Err(error_response(&format!(
+                "cursor-agent failed to start: {e}"
+            )))
+        }
+    }
 }
 
 /// What completion booking needs, captured at turn start. The driver task

@@ -457,25 +457,8 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<CostRule> {
         tracing::warn!("model route #{index} is not an object; skipping");
         return None;
     };
-    let mut unknown: Vec<&str> = map
-        .keys()
-        .map(String::as_str)
-        .filter(|k| !ALLOWED_ROUTE_KEYS.contains(k))
-        .collect();
-    if !unknown.is_empty() {
-        // A misspelled condition (e.g. "max_input_token") would otherwise be
-        // ignored, silently widening the rule. Reject unknown keys instead.
-        unknown.sort_unstable();
-        tracing::warn!("model route #{index} has unknown key(s) {unknown:?}; skipping route");
-        return None;
-    }
-    let to_model = match map.get("to_model") {
-        Some(Value::String(s)) if !s.is_empty() => s.clone(),
-        _ => {
-            tracing::warn!("model route #{index} missing string 'to_model'; skipping");
-            return None;
-        }
-    };
+    reject_unknown_keys(map, index)?;
+    let to_model = parse_to_model(map, index)?;
 
     let max_tokens = strict_opt_int(map.get("max_input_tokens"), "max_input_tokens", index).ok()?;
     let min_tokens = strict_opt_int(map.get("min_input_tokens"), "min_input_tokens", index).ok()?;
@@ -483,57 +466,16 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<CostRule> {
     // Only an absent key defaults to `false`. Python reads
     // `entry.get("require_no_tools", False)` and then rejects anything that
     // is not a `bool`, so an explicit `null` skips the route.
-    let require_no_tools = match map.get("require_no_tools") {
-        None => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => {
-            tracing::warn!(
-                "model route #{index} 'require_no_tools' must be a boolean; skipping route"
-            );
-            return None;
-        }
-    };
+    let require_no_tools = strict_bool_field(map, "require_no_tools", index)?;
 
     // Same strictness as `require_no_tools`: only an absent key defaults to
     // `false`; an explicit non-boolean skips the route (fail open, never
     // coerced).
-    let require_tools = match map.get("require_tools") {
-        None => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => {
-            tracing::warn!(
-                "model route #{index} 'require_tools' must be a boolean; skipping route"
-            );
-            return None;
-        }
-    };
+    let require_tools = strict_bool_field(map, "require_tools", index)?;
 
     // As above: `entry.get("from_models", [])` only defaults when the key is
     // absent; an explicit `null` is not a list and skips the route.
-    let from_models: Vec<String> = match map.get("from_models") {
-        None => Vec::new(),
-        Some(Value::Array(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Value::String(s) => out.push(s.clone()),
-                    _ => {
-                        tracing::warn!(
-                            "model route #{index} 'from_models' must be a list of strings; skipping route"
-                        );
-                        return None;
-                    }
-                }
-            }
-            out
-        }
-        Some(_) => {
-            tracing::warn!(
-                "model route #{index} 'from_models' must be a list of strings; skipping route"
-            );
-            return None;
-        }
-    };
+    let from_models = parse_from_models(map, index)?;
 
     let name = match map.get("name") {
         None => String::new(),
@@ -551,6 +493,84 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<CostRule> {
     })
 }
 
+/// Reject unknown keys: a misspelled condition (e.g. "max_input_token")
+/// would otherwise be ignored, silently widening the rule.
+/// Extracted from `route_from_entry` without behavior change.
+fn reject_unknown_keys(map: &serde_json::Map<String, Value>, index: usize) -> Option<()> {
+    let mut unknown: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !ALLOWED_ROUTE_KEYS.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return Some(());
+    }
+    // A misspelled condition (e.g. "max_input_token") would otherwise be
+    // ignored, silently widening the rule. Reject unknown keys instead.
+    unknown.sort_unstable();
+    tracing::warn!("model route #{index} has unknown key(s) {unknown:?}; skipping route");
+    None
+}
+
+/// Parse the required non-empty `to_model` string.
+/// Extracted from `route_from_entry` without behavior change.
+fn parse_to_model(map: &serde_json::Map<String, Value>, index: usize) -> Option<String> {
+    match map.get("to_model") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => {
+            tracing::warn!("model route #{index} missing string 'to_model'; skipping");
+            None
+        }
+    }
+}
+
+/// Parse an optional boolean flag: only an absent key defaults to `false`;
+/// an explicit non-boolean skips the route (fail open, never coerced).
+/// Extracted from `route_from_entry` without behavior change.
+fn strict_bool_field(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+    index: usize,
+) -> Option<bool> {
+    match map.get(key) {
+        None => Some(false),
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            tracing::warn!("model route #{index} '{key}' must be a boolean; skipping route");
+            None
+        }
+    }
+}
+
+/// Parse the optional `from_models` string list.
+/// Extracted from `route_from_entry` without behavior change.
+fn parse_from_models(map: &serde_json::Map<String, Value>, index: usize) -> Option<Vec<String>> {
+    match map.get("from_models") {
+        None => Some(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => {
+                        tracing::warn!(
+                            "model route #{index} 'from_models' must be a list of strings; skipping route"
+                        );
+                        return None;
+                    }
+                }
+            }
+            Some(out)
+        }
+        Some(_) => {
+            tracing::warn!(
+                "model route #{index} 'from_models' must be a list of strings; skipping route"
+            );
+            None
+        }
+    }
+}
+
 /// Return the int at `key`, `None` if absent, or `Err(Invalid)` if malformed.
 ///
 /// Accepts JSON integers and digit strings; rejects booleans, floats, and
@@ -565,29 +585,8 @@ fn strict_opt_int(value: Option<&Value>, key: &str, index: usize) -> Result<Opti
             tracing::warn!("model route #{index} '{key}' must be an integer, not a boolean");
             return Err(Invalid);
         }
-        Value::Number(n) => match n.as_i64() {
-            Some(i) => i128::from(i),
-            // A JSON float (or an integer beyond i64) renders via `str()` in
-            // Python and then fails `int()`; floats always do, huge ints do
-            // not — see the module tests for that documented divergence.
-            None => match py_int_from_str(&n.to_string()) {
-                Some(i) => i,
-                None => {
-                    tracing::warn!("model route #{index} '{key}' is not a valid integer");
-                    return Err(Invalid);
-                }
-            },
-        },
-        other => {
-            let rendered = py_str(other);
-            match py_int_from_str(&rendered) {
-                Some(i) => i,
-                None => {
-                    tracing::warn!("model route #{index} '{key}' is not a valid integer");
-                    return Err(Invalid);
-                }
-            }
-        }
+        Value::Number(n) => parse_json_number(n, key, index)?,
+        other => parse_rendered_number(other, key, index)?,
     };
     if parsed < 0 {
         tracing::warn!("model route #{index} '{key}' must be non-negative");
@@ -596,6 +595,41 @@ fn strict_opt_int(value: Option<&Value>, key: &str, index: usize) -> Result<Opti
     // Python's ints are unbounded; a bound above `u64::MAX` is unreachable
     // either way, so saturating keeps the match behaviour identical.
     Ok(Some(u64::try_from(parsed).unwrap_or(u64::MAX)))
+}
+
+/// Parse a JSON number the way Python's `int()` would: integers directly; a
+/// float (or an integer beyond i64, which renders via `str()`) goes through
+/// the string parser, where floats always fail and huge ints do not — see
+/// the module tests for that documented divergence.
+/// Extracted from `strict_opt_int` without behavior change.
+fn parse_json_number(n: &serde_json::Number, key: &str, index: usize) -> Result<i128, Invalid> {
+    match n.as_i64() {
+        Some(i) => Ok(i128::from(i)),
+        // A JSON float (or an integer beyond i64) renders via `str()` in
+        // Python and then fails `int()`; floats always do, huge ints do
+        // not — see the module tests for that documented divergence.
+        None => match py_int_from_str(&n.to_string()) {
+            Some(i) => Ok(i),
+            None => {
+                tracing::warn!("model route #{index} '{key}' is not a valid integer");
+                Err(Invalid)
+            }
+        },
+    }
+}
+
+/// Parse a non-number JSON value by rendering it Python-style (`str()`) and
+/// running the string parser.
+/// Extracted from `strict_opt_int` without behavior change.
+fn parse_rendered_number(other: &Value, key: &str, index: usize) -> Result<i128, Invalid> {
+    let rendered = py_str(other);
+    match py_int_from_str(&rendered) {
+        Some(i) => Ok(i),
+        None => {
+            tracing::warn!("model route #{index} '{key}' is not a valid integer");
+            Err(Invalid)
+        }
+    }
 }
 
 /// Parse a string the way Python's `int(str)` does: surrounding whitespace is

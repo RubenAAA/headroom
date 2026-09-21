@@ -453,58 +453,10 @@ pub(crate) async fn handle_rpc(session: &Session, request: &Value) -> Option<Val
     }
 
     let result = match method {
-        "initialize" => Ok(json!({
-            // Echo the client's version. MCP negotiates by agreement, and
-            // Cursor is the only client here.
-            "protocolVersion": request
-                .pointer("/params/protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or("2024-11-05"),
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "headroom", "version": env!("CARGO_PKG_VERSION")},
-        })),
+        "initialize" => Ok(serve_initialize(request)),
         "ping" => Ok(json!({})),
-        "tools/list" => {
-            let tools = session.mcp_tools().await;
-            // An empty list here is the failure the model reports as
-            // "discovery returned nothing", and it was previously invisible:
-            // the cursor path logged neither what it registered nor what it
-            // served, so the symptom could only be guessed at.
-            if tools.is_empty() {
-                tracing::warn!(
-                    event = "cursor_mcp_tools_empty",
-                    "the agent asked for the host tools and there were none to give it"
-                );
-            } else {
-                tracing::debug!(
-                    event = "cursor_mcp_tools_listed",
-                    count = tools.len(),
-                    "served the host tool list to the agent"
-                );
-            }
-            Ok(json!({"tools": tools}))
-        }
-        "tools/call" => {
-            let name = request
-                .pointer("/params/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if name.is_empty() {
-                Err((-32602, "tools/call without a name".to_string()))
-            } else {
-                let args = request
-                    .pointer("/params/arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                tracing::info!(
-                    event = "cursor_mcp_tool_call",
-                    tool = %name,
-                    "agent called a host tool"
-                );
-                Ok(session.park(&name, args).await.to_mcp_result())
-            }
-        }
+        "tools/list" => Ok(serve_tools_list(session).await),
+        "tools/call" => serve_tools_call(session, request).await,
         other => Err((-32601, format!("no method {other}"))),
     };
 
@@ -514,6 +466,71 @@ pub(crate) async fn handle_rpc(session: &Session, request: &Value) -> Option<Val
             json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
         }
     })
+}
+
+/// Answer `initialize`: echo the client's version (MCP negotiates by
+/// agreement, and Cursor is the only client here).
+/// Extracted from `handle_rpc` without behavior change.
+fn serve_initialize(request: &Value) -> Value {
+    json!({
+        // Echo the client's version. MCP negotiates by agreement, and
+        // Cursor is the only client here.
+        "protocolVersion": request
+            .pointer("/params/protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("2024-11-05"),
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "headroom", "version": env!("CARGO_PKG_VERSION")},
+    })
+}
+
+/// Answer `tools/list`, logging what was served: an empty list here is the
+/// failure the model reports as "discovery returned nothing", and it was
+/// previously invisible.
+/// Extracted from `handle_rpc` without behavior change.
+async fn serve_tools_list(session: &Session) -> Value {
+    let tools = session.mcp_tools().await;
+    // An empty list here is the failure the model reports as
+    // "discovery returned nothing", and it was previously invisible:
+    // the cursor path logged neither what it registered nor what it
+    // served, so the symptom could only be guessed at.
+    if tools.is_empty() {
+        tracing::warn!(
+            event = "cursor_mcp_tools_empty",
+            "the agent asked for the host tools and there were none to give it"
+        );
+    } else {
+        tracing::debug!(
+            event = "cursor_mcp_tools_listed",
+            count = tools.len(),
+            "served the host tool list to the agent"
+        );
+    }
+    json!({"tools": tools})
+}
+
+/// Answer `tools/call` by parking the call on the session.
+/// Extracted from `handle_rpc` without behavior change.
+async fn serve_tools_call(session: &Session, request: &Value) -> Result<Value, (i32, String)> {
+    let name = request
+        .pointer("/params/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if name.is_empty() {
+        Err((-32602, "tools/call without a name".to_string()))
+    } else {
+        let args = request
+            .pointer("/params/arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        tracing::info!(
+            event = "cursor_mcp_tool_call",
+            tool = %name,
+            "agent called a host tool"
+        );
+        Ok(session.park(&name, args).await.to_mcp_result())
+    }
 }
 
 #[cfg(test)]

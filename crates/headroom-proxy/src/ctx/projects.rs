@@ -155,7 +155,7 @@ impl ProjectStores {
         already_checked: &str,
     ) -> ColdTierLookup {
         let started = std::time::Instant::now();
-        let mut scanned = 0usize;
+        let scanned = 0usize;
         let skip = headroom_core::ctx::hash_project_dir_canonical(already_checked);
         let Some(dir) = content_db_path(&self.base, already_checked)
             .parent()
@@ -163,7 +163,21 @@ impl ProjectStores {
         else {
             return ColdTierLookup::miss(started, scanned, false);
         };
-        let entries = match std::fs::read_dir(&dir) {
+        Self::sweep_project_dbs(&dir, &skip, content_hash, started)
+    }
+
+    /// Sweep every project's content DB for one hash, within the cold-tier
+    /// time budget. Read-only: the sweep must not create a DB for a project
+    /// that has none, nor take a write lock on one another proxy is writing.
+    /// Extracted from `find_content_any_project` without behavior change.
+    fn sweep_project_dbs(
+        dir: &Path,
+        skip: &str,
+        content_hash: &str,
+        started: std::time::Instant,
+    ) -> ColdTierLookup {
+        let mut scanned = 0usize;
+        let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(
@@ -204,24 +218,43 @@ impl ProjectStores {
                 continue;
             };
             scanned += 1;
-            match store.content_by_hash(content_hash) {
-                Ok(Some(content)) => {
-                    return ColdTierLookup {
-                        found: Some((key.to_string(), content)),
-                        elapsed: started.elapsed(),
-                        scanned,
-                        gave_up: false,
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    event = "ctx_content_hash_lookup_failed",
-                    path = %path.display(),
-                    error = %e,
-                ),
+            if let Some(hit) =
+                Self::lookup_project_db(&store, &path, key, content_hash, started, scanned)
+            {
+                return hit;
             }
         }
         ColdTierLookup::miss(started, scanned, false)
+    }
+
+    /// Point-lookup one project's DB by hash. `Some` on a hit; `None` means
+    /// keep sweeping (miss or lookup error).
+    /// Extracted from `sweep_project_dbs` without behavior change.
+    fn lookup_project_db(
+        store: &CtxStore,
+        path: &Path,
+        key: &str,
+        content_hash: &str,
+        started: std::time::Instant,
+        scanned: usize,
+    ) -> Option<ColdTierLookup> {
+        match store.content_by_hash(content_hash) {
+            Ok(Some(content)) => Some(ColdTierLookup {
+                found: Some((key.to_string(), content)),
+                elapsed: started.elapsed(),
+                scanned,
+                gave_up: false,
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    event = "ctx_content_hash_lookup_failed",
+                    path = %path.display(),
+                    error = %e,
+                );
+                None
+            }
+        }
     }
 
     fn get_or_open<T>(

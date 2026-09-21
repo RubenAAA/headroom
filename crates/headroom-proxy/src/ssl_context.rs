@@ -59,6 +59,21 @@ pub enum CaBundleResult {
 /// Returns the first valid CA bundle path found, with its semantics.
 pub fn find_ca_bundle() -> CaBundleResult {
     // Check replacement vars first
+    if let Some(result) = find_replacement_bundle() {
+        return result;
+    }
+
+    // Check additive var
+    if let Some(result) = find_additive_bundle() {
+        return result;
+    }
+
+    CaBundleResult::Default
+}
+
+/// First valid CA bundle among the replacement vars, with its semantics.
+/// Extracted from `find_ca_bundle` without behavior change.
+fn find_replacement_bundle() -> Option<CaBundleResult> {
     for var in REPLACEMENT_CA_VARS {
         if let Ok(path) = std::env::var(var) {
             let path = PathBuf::from(&path);
@@ -69,7 +84,7 @@ pub fn find_ca_bundle() -> CaBundleResult {
                     path = %path.display(),
                     "CA bundle loaded"
                 );
-                return CaBundleResult::Replacement(path);
+                return Some(CaBundleResult::Replacement(path));
             }
             if !path.as_os_str().is_empty() {
                 tracing::warn!(
@@ -81,8 +96,12 @@ pub fn find_ca_bundle() -> CaBundleResult {
             }
         }
     }
+    None
+}
 
-    // Check additive var
+/// The additive-var bundle, if set and valid.
+/// Extracted from `find_ca_bundle` without behavior change.
+fn find_additive_bundle() -> Option<CaBundleResult> {
     if let Ok(path) = std::env::var(ADDITIVE_CA_VAR) {
         let path = PathBuf::from(&path);
         if path.is_file() {
@@ -93,7 +112,7 @@ pub fn find_ca_bundle() -> CaBundleResult {
                 additive = true,
                 "CA bundle loaded (additive)"
             );
-            return CaBundleResult::Additive(path);
+            return Some(CaBundleResult::Additive(path));
         }
         if !path.as_os_str().is_empty() {
             tracing::warn!(
@@ -104,84 +123,124 @@ pub fn find_ca_bundle() -> CaBundleResult {
             );
         }
     }
-
-    CaBundleResult::Default
+    None
 }
 
-/// Apply the common CA policy to either reqwest builder flavour. Keeping the
-/// implementation in one macro matters here: async and blocking reqwest use
-/// distinct builder types, but expose the same TLS methods.
-macro_rules! configure_tls_builder {
-    ($builder:expr) => {{
-        let builder = $builder;
-        match find_ca_bundle() {
-            CaBundleResult::Replacement(path) => match load_certificates_from_file(&path) {
-                Ok(certs) => {
-                    // SSL_CERT_FILE / REQUESTS_CA_BUNDLE replace the trust
-                    // store. Without this call reqwest would silently keep its
-                    // built-in WebPKI roots and turn replacement into additive
-                    // semantics.
-                    let mut configured = builder.tls_built_in_root_certs(false);
-                    for cert in certs {
-                        configured = configured.add_root_certificate(cert);
-                    }
-                    configured
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        path = %path.display(),
-                        semantics = "replacement",
-                        "failed to load CA certificates; using default TLS"
-                    );
-                    builder
-                }
-            },
-            CaBundleResult::Additive(path) => match load_certificates_from_file(&path) {
-                Ok(certs) => {
-                    let mut configured = builder;
-                    for cert in certs {
-                        configured = configured.add_root_certificate(cert);
-                    }
-                    configured
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        path = %path.display(),
-                        semantics = "additive",
-                        "failed to load CA certificates; using default TLS"
-                    );
-                    builder
-                }
-            },
-            CaBundleResult::Default => {
-                if tls_strict_disabled() {
-                    // rustls has no OpenSSL VERIFY_X509_STRICT flag to clear.
-                    // It keeps chain, signature, expiry, and hostname checks
-                    // enabled, which is the security contract of this toggle.
-                    tracing::info!(
-                        event = "ssl_x509_strict_disabled",
-                        reason = "env_toggle",
-                        "TLS strict compatibility toggle accepted; rustls validation remains enabled"
-                    );
-                }
-                builder
+/// The TLS knobs both reqwest builder flavours share. Async and blocking
+/// reqwest use distinct builder types with the same method shapes and no
+/// common trait, so this local trait is the seam that lets one generic
+/// function serve both call sites instead of a macro duplicated per flavour.
+trait TlsBuilder: Sized {
+    fn without_built_in_roots(self) -> Self;
+    fn with_root_certificate(self, cert: reqwest::Certificate) -> Self;
+}
+
+impl TlsBuilder for reqwest::ClientBuilder {
+    fn without_built_in_roots(self) -> Self {
+        self.tls_built_in_root_certs(false)
+    }
+    fn with_root_certificate(self, cert: reqwest::Certificate) -> Self {
+        self.add_root_certificate(cert)
+    }
+}
+
+impl TlsBuilder for reqwest::blocking::ClientBuilder {
+    fn without_built_in_roots(self) -> Self {
+        self.tls_built_in_root_certs(false)
+    }
+    fn with_root_certificate(self, cert: reqwest::Certificate) -> Self {
+        self.add_root_certificate(cert)
+    }
+}
+
+/// Apply the common CA policy to either reqwest builder flavour.
+/// Extracted from the former `configure_tls_builder!` macro without behavior
+/// change: the macro existed only to share code across the two builder types,
+/// which the [`TlsBuilder`] trait now covers with plain functions.
+fn apply_ca_bundle<B: TlsBuilder>(builder: B) -> B {
+    match find_ca_bundle() {
+        CaBundleResult::Replacement(path) => apply_replacement_bundle(builder, &path),
+        CaBundleResult::Additive(path) => apply_additive_bundle(builder, &path),
+        CaBundleResult::Default => apply_default_tls(builder),
+    }
+}
+
+/// Replacement semantics: the bundle becomes the whole trust store.
+/// Extracted from the former `configure_tls_builder!` macro without behavior change.
+fn apply_replacement_bundle<B: TlsBuilder>(builder: B, path: &Path) -> B {
+    match load_certificates_from_file(path) {
+        Ok(certs) => {
+            // SSL_CERT_FILE / REQUESTS_CA_BUNDLE replace the trust
+            // store. Without this call reqwest would silently keep its
+            // built-in WebPKI roots and turn replacement into additive
+            // semantics.
+            let mut configured = builder.without_built_in_roots();
+            for cert in certs {
+                configured = configured.with_root_certificate(cert);
             }
+            configured
         }
-    }};
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                semantics = "replacement",
+                "failed to load CA certificates; using default TLS"
+            );
+            builder
+        }
+    }
+}
+
+/// Additive semantics: custom CAs join the system trust store.
+/// Extracted from the former `configure_tls_builder!` macro without behavior change.
+fn apply_additive_bundle<B: TlsBuilder>(builder: B, path: &Path) -> B {
+    match load_certificates_from_file(path) {
+        Ok(certs) => {
+            let mut configured = builder;
+            for cert in certs {
+                configured = configured.with_root_certificate(cert);
+            }
+            configured
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                semantics = "additive",
+                "failed to load CA certificates; using default TLS"
+            );
+            builder
+        }
+    }
+}
+
+/// No bundle: default trust store, modulo the strict-compat toggle.
+/// Extracted from the former `configure_tls_builder!` macro without behavior change.
+fn apply_default_tls<B: TlsBuilder>(builder: B) -> B {
+    if tls_strict_disabled() {
+        // rustls has no OpenSSL VERIFY_X509_STRICT flag to clear.
+        // It keeps chain, signature, expiry, and hostname checks
+        // enabled, which is the security contract of this toggle.
+        tracing::info!(
+            event = "ssl_x509_strict_disabled",
+            reason = "env_toggle",
+            "TLS strict compatibility toggle accepted; rustls validation remains enabled"
+        );
+    }
+    builder
 }
 
 /// Configure an asynchronous reqwest builder with Headroom's CA policy.
 pub fn configure_client_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    configure_tls_builder!(builder)
+    apply_ca_bundle(builder)
 }
 
 /// Configure a blocking reqwest builder with Headroom's CA policy.
 pub fn configure_blocking_client_tls(
     builder: reqwest::blocking::ClientBuilder,
 ) -> reqwest::blocking::ClientBuilder {
-    configure_tls_builder!(builder)
+    apply_ca_bundle(builder)
 }
 
 /// The canonical constructor for every asynchronous outbound HTTP client.

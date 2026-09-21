@@ -150,7 +150,7 @@ pub(crate) async fn handle_live_call(
     if !crate::websocket_codex::resolve_codex_routing(&mut routed) {
         return LiveHttpDecision::Fallthrough(parts, body);
     }
-    let headers = outbound_headers(&parts.headers, strip_internal);
+    let headers = outbound_headers(&routed, strip_internal);
     let bytes = match axum::body::to_bytes(body, max_body_bytes).await {
         Ok(b) => b,
         Err(e) => {
@@ -317,6 +317,31 @@ mod tests {
         assert!(!out.contains_key("x-headroom-mode"));
         assert!(out.contains_key("authorization"));
         assert!(out.contains_key("chatgpt-account-id"));
+    }
+
+    #[test]
+    fn jwt_derived_account_id_survives_outbound() {
+        // Regression test: handle_live_call gates on a `routed` clone into
+        // which resolve_codex_routing inserts ChatGPT-Account-ID when
+        // derived from the Bearer JWT. Outbound must be built from `routed`,
+        // not the original headers, or JWT-only clients lose routing.
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct_jwt"}})
+                .to_string(),
+        );
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            "authorization",
+            format!("Bearer a.{payload}.b").parse().unwrap(),
+        );
+        let mut routed = inbound.clone();
+        assert!(crate::websocket_codex::resolve_codex_routing(&mut routed));
+        let out = outbound_headers(&routed, true);
+        assert_eq!(
+            out.get("chatgpt-account-id").and_then(|v| v.to_str().ok()),
+            Some("acct_jwt")
+        );
     }
 
     #[test]

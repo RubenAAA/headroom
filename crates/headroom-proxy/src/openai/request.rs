@@ -129,12 +129,11 @@ pub(crate) fn anthropic_to_openai_request(
 fn copy_scalar_fields(anthropic: &Value, openai: &mut Value) {
     // `temperature` is deliberately absent: the Codex ResponsesApiRequest
     // has no such field and the real CLI never sends it (the tail comment
-    // restates this for readers who only read the caller).
-    const SCALAR_FIELDS: &[(&str, &str)] = &[
-        ("top_p", "top_p"),
-        ("top_k", "top_k"),
-        ("stop_sequences", "stop"),
-    ];
+    // restates this for readers who only read the caller). `top_k` is
+    // absent for the same reason: Anthropic-only sampling param, no such
+    // field on the Responses shape — forwarding it would 400 exactly the
+    // turns that set it. `top_p` and `stop` are standard Responses fields.
+    const SCALAR_FIELDS: &[(&str, &str)] = &[("top_p", "top_p"), ("stop_sequences", "stop")];
     for (src, dst) in SCALAR_FIELDS {
         if let Some(v) = anthropic.get(*src) {
             openai[*dst] = (*v).clone();

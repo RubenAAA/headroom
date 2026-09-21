@@ -47,56 +47,15 @@ pub(crate) fn translate_routed_request(
     // everything below matches on it.
     let shape = shape_for(target_model);
     let is_responses = shape == RouteShape::Responses;
-    let translated = match shape {
-        RouteShape::Responses => anthropic_to_openai_responses_request(parsed, false),
-        RouteShape::Chat => anthropic_to_openai_request(parsed, true, true),
-    };
-    let openai_body = match translated {
-        Ok(v) => {
-            let mut v = apply_target_model_override(v, target_model, is_responses, is_responses);
-            let kind = classify_upstream(upstream, is_chatgpt_auth);
-            kind.strip_unreplayable_reasoning(&mut v);
-            // Zen's free-tier gate reads tool names: they must be
-            // OpenCode-native lowercase (`read`, not `Read`). Rename the
-            // translated body (definitions, history calls, forced choice)
-            // and map the model's calls back before delivery — see
-            // `routed::tool_alias`. Responses shape only: Chat routes
-            // have no Zen free-tier configuration today.
-            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
-                let alias = crate::routed::tool_alias::ToolAlias::derive(
-                    parsed.get("tools").and_then(|t| t.as_array()),
-                );
-                let renamed = alias.forward_body(&mut v);
-                // Tool-poor turns cannot clear the gate on renamed names
-                // alone (there is nothing to rename, or extras like memory
-                // tools inflate the count without adding known names): top
-                // up the missing core names with marked shadow copies.
-                // Already-present names are never duplicated.
-                let shadowed = crate::routed::tool_alias::ensure_gate_tools(&mut v);
-                if renamed > 0 || shadowed > 0 {
-                    tracing::debug!(
-                        event = "zen_tool_alias_applied",
-                        request_id = %request_id,
-                        renamed,
-                        shadowed,
-                        "lowercased tool names for the Zen gate; mapped back before delivery"
-                    );
-                }
-            }
-            v
-        }
-        Err(e) => {
-            tracing::warn!(
-                event = "local_model_translate_error",
-                error = %e,
-                "failed to translate Anthropic request to OpenAI format"
-            );
-            return Err(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("translation error"))
-                .expect("static response"));
-        }
-    };
+    let openai_body = translate_shaped_body(
+        parsed,
+        shape,
+        target_model,
+        upstream,
+        is_chatgpt_auth,
+        is_responses,
+        request_id,
+    )?;
 
     // PR-E4: OpenAI `prompt_cache_key`. Injected *after* translation, because
     // the field belongs to the OpenAI request shape — before translation there
@@ -139,25 +98,8 @@ pub(crate) fn translate_routed_request(
     // Codex traffic speaks the Codex endpoint, everything else appends one
     // `/v1/...` path onto the stripped base. The sniff lives in
     // `routed::quirks`; this keeps only the per-occurrence misroute alarm.
-    let kind = crate::routed::quirks::classify_upstream(upstream, is_chatgpt_auth);
-    let upstream_url = match shape {
-        RouteShape::Responses => kind.responses_url(upstream),
-        RouteShape::Chat => {
-            if kind.warn_ambiguous_codex() {
-                // Ambiguous Codex route: translate without a target on a
-                // codex-bound upstream speaks chat-completions today (the
-                // startup `warn_on_ambiguous_codex_routes` also fires). Loud
-                // per occurrence so dashboards see a misroute, not just logs.
-                tracing::warn!(
-                    event = "model_route_ambiguous_codex",
-                    request_id = %request_id,
-                    model = %body_model,
-                    "translate route on api.openai.com has no target model; serving chat-completions"
-                );
-            }
-            kind.chat_url(upstream)
-        }
-    };
+    let upstream_url =
+        resolve_upstream_url(shape, upstream, is_chatgpt_auth, body_model, request_id);
 
     tracing::info!(
         event = "model_route_translate",
@@ -174,6 +116,184 @@ pub(crate) fn translate_routed_request(
         downstream_is_stream,
         is_responses,
     })
+}
+
+/// Translate the prepared body into the route's OpenAI shape, including the
+/// target-model override, reasoning-strip, and Zen tool-alias passes.
+/// `Err` is the response to return directly when translation itself fails.
+///
+/// The `Response` error keeps the convention of every sibling arm on this
+/// path (cf. `auth.rs`); boxing it would save nothing measurable and diverge
+/// from all of them.
+///
+/// Extracted from `translate_routed_request`, then extended: the Zen
+/// Responses arm below clamps the output budget, moves `instructions` into a
+/// `developer` message, injects `prompt_cache_key` and strips
+/// `parallel_tool_calls`. Those are new behaviour, not part of the move.
+#[allow(clippy::result_large_err)]
+fn translate_shaped_body(
+    parsed: &Value,
+    shape: RouteShape,
+    target_model: Option<&str>,
+    upstream: &url::Url,
+    is_chatgpt_auth: bool,
+    is_responses: bool,
+    request_id: &str,
+) -> Result<Value, Response> {
+    let kind = classify_upstream(upstream, is_chatgpt_auth);
+    let translated = match shape {
+        RouteShape::Responses => {
+            // OpenCode's current Responses client always sends the output
+            // budget. Other Responses routes keep the historical omission.
+            anthropic_to_openai_responses_request(
+                parsed,
+                kind == crate::routed::quirks::UpstreamKind::OpenCodeZen,
+            )
+        }
+        RouteShape::Chat => anthropic_to_openai_request(parsed, true, true),
+    };
+    match translated {
+        Ok(v) => {
+            let mut v = apply_target_model_override(v, target_model, is_responses, is_responses);
+            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
+                clamp_zen_output_budget(&mut v, request_id);
+                move_zen_instructions_to_developer(&mut v);
+                // Match OpenCode's Responses request defaults. Its AI SDK
+                // sends the real OpenCode session as the cache key and leaves
+                // parallel tool calls at the provider default; forcing false
+                // here serializes tool work and makes this path slower than
+                // the native client.
+                v["prompt_cache_key"] =
+                    serde_json::json!(crate::routed::quirks::resolve_zen_session(request_id));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("parallel_tool_calls");
+                }
+            }
+            kind.strip_unreplayable_reasoning(&mut v);
+            // Zen's free-tier gate reads tool names: they must be
+            // OpenCode-native lowercase (`read`, not `Read`). Rename the
+            // translated body (definitions, history calls, forced choice)
+            // and map the model's calls back before delivery — see
+            // `routed::tool_alias`. Responses shape only: Chat routes
+            // have no Zen free-tier configuration today.
+            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
+                let alias = crate::routed::tool_alias::ToolAlias::derive(
+                    parsed.get("tools").and_then(|t| t.as_array()),
+                );
+                let renamed = alias.forward_body(&mut v);
+                // Tool-poor turns cannot clear the gate on renamed names
+                // alone (there is nothing to rename, or extras like memory
+                // tools inflate the count without adding known names): top
+                // up the missing core names with marked shadow copies.
+                // Already-present names are never duplicated.
+                let shadowed = crate::routed::tool_alias::ensure_gate_tools(&mut v);
+                if renamed > 0 || shadowed > 0 {
+                    tracing::debug!(
+                        event = "zen_tool_alias_applied",
+                        request_id = %request_id,
+                        renamed,
+                        shadowed,
+                        "lowercased tool names for the Zen gate; mapped back before delivery"
+                    );
+                }
+            }
+            Ok(v)
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "local_model_translate_error",
+                error = %e,
+                "failed to translate Anthropic request to OpenAI format"
+            );
+            Err(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("translation error"))
+                .expect("static response"))
+        }
+    }
+}
+
+/// Zen rejects `max_output_tokens` below 16. Claude Code uses a tiny output
+/// budget for model-selection/health probes, so preserve the request while
+/// lifting only this provider-specific lower bound. Other Responses routes
+/// must retain the client's requested budget.
+fn clamp_zen_output_budget(body: &mut Value, request_id: &str) {
+    const ZEN_MIN_OUTPUT_TOKENS: u64 = 16;
+    let Some(requested) = body.get("max_output_tokens").and_then(Value::as_u64) else {
+        return;
+    };
+    if requested >= ZEN_MIN_OUTPUT_TOKENS {
+        return;
+    }
+    body["max_output_tokens"] = serde_json::json!(ZEN_MIN_OUTPUT_TOKENS);
+    tracing::debug!(
+        event = "zen_output_budget_clamped",
+        request_id = %request_id,
+        requested,
+        applied = ZEN_MIN_OUTPUT_TOKENS,
+        "raised Zen Responses output budget to provider minimum"
+    );
+}
+
+/// OpenCode's current Responses client puts its system prompt in an input
+/// item with `role: developer`. Zen's free-tier gate checks that shape; the
+/// generic translator keeps `instructions` for other Responses providers.
+fn move_zen_instructions_to_developer(body: &mut Value) {
+    let Some(instructions) = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    body.as_object_mut()
+        .expect("translated body is an object")
+        .remove("instructions");
+    let input = body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .expect("Responses translation always has input");
+    input.insert(
+        0,
+        serde_json::json!({
+            "role": "developer",
+            "content": instructions,
+        }),
+    );
+}
+
+/// Endpoint selection is the provider quirk (P6): ChatGPT-subscription
+/// Codex traffic speaks the Codex endpoint, everything else appends one
+/// `/v1/...` path onto the stripped base. The sniff lives in
+/// `routed::quirks`; this keeps only the per-occurrence misroute alarm.
+/// Extracted from `translate_routed_request` without behavior change.
+fn resolve_upstream_url(
+    shape: RouteShape,
+    upstream: &url::Url,
+    is_chatgpt_auth: bool,
+    body_model: &str,
+    request_id: &str,
+) -> String {
+    let kind = crate::routed::quirks::classify_upstream(upstream, is_chatgpt_auth);
+    match shape {
+        RouteShape::Responses => kind.responses_url(upstream),
+        RouteShape::Chat => {
+            if kind.warn_ambiguous_codex() {
+                // Ambiguous Codex route: translate without a target on a
+                // codex-bound upstream speaks chat-completions today (the
+                // startup `warn_on_ambiguous_codex_routes` also fires). Loud
+                // per occurrence so dashboards see a misroute, not just logs.
+                tracing::warn!(
+                    event = "model_route_ambiguous_codex",
+                    request_id = %request_id,
+                    model = %body_model,
+                    "translate route on api.openai.com has no target model; serving chat-completions"
+                );
+            }
+            kind.chat_url(upstream)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +389,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn zen_route_clamps_tiny_probe_output_budget() {
+        let parsed = json!({
+            "model": "claude-muse-spark-1.3",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "probe"}],
+        });
+        let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("muse-spark-1.3-contributor-free"),
+            &zen,
+            false,
+            "claude-muse-spark-1.3",
+            "req-zen-probe",
+        )
+        .expect("translates");
+        assert_eq!(out.openai_body["max_output_tokens"], json!(16));
+        assert!(out.openai_body["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("ses_")));
+        assert!(out.openai_body.get("parallel_tool_calls").is_none());
+    }
+
     /// Zen's free-tier gate reads tool names: the translated body carries
     /// OpenCode-native lowercase names upstream, while every other
     /// provider keeps the client's names verbatim.
@@ -360,7 +505,7 @@ mod tests {
             "req-test",
         )
         .expect("translates");
-        assert_eq!(out.downstream_is_stream, false);
+        assert!(!out.downstream_is_stream);
         assert_eq!(
             out.openai_body.get("stream").and_then(|v| v.as_bool()),
             Some(true)
@@ -387,7 +532,7 @@ mod tests {
             "req-test",
         )
         .expect("translates");
-        assert_eq!(out.downstream_is_stream, false);
+        assert!(!out.downstream_is_stream);
         assert!(
             out.upstream_url.ends_with("/v1/chat/completions"),
             "{}",

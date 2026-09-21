@@ -225,6 +225,18 @@ impl Default for DiffCompressor {
     }
 }
 
+/// One compressed file plus its fold totals, for `compress_one_file`.
+struct CompressedFile {
+    file: DiffFile,
+    additions: usize,
+    deletions: usize,
+    hunks_kept: usize,
+    hunks_removed: usize,
+    context_kept: usize,
+    largest_kept: usize,
+    largest_dropped: usize,
+}
+
 impl DiffCompressor {
     pub fn new(config: DiffCompressorConfig) -> Self {
         Self { config }
@@ -272,6 +284,160 @@ impl DiffCompressor {
     /// would 404 on retrieval. The `DiffOffload` orchestrator wrapper
     /// papered over this for the new pipeline path; this method
     /// upstreams the fix so any caller can wire in storage cleanly.
+    /// Capture lossy-emit signals on the files that survived the file cap.
+    /// These cases are parity-bound (Python's emit hardcodes `100644` and
+    /// `Binary files differ` regardless of input), so the only honest move
+    /// is to surface the loss via observability rather than fix it.
+    /// Extracted from `compress_with_store` without behavior change.
+    fn note_lossy_emits(diff_files: &[DiffFile], stats: &mut DiffCompressorStats) {
+        for file in diff_files.iter() {
+            let label = format!("{} -> {}", file.old_file, file.new_file);
+            // File-mode normalization: any original mode line not literally
+            // `new file mode 100644` / `deleted file mode 100644` is lost on
+            // emit. Includes `100755` (executable), `100600` (private),
+            // `120000` (symlink), `160000` (gitlink/submodule), etc.
+            if let Some(orig) = &file.original_new_file_mode_line {
+                if orig != "new file mode 100644" {
+                    stats
+                        .file_mode_normalizations
+                        .push((label.clone(), orig.clone()));
+                }
+            }
+            if let Some(orig) = &file.original_deleted_file_mode_line {
+                if orig != "deleted file mode 100644" {
+                    stats
+                        .file_mode_normalizations
+                        .push((label.clone(), orig.clone()));
+                }
+            }
+            // Binary detail: any line richer than the bare `Binary files
+            // differ` (which is virtually all of them — git emits filenames)
+            // gets simplified on emit.
+            if let Some(orig) = &file.original_binary_line {
+                if orig != "Binary files differ" {
+                    stats.binary_files_simplified.push(orig.clone());
+                }
+            }
+        }
+    }
+
+    /// Compress one file's hunks: cap count, then trim context. Books the
+    /// per-file drop stats and returns the compressed file with its fold
+    /// totals.
+    /// Extracted from `compress_with_store` without behavior change.
+    fn compress_one_file(&self, file: DiffFile, stats: &mut DiffCompressorStats) -> CompressedFile {
+        let additions = file.total_additions();
+        let deletions = file.total_deletions();
+
+        let original_hunk_count = file.hunks.len();
+        let file_label = format!("{} -> {}", file.old_file, file.new_file);
+
+        let (selected, dropped) = select_hunks(file.hunks, self.config.max_hunks_per_file);
+        let dropped_count = dropped.len();
+        let mut file_largest_dropped = 0usize;
+        if dropped_count > 0 {
+            stats
+                .hunks_dropped_per_file
+                .insert(file_label, dropped_count);
+            let max_dropped = dropped.iter().map(|h| h.lines.len()).max().unwrap_or(0);
+            if max_dropped > file_largest_dropped {
+                file_largest_dropped = max_dropped;
+            }
+        }
+
+        // Trim context inside each kept hunk.
+        let mut compressed_hunks: Vec<DiffHunk> = Vec::with_capacity(selected.len());
+        let mut file_largest_kept = 0usize;
+        let mut file_context_kept = 0usize;
+        for hunk in selected {
+            let trimmed = reduce_context(&hunk, self.config.max_context_lines);
+            if trimmed.lines.len() > file_largest_kept {
+                file_largest_kept = trimmed.lines.len();
+            }
+            file_context_kept += trimmed.context_lines;
+            compressed_hunks.push(trimmed);
+        }
+
+        let hunks_kept = compressed_hunks.len();
+        CompressedFile {
+            file: DiffFile {
+                hunks: compressed_hunks,
+                ..file
+            },
+            additions,
+            deletions,
+            hunks_kept,
+            hunks_removed: original_hunk_count - hunks_kept,
+            context_kept: file_context_kept,
+            largest_kept: file_largest_kept,
+            largest_dropped: file_largest_dropped,
+        }
+    }
+
+    /// CCR layer: hash original with MD5[:24], append retrieval marker
+    /// *only* if compression met `min_compression_ratio_for_ccr`. Python
+    /// hardcodes 0.8 (>20% savings); we expose it as a config knob with
+    /// the same default. Returns the emitted cache key, if any.
+    ///
+    /// CRITICAL: `compressed_line_count` is captured BEFORE the CCR marker
+    /// is appended, both for the marker's own text ("compressed to N")
+    /// and for the result field. The output string ends up with one more
+    /// line than `compressed_line_count` reports, by design — Python
+    /// does the same. Mismatching this by recounting after the append
+    /// breaks parity by 1.
+    /// Extracted from `compress_with_store` without behavior change.
+    fn maybe_attach_ccr_marker(
+        &self,
+        content: &str,
+        original_line_count: usize,
+        compressed_line_count: usize,
+        compressed_output: &mut String,
+        store: Option<&dyn CcrStore>,
+        stats: &mut DiffCompressorStats,
+    ) -> Option<String> {
+        let savings_threshold = self.config.min_compression_ratio_for_ccr;
+        if self.config.enable_ccr
+            && (compressed_line_count as f64) < (original_line_count as f64) * savings_threshold
+        {
+            let key = md5_hex_24(content);
+            compressed_output.push('\n');
+            compressed_output.push_str(&format!(
+                "[{} lines compressed to {}. Retrieve full diff: hash={}]",
+                original_line_count, compressed_line_count, key
+            ));
+            // Persist the original under the same key. When `store` is
+            // `Some`, the marker we just emitted resolves through it on
+            // the LLM's retrieval tool call. When `None`, the caller
+            // (typically the Python shim) is responsible — see the
+            // method-level docs.
+            if let Some(s) = store {
+                if !s.put(&key, content) {
+                    tracing::warn!(
+                        target: "ccr.diff_compressor",
+                        hash = %key,
+                        "ccr_put_failed; marker will point at an unretrievable hash"
+                    );
+                }
+            }
+            stats.cache_key_emitted = true;
+            Some(key)
+        } else if !self.config.enable_ccr {
+            stats.ccr_skipped_reason = Some("ccr disabled".into());
+            None
+        } else {
+            stats.ccr_skipped_reason = Some(format!(
+                "compression ratio {:.3} above threshold {:.3}",
+                if original_line_count == 0 {
+                    1.0
+                } else {
+                    compressed_line_count as f64 / original_line_count as f64
+                },
+                savings_threshold
+            ));
+            None
+        }
+    }
+
     pub fn compress_with_store(
         &self,
         content: &str,
@@ -353,38 +519,7 @@ impl DiffCompressor {
         stats.files_kept = diff_files.len();
 
         // Capture lossy-emit signals on the files that survived the file cap.
-        // These cases are parity-bound (Python's emit hardcodes `100644` and
-        // `Binary files differ` regardless of input), so the only honest move
-        // is to surface the loss via observability rather than fix it.
-        for file in diff_files.iter() {
-            let label = format!("{} -> {}", file.old_file, file.new_file);
-            // File-mode normalization: any original mode line not literally
-            // `new file mode 100644` / `deleted file mode 100644` is lost on
-            // emit. Includes `100755` (executable), `100600` (private),
-            // `120000` (symlink), `160000` (gitlink/submodule), etc.
-            if let Some(orig) = &file.original_new_file_mode_line {
-                if orig != "new file mode 100644" {
-                    stats
-                        .file_mode_normalizations
-                        .push((label.clone(), orig.clone()));
-                }
-            }
-            if let Some(orig) = &file.original_deleted_file_mode_line {
-                if orig != "deleted file mode 100644" {
-                    stats
-                        .file_mode_normalizations
-                        .push((label.clone(), orig.clone()));
-                }
-            }
-            // Binary detail: any line richer than the bare `Binary files
-            // differ` (which is virtually all of them — git emits filenames)
-            // gets simplified on emit.
-            if let Some(orig) = &file.original_binary_line {
-                if orig != "Binary files differ" {
-                    stats.binary_files_simplified.push(orig.clone());
-                }
-            }
-        }
+        Self::note_lossy_emits(&diff_files, &mut stats);
 
         // Compress each file's hunks: cap count, then trim context.
         let mut compressed_files: Vec<DiffFile> = Vec::with_capacity(diff_files.len());
@@ -397,42 +532,15 @@ impl DiffCompressor {
         let mut context_kept_total = 0usize;
 
         for file in diff_files {
-            total_additions += file.total_additions();
-            total_deletions += file.total_deletions();
-
-            let original_hunk_count = file.hunks.len();
-            let file_label = format!("{} -> {}", file.old_file, file.new_file);
-
-            let (selected, dropped) = select_hunks(file.hunks, self.config.max_hunks_per_file);
-            let dropped_count = dropped.len();
-            if dropped_count > 0 {
-                stats
-                    .hunks_dropped_per_file
-                    .insert(file_label, dropped_count);
-                let max_dropped = dropped.iter().map(|h| h.lines.len()).max().unwrap_or(0);
-                if max_dropped > largest_dropped {
-                    largest_dropped = max_dropped;
-                }
-            }
-
-            // Trim context inside each kept hunk.
-            let mut compressed_hunks: Vec<DiffHunk> = Vec::with_capacity(selected.len());
-            for hunk in selected {
-                let trimmed = reduce_context(&hunk, self.config.max_context_lines);
-                if trimmed.lines.len() > largest_kept {
-                    largest_kept = trimmed.lines.len();
-                }
-                context_kept_total += trimmed.context_lines;
-                compressed_hunks.push(trimmed);
-            }
-
-            hunks_kept_total += compressed_hunks.len();
-            hunks_removed_total += original_hunk_count - compressed_hunks.len();
-
-            compressed_files.push(DiffFile {
-                hunks: compressed_hunks,
-                ..file
-            });
+            let folded = self.compress_one_file(file, &mut stats);
+            total_additions += folded.additions;
+            total_deletions += folded.deletions;
+            hunks_kept_total += folded.hunks_kept;
+            hunks_removed_total += folded.hunks_removed;
+            largest_kept = largest_kept.max(folded.largest_kept);
+            largest_dropped = largest_dropped.max(folded.largest_dropped);
+            context_kept_total += folded.context_kept;
+            compressed_files.push(folded.file);
         }
 
         stats.hunks_kept = hunks_kept_total;
@@ -468,46 +576,14 @@ impl DiffCompressor {
         // line than `compressed_line_count` reports, by design — Python
         // does the same. Mismatching this by recounting after the append
         // breaks parity by 1.
-        let savings_threshold = self.config.min_compression_ratio_for_ccr;
-        let mut cache_key: Option<String> = None;
-        if self.config.enable_ccr
-            && (compressed_line_count as f64) < (original_line_count as f64) * savings_threshold
-        {
-            let key = md5_hex_24(content);
-            compressed_output.push('\n');
-            compressed_output.push_str(&format!(
-                "[{} lines compressed to {}. Retrieve full diff: hash={}]",
-                original_line_count, compressed_line_count, key
-            ));
-            // Persist the original under the same key. When `store` is
-            // `Some`, the marker we just emitted resolves through it on
-            // the LLM's retrieval tool call. When `None`, the caller
-            // (typically the Python shim) is responsible — see the
-            // method-level docs.
-            if let Some(s) = store {
-                if !s.put(&key, content) {
-                    tracing::warn!(
-                        target = "ccr.diff_compressor",
-                        hash = %key,
-                        "ccr_put_failed; marker will point at an unretrievable hash"
-                    );
-                }
-            }
-            cache_key = Some(key);
-            stats.cache_key_emitted = true;
-        } else if !self.config.enable_ccr {
-            stats.ccr_skipped_reason = Some("ccr disabled".into());
-        } else {
-            stats.ccr_skipped_reason = Some(format!(
-                "compression ratio {:.3} above threshold {:.3}",
-                if original_line_count == 0 {
-                    1.0
-                } else {
-                    compressed_line_count as f64 / original_line_count as f64
-                },
-                savings_threshold
-            ));
-        }
+        let cache_key = self.maybe_attach_ccr_marker(
+            content,
+            original_line_count,
+            compressed_line_count,
+            &mut compressed_output,
+            store,
+            &mut stats,
+        );
 
         stats.output_lines = compressed_line_count;
         stats.compression_ratio = if original_line_count == 0 {
@@ -682,61 +758,62 @@ struct ParsedDiff {
     parse_warnings: Vec<String>,
 }
 
-fn parse_diff(lines: &[&str]) -> ParsedDiff {
-    let mut files: Vec<DiffFile> = Vec::new();
-    let mut current_file: Option<DiffFile> = None;
-    let mut current_hunk: Option<DiffHunk> = None;
-    let mut pre_diff_lines: Vec<String> = Vec::new();
-    // FINDING-014: was immutable — the documented >4-parent octopus
-    // warning below never fired. Now mutable with the push site.
-    let mut warnings: Vec<String> = Vec::new();
+/// Incremental unified-diff parser: one `feed` per line, `finish` for the
+/// trailing flush. Extracted from `parse_diff` without behavior change.
+#[derive(Default)]
+struct DiffParser {
+    files: Vec<DiffFile>,
+    current_file: Option<DiffFile>,
+    current_hunk: Option<DiffHunk>,
+    pre_diff_lines: Vec<String>,
+    warnings: Vec<String>,
+}
 
-    for &line in lines {
-        // New file section. Includes regular `diff --git` AND merge-commit
-        // `diff --combined <path>` / `diff --cc <path>` (bug-fix
-        // 2026-04-25). Without these, merge diffs from `git log -p` got
-        // treated as one giant pre-diff blob and never reached the
-        // hunk-parsing path.
-        if is_diff_header(line) {
-            if let Some(h) = current_hunk.take() {
-                if let Some(f) = current_file.as_mut() {
-                    f.hunks.push(h);
-                }
+impl DiffParser {
+    fn flush_hunk(&mut self) {
+        if let Some(h) = self.current_hunk.take() {
+            if let Some(f) = self.current_file.as_mut() {
+                f.hunks.push(h);
             }
-            if let Some(f) = current_file.take() {
-                files.push(f);
-            }
-            current_file = Some(DiffFile {
-                header: line.to_string(),
-                old_file: String::new(),
-                new_file: String::new(),
-                hunks: Vec::new(),
-                is_binary: false,
-                is_new_file: false,
-                is_deleted_file: false,
-                is_renamed: false,
-                rename_lines: Vec::new(),
-                original_new_file_mode_line: None,
-                original_deleted_file_mode_line: None,
-                original_binary_line: None,
-            });
-            continue;
         }
+    }
 
-        // Bug-fix: lines before the first `diff --git` are pre-diff content
-        // (commit metadata, email headers, etc.) — capture verbatim rather
-        // than drop silently. They get re-emitted at the head of the
-        // compressed output.
-        if current_file.is_none() {
-            pre_diff_lines.push(line.to_string());
-            continue;
+    fn flush_file(&mut self) {
+        if let Some(f) = self.current_file.take() {
+            self.files.push(f);
         }
+    }
 
-        // File-level mode/binary/rename markers. Capture the full original
-        // line in addition to the boolean — Python only sets the flag and
-        // discards the actual mode/detail, but we want the original around
-        // so we can surface emit-time normalizations as observability.
-        if let Some(f) = current_file.as_mut() {
+    /// New file section. Includes regular `diff --git` AND merge-commit
+    /// `diff --combined <path>` / `diff --cc <path>` (bug-fix
+    /// 2026-04-25). Without these, merge diffs from `git log -p` got
+    /// treated as one giant pre-diff blob and never reached the
+    /// hunk-parsing path.
+    fn begin_file(&mut self, line: &str) {
+        self.flush_hunk();
+        self.flush_file();
+        self.current_file = Some(DiffFile {
+            header: line.to_string(),
+            old_file: String::new(),
+            new_file: String::new(),
+            hunks: Vec::new(),
+            is_binary: false,
+            is_new_file: false,
+            is_deleted_file: false,
+            is_renamed: false,
+            rename_lines: Vec::new(),
+            original_new_file_mode_line: None,
+            original_deleted_file_mode_line: None,
+            original_binary_line: None,
+        });
+    }
+
+    /// File-level mode/binary/rename markers. Captures the full original
+    /// line in addition to the boolean — Python only sets the flag and
+    /// discards the actual mode/detail, but we want the original around
+    /// so we can surface emit-time normalizations as observability.
+    fn note_file_markers(&mut self, line: &str) {
+        if let Some(f) = self.current_file.as_mut() {
             if line.starts_with("new file mode") {
                 f.is_new_file = true;
                 f.original_new_file_mode_line = Some(line.to_string());
@@ -759,57 +836,14 @@ fn parse_diff(lines: &[&str]) -> ParsedDiff {
                 f.original_binary_line = Some(line.to_string());
             }
         }
+    }
 
-        // `--- a/file` or `--- /dev/null`.
-        if old_file_regex().is_match(line) {
-            if let Some(f) = current_file.as_mut() {
-                f.old_file = line.to_string();
-            }
-            continue;
-        }
-
-        // `+++ b/file` or `+++ /dev/null`.
-        if new_file_regex().is_match(line) {
-            if let Some(f) = current_file.as_mut() {
-                f.new_file = line.to_string();
-            }
-            continue;
-        }
-
-        // Hunk header.
-        if hunk_header_regex().is_match(line) {
-            if let Some(h) = current_hunk.take() {
-                if let Some(f) = current_file.as_mut() {
-                    f.hunks.push(h);
-                }
-            }
-            current_hunk = Some(DiffHunk {
-                header: line.to_string(),
-                lines: Vec::new(),
-                additions: 0,
-                deletions: 0,
-                context_lines: 0,
-                score: 0.0,
-            });
-            continue;
-        }
-
-        // FINDING-014: >4-parent octopus hunk headers (5+ `@`s) match no
-        // arm of hunk_header_regex. They used to fall into the content
-        // branch silently; warn so prod monitoring can flag the case.
-        // The `@`-run check must precede the content branch: a header
-        // line starts with `@`, which no content arm consumes, so it
-        // would otherwise vanish without a trace.
-        if line.starts_with("@@@@@") {
-            warnings.push(format!(
-                "unparsed octopus hunk header (>4 parents): {}",
-                line.chars().take(80).collect::<String>()
-            ));
-            continue;
-        }
-
-        // Hunk content.
-        if let Some(h) = current_hunk.as_mut() {
+    /// Hunk content lines: additions, deletions, context, and verbatim
+    /// "other" lines (`\ No newline at end of file`, trailing junk —
+    /// the context trim later decides whether they survive based on
+    /// proximity to a `+`/`-` line).
+    fn feed_content(&mut self, line: &str) {
+        if let Some(h) = self.current_hunk.as_mut() {
             if line.starts_with('+') && !line.starts_with("+++") {
                 h.additions += 1;
                 h.lines.push(line.to_string());
@@ -829,20 +863,92 @@ fn parse_diff(lines: &[&str]) -> ParsedDiff {
         }
     }
 
-    if let Some(h) = current_hunk.take() {
-        if let Some(f) = current_file.as_mut() {
-            f.hunks.push(h);
+    /// Classify one line. Order matters: the `@`-run octopus check must
+    /// precede the content branch, since a header line starts with `@`,
+    /// which no content arm consumes, so it would otherwise vanish
+    /// without a trace.
+    fn feed(&mut self, line: &str) {
+        if is_diff_header(line) {
+            self.begin_file(line);
+            return;
         }
-    }
-    if let Some(f) = current_file.take() {
-        files.push(f);
+
+        // Bug-fix: lines before the first `diff --git` are pre-diff content
+        // (commit metadata, email headers, etc.) — capture verbatim rather
+        // than drop silently. They get re-emitted at the head of the
+        // compressed output.
+        if self.current_file.is_none() {
+            self.pre_diff_lines.push(line.to_string());
+            return;
+        }
+
+        self.note_file_markers(line);
+
+        // `--- a/file` or `--- /dev/null`.
+        if old_file_regex().is_match(line) {
+            if let Some(f) = self.current_file.as_mut() {
+                f.old_file = line.to_string();
+            }
+            return;
+        }
+
+        // `+++ b/file` or `+++ /dev/null`.
+        if new_file_regex().is_match(line) {
+            if let Some(f) = self.current_file.as_mut() {
+                f.new_file = line.to_string();
+            }
+            return;
+        }
+
+        // Hunk header.
+        if hunk_header_regex().is_match(line) {
+            self.flush_hunk();
+            self.current_hunk = Some(DiffHunk {
+                header: line.to_string(),
+                lines: Vec::new(),
+                additions: 0,
+                deletions: 0,
+                context_lines: 0,
+                score: 0.0,
+            });
+            return;
+        }
+
+        // FINDING-014: >4-parent octopus hunk headers (5+ `@`s) match no
+        // arm of hunk_header_regex. They used to fall into the content
+        // branch silently; warn so prod monitoring can flag the case.
+        // The `@`-run check must precede the content branch: a header
+        // line starts with `@`, which no content arm consumes, so it
+        // would otherwise vanish without a trace.
+        if line.starts_with("@@@@@") {
+            self.warnings.push(format!(
+                "unparsed octopus hunk header (>4 parents): {}",
+                line.chars().take(80).collect::<String>()
+            ));
+            return;
+        }
+
+        // Hunk content.
+        self.feed_content(line);
     }
 
-    ParsedDiff {
-        pre_diff_lines,
-        files,
-        parse_warnings: warnings,
+    fn finish(mut self) -> ParsedDiff {
+        self.flush_hunk();
+        self.flush_file();
+        ParsedDiff {
+            pre_diff_lines: self.pre_diff_lines,
+            files: self.files,
+            parse_warnings: self.warnings,
+        }
     }
+}
+
+fn parse_diff(lines: &[&str]) -> ParsedDiff {
+    let mut parser = DiffParser::default();
+    for &line in lines {
+        parser.feed(line);
+    }
+    parser.finish()
 }
 
 // ─── Scoring ───────────────────────────────────────────────────────────────

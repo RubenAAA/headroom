@@ -1079,11 +1079,10 @@ fn non_streaming_continuation_request(forwarded_request: &Bytes) -> Bytes {
 }
 
 /// Keep streaming on for backends that mandate it. The chatgpt codex gateway
-/// answers a de-streamed continuation with `400 Stream must be set to true`:
-/// the main turn streams, so only the continuation trips it, and the
-/// retrieval lands unresolved. `handle_ccr_response` folds the SSE back into
-/// a turn before parsing, so the round still resolves from equivalent
-/// content. Every other routed backend keeps the de-streamed request above.
+/// answers a de-streamed continuation with `400 Stream must be set to true`.
+/// Spark does not enter this hidden-continuation path: its native compatibility
+/// profile suppresses Headroom-owned retrieval and memory tools, so keeping Zen
+/// here would only reintroduce the session-blocking behavior.
 fn restore_stream_when_mandated(request: Bytes, upstream_url: &url::Url) -> Bytes {
     if upstream_url.host_str() != Some("chatgpt.com") {
         return request;
@@ -1317,9 +1316,8 @@ mod tests {
         );
     }
 
-    /// The chatgpt codex gateway mandates streaming: a de-streamed
-    /// continuation comes back `400 Stream must be set to true` and the
-    /// retrieval lands unresolved. Stream stays on there — and only there.
+    /// The ChatGPT Codex gateway mandates streaming; other routed backends
+    /// keep the buffered continuation shape.
     #[test]
     fn mandating_backend_keeps_stream_on_continuations() {
         let destreamed = Bytes::from(r#"{"model":"m","stream":false,"input":[]}"#);
@@ -1333,11 +1331,7 @@ mod tests {
         let zen: url::Url = "https://opencode.ai/zen/v1/responses".parse().unwrap();
         let out = restore_stream_when_mandated(destreamed.clone(), &zen);
         let v: Value = serde_json::from_slice(&out).expect("valid JSON");
-        assert_eq!(
-            v["stream"],
-            json!(false),
-            "backends that accept non-streamed continuations keep them"
-        );
+        assert_eq!(v["stream"], json!(false));
 
         let garbage = Bytes::from(b"not json".to_vec());
         assert_eq!(
