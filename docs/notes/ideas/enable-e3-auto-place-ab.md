@@ -1,7 +1,9 @@
 # Idea: enable gated E3 auto-placement and measure
 
 - **Status:** open (code shipped `8672d5c3`; gated OFF for our traffic —
-  `e3_skipped{reason: auth_mode}` baseline)
+  `e3_skipped{reason: auth_mode}` baseline). Re-confirmed 2026-09-21 over
+  six days: 31,008 of 31,008 requests skipped, all on `auth_mode`.
+  Gate-blocked, not traffic-blocked.
 - **Source:** 2026-09-18 session; `anthropic_cache_control.rs:252-280`
 - **Value:** one marker on the last tool makes marker-less bodies cacheable;
   after the first write it is stable (`MarkerPresent` forever after). Our

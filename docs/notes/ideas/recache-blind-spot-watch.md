@@ -1,7 +1,9 @@
 # Idea: exonerate or indict the classifier blind spots
 
 - **Status:** beta half shipped and ranked; model-flap witness shipped
-  log-only (unranked, zero instances); TTL + tail exonerated
+  log-only and now **closed at zero over 456 observations** (2026-09-21 —
+  do not build the forwarded-model witness); TTL + tail exonerated.
+  `markers_changed` still unrankable for want of a denominator.
 - **Source:** 2026-09-17 code-reading proof that several provider key inputs
   are invisible to both drift lanes: beta headers (hash reads body only),
   `cache_control`/TTL moves (stripped), model-route changes (router runs
@@ -68,3 +70,35 @@ footprint gone anyway. They exonerate every proxy transform at once
   turn), so it would fire constantly — beta holds still for 100+ turns,
   which is what makes a rotation a signal. Remaining: forwarded-model
   route flap still unwitnessed (see Next above).
+
+## Findings 2026-09-21 — close the model-flap gap; do not build the witness
+
+Accumulated over 552 unexplained `cache_recache_observed` events carrying the
+full witness set, Anthropic models only, 2026-09-17 to 09-21:
+
+| witness | events | wasted |
+|---|---|---|
+| all clean | 350 | 787,636 |
+| `markers_changed` | 201 | 667,436 |
+| `beta_changed` + `markers_changed` | 1 | 2,680 |
+| `model_changed` | **0 of 456** | 0 |
+
+Three readings:
+
+- **Forwarded-model route flap is dead.** `model_changed` never fired in 456
+  observations. The Next step above says to add a forwarded-model witness on
+  the `note_forward_witnesses` pattern if clean misses persist. They do
+  persist, and this says the witness would not explain them. Do not build it.
+- **Beta rotation is handled.** One event in five days, 2,680 tokens. The
+  three instances the section above found were the whole of it.
+- **`markers_changed` cannot be ranked.** It fires on 37% of unexplained
+  events, but the samples are our own tail pair advancing a slot
+  (`sys[1]:1h,m0.2:1h,m7.3:1h,m8.0:1h` → `m8.x,m9.0` next turn), which is by
+  design and happens every turn. It is logged only on recache lines, so there
+  is no all-turns denominator to compare against. Either log it on every turn
+  or stop treating it as a candidate cause — as it stands the 667,436 tokens
+  beside it are not attributable to anything.
+
+What remains is the 350 all-clean events. `recache-residual-triage.md` places
+95% of those under `commit_race_suspect`, so the blind spots are not hiding
+them — a race is.

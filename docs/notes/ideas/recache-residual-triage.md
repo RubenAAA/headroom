@@ -1,6 +1,7 @@
 # Idea: triage the residual bucket with the new witness split
 
-- **Status:** open (instruments shipped 2026-09-17; needs a 2–3 day window)
+- **Status:** ANSWERED 2026-09-21 — window closed, verdict is the race lane.
+  See Findings at the bottom. (Instruments shipped 2026-09-17.)
 - **Source:** 2026-09-17 recache investigation. The 13-event window (56,423
   wasted tokens) held 9 `unexplained_after_replay` events whose forwarded
   fingerprints looked steady by eyeball — beta stable, tools/system stable,
@@ -79,4 +80,44 @@ Follow-ups: normalize `markers_changed` (or drop it, keep `forward_markers`
 for offline diff); the remaining triage continues automatically once the
 witness build deploys — this file stays open until the prospective split
 confirms or contradicts the retrospective one.
+
+## Findings 2026-09-21 — the residual is timing races
+
+The prospective split confirms the retrospective one. `triage.py` over the
+five rotated archives plus the live log (2026-09-15 to 09-21):
+
+```
+residual events: 1145, wasted: 3,539,753
+  (suspect=True,  rotated=True,  sibling=False) -> 716 events, 2,090,624
+  (suspect=True,  rotated=False, sibling=False) -> 367 events, 1,027,725
+  (suspect=False, rotated=True,  sibling=False) ->  39 events,   149,677
+  (suspect=False, rotated=False, sibling=False) ->  13 events,    62,705
+```
+
+`commit_race_suspect` carries 1,092 of 1,145 events (95%) and 3,147,447 of
+3,539,753 wasted tokens (89%). An independent query scoped to Anthropic
+models alone — 552 unexplained events, 1,457,752 wasted — agrees within a
+point: 95% of events, 95% of waste.
+
+Routing, by this file's own rule:
+
+- **Race.** Suspect plus `provider_missed_newest_write` dominates. The fix
+  lane is client-side: turn serialization, fan-out discipline, the shed cap.
+  `recache-commit-latency-proof.md` independently confirms the mechanism.
+- **Key handling.** The rotation flags do not discriminate. Landing mix is
+  the same with them set and clear (suspect ∧ rotated: 83 MISSED / 52
+  PARTIAL / 44 BETWEEN; suspect ∧ clean: 189 / 107 / 42). `markers_changed`
+  is the only one that fires often, and it fires on our own tail pair
+  advancing a slot each turn, so it needs an all-turns denominator before it
+  can be ranked at all — it is logged only on recache lines today.
+- **Eviction or an unguessed cause.** 13 events, 62,705 tokens, **1.8% of
+  waste**. "Mostly unavoidable" does not stand; "mostly a race we can
+  schedule around" does.
+
+Collection note: the `5 9 * * *` cron last appended on 2026-09-19. The daemon
+is alive — the box is simply off at 09:05 local, and cron does not catch up.
+Same root cause as the D0 monitor's `30 5 * * *`. Both now run hourly behind
+`~/.local/bin/run-daily-once`, which does the work on the first run of each
+UTC day and exits immediately after. The 2026-09-21 collection has run and
+`results.log` carries the `=== WINDOW COMPLETE ===` marker.
 

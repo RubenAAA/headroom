@@ -1,7 +1,8 @@
 # Idea: stop a stabilized-away client edit from unlocking a history rewrite
 
-- **Status:** open (diagnosed from one incident; the policy change needs a
-  measurement window before it ships)
+- **Status:** open, but parked 2026-09-21 — six days of traffic yielded five
+  classifiable events. The phenomenon is rare, not under-instrumented; more
+  waiting will not settle it. See Findings at the bottom.
 - **Source:** 2026-09-15 investigation of `cache_recache_observed
   attribution_reason=tools`; see `gate-prior-thinking-drop.md` (implemented) for
   the gate this would finish, and `prior-thinking-billing-question.md` for the
@@ -137,3 +138,57 @@ Not added, and not needed for the join: `request_id` on `cache_drift_observed`
 and `cache_drift_observed_outbound`. Both lanes now reach
 `cache_recache_observed`, which has `request_id`, so the drift events only
 matter for turns that did not recache — and those are the silent successes.
+
+## Findings 2026-09-18 (3-day join, Sep 15–18 archives + live log)
+
+Ran the join over 521 `prior_thinking_dropped` events. One data-quality
+note first: `forwarded_head_moved` / `outbound_drift_dims` only ride
+recache lines from the newest builds, so the Sep 15–17 `tools`-drift
+busts (69k, 64k, 102k waste, plus the original 104k incident) are
+unclassifiable — consistent with the incident shape, provable for none
+of them.
+
+Classifiable set (new-build lines only):
+
+| bucket | n | tokens |
+|---|---|---|
+| absorbed (`rb=1`, `head_moved=0`) | 3 | 70,506 waste |
+| real (`head_moved=1`) | 1 | 1,608 kept-for-nothing |
+| silent (no recache) | 392 | prefix hit anyway |
+
+One of the three absorbed rows is ambiguous (`early_messages` on both
+sides — the metric deliberately ignores that dimension, so a real
+early-message boundary reads the same). Clean absorbed ≈ 37k vs 1.6k
+real: the ratio favors candidate 1, **defer, don't suppress**, but n is
+tiny on both sides. Do not ship yet — re-run once classifiable volume
+accumulates (fields only started flowing recently). The machinery works;
+the sample does not yet carry a rollout.
+
+## Findings 2026-09-21 (6-day re-run) — rare, not under-instrumented
+
+Re-ran the join over 2026-09-15 to 09-21, Anthropic models only: 307
+`prior_thinking_dropped` events.
+
+| bucket | n | tokens |
+|---|---|---|
+| silent (no recache) | 249 | prefix hit anyway |
+| no boundary (`rb=0`, `head_moved=0`) | 31 | 32,652 waste |
+| unclassifiable (old build line) | 22 | 334,788 waste |
+| absorbed (`rb=1`, `head_moved=0`) | 4 | 84,683 waste |
+| real (`head_moved>=1`) | 1 | 15,673 kept-for-nothing |
+
+Three extra days bought **one** classifiable event. The 2026-09-18 reading
+had 3 absorbed and 1 real; this has 4 and 1. Volume is not the blocker — the
+event is simply rare, so waiting longer will not change the picture.
+
+The direction holds (absorbed outweighs real, now 84,683 against 15,673, a
+5.4× ratio favouring candidate 1: **defer, don't suppress**). But at five
+classifiable events in six days the whole phenomenon is worth under 100k
+tokens a week, against 3.78M of recache waste over the same window. Do not
+ship the policy change on this evidence. Either accept it as a known small
+leak, or come back when a single incident makes it expensive again.
+
+One shape worth noting for whoever picks this up: 31 drops rode no boundary
+at all (`rebuild_boundary=0`, `forwarded_agreement_len=0`), wasting 32,652.
+The gate lets those through on the agreement arm, which is the same
+`last_forwarded_messages`-empty path the section above describes.

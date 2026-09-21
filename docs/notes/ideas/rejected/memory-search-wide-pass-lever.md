@@ -1,6 +1,10 @@
 # Idea: rewrite the memory-search plan from live numbers
 
-- **Status:** open (plan 1a/1b as written are aimed wrong; do not implement as-is)
+- **Status:** REJECTED 2026-09-21. The gate passes by 6.6× with nothing done:
+  memory-on `pre_forward` p50 is **60.3 ms** against the 400 ms bar, and the
+  `memory` stage itself is **0.17 ms** — 0.29% of pre-forward. Measured over
+  23,779 `stage_timings` rows, Anthropic models only, 2026-09-15 to 09-21.
+  Plan 1 has nothing to win. See Verdict at the bottom.
 - **Source:** `docs/speed-ideas.md` §0.1 + §1–2 (2026-09-03 profile; line numbers stale)
 - **Summary:** memory search is 93% of pre-forward (p50 1.5 s vs 65 ms tool-mode).
   But live `memory_search_timings` invert the §2 assumptions: porter 70 ms
@@ -142,3 +146,43 @@ Do those first.
 Gate for plan 1 as a whole: live pre_forward p50 for memory-on requests
 under 400 ms over a day. Any single change that moves memory p50 by less
 than 100 ms gets reverted.
+
+## Verdict 2026-09-21 — rejected, with the killing number
+
+The gate asked for memory-on `pre_forward` p50 under 400 ms over a day. Read
+over six days instead: 23,779 `stage_timings` rows joined to Anthropic-model
+requests by `request_id` (2026-09-15 to 09-21).
+
+| stage | p50 | p90 | p99 |
+|---|---|---|---|
+| upstream | 1,480.79 | 2,575.74 | 5,068.05 |
+| **pre_forward** | **60.29** | 166.11 | 447.75 |
+| parse | 17.06 | 38.19 | 299.35 |
+| compression | 16.89 | 68.23 | 160.66 |
+| post | 8.79 | 19.03 | 42.96 |
+| replay | 4.57 | 12.78 | 33.39 |
+| rewrite | 3.78 | 8.26 | 20.87 |
+| **memory** | **0.17** | 0.43 | 1.13 |
+
+Memory is **0.29% of pre-forward at p50**. The 1,539 ms figure in the Summary
+above, and the 93%-of-pre-forward claim built on it, are artifacts of the
+2026-09-03 profile. Nothing in plan 1 — 1a, 1b, 1c or 1d — can move a number
+that is already a sixth of a millisecond.
+
+The load caveat is settled too, which is what the file was waiting on. Split
+by `inflight` (p50 2, p90 6, max 29):
+
+| inflight | n | pre_forward p50 | memory p50 |
+|---|---|---|---|
+| 0-2 | 13,023 | 62.0 | 0.175 |
+| 3-5 | 7,279 | 59.9 | 0.176 |
+| 6-50 | 3,477 | 56.4 | 0.166 |
+
+Flat, and slightly *faster* under load. The quiet-box worry does not hold.
+This confirms the busy-day re-read recorded above (n=869, memory p50 0.11 ms)
+at 27× the sample and with real concurrency.
+
+If `memory` p50 ever reaches single-digit milliseconds, reopen from the
+numbers here, not from `docs/speed-ideas.md` §1-2. Until then the pre-forward
+budget is `parse` and `compression`, and all of it is noise beside a 1.48 s
+upstream.

@@ -1,7 +1,11 @@
 # Idea: enable gated E1/E2 sort passes and measure
 
 - **Status:** open (code shipped `4a3b76bc`/`9112fed9`; gated OFF for our
-  traffic — triple-skip is the current baseline, ~469/469 turns)
+  traffic — triple-skip is the current baseline). Re-confirmed 2026-09-21
+  over six days: `e1_skipped` and `e2_skipped` fired on **31,008 of 31,008**
+  requests, every one `reason=auth_mode, auth_mode=subscription`. This is
+  gate-blocked, not traffic-blocked — no amount of waiting produces a
+  measurement, only a PAYG canary or a policy-enforcement window will.
 - **Source:** 2026-09-18 session; `tool_def_normalize.rs:70-95,207-234`,
   `live_zone_anthropic.rs:601-652`
 - **Value:** deterministic tool/schema order should cut prefix re-keys (tools

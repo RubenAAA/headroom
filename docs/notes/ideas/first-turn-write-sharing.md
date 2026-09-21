@@ -190,3 +190,52 @@ that the emitting binary is live), offline reasons, entry-availability
 answers, D4/tools-ladder candidates with savable-token estimates, calls per
 hash with trend vs the prior reading, and current prod%. First baseline
 appended 2026-09-17 (coverage 2/29 — the rest predate the D0 binary).
+
+## Findings 2026-09-21 (6-day window) — D4 is dead on volume; retarget
+
+Ran the monitor over the full window, Anthropic models only. Two mechanical
+notes first, because they explain why the "wait for a day of data" plan never
+produced one. The `30 5 * * *` cron last fired 2026-09-19 — the box is off at
+05:30 local and cron does not catch up — and by then a killed append had left
+a block of NUL bytes in `~/.headroom/d0-readings.jsonl`, which crashed the
+monitor on startup. Both are fixed: the state parse now skips bad lines, and
+the job runs hourly behind `run-daily-once`. Separately, `--log` takes a
+single file, so a plain run sees only the live log; this reading concatenates
+the five rotated archives.
+
+408 FirstTurn classifications, 272 with diagnostic lines, 6,319,863 outer
+first-turn write tokens:
+
+| reason | turns | outer tokens | of which rounds |
+|---|---|---|---|
+| fresh_session | 150 | 2,496,731 | 90,838 |
+| unmeasured (predates D0) | 136 | 0 | 0 |
+| compaction_restart | 58 | 2,171,915 | 0 |
+| arrived_with_history | 41 | 872,206 | 168,621 |
+| session_key_drift | 13 | 582,745 | 69,428 |
+| identical_prompt_fanout | 10 | 196,266 | 0 |
+
+Entry available within TTL: 217, cold: 183. So for **54% of first turns the
+matching billed write was still alive** — the prefix existed and something
+else stopped the read.
+
+**D4 candidates: 4, savable ~3,291 sys tokens. Tools-ladder candidates: 4,
+savable ~4,826 tools tokens.** About 8,100 tokens in six days against
+6,319,863 of first-turn writes — 0.13%. The trial was approved on risk
+grounds rather than return, and it turns out to have almost nothing to fire
+on. Drop it unless it becomes free as a side effect of something else.
+
+No savings projection is offered here, per the gate above; these are observed
+candidate counts, not a forecast.
+
+Where the mass actually is: `compaction_restart` (2.17M) plus
+`session_key_drift` (0.58M) is 2.75M, 44% of first-turn outer writes, and
+both are re-key events rather than scaffolding-sharing misses. That is the
+same lane as `recache-rekey-floor.md`, which measured 3.37M of uncounted
+contradiction writes over the same window. Retarget there.
+
+Context: first turns are 19.6% of all cache creation in the window
+(9,158,609 tokens over 349 conversations).
+
+Sibling loop: 2,316 retrieval calls over 1,132 hashes = 2.05 calls per hash,
+down from 3.5 on the 2026-09-17 window.

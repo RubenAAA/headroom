@@ -1,6 +1,9 @@
 # Idea: enable gated E4 prompt_cache_key and measure
 
-- **Status:** open (code shipped `573543fc`; gated OFF for our traffic)
+- **Status:** open (code shipped `573543fc`; gated OFF for our traffic).
+  Re-confirmed 2026-09-21: `e4_skipped` fired 7,125 times over six days,
+  all `reason=auth_mode` on `/v1/responses`. Gate-blocked, not
+  traffic-blocked.
 - **Source:** 2026-09-18 session; `openai_cache_key.rs:146-149,418-442`,
   caller `proxy.rs:10196`
 - **Value:** deterministic `(model, system, tools)` key pins OpenAI
