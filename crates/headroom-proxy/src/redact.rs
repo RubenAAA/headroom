@@ -900,6 +900,14 @@ pub fn restore_table(store: &RedactStore, session_key: &str) -> Option<RestoreTa
 }
 
 impl RestoreTable {
+    /// Whether this session ever minted a placeholder. A miss with an
+    /// empty forward map means no session state could have produced the
+    /// token — model invention or foreign text, never an expired mapping
+    /// (self-carrying tokens open regardless of mappings).
+    pub fn issued_any(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
     /// Restore every placeholder in `bytes`. Returns the bytes and the count
     /// of `__HR_` shapes that matched nothing — those stay as-is.
     pub fn restore_bytes(&self, bytes: &[u8]) -> (Vec<u8>, usize) {
@@ -924,24 +932,30 @@ impl RestoreTable {
                         _ => {
                             misses += 1;
                             crate::observability::redact_metrics::observe_restore_miss();
-                            out.extend_from_slice(b"[headroom: unresolved ");
-                            out.extend_from_slice(token.as_bytes());
-                            out.extend_from_slice(b"]");
+                            out.extend_from_slice(redacted_label(token).as_bytes());
                         }
                     }
                 } else {
-                    // Nothing in the process knows this token. Emitting it raw
-                    // is what put a placeholder into a settings file as if it
-                    // were a filename: `/home/you/` restores, the tail does
-                    // not, and the result is a path-shaped string that resolves
-                    // to nothing. The marker cannot be mistaken for one — it
-                    // holds spaces and brackets — while keeping the token
-                    // visible for the client-side guard and for grep.
+                    // Nothing in the process knows this token — not the
+                    // self-carrying cipher (which opens anything genuinely
+                    // minted, map or no map), not the forward map, not
+                    // recall. Emit a conventional redaction notice, never
+                    // the token and never a structured marker: on
+                    // 2026-09-22 a `[headroom: unresolved ...]` marker
+                    // taught the model the placeholder format, and it began
+                    // emitting invented `__HR_SECRET_<hex>__` tokens in its
+                    // own tool calls — each miss echoing a fresh marker
+                    // until the session wedged on ungreppable ids. A plain
+                    // `[redacted:<kind>]` carries no token shape, so even
+                    // if the model imitates it, imitation triggers no
+                    // restore path and the loop cannot compound. Like the
+                    // old marker it cannot be mistaken for a value (spaces
+                    // and brackets break it out of command/path position),
+                    // and the miss counter plus `redact_restore_miss` keep
+                    // operator visibility.
                     misses += 1;
                     crate::observability::redact_metrics::observe_restore_miss();
-                    out.extend_from_slice(b"[headroom: unresolved ");
-                    out.extend_from_slice(token.as_bytes());
-                    out.extend_from_slice(b"]");
+                    out.extend_from_slice(redacted_label(token).as_bytes());
                 }
                 i += len;
             } else {
@@ -965,6 +979,21 @@ fn restore_str(store: &RedactStore, forward: &HashMap<String, String>, s: &str) 
     };
     let (bytes, misses) = table.restore_bytes(s.as_bytes());
     (String::from_utf8_lossy(&bytes).into_owned(), misses)
+}
+
+/// Conventional redaction notice for an unresolvable token, e.g.
+/// `[redacted:secret]`. Deliberately free of token shape: emitting the
+/// token (or a structured wrapper around it) teaches the model a format
+/// it then imitates, compounding restore misses, while a generic notice
+/// triggers no restore path if echoed back.
+fn redacted_label(token: &str) -> String {
+    let kind = token
+        .strip_prefix(PREFIX)
+        .and_then(|s| s.split('_').next())
+        .map(|k| k.to_lowercase())
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("[redacted:{kind}]")
 }
 
 /// Strict placeholder shape: `__HR_<KIND>_<hex>__`, plus the uncounted
@@ -1053,7 +1082,8 @@ where
                     tracing::warn!(
                         event = "redact_restore_miss",
                         misses,
-                        "placeholders no session could restore; emitted as unresolved markers"
+                        session_issued_any = table.issued_any(),
+                        "placeholders no session could restore; emitted as redacted notices"
                     );
                 }
                 pending.drain(..emit_until);
@@ -1982,8 +2012,9 @@ mod tests {
         let (out, misses) = table.restore_bytes(b"run __HR_FOO_0001__ and __HR_PATH_9999__");
         assert_eq!(misses, 1, "unknown kind is bytes, unknown number is a miss");
         assert_eq!(
-            out, b"run __HR_FOO_0001__ and [headroom: unresolved __HR_PATH_9999__]",
-            "an unresolvable token is marked, never passed through as itself"
+            out, b"run __HR_FOO_0001__ and [redacted:path]",
+            "an unresolvable token becomes a conventional notice: no token \
+             shape survives that the model could imitate back into the loop"
         );
     }
 
@@ -2221,9 +2252,10 @@ mod tests {
             "a stranger's key must not open it"
         );
         assert!(
-            text.contains("[headroom: unresolved") || misses == 0,
-            "an unopenable token is marked, never guessed: {text}"
+            !text.contains("__HR_"),
+            "an unopenable token leaves no token shape behind to imitate: {text}"
         );
+        assert!(misses > 0, "the miss is still counted for the operator");
     }
 
     /// Home needs no key and no map: it is whatever this machine's home is.
@@ -2291,7 +2323,7 @@ mod tests {
     /// The shape that broke a settings file: a token no map can resolve must
     /// not reach the client looking like something a tool can use.
     #[test]
-    fn unknown_placeholders_are_marked_and_count_as_misses() {
+    fn unknown_placeholders_are_redacted_and_count_as_misses() {
         // A store that has minted nothing still restores: the key opens tokens
         // an earlier process minted, which is the whole point of the key file.
         let s2 = store();
@@ -2300,10 +2332,10 @@ mod tests {
         let table = restore_table(&s2, "sess").unwrap();
         let (out, misses) = table.restore_bytes(b"echo __HR_PATH_9999__ done");
         assert_eq!(misses, 1);
-        assert_eq!(out, b"echo [headroom: unresolved __HR_PATH_9999__] done");
+        assert_eq!(out, b"echo [redacted:path] done");
         assert!(
-            !String::from_utf8_lossy(&out).contains("echo __HR"),
-            "the marker must break the token out of command position"
+            !String::from_utf8_lossy(&out).contains("__HR_"),
+            "no token shape may survive where a tool could consume it"
         );
     }
 
