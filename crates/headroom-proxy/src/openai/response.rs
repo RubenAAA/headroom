@@ -484,6 +484,66 @@ mod tests {
         assert_eq!(items[0]["id"], "fc_final");
     }
 
+    /// Recorded shape of 2026-09-22 request
+    /// `6ffbe940-22a6-4637-9c39-068a1f73539f`: a completed 186 KB
+    /// GPT-5.6 Responses stream whose `response.completed` envelope
+    /// carried `output: []`. The previous fold treated that empty
+    /// array as authoritative and discarded the message already
+    /// gathered from `output_item.done` / text deltas, so
+    /// `continuation_turn_from_body` returned None and CCR spliced
+    /// the store-fetched retrieval as the whole turn.
+    ///
+    /// `continuation_body_is_sse` is ruled out: the body opened
+    /// `event: response.created` and Content-Type was empty, which
+    /// sniffs as SSE. The two `reasoning_summary_part.{added,done}`
+    /// events in the same timestamp were unknown to the fold (the
+    /// live translator already recognised them as a no-op boundary).
+    #[test]
+    fn responses_stream_keeps_items_when_completed_output_is_empty() {
+        let stream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":",
+            "\"resp_013e0a0c70eb6903016ab24d60f6b887d1ac0f6217c6325439\",",
+            "\"object\":\"response\",\"status\":\"in_progress\"}}\n",
+            "\n",
+            "event: response.reasoning_summary_text.delta\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",",
+            "\"item_id\":\"rs_1\",\"delta\":\"thinking about the retrieve\"}\n",
+            "\n",
+            "event: response.reasoning_summary_part.added\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",",
+            "\"item_id\":\"rs_1\"}\n",
+            "\n",
+            "event: response.reasoning_summary_part.done\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",",
+            "\"item_id\":\"rs_1\"}\n",
+            "\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{",
+            "\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",",
+            "\"content\":[{\"type\":\"output_text\",\"text\":",
+            "\"the retrieved file says X\"}]}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":",
+            "\"resp_013e0a0c70eb6903016ab24d60f6b887d1ac0f6217c6325439\",",
+            "\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":45}}}\n",
+            "\n",
+        );
+
+        let (turn, output_tokens) = responses_stream_to_turn(stream);
+
+        assert_eq!(output_tokens, 45);
+        let items = turn["output"].as_array().expect("output array");
+        assert_eq!(
+            items.len(),
+            1,
+            "empty completed output[] wiped the streamed message: {turn}"
+        );
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["content"][0]["text"], "the retrieved file says X");
+    }
+
     /// Minimal `AppState` for exercising the request-side stages.
     #[test]
     fn openai_to_anthropic_text_response() {

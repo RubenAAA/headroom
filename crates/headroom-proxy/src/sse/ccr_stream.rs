@@ -527,6 +527,46 @@ impl DropReason {
 const RETRIEVAL_DROPPED_MARKER: &str =
     "[headroom: a proxy tool call was dropped and did NOT run; re-issue it]";
 
+/// Client-visible prose for a turn whose continuation came back carrying
+/// nothing at all.
+///
+/// Distinct from [`empty_turn_text`], which covers a tool call the proxy could
+/// not run. Here the call ran and its answer was fetched; the continuation that
+/// was supposed to deliver it returned no content, so the answer exists and the
+/// turn does not carry it. Saying "ask again" is still the right advice, but
+/// the reason differs and the log line differs with it.
+fn lost_answer_text(tool: Option<&str>) -> String {
+    match tool {
+        Some(name) => format!(
+            "The proxy ran `{name}` for this turn, but the model's follow-up \
+             came back empty, so the answer is missing. Ask again.\n\n{RETRIEVAL_DROPPED_MARKER}"
+        ),
+        None => format!(
+            "The proxy resolved a tool call for this turn, but the model's \
+             follow-up came back empty, so the answer is missing. Ask \
+             again.\n\n{RETRIEVAL_DROPPED_MARKER}"
+        ),
+    }
+}
+
+/// Client-visible prose for a dropped tool call on a turn that did carry other
+/// text. [`empty_turn_text`] says the turn "came back empty", which is false
+/// here and contradicts the model's own words sitting right above it.
+fn dropped_call_text(unresolved_tool: Option<&str>) -> String {
+    match unresolved_tool {
+        Some(name) => format!(
+            "The proxy could not run `{name}` for this turn, so its answer is \
+             missing from the reply above. Nothing was lost; ask \
+             again.\n\n{RETRIEVAL_DROPPED_MARKER}"
+        ),
+        None => format!(
+            "The proxy could not run a tool call for this turn, so its answer \
+             is missing from the reply above. Nothing was lost; ask \
+             again.\n\n{RETRIEVAL_DROPPED_MARKER}"
+        ),
+    }
+}
+
 fn empty_turn_text(unresolved_tool: Option<&str>) -> String {
     match unresolved_tool {
         Some(name) => format!(
@@ -538,6 +578,23 @@ fn empty_turn_text(unresolved_tool: Option<&str>) -> String {
              content. Nothing was lost; ask again.\n\n{RETRIEVAL_DROPPED_MARKER}"
         ),
     }
+}
+
+/// Client-visible prose. Thinking is not visible: Claude Code renders it as
+/// "Thought for Ns" and then an empty turn. Whitespace-only text is the
+/// same as none.
+fn is_visible_text_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.trim().is_empty())
+}
+
+/// True when the client would otherwise see no prose for this turn:
+/// nothing streamed live except thinking, and nothing left to splice.
+fn turn_lacks_visible_text(emit: &[Value], client_saw_visible_text: bool) -> bool {
+    !client_saw_visible_text && !emit.iter().any(is_visible_text_block)
 }
 
 /// Whether this block's answer is already waiting for a later request.
@@ -723,6 +780,13 @@ struct Rewriter {
     /// terminal `stop_reason` has to agree with this or the client rejects
     /// the turn.
     client_saw_tool_use: bool,
+    /// Whether a `text` block has already gone out to the client. Thinking
+    /// does not count: the client renders it as a timer and then an empty
+    /// turn, which is the 2026-09-22 Zen memory-continuation 403 symptom.
+    /// Set on any `text` start, not on non-empty content: the start block
+    /// is usually empty and the prose arrives in later deltas, which do not
+    /// revisit this flag — content-checking here would miss real text.
+    client_saw_visible_text: bool,
     /// `message_delta` / `message_stop`, held until we know whether a
     /// continuation has to be spliced in ahead of them.
     withheld: Vec<Bytes>,
@@ -738,6 +802,7 @@ impl Rewriter {
             suppressed: HashSet::new(),
             next_client_index: 0,
             client_saw_tool_use: false,
+            client_saw_visible_text: false,
             withheld: Vec::new(),
             saw_ccr: false,
         }
@@ -772,6 +837,9 @@ impl Rewriter {
                 }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     self.client_saw_tool_use = true;
+                }
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    self.client_saw_visible_text = true;
                 }
                 let client_index = self.next_client_index;
                 self.next_client_index += 1;
@@ -957,6 +1025,7 @@ where
             // which drowned the 2 that mattered.
             if dropped[DropReason::UnresolvedProxyTool as usize] > 0 {
                 tracing::warn!(
+                    event = "ccr_tool_call_dropped",
                     request_id = %ctx.request_id,
                     unresolved_proxy_tool = dropped[DropReason::UnresolvedProxyTool as usize],
                     unresolved_tool_name = ?unresolved_tool,
@@ -1006,24 +1075,66 @@ where
             // looks like the model simply said nothing.
             //
             // Two guards, both learned from this firing wrongly. The turn has
-            // to be empty *to the client*, not merely to this round — blocks
-            // already streamed are content, and appending an apology under
-            // them told the user a turn had failed when they had just watched
-            // it succeed. And the wording has to match the cause: over
-            // 2026-08-28, five of the six firings had
-            // `unresolved_proxy_tool == 0`, so five users were told a
-            // retrieval had failed when no retrieval was dropped at all.
-            if emit.is_empty() && rw.next_client_index == 0 {
-                emit.push(json!({
-                    "type": "text",
-                    "text": empty_turn_text(unresolved_tool.as_deref()),
-                }));
-            }
+            // to lack *visible text* to the client, not merely to this round
+            // — text already streamed is content, and appending an apology
+            // under it told the user a turn had failed when they had just
+            // watched it succeed. Thinking is not visible text: on
+            // 2026-09-22 a Zen memory continuation 403 left a thinking
+            // block on the wire (`next_client_index > 0`) and the previous
+            // `next_client_index == 0` guard skipped the notice, so the
+            // client showed "Thought for 27s" then nothing. And the wording
+            // has to match the cause: over 2026-08-28, five of the six
+            // firings had `unresolved_proxy_tool == 0`, so five users were
+            // told a retrieval had failed when no retrieval was dropped at
+            // all. Bytes already on the wire still cannot become a 5xx; this
+            // splices a text block at the next client index.
+            // The client is told the call did not run whatever else the turn
+            // carried. Gating this on "the turn has no visible text at all"
+            // meant a turn that said "I'll search memory" and then lost the
+            // call went out looking like the model had simply finished —
+            // measured 2026-09-22 on Spark over Zen, where that is the common
+            // case rather than the corner one. Only the wording depends on
+            // whether anything else arrived.
+            let notice = if turn_lacks_visible_text(&emit, rw.client_saw_visible_text) {
+                empty_turn_text(unresolved_tool.as_deref())
+            } else {
+                dropped_call_text(unresolved_tool.as_deref())
+            };
+            emit.push(json!({"type": "text", "text": notice}));
         }
 
         // Nothing to add. When the client has had blocks already, that is the
         // whole turn and the terminal events finish it; only a turn that was
         // *nothing but* a retrieval leaves the client with an empty message.
+        // The continuation returned no blocks at all — nothing to drop, nothing
+        // to emit — while the proxy had taken a tool call off the client's
+        // hands. Left alone this streams a bare `end_turn` after the model's
+        // "I'll look that up", which reads as the model choosing to stop.
+        // Measured 2026-09-22 on Spark over Zen: the continuation spent its
+        // whole output budget reasoning, came back `response.incomplete` with
+        // `output: []`, and the memory answer vanished without a word in the
+        // log or on the wire.
+        //
+        // `next_client_index == 0` is left to the branch below: a client that
+        // has seen nothing at all gets the fuller notice there.
+        if emit.is_empty()
+            && rw.next_client_index != 0
+            && dropped.iter().all(|&n| n == 0)
+            && !rw.suppressed.is_empty()
+        {
+            tracing::warn!(
+                event = "ccr_continuation_answer_lost",
+                request_id = %ctx.request_id,
+                suppressed_blocks = rw.suppressed.len(),
+                unresolved_tool_name = ?unresolved_tool,
+                "ccr: the continuation carried no content; the resolved tool answer never reached the client"
+            );
+            emit.push(json!({
+                "type": "text",
+                "text": lost_answer_text(unresolved_tool.as_deref()),
+            }));
+        }
+
         let mut events = if emit.is_empty() && rw.next_client_index == 0 {
             // Dropping left an empty assistant turn, which is not a thing the
             // client can render. Say what happened instead of sending nothing.
@@ -1080,11 +1191,27 @@ fn non_streaming_continuation_request(forwarded_request: &Bytes) -> Bytes {
 
 /// Keep streaming on for backends that mandate it. The chatgpt codex gateway
 /// answers a de-streamed continuation with `400 Stream must be set to true`.
-/// Spark does not enter this hidden-continuation path: its native compatibility
-/// profile suppresses Headroom-owned retrieval and memory tools, so keeping Zen
-/// here would only reintroduce the session-blocking behavior.
+///
+/// OpenCode Zen mandates it too, and says so less plainly: a de-streamed
+/// continuation comes back `403 FreeTierError: "OpenCode's free tier can only
+/// be used from within OpenCode"`, which reads as an auth problem and is not.
+/// The real OpenCode client always streams, so a `stream: false` body fails
+/// the gate whatever its headers say. Measured 2026-09-22 on
+/// `muse-spark-1.3-contributor-free`: a streaming client 403d on every memory
+/// continuation while a non-streaming client on the same session, seconds
+/// apart, got 200 — and the only difference between the two is this flag,
+/// because the non-streaming path (`routed::ccr`) forwards the request body
+/// untouched and never de-streams it.
+///
+/// An earlier comment here claimed Spark never reaches this path because its
+/// compatibility profile suppresses Headroom's memory tools. With
+/// `HEADROOM_MEMORY_INJECT_TOOLS=1` it does reach it, on every turn where the
+/// model asks for memory.
 fn restore_stream_when_mandated(request: Bytes, upstream_url: &url::Url) -> Bytes {
-    if upstream_url.host_str() != Some("chatgpt.com") {
+    if !matches!(
+        upstream_url.host_str(),
+        Some("chatgpt.com") | Some("opencode.ai")
+    ) {
         return request;
     }
     streamed_continuation_request(request)
@@ -1164,6 +1291,7 @@ async fn resolve_retrieval(
         Ok(b) => Bytes::from(b),
         Err(e) => {
             tracing::warn!(
+                event = "ccr_stream_rebuild_failed",
                 request_id = %ctx.request_id,
                 error = %e,
                 "ccr: could not rebuild the streamed turn; leaving it unresolved"
@@ -1283,7 +1411,7 @@ async fn resolve_retrieval(
 mod tests {
     use super::*;
 
-    fn feed(rw: &mut Rewriter, name: &str, data: &str) -> Vec<Bytes> {
+    pub(super) fn feed(rw: &mut Rewriter, name: &str, data: &str) -> Vec<Bytes> {
         rw.handle(SseEvent {
             event_name: Some(name.to_string()),
             data: Bytes::from(data.to_string()),
@@ -1328,8 +1456,16 @@ mod tests {
         let v: Value = serde_json::from_slice(&out).expect("valid JSON");
         assert_eq!(v["stream"], json!(true));
 
+        // Zen rejects a de-streamed continuation with a 403 that reads like an
+        // auth failure, so it belongs in the same set as the codex gateway.
         let zen: url::Url = "https://opencode.ai/zen/v1/responses".parse().unwrap();
         let out = restore_stream_when_mandated(destreamed.clone(), &zen);
+        let v: Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(v["stream"], json!(true));
+
+        // Everything else still takes the de-streamed body.
+        let plain: url::Url = "https://api.x.ai/v1/responses".parse().unwrap();
+        let out = restore_stream_when_mandated(destreamed.clone(), &plain);
         let v: Value = serde_json::from_slice(&out).expect("valid JSON");
         assert_eq!(v["stream"], json!(false));
 
@@ -1914,6 +2050,7 @@ mod deferred_drop_reason_tests {
 
 #[cfg(test)]
 mod empty_turn_text_tests {
+    use super::tests::feed;
     use super::*;
 
     /// A dropped call is named, so the reader knows which machinery to look
@@ -1974,5 +2111,83 @@ mod empty_turn_text_tests {
                 "hook must grep for wire marker: {marker}"
             );
         }
+    }
+
+    /// Both notices carry the marker the hook greps for, and each says the
+    /// thing that is true of its own case. A turn that already spoke must not
+    /// be told it "came back empty" directly under the model's own sentence.
+    #[test]
+    fn each_notice_fits_the_turn_it_describes() {
+        let dropped = dropped_call_text(Some("memory_search"));
+        assert!(dropped.contains("memory_search"));
+        assert!(dropped.contains(RETRIEVAL_DROPPED_MARKER));
+        assert!(
+            !dropped.contains("came back empty"),
+            "a turn that spoke did not come back empty: {dropped}"
+        );
+
+        let empty = empty_turn_text(Some("memory_search"));
+        assert!(empty.contains("came back empty"));
+        assert!(empty.contains(RETRIEVAL_DROPPED_MARKER));
+
+        // And the case where the call ran but its answer never arrived, which
+        // is a different sentence again: nothing was dropped, the follow-up
+        // was.
+        let lost = lost_answer_text(Some("memory_search"));
+        assert!(lost.contains("came back empty"), "{lost}");
+        assert!(lost.contains("ran `memory_search`"), "{lost}");
+        assert!(lost.contains(RETRIEVAL_DROPPED_MARKER));
+    }
+
+    /// Thinking on the wire is not visible text. The 2026-09-22 Zen 403
+    /// turns streamed a thinking block, then nothing; the old
+    /// `next_client_index == 0` guard treated that as a successful turn.
+    #[test]
+    fn thinking_only_turns_lack_visible_text() {
+        let thinking = json!({"type": "thinking", "thinking": "hmm"});
+        assert!(
+            turn_lacks_visible_text(&[thinking.clone()], false),
+            "thinking in emit is not visible text"
+        );
+        assert!(
+            turn_lacks_visible_text(&[], false),
+            "an empty emit with no live text is blank"
+        );
+        assert!(
+            !turn_lacks_visible_text(&[json!({"type": "text", "text": "hi"})], false),
+            "prose in emit is visible"
+        );
+        assert!(
+            !turn_lacks_visible_text(&[], true),
+            "text already streamed is visible"
+        );
+        assert!(
+            turn_lacks_visible_text(&[json!({"type": "text", "text": "   "})], false),
+            "whitespace-only text is not visible"
+        );
+    }
+
+    #[test]
+    fn rewriter_counts_text_not_thinking_as_visible() {
+        let mut rw = Rewriter::new(false);
+        feed(
+            &mut rw,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        );
+        assert!(
+            !rw.client_saw_visible_text,
+            "thinking must not count as visible text"
+        );
+        assert!(rw.next_client_index > 0, "thinking still occupies an index");
+        feed(
+            &mut rw,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        );
+        assert!(
+            rw.client_saw_visible_text,
+            "a text block the client received is visible"
+        );
     }
 }

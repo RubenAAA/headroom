@@ -173,6 +173,18 @@ impl ResponseState {
             "response.reasoning_summary.done"
             | "response.reasoning_summary_text.done"
             | "reasoning_summary.done" => self.on_reasoning_summary_done(&v),
+            // GPT-5.6 / Codex emit part boundaries around the summary
+            // deltas the arms above already accumulate. Logged as
+            // `sse_unknown_event` on 2026-09-22 request
+            // `6ffbe940-22a6-4637-9c39-068a1f73539f` (two events, same
+            // timestamp as the empty fold). Treating them as unknown
+            // does not collect text; recognising them stops the warn
+            // and matches the live translator, which uses added as a
+            // thinking-block boundary and ignores done.
+            "response.reasoning_summary_part.added"
+            | "reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "reasoning_summary_part.done" => Ok(()),
             "response.completed" => self.on_response_completed(&v),
             "response.failed" => {
                 self.status = StreamStatus::Failed;
@@ -493,8 +505,15 @@ impl ResponseState {
             // The completed envelope carries the finished `output[]`, which
             // is authoritative over the incrementally gathered items (a call
             // whose `output_item.done` never arrived is still in here).
+            // An empty `output: []` is not that: on 2026-09-22 request
+            // `6ffbe940-22a6-4637-9c39-068a1f73539f` a 186544-byte
+            // `response.completed` stream folded to zero blocks because
+            // an empty array here won over items already gathered from
+            // deltas / `output_item.done`. Treat empty as omitted.
             if let Some(items) = resp.get("output").and_then(|o| o.as_array()) {
-                self.completed_output = Some(items.clone());
+                if !items.is_empty() {
+                    self.completed_output = Some(items.clone());
+                }
             }
             if let Some(id) = resp.get("id").and_then(|x| x.as_str()) {
                 self.response_id = Some(id.to_string());
@@ -507,8 +526,10 @@ impl ResponseState {
     /// Materialize the buffered `output[]` turn the CCR machinery speaks.
     ///
     /// Prefers the authoritative `output[]` from the `response.completed`
-    /// envelope when the upstream sent one; otherwise rebuilds items from
-    /// the incremental events (added / deltas / done) in first-seen order.
+    /// envelope when the upstream sent a non-empty one; an empty
+    /// `output: []` is treated as omitted so incrementally gathered
+    /// items survive. Otherwise rebuilds items from the incremental
+    /// events (added / deltas / done) in first-seen order.
     /// Returns the turn and the output-token count the outcome is booked with.
     pub fn to_responses_turn(&self) -> (Value, u64) {
         let output_tokens = self

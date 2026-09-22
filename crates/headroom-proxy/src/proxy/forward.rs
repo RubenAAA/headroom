@@ -26,6 +26,7 @@ pub(crate) async fn read_buffered_body(
     if let Some(len) = body_bytes_hint {
         if len as usize > max {
             tracing::warn!(
+                event = "forward_body_too_large",
                 request_id = %request_id,
                 path = %path_for_log,
                 limit_bytes = max,
@@ -69,6 +70,7 @@ pub(crate) async fn read_buffered_body(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
+                    event = "forward_body_over_limit_fatal",
                     request_id = %request_id,
                     path = %path_for_log,
                     limit_bytes = max,
@@ -192,10 +194,26 @@ pub(crate) async fn send_buffered_with_retry(
                 }
             }
         }
-        let resolved = result.ok_or_else(|| {
-            last_err
-                .unwrap_or_else(|| ProxyError::InvalidUpstream("retry loop exhausted".to_string()))
-        })?;
+        let resolved = match result {
+            Some(res) => res,
+            None => {
+                let err = last_err.unwrap_or_else(|| {
+                    ProxyError::InvalidUpstream("retry loop exhausted".to_string())
+                });
+                // Terminal line for the retry loop: the per-attempt
+                // "retrying" lines carry this id, but the `proxy error`
+                // line at the response boundary does not, which left a
+                // connection flap unlinkable to its requests.
+                tracing::warn!(
+                    event = "upstream_retry_exhausted",
+                    request_id = %request_id,
+                    attempts = attempts_made.max(1),
+                    error = %err,
+                    "upstream retry loop exhausted; failing the turn"
+                );
+                return Err(err);
+            }
+        };
         if let Some(ctx) = outcome_ctx.as_mut() {
             ctx.upstream_attempts = attempts_made.max(1);
         }
@@ -258,6 +276,7 @@ async fn maybe_retry_status(
                 backoff_ms(state, attempt),
             );
             tracing::warn!(
+                event = "upstream_retryable_status",
                 request_id = %request_id,
                 status = status,
                 attempt = attempt + 1,
@@ -294,6 +313,7 @@ async fn maybe_retry_leading_error(
     if attempt + 1 < overload_max_attempts {
         let delay_ms = backoff_ms(state, attempt);
         tracing::warn!(
+            event = "upstream_200_stream_error",
             request_id = %request_id,
             error_type = %kind,
             attempt = attempt + 1,
@@ -309,6 +329,7 @@ async fn maybe_retry_leading_error(
         return true;
     }
     tracing::warn!(
+        event = "upstream_200_error_exhausted",
         request_id = %request_id,
         error_type = %kind,
         attempts = overload_max_attempts,
@@ -336,6 +357,7 @@ async fn handle_transport_error(
     if is_retryable && attempt + 1 < max_attempts {
         let delay_ms = backoff_ms(state, attempt);
         tracing::warn!(
+            event = "upstream_transport_retrying",
             request_id = %request_id,
             error = %e,
             attempt = attempt + 1,
@@ -884,6 +906,25 @@ pub(crate) fn run_finalize_pipeline(
     } else {
         body_to_send
     };
+
+    // Orphan tool_result repair. Last history validator: the siblings
+    // only remove calls, which can strand results, and Anthropic checks
+    // result/call pairing independently of the tools array.
+    let body_to_send = if matches!(
+        endpoint,
+        compression::CompressibleEndpoint::AnthropicMessages
+    ) {
+        let (bytes, neutralized) = maybe_repair_orphan_tool_results(body_to_send, request_id);
+        if neutralized > 0 {
+            if let Some(ctx) = outcome_ctx.as_mut() {
+                ctx.transforms_applied
+                    .push(format!("router:orphan_tool_repair:{neutralized}blocks"));
+            }
+        }
+        bytes
+    } else {
+        body_to_send
+    };
     crate::handlers::responses::restore_codex_additional_tools_body(
         body_to_send,
         additional_tools_restore_plan.as_ref(),
@@ -1272,7 +1313,7 @@ pub(crate) fn build_outgoing_headers(
             mode = "disabled",
             internal_count = pre_strip_internal_count,
             request_id = %request_id,
-            "[headroom: unresolved __HR_SECRET_a2053d677360bacf8315df6d39ca4c25b0b3872122b7f7d40f9a0dae8f182ae7a4be530cce49aaacaf0c54ff4741bb33f5340191cd9a61ae44b3521ae2382cc541e4e0f918618295a8__]; \
+            "[redacted:secret]; \
              internal x-headroom-* headers forwarded to upstream"
         );
     }
@@ -3242,6 +3283,7 @@ pub(crate) fn consume_compression_outcome(
         }
         compression::Outcome::Passthrough { reason } => {
             tracing::warn!(
+                event = "compression_passthrough_parse",
                 request_id = %request_id,
                 path = %path_for_log,
                 reason = ?reason,
@@ -3623,6 +3665,7 @@ pub(crate) fn refine_compression_decision(
     if let Some(count) = message_array_length(buffered, endpoint) {
         if count > MAX_MESSAGE_ARRAY_LENGTH {
             tracing::warn!(
+                event = "request_message_array_too_large",
                 request_id = %request_id,
                 message_count = count,
                 max = MAX_MESSAGE_ARRAY_LENGTH,
@@ -4168,6 +4211,7 @@ pub(crate) async fn log_memory_send_rejection(
     // schema mismatch is diagnosable from the log alone.
     let rejected = rejected_item_summary(&detail, current_request, items_field);
     tracing::warn!(
+        event = "memory_continuation_rejected",
         request_id = %request_id,
         status = %status,
         attempt,
@@ -4176,6 +4220,28 @@ pub(crate) async fn log_memory_send_rejection(
         rejected_item = %rejected,
         "memory: upstream returned error during continuation"
     );
+}
+
+/// Whether a memory-continuation HTTP status is worth another send.
+///
+/// 429 and 5xx are the historical retry set on every route. On the Zen
+/// route only, 403 joins them. Over 2026-09-22, 4 of 8 memory continuations
+/// on muse-spark-1.3-contributor-free returned 403 FreeTierError ("OpenCode's
+/// free tier can only be used from within OpenCode") at attempt 0, round 1,
+/// while 15 memory continuations on Anthropic-route models and 294 CCR
+/// continuations (sonnet/opus; CCR never runs on Zen) all returned 200. The
+/// nonce refresh (`refresh_zen_request_id`) was already live and did not
+/// stop these 403s.
+///
+/// Ruled out that window: fallback session id (no zen_session_mint_started
+/// events, so a real synced OpenCode session id went out every time) and
+/// concurrency (zero other Spark requests in flight at each 403). Body
+/// shape is the better-supported hypothesis: all four failures had msgs=2
+/// / tok_before about 24.4k, all four passes had msgs=1 / tok_before
+/// 12.4-15.8k. This retry is a cheap hedge for the 403s, not a proven
+/// fix for that split.
+pub(crate) fn memory_status_is_retryable(status: http::StatusCode, zen_route: bool) -> bool {
+    status.as_u16() == 429 || status.is_server_error() || (zen_route && status.as_u16() == 403)
 }
 
 /// Classifies one `send_memory_continuation` attempt result: break the retry
@@ -4189,10 +4255,12 @@ pub(crate) async fn classify_memory_send(
     round: usize,
     items_field: &str,
     current_request: &serde_json::Value,
+    zen_route: bool,
 ) -> MemorySendOutcome {
     match sent {
         Err(_) => {
             tracing::warn!(
+                event = "memory_continuation_headers_timeout",
                 request_id = %request_id,
                 attempt,
                 round = round + 1,
@@ -4204,7 +4272,7 @@ pub(crate) async fn classify_memory_send(
         Ok(Ok(r)) if r.status().is_success() => MemorySendOutcome::Done(Some(r)),
         Ok(Ok(r)) => {
             let status = r.status();
-            let retryable = status.as_u16() == 429 || status.is_server_error();
+            let retryable = memory_status_is_retryable(status, zen_route);
             if retryable && attempt < MEMORY_CONTINUATION_RETRIES {
                 let attempt = attempt + 1;
                 tokio::time::sleep(memory_continuation_backoff(attempt)).await;
@@ -4221,6 +4289,7 @@ pub(crate) async fn classify_memory_send(
                 return MemorySendOutcome::Next(attempt);
             }
             tracing::warn!(
+                event = "memory_continuation_send_failed",
                 request_id = %request_id,
                 attempt,
                 round = round + 1,
@@ -4551,6 +4620,7 @@ pub(crate) fn finalize_ctx_transformed_body(
             }
             Err(e) => {
                 tracing::warn!(
+                    event = "ctx_transform_reserialize_failed",
                     request_id = %request_id,
                     error = %e,
                     "ctx transform re-serialization failed; forwarding original body"
@@ -4727,6 +4797,7 @@ where
             }
             Err(e) => {
                 tracing::warn!(
+                    event = "non_sse_buffer_failed",
                     request_id = %request_id,
                     error = %e,
                     "failed to buffer non-SSE response"
@@ -5083,5 +5154,27 @@ pub(crate) fn run_compression_stage(input: CompressionStageIn<'_>) -> Compressio
         compress_tokens_before,
         compress_tokens_saved,
         compress_strategies,
+    }
+}
+
+#[cfg(test)]
+mod memory_status_is_retryable_tests {
+    use super::memory_status_is_retryable;
+    use http::StatusCode;
+
+    #[test]
+    fn retryable_matrix() {
+        let too_many = StatusCode::TOO_MANY_REQUESTS;
+        let server = StatusCode::INTERNAL_SERVER_ERROR;
+        let forbidden = StatusCode::FORBIDDEN;
+        let bad = StatusCode::BAD_REQUEST;
+        assert!(memory_status_is_retryable(too_many, false));
+        assert!(memory_status_is_retryable(too_many, true));
+        assert!(memory_status_is_retryable(server, false));
+        assert!(memory_status_is_retryable(server, true));
+        assert!(!memory_status_is_retryable(forbidden, false));
+        assert!(memory_status_is_retryable(forbidden, true));
+        assert!(!memory_status_is_retryable(bad, false));
+        assert!(!memory_status_is_retryable(bad, true));
     }
 }

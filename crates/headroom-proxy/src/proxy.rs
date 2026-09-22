@@ -2337,6 +2337,7 @@ fn query_ccr_tracker(
         Ok(guard) => guard,
         Err(_) => {
             tracing::warn!(
+                event = "ccr_tracker_poisoned_proactive",
                 request_id = %request_id,
                 "CCR Phase 4: tracker mutex poisoned; skipping proactive expansion"
             );
@@ -2510,6 +2511,7 @@ pub(crate) fn track_ccr_context_records(
         Ok(guard) => guard,
         Err(_) => {
             tracing::warn!(
+                event = "ccr_tracker_poisoned_tracking",
                 request_id = %request_id,
                 "CCR Phase 4: tracker mutex poisoned; skipping compression tracking"
             );
@@ -2856,6 +2858,50 @@ pub(crate) fn maybe_repair_ccr_retrieve_history(
                 "neutralized headroom_retrieve history blocks the tools array does not declare"
             );
             (bytes::Bytes::from(bytes), repair.neutralized)
+        }
+        Err(_) => (body, 0),
+    }
+}
+
+/// Orphan client `tool_result` repair. Neutralizes history results with no
+/// preceding matching `tool_use`, then history calls with no matching
+/// result in the next message — Anthropic rejects both directions
+/// independently of the tools array (so neither sibling repair covers the
+/// declared-tool case). Results run first: the siblings only ever remove
+/// calls, which can only strand more results, and a result neutralized
+/// here strands its call for the second pass. Returns the
+/// neutralized-block count; zero means the original bytes are forwarded
+/// untouched.
+pub(crate) fn maybe_repair_orphan_tool_results(
+    body: bytes::Bytes,
+    request_id: &str,
+) -> (bytes::Bytes, usize) {
+    use crate::orphan_tool_result as otr;
+
+    let mut value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return (body, 0),
+    };
+    let messages: Vec<serde_json::Value> = match value.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m.clone(),
+        None => return (body, 0),
+    };
+    let first = otr::strip_orphan_tool_results(messages);
+    let second = otr::strip_dangling_tool_calls(first.messages);
+    let neutralized = first.neutralized + second.neutralized;
+    if neutralized == 0 {
+        return (body, 0);
+    }
+    value["messages"] = serde_json::Value::Array(second.messages);
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            tracing::info!(
+                event = "orphan_tool_repair",
+                request_id = %request_id,
+                neutralized_blocks = neutralized,
+                "neutralized history tool blocks with no matching pair"
+            );
+            (bytes::Bytes::from(bytes), neutralized)
         }
         Err(_) => (body, 0),
     }
@@ -4817,6 +4863,7 @@ where
             // chain is `Debug`-only and it is the only thing that separates a
             // TLS record failure from an idle drop.
             tracing::warn!(
+                event = "upstream_stream_mid_response_error",
                 request_id = %rid,
                 error = %e,
                 cause = ?e,
@@ -4887,6 +4934,7 @@ fn spawn_sse_parser_tee(
                 // every clean finish at info would double the per-stream volume
                 // of a log that is never rotated.
                 Ok(()) if dropped_chunks > 0 => tracing::warn!(
+                    event = "sse_missed_chunks",
                     request_id = %rid_for_parser,
                     sent_chunks,
                     dropped_chunks,
@@ -4900,6 +4948,7 @@ fn spawn_sse_parser_tee(
                     "sse state-machine task completed"
                 ),
                 Err(error) => tracing::error!(
+                    event = "sse_task_failed",
                     request_id = %rid_for_parser,
                     sent_chunks,
                     dropped_chunks,
@@ -8203,7 +8252,7 @@ pub(crate) fn apply_request_hooks(
     match serde_json::to_vec(&parsed) {
         Ok(v) => (bytes::Bytes::from(v), tools_saved),
         Err(e) => {
-            tracing::warn!(request_id = %request_id, error = %e, "turn hooks: re-serialize failed; forwarding original body");
+            tracing::warn!(event = "turn_hooks_reserialize_failed", request_id = %request_id, error = %e, "turn hooks: re-serialize failed; forwarding original body");
             (body, 0)
         }
     }
@@ -8248,7 +8297,7 @@ impl crate::turn_hooks::CallModel for ProxyCallModel {
         let body_bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(request_id = %self.request_id, error = %e, "turn hooks call_model: serialize failed");
+                tracing::warn!(event = "turn_hooks_call_model_serialize_failed", request_id = %self.request_id, error = %e, "turn hooks call_model: serialize failed");
                 return serde_json::Value::Null;
             }
         };
@@ -8268,12 +8317,12 @@ impl crate::turn_hooks::CallModel for ProxyCallModel {
                     parsed
                 }
                 Err(e) => {
-                    tracing::warn!(request_id = %self.request_id, error = %e, "turn hooks call_model: read body failed");
+                    tracing::warn!(event = "turn_hooks_call_model_read_failed", request_id = %self.request_id, error = %e, "turn hooks call_model: read body failed");
                     serde_json::Value::Null
                 }
             },
             Err(e) => {
-                tracing::warn!(request_id = %self.request_id, error = %e, "turn hooks call_model: upstream request failed");
+                tracing::warn!(event = "turn_hooks_call_model_upstream_failed", request_id = %self.request_id, error = %e, "turn hooks call_model: upstream request failed");
                 serde_json::Value::Null
             }
         }
@@ -9090,6 +9139,9 @@ async fn send_memory_continuation(
     current_request: &serde_json::Value,
 ) -> Option<reqwest::Response> {
     let mut attempt: u32 = 0;
+    // Same presence gate `refresh_zen_request_id` uses: the header is on
+    // the map iff this continuation is a Zen-route send.
+    let zen_route = outgoing_headers.contains_key("x-opencode-request");
     loop {
         let sent = forward::send_memory_continuation_once(
             client,
@@ -9105,6 +9157,7 @@ async fn send_memory_continuation(
             round,
             items_field,
             current_request,
+            zen_route,
         )
         .await
         {
@@ -9128,6 +9181,7 @@ async fn note_memory_body_stall(
     if *mem_cut_attempts < MEMORY_CONTINUATION_RETRIES {
         *mem_cut_attempts += 1;
         tracing::warn!(
+            event = "memory_continuation_body_unreadable",
             request_id = %request_id,
             error = %error,
             cut_attempt = *mem_cut_attempts,
@@ -9137,6 +9191,7 @@ async fn note_memory_body_stall(
         return MemoryRoundRead::Retry;
     }
     tracing::warn!(
+        event = "memory_continuation_body_failed",
         request_id = %request_id,
         error = %error,
         "memory: failed to read continuation response body"
@@ -9167,6 +9222,7 @@ async fn fold_or_retry_round_body(
             {
                 *mem_cut_attempts += 1;
                 tracing::warn!(
+                    event = "memory_continuation_empty_fold",
                     request_id = %request_id,
                     body_bytes = bytes.len(),
                     cut_attempt = *mem_cut_attempts,
@@ -9175,9 +9231,62 @@ async fn fold_or_retry_round_body(
                 tokio::time::sleep(memory_continuation_backoff(*mem_cut_attempts)).await;
                 return MemoryRoundRead::Retry;
             }
+            // Giving up here used to be silent, and silence is what made this
+            // expensive: the tool ran, its answer was thrown away, and the
+            // client was handed a turn that simply stopped. Measured
+            // 2026-09-22 on Spark — a continuation came back
+            // `response.incomplete` with `incomplete_details.reason:
+            // max_output_tokens`, 597 of 600 output tokens spent on reasoning
+            // and `output: []`. Nothing in the log said so.
+            tracing::warn!(
+                request_id = %request_id,
+                event = "memory_continuation_folded_empty",
+                body_bytes = bytes.len(),
+                content_type = content_type,
+                terminal = ?responses_terminal_reason(&bytes),
+                "memory: continuation folded to no usable turn; the memory answer is lost"
+            );
             MemoryRoundRead::Done
         }
     }
+}
+
+/// The terminal status of a Responses SSE body, plus the reason when it is
+/// `incomplete`, for a log line that says why a fold came back empty.
+///
+/// Returns `None` for bodies that are not a Responses stream, so the caller's
+/// log simply omits it rather than guessing.
+fn responses_terminal_reason(bytes: &bytes::Bytes) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut terminal = None;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let Some(response) = v.get("response") else {
+            continue;
+        };
+        let Some(status) = response.get("status").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        if !matches!(status, "completed" | "incomplete" | "failed") {
+            continue;
+        }
+        terminal = Some(
+            match response
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str())
+            {
+                Some(reason) => format!("{status}: {reason}"),
+                None => status.to_string(),
+            },
+        );
+    }
+    terminal
 }
 
 /// Read one memory continuation response: fold SSE back into a turn when a
@@ -9229,6 +9338,7 @@ fn append_round_messages(
         .and_then(|v| v.as_array_mut())
     else {
         tracing::warn!(
+            event = "memory_no_continuation_array",
             request_id = %request_id,
             field = items_field,
             "memory: no continuation array in request; cannot continue"
@@ -9282,6 +9392,7 @@ fn note_stranded_memory_calls(
         return;
     }
     tracing::warn!(
+        event = "memory_round_cap_reached",
         request_id = %request_id,
         rounds,
         "memory: retrieval round cap reached with calls outstanding; \
@@ -9377,6 +9488,7 @@ pub(crate) async fn handle_memory_response(
     let Ok(mut current_request) = serde_json::from_slice::<serde_json::Value>(forwarded_request)
     else {
         tracing::warn!(
+            event = "memory_request_unparseable",
             request_id = %request_id,
             "memory: failed to parse original request; skipping tool handling"
         );

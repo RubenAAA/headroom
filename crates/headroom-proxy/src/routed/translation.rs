@@ -143,12 +143,9 @@ fn translate_shaped_body(
     let kind = classify_upstream(upstream, is_chatgpt_auth);
     let translated = match shape {
         RouteShape::Responses => {
-            // OpenCode's current Responses client always sends the output
-            // budget. Other Responses routes keep the historical omission.
-            anthropic_to_openai_responses_request(
-                parsed,
-                kind == crate::routed::quirks::UpstreamKind::OpenCodeZen,
-            )
+            // No Responses route forwards the client's output budget. On Zen
+            // it was actively harmful: see [`lift_zen_output_ceiling`].
+            anthropic_to_openai_responses_request(parsed, false)
         }
         RouteShape::Chat => anthropic_to_openai_request(parsed, true, true),
     };
@@ -156,8 +153,8 @@ fn translate_shaped_body(
         Ok(v) => {
             let mut v = apply_target_model_override(v, target_model, is_responses, is_responses);
             if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
-                clamp_zen_output_budget(&mut v, request_id);
-                move_zen_instructions_to_developer(&mut v);
+                lift_zen_output_ceiling(&mut v, parsed, request_id);
+                move_zen_instructions_to_developer(&mut v, request_id);
                 // Match OpenCode's Responses request defaults. Its AI SDK
                 // sends the real OpenCode session as the cache key and leaves
                 // parallel tool calls at the provider default; forcing false
@@ -213,32 +210,43 @@ fn translate_shaped_body(
     }
 }
 
-/// Zen rejects `max_output_tokens` below 16. Claude Code uses a tiny output
-/// budget for model-selection/health probes, so preserve the request while
-/// lifting only this provider-specific lower bound. Other Responses routes
-/// must retain the client's requested budget.
-fn clamp_zen_output_budget(body: &mut Value, request_id: &str) {
-    const ZEN_MIN_OUTPUT_TOKENS: u64 = 16;
-    let Some(requested) = body.get("max_output_tokens").and_then(Value::as_u64) else {
-        return;
+/// Zen gets the whole budget and the top effort tier.
+///
+/// Two ceilings bounded a Zen turn and neither was deliberate. The client's
+/// `max_tokens` was copied into `max_output_tokens`, which on the Responses
+/// API covers reasoning *and* visible output together, so a reasoning model
+/// could spend the lot thinking and return `output: []` with
+/// `incomplete_details.reason: max_output_tokens`. Measured on Spark: 597 of
+/// 600 tokens burned on reasoning, nothing emitted, the turn lost. The other
+/// ceiling folded `xhigh` and `max` down to `high`, which is right for the
+/// OpenAI Responses API and wrong for Zen.
+///
+/// So the output budget goes, and the effort the client asked for reaches the
+/// backend at full strength. With no effort from the client, `xhigh` — Zen's
+/// own default is `high`.
+///
+/// The spinner sidecar is untouched: it builds its request in
+/// [`crate::routed::sidecar`], not here, and still pins `minimal` and a small
+/// budget for the reason documented there.
+fn lift_zen_output_ceiling(body: &mut Value, anthropic: &Value, request_id: &str) {
+    // `max` is Claude Code vocabulary; Zen's top tier is `xhigh`, which it is
+    // measured to accept. Anything else the client names goes through as sent.
+    let effort = match crate::output_shaper::requested_effort(anthropic) {
+        Some("max") | None => "xhigh",
+        Some(other) => other,
     };
-    if requested >= ZEN_MIN_OUTPUT_TOKENS {
-        return;
-    }
-    body["max_output_tokens"] = serde_json::json!(ZEN_MIN_OUTPUT_TOKENS);
+    body["reasoning"] = serde_json::json!({"effort": effort, "summary": "auto"});
+    body["stream_options"] = serde_json::json!({"reasoning_summary_delivery": "sequential_cutoff"});
+
     tracing::debug!(
-        event = "zen_output_budget_clamped",
+        event = "zen_output_ceiling_lifted",
         request_id = %request_id,
-        requested,
-        applied = ZEN_MIN_OUTPUT_TOKENS,
-        "raised Zen Responses output budget to provider minimum"
+        effort = effort,
+        "zen: no output ceiling, effort passed through"
     );
 }
 
-/// OpenCode's current Responses client puts its system prompt in an input
-/// item with `role: developer`. Zen's free-tier gate checks that shape; the
-/// generic translator keeps `instructions` for other Responses providers.
-fn move_zen_instructions_to_developer(body: &mut Value) {
+fn move_zen_instructions_to_developer(body: &mut Value, request_id: &str) {
     let Some(instructions) = body
         .get("instructions")
         .and_then(Value::as_str)
@@ -247,13 +255,23 @@ fn move_zen_instructions_to_developer(body: &mut Value) {
     else {
         return;
     };
-    body.as_object_mut()
-        .expect("translated body is an object")
-        .remove("instructions");
-    let input = body
-        .get_mut("input")
-        .and_then(Value::as_array_mut)
-        .expect("Responses translation always has input");
+    let Some(obj) = body.as_object_mut() else {
+        tracing::warn!(
+            event = "zen_instructions_drop",
+            request_id = %request_id,
+            "zen: translated body is not an object; dropping instructions"
+        );
+        return;
+    };
+    obj.remove("instructions");
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        tracing::warn!(
+            event = "zen_instructions_drop",
+            request_id = %request_id,
+            "zen: Responses translation has no input array; dropping instructions"
+        );
+        return;
+    };
     input.insert(
         0,
         serde_json::json!({
@@ -389,12 +407,17 @@ mod tests {
         );
     }
 
+    /// A Zen turn carries no output ceiling, and `xhigh` by default.
+    ///
+    /// The client's `max_tokens` used to become `max_output_tokens`, which on
+    /// the Responses API is reasoning *plus* visible output — so a reasoning
+    /// model could spend it all thinking and answer with nothing.
     #[test]
-    fn zen_route_clamps_tiny_probe_output_budget() {
+    fn zen_route_sends_no_output_ceiling_and_defaults_to_xhigh() {
         let parsed = json!({
             "model": "claude-muse-spark-1.3",
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "probe"}],
+            "max_tokens": 600,
+            "messages": [{"role": "user", "content": "hello"}],
         });
         let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
         let out = translate_routed_request(
@@ -404,14 +427,45 @@ mod tests {
             &zen,
             false,
             "claude-muse-spark-1.3",
-            "req-zen-probe",
+            "req-zen-budget",
         )
         .expect("translates");
-        assert_eq!(out.openai_body["max_output_tokens"], json!(16));
+        assert!(out.openai_body.get("max_output_tokens").is_none());
+        assert_eq!(out.openai_body["reasoning"]["effort"], json!("xhigh"));
         assert!(out.openai_body["prompt_cache_key"]
             .as_str()
             .is_some_and(|key| key.starts_with("ses_")));
         assert!(out.openai_body.get("parallel_tool_calls").is_none());
+    }
+
+    /// The effort the client picked reaches Zen as picked. `max` is the one
+    /// rewrite: it is Claude Code's word for the top tier, Zen's is `xhigh`.
+    #[test]
+    fn zen_route_passes_the_clients_effort_through() {
+        let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        for (asked, sent) in [("low", "low"), ("high", "high"), ("max", "xhigh")] {
+            let parsed = json!({
+                "model": "claude-muse-spark-1.3",
+                "max_tokens": 600,
+                "output_config": {"effort": asked},
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            let out = translate_routed_request(
+                &parsed,
+                &HeaderMap::new(),
+                Some("muse-spark-1.3-contributor-free"),
+                &zen,
+                false,
+                "claude-muse-spark-1.3",
+                "req-zen-effort",
+            )
+            .expect("translates");
+            assert_eq!(
+                out.openai_body["reasoning"]["effort"],
+                json!(sent),
+                "client asked for {asked}"
+            );
+        }
     }
 
     /// Zen's free-tier gate reads tool names: the translated body carries
