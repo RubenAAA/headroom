@@ -642,7 +642,7 @@ impl PassthroughStreamBooking {
             let value = match event {
                 Ok(event) => serde_json::from_slice::<Value>(&event.data),
                 Err(error) => {
-                    tracing::warn!(request_id = %self.request_id, %error, "sse framer error");
+                    tracing::warn!(event = "routed_sse_framer_error", request_id = %self.request_id, %error, "sse framer error");
                     continue;
                 }
             };
@@ -659,7 +659,7 @@ impl PassthroughStreamBooking {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(request_id = %self.request_id, %error, "sse usage parse error");
+                    tracing::warn!(event = "routed_sse_usage_parse_error", request_id = %self.request_id, %error, "sse usage parse error");
                 }
             }
         }
