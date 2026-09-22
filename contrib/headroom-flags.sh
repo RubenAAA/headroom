@@ -428,7 +428,13 @@ HEADROOM_FLAGS=(
   # nothing real. EnterWorktree/ExitWorktree measured at 1,130 and 707.
   # Only Claude Code built-ins here; MCP membership belongs in per-repo config,
   # which is also the only layer where changing it is free.
-  --prune-drop-tools ListMcpResourcesTool,ReadMcpResourceTool,ReadMcpResourceDirTool,EnterWorktree,ExitWorktree,EndConversation
+  # WaitForMcpServers added 2026-09-23: the MCP-connect wait affordance, and
+  # the flapper pin-roster (B3) was built for — 19 recaches / 342k tokens in
+  # 3h on 2026-09-06. Zero invocations in 78 logged host-tool calls and never
+  # seen called on the Anthropic path; the pin already holds the roster, so
+  # this only removes dead definition weight. Slow-MCP session starts lose
+  # the explicit wait; revert if models race half-ready servers.
+  --prune-drop-tools ListMcpResourcesTool,ReadMcpResourceTool,ReadMcpResourceDirTool,EnterWorktree,ExitWorktree,EndConversation,WaitForMcpServers
 
   # Anthropic's own server-side context GC, on 2026-08-17. Clears tool results
   # older than the last 20 tool calls before the prompt reaches the model, so the
