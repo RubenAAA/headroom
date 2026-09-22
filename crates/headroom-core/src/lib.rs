@@ -120,6 +120,7 @@ pub fn init_ort_ep() {
                 );
             } else {
                 tracing::warn!(
+                    event = "ort_openvino_unavailable",
                     ep = "openvino",
                     device = %device,
                     "ORT OpenVINO EP unavailable — falling back to CPU"
@@ -133,10 +134,15 @@ pub fn init_ort_ep() {
             {
                 tracing::info!(ep = "cuda", "ORT execution provider: CUDA");
             } else {
-                tracing::warn!(ep = "cuda", "ORT CUDA EP unavailable — falling back to CPU");
+                tracing::warn!(
+                    event = "ort_cuda_unavailable",
+                    ep = "cuda",
+                    "ORT CUDA EP unavailable — falling back to CPU"
+                );
             }
         }
         other => tracing::warn!(
+            event = "ort_unknown_ep",
             ep = other,
             "Unknown HEADROOM_ORT_EP — valid: cpu, openvino, cuda. Falling back to CPU"
         ),

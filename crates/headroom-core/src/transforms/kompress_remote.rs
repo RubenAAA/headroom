@@ -315,7 +315,7 @@ impl RemoteKompressCompressor {
             Ok(result) => result,
             Err(e) => {
                 // Fail OPEN — never break the proxy on a bad endpoint.
-                tracing::warn!(error = %e, "Remote Kompress failed; passing through");
+                tracing::warn!(event = "kompress_remote_failed", error = %e, "Remote Kompress failed; passing through");
                 return (
                     self.passthrough(content, n_words),
                     RemoteOutcome::FailedOpen(e),

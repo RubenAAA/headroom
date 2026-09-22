@@ -159,7 +159,11 @@ impl RolloutSnapshot {
         explicit: &[Feature],
     ) -> Self {
         let parsed_channel = RolloutChannel::from_str(channel).unwrap_or_else(|_| {
-            tracing::warn!(channel, "unknown rollout channel; falling back to stable");
+            tracing::warn!(
+                event = "rollout_unknown_channel",
+                channel,
+                "unknown rollout channel; falling back to stable"
+            );
             RolloutChannel::Stable
         });
         let valid_names: BTreeSet<_> = ALL_FEATURES
@@ -288,6 +292,7 @@ fn validated_names(raw: &str, source: &str, valid: &BTreeSet<String>) -> BTreeSe
     let names: BTreeSet<_> = split_feature_names(raw).into_iter().collect();
     for unknown in names.difference(valid) {
         tracing::warn!(
+            event = "rollout_unknown_feature",
             feature = unknown,
             source,
             "unknown rollout feature; ignoring (fail-closed)"

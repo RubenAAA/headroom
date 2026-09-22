@@ -385,7 +385,10 @@ fn session() -> &'static Mutex<Result<Session, String>> {
                 let _ = tx.send(Session::new().map_err(|e| e.to_string()));
             });
         if let Err(e) = spawned {
-            tracing::warn!("magika init thread spawn failed: {e}");
+            tracing::warn!(
+                event = "magika_init_spawn_failed",
+                "magika init thread spawn failed: {e}"
+            );
             return Mutex::new(Err(format!("magika init thread spawn failed: {e}")));
         }
         match rx.recv_timeout(timeout) {
@@ -393,6 +396,7 @@ fn session() -> &'static Mutex<Result<Session, String>> {
             Err(_) => {
                 let ort_dylib = std::env::var("ORT_DYLIB_PATH").ok();
                 tracing::warn!(
+                    event = "magika_init_timed_out",
                     timeout_secs = timeout.as_secs(),
                     ort_dylib_path = ort_dylib.as_deref(),
                     "magika ONNX session init timed out; detection falls back to \

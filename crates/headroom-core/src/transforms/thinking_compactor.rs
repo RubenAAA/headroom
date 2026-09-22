@@ -162,7 +162,10 @@ fn memo_compact(text: &str, kompress: Option<&dyn ThinkingCompressor>) -> Option
     let compacted = match kompress.compress_thinking(text) {
         Some(c) if !c.is_empty() => c,
         _ => {
-            tracing::warn!("thinking compaction produced nothing; leaving block untouched");
+            tracing::warn!(
+                event = "thinking_compaction_empty",
+                "thinking compaction produced nothing; leaving block untouched"
+            );
             return None;
         }
     };

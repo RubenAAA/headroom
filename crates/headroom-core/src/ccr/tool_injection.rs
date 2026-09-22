@@ -411,13 +411,18 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
     }
 
     let Some(hash_key) = input_data.get("hash").and_then(Value::as_str) else {
-        tracing::warn!(provider, "CCR tool call is missing a string hash argument");
+        tracing::warn!(
+            event = "ccr_tool_missing_hash",
+            provider,
+            "CCR tool call is missing a string hash argument"
+        );
         return None;
     };
 
     // Validate hash format: 12 or 24 hex chars
     if hash_key.len() != 12 && hash_key.len() != 24 {
         tracing::warn!(
+            event = "ccr_tool_invalid_hash_length",
             provider,
             hash_len = hash_key.len(),
             hash = %loggable_hash(hash_key),
@@ -427,6 +432,7 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
     }
     if !hash_key.chars().all(|c| c.is_ascii_hexdigit()) {
         tracing::warn!(
+            event = "ccr_tool_nonhex_hash",
             provider,
             hash_len = hash_key.len(),
             hash = %loggable_hash(hash_key),
@@ -463,6 +469,7 @@ pub fn parse_tool_call_query(tool_call: &Value, provider: &str) -> Option<String
     }
     if query.chars().count() > MAX_CCR_QUERY_LEN {
         tracing::warn!(
+            event = "ccr_tool_query_too_long",
             provider,
             query_len = query.chars().count(),
             "CCR tool call query exceeds the length bound; ignoring"
