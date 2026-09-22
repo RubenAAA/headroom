@@ -40,8 +40,9 @@ pub enum Backend {
 pub fn detect_backend(model: &str) -> Backend {
     let m = model.to_ascii_lowercase();
 
-    // OpenAI BPE-tokenized families (gpt-3.5/4/4o/5 + o1/o3/o4 reasoning + embeddings + legacy davinci/curie/babbage/ada + code-).
-    if m.starts_with("gpt-5")
+    // OpenAI BPE-tokenized families (gpt-3.5/4/4o/5/6 + o1/o3/o4 reasoning + embeddings + legacy davinci/curie/babbage/ada + code-).
+    if m.starts_with("gpt-6")
+        || m.starts_with("gpt-5")
         || m.starts_with("gpt-4o")
         || m.starts_with("gpt-4")
         || m.starts_with("gpt-3.5")

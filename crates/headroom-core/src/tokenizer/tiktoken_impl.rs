@@ -120,6 +120,8 @@ fn encoding_for(model: &str) -> Result<&'static str, TiktokenError> {
         // Without this, gpt-5 fell through to cl100k_base and over-counted
         // CJK by ~33%.
         ("gpt-5", "o200k_base"),
+        // Same for the gpt-6 line.
+        ("gpt-6", "o200k_base"),
         ("gpt-4-turbo", "cl100k_base"),
         ("gpt-4", "cl100k_base"),
         ("gpt-3.5", "cl100k_base"),
@@ -290,6 +292,7 @@ mod tests {
             "gpt-4.5-preview",
             "gpt-5",
             "gpt-5.6-terra",
+            "gpt-6-sol",
             "o4-mini",
         ] {
             assert_eq!(

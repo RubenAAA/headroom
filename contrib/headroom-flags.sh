@@ -507,6 +507,11 @@ HEADROOM_FLAGS=(
   --extra-model-route claude-codex-5.6-luna=https://api.openai.com/:translate:gpt-5.6-luna
   --extra-model-route claude-codex-5.6-terra=https://api.openai.com/:translate:gpt-5.6-terra
   --extra-model-route claude-codex-5.6-sol=https://api.openai.com/:translate:gpt-5.6-sol
+  # GPT-6 line, same shape as the 5.6 routes above: one alias per model, all
+  # sharing the --codex-auth-file below.
+  --extra-model-route claude-codex-6-astra=https://api.openai.com/:translate:gpt-6-astra
+  --extra-model-route claude-codex-6-sol=https://api.openai.com/:translate:gpt-6-sol
+  --extra-model-route claude-codex-6-luna=https://api.openai.com/:translate:gpt-6-luna
   # Points at a Codex CLI auth.json; drop the line if you don't use Codex.
   # install.sh rewrites the path to whichever ~/.codex*/auth.json it finds.
   # NOTE: `codex` CLI with CODEX_HOME unset reads $HOME/.codex/auth.json

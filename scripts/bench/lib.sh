@@ -77,6 +77,9 @@ model_alias() {
     union)      echo "claude-union-alpha" ;;
     codex-sol)  echo "claude-codex-5.6-sol" ;;
     codex-luna) echo "claude-codex-5.6-luna" ;;
+    codex-6-astra) echo "claude-codex-6-astra" ;;
+    codex-6-sol)   echo "claude-codex-6-sol" ;;
+    codex-6-luna)  echo "claude-codex-6-luna" ;;
     grok-high)  echo "claude-grok-4.6-high" ;;
     grok-xhigh) echo "claude-grok-4.6-xhigh" ;;
     *)          return 1 ;;
@@ -91,6 +94,7 @@ model_upstream() {
     opus)       echo "claude-opus-5" ;;
     spark)      echo "muse-spark-1.3-contributor-free" ;;
     union)      echo "union-alpha" ;;
+    codex-6-*)    echo "gpt-6" ;;
     codex-*)    echo "gpt-5.6" ;;
     # The effort suffix is part of the served name, so it has to be here too:
     # `cursor-grok-4.6` matches every Grok pane and attributes one pane's

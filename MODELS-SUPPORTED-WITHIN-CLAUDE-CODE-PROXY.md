@@ -8,6 +8,9 @@ the proxy; the session, tools, and cache stay intact.
 | `claude-codex-5.6-sol` | GPT-5.6 sol | OpenAI | `codex-sol` |
 | `claude-codex-5.6-luna` | GPT-5.6 luna | OpenAI | `codex-luna` |
 | `claude-codex-5.6-terra` | GPT-5.6 terra | OpenAI | `codex-terra` |
+| `claude-codex-6-astra` | GPT-6 astra | OpenAI | `codex-6-astra` |
+| `claude-codex-6-sol` | GPT-6 sol | OpenAI | `codex-6-sol` |
+| `claude-codex-6-luna` | GPT-6 luna | OpenAI | `codex-6-luna` |
 | `claude-grok-4.6-high` | Grok 4.6 | Cursor subscription | `grok-high` |
 | `claude-grok-4.6-low` | Grok 4.6 Low | Cursor subscription | `grok-low` |
 | `claude-grok-4.6-xhigh` | Grok 4.6 Extra High | Cursor subscription | `grok-xhigh` |
@@ -16,8 +19,8 @@ the proxy; the session, tools, and cache stay intact.
 
 Notes:
 
-- Codex aliases translate to the matching `gpt-5.6-*` model on the OpenAI
-  route (`contrib/headroom-flags.sh` `--extra-model-route` lines).
+- Codex aliases translate to the matching `gpt-5.6-*` or `gpt-6-*` model on
+  the OpenAI route (`contrib/headroom-flags.sh` `--extra-model-route` lines).
 - Grok aliases ride the Cursor subscription; there is also a
   `claude-grok-4.6` template alias taking an effort suffix.
 - Spark is free with no key spent, but the tier has dynamic unpublished rate
