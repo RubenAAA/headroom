@@ -41,7 +41,7 @@ fold_line() {
   [ "$cols" -le 0 ] 2>/dev/null && cols=$(stty size 2>/dev/null </dev/tty | awk '{print $2}')
   [ -z "$cols" ] && cols=${COLUMNS:-80}
   case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
-  local raw seg out="" cur="" curlen=0 s plain slen
+  local raw out="" cur="" curlen=0 s plain slen
   while IFS= read -r raw || [ -n "$raw" ]; do
     local IFS='|'
     # shellcheck disable=SC2206
