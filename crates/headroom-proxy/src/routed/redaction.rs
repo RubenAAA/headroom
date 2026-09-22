@@ -53,7 +53,8 @@ pub(crate) fn restore_buffered(
             event = "routed_redact_restore_miss",
             request_id = %request_id,
             misses,
-            "placeholders the map could not restore; left as-is"
+            session_issued_any = table.issued_any(),
+            "placeholders the map could not restore; emitted as redacted notices"
         );
     }
     body = out;

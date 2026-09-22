@@ -340,6 +340,50 @@ fn placeholder_block() -> Value {
     serde_json::json!({"type": "text", "text": TOOL_SEARCH_PLACEHOLDER_TEXT})
 }
 
+/// Stand-in for a non-tool-search server result the outbound request cannot
+/// support. Separate text so the two shapes stay distinguishable in logs
+/// and cached prefixes.
+const SERVER_RESULT_PLACEHOLDER_TEXT: &str = "[search result omitted: unavailable in this request]";
+
+fn server_result_placeholder_block() -> Value {
+    serde_json::json!({"type": "text", "text": SERVER_RESULT_PLACEHOLDER_TEXT})
+}
+
+/// Server-tool family for pairing results with their calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerToolFamily {
+    Search,
+    WebSearch,
+    CodeExec,
+}
+
+/// Server result block types sharing the pair-with-`server_tool_use` rule.
+/// `tool_search_tool_result` 400s without its call (seen live); the other
+/// two share the validator shape, so an orphan there fails the same way.
+fn server_result_family(block_type: &str) -> Option<ServerToolFamily> {
+    match block_type {
+        "tool_search_tool_result" => Some(ServerToolFamily::Search),
+        "web_search_tool_result" => Some(ServerToolFamily::WebSearch),
+        "code_execution_tool_result" => Some(ServerToolFamily::CodeExec),
+        _ => None,
+    }
+}
+
+/// Family of a `server_tool_use` call by name. Unknown names yield `None`:
+/// pairing stays permissive for flows this proxy has never seen rather
+/// than neutralizing calls it cannot classify.
+fn server_call_family(name: &str) -> Option<ServerToolFamily> {
+    if name.starts_with(TOOL_SEARCH_TYPE_PREFIX) {
+        Some(ServerToolFamily::Search)
+    } else if name.starts_with("web_search") {
+        Some(ServerToolFamily::WebSearch)
+    } else if name.starts_with("code_execution") {
+        Some(ServerToolFamily::CodeExec)
+    } else {
+        None
+    }
+}
+
 /// Outcome of [`strip_unsupported_blocks`].
 pub struct RepairOutcome {
     /// Repaired messages, or the input moved back unchanged when nothing
@@ -349,15 +393,21 @@ pub struct RepairOutcome {
     pub neutralized: usize,
 }
 
-/// Neutralize tool-search blocks the request's tools array cannot support.
+/// Neutralize server-tool blocks the request's tools array cannot support.
 ///
 /// A block pair is unsupportable when the request carries no typed search
-/// tool, or when a `tool_reference` names a tool absent from `tools` — both
-/// shapes Anthropic rejects. Both the `tool_search_tool_result` and its
-/// paired `server_tool_use` are handled (an orphan of either 400s on its
-/// own). Only tool-search server calls are eligible: `web_search` and
-/// code execution share the `server_tool_use` block type and must survive
-/// untouched.
+/// tool, when a `tool_reference` names a tool absent from `tools`, or when a
+/// server result (`tool_search_tool_result`, `web_search_tool_result`,
+/// `code_execution_tool_result`) names a `tool_use_id` no `server_tool_use`
+/// before it carries — all shapes Anthropic rejects (the last as
+/// `unexpected tool_use_id ... must have a corresponding server_tool_use
+/// block before it`; seen live when a client transcript kept bare results
+/// but never stored their calls). A result with a missing id is
+/// unsupportable too: every server result shape requires one.
+/// Both the result and its paired `server_tool_use` are handled (an orphan
+/// of either 400s on its own). Only tool-search server calls are eligible
+/// for call-side neutralization: `web_search` and code execution calls
+/// stand alone and must survive untouched.
 ///
 /// Replace in place rather than remove (upstream #3456). The block indexes
 /// of a message are load-bearing: the signed-thinking guard keys a thinking
@@ -392,6 +442,13 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
         .collect();
     let has_search_tool = has_typed_search_tool(tools);
 
+    // Server calls seen in earlier messages: id -> call family (None for
+    // names outside the known families). A result is only paired when its
+    // call precedes it — calls usually live in an earlier assistant
+    // message than their results, so a same-message-only check would
+    // orphan every split pair.
+    let mut seen_server_calls: std::collections::HashMap<String, Option<ServerToolFamily>> =
+        std::collections::HashMap::new();
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     let mut neutralized = 0usize;
     let mut changed = false;
@@ -405,34 +462,119 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
         };
         let mut neutralize_indexes: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
+        // Indexes neutralized with the generic server-result placeholder
+        // rather than the tool-search one.
+        let mut generic_placeholder_indexes: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         let mut orphaned_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Server calls earlier in THIS message: (index, id, family). A call
+        // neutralized below must not pair a later result (its placeholder
+        // is not a call upstream).
+        let mut message_server_calls: Vec<(usize, String, Option<ServerToolFamily>)> = Vec::new();
+        // Ids of the above seen so far, for pairing results below.
+        let mut message_call_families: std::collections::HashMap<String, Option<ServerToolFamily>> =
+            std::collections::HashMap::new();
         for (index, block) in content.iter().enumerate() {
-            if block.get("type").and_then(Value::as_str) != Some("tool_search_tool_result") {
+            let block_type = block.get("type").and_then(Value::as_str);
+            if block_type == Some("server_tool_use") {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                let family = server_call_family(name);
+                if let Some(id) = block.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        message_call_families.insert(id.to_string(), family);
+                        message_server_calls.push((index, id.to_string(), family));
+                    }
+                }
                 continue;
             }
-            let names = tool_search_reference_names(block.get("content").unwrap_or(&Value::Null));
-            if has_search_tool && names.iter().all(|n| available.contains(n.as_str())) {
+            let Some(family) = block_type.and_then(server_result_family) else {
+                continue;
+            };
+            let id = block.get("tool_use_id").and_then(Value::as_str);
+            let paired = match id {
+                Some(id) if !id.is_empty() => {
+                    let pair_ok =
+                        |m: &std::collections::HashMap<String, Option<ServerToolFamily>>| {
+                            match m.get(id) {
+                                // Same family pairs; an unknown call name
+                                // stays permissive (see server_call_family).
+                                Some(Some(f)) => *f == family,
+                                Some(None) => true,
+                                None => false,
+                            }
+                        };
+                    pair_ok(&seen_server_calls) || pair_ok(&message_call_families)
+                }
+                // A missing id never pairs: every server result shape
+                // requires one.
+                _ => false,
+            };
+            let supported = match family {
+                ServerToolFamily::Search => {
+                    let names =
+                        tool_search_reference_names(block.get("content").unwrap_or(&Value::Null));
+                    has_search_tool && names.iter().all(|n| available.contains(n.as_str()))
+                }
+                ServerToolFamily::WebSearch | ServerToolFamily::CodeExec => true,
+            };
+            if supported && paired {
                 continue;
             }
             neutralize_indexes.insert(index);
-            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                orphaned_ids.insert(id.to_string());
+            if family != ServerToolFamily::Search {
+                generic_placeholder_indexes.insert(index);
+            }
+            if let Some(id) = id {
+                if !id.is_empty() {
+                    orphaned_ids.insert(id.to_string());
+                }
             }
         }
         // The search call itself precedes its result, so pair it up in a
-        // second pass. Only tool-search server calls are eligible.
+        // second pass. Only tool-search server calls are eligible: other
+        // families stand alone and a lone call is valid upstream.
         for (index, block) in content.iter().enumerate() {
             if block.get("type").and_then(Value::as_str) != Some("server_tool_use") {
                 continue;
             }
             let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-            let is_search_call = name.starts_with(TOOL_SEARCH_TYPE_PREFIX);
+            let is_search_call = server_call_family(name) == Some(ServerToolFamily::Search);
             let id = block.get("id").and_then(Value::as_str).unwrap_or("");
             if orphaned_ids.contains(id) || (is_search_call && !has_search_tool) {
                 neutralize_indexes.insert(index);
             }
         }
+        // A kept result whose call was neutralized above is orphaned
+        // after all (duplicate ids in a corrupt transcript): neutralize
+        // it rather than forward a result pointing at placeholder text.
+        for (index, block) in content.iter().enumerate() {
+            if neutralize_indexes.contains(&index)
+                || block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .and_then(server_result_family)
+                    .is_none()
+            {
+                continue;
+            }
+            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                if message_server_calls
+                    .iter()
+                    .any(|(i, cid, _)| cid == id && neutralize_indexes.contains(i))
+                {
+                    neutralize_indexes.insert(index);
+                    if block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| server_result_family(t) != Some(ServerToolFamily::Search))
+                    {
+                        generic_placeholder_indexes.insert(index);
+                    }
+                }
+            }
+        }
         if neutralize_indexes.is_empty() {
+            seen_server_calls.extend(message_call_families);
             out.push(message);
             continue;
         }
@@ -445,9 +587,21 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
         // bookkeeping keeps its slot as text.
         for (index, block) in content.iter_mut().enumerate() {
             if neutralize_indexes.contains(&index) {
-                *block = placeholder_block();
+                *block = if generic_placeholder_indexes.contains(&index) {
+                    server_result_placeholder_block()
+                } else {
+                    placeholder_block()
+                };
             }
         }
+        // Only surviving calls pair later results: a neutralized call is
+        // placeholder text upstream, not a call.
+        seen_server_calls.extend(
+            message_server_calls
+                .iter()
+                .filter(|(i, _, _)| !neutralize_indexes.contains(i))
+                .map(|(_, id, family)| (id.clone(), *family)),
+        );
         out.push(message);
     }
     if changed {
@@ -719,6 +873,232 @@ mod tests {
         let out = strip_unsupported_blocks(messages, &tools);
         assert_eq!(out.neutralized, 0);
         assert_eq!(out.messages, before);
+    }
+
+    #[test]
+    fn orphan_result_with_resolvable_refs_is_neutralized() {
+        // Live 400 (2026-09-22, conv 607588fd): messages.1.content.4 was a
+        // tool_search_tool_result whose tool_use_id had no server_tool_use
+        // before it, while the tools array carried the search mechanism and
+        // resolvable references — so the old refs-only check waved it
+        // through and Anthropic rejected the turn.
+        let tools = {
+            let mut t = many_tools(&["Slack_post"]);
+            t.insert(
+                0,
+                json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH_NAME}),
+            );
+            t
+        };
+        let messages = vec![
+            json!({"role": "user", "content": "find it"}),
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "looking"},
+                    {"type": "text", "text": "still"},
+                    {"type": "text", "text": "almost"},
+                    {"type": "text", "text": "done"},
+                    search_result_block("srvtoolu_014GQB8PfhW2xzW8GVLSzM2a", vec![tool_ref("Slack_post")]),
+                ],
+            }),
+        ];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 1);
+        let content = out.messages[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 5);
+        assert_eq!(
+            content[4]["text"],
+            json!("[tool search omitted: unavailable in this request]")
+        );
+        // Neighbor blocks untouched.
+        assert_eq!(content[0]["text"], json!("looking"));
+    }
+
+    #[test]
+    fn orphan_result_with_empty_reference_object_is_neutralized() {
+        // Exact live shape (2026-09-22, conv 607588fd, messages.1.content.4):
+        // the client persists bare result blocks with no server_tool_use
+        // anywhere in the transcript, and empty tool_references — which the
+        // old refs-only check passed vacuously (`all` over nothing).
+        let tools = {
+            let mut t = many_tools(&["memory_search"]);
+            t.insert(
+                0,
+                json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH_NAME}),
+            );
+            t
+        };
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_search_tool_result",
+                "tool_use_id": "srvtoolu_014GQB8PfhW2xzW8GVLSzM2a",
+                "content": {
+                    "type": "tool_search_tool_search_result",
+                    "tool_references": [],
+                },
+            }],
+        })];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 1);
+        assert_eq!(
+            out.messages[0]["content"][0]["text"],
+            json!("[tool search omitted: unavailable in this request]")
+        );
+    }
+
+    #[test]
+    fn split_pair_across_messages_is_untouched() {
+        // The valid shape: the search call lives in an earlier assistant
+        // message than its result (server executes, client echoes back).
+        // Pairing must span messages, not just blocks.
+        let tools = {
+            let mut t = many_tools(&["Slack_post"]);
+            t.insert(
+                0,
+                json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH_NAME}),
+            );
+            t
+        };
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "searching"},
+                    search_call_block("srv_1"),
+                ],
+            }),
+            json!({
+                "role": "user",
+                "content": [search_result_block("srv_1", vec![tool_ref("Slack_post")])],
+            }),
+        ];
+        let before = messages.clone();
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 0);
+        assert_eq!(out.messages, before);
+    }
+
+    fn web_call_block(id: &str) -> Value {
+        json!({"type": "server_tool_use", "id": id, "name": "web_search"})
+    }
+
+    fn web_result_block(id: &str) -> Value {
+        json!({"type": "web_search_tool_result", "tool_use_id": id, "content": []})
+    }
+
+    #[test]
+    fn web_search_split_pair_is_untouched() {
+        // Pairing generalizes past tool_search: a web result paired with
+        // its call across messages is valid with no mechanism involved.
+        let tools = many_tools(&["read"]);
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "looking up"}, web_call_block("ws_1")],
+            }),
+            json!({
+                "role": "user",
+                "content": [web_result_block("ws_1")],
+            }),
+        ];
+        let before = messages.clone();
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 0);
+        assert_eq!(out.messages, before);
+    }
+
+    #[test]
+    fn web_search_orphan_result_is_neutralized_generically() {
+        // Same 400 shape as the tool_search orphan, other family: the
+        // result goes, the unrelated call survives, and the placeholder
+        // is the generic one (not the tool-search text, keeping the two
+        // shapes distinguishable in cached prefixes).
+        let tools = many_tools(&["read"]);
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [web_call_block("ws_9"), web_result_block("ws_orphan")],
+        })];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 1);
+        let content = out.messages[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["name"], json!("web_search"));
+        assert_eq!(
+            content[1]["text"],
+            json!("[search result omitted: unavailable in this request]")
+        );
+    }
+
+    #[test]
+    fn family_mismatch_neutralizes_the_pair() {
+        // Same id, wrong family: a tool_search result pointing at a
+        // web_search call is corrupt either way, and a call left dangling
+        // beside a neutralized result is its own 400 risk — so the pair
+        // goes together, like every other orphan id.
+        let tools = {
+            let mut t = many_tools(&["Slack_post"]);
+            t.insert(
+                0,
+                json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH_NAME}),
+            );
+            t
+        };
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [
+                web_call_block("srv_x"),
+                search_result_block("srv_x", vec![tool_ref("Slack_post")]),
+            ],
+        })];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 2);
+        let content = out.messages[0]["content"].as_array().unwrap();
+        assert!(content
+            .iter()
+            .all(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+    }
+
+    #[test]
+    fn missing_result_id_is_neutralized() {
+        // A server result without tool_use_id cannot pair by construction;
+        // forwarding it risks the same 400 class.
+        let tools = {
+            let mut t = many_tools(&["Slack_post"]);
+            t.insert(
+                0,
+                json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH_NAME}),
+            );
+            t
+        };
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [{"type": "tool_search_tool_result", "content": []}],
+        })];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 1);
+        assert_eq!(out.messages[0]["content"][0]["type"], json!("text"));
+    }
+
+    #[test]
+    fn neutralized_call_does_not_pair_a_later_result() {
+        // No mechanism: the call in message 0 is neutralized, so the later
+        // result with the same id must not treat it as a pair.
+        let tools = many_tools(&["read"]);
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [search_call_block("srv_1")],
+            }),
+            json!({
+                "role": "user",
+                "content": [search_result_block("srv_1", vec![tool_ref("Slack_post")])],
+            }),
+        ];
+        let out = strip_unsupported_blocks(messages, &tools);
+        assert_eq!(out.neutralized, 2);
+        assert_eq!(out.messages[0]["content"][0]["type"], json!("text"));
+        assert_eq!(out.messages[1]["content"][0]["type"], json!("text"));
     }
 
     #[test]

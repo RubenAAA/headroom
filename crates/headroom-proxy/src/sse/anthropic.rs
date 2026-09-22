@@ -614,6 +614,113 @@ impl AnthropicStreamState {
             .collect::<Vec<_>>()
             .join(",")
     }
+
+    /// Server-tool pairing inventory: which server-executed calls went out
+    /// and which result blocks came back, in stream order.
+    ///
+    /// Attribution tripwire for the 2026-09-22 orphan-result 400: the
+    /// provider minted a `tool_search_tool_result` whose
+    /// `server_tool_use` never reached the client, and neither side logged
+    /// the response's block inventory — so wire-vs-client was undecidable
+    /// from the log. With this, the next orphan joins against what the
+    /// response actually carried: id present here but absent from the next
+    /// turn's history means the client dropped it; absent here too means
+    /// the provider never sent it (or this layer did).
+    pub fn server_tool_inventory(&self) -> ServerToolInventory {
+        let mut v: Vec<_> = self.blocks.iter().collect();
+        v.sort_by_key(|(i, _)| **i);
+        let mut inv = ServerToolInventory::default();
+        for (_, b) in v {
+            match b.block_type.as_str() {
+                "server_tool_use" | "mcp_tool_use" => {
+                    inv.calls_total += 1;
+                    if inv.calls.len() < MAX_INVENTORY_IDS {
+                        let name = b
+                            .metadata
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("?");
+                        let id = b.metadata.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+                        inv.calls.push(format!("{name}:{id}"));
+                    }
+                }
+                "tool_search_tool_result"
+                | "web_search_tool_result"
+                | "code_execution_tool_result" => {
+                    inv.results_total += 1;
+                    if inv.results.len() < MAX_INVENTORY_IDS {
+                        let id = b
+                            .metadata
+                            .get("tool_use_id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("?");
+                        inv.results.push(format!("{}:{id}", b.block_type));
+                    }
+                }
+                _ => {}
+            }
+        }
+        inv
+    }
+}
+
+/// How many ids a log line carries per server-tool list. Turns with more
+/// calls than this still book exact totals; only the id detail is capped.
+pub const MAX_INVENTORY_IDS: usize = 8;
+
+/// Server-tool pairing inventory for one response stream. See
+/// [`AnthropicStreamState::server_tool_inventory`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerToolInventory {
+    /// `name:id` per server-executed call, stream order, capped at
+    /// [`MAX_INVENTORY_IDS`].
+    pub calls: Vec<String>,
+    /// `type:tool_use_id` per server result block, stream order, capped.
+    pub results: Vec<String>,
+    /// Uncapped totals (equal to the vec lengths unless capped).
+    pub calls_total: usize,
+    /// Uncapped totals (equal to the vec lengths unless capped).
+    pub results_total: usize,
+}
+
+impl AnthropicStreamState {
+    /// Result ids in this stream with no matching server-tool call id in
+    /// the same stream, in stream order.
+    ///
+    /// Provider-side evidence for the orphan-result class: if the call is
+    /// absent here too, the provider never sent it over this stream (or
+    /// this layer dropped it before the state machine saw it) — no need
+    /// to wait for the next turn's 400 to know. A result whose call the
+    /// client will supply from history is not an orphan at this layer;
+    /// this only sees one stream.
+    pub fn server_result_orphans(&self) -> Vec<String> {
+        // Walk blocks directly (not via the capped inventory): orphans
+        // must not hide past the id cap.
+        let mut v: Vec<_> = self.blocks.iter().collect();
+        v.sort_by_key(|(i, _)| **i);
+        let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut orphans = Vec::new();
+        for (_, b) in &v {
+            match b.block_type.as_str() {
+                "server_tool_use" | "mcp_tool_use" => {
+                    if let Some(id) = b.metadata.get("id").and_then(|x| x.as_str()) {
+                        call_ids.insert(id.to_string());
+                    }
+                }
+                "tool_search_tool_result"
+                | "web_search_tool_result"
+                | "code_execution_tool_result" => {
+                    if let Some(id) = b.metadata.get("tool_use_id").and_then(|x| x.as_str()) {
+                        if !call_ids.contains(id) {
+                            orphans.push(format!("{}:{id}", b.block_type));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        orphans
+    }
 }
 
 impl UsageBuilder {
@@ -674,6 +781,82 @@ fn payload_preview(data: &bytes::Bytes) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn server_call_block(name: &str, id: &str) -> BlockState {
+        BlockState {
+            block_type: "server_tool_use".to_string(),
+            metadata: json!({"type": "server_tool_use", "id": id, "name": name}),
+            ..Default::default()
+        }
+    }
+
+    fn server_result_block(block_type: &str, tool_use_id: &str) -> BlockState {
+        BlockState {
+            block_type: block_type.to_string(),
+            metadata: json!({"type": block_type, "tool_use_id": tool_use_id}),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inventory_lists_paired_calls_and_results_in_stream_order() {
+        let mut state = AnthropicStreamState::default();
+        state
+            .blocks
+            .insert(0, server_call_block("tool_search_tool_regex", "srv_1"));
+        state
+            .blocks
+            .insert(1, server_result_block("tool_search_tool_result", "srv_1"));
+        state
+            .blocks
+            .insert(2, server_call_block("web_search", "srv_2"));
+        let inv = state.server_tool_inventory();
+        assert_eq!(inv.calls_total, 2);
+        assert_eq!(inv.results_total, 1);
+        assert_eq!(
+            inv.calls,
+            vec!["tool_search_tool_regex:srv_1", "web_search:srv_2"]
+        );
+        assert_eq!(inv.results, vec!["tool_search_tool_result:srv_1"]);
+        assert!(state.server_result_orphans().is_empty());
+    }
+
+    #[test]
+    fn orphan_result_without_call_is_reported() {
+        // The 2026-09-22 shape: provider minted a result whose call never
+        // appeared on the stream.
+        let mut state = AnthropicStreamState::default();
+        state
+            .blocks
+            .insert(0, server_call_block("tool_search_tool_regex", "srv_1"));
+        state
+            .blocks
+            .insert(1, server_result_block("tool_search_tool_result", "srv_1"));
+        state.blocks.insert(
+            2,
+            server_result_block("tool_search_tool_result", "srv_orphan"),
+        );
+        let orphans = state.server_result_orphans();
+        assert_eq!(orphans, vec!["tool_search_tool_result:srv_orphan"]);
+        let inv = state.server_tool_inventory();
+        assert_eq!(inv.calls_total, 1);
+        assert_eq!(inv.results_total, 2);
+    }
+
+    #[test]
+    fn inventory_caps_ids_but_keeps_totals() {
+        let mut state = AnthropicStreamState::default();
+        for i in 0..MAX_INVENTORY_IDS + 3 {
+            state.blocks.insert(
+                i,
+                server_call_block("tool_search_tool_regex", &format!("srv_{i}")),
+            );
+        }
+        let inv = state.server_tool_inventory();
+        assert_eq!(inv.calls_total, MAX_INVENTORY_IDS + 3);
+        assert_eq!(inv.calls.len(), MAX_INVENTORY_IDS);
+    }
 
     #[test]
     fn the_output_split_counts_each_block_kind_against_its_own_bucket() {

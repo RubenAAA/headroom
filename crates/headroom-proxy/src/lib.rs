@@ -40,6 +40,7 @@ pub mod net_offload;
 pub mod observability;
 pub mod openai;
 pub mod openai_buffered_ccr;
+pub mod orphan_tool_result;
 pub mod output_shaper;
 pub mod probe_recorder;
 pub mod project_context;

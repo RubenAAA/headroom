@@ -50,6 +50,7 @@ fn drain_framer_events(
             Ok(ev) => {
                 if let Err(e) = state.apply(ev) {
                     tracing::warn!(
+                        event = "sse_anthropic_apply_error",
                         request_id = %request_id,
                         error = %e,
                         "sse anthropic state-machine apply error"
@@ -58,6 +59,7 @@ fn drain_framer_events(
             }
             Err(e) => {
                 tracing::warn!(
+                    event = "sse_anthropic_framer_error",
                     request_id = %request_id,
                     error = %e,
                     "sse framer error"
@@ -250,6 +252,10 @@ pub(super) fn complete_anthropic_replay(close: &AnthropicClose<'_>) {
 /// defect warn for a turn the client would refuse whole.
 pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
     let split = close.state.output_split();
+    // Server-tool pairing inventory (ids, capped): joins against the next
+    // turn's history when an orphan-result 400 needs wire-vs-client
+    // attribution. Empty on turns without server tools.
+    let inv = close.state.server_tool_inventory();
     tracing::info!(
         request_id = %close.request_id,
         provider = "anthropic",
@@ -271,6 +277,10 @@ pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
         text_blocks = split.text_blocks,
         tool_use_blocks = split.tool_use_blocks,
         thinking_deltas = split.thinking_deltas,
+        server_tool_calls = inv.calls.join(" "),
+        server_tool_results = inv.results.join(" "),
+        server_tool_calls_total = inv.calls_total,
+        server_tool_results_total = inv.results_total,
         "sse stream closed"
     );
     // A turn the client will refuse whole: it was told a tool call
@@ -287,6 +297,21 @@ pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
             detail = %defect,
             "upstream declared a tool call the client cannot execute"
         );
+    }
+    // A server result this stream never paired with a call. Provider-side
+    // evidence for the orphan-result 400 class: if the call is absent here
+    // too, the client cannot be blamed for losing it. Gated on completion
+    // so a cut stream's partial inventory doesn't false-positive.
+    if close.stream_completed() {
+        let orphans = close.state.server_result_orphans();
+        if !orphans.is_empty() {
+            tracing::warn!(
+                event = "sse_server_result_orphaned_in_stream",
+                request_id = %close.request_id,
+                orphan_results = orphans.join(" "),
+                "stream carried server results with no matching server_tool_use call"
+            );
+        }
     }
 }
 
