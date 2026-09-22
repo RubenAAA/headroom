@@ -334,6 +334,11 @@ Options:
           [env: HEADROOM_MEMORY_ENABLED=]
           [default: false]
 
+      --memory-project-root <MEMORY_PROJECT_ROOT>
+          Project root override for CCR/memory workspace resolution. When set, requests that carry no cwd metadata (no header, no system-prompt cwd) resolve to this directory instead of the shared unresolved bucket. Empty string counts as unset. Ports upstream `--memory-project-root`
+          
+          [env: HEADROOM_MEMORY_PROJECT_ROOT=]
+
       --cursor-agent-binary <CURSOR_AGENT_BINARY>
           Path to the `cursor-agent` CLI, for `MODEL=cursor:ID` routes.
           
@@ -857,7 +862,9 @@ Options:
           [default: 0]
 
       --code-aware <CODE_AWARE_ENABLED>
-          Enable code-aware compressor for source code
+          Enable code-aware compressor for source code.
+          
+          Default off upstream (conservative rollout): the arm predates the flag and the library default stays on to preserve historical dispatch, but a default-config proxy boots with it OFF until the operator opts in. Our deployment pins `--code-aware true` (see `contrib/headroom-flags.sh`) to keep the measured behavior.
           
           [env: HEADROOM_CODE_AWARE_ENABLED=]
           [default: false]
