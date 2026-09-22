@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# OpenCode launcher with optional headroom proxy. The `cclaude` equivalent
+# for opencode: where claude-launcher sets ANTHROPIC_BASE_URL, this injects
+# a `headroom` provider block via OPENCODE_CONFIG_CONTENT (inline config —
+# merges over global/project configs, touches no files) and execs `opencode`.
+#
+# Install: symlink profile names onto this script —
+#   ln -s opencode-launcher ~/.local/bin/oopencode
+#   ln -s opencode-launcher ~/.local/bin/oopencode-work
+#
+# Usage:
+#   oopencode       [--context] [proxy flags...] [opencode args...]   # default setup
+#   oopencode-work  [--context] [proxy flags...] [opencode args...]   # work defaults
+#
+#   oopencode-work carries defaults (see the profile table). oopencode does
+#   not — it is the bare launcher.
+#
+#   --context  route through the headroom proxy (starts it if not running;
+#              reuses the running instance otherwise — it is multi-tenant)
+#
+#   Proxy flags (passed to headroom-proxy, not opencode):
+#     any long flag that `headroom-proxy --help` lists, e.g.
+#     --extra-model-route "MODEL=URL[:translate]", --codex-auth-file <path>,
+#     --compression-mode all_messages, --ctx-offload-min-bytes 15000
+#
+# All other args are passed to `opencode` untouched. Pick the routed model
+# with `opencode -m headroom/<route>` or the /models picker — the proxy's
+# /v1/models advertises every route (e.g. headroom/claude-muse-spark-1.3).
+set -euo pipefail
+
+FLAGS_FILE="$HOME/.headroom-flags.sh"
+# Overridable so a candidate binary can be tried on another port without
+# restarting the shared proxy and cutting every live session's stream. The
+# default is the only port anything else knows about.
+PROXY_URL="${HEADROOM_PROXY_URL:-http://127.0.0.1:8787}"
+# Same path restart-headroom.sh uses; ~/headroom-savings.py reads this one
+# by name — a launcher-started proxy must log here or savings go stale.
+PROXY_LOG="$HOME/headroom-proxy.log"
+
+# ── profile from invocation name ──────────────────────────────────────────
+# DEFAULT_FLAGS is prepended to the command line, so anything typed still wins
+# for flags named twice. oopencode keeps none of them — it is the bare
+# launcher, and the one to reach for when a profile's defaults are in the way.
+DEFAULT_FLAGS=()
+case "$(basename "$0")" in
+    oopencode)      ;;
+    oopencode-work) DEFAULT_FLAGS=(--context --auto) ;;
+    *) echo "opencode-launcher: invoke via a profile symlink (oopencode|oopencode-work)" >&2
+       exit 1 ;;
+esac
+# NOTE: --auto is opencode's analog of claude's --dangerously-skip-permissions
+# (auto-approve permissions that are not explicitly denied). It is a boolean,
+# so unlike --context it cannot be undone on the command line — remove it
+# from DEFAULT_FLAGS above if the work profile should ask again.
+
+# ── which long flags belong to the proxy (asked of the binary itself) ─────
+# 1 = takes a value, 0 = boolean. --help/--version are opencode's, not ours.
+declare -A proxy_flag=()
+if command -v headroom-proxy >/dev/null 2>&1; then
+    while read -r name takes_value; do
+        [ -n "$name" ] && proxy_flag["$name"]="$takes_value"
+    done < <(headroom-proxy --help 2>/dev/null |
+             grep -oE '^[[:space:]]+(-[a-zA-Z], )?--[a-z0-9-]+( <[A-Z0-9_]+>)?' |
+             sed -E 's/^[[:space:]]+(-[a-zA-Z], )?//' |
+             awk '$1 != "--help" && $1 != "--version" { print $1, ($2 == "" ? 0 : 1) }')
+fi
+
+# One binary, one path. A stale copy elsewhere on PATH rejects flags the
+# flags file has grown, so every start dies on clap usage text. Say which
+# copy wins rather than let the next stale one fail the same way.
+proxy_bins=()
+while read -r line; do
+    [ -n "$line" ] && proxy_bins+=("$line")
+done < <(type -pa headroom-proxy 2>/dev/null | awk '!seen[$0]++')
+if [ "${#proxy_bins[@]}" -gt 1 ]; then
+    echo "headroom: ${#proxy_bins[@]} copies of headroom-proxy on PATH; the first wins:" >&2
+    printf '          %s\n' "${proxy_bins[@]}" >&2
+    echo "          Remove the others — 'make install-proxy' writes only ~/.local/bin." >&2
+fi
+
+# ── flags ─────────────────────────────────────────────────────────────────
+use_context=0
+passthrough=()
+proxy_flags=()
+args=("${DEFAULT_FLAGS[@]}" "$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
+    case "$arg" in
+        --context) use_context=1 ;;
+        --*=*)
+            if [ -n "${proxy_flag[${arg%%=*}]:-}" ]; then
+                proxy_flags+=("$arg")
+            else
+                passthrough+=("$arg")
+            fi
+            ;;
+        --*)
+            case "${proxy_flag[$arg]:-}" in
+                1) i=$((i + 1)); proxy_flags+=("$arg" "${args[$i]}") ;;
+                0) proxy_flags+=("$arg") ;;
+                *) passthrough+=("$arg") ;;
+            esac
+            ;;
+        *)
+            passthrough+=("$arg")
+            ;;
+    esac
+    i=$((i + 1))
+done
+
+# ── headroom proxy (start if requested and not up; else reuse) ────────────
+# Same contract as claude-launcher: the VPN-exit watcher survives proxy
+# restarts on its own, so nothing here ever kills it — but after a reboot
+# nothing is watching either. Ensure exactly one instance whenever a proxy
+# is up for this session to use.
+ensure_watcher() {
+    local watch="$HOME/.local/bin/zen-rotate-watch.sh"
+    [ -x "$watch" ] || return 0
+    # Bracket trick: pgrep -f would otherwise match this shell's own command
+    # line, which quotes the pattern.
+    if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+        return 0
+    fi
+    setsid nohup "$watch" >>"$HOME/zen-rotate-watch.log" 2>&1 </dev/null &
+    disown
+    echo "headroom: started VPN-exit watcher (log: $HOME/zen-rotate-watch.log)" >&2
+}
+if [ "$use_context" -eq 1 ]; then
+    # All launcher chatter goes to stderr: `opencode run` prints the model
+    # response on stdout and is commonly piped, so stdout must stay clean.
+    if curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
+        echo "headroom: reusing running proxy at $PROXY_URL" >&2
+        if [ "${#proxy_flags[@]}" -gt 0 ]; then
+            echo "headroom: the running proxy keeps the flags it was started with;" >&2
+            echo "          ${proxy_flags[*]} will NOT apply." >&2
+            echo "          To use them: pkill -f headroom-proxy, then rerun this command." >&2
+        fi
+    else
+        mkdir -p "$(dirname "$PROXY_LOG")"
+        # Roll the log so each proxy run starts with its own file. Keep four
+        # generations; the proxy reopens the path itself on start.
+        #
+        # Two guards, both learned the hard way: roll only when no proxy
+        # process exists (a live but unresponsive proxy still holds the file
+        # open; rolling it leaves the process writing into an unlinked inode),
+        # and only when the file holds a real run (a failed start leaves
+        # usage text that is not worth a generation). `pgrep -x` on the image
+        # name, not `-f` on the argv: a shell whose own command line quotes
+        # the pattern would match itself.
+        if pgrep -x headroom-proxy >/dev/null 2>&1; then
+            echo "headroom: a proxy process is still up on 8787 but not answering; not rolling its log" >&2
+        elif [ -s "$PROXY_LOG" ] && head -c 4096 "$PROXY_LOG" | grep -q '"level":'; then
+            rm -f "$PROXY_LOG.4"
+            for i in 3 2 1; do
+                [ -f "$PROXY_LOG.$i" ] && mv -f "$PROXY_LOG.$i" "$PROXY_LOG.$((i + 1))"
+            done
+            mv -f "$PROXY_LOG" "$PROXY_LOG.1"
+        elif [ -s "$PROXY_LOG" ]; then
+            : > "$PROXY_LOG"
+        fi
+        # The measured settings, shared with restart-headroom.sh. This branch is
+        # what runs after a reboot, when nothing holds 8787 — so a proxy started
+        # here without them would quietly serve every session on defaults.
+        # Expanded before "$proxy_flags", so a flag on the command line still
+        # wins for anything named twice.
+        measured_flags=()
+        if [ -r "$FLAGS_FILE" ]; then
+            # shellcheck source=/dev/null
+            source "$FLAGS_FILE"
+            measured_flags=("${HEADROOM_FLAGS[@]}")
+        else
+            echo "headroom: $FLAGS_FILE missing — starting on defaults" >&2
+        fi
+        echo "headroom: starting proxy at $PROXY_URL (log: $PROXY_LOG)" >&2
+        nohup headroom-proxy \
+            --listen 127.0.0.1:8787 \
+            --upstream https://api.anthropic.com \
+            "${measured_flags[@]}" \
+            "${proxy_flags[@]}" \
+            >> "$PROXY_LOG" 2>&1 &
+        disown
+        # wait for the listener (up to ~5s)
+        for _ in $(seq 1 25); do
+            curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1 && break
+            sleep 0.2
+        done
+        if ! curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
+            echo "headroom: proxy failed to start — see $PROXY_LOG" >&2
+            exit 1
+        fi
+    fi
+    ensure_watcher
+fi
+
+# ── assemble env and exec opencode ────────────────────────────────────────
+# The provider block rides OPENCODE_CONFIG_CONTENT (inline config): it merges
+# over the global (~/.config/opencode/opencode.json) and project configs and
+# touches no files, so removing the launcher leaves no residue. A `headroom`
+# block the user defined themselves loses to this one while the launcher runs.
+env_vars=()
+if [ "$use_context" -eq 1 ]; then
+    env_vars+=("OPENCODE_CONFIG_CONTENT={\"provider\":{\"headroom\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Headroom (local proxy)\",\"options\":{\"baseURL\":\"$PROXY_URL/v1\",\"apiKey\":\"x\"}}}}")
+fi
+
+exec env "${env_vars[@]}" opencode "${passthrough[@]}"

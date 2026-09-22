@@ -7,6 +7,20 @@ Point OpenCode at the local Headroom proxy with a `headroom` provider using `@ai
 
 ## Quick Start
 
+Start OpenCode through the launcher (the `cclaude` equivalent) — it starts
+the proxy if needed and injects the provider for that run only:
+
+```bash
+oopencode --context            # bare launcher, default setup
+oopencode-work                 # work defaults: proxy + --auto
+```
+
+Then pick a routed model with `opencode -m headroom/<route>` or the
+`/models` picker — the proxy's `/v1/models` advertises every route (e.g.
+`headroom/claude-muse-spark-1.3`).
+
+## By hand
+
 Start the proxy:
 
 ```bash
