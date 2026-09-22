@@ -871,7 +871,7 @@ pub fn compress_anthropic_live_zone(
 /// 2. Stores the original block content in the backend under that hash.
 /// 3. Appends the marker `<<ccr:HASH>>` to the compressed block content
 ///    (newline-separated) so the model can later call
-///    `headroom_retrieve(hash="HASH")` to recover the original bytes.
+///    use the `headroom_retrieve` tool to recover the original bytes.
 ///
 /// When `ccr_store` is `None` (default for tests, default for the old
 /// `compress_anthropic_live_zone` shim), the dispatcher behaves
@@ -1337,6 +1337,7 @@ fn compress_one_block(
                 if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref()) {
                     if !store.put(hash, content_text) {
                         tracing::warn!(
+                            event = "ccr_put_failed",
                             target = "ccr.live_zone",
                             hash = %hash,
                             "ccr_put_failed; marker will point at an unretrievable hash"
@@ -2911,7 +2912,7 @@ mod tests {
     fn a_ctx_offload_digest_is_not_compressed_again() {
         let digest = format!(
             "{}\n<<ctx:deadbeef>> (60000 bytes offloaded; \
-             retrieve: headroom_retrieve(hash=\"deadbeef\"))",
+             use the headroom_retrieve tool with hash=\"deadbeef\")",
             compressible_payload()
         );
         let b = body(json!({

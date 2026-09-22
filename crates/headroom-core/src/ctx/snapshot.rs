@@ -90,14 +90,20 @@ pub fn build_recall(hits: &[SearchHit], queries: &[String]) -> String {
 }
 
 /// Static "how to search" TOC header used by the resume snapshot.
+///
+/// Names the `headroom_retrieve` tool rather than the `headroom ctx search`
+/// CLI. Both read the same project content index, but the CLI costs a Bash
+/// call the model has to compose, and a pointer at a shell surface is what
+/// kept ctx-offload retrieval at zero once already (see `ctx_offload::footer`).
+/// "tool" is spelled out because a bare call signature reads as a skill name.
 fn how_to_search() -> String {
-    "<how_to_search>\nSearch prior session context with the Bash tool:\n  headroom ctx search \"<query>\"\n</how_to_search>".to_string()
+    "<how_to_search>\nSearch prior session context with the headroom_retrieve tool, passing query:\n  headroom_retrieve  query: \"<query>\"\n</how_to_search>".to_string()
 }
 
 /// A minimal static session directive (spirit of `buildSessionDirective`).
 /// Fixed text — no volatile fields.
 fn session_directive() -> String {
-    "<directive>\nPrior context is summarized above. Retrieve full detail on demand with `headroom ctx search`; do not assume anything not shown here.\n</directive>".to_string()
+    "<directive>\nPrior context is summarized above. Retrieve full detail on demand with the headroom_retrieve tool; do not assume anything not shown here.\n</directive>".to_string()
 }
 
 /// Render one category's section: the events' data as bullet lines plus a
@@ -178,7 +184,7 @@ fn search_toc(queries: &[String]) -> String {
         .map(|q| format!("\"{}\"", q.replace('"', "'")))
         .collect();
     format!(
-        "  For full details: headroom ctx search {}",
+        "  For full details: headroom_retrieve tool, query {}",
         quoted.join(" ")
     )
 }
@@ -234,7 +240,7 @@ mod tests {
         assert!(snap.contains("<files>"));
         assert!(snap.contains("<errors>"));
         assert!(snap.contains("<git>"));
-        assert!(snap.contains("headroom ctx search"));
+        assert!(snap.contains("headroom_retrieve"));
         // No volatile fields (I1): no generated_at, no ISO timestamps.
         assert!(!snap.contains("generated_at"));
         assert!(!snap.contains("T00:00:00"));
