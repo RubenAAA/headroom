@@ -89,6 +89,7 @@ impl OffloadTransform for ProseFieldOffload {
         };
         if !store.put(&key, content) {
             tracing::warn!(
+                event = "ccr_put_failed",
                 target = "ccr.prose_field",
                 hash = %key,
                 "ccr_put_failed; marker will point at an unretrievable hash"

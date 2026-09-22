@@ -256,6 +256,7 @@ impl CompressorRegistry {
         if !missing.is_empty() {
             let available = registered.iter().cloned().collect::<Vec<_>>().join(",");
             tracing::warn!(
+                event = "compressors_unregistered",
                 missing = %missing.join(","),
                 available = %if available.is_empty() { "<none>".to_string() } else { available },
                 "compressors requested but not registered"

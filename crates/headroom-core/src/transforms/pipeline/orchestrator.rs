@@ -227,6 +227,7 @@ impl CompressionPipeline {
             Err(TransformError::Internal { message, .. }) => {
                 tracing::warn!(
                     target: "headroom::pipeline",
+                    event = "pipeline_offload_error",
                     offload = offload.name(),
                     error = %message,
                     "offload internal error"
@@ -308,6 +309,7 @@ impl CompressionPipeline {
             Err(TransformError::Internal { message, .. }) => {
                 tracing::warn!(
                     target: "headroom::pipeline",
+                    event = "pipeline_reformat_error",
                     transform = transform.name(),
                     error = %message,
                     "reformat internal error"

@@ -269,6 +269,7 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
             if let Some(store) = store {
                 if !store.put(&ccr_hash, s) {
                     tracing::warn!(
+                        event = "ccr_put_failed",
                         target = "ccr.compactor",
                         hash = %ccr_hash,
                         "ccr_put_failed; marker will point at an unretrievable hash"

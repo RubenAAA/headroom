@@ -79,6 +79,7 @@ pub fn detect(content: &str) -> ContentType {
             // logs) and fall through to Tier 2 — the chain itself
             // must not break on a single tier's outage.
             tracing::warn!(
+                event = "language_detection_magika_failed",
                 error = %e,
                 "magika detection failed; falling through to unidiff tier"
             );

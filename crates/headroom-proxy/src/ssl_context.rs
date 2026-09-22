@@ -182,6 +182,7 @@ fn apply_replacement_bundle<B: TlsBuilder>(builder: B, path: &Path) -> B {
         }
         Err(error) => {
             tracing::warn!(
+                event = "ssl_ca_bundle_failed",
                 %error,
                 path = %path.display(),
                 semantics = "replacement",
@@ -205,6 +206,7 @@ fn apply_additive_bundle<B: TlsBuilder>(builder: B, path: &Path) -> B {
         }
         Err(error) => {
             tracing::warn!(
+                event = "ssl_ca_bundle_failed",
                 %error,
                 path = %path.display(),
                 semantics = "additive",
@@ -286,6 +288,7 @@ fn load_certificates_from_file(
                     certs.push(cert);
                 } else {
                     tracing::warn!(
+                        event = "ssl_bad_cert_skipped",
                         path = %path.display(),
                         "skipping unparseable certificate in bundle"
                     );

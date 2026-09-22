@@ -613,6 +613,7 @@ impl ReadLifecycleManager {
         if let Some(ref store) = self.store {
             if !store.put(&ccr_hash, content) {
                 tracing::warn!(
+                    event = "ccr_store_failed",
                     tool_call_id = %classification.tool_call_id,
                     "read_lifecycle: CCR store failed"
                 );

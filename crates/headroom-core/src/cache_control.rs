@@ -292,6 +292,7 @@ impl TtlOrderingWalk {
     fn warn_if_violated(&self, field: &'static str) {
         if self.violated {
             tracing::warn!(
+                event = "cache_control_ttl_ordering_violation",
                 field = field,
                 rule = "anthropic_prompt_caching_guide_2_19",
                 "cache_control TTL ordering violation: 1h marker appears after 5m marker; \

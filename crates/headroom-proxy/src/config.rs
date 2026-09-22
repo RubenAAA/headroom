@@ -2040,6 +2040,7 @@ pub fn parse_bedrock_model_map(raw: Option<&str>) -> HashMap<String, String> {
         let Some((name, target)) = pair.split_once('=') else {
             let preview: String = pair.chars().take(64).collect();
             tracing::warn!(
+                event = "config_bedrock_map_malformed",
                 pair = %preview,
                 "ignoring malformed HEADROOM_BEDROCK_MODEL_MAP entry (expected name=target)"
             );
@@ -2052,6 +2053,7 @@ pub fn parse_bedrock_model_map(raw: Option<&str>) -> HashMap<String, String> {
         } else {
             let preview: String = pair.chars().take(64).collect();
             tracing::warn!(
+                event = "config_bedrock_map_malformed",
                 pair = %preview,
                 "ignoring malformed HEADROOM_BEDROCK_MODEL_MAP entry (empty name or target)"
             );
@@ -2095,6 +2097,7 @@ pub fn warn_on_ambiguous_codex_routes(routes: &[ProviderRoute], codex_auth_file:
     for route in routes {
         if is_ambiguous_codex_route(route) {
             tracing::warn!(
+                event = "config_route_missing_target",
                 model = %route.model_prefix,
                 upstream = ?route.upstream,
                 "model route translates to OpenAI but has no TARGET_MODEL_ID, so it \
@@ -2117,6 +2120,7 @@ pub fn warn_on_ambiguous_codex_routes(routes: &[ProviderRoute], codex_auth_file:
 pub fn warn_on_shadowed_routes(routes: &[ProviderRoute]) {
     for (model, shadowed_by) in shadowed_routes(routes) {
         tracing::warn!(
+            event = "config_route_shadowed",
             model = %model,
             shadowed_by = %shadowed_by,
             "model route is unreachable: an earlier route already matches this name, \

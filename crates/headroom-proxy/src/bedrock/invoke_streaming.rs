@@ -980,6 +980,7 @@ fn apply_translated_event(
         Ok(ev) => {
             if let Err(e) = state.apply(ev) {
                 tracing::warn!(
+                    event = "bedrock_stream_apply_error",
                     request_id = %request_id,
                     error = %e,
                     "bedrock translated stream: anthropic state-machine apply error"
@@ -988,6 +989,7 @@ fn apply_translated_event(
         }
         Err(e) => {
             tracing::warn!(
+                event = "bedrock_stream_framer_error",
                 request_id = %request_id,
                 error = %e,
                 "bedrock translated stream: sse framer error"

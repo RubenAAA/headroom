@@ -107,6 +107,7 @@ pub async fn background_dedup(
             }
             Err(e) => {
                 tracing::warn!(
+                    event = "memory_dedup_failed",
                     old_id = %result.memory.id,
                     error = %e,
                     "memory background dedup failed"

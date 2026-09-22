@@ -1663,6 +1663,7 @@ fn external_output_rejected(name: &str, content: &str, out: &CompressOutput) -> 
     // providers reject the request); fall back so the built-in path runs.
     if !content.trim().is_empty() && out.content.trim().is_empty() {
         tracing::warn!(
+            event = "content_router_external_empty_output",
             compressor = %name,
             "external compressor produced empty output; falling back to built-in"
         );
@@ -1692,6 +1693,7 @@ fn store_external_recoverables(
     for (ccr_hash, original) in &out.recoverable {
         if !store_recoverable(ccr_hash, original, strategy_label) {
             tracing::warn!(
+                event = "content_router_recoverable_unstored",
                 compressor = %name,
                 hash = %ccr_hash,
                 "external compressor recoverable entry was not stored"

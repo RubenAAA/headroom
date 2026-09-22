@@ -270,6 +270,7 @@ impl Inner {
             Ok(u) => u,
             Err(e) => {
                 tracing::warn!(
+                    event = "cc_switch_bad_url_skipped",
                     captured_upstream = %url,
                     error = %e,
                     "cc-switch reconciler: captured URL is not valid; skipping rewrite to avoid broken upstream"

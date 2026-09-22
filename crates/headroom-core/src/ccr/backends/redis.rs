@@ -97,6 +97,7 @@ impl CcrStore for RedisCcrStore {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!(
+                    event = "ccr_redis_connect_failed_on_put",
                     target = "ccr.redis",
                     hash = %hash,
                     error = %err,
@@ -111,6 +112,7 @@ impl CcrStore for RedisCcrStore {
             conn.set_ex(&key, payload.as_bytes(), self.default_ttl_seconds);
         if let Err(err) = &res {
             tracing::warn!(
+                event = "ccr_redis_put_failed",
                 target = "ccr.redis",
                 hash = %hash,
                 error = %err,
@@ -125,6 +127,7 @@ impl CcrStore for RedisCcrStore {
             conn.set_ex(self.born_key_for(hash), 1_u8, self.max_lifetime_seconds);
         if let Err(err) = born {
             tracing::warn!(
+                event = "ccr_redis_put_born_failed",
                 target = "ccr.redis",
                 hash = %hash,
                 error = %err,
@@ -140,6 +143,7 @@ impl CcrStore for RedisCcrStore {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!(
+                    event = "ccr_redis_connect_failed_on_get",
                     target = "ccr.redis",
                     hash = %hash,
                     error = %err,
@@ -154,6 +158,7 @@ impl CcrStore for RedisCcrStore {
             Ok(None) => return None,
             Err(err) => {
                 tracing::warn!(
+                    event = "ccr_redis_get_failed",
                     target = "ccr.redis",
                     hash = %hash,
                     error = %err,
@@ -176,6 +181,7 @@ impl CcrStore for RedisCcrStore {
                 conn.set_ex(&born_key, 1_u8, self.max_lifetime_seconds);
             if let Err(err) = backfill {
                 tracing::warn!(
+                    event = "ccr_redis_born_backfill_failed",
                     target = "ccr.redis",
                     hash = %hash,
                     error = %err,
@@ -194,6 +200,7 @@ impl CcrStore for RedisCcrStore {
         let rearm: redis::RedisResult<()> = conn.expire(&key, new_ttl as i64);
         if let Err(err) = rearm {
             tracing::warn!(
+                event = "ccr_redis_ttl_rearm_failed",
                 target = "ccr.redis",
                 hash = %hash,
                 error = %err,

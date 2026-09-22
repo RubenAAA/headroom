@@ -143,6 +143,7 @@ where
                     .saturating_mul(1u64 << (attempt - 1))
                     .min(ctx.max_delay_ms);
                 tracing::warn!(
+                    event = "stream_retry_dropped",
                     request_id = %ctx.request_id,
                     error = %e,
                     cause = ?e,
@@ -171,6 +172,7 @@ where
                     // Asking again would only spend the budget to hear it twice.
                     Ok(r) => {
                         tracing::warn!(
+                            event = "stream_retry_non_success",
                             request_id = %ctx.request_id,
                             status = r.status().as_u16(),
                             "retry of a dropped stream came back non-success; giving up"
@@ -183,6 +185,7 @@ where
                         // in `Debug`, and the cause is the whole question when
                         // a fresh request cannot get off the ground.
                         tracing::warn!(
+                            event = "stream_retry_send_failed",
                             request_id = %ctx.request_id,
                             error = %e2,
                             cause = ?e2,

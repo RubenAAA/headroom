@@ -26,6 +26,7 @@ fn drain_chat_events(
             Ok(ev) => {
                 if let Err(e) = state.apply(ev) {
                     tracing::warn!(
+                        event = "sse_openai_chat_apply_error",
                         request_id = %request_id,
                         error = %e,
                         "sse openai_chat state-machine apply error"
@@ -34,6 +35,7 @@ fn drain_chat_events(
             }
             Err(e) => {
                 tracing::warn!(
+                    event = "sse_openai_chat_framer_error",
                     request_id = %request_id,
                     error = %e,
                     "sse framer error"
@@ -56,6 +58,7 @@ fn drain_responses_events(
             Ok(ev) => {
                 if let Err(e) = state.apply(ev) {
                     tracing::warn!(
+                        event = "sse_openai_responses_apply_error",
                         request_id = %request_id,
                         error = %e,
                         "sse openai_responses state-machine apply error"
@@ -64,6 +67,7 @@ fn drain_responses_events(
             }
             Err(e) => {
                 tracing::warn!(
+                    event = "sse_openai_responses_framer_error",
                     request_id = %request_id,
                     error = %e,
                     "sse framer error"

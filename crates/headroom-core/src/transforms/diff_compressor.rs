@@ -414,6 +414,7 @@ impl DiffCompressor {
                 if !s.put(&key, content) {
                     tracing::warn!(
                         target: "ccr.diff_compressor",
+                        event = "ccr_put_failed",
                         hash = %key,
                         "ccr_put_failed; marker will point at an unretrievable hash"
                     );

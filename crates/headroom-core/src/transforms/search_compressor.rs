@@ -393,6 +393,7 @@ impl SearchCompressor {
                 let key = md5_hex_24(content);
                 if !store.put(&key, content) {
                     tracing::warn!(
+                        event = "ccr_put_failed",
                         target = "ccr.search_compressor",
                         hash = %key,
                         "ccr_put_failed; marker will point at an unretrievable hash"

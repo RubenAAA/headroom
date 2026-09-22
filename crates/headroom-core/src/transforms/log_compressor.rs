@@ -986,6 +986,7 @@ impl LogCompressor {
                 let key = md5_hex_24(content);
                 if !store.put(&key, content) {
                     tracing::warn!(
+                        event = "ccr_put_failed",
                         target = "ccr.log_compressor",
                         hash = %key,
                         "ccr_put_failed; marker will point at an unretrievable hash"

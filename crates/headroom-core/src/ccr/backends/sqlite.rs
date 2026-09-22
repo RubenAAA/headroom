@@ -182,6 +182,7 @@ impl SqliteCcrStore {
         // been just-deleted by another caller.
         if let Err(err) = self.purge_expired(&conn, now) {
             tracing::warn!(
+                event = "ccr_sqlite_purge_failed",
                 target = "ccr.sqlite",
                 error = %err,
                 "ccr_sqlite_purge_failed"
@@ -200,6 +201,7 @@ impl SqliteCcrStore {
             .optional()
             .unwrap_or_else(|err| {
                 tracing::warn!(
+                    event = "ccr_sqlite_get_failed",
                     target = "ccr.sqlite",
                     hash = %hash,
                     error = %err,
@@ -216,6 +218,7 @@ impl SqliteCcrStore {
             params![hash, now as i64],
         ) {
             tracing::warn!(
+                event = "ccr_sqlite_touch_failed",
                 target = "ccr.sqlite",
                 hash = %hash,
                 error = %err,
@@ -256,6 +259,7 @@ impl CcrStore for SqliteCcrStore {
         // don't panic, so the proxy keeps serving traffic.
         if let Err(err) = &res {
             tracing::warn!(
+                event = "ccr_sqlite_put_failed",
                 target = "ccr.sqlite",
                 hash = %hash,
                 error = %err,

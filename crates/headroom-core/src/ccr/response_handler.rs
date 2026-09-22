@@ -481,6 +481,7 @@ impl CCRResponseHandler {
                 };
                 if tool_call_id.is_empty() {
                     tracing::warn!(
+                        event = "ccr_response_missing_identifier",
                         provider,
                         "CCR tool call has no identifier; retrieval result cannot be matched"
                     );

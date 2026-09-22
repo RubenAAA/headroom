@@ -574,6 +574,7 @@ fn stream_vertex_response(
         }
         Err(e) => {
             tracing::warn!(
+                event = "vertex_stream_mid_response_error",
                 request_id = %rid_for_stream,
                 error = %e,
                 cause = ?e,
@@ -707,6 +708,7 @@ fn apply_framed_event(
         Ok(ev) => {
             if let Err(e) = state.apply(ev) {
                 tracing::warn!(
+                    event = "vertex_sse_apply_error",
                     request_id = %request_id,
                     error = %e,
                     "vertex sse anthropic state-machine apply error"
@@ -715,6 +717,7 @@ fn apply_framed_event(
         }
         Err(e) => {
             tracing::warn!(
+                event = "vertex_sse_framer_error",
                 request_id = %request_id,
                 error = %e,
                 "vertex sse framer error"

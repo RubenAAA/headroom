@@ -348,6 +348,7 @@ fn report_dispatch_error(
             // independent parse can only fail on a state we missed.
             // Pass through with the same byte-faithful guarantee.
             tracing::warn!(
+                event = "live_zone_dispatcher_rejected_json",
                 request_id = %request_id,
                 path = "/v1/messages",
                 "live-zone dispatcher rejected JSON body that this layer parsed; \
@@ -581,6 +582,7 @@ fn parse_anthropic_body(
         Ok(v) => Ok(v),
         Err(_) => {
             tracing::warn!(
+                event = "live_zone_non_json_passthrough",
                 request_id = %request_id,
                 path = "/v1/messages",
                 method = "POST",

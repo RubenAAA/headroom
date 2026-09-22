@@ -524,6 +524,7 @@ impl SavingsLedger {
             }
             Err(error) => {
                 tracing::warn!(
+                    event = "output_savings_ledger_unreadable",
                     %error,
                     path = %path.display(),
                     "output-savings ledger unreadable; starting empty"
@@ -535,6 +536,7 @@ impl SavingsLedger {
             Ok(ledger) => ledger,
             Err(error) => {
                 tracing::warn!(
+                    event = "output_savings_ledger_corrupt",
                     %error,
                     path = %path.display(),
                     "output-savings ledger corrupt; starting empty"

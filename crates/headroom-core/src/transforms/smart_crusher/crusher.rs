@@ -662,6 +662,7 @@ impl SmartCrusher {
 
         if self.config.fail_closed_on_protected_loss {
             tracing::warn!(
+                event = "crusher_protected_pattern_lost_failsafe",
                 lost,
                 "SmartCrusher audit_safe: protected pattern match(es) lost in compression; \
                  failing closed — returning original content uncompressed."
@@ -673,6 +674,7 @@ impl SmartCrusher {
             );
         }
         tracing::warn!(
+            event = "crusher_protected_pattern_lost_best_effort",
             lost,
             "SmartCrusher audit_safe: protected pattern match(es) lost in compression; \
              fail_closed_on_protected_loss=false — shipping best-effort result."
@@ -1166,6 +1168,7 @@ impl SmartCrusher {
             if let Some(store) = &self.ccr_store {
                 if !store.put(&h, &canonical) {
                     tracing::warn!(
+                        event = "ccr_put_failed",
                         target = "ccr.crusher",
                         hash = %h,
                         "ccr_put_failed; marker will point at an unretrievable hash"

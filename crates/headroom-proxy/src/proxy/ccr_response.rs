@@ -422,6 +422,7 @@ pub(super) fn parse_ccr_request(
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(
+                event = "ccr_request_unparseable",
                 request_id = %request_id,
                 error = %e,
                 "ccr: failed to parse original request; skipping CCR handling"
@@ -437,6 +438,7 @@ pub(super) fn parse_ccr_request(
 pub(super) fn check_ccr_round_budget(rounds: usize, max_rounds: usize, request_id: &str) -> bool {
     if rounds >= max_rounds {
         tracing::warn!(
+            event = "ccr_max_rounds_partial",
             request_id = %request_id,
             rounds = rounds,
             "ccr: max retrieval rounds reached; returning partial response"
@@ -611,6 +613,7 @@ pub(super) fn build_ccr_continuation(
         );
     } else {
         tracing::warn!(
+            event = "ccr_no_continuation_array",
             request_id = %request_id,
             field = items_field,
             "ccr: no continuation array in request; cannot continue"
@@ -625,6 +628,7 @@ pub(super) fn build_ccr_continuation(
         Ok(b) => Some(b),
         Err(e) => {
             tracing::warn!(
+                event = "ccr_continuation_serialize_failed",
                 request_id = %request_id,
                 error = %e,
                 "ccr: failed to serialize continuation request"
@@ -647,6 +651,7 @@ pub(super) fn unwrap_ccr_send(
         Ok(r) => Some(r),
         Err(e) => {
             tracing::warn!(
+                event = "ccr_continuation_send_failed",
                 request_id = %request_id,
                 attempts = attempts,
                 error_kind = e.as_ref().map_or("headers_timeout", ccr_transport_kind),
@@ -706,6 +711,7 @@ pub(super) async fn check_ccr_response_status(
     let status = resp.status();
     let detail = resp.text().await.unwrap_or_default();
     tracing::warn!(
+        event = "ccr_continuation_rejected",
         request_id = %request_id,
         attempts = attempts,
         status = %status,
@@ -778,6 +784,7 @@ async fn await_ccr_headers(
         Ok(r) => r.map_err(Some),
         Err(_) => {
             tracing::warn!(
+                event = "ccr_continuation_headers_timeout",
                 request_id = %request_id,
                 attempt = attempt,
                 timeout_secs = CCR_CONTINUATION_SEND_TIMEOUT.as_secs(),
@@ -893,6 +900,7 @@ fn note_ccr_retry(
 ) {
     match outcome {
         Err(Some(e)) => tracing::warn!(
+            event = "ccr_continuation_transport_error",
             request_id = %request_id,
             error_kind = ccr_transport_kind(e),
             error_chain = %ccr_error_chain(e),
@@ -904,6 +912,7 @@ fn note_ccr_retry(
         // nothing more to say, just back off and resend.
         Err(None) => {}
         Ok(r) => tracing::warn!(
+            event = "ccr_continuation_rejected_retrying",
             request_id = %request_id,
             status = %r.status(),
             attempt = attempt,
@@ -936,6 +945,7 @@ async fn note_ccr_body_stall(
         *cut_attempts += 1;
         crate::observability::ccr_retrieval::observe_continuation_retry();
         tracing::warn!(
+            event = "ccr_continuation_body_unreadable",
             request_id = %request_id,
             error = %error,
             cut_attempt = *cut_attempts,
@@ -946,6 +956,7 @@ async fn note_ccr_body_stall(
         return CcrRoundRead::Retry;
     }
     tracing::warn!(
+        event = "ccr_continuation_body_failed",
         request_id = %request_id,
         error = %error,
         "ccr: failed to read continuation response body"
@@ -980,6 +991,7 @@ async fn retry_or_fail_ccr_fold(
         *cut_attempts += 1;
         crate::observability::ccr_retrieval::observe_continuation_retry();
         tracing::warn!(
+            event = "ccr_continuation_unterminated",
             request_id = %request_id,
             body_bytes = bytes.len(),
             cut_attempt = *cut_attempts,
@@ -990,6 +1002,7 @@ async fn retry_or_fail_ccr_fold(
         return CcrRoundRead::Retry;
     }
     tracing::warn!(
+        event = "ccr_continuation_unparseable",
         request_id = %request_id,
         body_bytes = bytes.len(),
         content_type = %content_type,
@@ -1129,6 +1142,7 @@ pub(super) fn resolve_ccr_residual(
                 .collect();
             let spliced = handler.splice_ccr_results_as_text(current_response, &notes, provider);
             tracing::warn!(
+                event = "ccr_retrieve_unresolved",
                 request_id = %request_id,
                 status = %status,
                 residual = residual.len(),

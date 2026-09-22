@@ -188,6 +188,7 @@ pub fn emit_opaque_ccr_marker(
     if let Some(s) = store {
         if !s.put(&hash, payload) {
             tracing::warn!(
+                event = "ccr_put_failed",
                 target = "ccr.walker",
                 hash = %hash,
                 "ccr_put_failed; marker will point at an unretrievable hash"

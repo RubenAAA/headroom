@@ -357,6 +357,7 @@ impl ReadMaturationManager {
         if let Some(ref store) = self.store {
             if !store.put(&ccr_hash, content) {
                 tracing::warn!(
+                    event = "ccr_store_failed",
                     tool_call_id = %tc_id,
                     "read_maturation: CCR store failed"
                 );
