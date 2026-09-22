@@ -94,6 +94,9 @@ fi
 # holder killed without running the trap (SIGKILL, `| head` SIGPIPE
 # before PIPE was trapped, box crash) does not block future runs
 # forever: a dead holder's lock is stolen, a live one's is respected.
+# SC2317 disabled: release_lock runs via the EXIT/INT/TERM/PIPE trap below,
+# which shellcheck cannot see as a caller.
+# shellcheck disable=SC2317
 release_lock() {
     rm -f "$LOCKDIR/pid" 2>/dev/null
     rmdir "$LOCKDIR" 2>/dev/null || true

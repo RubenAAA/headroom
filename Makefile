@@ -8,7 +8,7 @@ PYTHON ?= python3
 FIXTURES ?= upstream-python/tests/parity/fixtures
 PREFIX ?= $(HOME)/.local
 
-.PHONY: help test test-unit test-int test-ml test-nextest test-nextest-unit test-nextest-int test-nextest-shard test-parity bench build-proxy install-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
+.PHONY: help test test-unit test-int test-ml test-nextest test-nextest-unit test-nextest-int test-nextest-shard test-parity bench build-proxy install-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks install-local-hooks what-to-run check-drift check-log-events scan-log test-touched verify-rust-core
 
 help:
 	@echo "Headroom Rust targets:"
@@ -43,6 +43,14 @@ help:
 	@echo "  make ci-precheck-python - smart_crusher-affected python tests (upstream mirror, not in ci-precheck)"
 	@echo "  make ci-precheck-commitlint - lint commits since origin/main"
 	@echo "  make install-git-hooks  - install pre-commit, commit-msg, and pre-push hooks"
+	@echo "  make install-local-hooks - install local-only pre-push (fmt+clippy+touched+drift, no CI/npx)"
+	@echo ""
+	@echo "Local blast-radius checks (no CI, no network):"
+	@echo "  make what-to-run [BASE=ref] - list suites covering changes (default HEAD = working tree)"
+	@echo "  make test-touched [BASE=ref] - run those suites"
+	@echo "  make check-drift  - flags.md freshness + shellcheck + HEADROOM_PROXY_* coverage"
+	@echo "  make check-log-events - new warn!/error! without event field fails"
+	@echo "  make scan-log     - anomaly scan over ~/headroom-proxy.log"
 
 test:
 	$(CARGO) test --workspace
@@ -253,6 +261,29 @@ ci-precheck-commitlint:
 
 install-git-hooks:
 	@upstream-python/scripts/install-git-hooks.sh
+
+install-local-hooks:
+	@bash scripts/install-local-hooks.sh
+
+# ─── Local blast-radius checks (no CI) ───────────────────────────────────
+# `what-to-run` maps working-tree changes to the suites that guard them;
+# `test-touched` runs them. BASE defaults to HEAD (working tree); pass
+# BASE=origin/main to map the whole branch range.
+BASE ?= HEAD
+what-to-run:
+	@bash scripts/what-to-run.sh --base $(BASE)
+
+test-touched:
+	@bash scripts/what-to-run.sh --base $(BASE) --run
+
+check-log-events:
+	@bash scripts/check-log-events.sh
+
+scan-log:
+	@bash scripts/scan-log.sh
+
+check-drift:
+	@bash scripts/check-drift.sh
 
 # ─── E2e Docker targets ────────────────────────────────────────────────────
 #

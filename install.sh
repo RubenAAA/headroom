@@ -113,6 +113,11 @@ for tool in jq lsof; do
     command -v "$tool" >/dev/null 2>&1 || say "WARNING: $tool not found — install it, the status line and restart script need it"
 done
 
+if ! command -v shellcheck >/dev/null 2>&1; then
+    say "shellcheck not found — optional. Without it 'make check-drift' skips its shell leg:"
+    say "  apt install shellcheck   (or: brew install shellcheck)"
+fi
+
 # ── binaries ──────────────────────────────────────────────────────────────
 step "Binaries"
 mkdir -p "$BIN_DIR"
@@ -240,23 +245,28 @@ fi
 step "Launcher"
 if [ "$LINK" = 1 ]; then
     ln -sfn "$CONTRIB/claude-launcher" "$BIN_DIR/claude-launcher"
+    ln -sfn "$CONTRIB/opencode-launcher" "$BIN_DIR/opencode-launcher"
     ln -sfn "$CONTRIB/restart-headroom.sh" "$BIN_DIR/restart-headroom.sh"
     ln -sfn "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
     ln -sfn "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     ln -sfn "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
     ln -sfn "$CONTRIB/concurrency-report.sh" "$BIN_DIR/concurrency-report.sh"
-    say "linked claude-launcher and restart-headroom.sh into the checkout"
+    say "linked claude-launcher, opencode-launcher and restart-headroom.sh into the checkout"
 else
     install -m 755 "$CONTRIB/claude-launcher" "$BIN_DIR/claude-launcher"
+    install -m 755 "$CONTRIB/opencode-launcher" "$BIN_DIR/opencode-launcher"
     install -m 755 "$CONTRIB/restart-headroom.sh" "$BIN_DIR/restart-headroom.sh"
     install -m 755 "$CONTRIB/zen-rotate-watch.sh" "$BIN_DIR/zen-rotate-watch.sh"
     install -m 755 "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     install -m 755 "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
     install -m 755 "$CONTRIB/concurrency-report.sh" "$BIN_DIR/concurrency-report.sh"
-    say "installed claude-launcher and restart-headroom.sh"
+    say "installed claude-launcher, opencode-launcher and restart-headroom.sh"
 fi
 ln -sfn claude-launcher "$BIN_DIR/cclaude"
 say "cclaude -> claude-launcher"
+ln -sfn opencode-launcher "$BIN_DIR/oopencode"
+ln -sfn opencode-launcher "$BIN_DIR/oopencode-work"
+say "oopencode, oopencode-work -> opencode-launcher"
 
 # ── VPN rotation ────────────────────────────────────────────────────────
 # zen-rotate-watch.sh rotates the VPN exit on upstream rate limits. The
@@ -309,6 +319,11 @@ if [ "$LINK" = 1 ]; then
         && mv "$CLAUDE_DIR/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh.bak"
     ln -sfn "$CONTRIB/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh"
 else
+    # `>` through a symlink truncates the target: on 2026-09-23
+    # ~/.claude/statusline-with-cache.sh symlinked into contrib/ and this
+    # redirect emptied the checkout file itself (the shell truncates before
+    # sed reads). Drop any symlink first so the redirect creates a real file.
+    rm -f "$CLAUDE_DIR/statusline-with-cache.sh"
     sed "s|\${HEADROOM_REPO:-\$HOME/headroom}|$REPO_DIR|g" \
         "$CONTRIB/statusline-with-cache.sh" > "$CLAUDE_DIR/statusline-with-cache.sh"
     chmod 755 "$CLAUDE_DIR/statusline-with-cache.sh"
@@ -410,9 +425,14 @@ const WANT = [
   ["PreToolUse",       "Write|Edit|MultiEdit", "review-gate.sh",   10],
   // Vendored since the redaction work but never registered, which is how a
   // masked path reached ~/.claude/settings.json on 2026-09-10 and broke the
-  // review hook it overwrote. Write paths only: on Bash it would block every
-  // grep for the token shape, including the one that finds a leak.
+  // review hook it overwrote. Bash joined on 2026-09-22: a model that had
+  // seen the marker format pasted invented tokens into its own Bash commands
+  // until the session wedged on ungreppable ids. The shape regex only fires
+  // on concrete `__HR_KIND_<hex>__` tokens, so greps for the mechanism
+  // itself ("headroom: unresolved", bare kind names, regexes) pass untouched;
+  // HEADROOM_SCRUB_BASH=0 skips the Bash leg for deliberate token archaeology.
   ["PreToolUse",       "Write|Edit|MultiEdit", "scrub-placeholders.sh", 5],
+  ["PreToolUse",       "Bash",                "scrub-placeholders.sh", 5],
   // Blocks commands that would dump credentials into the transcript. Bash
   // only: it reads the command line, and there is nothing to check on a write.
   ["PreToolUse",       "Bash",                "scrub-secrets.sh",  5],
