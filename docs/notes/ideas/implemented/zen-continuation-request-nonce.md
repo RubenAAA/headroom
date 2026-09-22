@@ -39,3 +39,14 @@
 - **Verify live:** after restart, `continuation 403` rate on zen routes over
   the next heavy-Spark window; `ccr: refreshed x-opencode-request` debug
   lines confirm the path is hit.
+- **Verified 2026-09-22: it did not move the 403 rate.** Running under the
+  built binary (2026-09-20) since 02:43Z, 4 of 8 Spark memory continuations
+  still returned 403, all at `attempt: 0, round: 1`. Message-id replay is
+  therefore not the sole trigger, as the mechanism note above suspected.
+  The refresh stays — it is client-faithful and free. Full measurement,
+  with the fallback-session and concurrency hypotheses ruled out:
+  `docs/notes/learnings/zen-memory-continuation-403.md`.
+  The "next step" named above was taken, but in the other direction: rather
+  than failing pre-stream, the empty-turn notice now fires on any turn the
+  client saw no visible text in. A thinking block used to suppress it,
+  which is what made these failures silent.
