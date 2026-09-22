@@ -852,7 +852,11 @@ mod prefilter {
                 (
                     CodeLanguage::Rust,
                     vec![
-                        c(r"(?m)^\s*(fn|struct|enum|impl|mod|use|pub)\s+"),
+                        // Bare `use` is shared with Perl (`use strict;` opens
+                        // nearly every Perl file): only a `::` path counts,
+                        // which Perl preludes never have but Rust imports do.
+                        c(r"(?m)^\s*(fn|struct|enum|impl|mod|pub)\s+"),
+                        c(r"(?m)^\s*use\s+[\w:]*::"),
                         c(r"(?m)^\s*#\["),
                     ],
                 ),
@@ -882,9 +886,15 @@ mod prefilter {
                 (
                     CodeLanguage::Perl,
                     vec![
+                        // Deliberately no bare `[$@%]\w+` pattern: sigils alone
+                        // match shell ($VAR), PHP ($sigil), decorators and
+                        // JSDoc tags, and Perl's permissive grammar then
+                        // accepts that non-Perl input as valid. Perl only
+                        // competes with a line-anchored keyword behind it;
+                        // anything weaker is left to Unknown (see the
+                        // no-other-candidate gate in `detect_language`).
                         c(r"(?m)^\s*(sub|package|use|require)\s+[\w:]+"),
                         c(r"(?m)^\s*(my|our|local)\s+[\$@%]"),
-                        c(r"(?m)[\$@%]\w+"),
                     ],
                 ),
                 (
@@ -951,6 +961,15 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
         return (CodeLanguage::Unknown, 0.0);
     }
 
+    // Perl's grammar accepts almost anything with a sigil in it, so a lone
+    // Perl candidacy on keyword-less code is a misdetection until proven
+    // otherwise: only let Perl compete when another language also matched
+    // (then tree-sitter settles it) or the fence tag said perl outright
+    // (handled by the caller via `coerce`, never reaching this gate).
+    if candidates.len() == 1 && candidates[0].0 == CodeLanguage::Perl {
+        return (CodeLanguage::Unknown, 0.0);
+    }
+
     // Disambiguation: TS superset of JS; C++ superset of C.
     let get = |cs: &[(CodeLanguage, i64)], l: CodeLanguage| {
         cs.iter().find(|(x, _)| *x == l).map(|(_, s)| *s)
@@ -974,6 +993,20 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
     ) {
         if cpp >= 2 {
             if let Some(e) = candidates.iter_mut().find(|(x, _)| *x == CodeLanguage::C) {
+                e.1 = 0;
+            }
+        }
+    }
+    // Rust vs C++: `::` paths are shared, so Rust code routinely nominates
+    // Cpp. Any Rust prefilter hit (`fn`/`impl`/`mod`/`pub` line-starts, a
+    // `::` import, `#[]`) is anchored Rust-only syntax, so Cpp stands down
+    // when one fires. (`#include`, `namespace` still let real C++ win.)
+    if let (Some(rust), Some(_cpp)) = (
+        get(&candidates, CodeLanguage::Rust),
+        get(&candidates, CodeLanguage::Cpp),
+    ) {
+        if rust >= 1 {
+            if let Some(e) = candidates.iter_mut().find(|(x, _)| *x == CodeLanguage::Cpp) {
                 e.1 = 0;
             }
         }
@@ -1051,6 +1084,10 @@ struct SyntaxBreakerState {
     outcomes: HashMap<String, VecDeque<bool>>,
     open_until: HashMap<String, Instant>,
     trips: HashMap<String, u64>,
+    /// Attempts skipped because the input never parsed: input noise, not
+    /// compressor failure. Reported on the trip line so a trip with a high
+    /// skip count reads as "mostly fragments" rather than "broken grammar".
+    invalid_input_skips: HashMap<String, u64>,
 }
 
 fn syntax_breaker_state() -> &'static Mutex<SyntaxBreakerState> {
@@ -1093,6 +1130,7 @@ fn record_syntax_outcome(language: &str, valid: bool) {
         return;
     }
     let mut tripped_failures = 0usize;
+    let mut tripped_skips = 0u64;
     {
         let mut state = syntax_breaker_state()
             .lock()
@@ -1111,7 +1149,15 @@ fn record_syntax_outcome(language: &str, valid: bool) {
                 Instant::now() + Duration::from_secs(SYNTAX_BREAKER_COOLDOWN_SECS),
             );
             *state.trips.entry(language.to_string()).or_insert(0) += 1;
-            // A fresh window after the cooldown must re-earn the trip.
+            tripped_skips = state
+                .invalid_input_skips
+                .get(language)
+                .copied()
+                .unwrap_or(0);
+            // A fresh window after the cooldown must re-earn the next
+            // pause. Skips are kept: they describe the traffic mix, not
+            // this window, and resetting them would hide a
+            // fragments-dominated stream.
             if let Some(window) = state.outcomes.get_mut(language) {
                 window.clear();
             }
@@ -1120,10 +1166,29 @@ fn record_syntax_outcome(language: &str, valid: bool) {
     }
     if tripped_failures > 0 {
         tracing::warn!(
+            event = "code_syntax_breaker_tripped",
+            language = language,
+            invalid_input_skipped = tripped_skips,
             "Code compression for {language} paused for {} min: {tripped_failures} of the last {SYNTAX_BREAKER_WINDOW} attempts produced invalid syntax and were discarded (HEADROOM_CODE_SYNTAX_BREAKER=0 disables this breaker)",
             SYNTAX_BREAKER_COOLDOWN_SECS / 60,
         );
     }
+}
+
+/// A fragment that never parsed is input noise, not a compressor failure:
+/// counted separately so the trip line can tell "broken grammar" apart from
+/// "mostly fragments". Never touches the failure window.
+fn record_syntax_input_skipped(language: &str) {
+    if !syntax_breaker_enabled() {
+        return;
+    }
+    let mut state = syntax_breaker_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *state
+        .invalid_input_skips
+        .entry(language.to_string())
+        .or_insert(0) += 1;
 }
 
 /// Per-language breaker state for one language, surfaced on `/stats`.
@@ -1201,7 +1266,11 @@ impl<'a> Ctx<'a> {
     /// Without this, one bad candidate invalidates the entire output and the
     /// compressor discards every other saving with it.
     fn validated_candidate(&self, node: Node, compressed: String) -> String {
-        if !self.recover_invalid_python_nodes || self.language != CodeLanguage::Python {
+        // Generalized beyond Python (upstream keeps the Python gate at
+        // `code_compressor.py:1567`): the splice-and-reparse check below is
+        // grammar-agnostic, so every language gets per-node reverts. The
+        // flag keeps its upstream name for parity.
+        if !self.recover_invalid_python_nodes {
             return compressed;
         }
         let original = &self.code[node.start_byte()..node.end_byte()];
@@ -1212,7 +1281,7 @@ impl<'a> Ctx<'a> {
         candidate_module.push_str(&self.code[..node.start_byte()]);
         candidate_module.push_str(&compressed);
         candidate_module.push_str(&self.code[node.end_byte()..]);
-        if verify_syntax_of(&candidate_module, CodeLanguage::Python) {
+        if verify_syntax_of(&candidate_module, self.language) {
             compressed
         } else {
             original.to_string()
@@ -1335,16 +1404,28 @@ impl CodeAwareCompressor {
         // Verify syntax validity (ERROR + MISSING).
         let mut syntax_valid = self.verify_syntax(&compressed, detected_lang);
 
+        // Input validity gates both recovery and the breaker verdict below:
+        // re-compressing already-broken input can't produce anything
+        // trustworthy, and a fragment that never parsed must not count
+        // against the grammar. Debug-level so hot loops don't pay log
+        // volume; the per-language split it produces is what separates a
+        // compressor bug from input noise.
+        let input_valid = self.verify_syntax(code, detected_lang);
+        tracing::debug!(
+            event = "code_syntax_verdict",
+            language = detected_lang.value(),
+            input_valid,
+            output_valid = syntax_valid,
+            "code-aware compression syntax verdict"
+        );
+
         // Recovery retry: one bad candidate would otherwise sink the entire
         // output and we'd serve the original uncompressed. If the SOURCE was
-        // valid Python, redo the pass validating each candidate individually so
+        // valid, redo the pass validating each candidate individually so
         // only the offending nodes revert and the rest of the saving survives.
-        // Gated on the original being valid — re-compressing already-broken
-        // input can't produce anything trustworthy.
-        if !syntax_valid
-            && detected_lang == CodeLanguage::Python
-            && self.verify_syntax(code, detected_lang)
-        {
+        // Generalized beyond Python (upstream gates on Python): the per-node
+        // check is grammar-agnostic.
+        if !syntax_valid && input_valid {
             if let Some((c, st, sc)) = self.compress_with_ast(code, detected_lang, context, true) {
                 compressed = c;
                 structure = st;
@@ -1354,10 +1435,15 @@ impl CodeAwareCompressor {
             }
         }
 
-        // The recovery retry above feeds the final verdict: a grammar that
-        // keeps mangling real code pauses AST attempts for a cooldown
-        // instead of burning the latency on every request.
-        record_syntax_outcome(detected_lang.value(), syntax_valid);
+        // The verdict feeds the breaker only for parseable input: punishing
+        // the grammar for fragments it never could parse masks real
+        // compressor bugs behind input noise. Skips are counted per language
+        // and reported on the trip line.
+        if input_valid {
+            record_syntax_outcome(detected_lang.value(), syntax_valid);
+        } else {
+            record_syntax_input_skipped(detected_lang.value());
+        }
 
         // Still broken → never serve invalid code.
         if !syntax_valid {
@@ -3020,8 +3106,8 @@ mod tests {
 
     #[test]
     fn validated_candidate_is_inert_outside_the_recovery_pass() {
-        // The first pass must not pay for per-candidate re-parsing, and
-        // non-Python languages never take this path at all.
+        // The first pass must not pay for per-candidate re-parsing; the
+        // flag gates the path for every language, not just Python.
         let code = "def alpha(x):\n    return x\n";
         let tree = parse_code(code, CodeLanguage::Python).expect("parses");
         let root = tree.root_node();
@@ -3190,6 +3276,31 @@ mod tests {
         let perl = "package Acme::Widget;\n\nuse strict;\nuse warnings;\n\nsub run {\n    my ($self) = @_;\n    return $self->{id};\n}\n\n1;\n";
         let (plang, _) = detect_language(perl);
         assert_eq!(plang, CodeLanguage::Perl, "PHP must not steal Perl");
+
+        // Sigils alone are not Perl: shell, PHP and prose `$vars` must not
+        // nominate it, and a lone sigil-only hit goes to Unknown.
+        for not_perl in [
+            "echo $HOME built in $BUILD_DIR ok\n",
+            "the price is $5 and $10 for @all of %them\n",
+            "$sigil $other @decorator %hash\n",
+        ] {
+            let (lang, _) = detect_language(not_perl);
+            assert_ne!(lang, CodeLanguage::Perl, "sigils misread: {not_perl:?}");
+        }
+    }
+
+    #[test]
+    fn rust_beats_cpp_on_shared_paths() {
+        // `::` nominates Cpp on Rust code; anchored Rust syntax overrules it.
+        let rust = "use std::collections::HashMap;\n\nfn get(map: &HashMap<String, u32>) -> u32 {\n    map[\"k\"]\n}\n";
+        let (lang, _) = detect_language(rust);
+        assert_eq!(lang, CodeLanguage::Rust, "Rust lost to Cpp on its own code");
+
+        // And the reverse: real C++ with no Rust markers still wins.
+        let cpp =
+            "#include <vector>\n\nint get(const std::vector<int>& v) {\n    return v[0];\n}\n";
+        let (lang, _) = detect_language(cpp);
+        assert_eq!(lang, CodeLanguage::Cpp, "C++ lost on its own code");
     }
 
     #[test]
@@ -3331,6 +3442,7 @@ mod tests {
         state.outcomes.clear();
         state.open_until.clear();
         state.trips.clear();
+        state.invalid_input_skips.clear();
     }
 
     #[test]
@@ -3383,6 +3495,61 @@ mod tests {
         record_syntax_outcome("typescript", false);
         assert!(!syntax_breaker_open("typescript"));
         reset_syntax_breaker();
+    }
+
+    #[test]
+    fn breaker_ignores_invalid_input_fragments() {
+        // Fragments that never parsed are input noise, not compressor
+        // failure: any number of skips must not trip the breaker.
+        let _guard = breaker_test_lock();
+        reset_syntax_breaker();
+        for _ in 0..SYNTAX_BREAKER_WINDOW * 2 {
+            record_syntax_input_skipped("rust");
+        }
+        assert!(
+            !syntax_breaker_open("rust"),
+            "skipped fragments must never trip the breaker"
+        );
+        // And failures on parseable input still trip afterwards: the skips
+        // did not dilute the window.
+        for _ in 0..SYNTAX_BREAKER_MIN_FAILURES {
+            record_syntax_outcome("rust", false);
+        }
+        assert!(syntax_breaker_open("rust"));
+        reset_syntax_breaker();
+    }
+
+    #[test]
+    fn validated_candidate_reverts_broken_candidate_in_rust() {
+        // Per-node recovery is grammar-agnostic, not Python-only.
+        let code = "fn alpha(x: i32) -> i32 {\n    x\n}\n";
+        let tree = parse_code(code, CodeLanguage::Rust).expect("parses");
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let func = root
+            .children(&mut cursor)
+            .find(|c| c.kind() == "function_item")
+            .expect("has a function");
+        let lang = lang_config(CodeLanguage::Rust).expect("rust config");
+        let analysis = SymbolAnalysis::default();
+        let body_limits = HashMap::new();
+        let config = CodeCompressorConfig::default();
+        let ctx = Ctx {
+            code,
+            code_lines: code.split('\n').collect(),
+            language: CodeLanguage::Rust,
+            lang: &lang,
+            body_limits: &body_limits,
+            analysis: &analysis,
+            config: &config,
+            recover_invalid_python_nodes: true,
+        };
+        let broken = "fn alpha(x: i32) -> i32 {\n".to_string();
+        assert_eq!(
+            ctx.validated_candidate(func, broken),
+            "fn alpha(x: i32) -> i32 {\n    x\n}",
+            "an unparseable candidate must revert even outside Python"
+        );
     }
 
     #[test]
