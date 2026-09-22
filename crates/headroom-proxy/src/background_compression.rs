@@ -140,7 +140,10 @@ impl BackgroundCompressor {
                 Err(e) => {
                     let mut s = stats.lock().await;
                     s.errors += 1;
-                    tracing::warn!("background compression failed for {key}: {e}");
+                    tracing::warn!(
+                        event = "background_compression_failed",
+                        "background compression failed for {key}: {e}"
+                    );
                 }
             }
             pending.lock().await.remove(&key);

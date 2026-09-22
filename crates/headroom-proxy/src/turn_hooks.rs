@@ -126,7 +126,7 @@ pub fn run_request_hooks(ctx: &mut TurnContext) {
             hook.on_request(ctx);
         }));
         if result.is_err() {
-            tracing::error!(hook = %hook.name(), "turn hook on_request panicked; skipped");
+            tracing::error!(event = "turn_hook_on_request_panicked", hook = %hook.name(), "turn hook on_request panicked; skipped");
         }
     }
 }
@@ -150,7 +150,7 @@ pub async fn run_response_hooks(
             Ok(Some(replacement)) => current = replacement,
             Ok(None) => {}
             Err(_) => {
-                tracing::error!(hook = %hook.name(), "turn hook on_response panicked; skipped");
+                tracing::error!(event = "turn_hook_on_response_panicked", hook = %hook.name(), "turn hook on_response panicked; skipped");
             }
         }
     }

@@ -919,7 +919,7 @@ async fn forward_to_gemini_upstream(
             })
         }
         Err(e) => {
-            tracing::error!(error = %e, "Gemini upstream request failed");
+            tracing::error!(event = "gemini_upstream_failed", error = %e, "Gemini upstream request failed");
             error_response(StatusCode::BAD_GATEWAY, "Upstream request failed", 502)
         }
     }

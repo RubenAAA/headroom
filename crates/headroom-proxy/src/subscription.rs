@@ -62,7 +62,11 @@ impl SubscriptionFetcher for HttpSubscriptionFetcher {
             return None;
         }
         if status != 200 {
-            tracing::warn!(status, "Anthropic usage API returned non-200");
+            tracing::warn!(
+                event = "subscription_usage_non200",
+                status,
+                "Anthropic usage API returned non-200"
+            );
             return None;
         }
 
@@ -83,7 +87,7 @@ pub fn spawn_poll_loop(
         loop {
             let t = tracker.clone();
             if let Err(err) = tokio::task::spawn_blocking(move || t.poll_once()).await {
-                tracing::warn!(%err, "subscription tracker poll task join error");
+                tracing::warn!(event = "subscription_poll_join_error", %err, "subscription tracker poll task join error");
             }
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}

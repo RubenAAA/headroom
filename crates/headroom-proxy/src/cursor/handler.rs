@@ -336,12 +336,18 @@ async fn start_fresh_turn(
     cursor_model: &str,
 ) -> Response {
     let (session, inbox) = state.cursor_bridge.open(&key).await;
+    // Whether the chat id came back from the bridge, stated rather than
+    // inferred. Without it, a respawn is only visible as a `--resume`-less
+    // start, and telling "the id was lost" apart from "there was no id yet"
+    // costs a rebuild.
+    let resumed_chat = session.chat_id().await.is_some();
     let tool_count = announce_host_tools(&session, parsed, &key).await;
     tracing::info!(
         event = "cursor_turn_started",
         conversation = %key,
         model = %cursor_model,
         tools = tool_count,
+        resumed_chat,
         "starting a cursor turn"
     );
 

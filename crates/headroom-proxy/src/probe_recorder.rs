@@ -77,7 +77,10 @@ pub fn probe_recorder_from_env() -> Option<CompressionEventRecorder> {
     match CompressionEventRecorder::new(&path) {
         Ok(r) => Some(r),
         Err(e) => {
-            tracing::warn!("probe recorder disabled ({RECORD_DIR_ENV}): {e}");
+            tracing::warn!(
+                event = "probe_recorder_disabled",
+                "probe recorder disabled ({RECORD_DIR_ENV}): {e}"
+            );
             None
         }
     }

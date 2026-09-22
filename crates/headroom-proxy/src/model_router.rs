@@ -117,7 +117,10 @@ impl ModelRouterConfig {
         let enabled = truthy(enabled_raw);
         let routes = parse_routes(routes_raw);
         if enabled && routes.is_empty() {
-            tracing::warn!("model router enabled but no valid routes configured; disabling");
+            tracing::warn!(
+                event = "model_router_no_routes",
+                "model router enabled but no valid routes configured; disabling"
+            );
             return Self {
                 enabled: false,
                 routes: Vec::new(),
@@ -145,6 +148,7 @@ impl ModelRouterConfig {
                 Ok(secs) => Some(Duration::from_secs(secs)),
                 Err(_) => {
                     tracing::warn!(
+                        event = "model_router_bad_cooldown",
                         "invalid HEADROOM_MODEL_ROUTER_COOLDOWN_SECS {s:?}; using the default"
                     );
                     None
@@ -428,12 +432,18 @@ fn parse_routes(routes_raw: Option<&str>) -> Vec<CostRule> {
     let parsed: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("invalid HEADROOM_MODEL_ROUTES JSON; ignoring: {e}");
+            tracing::warn!(
+                event = "model_routes_bad_json",
+                "invalid HEADROOM_MODEL_ROUTES JSON; ignoring: {e}"
+            );
             return Vec::new();
         }
     };
     let Value::Array(entries) = parsed else {
-        tracing::warn!("HEADROOM_MODEL_ROUTES must be a JSON array; ignoring");
+        tracing::warn!(
+            event = "model_routes_not_array",
+            "HEADROOM_MODEL_ROUTES must be a JSON array; ignoring"
+        );
         return Vec::new();
     };
 
@@ -454,7 +464,10 @@ struct Invalid;
 /// an invalid condition disables just that rule rather than widening it.
 fn route_from_entry(entry: &Value, index: usize) -> Option<CostRule> {
     let Value::Object(map) = entry else {
-        tracing::warn!("model route #{index} is not an object; skipping");
+        tracing::warn!(
+            event = "model_route_skipped",
+            "model route #{index} is not an object; skipping"
+        );
         return None;
     };
     reject_unknown_keys(map, index)?;
@@ -508,7 +521,10 @@ fn reject_unknown_keys(map: &serde_json::Map<String, Value>, index: usize) -> Op
     // A misspelled condition (e.g. "max_input_token") would otherwise be
     // ignored, silently widening the rule. Reject unknown keys instead.
     unknown.sort_unstable();
-    tracing::warn!("model route #{index} has unknown key(s) {unknown:?}; skipping route");
+    tracing::warn!(
+        event = "model_route_skipped",
+        "model route #{index} has unknown key(s) {unknown:?}; skipping route"
+    );
     None
 }
 
@@ -518,7 +534,10 @@ fn parse_to_model(map: &serde_json::Map<String, Value>, index: usize) -> Option<
     match map.get("to_model") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => {
-            tracing::warn!("model route #{index} missing string 'to_model'; skipping");
+            tracing::warn!(
+                event = "model_route_skipped",
+                "model route #{index} missing string 'to_model'; skipping"
+            );
             None
         }
     }
@@ -536,7 +555,10 @@ fn strict_bool_field(
         None => Some(false),
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => {
-            tracing::warn!("model route #{index} '{key}' must be a boolean; skipping route");
+            tracing::warn!(
+                event = "model_route_skipped",
+                "model route #{index} '{key}' must be a boolean; skipping route"
+            );
             None
         }
     }
@@ -554,6 +576,7 @@ fn parse_from_models(map: &serde_json::Map<String, Value>, index: usize) -> Opti
                     Value::String(s) => out.push(s.clone()),
                     _ => {
                         tracing::warn!(
+                            event = "model_route_skipped",
                             "model route #{index} 'from_models' must be a list of strings; skipping route"
                         );
                         return None;
@@ -564,6 +587,7 @@ fn parse_from_models(map: &serde_json::Map<String, Value>, index: usize) -> Opti
         }
         Some(_) => {
             tracing::warn!(
+                event = "model_route_skipped",
                 "model route #{index} 'from_models' must be a list of strings; skipping route"
             );
             None
@@ -582,14 +606,20 @@ fn strict_opt_int(value: Option<&Value>, key: &str, index: usize) -> Result<Opti
     };
     let parsed: i128 = match value {
         Value::Bool(_) => {
-            tracing::warn!("model route #{index} '{key}' must be an integer, not a boolean");
+            tracing::warn!(
+                event = "model_route_skipped",
+                "model route #{index} '{key}' must be an integer, not a boolean"
+            );
             return Err(Invalid);
         }
         Value::Number(n) => parse_json_number(n, key, index)?,
         other => parse_rendered_number(other, key, index)?,
     };
     if parsed < 0 {
-        tracing::warn!("model route #{index} '{key}' must be non-negative");
+        tracing::warn!(
+            event = "model_route_skipped",
+            "model route #{index} '{key}' must be non-negative"
+        );
         return Err(Invalid);
     }
     // Python's ints are unbounded; a bound above `u64::MAX` is unreachable
@@ -611,7 +641,10 @@ fn parse_json_number(n: &serde_json::Number, key: &str, index: usize) -> Result<
         None => match py_int_from_str(&n.to_string()) {
             Some(i) => Ok(i),
             None => {
-                tracing::warn!("model route #{index} '{key}' is not a valid integer");
+                tracing::warn!(
+                    event = "model_route_skipped",
+                    "model route #{index} '{key}' is not a valid integer"
+                );
                 Err(Invalid)
             }
         },
@@ -626,7 +659,10 @@ fn parse_rendered_number(other: &Value, key: &str, index: usize) -> Result<i128,
     match py_int_from_str(&rendered) {
         Some(i) => Ok(i),
         None => {
-            tracing::warn!("model route #{index} '{key}' is not a valid integer");
+            tracing::warn!(
+                event = "model_route_skipped",
+                "model route #{index} '{key}' is not a valid integer"
+            );
             Err(Invalid)
         }
     }

@@ -1061,6 +1061,7 @@ fn inject_api_key_fallback(upstream_headers: &mut HeaderMap, request_id: &str) {
         }
         _ => {
             tracing::warn!(
+                event = "codex_ws_no_auth",
                 request_id = %request_id,
                 "codex ws: no authorization header and OPENAI_API_KEY unset"
             );
@@ -1140,6 +1141,7 @@ fn split_handshake_headers(
         }
         Err(e) => {
             tracing::warn!(
+                event = "codex_ws_connect_fallback",
                 request_id = %request_id,
                 session_id = %session_id,
                 upstream = %upstream_url,
@@ -1572,7 +1574,7 @@ async fn run_codex_session_inner(
     // ── Relay (openai.py 4861-5778) ──
     let (mut up_sink, mut up_stream) = upstream.split();
     if let Err(e) = up_sink.send(TgMsg::Text(first_msg_raw.into())).await {
-        tracing::warn!(request_id = %ctx.request_id, error = %e, "codex ws first-frame upstream send failed");
+        tracing::warn!(event = "codex_ws_first_frame_send_failed", request_id = %ctx.request_id, error = %e, "codex ws first-frame upstream send failed");
         let _ = client_sink
             .send(AxMsg::Close(Some(CloseFrame {
                 code: 1011,
@@ -2018,6 +2020,7 @@ async fn handle_compression_failure(
         threshold,
     );
     tracing::warn!(
+        event = "codex_ws_first_frame_compression_failed",
         request_id = %ctx.request_id,
         refuse = action.refuse,
         reason = %action.reason,
@@ -2128,6 +2131,7 @@ async fn post_fallback_with_retry(
             Ok(Ok(resp)) => return Some(resp),
             Ok(Err(e)) => {
                 tracing::warn!(
+                    event = "codex_ws_http_fallback_failed",
                     request_id = %ctx.request_id,
                     attempt = attempt + 1,
                     error = %e,
@@ -2140,6 +2144,7 @@ async fn post_fallback_with_retry(
             }
             Err(_) => {
                 tracing::warn!(
+                    event = "codex_ws_http_fallback_headers_timeout",
                     request_id = %ctx.request_id,
                     attempt = attempt + 1,
                     timeout_s = WS_HTTP_FALLBACK_READ_TIMEOUT.as_secs(),
@@ -2185,6 +2190,7 @@ async fn relay_fallback_sse(
             Ok(chunk) => chunk,
             Err(e) => {
                 tracing::warn!(
+                    event = "codex_ws_http_fallback_ended_early",
                     request_id = %request_id,
                     error = ?e,
                     "ws http fallback stream ended early"
@@ -2222,7 +2228,7 @@ fn serialize_fallback_body(http_body: &Value, request_id: &str) -> Option<Vec<u8
     match serde_json::to_vec(http_body) {
         Ok(b) => Some(b),
         Err(e) => {
-            tracing::warn!(request_id = %request_id, error = %e, "ws http fallback: body serialize failed");
+            tracing::warn!(event = "codex_ws_http_fallback_serialize_failed", request_id = %request_id, error = %e, "ws http fallback: body serialize failed");
             None
         }
     }
@@ -2264,6 +2270,7 @@ async fn ws_http_fallback(
     if response.status() != reqwest::StatusCode::OK {
         let status = response.status().as_u16();
         tracing::warn!(
+            event = "codex_ws_http_fallback_non200",
             request_id = %ctx.request_id,
             status,
             "ws http fallback got non-200"

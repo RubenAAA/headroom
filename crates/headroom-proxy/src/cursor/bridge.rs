@@ -415,11 +415,22 @@ impl Bridge {
     /// follow-up turn without `--resume`.
     pub(crate) async fn close(&self, key: &str) {
         let removed = self.sessions.lock().await.remove(key);
+        let mut stashed = false;
         if let Some(session) = removed {
             if let Some(id) = session.chat_id().await {
                 self.chat_ids.lock().await.insert(key.to_string(), id);
+                stashed = true;
             }
         }
+        // A close that stashes nothing is what makes the next turn respawn, so
+        // it is worth a line of its own: the alternative is reading the absence
+        // of a `--resume` three events later and guessing why.
+        tracing::debug!(
+            event = "cursor_chat_stashed",
+            conversation = %key,
+            stashed,
+            "closing a cursor conversation"
+        );
         let parked = self.drivers.lock().await.remove(key);
         if let Some(mut parked) = parked {
             parked.driver.shutdown().await;

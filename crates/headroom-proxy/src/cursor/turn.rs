@@ -94,6 +94,10 @@ impl Conversation {
                     // The session was closed underneath us.
                     return Step::End;
                 };
+                // Recorded here too, not only on the emit arm. A turn that
+                // parks on a tool call and never comes back is closed with no
+                // chat id otherwise, and the conversation respawns.
+                self.record_chat_id().await;
                 let mut frames = self.running.translator.emit_parked_tool_use(
                     &parked.id,
                     &parked.name,

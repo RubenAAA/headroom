@@ -41,7 +41,7 @@ pub async fn ws_handler(
     let upstream_url = match build_upstream_ws_url(&state.config.upstream, req.uri()) {
         Ok(u) => u,
         Err(e) => {
-            tracing::warn!(error = %e, "failed to build upstream ws url");
+            tracing::warn!(event = "websocket_upstream_url_failed", error = %e, "failed to build upstream ws url");
             return (StatusCode::BAD_GATEWAY, e).into_response_body();
         }
     };
@@ -93,7 +93,7 @@ pub async fn ws_handler(
         )
         .await
         {
-            tracing::warn!(error = %e, "websocket pump ended with error");
+            tracing::warn!(event = "websocket_pump_error", error = %e, "websocket pump ended with error");
         }
     })
 }

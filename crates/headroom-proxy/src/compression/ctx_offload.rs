@@ -937,10 +937,17 @@ fn preview(text: &str, max_bytes: usize) -> String {
 /// which no agent has a tool for. Offload therefore looked healthy while
 /// nothing was ever retrieved: the content was reachable, but the only
 /// instruction the model ever saw pointed at a surface it could not use.
+///
+/// Naming the tool was not enough on its own. Written as a call signature —
+/// `headroom_retrieve(hash="…")` — the pointer reads as a named callable
+/// rather than a tool, and `headroom_retrieve` is a deferred tool, absent
+/// from the schema until something surfaces it. Sessions that met the
+/// pointer before that reached for the Skill tool and got "Unknown skill".
+/// So the footer says "tool" in words, which no other surface is called.
 fn footer(hash: &str, orig_len: usize) -> String {
     format!(
         "\n{MARKER_PREFIX}{hash}>> ({orig_len} bytes offloaded; \
-         retrieve: headroom_retrieve(hash=\"{hash}\"))"
+         use the headroom_retrieve tool with hash=\"{hash}\")"
     )
 }
 
@@ -2357,7 +2364,7 @@ mod tests {
         assert!(text.starts_with("1\t[[package]]"), "preview keeps the head");
         assert!(text.contains("truncated"));
         assert!(text.contains(&format!(
-            "retrieve: headroom_retrieve(hash=\"{}\")",
+            "use the headroom_retrieve tool with hash=\"{}\"",
             out.records[0].hash
         )));
         assert_eq!(out.records[0].original, body);
@@ -2405,17 +2412,17 @@ mod tests {
         assert_eq!(parsed, after_first);
     }
 
-    /// The pointer has to name a tool the model can actually call. Pinned
-    /// because pointing it at a shell command is what kept retrieval at zero:
-    /// the content was stored and reachable, and the model was told to run
-    /// something it has no way to run.
+    /// The pointer has to name a tool the model can actually call, and say
+    /// in words that it is a tool. Pinned because both halves have been got
+    /// wrong: first a shell command the model cannot run, then a bare call
+    /// signature that sessions mistook for a skill.
     #[test]
     fn marker_format_is_pinned() {
         let f = footer("abc123", 1234);
         assert_eq!(
             f,
             "\n<<ctx:abc123>> (1234 bytes offloaded; \
-             retrieve: headroom_retrieve(hash=\"abc123\"))"
+             use the headroom_retrieve tool with hash=\"abc123\")"
         );
     }
 

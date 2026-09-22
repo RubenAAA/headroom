@@ -143,11 +143,21 @@ impl Translator {
         let subtype = event.get("subtype").and_then(Value::as_str);
         let mut out = Vec::new();
 
+        // Every event carries `session_id`, not just `system/init` — verified
+        // against a live `cursor-agent -p --output-format stream-json` run, all
+        // eight events of it. Reading it from `init` alone loses the chat id
+        // whenever that one event does not reach here, and a lost chat id costs
+        // a full respawn: the next turn re-sends the whole transcript instead
+        // of resuming. Taking it from whatever arrives first removes the
+        // dependency on one event's timing.
+        if self.session_id.is_none() {
+            if let Some(id) = event.get("session_id").and_then(Value::as_str) {
+                self.session_id = Some(id.to_string());
+            }
+        }
+
         match (kind, subtype) {
             ("system", Some("init")) => {
-                if let Some(id) = event.get("session_id").and_then(Value::as_str) {
-                    self.session_id = Some(id.to_string());
-                }
                 out.extend(self.ensure_started());
             }
             ("thinking", Some("delta")) => {
@@ -689,6 +699,29 @@ mod tests {
         let mut t = Translator::new("m");
         t.push_line(r#"{"type":"system","subtype":"init","session_id":"9b5c3b0a-2e0b"}"#);
         assert_eq!(t.session_id.as_deref(), Some("9b5c3b0a-2e0b"));
+    }
+
+    /// Losing the chat id costs a full respawn, so it is taken from whatever
+    /// event arrives — `cursor-agent` puts `session_id` on every one of them,
+    /// and depending on `init` alone made the id hostage to that event's
+    /// timing.
+    #[test]
+    fn the_session_id_is_taken_from_any_event_not_only_init() {
+        let mut t = Translator::new("m");
+        t.push_line(
+            r#"{"type":"thinking","subtype":"delta","text":"hm","session_id":"from-thinking"}"#,
+        );
+        assert_eq!(t.session_id.as_deref(), Some("from-thinking"));
+    }
+
+    /// And the first one wins: a later event must not swap the chat the turn
+    /// has been resuming.
+    #[test]
+    fn a_later_session_id_does_not_replace_the_first() {
+        let mut t = Translator::new("m");
+        t.push_line(r#"{"type":"system","subtype":"init","session_id":"first"}"#);
+        t.push_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"session_id":"second"}"#);
+        assert_eq!(t.session_id.as_deref(), Some("first"));
     }
 
     /// A dead subprocess must still produce a terminated stream, or the caller

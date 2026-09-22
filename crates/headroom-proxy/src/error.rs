@@ -58,12 +58,12 @@ impl IntoResponse for ProxyError {
         if let ProxyError::Upstream(e) = &self {
             if e.is_timeout() {
                 let msg = format!("upstream timeout: {e}");
-                tracing::warn!(error = %msg, cause = ?e, "proxy error");
+                tracing::warn!(event = "proxy_error", error = %msg, cause = ?e, "proxy error");
                 return transient_response(msg);
             }
             if e.is_connect() || e.is_request() || e.is_body() {
                 let msg = format!("upstream transient error: {e}");
-                tracing::warn!(error = %msg, cause = ?e, "proxy error");
+                tracing::warn!(event = "proxy_error", error = %msg, cause = ?e, "proxy error");
                 return transient_response(msg);
             }
         }
@@ -82,7 +82,7 @@ impl IntoResponse for ProxyError {
             }
             ProxyError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
-        tracing::warn!(error = %msg, "proxy error");
+        tracing::warn!(event = "proxy_error", error = %msg, "proxy error");
         (status, msg).into_response()
     }
 }
