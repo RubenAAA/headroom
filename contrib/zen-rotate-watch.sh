@@ -122,7 +122,7 @@ Yemen
 )
 # Same geography as COUNTRIES, as 2-letter codes for the mullvad and protonvpn
 # providers (Mullvad takes lowercase, Proton takes either case).
-MULLVAD_COUNTRIES=(al ad am at az be ba bg cy hr cz dk ee fi fr ge de gr hu
+MULLVAD_COUNTRIES=(al ad am at az be ba bg cy hr cz dk ee 'fi' fr ge de gr hu
 is ie it lv li lt lu mt md mc me nl mk no pl pt ro rs sk si es se ch ua gb
 bh iq il jo kw lb qa tr ae ye)
 # PIA fallback when `piactl get regions` is unavailable (region ids vary by
@@ -139,7 +139,7 @@ VPN_SETTLE_SECS="${VPN_SETTLE_SECS:-8}"
 VPN_IFACE_STATE="$HOME/.zen-rotate.iface"
 VPN_OVPN_PID="$HOME/.zen-rotate.ovpn.pid"
 
-SUPPORTED_PROVIDERS="nordvpn mullvad expressvpn protonvpn surfshark pia tailscale wireguard openvpn custom none"
+SUPPORTED_PROVIDERS=(nordvpn mullvad expressvpn protonvpn surfshark pia tailscale wireguard openvpn custom none)
 
 # What `auto` would pick on this machine: first known CLI on PATH, else none.
 detect_vpn_provider() {
@@ -252,7 +252,8 @@ vpn_locations() {
   local provider
   provider=$(vpn_provider)
   if [[ -n "${VPN_LOCATIONS:-}" ]]; then
-    # shellcheck disable=SC2086: VPN_LOCATIONS is intentionally space-split.
+    # VPN_LOCATIONS is intentionally space-split.
+    # shellcheck disable=SC2086
     printf '%s\n' $VPN_LOCATIONS
     return 0
   fi
@@ -264,7 +265,7 @@ vpn_locations() {
     surfshark) printf 'quick\n' ;;
     pia)
       if command -v piactl >/dev/null 2>&1; then
-        piactl get regions 2>/dev/null | tr ', ' '\n\n' | grep -v '^$' || printf '%s\n' "${PIA_REGIONS[@]}"
+        piactl get regions 2>/dev/null | tr ', ' '\n' | grep -v '^$' || printf '%s\n' "${PIA_REGIONS[@]}"
       else
         printf '%s\n' "${PIA_REGIONS[@]}"
       fi ;;
@@ -669,7 +670,7 @@ done
 # exercise detect_vpn_provider / vpn_connect / vpn_locations in isolation.
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
   case "${1:-}" in
-    --list-providers) printf '%s\n' $SUPPORTED_PROVIDERS; exit 0 ;;
+    --list-providers) printf '%s\n' "${SUPPORTED_PROVIDERS[@]}"; exit 0 ;;
     --detect-provider) detect_vpn_provider; exit 0 ;;
     *) main "$@" ;;
   esac

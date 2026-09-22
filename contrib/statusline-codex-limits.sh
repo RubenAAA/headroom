@@ -51,7 +51,7 @@ age=$(printf '%s' "$snapshot" | jq -r '.age_seconds // 0' 2>/dev/null)
 # five-hour one. Anything else is reported in whatever unit divides cleanly.
 window_label() {
     local minutes=$1
-    [ -n "$minutes" ] && [ "$minutes" != "null" ] || { printf 'quota'; return; }
+    if [ -z "$minutes" ] || [ "$minutes" = "null" ]; then printf 'quota'; return; fi
     if [ "$minutes" -ge 1440 ] && [ $((minutes % 1440)) -eq 0 ]; then
         printf '%dd' $((minutes / 1440))
     elif [ "$minutes" -ge 60 ] && [ $((minutes % 60)) -eq 0 ]; then

@@ -28,7 +28,10 @@
 set -euo pipefail
 
 FLAGS_FILE="$HOME/.headroom-flags.sh"
-PROXY_URL="http://127.0.0.1:8787"
+# Overridable so a candidate binary can be tried on another port without
+# restarting the shared proxy and cutting every live session's stream. The
+# default is the only port anything else knows about.
+PROXY_URL="${HEADROOM_PROXY_URL:-http://127.0.0.1:8787}"
 # Same path restart-headroom.sh uses. They used to differ, so which log held the
 # current run depended on who started the proxy, and ~/headroom-savings.py reads
 # this one by name — a launcher-started proxy left it stale, which looks just

@@ -18,6 +18,7 @@ set -euo pipefail
 
 # Installed to ~/.local/bin by install.sh (symlinked under --link), so $0 says
 # nothing about where the checkout is. ~/.headroom-paths.sh does.
+# shellcheck disable=SC1091
 [ -r "$HOME/.headroom-paths.sh" ] && source "$HOME/.headroom-paths.sh"
 REPO_DIR="${HEADROOM_REPO:-$HOME/headroom}"
 [ -d "$REPO_DIR/contrib" ] || {

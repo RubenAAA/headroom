@@ -61,6 +61,7 @@ if [[ ! -r "$FLAGS_FILE" ]]; then
   exit 1
 fi
 # shellcheck source=$HOME/.headroom-flags.sh
+# shellcheck disable=SC1091
 source "$FLAGS_FILE"
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
@@ -75,7 +76,7 @@ listener_pid() {
     pid=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
   fi
   if [ -z "$pid" ]; then
-    pid=$(ss -ltnp 2>/dev/null | grep -E "[:.]$PORT[[:space:]]" |
+    pid=$(ss -ltnp 2>/dev/null | grep -E "[:.]${PORT}[[:space:]]" |
           grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
   fi
   printf '%s' "$pid"
@@ -248,8 +249,11 @@ if [[ -f "$BACKUP" ]]; then
     listening && break
     sleep 0.5
   done
-  listening && log "rollback OK: previous binary is serving again" \
-            || log "ROLLBACK FAILED: proxy is DOWN, start it by hand"
+  if listening; then
+    log "rollback OK: previous binary is serving again"
+  else
+    log "ROLLBACK FAILED: proxy is DOWN, start it by hand"
+  fi
   listening && ensure_watcher
 else
   log "no backup available; proxy is DOWN"

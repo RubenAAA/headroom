@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # The proxy settings that were measured, in one place.
 #
+# SC2034/SC2054 disabled file-wide: HEADROOM_FLAGS is consumed by sourcing
+# (restart-headroom.sh, claude-launcher), never referenced in this file.
+# shellcheck disable=SC2034,SC2054
+#
 # Two things start the headroom proxy: `restart-headroom.sh` after a build, and
 # `claude-launcher` when nothing is listening on 8787 — which is what happens
 # after every reboot. Whichever starts it decides its flags for its whole life,
@@ -106,7 +110,7 @@ HEADROOM_FLAGS=(
   # Consequence worth knowing: cwd-less subagent turns from *other* repos also
   # land here. Point it at a neutral directory instead if that matters more than
   # keeping this repo's subagents in this repo's workspace.
-  --memory-project-root $HOME/headroom
+  --memory-project-root "$HOME/headroom"
 
   # ON 2026-08-17. The replay store is in memory, so every restart of this proxy
   # threw away the forwarded prefixes and the first turn of each live
@@ -127,9 +131,9 @@ HEADROOM_FLAGS=(
   # 909 settled median for that depth — no restart penalty at all, where the
   # baseline for a 150-400 message conversation inside 300s of a start was 6,018.
   # Look for `prefix_replay_rehydrated` to confirm after any future restart.
-  --replay-store-dir $HOME/.local/state/headroom/replay-prefixes
+  --replay-store-dir "$HOME/.local/state/headroom/replay-prefixes"
 
-  --ctx-store-dir $HOME/.claude-personal/context-mode
+  --ctx-store-dir "$HOME/.claude-personal/context-mode"
 
   # 15000 -> 8000 on 2026-08-17. A block only offloads if the digest is smaller
   # in TOKENS, and the preview cut now scales with the block, so the floor is
@@ -502,7 +506,7 @@ HEADROOM_FLAGS=(
   # NOTE: `codex` CLI with CODEX_HOME unset reads $HOME/.codex/auth.json
   # (work account); keep this pointed there so the proxy and the CLI share
   # credentials and token refreshes.
-  --codex-auth-file $HOME/.codex/auth.json
+  --codex-auth-file "$HOME/.codex/auth.json"
 
   # Grok on the Cursor subscription, laid out like the Codex routes above: one
   # alias per effort level, each with a matching agent in ~/.claude/agents.
@@ -518,7 +522,7 @@ HEADROOM_FLAGS=(
   # request with the level the client asked for. Pick this one interactively.
   # The pinned aliases below exist for the subagents in ~/.claude/agents, which
   # need a fixed tier per agent and do not run /effort.
-  --extra-model-route claude-grok-4.6=cursor:cursor-grok-4.6-{effort}
+  --extra-model-route "claude-grok-4.6=cursor:cursor-grok-4.6-{effort}"
   --extra-model-route claude-grok-4.6-xhigh=cursor:cursor-grok-4.6-xhigh
   --extra-model-route claude-grok-4.6-high=cursor:cursor-grok-4.6-high
   --extra-model-route claude-grok-4.6-low=cursor:cursor-grok-4.6-low

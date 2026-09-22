@@ -11,6 +11,7 @@ nothing here is on the request path.
 | File | Installed as | What it does |
 | --- | --- | --- |
 | `claude-launcher` | `~/.local/bin/claude-launcher`, `cclaude` | Starts the proxy if port 8787 is dead, sets `ANTHROPIC_BASE_URL`, execs `claude`. Handles several profiles and an optional local Qwen. |
+| `opencode-launcher` | `~/.local/bin/opencode-launcher`, `oopencode`, `oopencode-work` | The `cclaude` equivalent for opencode: starts/reuses the proxy, injects a `headroom` provider via `OPENCODE_CONFIG_CONTENT`, execs `opencode`. `oopencode-work` adds `--context --auto`. |
 | `restart-headroom.sh` | `~/.local/bin/` | Restarts the proxy onto a freshly built binary and rolls back if it fails to come up. Detached, so killing the proxy does not kill the restart. |
 | `update-headroom.sh` | `~/.local/bin/` | Pulls the checkout, reinstalls in the last install's mode, restarts the proxy. Run after `git pull`, or instead of it. |
 | `concurrency-report.sh` | `~/.local/bin/` | Verdict on the 2026-09-15 concurrency fixes from the proxy log: sidecar 404 fallbacks, Zen slot timeouts, proxy-side stalls, and whether `--cache-stampede-gate` held any follower that then read cache. Run after a day of use; it says when to drop the gate flag. |
@@ -50,7 +51,7 @@ session.
 | `review-gate.sh` | UserPromptSubmit, PreToolUse (Bash, writes), Stop | Only a review articulation it diverts to a worker |
 | `ticket-gate.sh` | UserPromptSubmit, PreToolUse (Bash) | Only a YouTrack filing it diverts to a worker |
 | `scrub-secrets.sh` | PreToolUse (Bash) | Yes — commands that would print credentials into the transcript |
-| `scrub-placeholders.sh` | PreToolUse (writes) | Yes — redaction tokens that would land literally in code or docs |
+| `scrub-placeholders.sh` | PreToolUse (writes, Bash) | Yes — redaction tokens that would land literally in code or docs, or wedge a session when pasted into commands; `HEADROOM_SCRUB_BASH=0` skips the Bash leg |
 | `shared-worktree-guard.sh` | PreToolUse (Bash) | Yes — the destructive git commands banned by `.agents/SHARED-WORKTREE-PROTOCOL.md`, but only while another agent is live in the same toplevel |
 | `peer-awareness.sh` | SessionStart, UserPromptSubmit | No — reports other sessions sharing the checkout |
 | `stale-branch.sh` | SessionStart | No — one-time notice when the branch trails its origin |
