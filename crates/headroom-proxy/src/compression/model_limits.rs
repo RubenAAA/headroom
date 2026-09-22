@@ -169,9 +169,14 @@ mod tests {
         // renames the canonical Claude entry we want a test failure
         // — not a silent fall-through to DEFAULT_CONTEXT_WINDOW.
         // Pick a model we expect to remain stable: claude-sonnet-4-5
-        // (current as of the snapshot fetch).
+        // (current as of the snapshot fetch; LiteLLM bumped its
+        // window from 200K to 1M on 2026-02-11).
         let n = context_window_for("claude-sonnet-4-5-20250929");
-        assert_eq!(n, 200_000, "claude-sonnet-4-5 should be 200K input window");
+        assert_eq!(n, 1_000_000, "claude-sonnet-4-5 should be 1M input window");
+        // Opus 5.5 ships with a 1M window (refresh 2026-09; fallback would
+        // be the 128K default, which would over-compress every request).
+        let n55 = context_window_for("claude-opus-5-5");
+        assert_eq!(n55, 1_000_000, "claude-opus-5-5 should be 1M input window");
     }
 
     #[test]

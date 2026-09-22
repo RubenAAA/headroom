@@ -202,6 +202,7 @@ static TABLE: &[(&str, ModelPricing)] = &[
     // under-reported by more than half.
     ("claude-fable-5", per_1m_ttl(10.0, 50.0, 1.0, 12.5, 20.0)),
     ("claude-mythos-5", per_1m_ttl(10.0, 50.0, 1.0, 12.5, 20.0)),
+    ("claude-opus-5-5", per_1m_ttl(4.0, 20.0, 0.4, 5.0, 8.0)),
     ("claude-opus-5", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
     ("claude-opus-4-8", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
     ("claude-opus-4-7", per_1m_ttl(5.0, 25.0, 0.5, 6.25, 10.0)),
@@ -250,6 +251,11 @@ static TABLE: &[(&str, ModelPricing)] = &[
     ("gpt-5-mini", per_1m(0.25, 2.0, Some(0.025), None)),
     ("gpt-5-nano", per_1m(0.05, 0.4, Some(0.005), None)),
     ("gpt-5", per_1m(1.25, 10.0, Some(0.125), None)),
+    // GPT-6 line, verified 2026-09-22 (USD per 1M; no cache-write price
+    // published, like the rest of the OpenAI family).
+    ("gpt-6-astra", per_1m(10.0, 50.0, Some(1.0), None)),
+    ("gpt-6-sol", per_1m(2.0, 10.0, Some(0.2), None)),
+    ("gpt-6-luna", per_1m(0.10, 0.50, Some(0.01), None)),
     ("gpt-4o-mini", per_1m(0.15, 0.60, Some(0.075), None)),
     ("gpt-4o", per_1m(2.5, 10.0, Some(1.25), None)),
     ("gpt-4.1-nano", per_1m(0.10, 0.40, Some(0.025), None)),
