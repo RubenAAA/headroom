@@ -18,9 +18,12 @@
 //! lowercase to the same upstream names again).
 //!
 //! Fail-open by construction: when two client tools collide after
-//! lowercasing the layer switches off for the turn (both directions
-//! derive from the same list, so they agree); names outside the map pass
-//! through untouched in both directions, which keeps proxy-internal tools
+//! lowercasing, the outbound rename switches off for the turn (forwarding
+//! one of them would misroute history). Inbound still restores whatever is
+//! unambiguous: a shadow call that case-insensitively matches exactly one
+//! real client tool comes back in the client's casing, while an ambiguous
+//! lowering (two clients, one lowered form) and names outside the map pass
+//! through untouched — which keeps proxy-internal tools
 //! (`memory_search`, `headroom_retrieve`) and model hallucinations on
 //! today's behavior.
 
@@ -28,11 +31,16 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 /// Client-name → upstream-name and back, derived from one tool list.
-/// Empty (inactive) when there is nothing to map.
+/// Empty (inactive) when there is nothing to map. `ci_unique` is the
+/// case-insensitive fallback: lowered client name → client name, kept only
+/// for lowered forms claimed by exactly one client tool, so a shadow call
+/// that uniquely matches a real client tool restores even on turns where
+/// the strict layer is off.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolAlias {
     forward: HashMap<String, String>,
     reverse: HashMap<String, String>,
+    ci_unique: HashMap<String, String>,
 }
 
 /// The core tool names Zen's free-tier gate looks for (probed live
@@ -48,8 +56,10 @@ pub(crate) const ZEN_GATE_CORE_TOOLS: [&str; 5] = ["bash", "edit", "glob", "grep
 /// boring and marker-free: probed live 2026-09-18, meta language here
 /// ("do not call", "routing marker") flips the gate back to 403 even
 /// with the right names — neutral one-liners pass. A model call to a
-/// shadow passes through to the client visibly (there is no silent
-/// execution path for a tool the client never declared).
+/// shadow with no matching client tool passes through to the client
+/// visibly (there is no silent execution path for a tool the client never
+/// declared); one that uniquely matches a real client tool
+/// case-insensitively restores to the client's casing instead.
 fn shadow_description(name: &str) -> &'static str {
     match name {
         "bash" => "Executes a shell command in a persistent session and returns its output.",
@@ -81,9 +91,10 @@ fn shadow_tool(name: &str) -> Value {
 /// appended, for logging.
 ///
 /// Shadows are visible to the model (the gate and the model read the
-/// same body — there is no hiding). A model call to one passes back
-/// through [`ToolAlias::reverse_turn`] untouched, exactly like any tool
-/// the client never declared.
+/// same body — there is no hiding). A model call to one comes back
+/// through [`ToolAlias::reverse_turn`]: restored to the client's casing
+/// when it uniquely matches a real client tool case-insensitively,
+/// otherwise untouched exactly like any tool the client never declared.
 pub(crate) fn ensure_gate_tools(openai_body: &mut Value) -> usize {
     let exact: HashSet<String> = openai_body
         .get("tools")
@@ -126,34 +137,65 @@ pub(crate) fn ensure_gate_tools(openai_body: &mut Value) -> usize {
 
 impl ToolAlias {
     /// Derive the mapping from an Anthropic `tools` array (`[{name, …}]`).
-    /// Inactive when the list is missing/empty or two names collide after
-    /// lowercasing — the turn then goes out exactly as translated today.
+    /// Inactive when the list is missing/empty. On a lowercasing collision
+    /// the strict rename switches off (forward and reverse stay empty —
+    /// the turn goes out exactly as translated today) but the
+    /// case-insensitive fallback keeps every unambiguous entry, so a
+    /// shadow call matching exactly one client tool still restores.
     pub(crate) fn derive(client_tools: Option<&Vec<Value>>) -> Self {
         let Some(tools) = client_tools else {
             return Self::default();
         };
-        let mut forward = HashMap::new();
-        let mut seen_lower = HashSet::new();
+        let mut names: Vec<String> = Vec::new();
         for tool in tools {
             let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            let lowered = name.to_ascii_lowercase();
-            if !seen_lower.insert(lowered.clone()) {
-                // Collision: reversing would be ambiguous, so the whole
-                // layer stays off rather than misrouting one call.
-                return Self::default();
-            }
-            forward.insert(name.to_string(), lowered);
+            names.push(name.to_string());
         }
-        if forward.is_empty() {
+        if names.is_empty() {
             return Self::default();
         }
+        let mut claimants: HashMap<String, Vec<String>> = HashMap::new();
+        for name in &names {
+            claimants
+                .entry(name.to_ascii_lowercase())
+                .or_default()
+                .push(name.clone());
+        }
+        let ci_unique: HashMap<String, String> = claimants
+            .iter()
+            .filter_map(|(lowered, owners)| {
+                if owners.len() == 1 {
+                    Some((lowered.clone(), owners[0].clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if claimants.values().any(|owners| owners.len() > 1) {
+            // Collision: reversing strictly would be ambiguous, so the
+            // rename layer stays off rather than misrouting one call.
+            // The unambiguous fallback above still stands.
+            return Self {
+                forward: HashMap::new(),
+                reverse: HashMap::new(),
+                ci_unique,
+            };
+        }
+        let forward: HashMap<String, String> = names
+            .iter()
+            .map(|name| (name.clone(), name.to_ascii_lowercase()))
+            .collect();
         let reverse = forward
             .iter()
             .map(|(client, upstream)| (upstream.clone(), client.clone()))
             .collect();
-        Self { forward, reverse }
+        Self {
+            forward,
+            reverse,
+            ci_unique,
+        }
     }
 
     /// True when names were derived (identity mappings included — a
@@ -171,10 +213,21 @@ impl ToolAlias {
     }
 
     /// Client name for an upstream tool name, for everything handed back.
-    /// Unknown names pass through (model hallucinations stay visible
-    /// rather than being quietly dropped or misattributed).
+    /// Exact strict-map hits first; on a miss the case-insensitive
+    /// fallback restores a shadow call that uniquely matches one real
+    /// client tool (e.g. shadow `glob` → client `Glob` on a collision
+    /// turn where the strict map is off, or an odd-cased `GLOB`).
+    /// Ambiguous lowerings and names outside the map pass through (model
+    /// hallucinations stay visible rather than being quietly dropped or
+    /// misattributed).
     pub(crate) fn reverse_name<'a>(&'a self, name: &'a str) -> &'a str {
-        self.reverse.get(name).map(String::as_str).unwrap_or(name)
+        if let Some(mapped) = self.reverse.get(name) {
+            return mapped;
+        }
+        self.ci_unique
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+            .unwrap_or(name)
     }
 
     /// Rename an OpenAI Responses request body in place: `tools[]`
@@ -236,9 +289,12 @@ impl ToolAlias {
 
     /// Restore an Anthropic turn in place: `content[]` tool_use blocks go
     /// back to client names before delivery. Returns how many names
-    /// actually changed, for logging.
+    /// actually changed, for logging. Runs whenever either the strict map
+    /// or the unambiguous fallback has entries — on a collision turn the
+    /// outbound rename is off but shadow calls to unique client tools
+    /// still restore.
     pub(crate) fn reverse_turn(&self, anthropic_turn: &mut Value) -> usize {
-        if !self.active() {
+        if self.reverse.is_empty() && self.ci_unique.is_empty() {
             return 0;
         }
         let mut restored = 0;
@@ -341,6 +397,62 @@ mod tests {
         assert_eq!(alias.reverse_turn(&mut turn), 1);
         assert_eq!(turn["content"][1]["name"], json!("Read"));
         assert_eq!(turn["content"][2]["name"], json!("memory_search"));
+    }
+
+    /// The 2026-09-24 `glob` incident: on a collision turn the strict
+    /// rename is off, but a shadow call that uniquely matches one real
+    /// client tool still restores instead of reaching the client as a
+    /// lowercase name it rejects (`No such tool available: glob`).
+    #[test]
+    fn collision_turn_restores_unambiguous_shadow_call() {
+        let client = vec![
+            json!({"name": "read"}),
+            json!({"name": "Read"}),
+            json!({"name": "Bash"}),
+        ];
+        let alias = ToolAlias::derive(Some(&client));
+        assert!(!alias.active());
+        // Outbound stays off: nothing renamed.
+        let mut body = json!({
+            "model": "m",
+            "tools": [
+                {"type": "function", "name": "read"},
+                {"type": "function", "name": "Read"},
+                {"type": "function", "name": "Bash"},
+            ],
+        });
+        assert_eq!(alias.forward_body(&mut body), 0);
+        // Unambiguous shadow target restores; the collided pair and tools
+        // the client never declared pass through untouched.
+        assert_eq!(alias.reverse_name("bash"), "Bash");
+        assert_eq!(alias.reverse_name("read"), "read");
+        assert_eq!(alias.reverse_name("glob"), "glob");
+        assert_eq!(alias.reverse_name("memory_search"), "memory_search");
+        let mut turn = json!({
+            "content": [
+                {"type": "tool_use", "id": "c1", "name": "bash", "input": {}},
+                {"type": "tool_use", "id": "c2", "name": "read", "input": {}},
+                {"type": "tool_use", "id": "c3", "name": "glob", "input": {}},
+            ],
+        });
+        assert_eq!(alias.reverse_turn(&mut turn), 1);
+        assert_eq!(turn["content"][0]["name"], json!("Bash"));
+        assert_eq!(turn["content"][1]["name"], json!("read"));
+        assert_eq!(turn["content"][2]["name"], json!("glob"));
+    }
+
+    /// Inbound is case-insensitive: an odd-cased call restores to the
+    /// client's spelling, and an already-correct name is untouched.
+    #[test]
+    fn reverse_restores_odd_cased_calls() {
+        let alias = ToolAlias::derive(Some(&vec![
+            json!({"name": "Glob"}),
+            json!({"name": "Read"}),
+        ]));
+        assert!(alias.active());
+        assert_eq!(alias.reverse_name("GLOB"), "Glob");
+        assert_eq!(alias.reverse_name("Glob"), "Glob");
+        assert_eq!(alias.reverse_name("grep"), "grep");
     }
 
     #[test]
