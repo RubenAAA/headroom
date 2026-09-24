@@ -150,38 +150,13 @@ pub(crate) async fn send_with_retry(
     // byte of the answer (it rides in the response body) — except while the
     // turn is parked in the 429 hold, which is waiting on that egress's
     // rotation and must not block its drain.
-    let (upstream_client, egress_slot, egress_id, mut egress_guard) = if is_zen {
-        match state.zen_client_for_lane(lane_key) {
-            Ok(selection) => selection,
-            Err(egress_id) => {
-                tracing::debug!(
-                    event = "zen_egress_maintenance_reject",
-                    egress_id,
-                    request_id = %request_id,
-                    "rejecting request while its provider egress is rotating"
-                );
-                return Err(crate::error::transient_response(
-                    "the selected Zen egress is rotating; retry this turn shortly".to_string(),
-                ));
-            }
-        }
-    } else {
-        (&state.client, 0, state.default_egress_id.as_str(), None)
-    };
+    let (upstream_client, egress_slot, egress_id, mut egress_guard) =
+        select_upstream_client(state, lane_key, request_id, is_zen)?;
     let upstream_host = crate::routed::upstream_gate::upstream_host(upstream_url)
         .unwrap_or_else(|| "unknown-upstream".to_string());
     let egress_gate_key = format!("{upstream_host}#{egress_id}");
     if is_zen {
-        tracing::debug!(
-            event = "zen_egress_selected",
-            egress_id,
-            egress_slot,
-            lane_key_hash = %lane_key
-                .map(crate::cache_stabilization::drift_detector::session_key_log_prefix)
-                .unwrap_or_default(),
-            request_id = %request_id,
-            "selected sticky provider egress for routed stream lane"
-        );
+        log_zen_egress_selected(egress_id, egress_slot, lane_key, request_id);
     }
     let mut refreshed = false;
     let mut attempt: u32 = 0;
@@ -227,28 +202,16 @@ pub(crate) async fn send_with_retry(
         match result {
             Ok(r) => {
                 let status = r.status();
-                tracing::info!(
-                    target: "headroom.proxy",
-                    event = "routed_upstream_response_headers",
-                    request_id = %request_id,
-                    upstream_host = %upstream_host,
-                    upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
-                    configured_http_proxy = state.config.http_proxy.is_some(),
-                    upstream_peer = ?r.remote_addr(),
-                    upstream_http_version = ?r.version(),
-                    upstream_status = status.as_u16(),
+                log_response_headers(
+                    state,
+                    &r,
+                    request_id,
+                    &upstream_host,
+                    attempt_started,
                     attempt,
-                    "routed upstream response headers became available"
                 );
                 if is_zen && status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    tracing::warn!(
-                        event = "zen_egress_rate_limited",
-                        egress_id,
-                        egress_slot,
-                        status = status.as_u16(),
-                        request_id = %request_id,
-                        "Zen rate limit observed on this provider egress"
-                    );
+                    log_zen_rate_limited(egress_id, egress_slot, status, request_id);
                 }
                 if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed && is_chatgpt_auth {
                     drop(probe);
@@ -346,16 +309,13 @@ pub(crate) async fn send_with_retry(
                 break r;
             }
             Err(e) => {
-                tracing::warn!(
-                    target: "headroom.proxy",
-                    event = "routed_upstream_send_failed",
-                    request_id = %request_id,
-                    upstream_host = %upstream_host,
-                    upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
-                    configured_http_proxy = state.config.http_proxy.is_some(),
-                    error_kind = transport_error_kind(&e),
+                log_send_failed(
+                    state,
+                    &e,
+                    request_id,
+                    &upstream_host,
+                    attempt_started,
                     attempt,
-                    "routed upstream send failed"
                 );
                 drop(probe);
                 // Same filter the Claude path uses: a decode or builder error
@@ -384,6 +344,109 @@ pub(crate) async fn send_with_retry(
         slow_probe,
         retried_without_replay: None,
     })
+}
+
+/// The client to send on. A Zen turn gets its lane's sticky egress; one whose
+/// egress is rotating is refused with a transient error the client retries.
+#[allow(clippy::result_large_err)]
+fn select_upstream_client<'a>(
+    state: &'a AppState,
+    lane_key: Option<&str>,
+    request_id: &str,
+    is_zen: bool,
+) -> Result<crate::proxy::ZenEgressSelection<'a>, Response> {
+    if !is_zen {
+        return Ok((&state.client, 0, state.default_egress_id.as_str(), None));
+    }
+    state.zen_client_for_lane(lane_key).map_err(|egress_id| {
+        tracing::debug!(
+            event = "zen_egress_maintenance_reject",
+            egress_id,
+            request_id = %request_id,
+            "rejecting request while its provider egress is rotating"
+        );
+        crate::error::transient_response(
+            "the selected Zen egress is rotating; retry this turn shortly".to_string(),
+        )
+    })
+}
+
+fn log_zen_egress_selected(
+    egress_id: &str,
+    egress_slot: usize,
+    lane_key: Option<&str>,
+    request_id: &str,
+) {
+    tracing::debug!(
+        event = "zen_egress_selected",
+        egress_id,
+        egress_slot,
+        lane_key_hash = %lane_key
+            .map(crate::cache_stabilization::drift_detector::session_key_log_prefix)
+            .unwrap_or_default(),
+        request_id = %request_id,
+        "selected sticky provider egress for routed stream lane"
+    );
+}
+
+fn log_response_headers(
+    state: &AppState,
+    r: &reqwest::Response,
+    request_id: &str,
+    upstream_host: &str,
+    attempt_started: std::time::Instant,
+    attempt: u32,
+) {
+    tracing::info!(
+        target: "headroom.proxy",
+        event = "routed_upstream_response_headers",
+        request_id = %request_id,
+        upstream_host = %upstream_host,
+        upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
+        configured_http_proxy = state.config.http_proxy.is_some(),
+        upstream_peer = ?r.remote_addr(),
+        upstream_http_version = ?r.version(),
+        upstream_status = r.status().as_u16(),
+        attempt,
+        "routed upstream response headers became available"
+    );
+}
+
+fn log_zen_rate_limited(
+    egress_id: &str,
+    egress_slot: usize,
+    status: reqwest::StatusCode,
+    request_id: &str,
+) {
+    tracing::warn!(
+        event = "zen_egress_rate_limited",
+        egress_id,
+        egress_slot,
+        status = status.as_u16(),
+        request_id = %request_id,
+        "Zen rate limit observed on this provider egress"
+    );
+}
+
+fn log_send_failed(
+    state: &AppState,
+    e: &reqwest::Error,
+    request_id: &str,
+    upstream_host: &str,
+    attempt_started: std::time::Instant,
+    attempt: u32,
+) {
+    tracing::warn!(
+        target: "headroom.proxy",
+        event = "routed_upstream_send_failed",
+        request_id = %request_id,
+        upstream_host = %upstream_host,
+        upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
+        configured_http_proxy = state.config.http_proxy.is_some(),
+        error_kind = transport_error_kind(e),
+        attempt,
+        "routed upstream send failed"
+    );
 }
 
 /// Retry bounds from the same config the Claude path uses, so

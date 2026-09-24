@@ -521,20 +521,7 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
         messages,
         neutralized: 0,
     };
-    let available: std::collections::HashSet<&str> = tools
-        .iter()
-        .filter_map(|t| {
-            let name = t.get("name").and_then(Value::as_str)?;
-            if name.is_empty()
-                || t.get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|ty| ty.starts_with(TOOL_SEARCH_TYPE_PREFIX))
-            {
-                return None;
-            }
-            Some(name)
-        })
-        .collect();
+    let available = available_tool_names(tools);
     let has_search_tool = has_typed_search_tool(tools);
 
     // Server calls seen in earlier messages: id -> call family (None for
@@ -625,49 +612,18 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
                 }
             }
         }
-        // The search call itself precedes its result, so pair it up in a
-        // second pass. Only tool-search server calls are eligible: other
-        // families stand alone and a lone call is valid upstream.
-        for (index, block) in content.iter().enumerate() {
-            if block.get("type").and_then(Value::as_str) != Some("server_tool_use") {
-                continue;
-            }
-            let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-            let is_search_call = server_call_family(name) == Some(ServerToolFamily::Search);
-            let id = block.get("id").and_then(Value::as_str).unwrap_or("");
-            if orphaned_ids.contains(id) || (is_search_call && !has_search_tool) {
-                neutralize_indexes.insert(index);
-            }
-        }
-        // A kept result whose call was neutralized above is orphaned
-        // after all (duplicate ids in a corrupt transcript): neutralize
-        // it rather than forward a result pointing at placeholder text.
-        for (index, block) in content.iter().enumerate() {
-            if neutralize_indexes.contains(&index)
-                || block
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .and_then(server_result_family)
-                    .is_none()
-            {
-                continue;
-            }
-            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                if message_server_calls
-                    .iter()
-                    .any(|(i, cid, _)| cid == id && neutralize_indexes.contains(i))
-                {
-                    neutralize_indexes.insert(index);
-                    if block
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|t| server_result_family(t) != Some(ServerToolFamily::Search))
-                    {
-                        generic_placeholder_indexes.insert(index);
-                    }
-                }
-            }
-        }
+        neutralize_unpaired_calls(
+            content,
+            &orphaned_ids,
+            has_search_tool,
+            &mut neutralize_indexes,
+        );
+        neutralize_results_of_dropped_calls(
+            content,
+            &message_server_calls,
+            &mut neutralize_indexes,
+            &mut generic_placeholder_indexes,
+        );
         if neutralize_indexes.is_empty() {
             seen_server_calls.extend(message_call_families);
             out.push(message);
@@ -680,15 +636,7 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
         // tampering guard still sees them byte-identical. No message is
         // ever dropped — an assistant turn that was pure tool-search
         // bookkeeping keeps its slot as text.
-        for (index, block) in content.iter_mut().enumerate() {
-            if neutralize_indexes.contains(&index) {
-                *block = if generic_placeholder_indexes.contains(&index) {
-                    server_result_placeholder_block()
-                } else {
-                    placeholder_block()
-                };
-            }
-        }
+        apply_placeholders(content, &neutralize_indexes, &generic_placeholder_indexes);
         // Only surviving calls pair later results: a neutralized call is
         // placeholder text upstream, not a call.
         seen_server_calls.extend(
@@ -706,6 +654,98 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
         }
     } else {
         unchanged(out)
+    }
+}
+
+type Indexes = std::collections::HashSet<usize>;
+
+/// Client tool names a tool-search reference may point at: named, and not a
+/// tool-search tool itself.
+fn available_tool_names(tools: &[Value]) -> std::collections::HashSet<&str> {
+    tools
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name").and_then(Value::as_str)?;
+            if name.is_empty()
+                || t.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| ty.starts_with(TOOL_SEARCH_TYPE_PREFIX))
+            {
+                return None;
+            }
+            Some(name)
+        })
+        .collect()
+}
+
+/// The search call itself precedes its result, so pair it up in a
+/// second pass. Only tool-search server calls are eligible: other
+/// families stand alone and a lone call is valid upstream.
+fn neutralize_unpaired_calls(
+    content: &[Value],
+    orphaned_ids: &std::collections::HashSet<String>,
+    has_search_tool: bool,
+    neutralize_indexes: &mut Indexes,
+) {
+    for (index, block) in content.iter().enumerate() {
+        if block.get("type").and_then(Value::as_str) != Some("server_tool_use") {
+            continue;
+        }
+        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+        let is_search_call = server_call_family(name) == Some(ServerToolFamily::Search);
+        let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+        if orphaned_ids.contains(id) || (is_search_call && !has_search_tool) {
+            neutralize_indexes.insert(index);
+        }
+    }
+}
+
+/// A kept result whose call was neutralized above is orphaned
+/// after all (duplicate ids in a corrupt transcript): neutralize
+/// it rather than forward a result pointing at placeholder text.
+fn neutralize_results_of_dropped_calls(
+    content: &[Value],
+    message_server_calls: &[(usize, String, Option<ServerToolFamily>)],
+    neutralize_indexes: &mut Indexes,
+    generic_placeholder_indexes: &mut Indexes,
+) {
+    for (index, block) in content.iter().enumerate() {
+        if neutralize_indexes.contains(&index)
+            || block
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(server_result_family)
+                .is_none()
+        {
+            continue;
+        }
+        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+            if message_server_calls
+                .iter()
+                .any(|(i, cid, _)| cid == id && neutralize_indexes.contains(i))
+            {
+                neutralize_indexes.insert(index);
+                if block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| server_result_family(t) != Some(ServerToolFamily::Search))
+                {
+                    generic_placeholder_indexes.insert(index);
+                }
+            }
+        }
+    }
+}
+
+fn apply_placeholders(content: &mut [Value], neutralize: &Indexes, generic: &Indexes) {
+    for (index, block) in content.iter_mut().enumerate() {
+        if neutralize.contains(&index) {
+            *block = if generic.contains(&index) {
+                server_result_placeholder_block()
+            } else {
+                placeholder_block()
+            };
+        }
     }
 }
 

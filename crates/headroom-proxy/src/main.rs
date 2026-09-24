@@ -75,14 +75,36 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
     // session, and the turns it kills are paid for.
     headroom_proxy::net_offload::warn_if_offload_corrupts_tls();
 
-    // Identity, so a log line can be tied to the process and the build that
-    // wrote it. The log outlives any one run — it is appended across restarts
-    // and reboots — and carried exactly one `headroom-proxy starting` marker
-    // across five files and 22 runs, so "scope the measurement by process
-    // start", which is the rule every re-cache number here depends on, could
-    // not actually be followed. Version alone does not separate two builds of
-    // the same version; the binary's size and mtime do.
-    let (binary_len, binary_mtime) = std::env::current_exe()
+    log_startup(&config);
+    warn_on_inert_settings(&config);
+
+    let state = AppState::new(config.clone())?;
+    // Process-global redaction switch, set once here rather than in
+    // `AppState::new`: states are rebuilt in tests several per process, and
+    // per-construction writes race. Production builds exactly one state, so
+    // once here carries the same value with none of the flicker.
+    headroom_proxy::redact::set_redact_paths(config.redact_paths);
+
+    let state = with_bedrock_credentials(state, &config).await;
+    init_live_zone_compressors(&config);
+    let _cc_reconciler = start_cc_reconciler(&config, &state);
+
+    spawn_resource_heartbeat();
+    spawn_cursor_reaper(&config, &state);
+    warn_on_open_bind(&config);
+
+    serve(state, &config).await
+}
+
+/// Identity, so a log line can be tied to the process and the build that
+/// wrote it. The log outlives any one run — it is appended across restarts
+/// and reboots — and carried exactly one `headroom-proxy starting` marker
+/// across five files and 22 runs, so "scope the measurement by process
+/// start", which is the rule every re-cache number here depends on, could
+/// not actually be followed. Version alone does not separate two builds of
+/// the same version; the binary's size and mtime do.
+fn binary_identity() -> (u64, u64) {
+    std::env::current_exe()
         .and_then(|path| path.metadata())
         .map(|meta| {
             let mtime = meta
@@ -92,8 +114,11 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
                 .map_or(0, |d| d.as_secs());
             (meta.len(), mtime)
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0))
+}
 
+fn log_startup(config: &Config) {
+    let (binary_len, binary_mtime) = binary_identity();
     tracing::info!(
         pid = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
@@ -116,7 +141,9 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
         qualification_eligible = config.rollout.qualification_eligible(),
         "headroom-proxy starting"
     );
+}
 
+fn warn_on_inert_settings(config: &Config) {
     // Session-sticky beta headers only run inside the compression
     // interceptor: with `--compression` off the proxy is a strict
     // byte-pipe and never mutates headers. Say so loudly at startup —
@@ -150,43 +177,42 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
              needs either"
         );
     }
+}
 
-    let mut state = AppState::new(config.clone())?;
-    // Process-global redaction switch, set once here rather than in
-    // `AppState::new`: states are rebuilt in tests several per process, and
-    // per-construction writes race. Production builds exactly one state, so
-    // once here carries the same value with none of the flicker.
-    headroom_proxy::redact::set_redact_paths(config.redact_paths);
-
-    // PR-D1: resolve AWS credentials at startup via the `aws-config`
-    // default chain. Loaded once so per-request signing is cheap.
-    // Failure is NOT fatal — the proxy may run in front of a non-AWS
-    // upstream — but the Bedrock invoke handler refuses to forward
-    // unsigned requests when `bedrock_credentials` is `None`
-    // (see `bedrock::invoke::handle_invoke`).
-    if config.enable_bedrock_native {
-        match load_bedrock_credentials(&config).await {
-            Ok(creds) => {
-                state = state.with_bedrock_credentials(creds);
-                tracing::info!(
-                    event = "bedrock_credentials_loaded",
-                    region = %config.bedrock_region,
-                    profile = ?config.aws_profile,
-                    "AWS credentials resolved for Bedrock SigV4 signing"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    event = "bedrock_credentials_unavailable",
-                    region = %config.bedrock_region,
-                    profile = ?config.aws_profile,
-                    error = %e,
-                    "AWS credentials not available at startup; Bedrock invoke will 5xx until creds are configured"
-                );
-            }
+/// PR-D1: resolve AWS credentials at startup via the `aws-config`
+/// default chain. Loaded once so per-request signing is cheap.
+/// Failure is NOT fatal — the proxy may run in front of a non-AWS
+/// upstream — but the Bedrock invoke handler refuses to forward
+/// unsigned requests when `bedrock_credentials` is `None`
+/// (see `bedrock::invoke::handle_invoke`).
+async fn with_bedrock_credentials(state: AppState, config: &Config) -> AppState {
+    if !config.enable_bedrock_native {
+        return state;
+    }
+    match load_bedrock_credentials(config).await {
+        Ok(creds) => {
+            tracing::info!(
+                event = "bedrock_credentials_loaded",
+                region = %config.bedrock_region,
+                profile = ?config.aws_profile,
+                "AWS credentials resolved for Bedrock SigV4 signing"
+            );
+            state.with_bedrock_credentials(creds)
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "bedrock_credentials_unavailable",
+                region = %config.bedrock_region,
+                profile = ?config.aws_profile,
+                error = %e,
+                "AWS credentials not available at startup; Bedrock invoke will 5xx until creds are configured"
+            );
+            state
         }
     }
+}
 
+fn init_live_zone_compressors(config: &Config) {
     // Gate + (when enabled) eagerly warm the Kompress PlainText compressor.
     // Default-off: it carries a ~261 MB cache-only model, so it loads only
     // when an operator opts in via `--enable-kompress`. The warm runs on a
@@ -210,11 +236,16 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
             );
         });
     }
+}
 
-    // cc-switch reconciler (opt-in: HEADROOM_CC_SWITCH_RECONCILE=1).
-    // Watches ~/.claude/settings.json and keeps Headroom in the request
-    // path when cc-switch overwrites ANTHROPIC_BASE_URL on provider switch.
-    let _cc_reconciler = if headroom_proxy::cc_switch_reconciler::reconciler_enabled() {
+/// cc-switch reconciler (opt-in: HEADROOM_CC_SWITCH_RECONCILE=1).
+/// Watches ~/.claude/settings.json and keeps Headroom in the request
+/// path when cc-switch overwrites ANTHROPIC_BASE_URL on provider switch.
+fn start_cc_reconciler(
+    config: &Config,
+    state: &AppState,
+) -> Option<headroom_proxy::cc_switch_reconciler::CCSwitchReconciler> {
+    if headroom_proxy::cc_switch_reconciler::reconciler_enabled() {
         let reconciler = headroom_proxy::cc_switch_reconciler::CCSwitchReconciler::new(
             format!("http://{}", config.listen),
             config.upstream.to_string(),
@@ -226,10 +257,10 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
         Some(reconciler)
     } else {
         None
-    };
+    }
+}
 
-    spawn_resource_heartbeat();
-
+fn spawn_cursor_reaper(config: &Config, state: &AppState) {
     // Reap Cursor conversations abandoned mid-tool. Each one is a live
     // `cursor-agent` process blocked on a tool result that is not coming, and
     // parking a new one sweeps the old, so this timer only matters on a proxy
@@ -262,7 +293,9 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
             }
         });
     }
+}
 
+fn warn_on_open_bind(config: &Config) {
     // Binding a non-loopback interface with no token leaves every `/v1/*`
     // route reachable from the surrounding network — the shape the 0.0.0.0
     // container image has by default. Say so at boot, where an operator will
@@ -277,7 +310,12 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
              the /v1/* routes are reachable WITHOUT authentication"
         );
     }
+}
 
+async fn serve(
+    state: AppState,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -300,11 +338,7 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown_signal().await;
         let _ = mark.set(std::time::Instant::now());
-        tracing::info!(
-            event = "shutdown_started",
-            timeout_s = grace.as_secs(),
-            "signal received; refusing new connections and draining in-flight requests"
-        );
+        log_shutdown_started(grace);
         let _ = drain_started_tx.send(());
     });
     // `WithGracefulShutdown` is `IntoFuture`, not `Future`, so it cannot be
@@ -324,27 +358,52 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
 
     tokio::select! {
         result = &mut serve => {
-            tracing::info!(
-                event = "shutdown_drained",
-                drain_ms = signalled_at.get().map_or(0, |t| t.elapsed().as_millis() as u64),
-                "in-flight requests finished; exiting"
-            );
+            log_drained(&signalled_at);
             result?;
         }
         _ = &mut deadline => {
-            // Says which of the two it was. A drain that overruns because a
-            // client is still streaming is expected; one that overruns with
-            // nothing in flight is a task that never sees the shutdown.
-            tracing::warn!(
-                event = "shutdown_drain_timed_out",
-                timeout_s = grace.as_secs(),
-                drain_ms = signalled_at.get().map_or(0, |t| t.elapsed().as_millis() as u64),
-                "requests were still in flight when the grace period expired; exiting anyway"
-            );
+            log_drain_timed_out(grace, &signalled_at);
         }
     }
 
     Ok(())
+}
+
+fn log_shutdown_started(grace: std::time::Duration) {
+    tracing::info!(
+        event = "shutdown_started",
+        timeout_s = grace.as_secs(),
+        "signal received; refusing new connections and draining in-flight requests"
+    );
+}
+
+fn drain_ms(signalled_at: &std::sync::OnceLock<std::time::Instant>) -> u64 {
+    signalled_at
+        .get()
+        .map_or(0, |t| t.elapsed().as_millis() as u64)
+}
+
+fn log_drained(signalled_at: &std::sync::OnceLock<std::time::Instant>) {
+    tracing::info!(
+        event = "shutdown_drained",
+        drain_ms = drain_ms(signalled_at),
+        "in-flight requests finished; exiting"
+    );
+}
+
+/// Says which of the two it was. A drain that overruns because a client is
+/// still streaming is expected; one that overruns with nothing in flight is a
+/// task that never sees the shutdown.
+fn log_drain_timed_out(
+    grace: std::time::Duration,
+    signalled_at: &std::sync::OnceLock<std::time::Instant>,
+) {
+    tracing::warn!(
+        event = "shutdown_drain_timed_out",
+        timeout_s = grace.as_secs(),
+        drain_ms = drain_ms(signalled_at),
+        "requests were still in flight when the grace period expired; exiting anyway"
+    );
 }
 
 fn init_tracing(level: &str) {

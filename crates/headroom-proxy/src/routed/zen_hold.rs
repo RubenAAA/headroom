@@ -128,28 +128,7 @@ async fn run_hold_probe(
     if hold_budget_spent(started, budget_ms, *attempts_made, request_id) {
         return ProbeOutcome::BudgetSpent;
     }
-    // Slice the wait so each probe re-checks the upstream: the same
-    // capped backoff shape as the fast loop, never sleeping past the
-    // budget so the last probe lands on the edge.
-    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let remaining = budget_ms.saturating_sub(elapsed_ms);
-    let slice_ms =
-        crate::proxy::backoff_ms(state, *attempts_made).min(state.config.retry_max_delay_ms);
-    let slice = std::time::Duration::from_millis(slice_ms.min(remaining).max(1));
-    tracing::warn!(
-        event = "zen_hold_waiting",
-        hold_attempt = *attempts_made + 1,
-        sleep_ms = slice.as_millis() as u64,
-        elapsed_ms,
-        hold_budget_ms = budget_ms,
-        request_id = %request_id,
-        "Zen rate limit holding before the next probe"
-    );
-    crate::observability::record_upstream_retry(
-        "routed",
-        crate::observability::retry_reason::ZEN_HOLD,
-    );
-    tokio::time::sleep(slice).await;
+    sleep_hold_slice(state, *attempts_made, started, budget_ms, request_id).await;
     // The parked turn gave its egress back; count the probe against it again
     // for as long as the probe's answer is alive. While that egress rotates,
     // skip the probe: sending would ride a pooled tunnel to the old exit
@@ -178,14 +157,7 @@ async fn run_hold_probe(
         .await
     {
         Ok(r) if r.status().as_u16() != 429 => {
-            tracing::warn!(
-                event = "zen_hold_recovered",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                attempts = *attempts_made,
-                status = r.status().as_u16(),
-                request_id = %request_id,
-                "upstream recovered during the rotation hold"
-            );
+            log_hold_recovered(&r, started, *attempts_made, request_id);
             ProbeOutcome::Recovered(Box::new(HeldSend {
                 resp: crate::proxy::attach_egress_guard(r, egress_guard),
                 headers: headers.clone(),
@@ -202,6 +174,53 @@ async fn run_hold_probe(
             ProbeOutcome::KeepHolding
         }
     }
+}
+
+/// Slice the wait so each probe re-checks the upstream: the same capped
+/// backoff shape as the fast loop, never sleeping past the budget so the last
+/// probe lands on the edge.
+async fn sleep_hold_slice(
+    state: &AppState,
+    attempts_made: u32,
+    started: std::time::Instant,
+    budget_ms: u64,
+    request_id: &str,
+) {
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let remaining = budget_ms.saturating_sub(elapsed_ms);
+    let slice_ms =
+        crate::proxy::backoff_ms(state, attempts_made).min(state.config.retry_max_delay_ms);
+    let slice = std::time::Duration::from_millis(slice_ms.min(remaining).max(1));
+    tracing::warn!(
+        event = "zen_hold_waiting",
+        hold_attempt = attempts_made + 1,
+        sleep_ms = slice.as_millis() as u64,
+        elapsed_ms,
+        hold_budget_ms = budget_ms,
+        request_id = %request_id,
+        "Zen rate limit holding before the next probe"
+    );
+    crate::observability::record_upstream_retry(
+        "routed",
+        crate::observability::retry_reason::ZEN_HOLD,
+    );
+    tokio::time::sleep(slice).await;
+}
+
+fn log_hold_recovered(
+    r: &reqwest::Response,
+    started: std::time::Instant,
+    attempts_made: u32,
+    request_id: &str,
+) {
+    tracing::warn!(
+        event = "zen_hold_recovered",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        attempts = attempts_made,
+        status = r.status().as_u16(),
+        request_id = %request_id,
+        "upstream recovered during the rotation hold"
+    );
 }
 
 /// Still limited. Zen's Retry-After does not survive contact with the facts:

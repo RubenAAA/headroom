@@ -177,43 +177,11 @@ impl OffloadStore {
         self.put_originals_inline(records);
         match self.outbox.enqueue(records, project_dir, self.budget) {
             Ok(stats) => {
-                crate::observability::ctx_metrics::observe_offload_index_backlog(
-                    stats.jobs,
-                    stats.bytes,
-                    stats.oldest_age_ms,
-                );
-                match self.wake_worker.try_send(()) {
-                    Ok(()) | Err(TrySendError::Full(())) => {}
-                    Err(TrySendError::Disconnected(())) => tracing::warn!(
-                        event = "ctx_offload_store_worker_gone",
-                        "CTX-3 jobs are durable but the indexing worker stopped"
-                    ),
-                }
-                tracing::debug!(
-                    event = "ctx_offload_index_outbox_enqueued",
-                    records = records.len(),
-                    pending_jobs = stats.jobs,
-                    pending_bytes = stats.bytes,
-                    oldest_age_ms = stats.oldest_age_ms,
-                    "durably queued CTX-3 index jobs"
-                );
+                self.on_enqueued(records.len(), &stats);
                 true
             }
             Err(EnqueueError::Full { jobs, bytes }) => {
-                let n = self.queue_full_batches.fetch_add(1, Ordering::Relaxed) + 1;
-                crate::observability::ctx_metrics::observe_offload_index_backpressure();
-                publish_outbox_stats(&self.outbox);
-                if should_report(n) {
-                    tracing::warn!(
-                        event = "ctx_offload_index_queue_full",
-                        backpressured = n,
-                        pending_jobs = jobs,
-                        pending_bytes = bytes,
-                        max_pending_jobs = MAX_PENDING_JOBS,
-                        max_pending_bytes = self.budget,
-                        "CTX-3 durable index queue is full; the index job was refused and the caller applies its provider-specific behavior"
-                    );
-                }
+                self.on_queue_full(jobs, bytes);
                 false
             }
             Err(EnqueueError::Database(error)) => {
@@ -225,6 +193,46 @@ impl OffloadStore {
                 );
                 false
             }
+        }
+    }
+
+    fn on_enqueued(&self, records: usize, stats: &QueueStats) {
+        crate::observability::ctx_metrics::observe_offload_index_backlog(
+            stats.jobs,
+            stats.bytes,
+            stats.oldest_age_ms,
+        );
+        match self.wake_worker.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => tracing::warn!(
+                event = "ctx_offload_store_worker_gone",
+                "CTX-3 jobs are durable but the indexing worker stopped"
+            ),
+        }
+        tracing::debug!(
+            event = "ctx_offload_index_outbox_enqueued",
+            records,
+            pending_jobs = stats.jobs,
+            pending_bytes = stats.bytes,
+            oldest_age_ms = stats.oldest_age_ms,
+            "durably queued CTX-3 index jobs"
+        );
+    }
+
+    fn on_queue_full(&self, jobs: u64, bytes: u64) {
+        let n = self.queue_full_batches.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::observability::ctx_metrics::observe_offload_index_backpressure();
+        publish_outbox_stats(&self.outbox);
+        if should_report(n) {
+            tracing::warn!(
+                event = "ctx_offload_index_queue_full",
+                backpressured = n,
+                pending_jobs = jobs,
+                pending_bytes = bytes,
+                max_pending_jobs = MAX_PENDING_JOBS,
+                max_pending_bytes = self.budget,
+                "CTX-3 durable index queue is full; the index job was refused and the caller applies its provider-specific behavior"
+            );
         }
     }
 
@@ -562,68 +570,7 @@ fn process_batch(
 
     let started = std::time::Instant::now();
     match content.index_content_batch(&items) {
-        Ok(_) => {
-            crate::observability::ctx_metrics::observe_offload_index_batch(started.elapsed());
-            let successful_ids: Vec<i64> = records
-                .iter()
-                .zip(&ccr_ok)
-                .filter_map(|(record, ccr_ok)| (*ccr_ok).then_some(record.id))
-                .collect();
-            let successful_bytes: Vec<u64> = records
-                .iter()
-                .zip(&ccr_ok)
-                .filter_map(|(record, ccr_ok)| (*ccr_ok).then_some(record.original.len() as u64))
-                .collect();
-            for (record, ccr_ok) in records.iter().zip(&ccr_ok) {
-                if !*ccr_ok {
-                    tracing::warn!(
-                        event = "ctx_offload_persist_partial",
-                        index_ok = true,
-                        ccr_ok = false,
-                        hash = %record.hash,
-                        bytes = record.original.len(),
-                        "CTX-3 offload indexed but not stored; retaining it in the index outbox for retry"
-                    );
-                }
-            }
-            if let Err(error) = outbox.acknowledge(&successful_ids) {
-                tracing::warn!(
-                    event = "ctx_offload_index_outbox_ack_failed",
-                    records = successful_ids.len(),
-                    error = %error,
-                    "indexed CTX-3 jobs remain in the outbox and will be replayed idempotently"
-                );
-                retry_batch(outbox, records, "ack_failed", is_database_busy(&error));
-                return;
-            }
-            publish_outbox_stats(outbox);
-            for bytes in successful_bytes {
-                crate::observability::ctx_metrics::observe_offloaded(bytes);
-            }
-            let stats = outbox.stats().ok();
-            tracing::debug!(
-                event = "ctx_offload_index_batch_complete",
-                records = records.len(),
-                index_batch_ms = started.elapsed().as_millis() as u64,
-                oldest_job_age_ms = records
-                    .iter()
-                    .map(|record| now_ms().saturating_sub(record.enqueued_at_ms))
-                    .max()
-                    .unwrap_or(0),
-                pending_jobs = stats.as_ref().map(|stats| stats.jobs).unwrap_or(0),
-                pending_bytes = stats.as_ref().map(|stats| stats.bytes).unwrap_or(0),
-                "indexed CTX-3 outbox batch"
-            );
-            let failed_ccr: Vec<PendingRecord> = records
-                .iter()
-                .zip(&ccr_ok)
-                .filter_map(|(record, ccr_ok)| (!*ccr_ok).then_some(record))
-                .cloned()
-                .collect();
-            if !failed_ccr.is_empty() {
-                retry_batch(outbox, &failed_ccr, "ccr_put_failed", false);
-            }
-        }
+        Ok(_) => finish_indexed_batch(outbox, records, &ccr_ok, started),
         Err(error) => {
             crate::observability::ctx_metrics::observe_offload_index_batch(started.elapsed());
             let transient = is_database_busy(&error);
@@ -638,6 +585,82 @@ fn process_batch(
             retry_batch(outbox, records, "index_failed", transient);
         }
     }
+}
+
+fn finish_indexed_batch(
+    outbox: &IndexOutbox,
+    records: &[PendingRecord],
+    ccr_ok: &[bool],
+    started: std::time::Instant,
+) {
+    crate::observability::ctx_metrics::observe_offload_index_batch(started.elapsed());
+    let successful_ids: Vec<i64> = records
+        .iter()
+        .zip(ccr_ok)
+        .filter_map(|(record, ccr_ok)| (*ccr_ok).then_some(record.id))
+        .collect();
+    let successful_bytes: Vec<u64> = records
+        .iter()
+        .zip(ccr_ok)
+        .filter_map(|(record, ccr_ok)| (*ccr_ok).then_some(record.original.len() as u64))
+        .collect();
+    for (record, ccr_ok) in records.iter().zip(ccr_ok) {
+        if !*ccr_ok {
+            tracing::warn!(
+                event = "ctx_offload_persist_partial",
+                index_ok = true,
+                ccr_ok = false,
+                hash = %record.hash,
+                bytes = record.original.len(),
+                "CTX-3 offload indexed but not stored; retaining it in the index outbox for retry"
+            );
+        }
+    }
+    if let Err(error) = outbox.acknowledge(&successful_ids) {
+        tracing::warn!(
+            event = "ctx_offload_index_outbox_ack_failed",
+            records = successful_ids.len(),
+            error = %error,
+            "indexed CTX-3 jobs remain in the outbox and will be replayed idempotently"
+        );
+        retry_batch(outbox, records, "ack_failed", is_database_busy(&error));
+        return;
+    }
+    publish_outbox_stats(outbox);
+    for bytes in successful_bytes {
+        crate::observability::ctx_metrics::observe_offloaded(bytes);
+    }
+    log_batch_complete(outbox, records, started);
+    let failed_ccr: Vec<PendingRecord> = records
+        .iter()
+        .zip(ccr_ok)
+        .filter_map(|(record, ccr_ok)| (!*ccr_ok).then_some(record))
+        .cloned()
+        .collect();
+    if !failed_ccr.is_empty() {
+        retry_batch(outbox, &failed_ccr, "ccr_put_failed", false);
+    }
+}
+
+fn log_batch_complete(
+    outbox: &IndexOutbox,
+    records: &[PendingRecord],
+    started: std::time::Instant,
+) {
+    let stats = outbox.stats().ok();
+    tracing::debug!(
+        event = "ctx_offload_index_batch_complete",
+        records = records.len(),
+        index_batch_ms = started.elapsed().as_millis() as u64,
+        oldest_job_age_ms = records
+            .iter()
+            .map(|record| now_ms().saturating_sub(record.enqueued_at_ms))
+            .max()
+            .unwrap_or(0),
+        pending_jobs = stats.as_ref().map(|stats| stats.jobs).unwrap_or(0),
+        pending_bytes = stats.as_ref().map(|stats| stats.bytes).unwrap_or(0),
+        "indexed CTX-3 outbox batch"
+    );
 }
 
 fn retry_batch(outbox: &IndexOutbox, records: &[PendingRecord], reason: &str, transient: bool) {

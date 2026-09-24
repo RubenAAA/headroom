@@ -209,55 +209,59 @@ impl Translator {
                     self.saw_visible_block = true;
                 }
             }
-            ("result", _) => {
-                out.extend(self.ensure_started());
-                out.extend(self.close_block());
-                if let Some(usage) = event.get("usage") {
-                    self.usage = Usage::from_cursor(usage);
-                }
-                let failed = event.get("is_error").and_then(Value::as_bool) == Some(true)
-                    || subtype == Some("error");
-                // A turn that only thought is a turn that said nothing: Claude
-                // Code renders it as stopped and prompts again, which is how a
-                // working agent looks like it halted at random. Cursor puts the
-                // final answer on `result` as well, so when nothing visible
-                // went out, that copy is the one there is.
-                if !failed && !self.saw_visible_block {
-                    let text = event.get("result").and_then(Value::as_str).unwrap_or("");
-                    if text.is_empty() {
-                        tracing::debug!(
-                            event = "cursor_turn_without_visible_output",
-                            "a turn ended with nothing to show and no result text to recover"
-                        );
-                    } else {
-                        tracing::debug!(
-                            event = "cursor_result_text_recovered",
-                            chars = text.len(),
-                            "recovered a turn's answer from the result event"
-                        );
-                        out.extend(self.open_block(OpenBlock::Text));
-                        out.push(self.delta_frame("text_delta", "text", text));
-                        out.extend(self.close_block());
-                        self.saw_visible_block = true;
-                    }
-                }
-                self.outcome = Some(if failed {
-                    Outcome::Error(
-                        event
-                            .get("result")
-                            .and_then(Value::as_str)
-                            .unwrap_or("cursor-agent reported an error")
-                            .to_string(),
-                    )
-                } else {
-                    Outcome::EndTurn
-                });
-                out.push(self.message_delta_frame("end_turn"));
-                out.push(outbound::message_stop());
-            }
+            ("result", _) => self.on_result(event, subtype, &mut out),
             _ => {}
         }
         out
+    }
+
+    /// The turn's last event: flush, record usage and outcome, and close the
+    /// message.
+    fn on_result(&mut self, event: &Value, subtype: Option<&str>, out: &mut Vec<String>) {
+        out.extend(self.ensure_started());
+        out.extend(self.close_block());
+        if let Some(usage) = event.get("usage") {
+            self.usage = Usage::from_cursor(usage);
+        }
+        let failed = event.get("is_error").and_then(Value::as_bool) == Some(true)
+            || subtype == Some("error");
+        // A turn that only thought is a turn that said nothing: Claude
+        // Code renders it as stopped and prompts again, which is how a
+        // working agent looks like it halted at random. Cursor puts the
+        // final answer on `result` as well, so when nothing visible
+        // went out, that copy is the one there is.
+        if !failed && !self.saw_visible_block {
+            let text = event.get("result").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                tracing::debug!(
+                    event = "cursor_turn_without_visible_output",
+                    "a turn ended with nothing to show and no result text to recover"
+                );
+            } else {
+                tracing::debug!(
+                    event = "cursor_result_text_recovered",
+                    chars = text.len(),
+                    "recovered a turn's answer from the result event"
+                );
+                out.extend(self.open_block(OpenBlock::Text));
+                out.push(self.delta_frame("text_delta", "text", text));
+                out.extend(self.close_block());
+                self.saw_visible_block = true;
+            }
+        }
+        self.outcome = Some(if failed {
+            Outcome::Error(
+                event
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or("cursor-agent reported an error")
+                    .to_string(),
+            )
+        } else {
+            Outcome::EndTurn
+        });
+        out.push(self.message_delta_frame("end_turn"));
+        out.push(outbound::message_stop());
     }
 
     /// Open, fill and close a `tool_use` block for a call the bridge parked.
