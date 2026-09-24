@@ -88,7 +88,7 @@ def module_paths(file):
 
 
 PRIVATE_DECL = re.compile(r"^(?P<indent>\s*)(?:async\s+|unsafe\s+|const\s+(?=fn))*(?:fn|struct|enum|const|static|type|trait)\b")
-FIELD = re.compile(r"^\s*[a-z_][a-z0-9_]*\s*:")
+FIELD = re.compile(r"^\s*(?:r#)?[a-z_][a-z0-9_]*\s*:")
 
 
 def adjust(lines, kind, parent):
@@ -168,7 +168,7 @@ def split(file, plan_path):
         if wanted[name] is None:
             head = next(i for i, l in enumerate(chunk) if re.match(rf"^mod {name} \{{$", l))
             assert chunk[-1].rstrip() == "}", name
-            (child_dir / f"{name}.rs").write_text("".join(chunk[head + 1 : -1]))
+            (child_dir / f"{name}.rs").write_text("".join(chunk[head + 1 : -1]).lstrip("\n"))
             replaced[s] = "".join(chunk[:head]) + f"mod {name};\n"
             continue
         if kind == "mod":
