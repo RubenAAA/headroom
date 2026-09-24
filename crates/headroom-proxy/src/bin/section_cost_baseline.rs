@@ -690,7 +690,7 @@ fn main() {
     );
     println!("{}", "-".repeat(72));
     let mut trows: Vec<_> = tools.iter().collect();
-    trows.sort_by(|a, b| b.1.result_tokens.cmp(&a.1.result_tokens));
+    trows.sort_by_key(|a| std::cmp::Reverse(a.1.result_tokens));
     for (name, st) in trows.iter().take(40) {
         let sess = tool_sessions.get(*name).map(|s| s.len()).unwrap_or(0);
         let err = if st.result_blocks > 0 {

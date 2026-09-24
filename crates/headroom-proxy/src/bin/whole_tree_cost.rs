@@ -184,8 +184,10 @@ fn main() {
     let mut prev: HashMap<(String, String), Vec<u64>> = HashMap::new();
 
     for (sk, turns) in &trees {
-        let mut tree = Tree::default();
-        tree.planner = turns.first().map(|t| t.model.clone()).unwrap_or_default();
+        let mut tree = Tree {
+            planner: turns.first().map(|t| t.model.clone()).unwrap_or_default(),
+            ..Tree::default()
+        };
         for (idx, turn) in turns.iter().enumerate() {
             let tok = get_tokenizer(&turn.model);
             let tokens = body_tokens(&turn.body, tok.as_ref());

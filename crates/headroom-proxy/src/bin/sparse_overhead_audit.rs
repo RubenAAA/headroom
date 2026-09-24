@@ -334,7 +334,7 @@ fn main() {
     );
     println!("{}", "-".repeat(92));
     let mut order: Vec<_> = by_cat.iter().collect();
-    order.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
+    order.sort_by_key(|a| std::cmp::Reverse(a.1.tokens));
     for (cat, a) in order {
         let num_pct = pct(a.number_prefix_tokens, a.tokens);
         let path_pct = pct(a.path_span_tokens, a.tokens);
