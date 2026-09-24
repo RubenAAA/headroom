@@ -131,25 +131,25 @@ fn find_additive_bundle() -> Option<CaBundleResult> {
 /// common trait, so this local trait is the seam that lets one generic
 /// function serve both call sites instead of a macro duplicated per flavour.
 trait TlsBuilder: Sized {
-    fn without_built_in_roots(self) -> Self;
-    fn with_root_certificate(self, cert: reqwest::Certificate) -> Self;
+    fn with_only_roots(self, certs: Vec<reqwest::Certificate>) -> Self;
+    fn with_extra_roots(self, certs: Vec<reqwest::Certificate>) -> Self;
 }
 
 impl TlsBuilder for reqwest::ClientBuilder {
-    fn without_built_in_roots(self) -> Self {
-        self.tls_built_in_root_certs(false)
+    fn with_only_roots(self, certs: Vec<reqwest::Certificate>) -> Self {
+        self.tls_certs_only(certs)
     }
-    fn with_root_certificate(self, cert: reqwest::Certificate) -> Self {
-        self.add_root_certificate(cert)
+    fn with_extra_roots(self, certs: Vec<reqwest::Certificate>) -> Self {
+        self.tls_certs_merge(certs)
     }
 }
 
 impl TlsBuilder for reqwest::blocking::ClientBuilder {
-    fn without_built_in_roots(self) -> Self {
-        self.tls_built_in_root_certs(false)
+    fn with_only_roots(self, certs: Vec<reqwest::Certificate>) -> Self {
+        self.tls_certs_only(certs)
     }
-    fn with_root_certificate(self, cert: reqwest::Certificate) -> Self {
-        self.add_root_certificate(cert)
+    fn with_extra_roots(self, certs: Vec<reqwest::Certificate>) -> Self {
+        self.tls_certs_merge(certs)
     }
 }
 
@@ -169,17 +169,10 @@ fn apply_ca_bundle<B: TlsBuilder>(builder: B) -> B {
 /// Extracted from the former `configure_tls_builder!` macro without behavior change.
 fn apply_replacement_bundle<B: TlsBuilder>(builder: B, path: &Path) -> B {
     match load_certificates_from_file(path) {
-        Ok(certs) => {
-            // SSL_CERT_FILE / REQUESTS_CA_BUNDLE replace the trust
-            // store. Without this call reqwest would silently keep its
-            // built-in WebPKI roots and turn replacement into additive
-            // semantics.
-            let mut configured = builder.without_built_in_roots();
-            for cert in certs {
-                configured = configured.with_root_certificate(cert);
-            }
-            configured
-        }
+        // SSL_CERT_FILE / REQUESTS_CA_BUNDLE replace the trust store.
+        // Merging instead would keep the system roots and turn replacement
+        // into additive semantics.
+        Ok(certs) => builder.with_only_roots(certs),
         Err(error) => {
             tracing::warn!(
                 event = "ssl_ca_bundle_failed",
@@ -197,13 +190,7 @@ fn apply_replacement_bundle<B: TlsBuilder>(builder: B, path: &Path) -> B {
 /// Extracted from the former `configure_tls_builder!` macro without behavior change.
 fn apply_additive_bundle<B: TlsBuilder>(builder: B, path: &Path) -> B {
     match load_certificates_from_file(path) {
-        Ok(certs) => {
-            let mut configured = builder;
-            for cert in certs {
-                configured = configured.with_root_certificate(cert);
-            }
-            configured
-        }
+        Ok(certs) => builder.with_extra_roots(certs),
         Err(error) => {
             tracing::warn!(
                 event = "ssl_ca_bundle_failed",

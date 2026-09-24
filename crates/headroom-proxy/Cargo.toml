@@ -116,7 +116,7 @@ md-5 = { workspace = true }
 urlencoding = "2"
 # CTX-5: HTML→markdown conversion for ctx fetch (port of Turndown used by
 # the TS context-mode's ctx_fetch_and_index).
-htmd = "0.1"
+htmd = "0.5"
 # CTX-5 fetch ladder (context-mode `next` P4): the lossless page/block sidecar
 # (`fetch-pages.db`) beside the FTS content DB. Same crate + version +
 # `bundled` feature as headroom-core's CtxStore, so no new SQLite backend
@@ -135,7 +135,7 @@ brotli = "9"
 # dependency, not only a dev-dependency.
 tempfile = { workspace = true }
 tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
 # Global allocator for the proxy binary (wired in `src/main.rs`). The hot
 # path is allocation-heavy (JSON parse/strip/serialize per request plus
