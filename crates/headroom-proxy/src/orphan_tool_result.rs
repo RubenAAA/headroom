@@ -17,7 +17,8 @@
 //!
 //! Neutralize in place, preserving the result's text (the model already
 //! saw it) with a short placeholder fallback. Indexes, messages, and
-//! roles never move.
+//! roles never move, and a `cache_control` on the replaced block stays on
+//! its replacement, so the client's breakpoint survives the repair.
 
 use serde_json::Value;
 
@@ -32,6 +33,17 @@ pub struct OrphanRepairOutcome {
     pub messages: Vec<Value>,
     /// Number of blocks neutralized. Zero means unchanged.
     pub neutralized: usize,
+}
+
+/// A text block standing in for `block`, carrying over its `cache_control`.
+fn text_block_like(block: &Value, text: String) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("type".to_string(), Value::String("text".to_string()));
+    out.insert("text".to_string(), Value::String(text));
+    if let Some(marker) = block.get("cache_control") {
+        out.insert("cache_control".to_string(), marker.clone());
+    }
+    Value::Object(out)
 }
 
 /// Flatten a `tool_result` block's content to plain text, preserving what
@@ -107,14 +119,7 @@ pub fn strip_orphan_tool_results(messages: Vec<Value>) -> OrphanRepairOutcome {
                 continue;
             }
             let text = result_as_text(block);
-            *block = Value::Object(
-                [
-                    ("type".to_string(), Value::String("text".to_string())),
-                    ("text".to_string(), Value::String(text)),
-                ]
-                .into_iter()
-                .collect(),
-            );
+            *block = text_block_like(block, text);
             neutralized += 1;
             changed = true;
         }
@@ -210,14 +215,7 @@ pub fn strip_dangling_tool_calls(messages: Vec<Value>) -> OrphanRepairOutcome {
                 .filter(|n| !n.is_empty())
                 .unwrap_or("?");
             let text = format!("[tool call to {name} omitted: no result arrived]");
-            *block = Value::Object(
-                [
-                    ("type".to_string(), Value::String("text".to_string())),
-                    ("text".to_string(), Value::String(text)),
-                ]
-                .into_iter()
-                .collect(),
-            );
+            *block = text_block_like(block, text);
             neutralized += 1;
             changed = true;
         }
@@ -287,6 +285,36 @@ mod tests {
         assert_eq!(
             out.messages[1]["content"][0]["text"],
             json!("the file said yes")
+        );
+    }
+
+    #[test]
+    fn a_neutralized_result_keeps_its_cache_breakpoint() {
+        let mut orphan = result("gone", "the file said yes");
+        orphan["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+        let messages = vec![json!({"role": "user", "content": [orphan]})];
+        let out = strip_orphan_tool_results(messages);
+        assert_eq!(out.neutralized, 1);
+        assert_eq!(
+            out.messages[0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn a_neutralized_call_keeps_its_cache_breakpoint() {
+        let mut dangling = call("t1", "Bash");
+        dangling["cache_control"] = json!({"type": "ephemeral"});
+        let messages = vec![
+            json!({"role": "assistant", "content": [dangling]}),
+            json!({"role": "user", "content": "never mind"}),
+        ];
+        let out = strip_dangling_tool_calls(messages);
+        assert_eq!(out.neutralized, 1);
+        assert_eq!(out.messages[0]["content"][0]["type"], json!("text"));
+        assert_eq!(
+            out.messages[0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
         );
     }
 
