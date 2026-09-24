@@ -2162,7 +2162,7 @@ mod empty_turn_text_tests {
     fn thinking_only_turns_lack_visible_text() {
         let thinking = json!({"type": "thinking", "thinking": "hmm"});
         assert!(
-            turn_lacks_visible_text(&[thinking.clone()], false),
+            turn_lacks_visible_text(std::slice::from_ref(&thinking), false),
             "thinking in emit is not visible text"
         );
         assert!(

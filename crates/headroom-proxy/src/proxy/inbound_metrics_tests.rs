@@ -1,14 +1,14 @@
-
 use super::*;
 use crate::observability::proxy_counters;
 use axum::routing::get;
 use tower::ServiceExt;
 
 /// The inbound counters are process-global, so these tests would race each
-/// other's increments if they ran concurrently.
-fn inbound_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// other's increments if they ran concurrently. An async lock, since the
+/// guard is held across the request's `.await`.
+async fn inbound_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 /// Drive one request through the same middleware `build_app` installs.
@@ -28,7 +28,7 @@ async fn run_once(path: &str, handler_router: Router) -> axum::http::StatusCode 
 /// returns, or a long-running proxy would show ever-growing "active" load.
 #[tokio::test]
 async fn a_completed_request_leaves_the_active_gauge_balanced() {
-    let _guard = inbound_test_lock();
+    let _guard = inbound_test_lock().await;
     let before = proxy_counters::inbound_active_for_test();
 
     let status = run_once("/ok", Router::new().route("/ok", get(|| async { "hi" }))).await;
@@ -45,7 +45,7 @@ async fn a_completed_request_leaves_the_active_gauge_balanced() {
 /// the gauge upward.
 #[tokio::test]
 async fn a_failing_handler_still_decrements() {
-    let _guard = inbound_test_lock();
+    let _guard = inbound_test_lock().await;
     let before = proxy_counters::inbound_active_for_test();
 
     let status = run_once(
@@ -64,7 +64,7 @@ async fn a_failing_handler_still_decrements() {
 /// A request that matches nothing still counts — it consumed proxy work.
 #[tokio::test]
 async fn an_unmatched_route_is_still_counted() {
-    let _guard = inbound_test_lock();
+    let _guard = inbound_test_lock().await;
     let before = proxy_counters::inbound_total_for_test();
 
     run_once("/nope", Router::new().route("/ok", get(|| async { "hi" }))).await;

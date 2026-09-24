@@ -927,7 +927,7 @@ mod tests {
         let path = dir.path().join("rec.json");
         let rec = SavingsRecorder::new(path.clone(), 2);
         let label = stratum_label("treatment", "sonnet|c|s|tools");
-        assert!(rec.record_from_labels(&[label.clone()], 50));
+        assert!(rec.record_from_labels(std::slice::from_ref(&label), 50));
         // Non-shaping labels ignored.
         assert!(!rec.record_from_labels(&["router:x".to_string()], 10));
         // Second shaping record hits flush_every=2 → file written.
@@ -975,7 +975,10 @@ mod tests {
         let ctrl = stratum_label("control", key);
 
         // Treatment: baseline mean 100 minus what we actually emitted.
-        assert_eq!(rec.estimate_request_savings(&[treat.clone()], 60), 40);
+        assert_eq!(
+            rec.estimate_request_savings(std::slice::from_ref(&treat), 60),
+            40
+        );
         // No saving when we matched or exceeded the baseline — never negative.
         assert_eq!(rec.estimate_request_savings(&[treat], 100), 0);
         // Control and unlabelled requests never claim a saving.
@@ -1016,7 +1019,10 @@ mod tests {
         let rec = recorder_with_baseline(dir.path().join("r.json"), key, &[100, 101]);
         let treat = stratum_label("treatment", key);
         // mean = 100.5
-        assert_eq!(rec.estimate_request_savings(&[treat.clone()], 100), 0);
+        assert_eq!(
+            rec.estimate_request_savings(std::slice::from_ref(&treat), 100),
+            0
+        );
         assert_eq!(rec.estimate_request_savings(&[treat], 99), 2);
     }
 

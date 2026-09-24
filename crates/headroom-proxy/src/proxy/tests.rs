@@ -1,4 +1,3 @@
-
 use super::*;
 
 #[tokio::test]
@@ -1993,7 +1992,7 @@ fn an_untouched_signed_block_is_not_reported() {
     let msg = serde_json::json!({"role": "assistant", "content": [
             {"type": "thinking", "thinking": "…", "signature": "sig"},
             {"type": "text", "text": "hello"}]});
-    let report = rewritten_message_report(&[msg.clone()], &[msg]);
+    let report = rewritten_message_report(std::slice::from_ref(&msg), std::slice::from_ref(&msg));
     assert!(report.thinking_touched.is_empty());
 }
 

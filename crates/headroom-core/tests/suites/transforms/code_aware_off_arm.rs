@@ -32,7 +32,7 @@ fn big_python() -> String {
         for i in 0..12 {
             src.push_str(&format!("    step_{i} = process_{f}(items[{i}])\n"));
         }
-        src.push_str(&format!("    return step_11\n\n"));
+        src.push_str("    return step_11\n\n");
     }
     assert!(src.len() > 512);
     src

@@ -85,11 +85,9 @@ async fn follower_waits_for_the_leader_first_byte() {
     // Prove the leader is actually in flight instead of assuming 30ms
     // sufficed: the follower must overlap it at the gate.
     assert!(
-        common::wait_until(
-            Duration::from_secs(2),
-            Duration::from_millis(5),
-            || arrivals.lock().unwrap().len() >= 1
-        )
+        common::wait_until(Duration::from_secs(2), Duration::from_millis(5), || {
+            !arrivals.lock().unwrap().is_empty()
+        })
         .await,
         "leader request never reached the upstream"
     );
@@ -128,11 +126,9 @@ async fn different_heads_do_not_wait() {
     // Prove the first request is actually in flight instead of assuming
     // 30ms sufficed.
     assert!(
-        common::wait_until(
-            Duration::from_secs(2),
-            Duration::from_millis(5),
-            || arrivals.lock().unwrap().len() >= 1
-        )
+        common::wait_until(Duration::from_secs(2), Duration::from_millis(5), || {
+            !arrivals.lock().unwrap().is_empty()
+        })
         .await,
         "first request never reached the upstream"
     );
@@ -172,11 +168,9 @@ async fn warm_head_does_not_wait_on_the_next_turn() {
     // Prove turn two is actually in flight instead of assuming 30ms
     // sufficed: the sibling must overlap it at the gate.
     assert!(
-        common::wait_until(
-            Duration::from_secs(2),
-            Duration::from_millis(5),
-            || arrivals.lock().unwrap().len() >= 1
-        )
+        common::wait_until(Duration::from_secs(2), Duration::from_millis(5), || {
+            !arrivals.lock().unwrap().is_empty()
+        })
         .await,
         "turn two never reached the upstream"
     );

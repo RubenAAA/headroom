@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn json_shaped_lines_belong_to_smart_crusher() {
-        let line = format!("{}{}{}", "{".to_string(), "a".repeat(400), "}");
+        let line = format!("{}{}{}", "{", "a".repeat(400), "}");
         assert!(!is_dense_line(&line));
         let arr = format!("[{}]", "1,".repeat(200));
         assert!(!is_dense_line(&arr));

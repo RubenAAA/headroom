@@ -551,18 +551,6 @@ async fn passthrough_recorded_fixture_byte_equal_sha256() {
 }
 
 /// Tracing-capture test for the per-request decision log.
-///
-/// Lives in its own module rather than at file scope because it
-/// installs a *global* tracing subscriber via
-/// `tracing::subscriber::set_global_default` — we only do this once
-/// per test process and isolate it to a single test to avoid
-/// double-registration races with other tests in the same binary.
-
-/// Lazily install the JSON tracing subscriber once per test
-/// process. The buffer is shared across the whole process, but
-/// because we only run one tracing-capture test per binary, we
-/// don't have to worry about cross-test interference.
-
 #[tokio::test]
 async fn compression_decision_logged() {
     // Serialized with the other capture suites: shared buffer, see common::tracing_capture.

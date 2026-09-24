@@ -82,10 +82,6 @@ fn anthropic_payload_with_tools(system: &str) -> Value {
 
 #[tokio::test]
 async fn system_rewrite_mints_a_new_lane_without_drift_warn() {
-    // Serialized: this binary shares one tracing buffer.
-    let _capture = common::tracing_capture::serial().await;
-    // Serialized: this binary shares one tracing buffer.
-    let _capture = common::tracing_capture::serial().await;
     // Serialized with the other capture suites: shared buffer, see common::tracing_capture.
     let _capture = common::tracing_capture::serial().await;
     let buf = common::tracing_capture::buffer();

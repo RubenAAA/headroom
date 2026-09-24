@@ -238,6 +238,7 @@ mod tests {
 
     /// The unified constructor against a neutral upstream, so these snapshots
     /// pin exactly what the main path and the sidecar both send.
+    #[allow(clippy::result_large_err)]
     fn auth_for_test(
         auth_env: Option<&str>,
         caller: &HeaderMap,

@@ -162,8 +162,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // The registry is process-global; serialize tests that touch it.
-    static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+    // The registry is process-global; serialize tests that touch it. An
+    // async lock, since async tests hold the guard across `.await`; sync
+    // tests take it with `blocking_lock`.
+    static REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn ctx() -> TurnContext {
         TurnContext::new("anthropic", "claude-x", vec![])
@@ -182,7 +184,7 @@ mod tests {
 
     #[test]
     fn request_runner_inert_when_empty() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.blocking_lock();
         clear_turn_hooks();
         assert!(registered_turn_hooks().is_empty());
         let mut c = ctx();
@@ -194,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_runner_returns_input_unchanged_when_empty() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.lock().await;
         clear_turn_hooks();
         let resp = serde_json::json!({"id": "orig", "content": []});
         let out = run_response_hooks(&ctx(), resp.clone(), &NoopCallModel).await;
@@ -205,7 +207,7 @@ mod tests {
 
     #[test]
     fn on_request_may_mutate_ctx() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.blocking_lock();
         clear_turn_hooks();
 
         struct Shrink;
@@ -233,7 +235,7 @@ mod tests {
     #[test]
     fn apply_request_hooks_reports_tool_shrink_tokens() {
         use crate::compression::CompressibleEndpoint;
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.blocking_lock();
         clear_turn_hooks();
 
         struct Shrink;
@@ -274,7 +276,7 @@ mod tests {
     #[test]
     fn apply_request_hooks_reports_zero_without_hooks() {
         use crate::compression::CompressibleEndpoint;
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.blocking_lock();
         clear_turn_hooks();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -296,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_response_can_replace_via_call_model() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.lock().await;
         clear_turn_hooks();
 
         struct CountingCallModel {
@@ -345,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_response_none_leaves_response_unchanged() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.lock().await;
         clear_turn_hooks();
 
         struct Observer;
@@ -373,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn replacements_chain_across_hooks() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.lock().await;
         clear_turn_hooks();
 
         struct First;
@@ -423,7 +425,7 @@ mod tests {
 
     #[test]
     fn failing_on_request_is_swallowed() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.blocking_lock();
         clear_turn_hooks();
 
         struct Boom;
@@ -443,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_on_response_is_skipped_and_survivor_runs() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.lock().await;
         clear_turn_hooks();
 
         struct Boom;
@@ -490,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_without_on_response_is_skipped() {
-        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_LOCK.lock().await;
         clear_turn_hooks();
 
         struct OnlyRequest;

@@ -28,7 +28,7 @@ help:
 	@echo "  make verify-rust-core   - build + install + import-verify headroom._core"
 	@echo "  make fmt                - cargo fmt --all"
 	@echo "  make fmt-check          - cargo fmt --all -- --check"
-	@echo "  make lint               - cargo clippy --workspace -- -D warnings"
+	@echo "  make lint               - cargo clippy --workspace --all-targets -- -D warnings"
 	@echo "  make clean              - cargo clean"
 	@echo "  make gc                 - GC stale target/ artifacts now (cargo-sweep, conservative)"
 	@echo "  make gc-check           - preview what 'make gc' would delete (deletes nothing)"
@@ -178,7 +178,7 @@ fmt-check:
 	$(CARGO) fmt --all -- --check
 
 clippy lint:
-	$(CARGO) clippy --workspace -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 clean:
 	$(CARGO) clean
@@ -224,7 +224,7 @@ ci-precheck: ci-precheck-rust ci-precheck-commitlint
 ci-precheck-rust:
 	@echo "── ci-precheck-rust ────────────────────────────────────────────"
 	$(CARGO) fmt --all -- --check
-	$(CARGO) clippy --workspace -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(MAKE) test-nextest
 
 # Mirrors the smart_crusher-affected test files we expect green on every

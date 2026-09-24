@@ -1385,7 +1385,10 @@ fn tracker_drops_a_directive_only_tail_from_stored_replay_state() {
 
     tracker.update_from_response(5_000, 0, &messages, Some(&messages), String::new());
 
-    assert_eq!(tracker.last_original_messages(), &[stable.clone()]);
+    assert_eq!(
+        tracker.last_original_messages(),
+        std::slice::from_ref(&stable)
+    );
     assert_eq!(tracker.last_forwarded_messages(), &[stable]);
 }
 
@@ -1488,8 +1491,10 @@ fn record_turn(store: &SessionReplayStore, key: &str, request: &str, originals: 
     store.complete(request, 0, 5000);
 }
 
-fn adoption_log() -> (AdoptionHook, Arc<Mutex<Vec<(AdoptionDonor, String)>>>) {
-    let seen: Arc<Mutex<Vec<(AdoptionDonor, String)>>> = Arc::new(Mutex::new(Vec::new()));
+type AdoptionLog = Arc<Mutex<Vec<(AdoptionDonor, String)>>>;
+
+fn adoption_log() -> (AdoptionHook, AdoptionLog) {
+    let seen: AdoptionLog = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
     let hook: AdoptionHook = Arc::new(move |donor: &AdoptionDonor, key: &str| {
         sink.lock().unwrap().push((donor.clone(), key.to_string()));

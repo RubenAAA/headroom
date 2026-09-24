@@ -809,7 +809,7 @@ mod tests {
             title: "cargo test".to_string(),
             gate_rollback: None,
         };
-        store.persist(&[record.clone()], "/home/dev/alpha");
+        store.persist(std::slice::from_ref(&record), "/home/dev/alpha");
 
         assert_eq!(
             store.ccr().get(&record.hash).as_deref(),
@@ -837,7 +837,7 @@ mod tests {
             title: "rg needle".to_string(),
             gate_rollback: None,
         };
-        store.persist(&[record.clone()], "/home/dev/alpha");
+        store.persist(std::slice::from_ref(&record), "/home/dev/alpha");
 
         assert_eq!(store.shed_batches(), 1, "the batch should be shed");
         assert_eq!(store.queued_bytes(), 0, "a shed batch charges nothing");

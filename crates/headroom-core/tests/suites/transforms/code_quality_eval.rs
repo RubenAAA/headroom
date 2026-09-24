@@ -77,7 +77,7 @@ fn identifiers(text: &str) -> BTreeSet<String> {
             w.len() >= 3
                 && w.chars()
                     .next()
-                    .map_or(false, |c| c.is_alphabetic() || c == '_')
+                    .is_some_and(|c| c.is_alphabetic() || c == '_')
                 && !KEYWORDS.contains(w)
         })
         .map(str::to_string)
@@ -282,7 +282,7 @@ fn skeleton_beats_truncate_on_symbol_survival() {
         assert!(result.syntax_valid, "{lang}: skeleton must re-parse");
         let budget = tokens(&result.compressed);
         let truncated = truncate_to(src, budget);
-        assert_eq!(tokens(&truncated) <= budget, true);
+        assert!(tokens(&truncated) <= budget);
 
         let answers = answer_symbols(lang);
         let sym_skel = answers

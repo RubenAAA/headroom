@@ -360,7 +360,7 @@ async fn ccr_upstream_unresolvable(
                                         }
                                     }
                                 });
-                                return Ok::<_, Infallible>(
+                                Ok::<_, Infallible>(
                                     Response::builder()
                                         .status(200)
                                         .header("content-type", "text/event-stream")
@@ -368,7 +368,7 @@ async fn ccr_upstream_unresolvable(
                                             tokio_stream::wrappers::ReceiverStream::new(rx),
                                         ))
                                         .unwrap(),
-                                );
+                                )
                             }
                         }),
                     )

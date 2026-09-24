@@ -262,11 +262,11 @@ async fn two_stores_over_one_directory_do_not_block_each_other() {
     let a = {
         let first = Arc::clone(&first);
         tokio::spawn(async move {
-            for i in 0..SUBJECTS_A.len() {
+            for (i, subject) in SUBJECTS_A.iter().enumerate() {
                 call(
                     &first,
                     "memory_save",
-                    json!({"content": SUBJECTS_A[i], "title": format!("a{i}")}),
+                    json!({"content": subject, "title": format!("a{i}")}),
                 )
                 .await;
             }
@@ -275,11 +275,11 @@ async fn two_stores_over_one_directory_do_not_block_each_other() {
     let b = {
         let second = Arc::clone(&second);
         tokio::spawn(async move {
-            for i in 0..SUBJECTS_B.len() {
+            for (i, subject) in SUBJECTS_B.iter().enumerate() {
                 call(
                     &second,
                     "memory_save",
-                    json!({"content": SUBJECTS_B[i], "title": format!("b{i}")}),
+                    json!({"content": subject, "title": format!("b{i}")}),
                 )
                 .await;
             }

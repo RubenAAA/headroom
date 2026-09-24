@@ -287,7 +287,7 @@ mod tests {
     }
 
     impl StubCompressor {
-        fn new(name: &str) -> Arc<dyn Compressor> {
+        fn arc(name: &str) -> Arc<dyn Compressor> {
             Arc::new(Self {
                 descriptor: CompressorDescriptor {
                     name: name.to_string(),
@@ -321,7 +321,7 @@ mod tests {
     fn register_returns_the_descriptor_name() {
         let mut registry = CompressorRegistry::new();
         let name = registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap();
         assert_eq!(name, "alpha");
         assert!(registry.get("alpha").is_some());
@@ -331,7 +331,7 @@ mod tests {
     fn register_rejects_an_empty_name() {
         let mut registry = CompressorRegistry::new();
         let err = registry
-            .register(StubCompressor::new(""), false)
+            .register(StubCompressor::arc(""), false)
             .unwrap_err();
         assert_eq!(err, RegistryError::EmptyName);
     }
@@ -340,16 +340,16 @@ mod tests {
     fn register_rejects_a_duplicate_unless_replace_is_set() {
         let mut registry = CompressorRegistry::new();
         registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap();
 
         let err = registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap_err();
         assert_eq!(err, RegistryError::AlreadyRegistered("alpha".to_string()));
 
         registry
-            .register(StubCompressor::new("alpha"), true)
+            .register(StubCompressor::arc("alpha"), true)
             .unwrap();
         assert_eq!(registry.names(), vec!["alpha".to_string()]);
     }
@@ -358,7 +358,7 @@ mod tests {
     fn names_and_descriptors_are_sorted() {
         let mut registry = CompressorRegistry::new();
         for name in ["zulu", "alpha", "mike"] {
-            registry.register(StubCompressor::new(name), false).unwrap();
+            registry.register(StubCompressor::arc(name), false).unwrap();
         }
         assert_eq!(registry.names(), sel(&["alpha", "mike", "zulu"]));
         let descriptor_names: Vec<String> =
@@ -371,7 +371,7 @@ mod tests {
     fn selection_is_opt_in_so_none_is_active_by_default() {
         let mut registry = CompressorRegistry::new();
         registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap();
 
         assert!(registry.select(None).is_empty());
@@ -383,10 +383,10 @@ mod tests {
     fn wildcard_selects_everything_registered() {
         let mut registry = CompressorRegistry::new();
         registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap();
         registry
-            .register(StubCompressor::new("bravo"), false)
+            .register(StubCompressor::arc("bravo"), false)
             .unwrap();
 
         let selected = registry.select(Some(&sel(&["*"])));
@@ -400,7 +400,7 @@ mod tests {
     fn unregistered_names_are_skipped_not_fatal() {
         let mut registry = CompressorRegistry::new();
         registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap();
 
         let selected = registry.select(Some(&sel(&["alpha", "ghost"])));
@@ -411,7 +411,7 @@ mod tests {
     fn selection_entries_are_trimmed_and_blanks_dropped() {
         let mut registry = CompressorRegistry::new();
         registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap();
 
         let selected = registry.select(Some(&sel(&["  alpha  ", "   "])));
@@ -425,10 +425,10 @@ mod tests {
     fn active_returns_compressors_sorted_by_name() {
         let mut registry = CompressorRegistry::new();
         registry
-            .register(StubCompressor::new("zulu"), false)
+            .register(StubCompressor::arc("zulu"), false)
             .unwrap();
         registry
-            .register(StubCompressor::new("alpha"), false)
+            .register(StubCompressor::arc("alpha"), false)
             .unwrap();
 
         let active = registry.active(Some(&sel(&["*"])));

@@ -3,7 +3,7 @@
 #
 # The hook runs, on every `git push`:
 #   1. cargo fmt --check (fast fail)
-#   2. cargo clippy --workspace (fast fail)
+#   2. cargo clippy --workspace --all-targets (fast fail; tests included)
 #   3. scripts/what-to-run.sh --run (touched-area suites only, not the
 #      full workspace — full `make test-nextest` stays a manual call)
 #   4. scripts/check-drift.sh (flags.md freshness, shellcheck, var coverage;
@@ -16,6 +16,8 @@
 #   8. scripts/check-hygiene.sh (rustdoc links resolve, no unused deps,
 #      touched TOML canonical; needs cargo-machete, taplo-cli, cargo-sort
 #      for the optional legs — each skips gracefully when absent)
+#   9. cargo deny check (advisories, licenses, bans, sources; skipped with
+#      a note when cargo-deny is not installed)
 #
 # Idempotent. Bypass per-push with `git push --no-verify`.
 # (Replaces upstream-python/scripts/install-git-hooks.sh for local use;
@@ -59,7 +61,7 @@ cargo fmt --all -- --check || {
     exit 1
 }
 echo "── pre-push (local): cargo clippy"
-cargo clippy --workspace -- -D warnings || {
+cargo clippy --workspace --all-targets -- -D warnings || {
     echo "❌ pre-push: clippy failed." >&2
     echo "   Bypass: git push --no-verify" >&2
     exit 1
@@ -116,12 +118,22 @@ else
         exit 1
     }
 fi
+if command -v cargo-deny >/dev/null; then
+    echo "── pre-push (local): cargo deny"
+    cargo deny check || {
+        echo "❌ pre-push: cargo deny failed (advisory, license, ban or source)." >&2
+        echo "   Bypass: git push --no-verify" >&2
+        exit 1
+    }
+else
+    echo "── pre-push (local): cargo deny skipped (cargo install --locked cargo-deny)"
+fi
 echo "✅ pre-push (local): PASSED"
 HOOK_EOF
 
 chmod +x "$HOOK"
 echo "✅ installed: $HOOK"
-echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity + check-file-size + check-hygiene."
+echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity + check-file-size + check-hygiene + cargo deny."
 echo "   Hygiene needs cargo-machete, taplo-cli, cargo-sort for its optional legs:"
 echo "     cargo install cargo-machete taplo-cli cargo-sort --locked"
 echo "   Each leg skips gracefully when its tool is absent."

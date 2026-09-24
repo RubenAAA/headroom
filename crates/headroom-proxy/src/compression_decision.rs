@@ -298,7 +298,7 @@ mod tests {
         let mut tags = HashMap::from([("client".to_string(), "codex".to_string())]);
         d.apply_to_tags(&mut tags);
         assert_eq!(tags.get("client").map(|s| s.as_str()), Some("codex"));
-        assert!(tags.get("passthrough_reason").is_none());
+        assert!(!tags.contains_key("passthrough_reason"));
     }
 
     #[test]

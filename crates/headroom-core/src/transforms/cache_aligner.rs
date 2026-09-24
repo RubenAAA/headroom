@@ -492,7 +492,7 @@ mod tests {
         let mut state = CacheAlignerState::default();
         let tok = estimating_tokenizer();
         let msgs = system_user_messages("Session: 550e8400-e29b-41d4-a716-446655440000");
-        let snapshot: Vec<serde_json::Value> = msgs.iter().map(|m| m.clone()).collect();
+        let snapshot: Vec<serde_json::Value> = msgs.to_vec();
         let _result = aligner.apply(&msgs, &tok, &mut state, None);
         assert_eq!(msgs, snapshot);
     }

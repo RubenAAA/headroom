@@ -201,6 +201,9 @@ pub async fn wait_for_upstream_requests(
 // emitted lines (lost lines → presence-flakes), and a concurrent
 // suite's lines leak into negative assertions like volatile's
 // `!contains(detected)` (absence-flakes).
+// Every test binary compiles `common/` on its own, and the ones that never
+// capture logs would otherwise warn that this module is unused.
+#[allow(dead_code)]
 pub mod tracing_capture {
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use tracing_subscriber::fmt::MakeWriter;

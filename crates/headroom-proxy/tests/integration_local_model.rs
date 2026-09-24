@@ -437,11 +437,6 @@ async fn a_redacted_routed_turn_falls_back_on_restored_text() {
     proxy.shutdown().await;
 }
 
-/// Explicit pick, redacted: the routed upstream's error echoes the redacted
-/// request, and the client must get real values back. A placeholder in an
-/// error body leaks the map's existence outward and hands the caller a path
-/// it cannot debug with.
-
 /// Zen hold, end to end through the routed path: the mock 429s once then
 /// recovers, and with only 1 fast attempt the client must still see the
 /// recovered 200 — the hold (not the fast loop) absorbed the 429.

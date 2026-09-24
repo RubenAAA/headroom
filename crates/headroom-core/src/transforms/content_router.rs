@@ -3448,7 +3448,7 @@ mod tests {
     #[test]
     fn tool_signature_from_json_object() {
         let json = json!({"name": "Alice", "age": 30, "active": true});
-        let sig = ToolSignature::from_items(&[json.clone()]);
+        let sig = ToolSignature::from_items(std::slice::from_ref(&json));
         assert_eq!(sig.field_count, 3);
         assert!(!sig.has_nested_objects);
         assert!(!sig.has_arrays);
@@ -3459,7 +3459,7 @@ mod tests {
     #[test]
     fn tool_signature_from_json_nested() {
         let json = json!({"user": {"name": "Alice", "address": {"city": "NYC"}}});
-        let sig = ToolSignature::from_items(&[json.clone()]);
+        let sig = ToolSignature::from_items(std::slice::from_ref(&json));
         assert!(sig.has_nested_objects);
         assert!(sig.max_depth >= 2);
     }
@@ -3467,15 +3467,15 @@ mod tests {
     #[test]
     fn tool_signature_from_json_array() {
         let json = json!({"items": [1, 2, 3]});
-        let sig = ToolSignature::from_items(&[json.clone()]);
+        let sig = ToolSignature::from_items(std::slice::from_ref(&json));
         assert!(sig.has_arrays);
     }
 
     #[test]
     fn tool_signature_deterministic() {
         let json = json!({"key": "value"});
-        let sig1 = ToolSignature::from_items(&[json.clone()]);
-        let sig2 = ToolSignature::from_items(&[json.clone()]);
+        let sig1 = ToolSignature::from_items(std::slice::from_ref(&json));
+        let sig2 = ToolSignature::from_items(std::slice::from_ref(&json));
         assert_eq!(sig1.structure_hash, sig2.structure_hash);
     }
 
@@ -3699,8 +3699,10 @@ mod tests {
 
     #[test]
     fn apply_strategy_disabled_compressor() {
-        let mut config = ContentRouterConfig::default();
-        config.enable_smart_crusher = false;
+        let config = ContentRouterConfig {
+            enable_smart_crusher: false,
+            ..Default::default()
+        };
         let content = "[1, 2, 3]";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -3716,11 +3718,14 @@ mod tests {
 
     #[test]
     fn apply_strategy_smart_crusher_fallback_to_log() {
-        let mut config = ContentRouterConfig::default();
-        config.enable_log_compressor = true;
-        config.enable_kompress = false; // Skip Kompress to test Log fallback directly
-                                        // Non-JSON content — SmartCrusher passes through unchanged, then
-                                        // Kompress is skipped (disabled), then Log is attempted.
+        // Skip Kompress to test Log fallback directly. Non-JSON content —
+        // SmartCrusher passes through unchanged, then Kompress is skipped
+        // (disabled), then Log is attempted.
+        let config = ContentRouterConfig {
+            enable_log_compressor: true,
+            enable_kompress: false,
+            ..Default::default()
+        };
         let content = "unique one-off error that cannot be deduplicated or compressed";
         let original_tokens = content.split_whitespace().count();
         let (compressed, tokens, chain) = apply_strategy(
@@ -3984,9 +3989,12 @@ mod tests {
 
     #[test]
     fn apply_strategy_code_aware_compresses_code() {
-        let mut config = ContentRouterConfig::default();
-        config.enable_code_aware = true;
-        config.enable_kompress = false; // Don't fall back to Kompress
+        // Don't fall back to Kompress
+        let config = ContentRouterConfig {
+            enable_code_aware: true,
+            enable_kompress: false,
+            ..Default::default()
+        };
         let content = "function hello() {\n  console.log('world');\n  return 42;\n}";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -4002,8 +4010,10 @@ mod tests {
 
     #[test]
     fn apply_strategy_code_aware_disabled_falls_through() {
-        let mut config = ContentRouterConfig::default();
-        config.enable_code_aware = false;
+        let config = ContentRouterConfig {
+            enable_code_aware: false,
+            ..Default::default()
+        };
         let content = "function hello() { return 42; }";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -4033,8 +4043,10 @@ mod tests {
 
     #[test]
     fn apply_strategy_html_disabled_falls_through() {
-        let mut config = ContentRouterConfig::default();
-        config.enable_html_extractor = false;
+        let config = ContentRouterConfig {
+            enable_html_extractor: false,
+            ..Default::default()
+        };
         let content = "<html><body><h1>Hello</h1></body></html>";
         let (compressed, _tokens, chain) =
             apply_strategy(content, CompressionStrategy::Html, &config, "", None, 1.0);
@@ -4057,8 +4069,10 @@ mod tests {
 
     #[test]
     fn apply_strategy_tabular_disabled_falls_through() {
-        let mut config = ContentRouterConfig::default();
-        config.enable_kompress = false;
+        let config = ContentRouterConfig {
+            enable_kompress: false,
+            ..Default::default()
+        };
         let content = "col1,col2,col3\n1,2,3\n4,5,6";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -4075,8 +4089,10 @@ mod tests {
 
     #[test]
     fn apply_strategy_text_disabled_falls_through() {
-        let mut config = ContentRouterConfig::default();
-        config.enable_kompress = false;
+        let config = ContentRouterConfig {
+            enable_kompress: false,
+            ..Default::default()
+        };
         let content = "just some plain text content here";
         let (compressed, _tokens, chain) =
             apply_strategy(content, CompressionStrategy::Text, &config, "", None, 1.0);
@@ -4220,7 +4236,7 @@ mod tests {
         let frozen = cache.frozen.lock().unwrap();
         assert_eq!(frozen.verdicts.len(), 1);
         assert_eq!(frozen.order.len(), 1, "order must not gain a second entry");
-        assert_eq!(frozen.verdicts[&1], false, "later verdict wins");
+        assert!(!frozen.verdicts[&1], "later verdict wins");
     }
 
     #[test]
@@ -4366,7 +4382,7 @@ mod external_compressor_tests {
     }
 
     impl StubExternal {
-        fn new(name: &str, content_types: &[&str], behavior: Behavior) -> Arc<dyn Compressor> {
+        fn arc(name: &str, content_types: &[&str], behavior: Behavior) -> Arc<dyn Compressor> {
             Arc::new(Self {
                 descriptor: CompressorDescriptor {
                     name: name.to_string(),
@@ -4452,7 +4468,7 @@ mod external_compressor_tests {
     /// selection, the result is byte-identical to the built-in-only path.
     #[test]
     fn no_selection_means_the_external_path_is_never_reached() {
-        let registry = registry_with(StubExternal::new("ext", &["text/plain"], Behavior::Shrink));
+        let registry = registry_with(StubExternal::arc("ext", &["text/plain"], Behavior::Shrink));
         let config = ContentRouterConfig {
             enable_kompress: false,
             ..Default::default()
@@ -4470,7 +4486,7 @@ mod external_compressor_tests {
 
     #[test]
     fn a_selected_compressor_handles_a_matching_content_type() {
-        let registry = registry_with(StubExternal::new("ext", &["text/plain"], Behavior::Shrink));
+        let registry = registry_with(StubExternal::arc("ext", &["text/plain"], Behavior::Shrink));
         let (out, tokens, chain) = run(SAMPLE, &selecting(&["ext"]), &registry);
 
         assert_eq!(out, "SHRUNK");
@@ -4483,7 +4499,7 @@ mod external_compressor_tests {
     #[test]
     fn a_wildcard_content_type_matches_anything() {
         for declared in [vec!["*"], vec!["*/*"], vec!["text/*"]] {
-            let registry = registry_with(StubExternal::new("ext", &declared, Behavior::Shrink));
+            let registry = registry_with(StubExternal::arc("ext", &declared, Behavior::Shrink));
             let (out, _, chain) = run(SAMPLE, &selecting(&["ext"]), &registry);
             assert_eq!(
                 out, "SHRUNK",
@@ -4495,7 +4511,7 @@ mod external_compressor_tests {
 
     #[test]
     fn a_non_matching_content_type_falls_through_to_the_builtin() {
-        let registry = registry_with(StubExternal::new(
+        let registry = registry_with(StubExternal::arc(
             "ext",
             &["application/json"],
             Behavior::Shrink,
@@ -4510,7 +4526,7 @@ mod external_compressor_tests {
     /// its own top-level type, otherwise it would be a full wildcard.
     #[test]
     fn a_type_wildcard_does_not_cross_content_types() {
-        let registry = registry_with(StubExternal::new("ext", &["image/*"], Behavior::Shrink));
+        let registry = registry_with(StubExternal::arc("ext", &["image/*"], Behavior::Shrink));
         let (out, _, chain) = run(SAMPLE, &selecting(&["ext"]), &registry);
 
         assert_ne!(out, "SHRUNK");
@@ -4519,7 +4535,7 @@ mod external_compressor_tests {
 
     #[test]
     fn an_expanding_compressor_is_rejected() {
-        let registry = registry_with(StubExternal::new("ext", &["text/plain"], Behavior::Expand));
+        let registry = registry_with(StubExternal::arc("ext", &["text/plain"], Behavior::Expand));
         let (out, _, chain) = run(SAMPLE, &selecting(&["ext"]), &registry);
 
         assert!(out.len() <= SAMPLE.len());
@@ -4530,7 +4546,7 @@ mod external_compressor_tests {
     /// an empty result must fall back rather than be returned.
     #[test]
     fn a_compressor_that_blanks_the_block_is_rejected() {
-        let registry = registry_with(StubExternal::new("ext", &["text/plain"], Behavior::Empty));
+        let registry = registry_with(StubExternal::arc("ext", &["text/plain"], Behavior::Empty));
         let (out, _, chain) = run(SAMPLE, &selecting(&["ext"]), &registry);
 
         assert!(!out.trim().is_empty());
@@ -4539,7 +4555,7 @@ mod external_compressor_tests {
 
     #[test]
     fn selecting_an_unregistered_name_is_not_fatal() {
-        let registry = registry_with(StubExternal::new("ext", &["text/plain"], Behavior::Shrink));
+        let registry = registry_with(StubExternal::arc("ext", &["text/plain"], Behavior::Shrink));
         let (out, _, chain) = run(SAMPLE, &selecting(&["ghost"]), &registry);
 
         assert_ne!(out, "SHRUNK");
@@ -4548,7 +4564,7 @@ mod external_compressor_tests {
 
     #[test]
     fn the_recovery_map_is_handed_to_the_store() {
-        let registry = registry_with(StubExternal::new(
+        let registry = registry_with(StubExternal::arc(
             "ext",
             &["text/plain"],
             Behavior::ShrinkWithRecoverable,
@@ -4587,7 +4603,7 @@ mod external_compressor_tests {
     /// still returned, only that entry is unretrievable.
     #[test]
     fn a_store_failure_still_returns_the_compressed_block() {
-        let registry = registry_with(StubExternal::new(
+        let registry = registry_with(StubExternal::arc(
             "ext",
             &["text/plain"],
             Behavior::ShrinkWithRecoverable,
@@ -4639,7 +4655,7 @@ mod external_compressor_tests {
     /// never inject unrecoverable loss into a lossless-only session.
     #[test]
     fn lossless_only_mode_never_reaches_the_external_path() {
-        let registry = registry_with(StubExternal::new("ext", &["*"], Behavior::Shrink));
+        let registry = registry_with(StubExternal::arc("ext", &["*"], Behavior::Shrink));
         let config = ContentRouterConfig {
             lossless: true,
             ..selecting(&["ext"])
@@ -4789,8 +4805,10 @@ mod kompress_size_gate_tests {
     fn dense_elide_fires_on_passthrough_bundle_dump() {
         // A minified-bundle dump: no structural compressor understands it.
         // Elision must fire on the passthrough path with the strategy named.
-        let mut config = ContentRouterConfig::default();
-        config.enable_kompress = false;
+        let config = ContentRouterConfig {
+            enable_kompress: false,
+            ..Default::default()
+        };
         // A minified-bundle dump with prose around it: no structural
         // compressor understands the dense lines, so elision fires on the
         // passthrough path with the strategy named.
@@ -4813,13 +4831,17 @@ mod kompress_size_gate_tests {
             "a".repeat(3000),
             "b".repeat(3000)
         );
-        let mut off = ContentRouterConfig::default();
-        off.enable_dense_line_elision = false;
+        let off = ContentRouterConfig {
+            enable_dense_line_elision: false,
+            ..Default::default()
+        };
         let (_, _, chain) = apply_strategy(&dump, CompressionStrategy::Log, &off, "", None, 1.0);
         assert!(!chain.contains(&"dense_elide".to_string()));
 
-        let mut lossless = ContentRouterConfig::default();
-        lossless.lossless = true;
+        let lossless = ContentRouterConfig {
+            lossless: true,
+            ..Default::default()
+        };
         let (_, _, chain) =
             apply_strategy(&dump, CompressionStrategy::Log, &lossless, "", None, 1.0);
         assert!(!chain.contains(&"dense_elide".to_string()));

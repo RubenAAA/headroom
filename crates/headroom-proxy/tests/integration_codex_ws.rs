@@ -61,6 +61,8 @@ async fn spawn_mock_upstream(
             let events = events.clone();
             let codex_headers = codex_headers.clone();
             tokio::spawn(async move {
+                // tungstenite fixes this callback signature, large Err included.
+                #[allow(clippy::result_large_err)]
                 let callback =
                     |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
                      mut resp: tokio_tungstenite::tungstenite::handshake::server::Response|
