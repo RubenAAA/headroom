@@ -7,6 +7,9 @@ retests), with status in the file.
 Measurement-led files (`recache-*`, `savings-*`, `proxy-*`) scope every
 number to its window; do not quote across windows.
 
+- [`offload-loses-at-2000-bytes.md`](offload-loses-at-2000-bytes.md): at a
+  2,000-byte floor, retrievals and re-reads cost more than offload saves;
+  two thirds of retrievals repeat one from an earlier turn.
 - [`zen-retry-after-guidance.md`](zen-retry-after-guidance.md): use bounded
   provider guidance, but preserve the measured guard against Zen's stale,
   oversized Retry-After value.

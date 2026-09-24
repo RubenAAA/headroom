@@ -1080,6 +1080,19 @@ pub struct CliArgs {
     )]
     pub ctx_offload_min_bytes: usize,
 
+    /// CTX-3: offload `tool_result` blocks on the OpenCode Zen route too.
+    /// Default `false`. Zen is free, so offload saves no money there, while
+    /// every digest the model wants back costs a `headroom_retrieve` round trip
+    /// the client never sees: 1,097 on Zen over 2026-09-23..24, 2.2 s median.
+    /// The Claude path and other routed upstreams are unaffected.
+    #[arg(
+        long = "ctx-offload-zen",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_ZEN",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub ctx_offload_zen: bool,
+
     /// CTX-3: how many messages back from the tail a `tool_result` must be
     /// before `--exclude-tools` stops shielding it from offload. `0` (the
     /// default) shields the whole history, which is the behaviour before this
@@ -2424,6 +2437,8 @@ pub struct Config {
     pub replay_store_dir: String,
     /// CTX-3: min serialized byte length for a block to be offloaded.
     pub ctx_offload_min_bytes: usize,
+    /// CTX-3: offload on the OpenCode Zen route too.
+    pub ctx_offload_zen: bool,
     /// CTX-3: messages back from the tail before `exclude_tools` stops
     /// shielding a block from offload; `0` shields all of it.
     pub ctx_offload_stale_messages: usize,
@@ -2743,6 +2758,7 @@ impl Config {
             cache_stampede_wait_cap: args.cache_stampede_wait_cap,
             replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
+            ctx_offload_zen: args.ctx_offload_zen,
             ctx_offload_stale_messages: args.ctx_offload_stale_messages,
             ctx_offload_stale_window: args.ctx_offload_stale_window,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
@@ -3024,6 +3040,7 @@ impl Config {
             cache_stampede_wait_cap: Duration::from_secs(10),
             replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,
+            ctx_offload_zen: false,
             ctx_offload_stale_messages: 0,
             ctx_offload_stale_window: 0,
             ctx_offload_ttl_seconds: 604_800,

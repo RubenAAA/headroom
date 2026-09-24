@@ -510,6 +510,13 @@ Options:
           [env: HEADROOM_PROXY_CTX_OFFLOAD_MIN_BYTES=]
           [default: 50000]
 
+      --ctx-offload-zen <CTX_OFFLOAD_ZEN>
+          CTX-3: offload `tool_result` blocks on the OpenCode Zen route too. Default `false`. Zen is free, so offload saves no money there, while every digest the model wants back costs a `headroom_retrieve` round trip the client never sees: 1,097 on Zen over 2026-09-23..24, 2.2 s median. The Claude path and other routed upstreams are unaffected
+          
+          [env: HEADROOM_PROXY_CTX_OFFLOAD_ZEN=]
+          [default: false]
+          [possible values: true, false]
+
       --ctx-offload-stale-messages <CTX_OFFLOAD_STALE_MESSAGES>
           CTX-3: how many messages back from the tail a `tool_result` must be before `--exclude-tools` stops shielding it from offload. `0` (the default) shields the whole history, which is the behaviour before this flag existed.
           

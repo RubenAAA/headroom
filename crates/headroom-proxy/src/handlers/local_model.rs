@@ -207,6 +207,10 @@ pub async fn handle_messages(
         .await;
     }
 
+    // Zen is free, so offload saves no money there and costs a hidden
+    // retrieval round trip each time the model wants a digest back.
+    let offload = state.config.ctx_offload_zen
+        || classify_upstream(&upstream, is_chatgpt_auth) != UpstreamKind::OpenCodeZen;
     let prepared = match prepare_turn(
         &state,
         parsed,
@@ -214,6 +218,7 @@ pub async fn handle_messages(
         &client_addr,
         &request_id,
         identity_model.as_deref(),
+        offload,
     )
     .await
     {

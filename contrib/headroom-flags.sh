@@ -181,7 +181,13 @@ HEADROOM_FLAGS=(
   # 4-7 and a first conversion almost never needs a boundary at all. So the
   # backlog the gate defers is small, and where the rest of that number lives is
   # still an open question.
-  --ctx-offload-min-bytes 2000
+  #
+  # 2000 -> 20000 on 2026-09-24. The cache simulator above prices only what
+  # offload saves; `scripts/offload-ledger.py` also prices what it costs. Over
+  # 7.4 days, hidden `headroom_retrieve` rounds and re-reads cost 126% of the
+  # saving at 2000. The sweep peaks at 20000 under both weight sets, flat from
+  # 18000 to 22000. See docs/notes/learnings/offload-loses-at-2000-bytes.md.
+  --ctx-offload-min-bytes 20000
 
   # ON 2026-08-17. --exclude-tools keeps Read/Grep/Glob results verbatim so the
   # model never edits a file from a summary of it. That argument is about the

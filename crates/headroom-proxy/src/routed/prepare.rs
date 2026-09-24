@@ -38,6 +38,7 @@ pub(crate) async fn prepare_turn(
     client_addr: &SocketAddr,
     request_id: &str,
     identity_model: Option<&str>,
+    offload: bool,
 ) -> Result<PreparedTurn, Response> {
     // Apply headroom's CTX request-side transforms (session capture +
     // tool_result offload) so routed models get the same optimizations and
@@ -51,6 +52,7 @@ pub(crate) async fn prepare_turn(
         client_addr,
         request_id,
         identity_model,
+        offload,
     )
     .await;
 

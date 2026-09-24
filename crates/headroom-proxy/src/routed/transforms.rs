@@ -367,48 +367,68 @@ fn offload_tool_results(
                 rebuild_boundary,
                 "offloaded tool_result blocks on routed-model request"
             );
-            // Record what was offloaded against the workspace so a later turn's
-            // proactive expansion can find it. Without this the expansion above
-            // has an empty index to consult and can never fire.
-            if index_queued {
-                if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
-                    crate::proxy::track_ccr_context_records(
-                        state,
-                        &out.records,
-                        workspace_key,
-                        user_query,
-                        turn_number,
-                        request_id,
-                    );
-                } else if state.ccr_context_tracker.is_some() {
-                    tracing::info!(
-                        event = "codex_ccr_workspace_unresolved",
-                        records_skipped = out.records.len(),
-                        bytes_skipped = out
-                            .records
-                            .iter()
-                            .map(|r| r.original.len() as u64)
-                            .sum::<u64>(),
-                        "CCR: workspace unresolved; skipping compression tracking"
-                    );
-                }
-            } else if state.ccr_context_tracker.is_some() {
-                tracing::warn!(
-                    event = "ctx_offload_context_tracking_skipped",
-                    request_id = %request_id,
-                    "offload index unavailable; skipping routed context tracking"
-                );
-            }
-            if !index_queued {
-                tracing::warn!(
-                    event = "ctx_offload_index_degraded",
-                    request_id = %request_id,
-                    records = out.records.len(),
-                    "routed request keeps CCR digests, but project search and recall will miss these records"
-                );
-            }
+            track_offloaded_records(
+                state,
+                &out.records,
+                index_queued,
+                ccr_workspace,
+                user_query,
+                turn_number,
+                request_id,
+            );
         }
     }
+}
+
+/// Record what was offloaded against the workspace so a later turn's
+/// proactive expansion can find it. Without this the expansion above
+/// has an empty index to consult and can never fire.
+fn track_offloaded_records(
+    state: &AppState,
+    records: &[crate::compression::ctx_offload::OffloadRecord],
+    index_queued: bool,
+    ccr_workspace: &Option<(String, Option<String>)>,
+    user_query: &str,
+    turn_number: u32,
+    request_id: &str,
+) {
+    if !index_queued {
+        if state.ccr_context_tracker.is_some() {
+            tracing::warn!(
+                event = "ctx_offload_context_tracking_skipped",
+                request_id = %request_id,
+                "offload index unavailable; skipping routed context tracking"
+            );
+        }
+        tracing::warn!(
+            event = "ctx_offload_index_degraded",
+            request_id = %request_id,
+            records = records.len(),
+            "routed request keeps CCR digests, but project search and recall will miss these records"
+        );
+        return;
+    }
+    if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
+        crate::proxy::track_ccr_context_records(
+            state,
+            records,
+            workspace_key,
+            user_query,
+            turn_number,
+            request_id,
+        );
+    } else if state.ccr_context_tracker.is_some() {
+        log_workspace_unresolved(records);
+    }
+}
+
+fn log_workspace_unresolved(records: &[crate::compression::ctx_offload::OffloadRecord]) {
+    tracing::info!(
+        event = "codex_ccr_workspace_unresolved",
+        records_skipped = records.len(),
+        bytes_skipped = records.iter().map(|r| r.original.len() as u64).sum::<u64>(),
+        "CCR: workspace unresolved; skipping compression tracking"
+    );
 }
 
 /// Tool-definition stages on the still-Anthropic-shaped body: memory tools
@@ -480,6 +500,7 @@ pub(crate) async fn apply_ctx_request_transforms(
     client_addr: &SocketAddr,
     request_id: &str,
     identity_model: Option<&str>,
+    offload: bool,
 ) -> CtxTransformReport {
     let mut report = CtxTransformReport::default();
     use crate::cache_stabilization::drift_detector::{
@@ -615,19 +636,22 @@ pub(crate) async fn apply_ctx_request_transforms(
     }
 
     // CTX-3: tool_result offload. Feeds the FTS search store and shrinks the
-    // body. Gated on the same `ctx_offload` flag as the Claude path.
-    offload_tool_results(
-        state,
-        parsed,
-        &session_key,
-        rebuild_boundary,
-        &ccr_workspace,
-        &user_query,
-        turn_number,
-        request_id,
-        &ctx_project,
-        &mut report,
-    );
+    // body. Gated on the same `ctx_offload` flag as the Claude path, and off
+    // for routes the caller excludes (see `--ctx-offload-zen`).
+    if offload {
+        offload_tool_results(
+            state,
+            parsed,
+            &session_key,
+            rebuild_boundary,
+            &ccr_workspace,
+            &user_query,
+            turn_number,
+            request_id,
+            &ctx_project,
+            &mut report,
+        );
+    }
 
     // Tool-definition + recall stages on the still-Anthropic-shaped body.
     inject_turn_tools(state, parsed, &mut report);
@@ -1109,8 +1133,16 @@ mod routed_request_tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        apply_ctx_request_transforms(&state, &mut with_tools, &headers, &addr, "req-test", None)
-            .await;
+        apply_ctx_request_transforms(
+            &state,
+            &mut with_tools,
+            &headers,
+            &addr,
+            "req-test",
+            None,
+            true,
+        )
+        .await;
         let names: Vec<&str> = with_tools["tools"]
             .as_array()
             .unwrap()
@@ -1130,12 +1162,75 @@ mod routed_request_tests {
             &addr,
             "req-test",
             None,
+            true,
         )
         .await;
         assert!(
             without_tools.get("tools").is_none(),
             "a request with no tools array must not grow one"
         );
+    }
+
+    /// A route the caller excludes (Zen, under `--ctx-offload-zen false`) must
+    /// forward an oversized `tool_result` verbatim, while an included route
+    /// still gets the digest.
+    #[tokio::test]
+    async fn offload_runs_only_when_the_route_allows_it() {
+        // `test_state` leaves the offload runtime unset; `AppState::new` builds
+        // it from the config the way the live proxy does.
+        let store = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::config::Config::for_test(url::Url::parse("http://upstream:8080").unwrap());
+        config.ctx_offload = true;
+        config.ctx_offload_min_bytes = 2_000;
+        config.ctx_store_dir = Some(store.path().to_path_buf());
+        let state = crate::proxy::AppState::new(config).expect("app state");
+        assert!(state.ctx_offload.is_some(), "offload runtime must be live");
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let file: String = (1..=200)
+            .map(|i| format!("{i:>6}\tlet value_{i} = compute({i});\n"))
+            .collect();
+        let body = json!({
+            "model": "claude-muse-spark-1.3",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/x.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": file}
+                ]}
+            ]
+        });
+
+        let mut excluded = body.clone();
+        let report = apply_ctx_request_transforms(
+            &state,
+            &mut excluded,
+            &headers,
+            &addr,
+            "req-a",
+            None,
+            false,
+        )
+        .await;
+        assert!(!report.transforms_applied.iter().any(|t| t == "ctx_offload"));
+        assert_eq!(excluded["messages"][2], body["messages"][2]);
+
+        let mut included = body.clone();
+        let report = apply_ctx_request_transforms(
+            &state,
+            &mut included,
+            &headers,
+            &addr,
+            "req-b",
+            None,
+            true,
+        )
+        .await;
+        assert!(report.transforms_applied.iter().any(|t| t == "ctx_offload"));
+        assert_ne!(included["messages"][2], body["messages"][2]);
     }
 
     /// Injecting the same tool twice would send the model a duplicate
@@ -1150,8 +1245,10 @@ mod routed_request_tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None).await;
-        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None).await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None, true)
+            .await;
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None, true)
+            .await;
         let count = body["tools"]
             .as_array()
             .unwrap()
@@ -1178,9 +1275,10 @@ mod routed_request_tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
         });
-        let report =
-            apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None)
-                .await;
+        let report = apply_ctx_request_transforms(
+            &state, &mut body, &headers, &addr, "req-test", None, true,
+        )
+        .await;
         assert_eq!(report.transforms_applied, vec!["ccr_tool".to_string()]);
         assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
