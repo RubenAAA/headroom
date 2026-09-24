@@ -626,14 +626,51 @@ impl CCRResponseHandler {
                 }
             }
             "openai_responses" => {
-                // Responses API: the model's turn is the full `output[]` array
-                // (function_call items, message items, reasoning items, ...),
-                // echoed back verbatim as `input[]` items — not a single
-                // role/content dict like chat completions. Sentinel key mirrors
+                // Responses API: the model's turn is the full `output[]` array,
+                // echoed back as `input[]` items — not a single role/content
+                // dict like chat completions. Sentinel key mirrors
                 // `_openai_tool_results`; the continuation loop extends on it.
+                //
+                // The echo must be input-shaped: `function_call` items pass
+                // through verbatim (they are valid input), but `message`
+                // items arrive carrying output content (`output_text`) and
+                // must be re-encoded the way history translation encodes
+                // them — a plain-string message — because `output_text` is
+                // not a valid input content part and the upstream refuses
+                // the continuation. Anything else (reasoning items, …)
+                // passes through untouched, as before.
+                let empty = Vec::new();
+                let items = response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty);
+                let converted: Vec<Value> = items
+                    .iter()
+                    .map(|item| {
+                        if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+                            return item.clone();
+                        }
+                        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+                            // Already input-shaped (or content-free): leave it.
+                            return item.clone();
+                        };
+                        let text: String = parts
+                            .iter()
+                            .filter_map(|p| {
+                                p.get("text")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| p.get("refusal").and_then(Value::as_str))
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "type": "message",
+                            "role": item.get("role").and_then(Value::as_str).unwrap_or("assistant"),
+                            "content": text,
+                        })
+                    })
+                    .collect();
                 serde_json::json!({
-                    "_openai_responses_output_items":
-                        response.get("output").cloned().unwrap_or(Value::Array(vec![])),
+                    "_openai_responses_input_items": converted,
                 })
             }
             "google" => {
@@ -1229,8 +1266,16 @@ mod tests {
         });
         let handler = CCRResponseHandler::new(None);
         let msg = handler.extract_assistant_message(&response, "openai_responses");
-        let items = msg["_openai_responses_output_items"].as_array().unwrap();
+        let items = msg["_openai_responses_input_items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
+        // The echo is input-shaped: history text rides as a plain-string
+        // message (the way the outbound translator encodes it), because
+        // `output_text` is not a valid input content part. The call passes
+        // through verbatim.
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["content"], "hi");
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[1]["call_id"], "call_1");
     }
 
     #[test]

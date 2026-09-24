@@ -605,7 +605,7 @@ pub(super) fn build_ccr_continuation(
         .get_mut(items_field)
         .and_then(|v| v.as_array_mut())
     {
-        extend_or_push(items, assistant_msg, &["_openai_responses_output_items"]);
+        extend_or_push(items, assistant_msg, &["_openai_responses_input_items"]);
         extend_or_push(
             items,
             tool_result_msg,

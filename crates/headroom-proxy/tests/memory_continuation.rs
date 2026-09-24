@@ -235,3 +235,31 @@ async fn the_continuation_carries_the_tool_result_upstream() {
         upstream_saw[1]
     );
 }
+
+#[tokio::test]
+async fn the_continuation_ends_with_a_user_message() {
+    // Opus models without prefill support refuse a continuation whose
+    // conversation ends on assistant text (400 "must end with a user
+    // message", measured 2026-09-24). The continuation must always close
+    // with the tool-result message, never with the assistant echo.
+    let dir = TempDir::new().unwrap();
+    let (_client_saw, upstream_saw, _) = run_turn(&dir).await;
+
+    assert_eq!(
+        upstream_saw.len(),
+        2,
+        "expected an original and a continuation"
+    );
+    let continuation: Value = serde_json::from_str(&upstream_saw[1]).unwrap();
+    let messages = continuation
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .expect("anthropic continuation carries messages[]");
+    let last = messages.last().expect("continuation is never empty");
+    assert_eq!(
+        last.get("role").and_then(|r| r.as_str()),
+        Some("user"),
+        "continuation must end with the tool result, not a prefill: {}",
+        upstream_saw[1]
+    );
+}

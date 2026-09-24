@@ -347,6 +347,37 @@ pub async fn handle_messages(
 
     let upstream_status = upstream_resp.status();
 
+    // Early-drop cover for the streaming arm below: while the client is
+    // still uncommitted (opening bytes held), a dropped stream re-sends
+    // instead of truncating the turn — the routed equivalent of the
+    // direct path's `retry_on_early_drop`. Built here, where the full
+    // send context is in scope; consumed by `handle_streaming_response`.
+    // The buffered and fallback arms take none: a complete buffered body
+    // has no truncation signature to read, and a fallback re-sends to a
+    // different upstream on its own.
+    let early_retry = (state.config.retry_stream_hold_bytes > 0).then(|| {
+        let max_attempts = if state.config.retry_enabled {
+            state.config.retry_max_attempts.max(1)
+        } else {
+            1
+        };
+        crate::routed::early_stream_retry::EarlyRetryCtx {
+            state: state.clone(),
+            url: upstream_url.clone(),
+            headers: upstream_headers.clone(),
+            body: openai_body_bytes.clone(),
+            request_id: request_id.clone(),
+            session_key: session_key.clone(),
+            lane_key: Some(egress_lane_key.clone()),
+            is_chatgpt_auth,
+            is_zen,
+            hold_bytes: state.config.retry_stream_hold_bytes,
+            max_resends: max_attempts.saturating_sub(1),
+            base_delay_ms: state.config.retry_base_delay_ms,
+            max_delay_ms: state.config.retry_max_delay_ms,
+        }
+    });
+
     let ccr = RoutedCcr::assemble(
         &state,
         &headers,
@@ -378,6 +409,7 @@ pub async fn handle_messages(
         outcome_ctx,
         ccr,
         slow_probe,
+        early_retry,
         &request_id,
     )
     .await
@@ -718,6 +750,7 @@ async fn dispatch_upstream_answer(
     outcome_ctx: Option<crate::routed::outcome::RoutedOutcomeContext>,
     ccr: Option<RoutedCcr>,
     slow_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
+    early_retry: Option<crate::routed::early_stream_retry::EarlyRetryCtx>,
     request_id: &str,
 ) -> Response {
     if upstream_status != StatusCode::OK {
@@ -755,6 +788,7 @@ async fn dispatch_upstream_answer(
             outcome_ctx,
             ccr,
             slow_probe,
+            early_retry,
         )
         .await
     } else {

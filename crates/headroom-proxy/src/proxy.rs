@@ -9823,7 +9823,7 @@ fn append_round_messages(
         );
         return None;
     };
-    extend_or_push(items, assistant_msg, &["_openai_responses_output_items"]);
+    extend_or_push(items, assistant_msg, &["_openai_responses_input_items"]);
     extend_or_push(
         items,
         tool_result_msg,
@@ -10010,6 +10010,35 @@ pub(crate) async fn handle_memory_response(
             &results,
             memory.provider,
         ));
+
+        // Answer the memory calls in
+        // place the way the CCR mixed branch does, and let the client's
+        // calls reach the client untouched. Anthropic keeps its deferral
+        // (a real tool_result beats prose); every other shape takes the
+        // in-place answer. No continuation is sent, so there is nothing
+        // to book and the loop ends with the turn resolved. When the
+        // splice left a memory call standing (nothing matched it, which
+        // cannot happen while ids come from the same turn), fall through
+        // to the legacy continuation attempt rather than stranding it.
+        if provider != "anthropic" && count_non_memory_calls(&current_response, memory.provider) > 0
+        {
+            let spliced = splice_memory_results_as_text(&mut current_response, &results, provider);
+            let standing = memory
+                .handler
+                .has_memory_tool_calls(&current_response, memory.provider);
+            tracing::info!(
+                request_id = %request_id,
+                event = "memory_mixed_turn_answered_in_place",
+                round = rounds + 1,
+                memory_calls = results.len(),
+                spliced,
+                standing,
+                "memory: turn also calls client tools; answering in place instead of continuing"
+            );
+            if !standing {
+                break;
+            }
+        }
 
         // `handle_memory_tool_calls` returns provider-shaped tool results
         // already; wrap them the way the continuation array expects.
@@ -10240,6 +10269,102 @@ fn memory_trace_lines(
 }
 
 #[cfg(test)]
+mod memory_mixed_turn_tests {
+    use super::{count_non_memory_calls, splice_memory_results_as_text};
+    use crate::memory::tool_adapter::Provider;
+    use serde_json::json;
+
+    fn responses_turn() -> serde_json::Value {
+        json!({
+            "output": [
+                {"type": "function_call", "call_id": "call_mem", "name": "memory_search",
+                 "arguments": "{\"query\":\"x\"}"},
+                {"type": "function_call", "call_id": "call_client", "name": "Read",
+                 "arguments": "{\"path\":\"f\"}"},
+            ],
+        })
+    }
+
+    fn chat_result(call_id: &str, content: &str) -> serde_json::Value {
+        json!({"role": "tool", "tool_call_id": call_id, "content": content})
+    }
+
+    #[test]
+    fn counts_only_client_calls() {
+        assert_eq!(
+            count_non_memory_calls(&responses_turn(), Provider::Openai),
+            1
+        );
+        let pure = json!({
+            "output": [
+                {"type": "function_call", "call_id": "call_mem", "name": "memory_search",
+                 "arguments": "{}"},
+            ],
+        });
+        assert_eq!(count_non_memory_calls(&pure, Provider::Openai), 0);
+    }
+
+    #[test]
+    fn responses_splice_replaces_only_the_memory_call() {
+        let mut turn = responses_turn();
+        let results = vec![chat_result("call_mem", "two hits")];
+        assert_eq!(
+            splice_memory_results_as_text(&mut turn, &results, "openai_responses"),
+            1
+        );
+        let items = turn["output"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // The memory call is now an answer-shaped message item; the client
+        // call is untouched, with its identity intact for the client's run.
+        assert_eq!(items[0]["type"], "message");
+        assert!(items[0].to_string().contains("two hits"));
+        assert!(!items[0].to_string().contains("retrieved_context"));
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[1]["call_id"], "call_client");
+    }
+
+    #[test]
+    fn responses_splice_leaves_unmatched_calls_standing() {
+        let mut turn = responses_turn();
+        let results = vec![chat_result("call_other", "stray")];
+        assert_eq!(
+            splice_memory_results_as_text(&mut turn, &results, "openai_responses"),
+            0
+        );
+        assert_eq!(turn["output"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn chat_splice_removes_the_memory_call_and_appends_text() {
+        let mut turn = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "looking it up",
+                    "tool_calls": [
+                        {"id": "call_mem", "type": "function",
+                         "function": {"name": "memory_search", "arguments": "{}"}},
+                        {"id": "call_client", "type": "function",
+                         "function": {"name": "Read", "arguments": "{}"}},
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        });
+        let results = vec![chat_result("call_mem", "two hits")];
+        assert_eq!(
+            splice_memory_results_as_text(&mut turn, &results, "openai"),
+            1
+        );
+        let msg = &turn["choices"][0]["message"];
+        let calls = msg["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_client");
+        assert!(msg["content"].as_str().unwrap().contains("two hits"));
+    }
+}
+
+#[cfg(test)]
 mod memory_trace_tests {
     use super::{memory_trace_lines, pending_memory_call_names};
     use crate::memory::tool_adapter::Provider;
@@ -10448,6 +10573,150 @@ fn memory_results_message(results: &[serde_json::Value], provider: &str) -> serd
             serde_json::json!({"_openai_responses_tool_results": items})
         }
         _ => serde_json::json!({"_memory_tool_results": results}),
+    }
+}
+
+/// Whether this tool-call name belongs to the proxy (a memory tool the proxy
+/// injected, so the proxy must answer it) rather than to the client.
+fn is_proxy_memory_call(name: &str) -> bool {
+    crate::memory::tool_adapter::MEMORY_TOOL_NAMES.contains(&name)
+        || name == crate::memory::tool_adapter::NATIVE_MEMORY_TOOL_NAME
+}
+
+/// Count the turn's calls that are NOT proxy memory tools, in the shape the
+/// provider speaks. A turn mixing memory calls with client calls cannot be
+/// continued on shapes without deferral: the client's calls have no results
+/// yet, and appending the assistant turn would leave them unanswered
+/// upstream (Zen refuses the continuation with 400 "No tool output found
+/// for function call"). Anthropic is excluded by the caller — its deferral
+/// holds the memory answer for the next request instead.
+fn count_non_memory_calls(
+    response: &serde_json::Value,
+    provider: crate::memory::tool_adapter::Provider,
+) -> usize {
+    use crate::memory::tool_adapter::{extract_tool_calls, get_tool_name};
+    extract_tool_calls(response, provider)
+        .iter()
+        .filter(|call| !is_proxy_memory_call(&get_tool_name(call, provider)))
+        .count()
+}
+
+/// Answer memory calls in place as assistant prose, leaving every other call
+/// untouched for the client. Mirrors `splice_ccr_results_as_text` for the
+/// mixed-turn case no continuation can serve — with a memory wrapper, never
+/// `<retrieved_context>`, so the Stop hook's retrieval branch cannot mistake
+/// it for a spliced retrieval. Returns how many calls were replaced.
+///
+/// Only the shapes without deferral need this (the caller gates Anthropic
+/// out): `openai_responses` replaces `function_call` items with `message`
+/// items, the same item type a text answer arrives as; `openai` removes the
+/// calls from `message.tool_calls` and appends the text to
+/// `message.content`, which the client already renders.
+fn splice_memory_results_as_text(
+    response: &mut serde_json::Value,
+    results: &[serde_json::Value],
+    provider: &str,
+) -> usize {
+    // `handle_memory_tool_calls` formats every result Chat-shaped
+    // (`role: tool` + `tool_call_id`), whatever the turn's own shape.
+    fn result_text<'a>(results: &'a [serde_json::Value], id: &str) -> Option<&'a str> {
+        results
+            .iter()
+            .find(|r| r.get("tool_call_id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|r| r.get("content").and_then(|v| v.as_str()))
+    }
+    fn wrapped(text: &str) -> String {
+        format!("<memory_context>\n{text}\n</memory_context>")
+    }
+    match provider {
+        "openai_responses" => {
+            let Some(items) = response.get_mut("output").and_then(|v| v.as_array_mut()) else {
+                return 0;
+            };
+            let mut spliced = 0;
+            for item in items.iter_mut() {
+                if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                    continue;
+                }
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                    .unwrap_or_default();
+                let Some(text) = result_text(results, call_id) else {
+                    continue;
+                };
+                *item = serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": wrapped(text),
+                    }],
+                });
+                spliced += 1;
+            }
+            spliced
+        }
+        "openai" => {
+            let hits: Vec<(String, String)> = response
+                .get("choices")
+                .and_then(|v| v.as_array())
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|v| v.as_array())
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| {
+                            let id = call.get("id").and_then(|v| v.as_str())?;
+                            let text = result_text(results, id)?;
+                            Some((id.to_string(), text.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if hits.is_empty() {
+                return 0;
+            }
+            let Some(message) = response
+                .get_mut("choices")
+                .and_then(|v| v.as_array_mut())
+                .and_then(|c| c.first_mut())
+                .and_then(|c| c.get_mut("message"))
+            else {
+                return 0;
+            };
+            if let Some(calls) = message.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+                calls.retain(|call| {
+                    let id = call.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                    !hits.iter().any(|(hid, _)| hid == id)
+                });
+            }
+            let joined = hits
+                .iter()
+                .map(|(_, text)| wrapped(text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            match message.get_mut("content") {
+                Some(serde_json::Value::String(prev)) => {
+                    if !prev.is_empty() {
+                        *prev = format!("{prev}\n{joined}");
+                    } else {
+                        *prev = joined;
+                    }
+                }
+                Some(serde_json::Value::Array(blocks)) => {
+                    blocks.push(serde_json::json!({"type": "text", "text": joined}));
+                }
+                _ => {
+                    message["content"] = serde_json::Value::String(joined);
+                }
+            }
+            hits.len()
+        }
+        _ => 0,
     }
 }
 
@@ -11678,7 +11947,7 @@ mod tests {
         extend_or_push(
             &mut items,
             serde_json::json!({"role": "assistant"}),
-            &["_openai_responses_output_items"],
+            &["_openai_responses_input_items"],
         );
         // Sentinel wrapper is spliced.
         extend_or_push(

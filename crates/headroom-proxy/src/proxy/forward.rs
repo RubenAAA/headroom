@@ -4241,6 +4241,12 @@ pub(crate) async fn log_memory_send_rejection(
     // `messages[N]`); log that item's shape so the next
     // schema mismatch is diagnosable from the log alone.
     let rejected = rejected_item_summary(&detail, current_request, items_field);
+    // …but some 400s name no item at all (e.g. "the conversation must end
+    // with a user message"), so also snapshot the tail roles: a trailing
+    // assistant message is the whole diagnosis for that class, and without
+    // this line the next one is as unreadable as the 2026-09-24 Opus
+    // prefill rejections were.
+    let tail_roles = continuation_tail_summary(current_request, items_field);
     tracing::warn!(
         event = "memory_continuation_rejected",
         request_id = %request_id,
@@ -4249,8 +4255,56 @@ pub(crate) async fn log_memory_send_rejection(
         round = round + 1,
         detail = %first_bytes(&detail, 600),
         rejected_item = %rejected,
+        tail_roles = %tail_roles,
         "memory: upstream returned error during continuation"
     );
+}
+
+/// Roles (and, for Responses items, item types) of the last three entries
+/// of a continuation array, most recent last. Companions
+/// `rejected_item_summary` for rejections that name no item. Shared with
+/// the pre-send continuation check in `proxy.rs`, which logs the same
+/// shape when it skips a body that would fail the same way.
+pub(crate) fn continuation_tail_summary(request: &serde_json::Value, items_field: &str) -> String {
+    let items = request
+        .get(items_field)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tail: Vec<String> = items
+        .iter()
+        .rev()
+        .take(3)
+        .map(|item| {
+            if let Some(role) = item.get("role").and_then(|v| v.as_str()) {
+                let kinds = item
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| b.get("type").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    })
+                    .unwrap_or_default();
+                if kinds.is_empty() {
+                    role.to_string()
+                } else {
+                    format!("{role}[{kinds}]")
+                }
+            } else {
+                item.get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string()
+            }
+        })
+        .collect();
+    format!(
+        "[{}]",
+        tail.iter().rev().cloned().collect::<Vec<_>>().join(",")
+    )
 }
 
 /// Whether a memory-continuation HTTP status is worth another send.

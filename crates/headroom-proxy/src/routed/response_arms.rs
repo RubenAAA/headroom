@@ -472,6 +472,7 @@ pub(crate) async fn handle_streaming_response(
     outcome: Option<RoutedOutcomeContext>,
     ccr: Option<RoutedCcr>,
     slow_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
+    early_retry: Option<crate::routed::early_stream_retry::EarlyRetryCtx>,
 ) -> Response {
     let original_model = original
         .get("model")
@@ -484,10 +485,16 @@ pub(crate) async fn handle_streaming_response(
     let quota_seen_in_headers =
         codex_limits.record_headers(&original_model, upstream_resp.headers());
 
+    // Closest to the client of the two guards below: an early drop
+    // re-sends the request while the client is still uncommitted, so the
+    // client sees one clean stream. The slow-probe wrapper stays closest
+    // to the upstream — it disarms on the first bytes that arrive,
+    // whether or not they are forwarded yet.
     let stream = crate::upstream_route_probe::cancel_on_first_chunk(
         Box::pin(upstream_resp.bytes_stream()),
         slow_probe,
     );
+    let stream = crate::routed::early_stream_retry::wrap_streaming_body(stream, early_retry);
     // Snapshot before `outcome` moves into the translator below.
     let request_id = outcome
         .as_ref()
