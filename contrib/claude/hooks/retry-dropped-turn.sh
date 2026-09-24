@@ -214,8 +214,15 @@ if [ -z "$MSG" ]; then
   # may proceed. A tool_result after the splice is not an answer -- it is
   # the mixed-turn pending calls running, after which the model still owes
   # its reply.
-  SPLICE_TAG='<retrieved_context>'
-  SPLICE_LINE=$(printf '%s\n' "$WIDE" | grep -nF "$SPLICE_TAG" | tail -1 | cut -d: -f1)
+  # Matched on the splice's whole shape, not the bare tag: the proxy always
+  # writes the tag, a newline, the content, a newline and the closing tag,
+  # which JSONL stores as a literal \n on each side. A reply or a Bash command
+  # that merely names the tag is an assistant line too, and matching it re-armed
+  # the hook on turns that had already answered (2026-09-24).
+  SPLICE_OPEN='<retrieved_context>\n'
+  SPLICE_CLOSE='\n</retrieved_context>'
+  SPLICE_LINE=$(printf '%s\n' "$WIDE" | grep -nF "$SPLICE_OPEN" | grep -F "$SPLICE_CLOSE" |
+    tail -1 | cut -d: -f1)
   if [ -n "$SPLICE_LINE" ] &&
      printf '%s\n' "$WIDE" | sed -n "${SPLICE_LINE}p" | grep -qF '"type":"assistant"' &&
      ! answered_after "$SPLICE_LINE"; then
