@@ -105,7 +105,9 @@ if [[ -n "${TOML_FILES// /}" ]]; then
             taplo fmt "$tmp_fmt" >/dev/null 2>&1 || { rm -f "$tmp_fmt"; continue; }
             # Lines taplo changed, intersected with lines the push added.
             if grep -vFxf "$f" "$tmp_fmt" | grep -q .; then
-                added="$(git diff HEAD -- "$f" | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^+//' | sort -u)"
+                # Same range the file list came from; `|| true` because a
+                # file with no added lines makes grep exit 1 under pipefail.
+                added="$(git diff "${BASE:+$BASE...}HEAD" -- "$f" | { grep -E '^\+' || true; } | { grep -vE '^\+\+\+' || true; } | sed 's/^+//' | sort -u)"
                 if grep -vFxf "$f" "$tmp_fmt" | sort -u | grep -qFxf <(printf '%s\n' "$added") 2>/dev/null; then
                     echo "❌ hygiene: $f has unformatted lines added by this push. Run 'taplo fmt $f'." >&2
                     fail=1
