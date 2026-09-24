@@ -2,4 +2,3 @@
 # Read by scripts/check-complexity.sh. Only remove entries; do not add new ones.
 crates/headroom-proxy/src/proxy/memory_continuation.rs::handle_memory_response
 crates/headroom-proxy/src/proxy/memory_continuation.rs::continuation_dangling_calls
-crates/headroom-proxy/src/proxy/forward.rs::finalize_ctx_transformed_body

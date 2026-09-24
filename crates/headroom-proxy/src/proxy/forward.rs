@@ -4695,59 +4695,61 @@ pub(crate) fn finalize_ctx_transformed_body(
     state: &AppState,
     request_id: &str,
 ) -> bytes::Bytes {
-    let CtxSerializeInputs {
-        offload_records,
-        ccr_workspace,
-        latest_user_query,
-        turn_number,
-        ctx_project,
-    } = inputs;
-    if changed {
-        match serde_json::to_vec(&value) {
-            Ok(bytes) => {
-                if let Some((runtime, records)) = offload_records {
-                    if !runtime.store.persist(&records, &ctx_project) {
-                        runtime.gate.rollback_unstored_records(&records);
-                        tracing::warn!(
-                            event = "ctx_offload_backpressure_passthrough",
-                            request_id = %request_id,
-                            "forwarding the original request because CTX-3 index work could not be queued"
-                        );
-                        return buffered;
-                    }
-                    if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
-                        track_ccr_context_records(
-                            state,
-                            &records,
-                            workspace_key,
-                            &latest_user_query,
-                            turn_number,
-                            request_id,
-                        );
-                    } else if state.ccr_context_tracker.is_some() {
-                        tracing::info!(
-                            request_id = %request_id,
-                            "CCR Phase 4: workspace unresolved; skipping compression tracking"
-                        );
-                    }
-                }
-                axum::body::Bytes::from(bytes)
+    if !changed {
+        return buffered;
+    }
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            if let Some((runtime, records)) = &inputs.offload_records {
+                runtime.gate.rollback_unstored_records(records);
             }
-            Err(e) => {
-                if let Some((runtime, records)) = offload_records {
-                    runtime.gate.rollback_unstored_records(&records);
-                }
-                tracing::warn!(
-                    event = "ctx_transform_reserialize_failed",
-                    request_id = %request_id,
-                    error = %e,
-                    "ctx transform re-serialization failed; forwarding original body"
-                );
-                buffered
-            }
+            tracing::warn!(
+                event = "ctx_transform_reserialize_failed",
+                request_id = %request_id,
+                error = %e,
+                "ctx transform re-serialization failed; forwarding original body"
+            );
+            return buffered;
         }
-    } else {
-        buffered
+    };
+    if let Some((runtime, records)) = &inputs.offload_records {
+        if !runtime.store.persist(records, &inputs.ctx_project) {
+            runtime.gate.rollback_unstored_records(records);
+            tracing::warn!(
+                event = "ctx_offload_backpressure_passthrough",
+                request_id = %request_id,
+                "forwarding the original request because CTX-3 index work could not be queued"
+            );
+            return buffered;
+        }
+        track_offloaded_ccr_records(state, records, &inputs, request_id);
+    }
+    axum::body::Bytes::from(bytes)
+}
+
+/// Hands stored offload records to CCR Phase 4 tracking, when the workspace
+/// resolved.
+fn track_offloaded_ccr_records(
+    state: &AppState,
+    records: &[crate::compression::ctx_offload::OffloadRecord],
+    inputs: &CtxSerializeInputs<'_>,
+    request_id: &str,
+) {
+    if let Some((workspace_key, _)) = inputs.ccr_workspace.as_ref() {
+        track_ccr_context_records(
+            state,
+            records,
+            workspace_key,
+            &inputs.latest_user_query,
+            inputs.turn_number,
+            request_id,
+        );
+    } else if state.ccr_context_tracker.is_some() {
+        tracing::info!(
+            request_id = %request_id,
+            "CCR Phase 4: workspace unresolved; skipping compression tracking"
+        );
     }
 }
 
