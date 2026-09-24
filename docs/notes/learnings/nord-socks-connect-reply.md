@@ -20,10 +20,15 @@
   passed an isolated live shadow run: 8 exits started, sequential `curl`
   succeeded, and Reqwest's helper probe passed on all 8 with 8 unique
   fingerprints. Safe trace metadata confirmed successful normalized replies.
-  The Rust relay is installed on separate production ports `19300`–`19307`; the
-  Python relay remains on `18600`–`18607` for rollback. Proxy cutover is still
-  pending: the first restart selected the main checkout binary because the
-  restart script resolved `NEW_BIN` before loading the installed worktree path.
-  That path-order bug is fixed; wait for zero in-flight requests, restart onto
-  the worktree binary, and confirm `/debug/zen-egresses` before approving the
-  live proxy behavior.
+  The Rust relay is installed on separate candidate ports `19300`–`19307`; the
+  Python relay remains on `18600`–`18607` for rollback. The worktree release
+  binary's isolated smoke check served `/healthz` and reported all 8 configured
+  egress IDs. The first restart selected the main checkout binary because the
+  restart script resolved `NEW_BIN` before loading the installed worktree path;
+  that path-order bug is fixed in the worktree and installed script. The
+  corrected live cutover is active: the installed binary matches the worktree
+  release, `/healthz` succeeds, and `/debug/zen-egresses` reports all 8 lanes.
+  The helper reports 8 distinct live exit fingerprints, while the Python relay
+  remains available on its original ports. The first post-restart request was
+  assigned to lane 0. Cache-health response samples were still zero at the
+  immediate check, so measure the next completed turn before comparing latency.

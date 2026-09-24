@@ -4,9 +4,9 @@ Snapshot recorded 2026-09-24 for `codex/muse-egress-lanes`.
 
 ## Rust Nord SOCKS relay: final shadow verification passed
 
-The final candidate-probe fix passed isolated live shadow verification. The
-production relay is installed and running on separate ports; keep final proxy
-cutover pending until the worktree release binary is confirmed on port 8787.
+The final candidate-probe fix passed isolated live shadow verification, and
+the worktree release is now active on port 8787 with the Rust egress pool. The
+Python relay remains available on its original ports for rollback.
 
 Evidence so far:
 
@@ -65,25 +65,31 @@ or switched into service. The follow-up below was run after a cooldown.
   `/tmp/headroom-nord-rust-final-20260924-1230/relay.log` (mode 0600); it records
   successful reply metadata without credentials. One additional candidate was
   unavailable, but the required eight exits passed.
-- The installed helper then started a production Rust relay on ports
+- The installed helper then started a candidate Rust relay on ports
   `19300`–`19307` and verified 8 exits. The original Python relay remains
   available on `18600`–`18607` for rollback.
+- The worktree release binary also passed a local smoke check on port `18787`:
+  `/healthz` succeeded and `/debug/zen-egresses` reported all 8 configured
+  opaque IDs. The shadow proxy was stopped without sending an upstream request.
 - The first proxy restart drained the prior request to zero, but selected the
   main checkout's release binary: `restart-headroom.sh` computed `NEW_BIN`
   before loading `~/.headroom-paths.sh`. The worktree script now loads the path
-  first, and the installed script has that fix. The running proxy still needs
-  a drain-safe restart onto the worktree release binary; its current in-flight
-  count was 1 at the last check. The main binary returned 404 for
-  `/debug/zen-egresses`, confirming it is not the intended feature build.
+  first, and the installed script has that fix.
+- The corrected cutover restarted from the worktree release binary. Its hash
+  matches `target/release/headroom-proxy`; `/healthz` is healthy and
+  `/debug/zen-egresses` reports `pool_enabled: true` with 8 IDs. The helper
+  reports 8 unique exit fingerprints on `19300`–`19307`; the Python fallback
+  remains listening on `18600`–`18607`.
+- At the immediate post-restart check, `egress_in_flight` showed a new request
+  assigned to lane 0, confirming the proxy is using the Rust pool. The user
+  authorized truncating the prior active stream, so the restart used
+  `--force`. `cache-health` had no completed samples yet; use the next finished
+  model turn to assess response timing and counters.
 
-Remaining before approving the live behavior:
+Live behavior approval:
 
-1. Wait for the current proxy's in-flight count to reach zero.
-2. Restart with the worktree release binary and the existing Rust pool
-   environment. Confirm `/healthz` succeeds and `/debug/zen-egresses` reports
-   the eight configured lanes. Do not stop the Python relay during this check.
-3. Record the successful live cutover here, then review this worktree against
-   the separate main-worktree changes before any merge.
+The live cutover checks passed. Review the completed worktree against the
+separate main-worktree changes before any merge; no merge has been made.
 
 ## Git/worktree state at snapshot
 
