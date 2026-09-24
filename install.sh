@@ -163,6 +163,41 @@ else
     say "cargo not found — skipping cargo-sweep (builds still work; install it by hand for automatic target/ cleanup)"
 fi
 
+# ── fast test tools (optional) ────────────────────────────────────────
+# cargo-nextest (parallel test runner; what CI shards run via
+# `make test-nextest-shard`) and sccache (compiler cache, CI sets
+# RUSTC_WRAPPER=sccache). Both strictly optional: the Makefile falls back
+# to plain `cargo test` without nextest, and .cargo/config.toml
+# deliberately does not set `build.rustc-wrapper` so checkouts without
+# sccache keep working — opt in per-shell with
+# `export RUSTC_WRAPPER=sccache`. Never fatal: a failed install leaves
+# `cargo test` working, only the fast path stays dormant.
+step "Fast test tools"
+if [ "$BUILD" = 0 ]; then
+    say "skipping (--no-build); run 'cargo install cargo-nextest --locked' and 'cargo install sccache' by hand for the fast test loop"
+else
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        say "cargo-nextest already installed"
+    elif command -v cargo >/dev/null 2>&1; then
+        say "installing cargo-nextest (one-time parallel test runner)"
+        cargo install cargo-nextest --locked \
+            && say "installed cargo-nextest" \
+            || say "WARNING: could not install cargo-nextest — 'make test' still works, run 'cargo install cargo-nextest --locked' by hand for the fast path"
+    else
+        say "cargo not found — skipping cargo-nextest (tests still work; install it by hand for the fast path)"
+    fi
+    if command -v sccache >/dev/null 2>&1; then
+        say "sccache already installed (opt in with 'export RUSTC_WRAPPER=sccache')"
+    elif command -v cargo >/dev/null 2>&1; then
+        say "installing sccache (one-time compiler cache; opt in with 'export RUSTC_WRAPPER=sccache')"
+        cargo install sccache \
+            && say "installed sccache" \
+            || say "WARNING: could not install sccache — builds still work, run 'cargo install sccache' by hand for cached rebuilds"
+    else
+        say "cargo not found — skipping sccache (builds still work; install it by hand for cached rebuilds)"
+    fi
+fi
+
 # ── flag set ──────────────────────────────────────────────────────────────
 # contrib/headroom-flags.sh is the measured flag set — every option the
 # maintainer runs with, paths written as $HOME. An existing file is kept: it

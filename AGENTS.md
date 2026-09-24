@@ -22,6 +22,11 @@ for file type detection and embeddings: `install.sh` checks `ORT_DYLIB_PATH` for
 an existing file, then tries importing `onnxruntime` in python3, and prints a
 hint if neither works. Without it the proxy still runs.
 
+Optional but recommended for fast test loops: `cargo-nextest` (parallel
+runner; what CI shards run) and `sccache` (compiler cache, opt in with
+`export RUSTC_WRAPPER=sccache`). `install.sh` offers both; without them
+the Makefile falls back to plain `cargo test`.
+
 ```bash
 git clone https://github.com/RubenAAA/headroom.git ~/headroom
 cd ~/headroom
@@ -125,11 +130,31 @@ Integration tests live in `crates/headroom-proxy/tests/`. The pattern is a
 wiremock upstream capturing forwarded bodies, a proxy started against it, and
 assertions on what came out. Copy an existing file, do not invent a harness.
 
+## Testing (fast loop)
+
+Do not run `cargo test --workspace` in a loop — it links 80+ integration
+binaries every time. Prefer, in order:
+
+```bash
+make test-unit           # --lib --bins only; default loop
+make test-nextest-unit   # same, via nextest (needs cargo-nextest)
+make test-touched        # only suites covering `git diff HEAD`
+make what-to-run         # preview what test-touched would run
+```
+
+Full suite is `make test-nextest` (what CI shards run as
+`--partition hash:<shard>/4`); plain `make test` is the back-compat
+fallback. Scope with `-p <crate>` and nextest `-E` filters, e.g.
+`cargo nextest run -p headroom-proxy --profile ci -E 'kind(lib) and test(cache_stabilization)'`.
+The `ci` profile sets `PROPTEST_CASES=32` (vs 256 default); rerun with
+`PROPTEST_CASES=256` when touching parser code. Skip `--features ml`
+unless you touched ONNX paths — it needs a real libonnxruntime and is
+much slower.
+
 Before pushing:
 
 ```bash
 make ci-precheck   # fmt, clippy, tests; the same gate CI runs
-make test          # cargo test --workspace alone
 ```
 
 `rust-toolchain.toml` pins 1.95.0 so a clippy lint from a newer stable cannot
