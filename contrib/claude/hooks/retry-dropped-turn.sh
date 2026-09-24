@@ -145,6 +145,7 @@ answered_after() {
 
 MSG=""
 TAIL_INSTR=""
+BRANCH="none"
 # The `"text":"` prefix is the assistant gate: the synthesised message's
 # content starts with the marker, while a reply quoting an old drop has
 # prose before it and tool_use inputs carry it in user lines.
@@ -155,9 +156,11 @@ if [ -n "$MARK_LINE" ] &&
     if printf '%s\n' "$WIDE" | sed -n "${MARK_LINE}p" | grep -qF 'did NOT run'; then
       MSG="The API connection dropped mid-response and a pending tool call was discarded without running"
       TAIL_INSTR="Check the transcript first: if that call already ran since the drop, do not re-issue it. Otherwise re-issue the discarded tool call now; do not ask, do not narrate."
+      BRANCH="truncation-drop"
     else
       MSG="The API connection dropped mid-response and the reply was cut off"
       TAIL_INSTR="Continue from where the reply was cut off; do not repeat tool calls that already ran — check the transcript first, then continue."
+      BRANCH="truncation-cut"
     fi
   fi
 fi
@@ -177,6 +180,7 @@ if [ -z "$MSG" ]; then
     # be mistaken for a real error that ended the turn.
     MSG="The upstream request failed and the turn ended on an error"
     TAIL_INSTR="Check the transcript first: re-issue whatever was in flight when the error hit (tool call or reply), without repeating work that already ran; if the error text names rate limiting, wait a few seconds before retrying — do not ask, do not narrate."
+    BRANCH="api-error"
   fi
 fi
 if [ -z "$MSG" ]; then
@@ -198,6 +202,7 @@ if [ -z "$MSG" ]; then
       # cannot require a starts-with match.)
       MSG="The proxy dropped a tool call this turn and the reply came back empty"
       TAIL_INSTR="Check the transcript first: re-issue the dropped tool call now (it never ran), without repeating work that already ran; do not ask, do not narrate."
+      BRANCH="retrieval-marker"
     fi
 fi
 if [ -z "$MSG" ]; then
@@ -226,8 +231,24 @@ if [ -z "$MSG" ]; then
   if [ -n "$SPLICE_LINE" ] &&
      printf '%s\n' "$WIDE" | sed -n "${SPLICE_LINE}p" | grep -qF '"type":"assistant"' &&
      ! answered_after "$SPLICE_LINE"; then
+      # Per-splice dedup: a re-issued retrieve after a continue re-arms this
+      # branch on a new line with the same content, and the model can ping-pong
+      # for the full breaker budget re-reading what it was already told to
+      # use (2026-09-24). If this exact splice was already continued, let the
+      # stop through. New content still fires. Fail-open: any hashing error
+      # falls through to firing as before.
+      SPLICE_HASH=$(printf '%s\n' "$WIDE" | sed -n "${SPLICE_LINE}p" | sha256sum 2>/dev/null | cut -d' ' -f1)
+      if [ -n "$SPLICE_HASH" ] && [ -f "$STATE_DIR/$SESSION.splice" ] &&
+         [ "$SPLICE_HASH" = "$(cat "$STATE_DIR/$SESSION.splice" 2>/dev/null)" ]; then
+        echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=splice-dedup-skip branch=splice" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
+        rm -f "$STATE_DIR/$SESSION"
+        exit 0
+      fi
       MSG="The turn ended with retrieved context but no answer built on it"
       TAIL_INSTR="Continue the original task now using the retrieved context above — reference it directly instead of calling headroom_retrieve for it again, and do not repeat tool calls that already ran; do not ask, do not narrate."
+      BRANCH="splice"
+      mkdir -p "$STATE_DIR" 2>/dev/null
+      [ -n "$SPLICE_HASH" ] && printf '%s' "$SPLICE_HASH" >"$STATE_DIR/$SESSION.splice" 2>/dev/null || true
     fi
 fi
 if [ -z "$MSG" ]; then
@@ -251,6 +272,7 @@ if [ -z "$MSG" ]; then
       if [ "$mem_acted" -eq 0 ]; then
         MSG="The turn ended with a dropped memory lookup and no answer built without it"
         TAIL_INSTR="Continue the original task now without the dropped memory lookup — answer from the context you already have, do not try to re-run the memory call (it is proxy-run and will not resolve), and do not repeat tool calls that already ran; do not ask, do not narrate."
+        BRANCH="memory"
       fi
     fi
 fi
@@ -270,7 +292,7 @@ fi
 DECISION="no-match"
 if [ -z "$MSG" ]; then
   rm -f "$STATE_DIR/$SESSION"
-  echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=$DECISION" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
+  echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=$DECISION branch=$BRANCH" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
   exit 0
 fi
 
@@ -279,11 +301,11 @@ case "$COUNT" in '' | *[!0-9]*) COUNT=0 ;; esac
 if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
   rm -f "$STATE_DIR/$SESSION"
   rm -f "$STATE_DIR/$SESSION.drop" 2>/dev/null || true  # pre-window-scan state, if any
-  echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=breaker-tripped" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
+  echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=breaker-tripped branch=$BRANCH" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
   exit 0
 fi
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 echo $((COUNT + 1)) >"$STATE_DIR/$SESSION" 2>/dev/null || exit 0
-echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=fired retry=$((COUNT + 1))/$MAX_RETRIES" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
+echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=fired retry=$((COUNT + 1))/$MAX_RETRIES branch=$BRANCH" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
 echo "$MSG (retry $((COUNT + 1))/$MAX_RETRIES). $TAIL_INSTR" >&2
 exit 2
