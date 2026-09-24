@@ -166,6 +166,29 @@ struct Accum {
     sparse_tokens: usize,
 }
 
+/// tool_use id → tool name across `msgs`.
+fn tool_use_names(msgs: &[Value]) -> HashMap<String, String> {
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    for msg in msgs {
+        for b in msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && let (Some(id), Some(name)) = (
+                    b.get("id").and_then(|i| i.as_str()),
+                    b.get("name").and_then(|n| n.as_str()),
+                )
+            {
+                id_map.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    id_map
+}
+
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: sparse_overhead_audit <capture_dir>");
@@ -223,24 +246,7 @@ fn main() {
             .get("messages")
             .and_then(|m| m.as_array())
             .unwrap_or(&empty);
-        let mut id_map: HashMap<String, String> = HashMap::new();
-        for msg in msgs {
-            for b in msg
-                .get("content")
-                .and_then(|c| c.as_array())
-                .cloned()
-                .unwrap_or_default()
-            {
-                if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                    && let (Some(id), Some(name)) = (
-                        b.get("id").and_then(|i| i.as_str()),
-                        b.get("name").and_then(|n| n.as_str()),
-                    )
-                {
-                    id_map.insert(id.to_string(), name.to_string());
-                }
-            }
-        }
+        let id_map = tool_use_names(msgs);
 
         for msg in msgs {
             for b in msg

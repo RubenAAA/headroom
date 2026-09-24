@@ -316,7 +316,8 @@ fn rates(model: &str, write_tier_1h: bool) -> (f64, f64) {
     }
 }
 
-fn main() {
+/// Capture dir and whether cache writes bill at the 1h tier (the default).
+fn parse_args() -> (String, bool) {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| {
         eprintln!("usage: section_cost_baseline <capture_dir> [--write-tier 5m|1h]");
@@ -338,14 +339,19 @@ fn main() {
             std::process::exit(2);
         }
     }
+    (dir, write_tier_1h)
+}
 
+/// Anthropic turns grouped by (session_key, model) and time-ordered, plus the
+/// count of files loaded and skipped.
+fn load_sessions(dir: &str) -> (BTreeMap<(String, String), Vec<Turn>>, usize, usize) {
     // Load envelopes, group by (session_key, model), order by seq.
     // Model switches reset the stable prefix (separate cache lineage —
     // same reason usage_observer compares within one model).
     let mut sessions: BTreeMap<(String, String), Vec<Turn>> = BTreeMap::new();
     let mut files = 0usize;
     let mut skipped = 0usize;
-    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
         eprintln!("read capture dir {dir}: {e}");
         std::process::exit(1);
     });
@@ -412,6 +418,46 @@ fn main() {
     for turns in sessions.values_mut() {
         turns.sort_by_key(|t| (t.ts_ms, t.seq));
     }
+    (sessions, files, skipped)
+}
+
+/// tool_use id → tool name across `msgs`.
+fn tool_use_names(msgs: &[Value]) -> HashMap<String, String> {
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    for msg in msgs {
+        for b in msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && let (Some(id), Some(name)) = (
+                    b.get("id").and_then(|i| i.as_str()),
+                    b.get("name").and_then(|n| n.as_str()),
+                )
+            {
+                id_map.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    id_map
+}
+
+/// Tokens in the leading run of segment keys shared with the previous turn.
+fn stable_prefix_tokens(prev: Option<&[(u64, usize)]>, keys: &[(u64, usize)]) -> usize {
+    let Some(p) = prev else { return 0 };
+    keys.iter()
+        .zip(p)
+        .take_while(|(cur, old)| cur.0 == old.0)
+        .map(|(cur, _)| cur.1)
+        .sum()
+}
+
+fn main() {
+    let (dir, write_tier_1h) = parse_args();
+
+    let (sessions, files, skipped) = load_sessions(&dir);
 
     println!(
         "Loaded {files} anthropic turns across {} session(s) from {dir} (skipped {skipped} non-anthropic/empty)",
@@ -443,30 +489,13 @@ fn main() {
             let tok = get_tokenizer(&turn.model);
             let tok = tok.as_ref();
             // Build id map first so result parents resolve across messages.
-            let mut id_map: HashMap<String, String> = HashMap::new();
             let empty = vec![];
             let msgs = turn
                 .body
                 .get("messages")
                 .and_then(|m| m.as_array())
                 .unwrap_or(&empty);
-            for msg in msgs {
-                for b in msg
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                        && let (Some(id), Some(name)) = (
-                            b.get("id").and_then(|i| i.as_str()),
-                            b.get("name").and_then(|n| n.as_str()),
-                        )
-                    {
-                        id_map.insert(id.to_string(), name.to_string());
-                    }
-                }
-            }
+            let id_map = tool_use_names(msgs);
 
             let mut tool_calls: HashMap<String, usize> = HashMap::new();
             let mut segs = segmentize(&turn.body, tok, &mut tool_calls);
@@ -554,20 +583,7 @@ fn main() {
             let (read_mult, write_mult) = rates(&turn.model, write_tier_1h);
             let keys: Vec<(u64, usize)> = segs.iter().map(|s| (s.key, s.tokens)).collect();
             let total: usize = segs.iter().map(|s| s.tokens).sum();
-            let stable: usize = match &prev {
-                None => 0,
-                Some(p) => {
-                    let mut acc = 0;
-                    for (cur, old) in keys.iter().zip(p.iter()) {
-                        if cur.0 == old.0 {
-                            acc += cur.1;
-                        } else {
-                            break;
-                        }
-                    }
-                    acc
-                }
-            };
+            let stable = stable_prefix_tokens(prev.as_deref(), &keys);
             prev = Some(keys);
 
             total_turns += 1;

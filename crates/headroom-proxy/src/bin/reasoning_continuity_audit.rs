@@ -88,12 +88,9 @@ struct Turn {
     outbound: Value,
 }
 
-fn main() {
-    let dir = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("usage: reasoning_continuity_audit <capture_dir>");
-        std::process::exit(2);
-    });
-
+/// Captured turns paired with their outbound wire copies, grouped by envelope
+/// (session_key, model) and time-ordered, plus the count of unpaired `out/` files.
+fn load_sessions(dir: &str) -> (BTreeMap<(String, String), Vec<Turn>>, usize) {
     // Load inbound envelopes.
     struct Inbound {
         ts_ms: u64,
@@ -103,7 +100,7 @@ fn main() {
         body: Value,
     }
     let mut inbound: HashMap<String, Inbound> = HashMap::new();
-    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
         eprintln!("read capture dir {dir}: {e}");
         std::process::exit(1);
     });
@@ -215,6 +212,16 @@ fn main() {
     for v in sessions.values_mut() {
         v.sort_by_key(|t| (t.ts_ms, t.seq));
     }
+    (sessions, unpaired)
+}
+
+fn main() {
+    let dir = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: reasoning_continuity_audit <capture_dir>");
+        std::process::exit(2);
+    });
+
+    let (sessions, unpaired) = load_sessions(&dir);
 
     println!(
         "Auditing {} paired turns across {} session(s) (unpaired out/ files: {unpaired})",
