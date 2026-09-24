@@ -58,7 +58,7 @@ tokio-util = { version = "0.7" }
 # `default-features = false` so the proxy's own `ml` feature is what decides
 # whether ONNX Runtime is linked; see `[features]` below.
 headroom-core = { path = "../headroom-core", default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS
 # default credential chain.
@@ -129,8 +129,8 @@ regex-lite = "0.1"
 # forwarding. Ports Python `_read_request_body_bytes` which supports
 # gzip/deflate (flate2), zstd, and brotli (br) Content-Encodings.
 flate2 = { workspace = true }
-zstd = "0.13"
-brotli = "7"
+zstd = "0.14"
+brotli = "9"
 # Runtime ast-grep interceptor writes tool output to a temporary file before
 # invoking ast-grep. This is used outside tests, so tempfile must be a normal
 # dependency, not only a dev-dependency.

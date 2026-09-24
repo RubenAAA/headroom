@@ -183,7 +183,7 @@ uuid = { workspace = true }
 # strings, and both stream without loading styles. Pure Rust (zip + quick-xml
 # under the hood), no system dep. The `dates` feature pulls chrono (already a
 # direct dep) so datetime cells render like Python's `str(datetime)`.
-calamine = { version = "0.35", features = ["dates"] }
+calamine = { version = "0.36", features = ["dates"] }
 # `dom_smoothie` powers the HTMLExtractor (`transforms/html_extractor.rs`).
 # It is a FUNCTIONAL replacement for Python's `trafilatura` — a Rust port of
 # Mozilla Readability.js (html5ever-based DOM; html5ever is already in the
