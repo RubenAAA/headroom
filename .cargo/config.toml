@@ -2,6 +2,16 @@
 # .github/workflows/rust.yml); this file intentionally does NOT set
 # `build.rustc-wrapper`, so checkouts without sccache installed keep working.
 # To opt in locally: `cargo install sccache` and export RUSTC_WRAPPER=sccache.
+#
+# Same deal for the mold linker (Linux only; mold does not support macOS):
+# no `linker`/`rustflags` stanza here, so checkouts without mold keep
+# working. To opt in: `install.sh` downloads a prebuilt mold to
+# ~/.local/share/mold, then export
+#   PATH="$HOME/.local/share/mold/bin:$PATH"
+#   RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+# First build after opting in re-links everything once; steady state is
+# ~10-20% faster on link-heavy rebuilds (the 80+ integration binaries).
+# It does not replace merging them — see AGENTS.md "Testing (fast loop)".
 
 [profile.dev]
 # Trade a little runtime for much faster incremental test builds: 256

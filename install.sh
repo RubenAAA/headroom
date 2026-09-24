@@ -196,6 +196,39 @@ else
     else
         say "cargo not found — skipping sccache (builds still work; install it by hand for cached rebuilds)"
     fi
+    # mold: fast linker for the 80+ integration test binaries (Linux
+    # only — mold does not support macOS). Prebuilt tarball, no sudo,
+    # no cargo compile: seconds, not minutes. Strictly optional like
+    # sccache — .cargo/config.toml sets no linker flags, so checkouts
+    # without mold keep working. Opt in per-shell (see .cargo/config.toml).
+    if [ "$OS" != "Linux" ]; then
+        say "skipping mold (Linux-only linker; this is $OS)"
+    elif [ -x "$HOME/.local/share/mold/bin/mold" ] || command -v mold >/dev/null 2>&1; then
+        say "mold already installed (opt in per .cargo/config.toml)"
+    else
+        _mold_arch=""
+        case "$(uname -m)" in
+            x86_64) _mold_arch="x86_64" ;;
+            aarch64|arm64) _mold_arch="aarch64" ;;
+            *) say "WARNING: unknown arch '$(uname -m)' — skipping mold (builds still work)" ;;
+        esac
+        if [ -n "$_mold_arch" ]; then
+            # Pinned: verified against this tree. Bump deliberately.
+            _mold_ver="2.42.1"
+            _mold_url="https://github.com/rui314/mold/releases/download/v${_mold_ver}/mold-${_mold_ver}-${_mold_arch}-linux.tar.gz"
+            say "installing mold ${_mold_ver} (one-time fast linker; opt in per .cargo/config.toml)"
+            if command -v curl >/dev/null 2>&1 && mkdir -p "$HOME/.local/share/mold" \
+                && curl -sL --proto '=https' --tlsv1.2 -o /tmp/mold-install.tar.gz "$_mold_url" \
+                && tar xzf /tmp/mold-install.tar.gz -C /tmp \
+                && cp -r "/tmp/mold-${_mold_ver}-${_mold_arch}-linux/." "$HOME/.local/share/mold/" \
+                && rm -rf /tmp/mold-install.tar.gz "/tmp/mold-${_mold_ver}-${_mold_arch}-linux"; then
+                say "installed mold to ~/.local/share/mold"
+            else
+                say "WARNING: could not install mold — builds still work, see .cargo/config.toml for the by-hand install"
+            fi
+        fi
+        unset _mold_arch _mold_ver _mold_url
+    fi
 fi
 
 # ── flag set ──────────────────────────────────────────────────────────────
