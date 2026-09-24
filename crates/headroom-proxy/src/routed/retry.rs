@@ -87,9 +87,9 @@ pub(crate) struct UpstreamSend {
 ///
 /// `is_zen` enables the rate-limit hold: a Zen (opencode.ai) 429 that
 /// exhausts the fast budget waits on, bounded by
-/// `retry_zen_hold_budget_ms`, instead of returning the fatal 429 — the VPN
-/// watcher rotates the exit on the 429 log line, and the turn must outlive
-/// the rotation to land on the fresh exit.
+/// `retry_zen_hold_budget_ms`, instead of returning the fatal 429. The rate
+/// limit event carries the selected egress identity so an egress-aware
+/// rotation controller can rotate only the limited path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_with_retry(
     state: &AppState,
@@ -98,10 +98,48 @@ pub(crate) async fn send_with_retry(
     body: Bytes,
     request_id: &str,
     session_key: Option<&str>,
+    lane_key: Option<&str>,
     is_chatgpt_auth: bool,
     is_zen: bool,
 ) -> Result<UpstreamSend, Response> {
     let (max_attempts, max_delay_ms) = retry_bounds(state);
+    // `egress_guard` counts this turn against its Zen egress until the last
+    // byte of the answer (it rides in the response body) — except while the
+    // turn is parked in the 429 hold, which is waiting on that egress's
+    // rotation and must not block its drain.
+    let (upstream_client, egress_slot, egress_id, mut egress_guard) = if is_zen {
+        match state.zen_client_for_lane(lane_key) {
+            Ok(selection) => selection,
+            Err(egress_id) => {
+                tracing::debug!(
+                    event = "zen_egress_maintenance_reject",
+                    egress_id,
+                    request_id = %request_id,
+                    "rejecting request while its provider egress is rotating"
+                );
+                return Err(crate::error::transient_response(
+                    "the selected Zen egress is rotating; retry this turn shortly".to_string(),
+                ));
+            }
+        }
+    } else {
+        (&state.client, 0, state.default_egress_id.as_str(), None)
+    };
+    let upstream_host = crate::routed::upstream_gate::upstream_host(upstream_url)
+        .unwrap_or_else(|| "unknown-upstream".to_string());
+    let egress_gate_key = format!("{upstream_host}#{egress_id}");
+    if is_zen {
+        tracing::debug!(
+            event = "zen_egress_selected",
+            egress_id,
+            egress_slot,
+            lane_key_hash = %lane_key
+                .map(crate::cache_stabilization::drift_detector::session_key_log_prefix)
+                .unwrap_or_default(),
+            request_id = %request_id,
+            "selected sticky provider egress for routed stream lane"
+        );
+    }
     let mut refreshed = false;
     let mut attempt: u32 = 0;
     // Zen in-flight cap: bound the first wave (concurrent POST starts),
@@ -113,6 +151,7 @@ pub(crate) async fn send_with_retry(
     let mut zen_slot = if is_zen {
         Some(
             crate::routed::upstream_gate::acquire_global_zen_slot(
+                &egress_gate_key,
                 state.config.retry_zen_max_inflight,
                 max_delay_ms,
                 request_id,
@@ -122,11 +161,10 @@ pub(crate) async fn send_with_retry(
     } else {
         None
     };
-    wait_behind_parked_host(upstream_url, max_delay_ms, request_id).await;
+    wait_behind_parked_host(upstream_url, &egress_gate_key, max_delay_ms, request_id).await;
     let upstream_resp = loop {
         attempt += 1;
-        let result = state
-            .client
+        let result = upstream_client
             .post(upstream_url)
             .headers(headers.clone())
             .body(body.clone())
@@ -136,9 +174,25 @@ pub(crate) async fn send_with_retry(
         match result {
             Ok(r) => {
                 let status = r.status();
+                if is_zen && status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    tracing::warn!(
+                        event = "zen_egress_rate_limited",
+                        egress_id,
+                        egress_slot,
+                        status = status.as_u16(),
+                        request_id = %request_id,
+                        "Zen rate limit observed on this provider egress"
+                    );
+                }
                 if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed && is_chatgpt_auth {
-                    let Some(r) =
-                        try_codex_token_refresh(state, &mut headers, &mut refreshed, r).await
+                    let Some(r) = try_codex_token_refresh(
+                        state,
+                        upstream_client,
+                        &mut headers,
+                        &mut refreshed,
+                        r,
+                    )
+                    .await
                     else {
                         continue;
                     };
@@ -152,6 +206,7 @@ pub(crate) async fn send_with_retry(
                         max_attempts,
                         max_delay_ms,
                         upstream_url,
+                        &egress_gate_key,
                         request_id,
                         session_key,
                         is_zen,
@@ -178,7 +233,7 @@ pub(crate) async fn send_with_retry(
                 if status.as_u16() == 413 && prepared_replay_applies(&body) {
                     drop(r);
                     return try_replay_stripped_resend(
-                        state,
+                        upstream_client,
                         upstream_url,
                         &headers,
                         &body,
@@ -186,18 +241,31 @@ pub(crate) async fn send_with_retry(
                         request_id,
                         session_key,
                     )
-                    .await;
+                    .await
+                    .map(|mut send| {
+                        send.resp = crate::proxy::attach_egress_guard(send.resp, egress_guard);
+                        send
+                    });
                 }
                 if status.as_u16() == 429 && is_zen && state.config.retry_zen_hold_enabled {
+                    let retry_after_ms = r
+                        .headers()
+                        .get(http::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(headroom_core::retry::retry_after_ms_uncapped);
                     drop(r);
                     match try_zen_hold(
                         state,
+                        upstream_client,
+                        egress_slot,
+                        &mut egress_guard,
                         upstream_url,
                         &mut headers,
                         &body,
                         &mut attempt,
                         &mut zen_slot,
                         request_id,
+                        retry_after_ms,
                     )
                     .await
                     {
@@ -228,7 +296,7 @@ pub(crate) async fn send_with_retry(
         }
     };
     Ok(UpstreamSend {
-        resp: upstream_resp,
+        resp: crate::proxy::attach_egress_guard(upstream_resp, egress_guard),
         headers,
         attempts: attempt,
         retried_without_replay: None,
@@ -250,13 +318,19 @@ fn retry_bounds(state: &AppState) -> (u32, u64) {
     (max_attempts, state.config.retry_max_delay_ms)
 }
 
-/// Shared 429 gate: a recent 429 on this host parks it until now+backoff,
-/// so turns arriving behind a known-limited upstream wait instead of
-/// re-colliding. Capped at `retry_max_delay_ms`; the request is untouched.
+/// Shared 429 gate: a recent 429 parks only this upstream egress until
+/// now+backoff, so turns behind a known-limited egress wait instead of
+/// re-colliding while independent egresses keep going. Capped at
+/// `retry_max_delay_ms`; the request is untouched.
 /// Extracted from `send_with_retry` without behavior change.
-async fn wait_behind_parked_host(upstream_url: &str, max_delay_ms: u64, request_id: &str) {
+async fn wait_behind_parked_host(
+    upstream_url: &str,
+    egress_gate_key: &str,
+    max_delay_ms: u64,
+    request_id: &str,
+) {
     if let Some(host) = crate::routed::upstream_gate::upstream_host(upstream_url) {
-        let wait_ms = crate::routed::upstream_gate::gate_wait_ms(&host).min(max_delay_ms);
+        let wait_ms = crate::routed::upstream_gate::gate_wait_ms(egress_gate_key).min(max_delay_ms);
         if wait_ms > 0 {
             tracing::warn!(
                 event = "upstream_backoff_gate_wait",
@@ -276,12 +350,13 @@ async fn wait_behind_parked_host(upstream_url: &str, max_delay_ms: u64, request_
 /// Extracted from `send_with_retry` without behavior change.
 async fn try_codex_token_refresh(
     state: &AppState,
+    client: &reqwest::Client,
     headers: &mut HeaderMap,
     refreshed: &mut bool,
     r: reqwest::Response,
 ) -> Option<reqwest::Response> {
     if let Some(auth_file) = state.config.codex_auth_file.as_deref() {
-        if let Some(token) = refresh_codex_token(&state.client, auth_file).await {
+        if let Some(token) = refresh_codex_token(client, auth_file).await {
             if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
                 headers.insert(http::header::AUTHORIZATION, val);
             }
@@ -313,6 +388,7 @@ async fn backoff_retryable_status(
     max_attempts: u32,
     max_delay_ms: u64,
     upstream_url: &str,
+    egress_gate_key: &str,
     request_id: &str,
     session_key: Option<&str>,
     is_zen: bool,
@@ -375,12 +451,11 @@ async fn backoff_retryable_status(
         "local_model",
         crate::observability::retry_reason::from_status(status.as_u16()),
     );
-    // Share the pain: park this host until now+backoff so
-    // parallel turns queue behind the limit instead of each
-    // sleeping privately and re-colliding on the same wake.
-    if let Some(host) = crate::routed::upstream_gate::upstream_host(upstream_url) {
+    // Share the pain only within this egress: parallel turns behind the
+    // same limited IP wait together, while other egresses remain independent.
+    if crate::routed::upstream_gate::upstream_host(upstream_url).is_some() {
         crate::routed::upstream_gate::gate_hold(
-            &host,
+            egress_gate_key,
             backoff.as_millis().min(u64::MAX as u128) as u64,
         );
     }
@@ -396,7 +471,7 @@ async fn backoff_retryable_status(
 /// Extracted from `send_with_retry` without behavior change.
 #[allow(clippy::too_many_arguments)]
 async fn try_replay_stripped_resend(
-    state: &AppState,
+    client: &reqwest::Client,
     upstream_url: &str,
     headers: &HeaderMap,
     body: &Bytes,
@@ -405,8 +480,7 @@ async fn try_replay_stripped_resend(
     session_key: Option<&str>,
 ) -> Result<UpstreamSend, Response> {
     let stripped = strip_replay_prefix(body);
-    match state
-        .client
+    match client
         .post(upstream_url)
         .headers(headers.clone())
         .body(stripped.clone())
@@ -443,28 +517,38 @@ async fn try_replay_stripped_resend(
 #[allow(clippy::too_many_arguments)]
 async fn try_zen_hold(
     state: &AppState,
+    client: &reqwest::Client,
+    egress_slot: usize,
+    egress_guard: &mut Option<crate::proxy::EgressInflightGuard>,
     upstream_url: &str,
     headers: &mut HeaderMap,
     body: &Bytes,
     attempt: &mut u32,
     zen_slot: &mut Option<crate::routed::upstream_gate::ZenSlot>,
     request_id: &str,
+    retry_after_ms: Option<f64>,
 ) -> Result<reqwest::Response, Response> {
     // A hold sleeps for up to the hold budget (187 s seen
     // 2026-09-14) with nothing in flight. Holding the Zen
     // slot through it pinned every slot behind 429s, so the
     // 1,152 over-cap turns that day each waited the full
     // 30 s and then went without one anyway. Give it back;
-    // the per-host gate already staggers arrivals behind
-    // the same 429.
+    // the per-egress gate already staggers arrivals behind
+    // the same egress-specific 429.
     zen_slot.take();
+    // Same for the egress count: a parked turn is waiting on this egress's
+    // rotation, so it must not hold the drain. Each probe re-takes it.
+    egress_guard.take();
     match crate::routed::zen_hold::hold_for_rotation(
         state,
+        client,
+        egress_slot,
         upstream_url,
         headers.clone(),
         body.clone(),
         *attempt,
         request_id,
+        retry_after_ms,
     )
     .await
     {
@@ -477,19 +561,25 @@ async fn try_zen_hold(
         // the fast loop's last 429 is already dropped, so
         // re-send once for the honest answer rather than
         // inventing a status.
-        None => match state
-            .client
-            .post(upstream_url)
-            .headers(headers.clone())
-            .body(body.clone())
-            .send()
-            .await
-        {
-            Ok(r) => Ok(r),
-            Err(e) => Err(crate::error::transient_response(format!(
-                "local upstream error: {e}"
-            ))),
-        },
+        None => {
+            let guard = state.acquire_zen_egress(egress_slot).map_err(|_| {
+                crate::error::transient_response(
+                    "the selected Zen egress is rotating; retry this turn shortly".to_string(),
+                )
+            })?;
+            match client
+                .post(upstream_url)
+                .headers(headers.clone())
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(r) => Ok(crate::proxy::attach_egress_guard(r, guard)),
+                Err(e) => Err(crate::error::transient_response(format!(
+                    "local upstream error: {e}"
+                ))),
+            }
+        }
     }
 }
 
@@ -599,6 +689,7 @@ mod tests {
             Bytes::from("{}"),
             "test-exhaustion",
             None,
+            None,
             false,
             false,
         )
@@ -654,6 +745,7 @@ mod tests {
             Bytes::from("{}"),
             "test-zen-hold",
             None,
+            None,
             false,
             true,
         )
@@ -661,6 +753,144 @@ mod tests {
         .expect("hold must recover into Ok");
         assert_eq!(send.resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "one 429 then recovery");
+    }
+
+    /// A turn parked in the 429 hold gives its egress back, so the rotation
+    /// drain for that egress is not waiting on the turn that waits on it.
+    /// While the egress is rotating, probes are skipped rather than sent over
+    /// a pooled tunnel to the old exit; once it reopens, the recovering probe
+    /// re-takes the count and the stream carries it to the last byte.
+    #[tokio::test]
+    async fn zen_hold_releases_its_egress_and_skips_probes_while_rotating() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![reqwest::Client::new()],
+            vec!["proxy-a".to_string()],
+        ));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = wiremock::MockServer::start().await;
+        {
+            let hits = hits.clone();
+            let pool = pool.clone();
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(move |_: &wiremock::Request| {
+                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // The watcher starts rotating this egress on its 429.
+                        assert!(pool.set_maintenance("proxy-a", true));
+                        wiremock::ResponseTemplate::new(429)
+                    } else {
+                        wiremock::ResponseTemplate::new(200).set_body_string("recovered")
+                    }
+                })
+                .mount(&mock)
+                .await;
+        }
+        let upstream: url::Url = mock.uri().parse().unwrap();
+        let mut config = crate::config::Config::for_test(upstream);
+        config.retry_enabled = true;
+        config.retry_max_attempts = 1;
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 1;
+        config.retry_zen_hold_enabled = true;
+        config.retry_zen_hold_budget_ms = 30_000;
+        let mut state = AppState::new(config).expect("app state");
+        state.zen_egresses = Some(pool.clone());
+        let count = || state.zen_egress_in_flight()["proxy-a"].as_u64().unwrap();
+
+        let task_state = state.clone();
+        let uri = mock.uri();
+        let turn = tokio::spawn(async move {
+            send_with_retry(
+                &task_state,
+                &uri,
+                HeaderMap::new(),
+                Bytes::from("{}"),
+                "test-zen-hold-rotating",
+                None,
+                Some("lane-a"),
+                false,
+                true,
+            )
+            .await
+        });
+
+        // Dozens of 1ms probe slices pass; none may reach the upstream, and
+        // the parked turn must not count against the rotating egress.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "probes skipped while rotating"
+        );
+        assert_eq!(count(), 0, "a held turn does not block the drain");
+        assert!(!turn.is_finished());
+
+        assert!(pool.set_maintenance("proxy-a", false));
+        let send = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("hold recovers once the egress reopens")
+            .unwrap()
+            .unwrap_or_else(|_| panic!("hold must recover into Ok"));
+        assert_eq!(send.resp.status(), 200);
+        assert_eq!(count(), 1, "the recovering probe carries the count");
+        assert_eq!(send.resp.text().await.unwrap(), "recovered");
+        assert_eq!(count(), 0);
+    }
+
+    /// A sane Retry-After on the last fast-loop 429 controls the first hold
+    /// probe. A real provider wait reduces re-collisions on this egress.
+    #[tokio::test]
+    async fn zen_hold_honors_within_cap_retry_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = hits_clone.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    wiremock::ResponseTemplate::new(429)
+                        .insert_header("retry-after", "0.05")
+                        .set_body_string("rate limited")
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#)
+                }
+            })
+            .mount(&mock)
+            .await;
+        let upstream: url::Url = mock.uri().parse().unwrap();
+        let mut config = crate::config::Config::for_test(upstream);
+        config.retry_enabled = true;
+        config.retry_max_attempts = 1;
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 100;
+        config.retry_zen_hold_enabled = true;
+        config.retry_zen_hold_budget_ms = 30_000;
+        let state = AppState::new(config).expect("app state");
+        let started = std::time::Instant::now();
+        let send = send_with_retry(
+            &state,
+            &mock.uri(),
+            HeaderMap::new(),
+            Bytes::from("{}"),
+            "test-zen-retry-after",
+            None,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("hold must recover into Ok");
+        assert_eq!(send.resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one 429 then recovery");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(45),
+            "the within-cap Retry-After should guide the first hold probe"
+        );
     }
 
     /// The default budget (0) holds through a long run of 429s instead of
@@ -702,6 +932,7 @@ mod tests {
             HeaderMap::new(),
             Bytes::from("{}"),
             "test-zen-hold-unbounded",
+            None,
             None,
             false,
             true,
@@ -758,6 +989,7 @@ mod tests {
             Bytes::from("{}"),
             "test-zen-long-retry-after",
             None,
+            None,
             false,
             true,
         )
@@ -808,6 +1040,7 @@ mod tests {
             Bytes::from("{}"),
             "test-zen-hold-exhaust",
             None,
+            None,
             false,
             true,
         )
@@ -855,6 +1088,7 @@ mod tests {
             Bytes::from("{}"),
             "test-non-zen-long-retry-after",
             None,
+            None,
             false,
             false,
         )
@@ -886,6 +1120,7 @@ mod tests {
             HeaderMap::new(),
             Bytes::from("{}"),
             "test-no-hold",
+            None,
             None,
             false,
             false,
@@ -948,6 +1183,7 @@ mod tests {
             pinned.clone(),
             "test-413-strip",
             None,
+            None,
             false,
             false,
         )
@@ -998,6 +1234,7 @@ mod tests {
             HeaderMap::new(),
             Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"fresh"}]}"#),
             "test-413-plain",
+            None,
             None,
             false,
             false,

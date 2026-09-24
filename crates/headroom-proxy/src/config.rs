@@ -329,14 +329,21 @@ pub struct CliArgs {
     )]
     pub pool_idle_timeout: Duration,
 
-    /// Optional HTTP proxy for upstream provider calls only (e.g.
-    /// http://127.0.0.1:3128). Scoped to the proxy's provider HTTP
-    /// client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY`
+    /// Optional HTTP or SOCKS5 proxy for upstream provider calls only (e.g.
+    /// http://127.0.0.1:3128 or socks5h://127.0.0.1:1080). Scoped to the
+    /// proxy's provider client — it does NOT set process-wide
+    /// `HTTP_PROXY`/`HTTPS_PROXY`
     /// env vars, which would leak into tool executions inheriting the
     /// environment. HTTP/2 is disabled for provider clients when this is
-    /// set so HTTPS provider APIs can tunnel through a CONNECT proxy.
+    /// set so HTTPS provider APIs can tunnel through the proxy.
     #[arg(long, env = "HEADROOM_HTTP_PROXY")]
     pub http_proxy: Option<String>,
+
+    /// Optional newline-separated HTTP or SOCKS5 proxy URLs used only for
+    /// OpenCode Zen routed requests. Populated from the environment so proxy
+    /// credentials do not appear in command-line arguments.
+    #[arg(skip)]
+    pub zen_http_proxy_pool: Vec<String>,
 
     /// Max body size for buffered cases (does NOT bound streaming bodies).
     #[arg(long, default_value = "100MB", value_parser = parse_bytes)]
@@ -2281,6 +2288,11 @@ pub struct Config {
     /// the same name; scoped to the provider HTTP client, never exported
     /// to the process environment.
     pub http_proxy: Option<String>,
+    /// Zen-only proxy transports assigned with sticky stream affinity. Values
+    /// are read from `HEADROOM_ZEN_HTTP_PROXY_POOL` before the async runtime
+    /// starts; they are intentionally not a CLI option because URLs may
+    /// contain credentials. Claude and Codex do not use this pool.
+    pub zen_http_proxy_pool: Vec<String>,
     pub max_body_bytes: u64,
     pub log_level: String,
     pub rewrite_host: bool,
@@ -2666,6 +2678,7 @@ impl Config {
             upstream_write_timeout: args.upstream_write_timeout,
             pool_idle_timeout: args.pool_idle_timeout,
             http_proxy: args.http_proxy,
+            zen_http_proxy_pool: args.zen_http_proxy_pool,
             max_body_bytes: args.max_body_bytes,
             log_level: args.log_level,
             rewrite_host,
@@ -2934,6 +2947,7 @@ impl Config {
             upstream_write_timeout: Duration::from_secs(150),
             pool_idle_timeout: Duration::from_secs(90),
             http_proxy: None,
+            zen_http_proxy_pool: Vec::new(),
             max_body_bytes: 100 * 1024 * 1024,
             log_level: "warn".into(),
             rewrite_host: true,

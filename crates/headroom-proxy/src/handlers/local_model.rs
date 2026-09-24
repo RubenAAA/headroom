@@ -221,6 +221,7 @@ pub async fn handle_messages(
         Err(resp) => return resp,
     };
     let parsed = prepared.parsed;
+    let egress_lane_key = prepared.ctx_report.lane_key.clone();
 
     let translated = match translate_routed_request(
         &parsed,
@@ -320,6 +321,7 @@ pub async fn handle_messages(
         openai_body_bytes.clone(),
         &request_id,
         session_key.as_deref(),
+        Some(&egress_lane_key),
         is_chatgpt_auth,
         is_zen,
     )

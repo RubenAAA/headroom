@@ -92,13 +92,24 @@ listening() { [ -n "$(listener_pid)" ]; }
 # this script leaves a proxy listening.
 ensure_watcher() {
   local watch="$HOME/.local/bin/zen-rotate-watch.sh"
+  # Same guard as the launchers, logged since this script runs detached.
+  if [ -n "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ]; then
+    if [ -z "${HEADROOM_ZEN_EGRESS_ROTATE_COMMAND:-}" ] || [ ! -x "$HEADROOM_ZEN_EGRESS_ROTATE_COMMAND" ]; then
+      log "Zen egress pool has no executable HEADROOM_ZEN_EGRESS_ROTATE_COMMAND; per-egress 429 and scheduled rotations are disabled (no shared VPN route will be changed)"
+      if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+        log "an existing watcher may still rotate the device-wide VPN route; stop it before relying on isolated egresses"
+      fi
+      return 0
+    fi
+  fi
   [ -x "$watch" ] || return 0
   # Bracket trick: pgrep -f would otherwise match this script's own command
   # line, which quotes the pattern.
   if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
     return 0
   fi
-  setsid nohup "$watch" >>"$HOME/zen-rotate-watch.log" 2>&1 </dev/null &
+  setsid nohup env -u HEADROOM_HTTP_PROXY -u HEADROOM_ZEN_HTTP_PROXY_POOL \
+    "$watch" >>"$HOME/zen-rotate-watch.log" 2>&1 </dev/null &
   disown
   log "watcher (re)started"
 }

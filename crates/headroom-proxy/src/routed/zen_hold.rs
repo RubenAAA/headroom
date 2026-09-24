@@ -2,17 +2,16 @@
 //!
 //! The fast retry loop in [`crate::routed::retry`] spends its ~3s budget on a
 //! Zen 429 and would return the 429 to Claude Code — which treats it as fatal
-//! and kills the turn (and its subagents). But a Zen 429 is exactly what
-//! `zen-rotate-watch.sh` reacts to: it rotates the VPN exit (cooldown 120s,
-//! drain up to 90s) so the *next* request lands on a fresh exit. The turn
-//! just has to outlive the rotation.
+//! and kills the turn (and its subagents). A separate egress lane gets its
+//! own upstream limit, so hold and re-probe this request on that same lane.
 //!
-//! So instead of returning the 429, the proxy holds the request: sleep in
+//! So instead of returning the 429, the proxy holds the request: honor a
+//! usable `Retry-After`, otherwise sleep in
 //! [`crate::proxy::backoff_ms`]-shaped slices capped by `retry_max_delay_ms`,
 //! re-POST-ing the buffered body between sleeps, until the upstream answers
 //! non-429. By default (`retry_zen_hold_budget_ms` = 0) there is no budget:
 //! on 2026-09-14 the 150s budget ran out five times while Zen kept
-//! answering 429 past one rotation, and each time the 429 reached the client
+//! answering 429, and each time the 429 reached the client
 //! and killed the turn. A client that gives up drops this future, so an
 //! unbounded hold cannot outlive the request it serves. A positive budget
 //! restores the bounded behaviour.
@@ -32,6 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// before draining: a held turn has nothing generating and is itself waiting
 /// for the rotation, so draining on it only stalls the rotation until the
 /// drain's own deadline (4m40s on 2026-09-14, twice the old hold budget).
+/// The per-egress count (`egress_in_flight`) leaves held turns out on its
+/// own: the hold gives the egress back and each probe re-takes it.
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn held_count() -> usize {
@@ -102,7 +103,7 @@ fn hold_budget_spent(
     true
 }
 
-/// One hold probe: sleep a capped backoff slice (never past the budget, so
+/// One hold probe: sleep a Retry-After or capped backoff slice (never past the budget, so
 /// the last probe lands on the edge), re-send the buffered body, and classify
 /// the answer. Transport errors of any kind keep the hold going: they are
 /// what a VPN restart looks like from here. A long `Retry-After` is not a
@@ -111,10 +112,13 @@ fn hold_budget_spent(
 #[allow(clippy::too_many_arguments)]
 async fn run_hold_probe(
     state: &AppState,
+    client: &reqwest::Client,
+    egress_slot: usize,
     upstream_url: &str,
     headers: &HeaderMap,
     body: &Bytes,
     attempts_made: &mut u32,
+    next_retry_after_ms: &mut Option<u64>,
     started: std::time::Instant,
     budget_ms: u64,
     request_id: &str,
@@ -127,8 +131,10 @@ async fn run_hold_probe(
     // budget so the last probe lands on the edge.
     let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let remaining = budget_ms.saturating_sub(elapsed_ms);
-    let slice_ms =
-        crate::proxy::backoff_ms(state, *attempts_made).min(state.config.retry_max_delay_ms);
+    let delay_ms = next_retry_after_ms.take().unwrap_or_else(|| {
+        crate::proxy::backoff_ms(state, *attempts_made).min(state.config.retry_max_delay_ms)
+    });
+    let slice_ms = delay_ms.min(state.config.retry_max_delay_ms);
     let slice = std::time::Duration::from_millis(slice_ms.min(remaining).max(1));
     tracing::warn!(
         event = "zen_hold_waiting",
@@ -137,19 +143,34 @@ async fn run_hold_probe(
         elapsed_ms,
         hold_budget_ms = budget_ms,
         request_id = %request_id,
-        "Zen rate limit holding for VPN rotation"
+        "Zen rate limit holding before the next probe"
     );
     crate::observability::record_upstream_retry(
         "local_model",
         crate::observability::retry_reason::ZEN_HOLD,
     );
     tokio::time::sleep(slice).await;
+    // The parked turn gave its egress back; count the probe against it again
+    // for as long as the probe's answer is alive. While that egress rotates,
+    // skip the probe: sending would ride a pooled tunnel to the old exit
+    // after the drain already reported it idle.
+    let egress_guard = match state.acquire_zen_egress(egress_slot) {
+        Ok(guard) => guard,
+        Err(egress_id) => {
+            tracing::debug!(
+                event = "zen_hold_probe_skipped_rotating",
+                egress_id,
+                request_id = %request_id,
+                "Zen hold probe skipped while its egress rotates"
+            );
+            return ProbeOutcome::KeepHolding;
+        }
+    };
     *attempts_made += 1;
     // The 429 refused the turn, so the buffered body replays freely —
     // this is a real re-send, not a cheap probe, so recovery lands the
     // turn immediately instead of needing another loop iteration.
-    match state
-        .client
+    match client
         .post(upstream_url)
         .headers(headers.clone())
         .body(body.clone())
@@ -166,13 +187,13 @@ async fn run_hold_probe(
                 "upstream recovered during the rotation hold"
             );
             ProbeOutcome::Recovered(Box::new(HeldSend {
-                resp: r,
+                resp: crate::proxy::attach_egress_guard(r, egress_guard),
                 headers: headers.clone(),
                 attempts_made: *attempts_made,
             }))
         }
         Ok(r) => {
-            note_still_limited(&r, state, request_id);
+            *next_retry_after_ms = note_still_limited(&r, state, request_id);
             drop(r);
             ProbeOutcome::KeepHolding
         }
@@ -183,31 +204,41 @@ async fn run_hold_probe(
     }
 }
 
-/// Still limited. Zen's Retry-After does not survive contact with the facts:
+/// Still limited. A usable Retry-After guides the next probe. Zen's unusually
+/// long Retry-After does not survive contact with the facts:
 /// on 2026-09-14 it sat at ~53568 (14.9h read as seconds) for seven hours
 /// without counting down, while the same route answered a probe fine minutes
-/// later. So on this route the header is a constant, not a wait, and honoring
-/// it only returns the fatal 429 early. Keep holding and let the budget
-/// decide; log the value once per probe so a real multi-hour window still
-/// shows up in the log.
-/// Extracted from `hold_for_rotation` without behavior change.
-fn note_still_limited(r: &reqwest::Response, state: &AppState, request_id: &str) {
-    if let Some(wait) = r
+/// later. So an oversized value is ignored rather than becoming a multi-hour
+/// sleep; use exponential backoff with jitter instead.
+fn note_still_limited(r: &reqwest::Response, state: &AppState, request_id: &str) -> Option<u64> {
+    let retry_after_ms = r
         .headers()
         .get(http::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
-        .and_then(headroom_core::retry::retry_after_ms_uncapped)
-    {
-        if wait > state.config.retry_max_delay_ms as f64 {
-            tracing::warn!(
-                event = "zen_hold_retry_after_ignored",
-                retry_after_ms = wait,
-                probe_cap_ms = state.config.retry_max_delay_ms,
-                request_id = %request_id,
-                "upstream Retry-After outruns the rotation hold; ignoring it (Zen sends a constant) and holding on"
-            );
-        }
+        .and_then(headroom_core::retry::retry_after_ms_uncapped);
+    capped_retry_after_ms(retry_after_ms, state, request_id)
+}
+
+/// Use a finite Retry-After only when it fits the configured per-probe cap.
+/// Zen has been observed sending a constant ~14.9h value while the route
+/// recovers much sooner, so oversized values fall back to jittered backoff.
+fn capped_retry_after_ms(
+    retry_after_ms: Option<f64>,
+    state: &AppState,
+    request_id: &str,
+) -> Option<u64> {
+    let wait = retry_after_ms.filter(|wait| wait.is_finite())?;
+    if wait > state.config.retry_max_delay_ms as f64 {
+        tracing::warn!(
+            event = "zen_hold_retry_after_ignored",
+            retry_after_ms = wait,
+            probe_cap_ms = state.config.retry_max_delay_ms,
+            request_id = %request_id,
+            "upstream Retry-After exceeds the probe cap; ignoring it and using jittered backoff"
+        );
+        return None;
     }
+    Some(headroom_core::retry::next_delay_ms(Some(wait), 0))
 }
 
 /// Transport errors during the hold are the rotation happening under us
@@ -247,20 +278,22 @@ fn note_hold_transport_error(e: &reqwest::Error, started: std::time::Instant, re
 /// Returns `Some` when the caller should `continue` its send loop with the
 /// returned response/headers/attempts — either the upstream recovered (the
 /// response is non-429) or the hold budget elapsed while still limited (the
-/// still-429 response then flows through the normal error path, and the
-/// `local_model_upstream_error` line it logs re-arms the watcher).
+/// still-429 response then flows through the normal error path).
 /// Returns `None` only when a positive budget elapsed while still limited.
-/// Transport errors of any kind keep the hold going: they are what a VPN
-/// restart looks like from here. The caller answers `None` with one honest
-/// re-send rather than the stale 429. A long `Retry-After` is not a reason to stop — Zen sends a
-/// constant one (see the still-limited arm below).
+/// Transport errors of any kind keep the hold going. The caller answers
+/// `None` with one honest re-send rather than the stale 429. An oversized
+/// `Retry-After` falls back to the capped exponential backoff.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn hold_for_rotation(
     state: &AppState,
+    client: &reqwest::Client,
+    egress_slot: usize,
     upstream_url: &str,
     headers: HeaderMap,
     body: Bytes,
     attempts_so_far: u32,
     request_id: &str,
+    initial_retry_after_ms: Option<f64>,
 ) -> Option<HeldSend> {
     // `0` is the default and means no budget: hold until Zen answers
     // something other than 429. A spent budget hands the 429 to the client,
@@ -274,13 +307,17 @@ pub(crate) async fn hold_for_rotation(
     let started = std::time::Instant::now();
     let _held = HeldGuard::enter();
     let mut attempts_made = attempts_so_far;
+    let mut next_retry_after_ms = capped_retry_after_ms(initial_retry_after_ms, state, request_id);
     loop {
         match run_hold_probe(
             state,
+            client,
+            egress_slot,
             upstream_url,
             &headers,
             &body,
             &mut attempts_made,
+            &mut next_retry_after_ms,
             started,
             budget_ms,
             request_id,

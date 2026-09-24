@@ -5,6 +5,7 @@ mod forward;
 mod sse_anthropic;
 mod sse_openai;
 
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -60,6 +61,10 @@ use headroom_core::compression_policy::CompressionPolicy;
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
+    /// Optional per-stream Zen transports. These are never used for the main
+    /// Claude route or routed Codex/OpenAI calls.
+    pub(crate) zen_egresses: Option<Arc<ProviderEgressPool>>,
+    pub(crate) default_egress_id: String,
     /// Bounded pool of transports for caller-selected upstreams. A cache key
     /// contains the hostname and the complete approved address set, so a DNS
     /// change receives a new client and cannot reuse a connection pinned to a
@@ -224,6 +229,86 @@ pub struct AppState {
     pub model_route_cooldowns: crate::model_router::ModelCooldowns,
 }
 
+impl AppState {
+    /// Select the provider transport and opaque egress identity pinned to an
+    /// inbound stream lane. Empty/missing lanes use the first configured
+    /// egress; real routed requests carry the lane derived from the client
+    /// session and original system prompt.
+    ///
+    /// A selected pool egress comes with its in-flight guard, taken under the
+    /// same check that turns requests away from a rotating egress.
+    pub(crate) fn zen_client_for_lane(
+        &self,
+        lane_key: Option<&str>,
+    ) -> Result<ZenEgressSelection<'_>, String> {
+        match self.zen_egresses.as_ref() {
+            Some(pool) => {
+                let slot = pool.slot_for_lane(lane_key.unwrap_or_default());
+                let guard = pool.acquire(slot)?;
+                Ok((
+                    &pool.clients[slot],
+                    slot,
+                    pool.egress_ids[slot].as_str(),
+                    Some(guard),
+                ))
+            }
+            None => Ok((&self.client, 0, self.default_egress_id.as_str(), None)),
+        }
+    }
+
+    /// Re-take the in-flight guard for a Zen egress already selected, as a
+    /// held turn does before each probe. `Err` carries the egress ID while it
+    /// is rotating; without a pool there is nothing to count.
+    pub(crate) fn acquire_zen_egress(
+        &self,
+        slot: usize,
+    ) -> Result<Option<EgressInflightGuard>, String> {
+        match self.zen_egresses.as_ref() {
+            Some(pool) => pool.acquire(slot).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Per-egress in-flight counts for `/debug/inflight`, keyed by the same
+    /// opaque IDs `/debug/zen-egresses` lists. Empty without a pool.
+    pub(crate) fn zen_egress_in_flight(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.zen_egresses
+            .as_ref()
+            .map(|pool| pool.in_flight_by_egress())
+            .unwrap_or_default()
+    }
+
+    /// Toggle admission for one configured Zen egress while its upstream
+    /// SOCKS endpoint is changing. Existing requests remain visible to the
+    /// normal in-flight drain and can finish before old tunnels are closed.
+    pub(crate) fn set_zen_egress_maintenance(&self, egress_id: &str, rotating: bool) -> bool {
+        self.zen_egresses
+            .as_ref()
+            .is_some_and(|pool| pool.set_maintenance(egress_id, rotating))
+    }
+
+    /// Safe inventory for the local rotation watcher. Egress IDs are opaque
+    /// hashes; proxy URLs and credentials are never returned.
+    pub(crate) fn zen_egress_inventory(&self) -> Vec<serde_json::Value> {
+        self.zen_egresses
+            .as_ref()
+            .map(|pool| {
+                pool.egress_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, egress_id)| {
+                        serde_json::json!({
+                            "slot": slot,
+                            "egress_id": egress_id,
+                            "rotating": pool.is_in_maintenance(egress_id),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// TTL for a stored CCR batch context (24h). Mirrors Python's
 /// `BatchContextStore` default.
 pub(crate) const BATCH_CONTEXT_TTL_SECS: u64 = 86_400;
@@ -332,10 +417,210 @@ fn ccr_error_chain(e: &reqwest::Error) -> String {
 }
 const CALLER_CLIENT_CACHE_CAPACITY: usize = 128;
 
+/// Client, slot, egress ID and in-flight guard for one routed Zen send.
+pub(crate) type ZenEgressSelection<'a> = (
+    &'a reqwest::Client,
+    usize,
+    &'a str,
+    Option<EgressInflightGuard>,
+);
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CallerClientKey {
     host: String,
     addresses: Vec<SocketAddr>,
+}
+
+/// Provider-only transports assigned once per stream lane. First-seen lanes
+/// cycle across the configured egresses, which gives a fan-out of N streams
+/// N distinct egresses when at least N are configured; later turns stay on
+/// their assigned egress. The bounded map retains affinity for active work
+/// without growing forever on a long-lived proxy.
+pub(crate) struct ProviderEgressPool {
+    clients: Vec<reqwest::Client>,
+    egress_ids: Vec<String>,
+    assignments: Mutex<ProviderEgressAssignments>,
+    maintenance: Mutex<std::collections::HashSet<String>>,
+    /// Requests holding each egress, indexed like `clients`. Exposed on
+    /// `/debug/inflight` as `egress_in_flight` so a rotation drains only the
+    /// lane it rotates instead of waiting for the whole proxy to go idle.
+    in_flight: Vec<std::sync::atomic::AtomicUsize>,
+}
+
+struct ProviderEgressAssignments {
+    lanes: lru::LruCache<String, usize>,
+    next_slot: usize,
+}
+
+impl ProviderEgressPool {
+    pub(crate) fn new(clients: Vec<reqwest::Client>, egress_ids: Vec<String>) -> Self {
+        debug_assert!(!clients.is_empty());
+        debug_assert_eq!(clients.len(), egress_ids.len());
+        Self {
+            clients,
+            assignments: Mutex::new(ProviderEgressAssignments {
+                lanes: lru::LruCache::new(NonZeroUsize::new(4096).expect("non-zero capacity")),
+                next_slot: 0,
+            }),
+            maintenance: Mutex::new(std::collections::HashSet::new()),
+            in_flight: (0..egress_ids.len())
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+            egress_ids,
+        }
+    }
+
+    fn slot_for_lane(&self, lane_key: &str) -> usize {
+        if lane_key.is_empty() {
+            return 0;
+        }
+        let lane_fingerprint = hex::encode(Sha256::digest(lane_key.as_bytes()));
+        let mut assignments = self.assignments.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&slot) = assignments.lanes.get(&lane_fingerprint) {
+            return slot;
+        }
+        let slot = assignments.next_slot % self.clients.len();
+        assignments.next_slot = assignments.next_slot.wrapping_add(1);
+        assignments.lanes.put(lane_fingerprint, slot);
+        slot
+    }
+
+    pub(crate) fn set_maintenance(&self, egress_id: &str, rotating: bool) -> bool {
+        if !self.egress_ids.iter().any(|id| id == egress_id) {
+            return false;
+        }
+        let mut maintenance = self.maintenance.lock().unwrap_or_else(|e| e.into_inner());
+        if rotating {
+            maintenance.insert(egress_id.to_owned());
+        } else {
+            maintenance.remove(egress_id);
+        }
+        true
+    }
+
+    fn is_in_maintenance(&self, egress_id: &str) -> bool {
+        self.maintenance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(egress_id)
+    }
+
+    /// Count one request onto `slot`, or return its egress ID if the egress
+    /// is rotating. The check and the increment happen under the lock
+    /// `set_maintenance` takes, so once that call returns, every request it
+    /// did not turn away is already counted and a drain that reads the count
+    /// afterwards cannot miss it.
+    fn acquire(self: &Arc<Self>, slot: usize) -> Result<EgressInflightGuard, String> {
+        let egress_id = &self.egress_ids[slot];
+        let maintenance = self.maintenance.lock().unwrap_or_else(|e| e.into_inner());
+        if maintenance.contains(egress_id) {
+            return Err(egress_id.clone());
+        }
+        self.in_flight[slot].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(maintenance);
+        Ok(EgressInflightGuard {
+            pool: Arc::clone(self),
+            slot,
+        })
+    }
+
+    fn in_flight_by_egress(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.egress_ids
+            .iter()
+            .zip(&self.in_flight)
+            .map(|(egress_id, count)| {
+                (
+                    egress_id.clone(),
+                    count.load(std::sync::atomic::Ordering::SeqCst).into(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// One request counted against one Zen egress. It goes with the response
+/// body (see [`attach_egress_guard`]), so the count covers the whole turn up
+/// to the last upstream byte, and drops early on error or client disconnect.
+pub(crate) struct EgressInflightGuard {
+    pool: Arc<ProviderEgressPool>,
+    slot: usize,
+}
+
+impl Drop for EgressInflightGuard {
+    fn drop(&mut self) {
+        self.pool.in_flight[self.slot].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Response body stream that releases its egress guard at the end of the
+    /// body or on the first error, rather than whenever the consumer drops it.
+    struct EgressGuardedStream<S> {
+        #[pin]
+        inner: S,
+        guard: Option<EgressInflightGuard>,
+    }
+}
+
+impl<S, T, E> futures_util::Stream for EgressGuardedStream<S>
+where
+    S: futures_util::Stream<Item = Result<T, E>>,
+{
+    type Item = Result<T, E>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        let item = futures_util::ready!(this.inner.poll_next(cx));
+        if !matches!(item, Some(Ok(_))) {
+            this.guard.take();
+        }
+        std::task::Poll::Ready(item)
+    }
+}
+
+/// Move `guard` into `resp`'s body. Every consumer of a routed Zen response
+/// (streamed, buffered, or dropped on an error arm) then holds the egress for
+/// exactly as long as it holds the upstream body, with no plumbing per arm.
+pub(crate) fn attach_egress_guard(
+    resp: reqwest::Response,
+    guard: Option<EgressInflightGuard>,
+) -> reqwest::Response {
+    let Some(guard) = guard else {
+        return resp;
+    };
+    use http_body_util::BodyExt;
+    use reqwest::ResponseBuilderExt;
+    let url = resp.url().clone();
+    let (parts, body) = http::Response::<reqwest::Body>::from(resp).into_parts();
+    let body = reqwest::Body::wrap_stream(EgressGuardedStream {
+        inner: body.into_data_stream(),
+        guard: Some(guard),
+    });
+    let mut builder = http::Response::builder()
+        .status(parts.status)
+        .version(parts.version)
+        .url(url);
+    if let Some(headers) = builder.headers_mut() {
+        *headers = parts.headers;
+    }
+    if let Some(extensions) = builder.extensions_mut() {
+        extensions.extend(parts.extensions);
+    }
+    let rebuilt = builder
+        .body(body)
+        .expect("parts copied from a valid response");
+    reqwest::Response::from(rebuilt)
+}
+
+fn provider_egress_id(proxy_url: Option<&str>) -> String {
+    let Some(proxy_url) = proxy_url else {
+        return "direct".to_string();
+    };
+    let digest = Sha256::digest(proxy_url.as_bytes());
+    format!("proxy-{}", hex::encode(&digest[..6]))
 }
 
 /// Transport settings shared by trusted and caller-selected upstreams.
@@ -455,7 +740,7 @@ impl AppState {
         }
         self.ctx_offload.as_ref().map(|r| r.store.ccr())
     }
-    /// Provider upstream client. A provider-only HTTP proxy is scoped to
+    /// Provider upstream client. A provider-only proxy is scoped to
     /// this client so routing never leaks into the process environment
     /// (which tool executions inherit). HTTP/2 is disabled when a proxy
     /// is set so HTTPS provider APIs tunnel through a CONNECT proxy
@@ -463,23 +748,57 @@ impl AppState {
     /// and HTTP/2 negotiated via ALPN otherwise.
     /// Extracted from `AppState::new` without behavior change.
     fn build_upstream_client(config: &Config) -> Result<reqwest::Client, ProxyError> {
+        Self::build_client_for_proxy(config, config.http_proxy.as_deref())
+    }
+
+    fn build_client_for_proxy(
+        config: &Config,
+        proxy_url: Option<&str>,
+    ) -> Result<reqwest::Client, ProxyError> {
         let mut client_builder = upstream_client_builder(config);
-        // Provider-only HTTP proxy: scoped to this upstream client so
+        // Provider-only proxy: scoped to this upstream client so
         // routing never leaks into the process environment (which tool
         // executions inherit). HTTP/2 is disabled when a proxy is set so
         // HTTPS provider APIs tunnel through a CONNECT proxy instead of
         // failing ALPN negotiation through it.
-        if let Some(proxy_url) = config.http_proxy.as_deref() {
-            let proxy = reqwest::Proxy::all(proxy_url).map_err(ProxyError::Upstream)?;
+        if let Some(proxy_url) = proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|_| {
+                ProxyError::Config(
+                    "invalid provider proxy URL (the configured URL is omitted because it may contain credentials)".to_string(),
+                )
+            })?;
             client_builder = client_builder.proxy(proxy).http1_only();
             tracing::info!(
                 event = "provider_http_proxy_configured",
-                "provider upstream calls routed through HTTP proxy (HTTP/2 disabled)"
+                "provider upstream calls routed through a proxy (HTTP/2 disabled)"
             );
         }
         // Both HTTP/1.1 and HTTP/2 negotiated via ALPN (unless a proxy
         // forced HTTP/1.1 above).
         client_builder.build().map_err(ProxyError::Upstream)
+    }
+
+    fn build_zen_egresses(config: &Config) -> Result<Option<ProviderEgressPool>, ProxyError> {
+        let mut clients = Vec::with_capacity(config.zen_http_proxy_pool.len());
+        let mut egress_ids = Vec::with_capacity(config.zen_http_proxy_pool.len());
+        let mut seen = std::collections::HashSet::new();
+        for proxy_url in &config.zen_http_proxy_pool {
+            if !seen.insert(proxy_url) {
+                continue;
+            }
+            clients.push(Self::build_client_for_proxy(config, Some(proxy_url))?);
+            egress_ids.push(provider_egress_id(Some(proxy_url)));
+        }
+        if clients.is_empty() {
+            Ok(None)
+        } else {
+            tracing::info!(
+                event = "zen_egress_pool_configured",
+                egress_count = clients.len(),
+                "routed provider requests will use sticky per-stream egress assignment"
+            );
+            Ok(Some(ProviderEgressPool::new(clients, egress_ids)))
+        }
     }
 
     /// One registry dir for the per-project CTX stores, shared by capture,
@@ -774,8 +1093,13 @@ impl AppState {
             })
     }
 
-    pub fn new(config: Config) -> Result<Self, ProxyError> {
+    pub fn new(mut config: Config) -> Result<Self, ProxyError> {
         let client = Self::build_upstream_client(&config)?;
+        let zen_egresses = Self::build_zen_egresses(&config)?;
+        let default_egress_id = provider_egress_id(config.http_proxy.as_deref());
+        // Runtime clients retain their proxy config internally. Do not keep
+        // pool URLs (which may carry credentials) in Config/Debug output.
+        config.zen_http_proxy_pool.clear();
 
         // PR-D4: lazy ADC token source. Provider resolution is
         // deferred to first `bearer()` call so proxy startup stays
@@ -896,6 +1220,8 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             client,
+            zen_egresses: zen_egresses.map(Arc::new),
+            default_egress_id,
             caller_clients: Arc::new(Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(CALLER_CLIENT_CACHE_CAPACITY).expect("non-zero capacity"),
             ))),
@@ -1703,10 +2029,39 @@ fn mount_debug_routes(router: Router<AppState>) -> Router<AppState> {
         )
     }
 
+    async fn debug_zen_egresses(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> axum::response::Json<serde_json::Value> {
+        let egresses = state.zen_egress_inventory();
+        axum::response::Json(serde_json::json!({
+            "pool_enabled": !egresses.is_empty(),
+            "egresses": egresses,
+        }))
+    }
+
+    async fn debug_zen_egress_maintenance(
+        axum::extract::State(state): axum::extract::State<AppState>,
+        axum::extract::Path(egress_id): axum::extract::Path<String>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> Response {
+        let Some(rotating) = body.get("rotating").and_then(serde_json::Value::as_bool) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if !state.set_zen_egress_maintenance(&egress_id, rotating) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        axum::Json(serde_json::json!({"ok": true, "rotating": rotating})).into_response()
+    }
+
     let debug_router = Router::new()
         .route("/debug/tasks", get(debug_tasks))
         .route("/debug/ws-sessions", get(debug_ws_sessions))
         .route("/debug/warmup", get(debug_warmup))
+        .route("/debug/zen-egresses", get(debug_zen_egresses))
+        .route(
+            "/debug/zen-egresses/{egress_id}/maintenance",
+            post(debug_zen_egress_maintenance),
+        )
         .route(
             "/debug/active-conversations",
             get(debug_active_conversations),
@@ -1714,14 +2069,16 @@ fn mount_debug_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/debug/inflight",
             get(
-                |axum::extract::State(_state): axum::extract::State<AppState>| async {
+                |axum::extract::State(state): axum::extract::State<AppState>| async move {
                     // `zen_held` turns are parked in the Zen 429 hold: no
                     // generation is running for them, so the rotation
                     // watcher's drain must not wait on them (they are
-                    // waiting on it).
+                    // waiting on it). `egress_in_flight` already leaves
+                    // them out: a parked turn gives its egress back.
                     axum::response::Json(serde_json::json!({
                         "in_flight": InflightGuard::count_global(),
                         "zen_held": crate::routed::zen_hold::held_count(),
+                        "egress_in_flight": state.zen_egress_in_flight(),
                     }))
                 },
             ),
@@ -10006,6 +10363,268 @@ fn extract_tool_name(body: &[u8], endpoint: compression::CompressibleEndpoint) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provider_client_routes_through_socks5h_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let socks_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(
+                greeting,
+                [5, 1, 2],
+                "client requests SOCKS5 username/password auth"
+            );
+            stream.write_all(&[5, 2]).await.unwrap();
+            let mut auth_header = [0; 2];
+            stream.read_exact(&mut auth_header).await.unwrap();
+            assert_eq!(auth_header[0], 1, "RFC 1929 auth version");
+            let mut username = vec![0; usize::from(auth_header[1])];
+            stream.read_exact(&mut username).await.unwrap();
+            let mut password_len = [0; 1];
+            stream.read_exact(&mut password_len).await.unwrap();
+            let mut password = vec![0; usize::from(password_len[0])];
+            stream.read_exact(&mut password).await.unwrap();
+            assert_eq!(username, b"testuser");
+            assert_eq!(password, b"testpass");
+            stream.write_all(&[1, 0]).await.unwrap();
+
+            let mut request_header = [0; 4];
+            stream.read_exact(&mut request_header).await.unwrap();
+            assert_eq!(request_header, [5, 1, 0, 3], "domain-name CONNECT");
+            let mut host_len = [0; 1];
+            stream.read_exact(&mut host_len).await.unwrap();
+            let mut host = vec![0; usize::from(host_len[0])];
+            stream.read_exact(&mut host).await.unwrap();
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            assert_eq!(host, b"muse-zen.internal");
+            assert_eq!(u16::from_be_bytes(port), 8087);
+
+            // Accept the tunnel and act as the target HTTP server. No DNS or
+            // external network access is needed for this end-to-end check.
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut request = [0; 1024];
+            let n = stream.read(&mut request).await.unwrap();
+            assert!(request[..n].starts_with(b"POST /v1/messages HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let mut config = crate::config::Config::for_test(
+            "https://api.anthropic.com".parse().expect("upstream URL"),
+        );
+        config.http_proxy = Some(format!("socks5h://testuser:testpass@{proxy_addr}"));
+        let client = AppState::build_upstream_client(&config).expect("SOCKS5 client");
+        let response = client
+            .post("http://muse-zen.internal:8087/v1/messages")
+            .body("test")
+            .send()
+            .await
+            .expect("request should traverse the local SOCKS5 proxy");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+        socks_server.await.unwrap();
+    }
+
+    /// Simulate ten parallel Claude sibling lanes over ten independent SOCKS
+    /// egresses. Each first-seen lane must use a different endpoint, and a
+    /// later turn for the same lane must remain pinned to its original one.
+    /// The per-egress count behind `/debug/inflight`'s `egress_in_flight`: a
+    /// rotating egress refuses without leaving a count behind, the other keeps
+    /// serving, and a guard moved into a response body lasts until that body
+    /// ends or is dropped.
+    #[tokio::test]
+    async fn egress_guard_follows_the_response_body_and_respects_maintenance() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("x-probe", "kept")
+                    .set_body_string("hello"),
+            )
+            .mount(&server)
+            .await;
+        let pool = Arc::new(ProviderEgressPool::new(
+            vec![reqwest::Client::new(), reqwest::Client::new()],
+            vec!["proxy-a".to_string(), "proxy-b".to_string()],
+        ));
+        let count = |id: &str| pool.in_flight_by_egress()[id].as_u64().unwrap();
+
+        let guard = pool.acquire(0).expect("idle egress");
+        assert_eq!((count("proxy-a"), count("proxy-b")), (1, 0));
+        assert!(pool.set_maintenance("proxy-a", true));
+        assert_eq!(pool.acquire(0).err().as_deref(), Some("proxy-a"));
+        assert_eq!(count("proxy-a"), 1, "a refused acquire leaves no count");
+        let other = pool.acquire(1).expect("the other egress keeps serving");
+        assert_eq!(count("proxy-b"), 1);
+        drop(other);
+        assert_eq!(count("proxy-b"), 0);
+
+        let resp = reqwest::get(server.uri()).await.unwrap();
+        let url = resp.url().clone();
+        let resp = attach_egress_guard(resp, Some(guard));
+        assert_eq!(count("proxy-a"), 1, "the body carries the guard");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["x-probe"], "kept");
+        assert_eq!(resp.url(), &url);
+        assert_eq!(resp.text().await.unwrap(), "hello");
+        assert_eq!(count("proxy-a"), 0, "released at the end of the body");
+
+        assert!(pool.set_maintenance("proxy-a", false));
+        let guard = pool.acquire(0).expect("rotation finished");
+        let resp = attach_egress_guard(reqwest::get(server.uri()).await.unwrap(), Some(guard));
+        assert_eq!(count("proxy-a"), 1);
+        drop(resp);
+        assert_eq!(count("proxy-a"), 0, "released when the body is dropped");
+    }
+
+    #[tokio::test]
+    async fn ten_concurrent_stream_lanes_use_distinct_sticky_socks_egresses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        const LANES: usize = 10;
+        let mut socks_listeners = Vec::with_capacity(LANES);
+        let mut proxy_urls = Vec::with_capacity(LANES);
+        for _ in 0..LANES {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            proxy_urls.push(format!("socks5h://{}", listener.local_addr().unwrap()));
+            socks_listeners.push(listener);
+        }
+
+        let socks_servers: Vec<_> = socks_listeners
+            .into_iter()
+            .enumerate()
+            .map(|(index, listener)| {
+                tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut greeting = [0; 2];
+                    stream.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting, [5, 1]);
+                    let mut method = [0; 1];
+                    stream.read_exact(&mut method).await.unwrap();
+                    assert_eq!(method, [0]);
+                    stream.write_all(&[5, 0]).await.unwrap();
+
+                    let mut request_header = [0; 4];
+                    stream.read_exact(&mut request_header).await.unwrap();
+                    assert_eq!(request_header, [5, 1, 0, 3]);
+                    let mut host_len = [0; 1];
+                    stream.read_exact(&mut host_len).await.unwrap();
+                    let mut host = vec![0; usize::from(host_len[0])];
+                    stream.read_exact(&mut host).await.unwrap();
+                    let mut port = [0; 2];
+                    stream.read_exact(&mut port).await.unwrap();
+                    assert_eq!(host, b"muse-zen.internal");
+                    assert_eq!(u16::from_be_bytes(port), 8087);
+                    stream
+                        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                        .await
+                        .unwrap();
+
+                    let mut request = [0; 1024];
+                    let n = stream.read(&mut request).await.unwrap();
+                    assert!(request[..n].starts_with(b"POST /v1/messages HTTP/1.1"));
+                    let body = format!("lane-{index}");
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).await.unwrap();
+                })
+            })
+            .collect();
+
+        let mut config = crate::config::Config::for_test(
+            "https://api.anthropic.com".parse().expect("upstream URL"),
+        );
+        config.zen_http_proxy_pool = proxy_urls;
+        let pool = AppState::build_zen_egresses(&config)
+            .expect("valid test SOCKS URLs")
+            .expect("pool configured");
+        let mut state = crate::test_support::test_state(|_| {});
+        state.zen_egresses = Some(Arc::new(pool));
+
+        let mut requests = Vec::with_capacity(LANES);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer test-spark-token".parse().unwrap(),
+        );
+        let client_addr = "127.0.0.1:4242".parse::<SocketAddr>().unwrap();
+        let mut shared_session_key = None;
+        for index in 0..LANES {
+            // Model ten sibling subagents with a shared credential and
+            // opener but distinct agent system prompts, matching the stream
+            // lane derivation used by real routed Claude requests.
+            let body = serde_json::json!({
+                "model": "claude-muse-spark-1.3",
+                "system": format!("Spark subagent instructions {index}"),
+                "messages": [{"role": "user", "content": "shared parent task opener"}]
+            });
+            let session_key = derive_session_key(&headers, &client_addr, &body, ApiKind::Anthropic);
+            if let Some(shared) = shared_session_key.as_deref() {
+                assert_eq!(
+                    shared, session_key,
+                    "siblings should share session identity"
+                );
+            } else {
+                shared_session_key = Some(session_key.clone());
+            }
+            let lane_key = stream_lane_key(
+                &session_key,
+                &compute_structural_hash(&body, ApiKind::Anthropic),
+            );
+            let (client, slot, egress_id, _guard) = state
+                .zen_client_for_lane(Some(&lane_key))
+                .expect("new test egresses are not in maintenance");
+            assert_eq!(slot, index, "first fan-out should spread one per egress");
+            assert!(egress_id.starts_with("proxy-"));
+            if index == 0 {
+                assert!(state.set_zen_egress_maintenance(egress_id, true));
+                assert!(matches!(
+                    state.zen_client_for_lane(Some(&lane_key)),
+                    Err(blocked_id) if blocked_id == egress_id
+                ));
+                assert!(state.set_zen_egress_maintenance(egress_id, false));
+            }
+            let (_, sticky_slot, sticky_id, _) = state
+                .zen_client_for_lane(Some(&lane_key))
+                .expect("new test egresses are not in maintenance");
+            assert_eq!(sticky_slot, slot, "later turns must stay pinned");
+            assert_eq!(sticky_id, egress_id);
+
+            let client = client.clone();
+            requests.push(tokio::spawn(async move {
+                let response = client
+                    .post("http://muse-zen.internal:8087/v1/messages")
+                    .body("{}")
+                    .send()
+                    .await
+                    .expect("request traverses its assigned SOCKS egress");
+                response.text().await.unwrap()
+            }));
+        }
+
+        for (index, request) in requests.into_iter().enumerate() {
+            assert_eq!(request.await.unwrap(), format!("lane-{index}"));
+        }
+        for server in socks_servers {
+            server.await.unwrap();
+        }
+    }
 
     /// The rotation-drain contract (`GET /debug/inflight`): guards held for
     /// whole turns must move the process counter up on entry and back down

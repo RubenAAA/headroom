@@ -31,3 +31,16 @@ Don't save: task state, anything in the repo already, or a number that changes w
 ### Scope
 
 Default is project scope. Use `scope: "global"` for facts about the user, their tooling, or cross-project infrastructure. A fact about one repo's schema is project-scoped; a fact about an SSH host serving several repos is global.
+
+## Muse Spark fan-out budget
+
+The Nord SOCKS helper starts eight lanes, or all ten when every preferred exit
+verifies.
+Before fan-out, run `~/.local/bin/nord-socks-egress status` and read its
+`lane_count`; if the helper or status is unavailable, budget for eight. Count
+every Spark session whose task is still running, including the
+current session if you are Muse Spark. Never start a task that would put that
+count above `lane_count` (or eight when unknown). Spark workers do not spawn
+nested agents, so a child cannot multiply the parent's fan-out. When all slots
+are occupied, wait for a child to finish or continue the remaining work
+sequentially; do not start a replacement just because a request failed.

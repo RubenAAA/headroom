@@ -130,12 +130,12 @@ if [ "$BUILD" = 1 ]; then
     if [ "$NO_ML" = 1 ]; then
         say "without the ML crates (--no-default-features): ort/fastembed/magika"
         say "stay out of the tree; TextCrusher/BM25/extension fallbacks only"
-        ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy --no-default-features )
+        ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy --bins --no-default-features )
     else
-        ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy )
+        ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy --bins )
     fi
 fi
-for bin in headroom-proxy headroom; do
+for bin in headroom-proxy headroom nord-socks-egress; do
     src="$REPO_DIR/target/release/$bin"
     [ -x "$src" ] || { echo "missing $src — run without --no-build" >&2; exit 1; }
     install -m 755 "$src" "$BIN_DIR/$bin"
@@ -260,7 +260,7 @@ else
     install -m 755 "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     install -m 755 "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
     install -m 755 "$CONTRIB/concurrency-report.sh" "$BIN_DIR/concurrency-report.sh"
-    say "installed claude-launcher, opencode-launcher and restart-headroom.sh"
+    say "installed launchers, rotation watcher and local SOCKS egress helper"
 fi
 ln -sfn claude-launcher "$BIN_DIR/cclaude"
 say "cclaude -> claude-launcher"

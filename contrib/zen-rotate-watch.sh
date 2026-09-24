@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Watch headroom-proxy.log for Zen/Spark rate limits; rotate the VPN exit
-# and leave a notice for the sleeping sessions, then keep watching.
+# Watch the Headroom log for Zen/Spark rate limits. The default mode rotates
+# the device-wide VPN exit; per-egress mode calls an operator-supplied
+# rotator for the one affected egress and schedules every configured egress.
 #
 # Works with whatever VPN the operator already pays for — the provider is
 # auto-detected, or pinned explicitly. No supported VPN is also fine: the
@@ -26,6 +27,10 @@
 #                       argument. Required when VPN_PROVIDER=custom.
 #   VPN_CONNECT_TIMEOUT connect timeout in seconds (default 120).
 #   VPN_SETTLE_SECS     sleep after connect before checking egress (default 8).
+#   HEADROOM_ZEN_EGRESS_MODE=1 enables per-egress mode for a configured pool.
+#   HEADROOM_ZEN_EGRESS_ROTATE_COMMAND is an executable called with
+#                         <opaque-egress-id> <rate-limit|proactive|manual>.
+#                         It must control only that independent session.
 #
 # Provider notes (log in / set up the VPN app first, outside this script):
 #   nordvpn    `nordvpn connect <Country>`; needs the `nordvpn` group +
@@ -62,51 +67,42 @@
 # Stop:  pkill -f zen-rotate-watch
 # Follow: tail -f ~/zen-rotate-watch.log
 #
-# Manual rotation (same drain + notices as the automatic path — never
-# reconnect bare-handed while turns are in flight; it RSTs every stream):
+# Manual rotation also drains before touching a tunnel. Device-wide rotations
+# write notices; per-egress callbacks receive only the selected opaque ID.
 #   zen-rotate-watch.sh --rotate-now [location]
+# In per-egress mode, --rotate-now [egress-id] rotates that egress, or all
+# configured egresses when no ID is supplied. --rotate-egress <egress-id> is
+# an explicit single-egress spelling.
 #
 # Introspection:
 #   zen-rotate-watch.sh --list-providers   # supported provider names
 #   zen-rotate-watch.sh --detect-provider  # what `auto` would pick here
 #
-# Trigger 1: `local_model_upstream_error` with `"status":429` — the exact line
-# the proxy emits when Zen refuses a routed turn (12h wait included) — or
-# `zen_hold_waiting`, the line the proxy emits while it holds that refusal
-# instead of returning it (the hold is unbounded by default, so this is the
-# only 429 signal in the log while the hold is on).
-# Trigger 2: the session-visible form of the same refusal, `temporarily
-# limiting requests`, polled in recent spark transcripts. The proxy log only
-# shows what arrived while the tail was running; the transcript poll catches
-# a refusal the log trigger missed.
-# Rotation cycles the provider's location list — reshuffled and recycled until
-# api.ipify.org reports a different egress, bounded by ROTATE_DEADLINE_SECS
-# rather than by list exhaustion (locations are reusable; giving up after one
-# pass through the list would strand us on a congested exit). No proxy restart, ever:
-# restarting wipes in-memory session state
-# and forces fleet-wide recaches plus a burst of errors — far worse than a
-# few corpse-RST turns served from the old pool until it ages out (~25 s,
-# `--pool-idle-timeout`).
-# Rotations happen two ways. Reactive: a routed 429 (log tail or session
-# transcript) rotates at once and leaves a notice for every recently-active
-# spark session, since turns already died. Proactive: every PROACTIVE_INTERVAL_SECS
-# (± jitter, so no cron-shaped pattern for abuse detection to key on) the watcher
-# rotates into a quiet moment — in-flight turns are drained first, and when the box is
-# busy the rotation defers rather than killing live turns. A drained rotation
-# leaves no notices; only stragglers that died truncated get one.
-# A 429 hits every session behind the
-# proxy, so there is no victim lookup: any hit rotates, and every
-# recently-active spark session gets a notice file that `rotation-notice.sh`
-# relays on its next prompt (one-shot). The old billed `claude --resume`
-# wake is gone: resuming loads each session's full context as a billed turn,
-# six figures of tokens per session, for news the session reads free on its
-# next prompt anyway.
+# Legacy device-wide mode watches `local_model_upstream_error` /
+# `zen_hold_waiting` and session transcripts. Per-egress mode reacts only to
+# `zen_egress_rate_limited`, which carries the opaque egress ID; it never falls
+# back to a global VPN rotation for an unscoped event.
+# Device-wide mode cycles the provider's location list — reshuffled and
+# recycled until api.ipify.org reports a different egress, bounded by
+# ROTATE_DEADLINE_SECS. Per-egress mode delegates the change to the operator's
+# callback, which must verify that its independent session actually rotated.
+# Neither mode restarts the proxy: restarting wipes in-memory session state and
+# forces fleet-wide recaches. A 429 in device-wide mode rotates the shared exit
+# and may notify every recent Spark session. In pool mode only the reported
+# egress ID is passed to the callback; the timed tick enumerates all pool IDs
+# and rotates them sequentially. Both modes drain active proxy traffic first.
 
 set -uo pipefail
 
-LOG="$HOME/headroom-proxy.log"
+LOG="${HEADROOM_PROXY_LOG:-$HOME/headroom-proxy.log}"
+PROXY_URL="${HEADROOM_PROXY_URL:-http://127.0.0.1:8787}"
+PROXY_URL="${PROXY_URL%/}"
 WATCHLOG="$HOME/zen-rotate-watch.log"
 STAMP="$HOME/.zen-rotate.last"
+ZEN_EGRESS_MODE="${HEADROOM_ZEN_EGRESS_MODE:-0}"
+ZEN_EGRESS_ROTATE_COMMAND="${HEADROOM_ZEN_EGRESS_ROTATE_COMMAND:-}"
+ZEN_EGRESS_ROTATE_TIMEOUT="${HEADROOM_ZEN_EGRESS_ROTATE_TIMEOUT:-600}"
+ZEN_EGRESS_STAMP_DIR="$HOME/.zen-rotate-egresses"
 COUNTRIES=(
 # Europe (NordVPN names; Turkey not Turkiye). Default location list for the
 # nordvpn provider; other providers bring their own defaults below.
@@ -383,11 +379,17 @@ EOF
   log "rotation notices written (reason=$reason, egress=$before->$after)"
 }
 
-# Next proactive rotation: now + interval ± jitter. Recomputed after every
-# rotation (reactive rotations reset the clock — a fresh exit needs no
-# proactive cycle on top of it).
+# Next proactive rotation: now + interval ± jitter. In device-wide mode, a
+# reactive rotation resets the timer. In per-egress mode, resetting this
+# pool-wide timer on every single-lane 429 could starve the timed all-lane
+# rotation indefinitely, so only the scheduled all-lane pass advances it.
 schedule_next() {
   echo $(( $(date +%s) + PROACTIVE_INTERVAL_SECS + RANDOM % (2 * PROACTIVE_JITTER_SECS + 1) - PROACTIVE_JITTER_SECS ))
+}
+
+reset_proactive_schedule_after_reactive() {
+  [[ "$ZEN_EGRESS_MODE" == "1" ]] && return 0
+  next_proactive_at=$(schedule_next)
 }
 
 # Turns currently in flight, or -1 when the endpoint is unreachable
@@ -395,11 +397,140 @@ schedule_next() {
 # Turns parked in the proxy's Zen 429 hold (`zen_held`) are waiting for this
 # rotation, not generating, so they are subtracted: draining on them stalled
 # the 2026-09-14 rotation for 4m40s while the holds ran out and returned 429s.
+# With an egress ID, count only that egress (`egress_in_flight`, which leaves
+# held turns out already); an older proxy without it gets the global count.
 inflight() {
   local n
-  n=$(curl -s --max-time 5 "http://127.0.0.1:8787/debug/inflight" 2>/dev/null \
-    | python3 -c 'import json,sys; j=json.load(sys.stdin); print(max(0, j.get("in_flight", -1) - j.get("zen_held", 0)) if "in_flight" in j else -1)' 2>/dev/null) || n=-1
+  n=$(curl --noproxy '*' -s --max-time 5 "$PROXY_URL/debug/inflight" 2>/dev/null \
+    | python3 -c '
+import json, sys
+j = json.load(sys.stdin)
+lanes = j.get("egress_in_flight")
+lane = lanes.get(sys.argv[1]) if sys.argv[1] and isinstance(lanes, dict) else None
+if isinstance(lane, int):
+    print(lane)
+else:
+    print(max(0, j["in_flight"] - j.get("zen_held", 0)) if "in_flight" in j else -1)
+' "${1:-}" 2>/dev/null) || n=-1
   printf '%s' "$n"
+}
+
+# Configured pool IDs are opaque hashes, so returning them to the loopback-only
+# watcher does not reveal proxy URLs or credentials.
+zen_egress_ids() {
+  local payload
+  payload=$(curl --noproxy '*' -fsS --max-time 5 "$PROXY_URL/debug/zen-egresses" 2>/dev/null) || return 1
+  python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if not data.get("pool_enabled"):
+        raise SystemExit(1)
+    for item in data.get("egresses", []):
+        value = item.get("egress_id", "")
+        if isinstance(value, str) and value.startswith("proxy-"):
+            print(value)
+except (ValueError, TypeError):
+    raise SystemExit(1)
+' <<<"$payload"
+}
+
+refresh_zen_egress_mode() {
+  local ids
+  [[ "$ZEN_EGRESS_MODE" == "1" ]] && return 0
+  ids=$(zen_egress_ids) || return 0
+  [[ -n "$ids" ]] || return 0
+  ZEN_EGRESS_MODE=1
+  log "Zen egress pool detected; switching watcher to per-egress mode (device-wide rotation disabled)"
+}
+
+valid_zen_egress_id() {
+  [[ "${1:-}" =~ ^proxy-[0-9a-f]{12}$ ]]
+}
+
+# The configured executable owns the VPN-specific details for one independent
+# egress. It receives exactly: <opaque-egress-id> <rate-limit|proactive|manual>.
+# No pool URL or provider credential is passed to it.
+rotate_zen_egress() {
+  local egress_id="$1" reason="$2" stamp now last n
+  if ! valid_zen_egress_id "$egress_id"; then
+    log "refusing invalid egress id for per-egress rotation"
+    return 2
+  fi
+  if [[ -z "$ZEN_EGRESS_ROTATE_COMMAND" || ! -x "$ZEN_EGRESS_ROTATE_COMMAND" ]]; then
+    log "egress=$egress_id rotation requested ($reason) but HEADROOM_ZEN_EGRESS_ROTATE_COMMAND is not executable; no shared VPN route was changed"
+    return 2
+  fi
+
+  mkdir -p "$ZEN_EGRESS_STAMP_DIR" 2>/dev/null || return 2
+  stamp="$ZEN_EGRESS_STAMP_DIR/$egress_id.last"
+  (
+    flock -n 9 || {
+      log "egress=$egress_id rotation already in progress, skipping ($reason)"
+      exit 0
+    }
+    if [[ "$reason" != "manual" ]]; then
+      last=$(cat "$stamp" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      if (( now - last < COOLDOWN_SECS )); then
+        log "egress=$egress_id cooldown active, skipping ($reason)"
+        exit 0
+      fi
+    fi
+
+    # Drain only this egress's turns; other egresses keep streaming. Fail
+    # closed if the counter is unreachable or live turns do not drain; do
+    # not truncate them.
+    n=$(inflight "$egress_id")
+    if [[ "$n" == "-1" ]]; then
+      log "egress=$egress_id rotation deferred ($reason): inflight endpoint unavailable"
+      exit 1
+    fi
+    if ! drain "$egress_id"; then
+      log "egress=$egress_id rotation deferred ($reason): active streams did not drain"
+      exit 1
+    fi
+    if timeout "$ZEN_EGRESS_ROTATE_TIMEOUT" env \
+      -u HEADROOM_HTTP_PROXY -u HEADROOM_ZEN_HTTP_PROXY_POOL \
+      HEADROOM_PROXY_URL="$PROXY_URL" "$ZEN_EGRESS_ROTATE_COMMAND" \
+      "$egress_id" "$reason" >/dev/null 2>&1; then
+      date +%s >"$stamp"
+      log "egress=$egress_id rotated ($reason)"
+    else
+      log "egress=$egress_id rotation FAILED ($reason); external rotator returned non-zero or timed out"
+      exit 1
+    fi
+  ) 9>"$stamp.flock"
+}
+
+rotate_all_zen_egresses() {
+  local reason="$1" ids egress_id result=0 count=0
+  ids=$(zen_egress_ids) || {
+    log "cannot enumerate configured Zen egresses at $PROXY_URL/debug/zen-egresses; scheduled rotation skipped"
+    return 1
+  }
+  while IFS= read -r egress_id; do
+    [[ -n "$egress_id" ]] || continue
+    count=$((count + 1))
+    rotate_zen_egress "$egress_id" "$reason" || result=1
+  done <<<"$ids"
+  if (( count == 0 )); then
+    log "no configured Zen egresses found; scheduled rotation skipped"
+    return 1
+  fi
+  return "$result"
+}
+
+zen_egress_id_from_line() {
+  python3 -c '
+import json, sys
+try:
+    value = json.loads(sys.stdin.read()).get("egress_id", "")
+    if isinstance(value, str):
+        print(value)
+except (ValueError, TypeError):
+    pass
+' <<<"$1"
 }
 
 # Wait for in-flight turns to land before killing the tunnel: a rotation
@@ -408,19 +539,21 @@ inflight() {
 # stalled count dies on schedule. 2026-09-14 13:08 killed a live turn after
 # a flat 90s; the proxy closes those turns marked, but not killing them is
 # strictly better. Returns 0 on a clean drain (or drain-blind), 1 when
-# stragglers remain.
+# stragglers remain. Given an egress ID it waits on that egress alone, and
+# its caller defers the rotation instead of rotating anyway.
 DRAIN_SECS=90
 # Extra drain granted each time the count falls, and the hard ceiling on all
 # extensions: a landing trickle gets room, a stuck turn still dies on time.
 DRAIN_PROGRESS_EXTEND_SECS=30
 DRAIN_MAX_EXTEND_SECS=180
 drain() {
+  local egress_id="${1:-}"
   local deadline=$(( $(date +%s) + DRAIN_SECS ))
   local max_deadline=$(( $(date +%s) + DRAIN_SECS + DRAIN_MAX_EXTEND_SECS ))
   # First read decides: no endpoint (old proxy binary, pre-drain support)
   # means drain-blind — rotate at once rather than burning the timeout.
   local n last_n
-  n=$(inflight)
+  n=$(inflight "$egress_id")
   if [[ "$n" == "-1" ]]; then
     log "drain: no inflight endpoint (old proxy); rotating without drain"
     return 0
@@ -432,7 +565,7 @@ drain() {
       return 0
     fi
     sleep 2
-    n=$(inflight)
+    n=$(inflight "$egress_id")
     # Progress short of completion: turns are landing, so give the rest more
     # room — bounded by max_deadline so a trickle never holds the rotation
     # hostage. A non-numeric read (endpoint hiccup) neither extends nor kills.
@@ -446,7 +579,11 @@ drain() {
     fi
     last_n="$n"
   done
-  log "drain: timed out with in_flight=${n:-unknown}; rotating anyway"
+  if [[ -n "$egress_id" ]]; then
+    log "drain: egress=$egress_id timed out with in_flight=${n:-unknown}"
+  else
+    log "drain: timed out with in_flight=${n:-unknown}; rotating anyway"
+  fi
   return 1
 }
 
@@ -612,50 +749,105 @@ poll_transcripts() {
 }
 
 main() {
-log "watcher started (pid $$, provider=$(vpn_provider))"
+refresh_zen_egress_mode
+log "watcher started (pid $$, provider=$(vpn_provider), mode=$([[ "$ZEN_EGRESS_MODE" == "1" ]] && echo per-egress || echo device-wide))"
+if [[ "$ZEN_EGRESS_MODE" == "1" && ( -z "$ZEN_EGRESS_ROTATE_COMMAND" || ! -x "$ZEN_EGRESS_ROTATE_COMMAND" ) ]]; then
+  log "per-egress mode has no executable HEADROOM_ZEN_EGRESS_ROTATE_COMMAND; rotations will fail closed"
+fi
 if [[ "${1:-}" == "--rotate-now" ]]; then
   # Manual rotation with the same protection as the automatic path: drain
   # in-flight turns first (bounded), then rotate once, then wake sessions.
   # Explicit operator intent bypasses the 120 s auto-throttle but keeps the
   # flock, so a concurrent automatic rotation still serialises. Optional
   # second arg pins the location instead of cycling the list.
+  if [[ "$ZEN_EGRESS_MODE" == "1" ]]; then
+    if [[ -n "${2:-}" ]]; then
+      rotate_zen_egress "$2" manual
+    else
+      rotate_all_zen_egresses manual
+    fi
+    exit $?
+  fi
   if rotate manual "${2:-}"; then
     exit 0
   else
     exit 1
   fi
 fi
+if [[ "${1:-}" == "--rotate-egress" ]]; then
+  [[ "$ZEN_EGRESS_MODE" == "1" ]] || {
+    log "--rotate-egress requires HEADROOM_ZEN_EGRESS_MODE=1"
+    exit 2
+  }
+  [[ -n "${2:-}" ]] || { log "--rotate-egress requires an opaque egress id"; exit 2; }
+  rotate_zen_egress "$2" manual
+  exit $?
+fi
 next_proactive_at=$(schedule_next)
 log "proactive rotation scheduled (hourly ±10min jitter)"
 tail -n0 -F "$LOG" 2>/dev/null | while true; do
+  refresh_zen_egress_mode
   if IFS= read -r -t "$POLL_SECS" line; then
-    if printf '%s' "$line" | grep -q 'local_model_upstream_error'; then
-      if printf '%s' "$line" | grep -q '"status":429'; then
+    if printf '%s' "$line" | grep -q 'zen_egress_rate_limited'; then
+      if [[ "$ZEN_EGRESS_MODE" == "1" ]]; then
+        egress_id=$(zen_egress_id_from_line "$line")
+        if [[ -n "$egress_id" ]]; then
+          rotate_zen_egress "$egress_id" rate-limit
+        else
+          log "Zen rate-limit event had no egress id; refusing device-wide rotation in per-egress mode"
+        fi
+      else
         rotate auto
-        next_proactive_at=$(schedule_next)
+      fi
+      reset_proactive_schedule_after_reactive
+    elif printf '%s' "$line" | grep -q 'local_model_upstream_error'; then
+      if printf '%s' "$line" | grep -q '"status":429'; then
+        if [[ "$ZEN_EGRESS_MODE" == "1" ]]; then
+          log "unscoped legacy 429 event ignored in per-egress mode; no device-wide rotation attempted"
+        else
+          rotate auto
+        fi
+        reset_proactive_schedule_after_reactive
       fi
     elif printf '%s' "$line" | grep -q '"event":"zen_hold_waiting"'; then
       # The proxy holds a Zen 429 instead of returning it (unbounded by
       # default), so the `local_model_upstream_error` line above no longer
       # appears while a hold is on. Every hold probe that still sees 429
       # asks for a rotation; the cooldown collapses the burst into one.
-      rotate auto
-      next_proactive_at=$(schedule_next)
+      if [[ "$ZEN_EGRESS_MODE" == "1" ]]; then
+        log "legacy Zen hold event ignored in per-egress mode; waiting for zen_egress_rate_limited event"
+      else
+        rotate auto
+      fi
+      reset_proactive_schedule_after_reactive
     fi
-  elif [ -n "$(poll_transcripts)" ]; then
+  elif [[ "$ZEN_EGRESS_MODE" != "1" ]] && [ -n "$(poll_transcripts)" ]; then
     log "rate-limit message in session transcript; rotating..."
     rotate auto
     next_proactive_at=$(schedule_next)
-  elif [ "$(poll_transport)" -ge "$TRANSPORT_BURST_THRESHOLD" ] && transport_fire_due; then
+  elif [[ "$ZEN_EGRESS_MODE" != "1" ]] && [ "$(poll_transport)" -ge "$TRANSPORT_BURST_THRESHOLD" ] && transport_fire_due; then
     log "egress send-failure burst in proxy log; rotating..."
     rotate auto "" "egress-degraded"
     next_proactive_at=$(schedule_next)
   fi
   if (( $(date +%s) >= next_proactive_at )); then
     n=$(inflight)
-    if [[ "$n" == "0" || "$n" == "-1" ]]; then
-      log "proactive rotation due (in_flight=$n); rotating into the quiet moment..."
-      rotate scheduled
+    if [[ "$ZEN_EGRESS_MODE" == "1" && "$n" == "-1" ]]; then
+      log "proactive per-egress rotation deferred: inflight endpoint unavailable"
+      next_proactive_at=$(( $(date +%s) + PROACTIVE_DEFER_SECS ))
+    # Per-egress mode does not wait for the whole proxy to go idle: each
+    # egress drains on its own count and defers alone if it stays busy.
+    elif [[ "$ZEN_EGRESS_MODE" == "1" || "$n" == "0" || "$n" == "-1" ]]; then
+      if [[ "$ZEN_EGRESS_MODE" == "1" ]]; then
+        log "proactive per-egress rotation due (in_flight=$n); rotating every configured Zen egress..."
+        if ! rotate_all_zen_egresses proactive; then
+          next_proactive_at=$(( $(date +%s) + PROACTIVE_DEFER_SECS ))
+          continue
+        fi
+      else
+        log "proactive rotation due (in_flight=$n); rotating into the quiet moment..."
+        rotate scheduled
+      fi
       next_proactive_at=$(schedule_next)
     else
       log "proactive rotation deferred: $n turns in flight; rechecking in ${PROACTIVE_DEFER_SECS}s"

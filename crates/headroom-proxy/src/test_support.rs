@@ -44,6 +44,8 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
         started_at: std::time::Instant::now(),
         config: std::sync::Arc::new(config),
         client: reqwest::Client::new(),
+        zen_egresses: None,
+        default_egress_id: "direct".to_string(),
         caller_clients: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(128).unwrap(),
         ))),

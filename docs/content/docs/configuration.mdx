@@ -67,6 +67,9 @@ headroom-proxy  # passthrough is flag-driven; see headroom-proxy --help
 | `HEADROOM_MAX_KEEPALIVE` | Maximum upstream keep-alive connections | `100` |
 | `HEADROOM_KEEPALIVE_EXPIRY` | Seconds an idle upstream keep-alive connection is kept open | `90` |
 | `HEADROOM_HTTP_PROXY` | HTTP proxy URL for upstream provider requests only; HTTPS provider APIs use CONNECT | -- |
+| `HEADROOM_ZEN_HTTP_PROXY_POOL` | Newline-separated HTTP/SOCKS5 proxy URLs for sticky per-stream egress selection on OpenCode Zen/Muse Spark calls only; Claude and Codex do not use this pool | -- |
+| `HEADROOM_ZEN_EGRESS_ROTATE_COMMAND` | Executable used by the Zen watcher; receives `<opaque-egress-id> <rate-limit\|proactive\|manual>`, with a single egress for 429s and every configured egress on scheduled rotations | -- |
+| `HEADROOM_ZEN_EGRESS_ROTATE_TIMEOUT` | Maximum runtime in seconds for each per-egress rotation callback | `600` |
 | `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
 | `HEADROOM_TELEMETRY` | Set to `on` for **local-only** usage stats (powers your own `/stats` and dashboard; nothing is sent externally) | `off` |
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
@@ -102,7 +105,20 @@ headroom-proxy  # passthrough is flag-driven; see headroom-proxy --help
 | `HEADROOM_KOMPRESS_ENDPOINT` / `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | Offload ML compression (Kompress) to a remote endpoint instead of the local ONNX model — used by reasoning compaction and the router when set. | -- |
 | `HEADROOM_1M_MODEL` | Fallback model for 1M-context sessions (Python mirror `headroom wrap claude --1m`; no Rust equivalent). Accepts the id with or without the `[1m]` suffix (added when absent); an explicit `--model` / `ANTHROPIC_MODEL` always wins. See [Claude 1M context window](#claude-1m-context-window-headroom-wrap-claude---1m). | `claude-opus-5` |
 
-For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
+For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` or `HEADROOM_ZEN_HTTP_PROXY_POOL` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. The Zen-only pool assigns each new Muse Spark stream lane to one endpoint and keeps later turns on that egress; configured endpoints should be verified as distinct egresses. HTTPX reads process-wide proxy variables, but Headroom also passes them through to tool executions.
+
+When a Zen pool is configured, the launcher starts the rotation watcher in
+per-egress mode only if `HEADROOM_ZEN_EGRESS_ROTATE_COMMAND` names an executable.
+The watcher passes the opaque ID of a rate-limited egress to that executable;
+scheduled rotations enumerate `/debug/zen-egresses` and invoke it once per
+configured egress. The executable must map each ID to an independently managed
+VPN session and return a nonzero status if rotation fails. It receives no proxy
+URLs or credentials. Without it, requests still use the pool, but no automatic
+rotation occurs and the launcher warns; the watcher never falls back to
+rotating the device-wide VPN route in pool mode. Existing built-in VPN commands
+control a single machine-wide route and do not create separate sessions. The
+watcher discards callback stdout/stderr and trusts a zero exit status, so the
+adapter should verify that the egress changed and log diagnostics privately.
 
 ### Cold-prefix hook & reasoning compaction
 
@@ -308,4 +324,3 @@ Validate the proxy is up and configured:
 curl -s localhost:8787/healthz
 headroom doctor
 ```
-

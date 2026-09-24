@@ -22,8 +22,8 @@ help:
 	@echo "  make test-nextest-shard SHARD=1/4 - one hash-partition (what CI runs)"
 	@echo "  make test-parity        - parity-run against recorded fixtures"
 	@echo "  make bench              - cargo bench --workspace"
-	@echo "  make build-proxy        - release build + strip headroom-proxy, print size"
-	@echo "  make install-proxy      - build-proxy, then install it to $$PREFIX/bin (default ~/.local)"
+	@echo "  make build-proxy        - release build proxy tools; strip headroom-proxy and print size"
+	@echo "  make install-proxy      - build-proxy, then install the proxy and Nord egress helper"
 	@echo "  make build-wheel        - release wheel for headroom-py"
 	@echo "  make verify-rust-core   - build + install + import-verify headroom._core"
 	@echo "  make fmt                - cargo fmt --all"
@@ -114,7 +114,7 @@ bench:
 	$(CARGO) bench --workspace
 
 build-proxy:
-	$(CARGO) build --release -p headroom-proxy
+	$(CARGO) build --release -p headroom-proxy --bins
 	@BIN=target/release/headroom-proxy; \
 	if command -v strip >/dev/null 2>&1; then strip "$$BIN" || true; fi; \
 	SIZE=$$(wc -c < "$$BIN"); \
@@ -129,7 +129,9 @@ build-proxy:
 install-proxy: build-proxy
 	@mkdir -p "$(PREFIX)/bin"
 	@install -m 0755 target/release/headroom-proxy "$(PREFIX)/bin/headroom-proxy"
+	@install -m 0755 target/release/nord-socks-egress "$(PREFIX)/bin/nord-socks-egress"
 	@echo "installed $(PREFIX)/bin/headroom-proxy"
+	@echo "installed $(PREFIX)/bin/nord-socks-egress"
 	@RESOLVED=$$(command -v headroom-proxy || true); \
 	if [ -z "$$RESOLVED" ]; then \
 		echo "warning: $(PREFIX)/bin is not on PATH" >&2; \

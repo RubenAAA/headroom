@@ -2239,6 +2239,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "libc",
  "lru",
  "md-5",
  "memchr",

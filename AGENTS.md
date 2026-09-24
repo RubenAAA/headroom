@@ -35,7 +35,8 @@ for working on Headroom. The maintainer does.
 
 `install.sh` writes:
 
-- `~/.local/bin/headroom-proxy` and `~/.local/bin/headroom`, built release.
+- `~/.local/bin/headroom-proxy`, `~/.local/bin/headroom`, and the Rust
+  `~/.local/bin/nord-socks-egress` helper, built release.
 - `~/.local/bin/claude-launcher`, with `cclaude` symlinked to it, and
   `~/.local/bin/restart-headroom.sh`.
 - `~/.headroom-flags.sh`, a bash array of proxy flags copied from

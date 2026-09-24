@@ -1,12 +1,13 @@
-//! Shared per-upstream rate-limit gate + Zen in-flight cap for routed sends.
+//! Shared per-upstream-egress rate-limit gate + Zen in-flight cap for routed sends.
 //!
 //! `send_with_retry` retries each turn on its own: when Zen answers 429,
 //! every parallel turn sleeps its private backoff and re-collides —
 //! 2026-09-14 saw 40 parallel Zen 429s inside one hour, plus a 7-wide
 //! subagent burst that truncated every turn in the same millisecond. The
-//! gate shares one hold per upstream host: the first 429 parks the host
-//! until now+backoff, and turns arriving behind it wait instead of firing
-//! into a known-limited upstream. The in-flight cap bounds the *first*
+//! gate shares one hold per (upstream host, egress): the first 429 parks that
+//! egress until now+backoff, and turns arriving behind it wait instead of
+//! firing into a known-limited egress. Separate egresses have separate holds
+//! and in-flight counters. The in-flight cap bounds the *first*
 //! wave (concurrent POST starts), which no backoff can stagger because
 //! nothing has failed yet.
 //!
@@ -30,7 +31,8 @@ const CAP_POLL_MS: u64 = 100;
 static HOLDS: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static ZEN_INFLIGHT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+static ZEN_INFLIGHT: LazyLock<Mutex<HashMap<String, Arc<AtomicUsize>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> {
     HOLDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -74,14 +76,15 @@ fn hold_for(holds: &mut HashMap<String, Instant>, host: &str, delay_ms: u64) {
         .or_insert(until);
 }
 
-/// How long this turn should wait before sending to `host` (0 = go).
-pub(crate) fn gate_wait_ms(host: &str) -> u64 {
-    remaining_ms(&mut lock(), host)
+/// How long this turn should wait before sending to an upstream-egress key
+/// (0 = go).
+pub(crate) fn gate_wait_ms(egress_key: &str) -> u64 {
+    remaining_ms(&mut lock(), egress_key)
 }
 
-/// Park `host` for `delay_ms` after a 429/5xx (extends, never shortens).
-pub(crate) fn gate_hold(host: &str, delay_ms: u64) {
-    hold_for(&mut lock(), host, delay_ms);
+/// Park an upstream-egress key for `delay_ms` after a 429/5xx (extends, never shortens).
+pub(crate) fn gate_hold(egress_key: &str, delay_ms: u64) {
+    hold_for(&mut lock(), egress_key, delay_ms);
 }
 
 /// Test/reset helper: drops every hold.
@@ -159,13 +162,22 @@ pub(crate) async fn acquire_zen_slot(
     }
 }
 
-/// Production entry point: the shared in-flight counter.
+/// Production entry point: one shared in-flight counter per upstream-egress key.
 pub(crate) async fn acquire_global_zen_slot(
+    egress_key: &str,
     max: usize,
     wait_cap_ms: u64,
     request_id: &str,
 ) -> ZenSlot {
-    acquire_zen_slot(&ZEN_INFLIGHT, max, wait_cap_ms, request_id).await
+    let counter = {
+        let mut counters = ZEN_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            counters
+                .entry(egress_key.to_string())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+        )
+    };
+    acquire_zen_slot(&counter, max, wait_cap_ms, request_id).await
 }
 
 #[cfg(test)]
@@ -235,6 +247,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         counter.fetch_sub(1, Ordering::SeqCst);
         assert!(waiter.await.unwrap(), "waiter should acquire once freed");
+    }
+
+    #[tokio::test]
+    async fn separate_egresses_have_independent_holds_and_slots() {
+        let suffix = uuid::Uuid::new_v4();
+        let egress_a = format!("test-upstream#{suffix}-a");
+        let egress_b = format!("test-upstream#{suffix}-b");
+
+        gate_hold(&egress_a, 5_000);
+        assert!(gate_wait_ms(&egress_a) > 0);
+        assert_eq!(gate_wait_ms(&egress_b), 0);
+
+        let slot_a = acquire_global_zen_slot(&egress_a, 1, 0, "egress-a-first").await;
+        assert!(slot_a.is_held());
+        let over_a = acquire_global_zen_slot(&egress_a, 1, 0, "egress-a-over-cap").await;
+        assert!(!over_a.is_held(), "same egress observes its own cap");
+        let slot_b = acquire_global_zen_slot(&egress_b, 1, 0, "egress-b-first").await;
+        assert!(slot_b.is_held(), "another egress has an independent slot");
     }
 
     #[test]

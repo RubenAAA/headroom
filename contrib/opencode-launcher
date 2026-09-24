@@ -32,10 +32,17 @@ FLAGS_FILE="$HOME/.headroom-flags.sh"
 # Overridable so a candidate binary can be tried on another port without
 # restarting the shared proxy and cutting every live session's stream. The
 # default is the only port anything else knows about.
-PROXY_URL="${HEADROOM_PROXY_URL:-http://127.0.0.1:8787}"
+PROXY_LISTEN="${HEADROOM_PROXY_LISTEN:-127.0.0.1:8787}"
+PROXY_PORT="${PROXY_LISTEN##*:}"
+PROXY_URL="${HEADROOM_PROXY_URL:-http://127.0.0.1:$PROXY_PORT}"
 # Same path restart-headroom.sh uses; ~/headroom-savings.py reads this one
 # by name — a launcher-started proxy must log here or savings go stale.
-PROXY_LOG="$HOME/headroom-proxy.log"
+if [ "$PROXY_PORT" = "8787" ]; then
+    DEFAULT_PROXY_LOG="$HOME/headroom-proxy.log"
+else
+    DEFAULT_PROXY_LOG="$HOME/headroom-proxy-$PROXY_PORT.log"
+fi
+PROXY_LOG="${HEADROOM_PROXY_LOG:-$DEFAULT_PROXY_LOG}"
 
 # ── profile from invocation name ──────────────────────────────────────────
 # DEFAULT_FLAGS is prepended to the command line, so anything typed still wins
@@ -116,6 +123,39 @@ done
 # is up for this session to use.
 ensure_watcher() {
     local watch="$HOME/.local/bin/zen-rotate-watch.sh"
+    if [ "${HEADROOM_DISABLE_ZEN_ROTATE_WATCH:-0}" = "1" ]; then
+        if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+            echo "headroom: watcher auto-start disabled, but an existing watcher is still running" >&2
+        fi
+        return 0
+    fi
+    if [ -n "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ]; then
+        if [ -z "${HEADROOM_ZEN_EGRESS_ROTATE_COMMAND:-}" ] || [ ! -x "$HEADROOM_ZEN_EGRESS_ROTATE_COMMAND" ]; then
+            echo "headroom: Zen egress pool has no executable HEADROOM_ZEN_EGRESS_ROTATE_COMMAND; per-egress 429 and scheduled rotations are disabled (no shared VPN route will be changed)" >&2
+            if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+                echo "headroom: an existing watcher may still rotate the device-wide VPN route; stop it before relying on isolated egresses" >&2
+            fi
+            return 0
+        fi
+        if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+            echo "headroom: an existing watcher may still rotate the device-wide VPN route; restart it in per-egress mode before relying on the Zen pool" >&2
+            return 0
+        fi
+        [ -x "$watch" ] || return 0
+        setsid nohup env -u HEADROOM_HTTP_PROXY -u HEADROOM_ZEN_HTTP_PROXY_POOL \
+            HEADROOM_PROXY_URL="$PROXY_URL" HEADROOM_PROXY_LOG="$PROXY_LOG" \
+            HEADROOM_ZEN_EGRESS_MODE=1 \
+            HEADROOM_ZEN_EGRESS_ROTATE_COMMAND="$HEADROOM_ZEN_EGRESS_ROTATE_COMMAND" \
+            "$watch" >>"$HOME/zen-rotate-watch.log" 2>&1 </dev/null &
+        echo "headroom: started per-egress Zen rotation watcher (log: $HOME/zen-rotate-watch.log)" >&2
+        return 0
+    fi
+    if [ -n "${HEADROOM_HTTP_PROXY:-}" ]; then
+        if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+            echo "headroom: watcher auto-start disabled for provider proxying, but an existing watcher is still running" >&2
+        fi
+        return 0
+    fi
     [ -x "$watch" ] || return 0
     # Bracket trick: pgrep -f would otherwise match this shell's own command
     # line, which quotes the pattern.
@@ -126,6 +166,30 @@ ensure_watcher() {
     disown
     echo "headroom: started VPN-exit watcher (log: $HOME/zen-rotate-watch.log)" >&2
 }
+
+validate_zen_pool() {
+    [ -n "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ] || return 0
+    local expected actual
+    expected=$(python3 -c '
+import hashlib, os
+urls = dict.fromkeys(line.strip() for line in os.environ["HEADROOM_ZEN_HTTP_PROXY_POOL"].splitlines() if line.strip())
+print("\n".join("proxy-" + hashlib.sha256(url.encode()).hexdigest()[:12] for url in urls))
+') || {
+        echo "headroom: could not validate the configured Zen egress pool" >&2
+        return 1
+    }
+    actual=$(curl --noproxy '*' -fsS --max-time 2 "$PROXY_URL/debug/zen-egresses" 2>/dev/null | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+print("\n".join(item["egress_id"] for item in data.get("egresses", [])))
+' 2>/dev/null) || actual=""
+    if [ "$actual" != "$expected" ]; then
+        echo "headroom: the running proxy's Zen egress pool does not match this shell's configuration" >&2
+        echo "          Drain active turns and restart the proxy, then rerun oopencode-work." >&2
+        return 1
+    fi
+}
+
 if [ "$use_context" -eq 1 ]; then
     # All launcher chatter goes to stderr: `opencode run` prints the model
     # response on stdout and is commonly piped, so stdout must stay clean.
@@ -149,7 +213,7 @@ if [ "$use_context" -eq 1 ]; then
         # name, not `-f` on the argv: a shell whose own command line quotes
         # the pattern would match itself.
         if pgrep -x headroom-proxy >/dev/null 2>&1; then
-            echo "headroom: a proxy process is still up on 8787 but not answering; not rolling its log" >&2
+            echo "headroom: a proxy process is still up but not answering; not rolling its log" >&2
         elif [ -s "$PROXY_LOG" ] && head -c 4096 "$PROXY_LOG" | grep -q '"level":'; then
             rm -f "$PROXY_LOG.4"
             for i in 3 2 1; do
@@ -174,7 +238,7 @@ if [ "$use_context" -eq 1 ]; then
         fi
         echo "headroom: starting proxy at $PROXY_URL (log: $PROXY_LOG)" >&2
         nohup headroom-proxy \
-            --listen 127.0.0.1:8787 \
+            --listen "$PROXY_LISTEN" \
             --upstream https://api.anthropic.com \
             "${measured_flags[@]}" \
             "${proxy_flags[@]}" \
@@ -190,8 +254,15 @@ if [ "$use_context" -eq 1 ]; then
             exit 1
         fi
     fi
+    validate_zen_pool || exit 1
     ensure_watcher
 fi
+
+# The upstream-proxy URL can contain service credentials. Headroom consumed it
+# at startup; never pass this Headroom-only setting into OpenCode or its tools.
+unset HEADROOM_HTTP_PROXY
+unset HEADROOM_ZEN_HTTP_PROXY_POOL
+unset HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
 
 # ── assemble env and exec opencode ────────────────────────────────────────
 # The provider block rides OPENCODE_CONFIG_CONTENT (inline config): it merges

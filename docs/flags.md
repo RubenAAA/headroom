@@ -86,7 +86,7 @@ Options:
           [default: 90s]
 
       --http-proxy <HTTP_PROXY>
-          Optional HTTP proxy for upstream provider calls only (e.g. http://127.0.0.1:3128). Scoped to the proxy's provider HTTP client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY` env vars, which would leak into tool executions inheriting the environment. HTTP/2 is disabled for provider clients when this is set so HTTPS provider APIs can tunnel through a CONNECT proxy
+          Optional HTTP or SOCKS5 proxy for upstream provider calls only (e.g. http://127.0.0.1:3128 or socks5h://127.0.0.1:1080). Scoped to the proxy's provider client — it does NOT set process-wide `HTTP_PROXY`/`HTTPS_PROXY` env vars, which would leak into tool executions inheriting the environment. HTTP/2 is disabled for provider clients when this is set so HTTPS provider APIs can tunnel through the proxy
           
           [env: HEADROOM_HTTP_PROXY=]
 

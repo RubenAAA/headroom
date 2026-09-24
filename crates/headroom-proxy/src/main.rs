@@ -23,12 +23,41 @@ use tracing_subscriber::EnvFilter;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Before anything opens a database: SQLite refuses process-wide settings
     // once its library has initialised.
     headroom_core::sqlite_tuning::apply();
-    let args = CliArgs::parse();
+    let mut args = CliArgs::parse();
+    // Pool entries stay out of argv (they may contain SOCKS credentials).
+    // Capture and remove them before creating the multithreaded runtime, just
+    // like the single-provider proxy URL below.
+    if let Ok(pool) = std::env::var("HEADROOM_ZEN_HTTP_PROXY_POOL") {
+        args.zen_http_proxy_pool = pool
+            .lines()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    std::env::remove_var("HEADROOM_ZEN_HTTP_PROXY_POOL");
+    // These are launcher/watcher controls, not proxy request configuration.
+    // Keep them out of helper processes spawned by the proxy.
+    std::env::remove_var("HEADROOM_ZEN_EGRESS_ROTATE_COMMAND");
+    std::env::remove_var("HEADROOM_ZEN_EGRESS_ROTATE_TIMEOUT");
+    std::env::remove_var("HEADROOM_ZEN_EGRESS_MODE");
+    // Clap has captured the provider-proxy URL. Remove it before creating the
+    // multithreaded runtime so helper processes spawned by the proxy do not
+    // inherit SOCKS credentials from this configuration variable.
+    if args.http_proxy.is_some() {
+        std::env::remove_var("HEADROOM_HTTP_PROXY");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_cli(args);
 
     init_tracing(&config.log_level);
