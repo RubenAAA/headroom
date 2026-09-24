@@ -519,152 +519,176 @@ fn splice_memory_trace(provider: &str, trace: &[String], current_response: &mut 
 /// This is a shape check, not a verdict on the model: history pairs that
 /// already served are untouched, only unpaired calls are named.
 fn continuation_dangling_calls(body: &serde_json::Value, provider: &str) -> Vec<String> {
+    match provider {
+        "openai_responses" => responses_dangling_calls(body),
+        "anthropic" => anthropic_dangling_calls(body),
+        _ => chat_dangling_calls(body),
+    }
+}
+
+/// Responses: every `function_call` needs a `function_call_output` with its
+/// `call_id`.
+fn responses_dangling_calls(body: &serde_json::Value) -> Vec<String> {
     use serde_json::Value;
     let mut dangling = Vec::new();
-    match provider {
-        "openai_responses" => {
-            let empty = Vec::new();
-            let items = body
-                .get("input")
-                .and_then(Value::as_array)
-                .unwrap_or(&empty);
-            let mut calls = Vec::new();
-            let mut outputs = std::collections::HashSet::new();
-            for item in items {
-                match item.get("type").and_then(Value::as_str) {
-                    Some("function_call") => match item.get("call_id").and_then(Value::as_str) {
-                        Some(id) => calls.push(id.to_string()),
-                        None => dangling.push("function_call without call_id".to_string()),
-                    },
-                    Some("function_call_output") => {
-                        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
-                            outputs.insert(id.to_string());
-                        }
-                    }
-                    _ => {}
+    let empty = Vec::new();
+    let items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let mut calls = Vec::new();
+    let mut outputs = std::collections::HashSet::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => match item.get("call_id").and_then(Value::as_str) {
+                Some(id) => calls.push(id.to_string()),
+                None => dangling.push("function_call without call_id".to_string()),
+            },
+            Some("function_call_output") => {
+                if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                    outputs.insert(id.to_string());
                 }
             }
-            for call in calls {
-                if !outputs.contains(&call) {
-                    dangling.push(format!("function_call {call} has no output"));
-                }
-            }
+            _ => {}
         }
-        "anthropic" => {
-            let empty = Vec::new();
-            let messages = body
-                .get("messages")
-                .and_then(Value::as_array)
-                .unwrap_or(&empty);
-            if messages.is_empty() {
-                dangling.push("no messages".to_string());
-                return dangling;
-            }
-            for pair in messages.windows(2) {
-                let (msg, next) = (&pair[0], &pair[1]);
-                if msg.get("role").and_then(Value::as_str) != Some("assistant") {
-                    continue;
-                }
-                let blocks = msg
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut seen_in_turn = std::collections::HashSet::new();
-                for b in &blocks {
-                    let btype = b.get("type").and_then(Value::as_str).unwrap_or("");
-                    if btype != "tool_use" && btype != "server_tool_use" {
-                        continue;
-                    }
-                    let Some(id) = b.get("id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    if !seen_in_turn.insert((btype, id)) {
-                        dangling.push(format!("duplicate {btype} {id} in one assistant message"));
-                    }
-                }
-                let next_blocks = next
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let answered: std::collections::HashSet<&str> = next_blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                    .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
-                    .collect();
-                // Server-run tools answer themselves; only client-style
-                // `tool_use` blocks need a result in the next message.
-                // (Anthropic rejects a turn whose tool_use has no
-                // `tool_result` immediately after it.)
-                if next.get("role").and_then(Value::as_str) != Some("user") {
-                    for b in &blocks {
-                        if b.get("type").and_then(Value::as_str) == Some("tool_use")
-                            && b.get("id").and_then(Value::as_str).is_some()
-                        {
-                            dangling.push(
-                                "assistant message not followed by a user message".to_string(),
-                            );
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                for b in &blocks {
-                    if b.get("type").and_then(Value::as_str) != Some("tool_use") {
-                        continue;
-                    }
-                    if let Some(id) = b.get("id").and_then(Value::as_str) {
-                        if !answered.contains(id) {
-                            dangling.push(format!("tool_use {id} has no tool_result after it"));
-                        }
-                    }
-                }
-            }
-            if messages
-                .last()
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str)
-                == Some("assistant")
+    }
+    for call in calls {
+        if !outputs.contains(&call) {
+            dangling.push(format!("function_call {call} has no output"));
+        }
+    }
+    dangling
+}
+
+/// Anthropic: each assistant `tool_use` needs a `tool_result` in the user
+/// message right after it, and the conversation must not end on the
+/// assistant.
+fn anthropic_dangling_calls(body: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    let mut dangling = Vec::new();
+    let empty = Vec::new();
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if messages.is_empty() {
+        dangling.push("no messages".to_string());
+        return dangling;
+    }
+    for pair in messages.windows(2) {
+        anthropic_pair_dangling(&pair[0], &pair[1], &mut dangling);
+    }
+    if messages
+        .last()
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+    {
+        dangling.push("conversation ends with an assistant message".to_string());
+    }
+    dangling
+}
+
+/// One assistant message and the message after it.
+fn anthropic_pair_dangling(
+    msg: &serde_json::Value,
+    next: &serde_json::Value,
+    dangling: &mut Vec<String>,
+) {
+    use serde_json::Value;
+    if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let blocks = msg
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut seen_in_turn = std::collections::HashSet::new();
+    for b in &blocks {
+        let btype = b.get("type").and_then(Value::as_str).unwrap_or("");
+        if btype != "tool_use" && btype != "server_tool_use" {
+            continue;
+        }
+        let Some(id) = b.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !seen_in_turn.insert((btype, id)) {
+            dangling.push(format!("duplicate {btype} {id} in one assistant message"));
+        }
+    }
+    let next_blocks = next
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let answered: std::collections::HashSet<&str> = next_blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
+        .collect();
+    // Server-run tools answer themselves; only client-style
+    // `tool_use` blocks need a result in the next message.
+    // (Anthropic rejects a turn whose tool_use has no
+    // `tool_result` immediately after it.)
+    if next.get("role").and_then(Value::as_str) != Some("user") {
+        for b in &blocks {
+            if b.get("type").and_then(Value::as_str) == Some("tool_use")
+                && b.get("id").and_then(Value::as_str).is_some()
             {
-                dangling.push("conversation ends with an assistant message".to_string());
+                dangling.push("assistant message not followed by a user message".to_string());
+                break;
             }
         }
-        _ => {
-            // Chat completions: every tool call id must be covered by a
-            // later tool message. Order-insensitive: history pairs served
-            // long ago stay quiet, only uncovered calls are named.
-            let empty = Vec::new();
-            let messages = body
-                .get("messages")
-                .and_then(Value::as_array)
-                .unwrap_or(&empty);
-            let mut calls = Vec::new();
-            let mut results = std::collections::HashSet::new();
-            for msg in messages {
-                match msg.get("role").and_then(Value::as_str) {
-                    Some("assistant") => {
-                        if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
-                            for tc in tcs {
-                                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                                    calls.push(id.to_string());
-                                }
-                            }
+        return;
+    }
+    for b in &blocks {
+        if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        if let Some(id) = b.get("id").and_then(Value::as_str) {
+            if !answered.contains(id) {
+                dangling.push(format!("tool_use {id} has no tool_result after it"));
+            }
+        }
+    }
+}
+
+/// Chat completions: every tool call id must be covered by a later tool
+/// message. Order-insensitive: history pairs served long ago stay quiet,
+/// only uncovered calls are named.
+fn chat_dangling_calls(body: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    let mut dangling = Vec::new();
+    let empty = Vec::new();
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let mut calls = Vec::new();
+    let mut results = std::collections::HashSet::new();
+    for msg in messages {
+        match msg.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tcs {
+                        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                            calls.push(id.to_string());
                         }
                     }
-                    Some("tool") => {
-                        if let Some(id) = msg.get("tool_call_id").and_then(Value::as_str) {
-                            results.insert(id.to_string());
-                        }
-                    }
-                    _ => {}
                 }
             }
-            for call in calls {
-                if !results.contains(&call) {
-                    dangling.push(format!("tool_call {call} has no tool message"));
+            Some("tool") => {
+                if let Some(id) = msg.get("tool_call_id").and_then(Value::as_str) {
+                    results.insert(id.to_string());
                 }
             }
+            _ => {}
+        }
+    }
+    for call in calls {
+        if !results.contains(&call) {
+            dangling.push(format!("tool_call {call} has no tool message"));
         }
     }
     dangling
@@ -927,23 +951,9 @@ pub(crate) async fn handle_memory_response(
         "messages"
     };
 
-    let Ok(response) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-        return (body_bytes.clone(), round_usage);
-    };
-    {
-        let handler = memory.handler.as_ref();
-        if !handler.is_initialized() || !handler.has_memory_tool_calls(&response, memory.provider) {
-            return (body_bytes.clone(), round_usage);
-        }
-    }
-
-    let Ok(mut current_request) = serde_json::from_slice::<serde_json::Value>(forwarded_request)
+    let Some((response, mut current_request)) =
+        parse_memory_turn(body_bytes, forwarded_request, memory, request_id)
     else {
-        tracing::warn!(
-            event = "memory_request_unparseable",
-            request_id = %request_id,
-            "memory: failed to parse original request; skipping tool handling"
-        );
         return (body_bytes.clone(), round_usage);
     };
 
@@ -994,24 +1004,15 @@ pub(crate) async fn handle_memory_response(
         // splice left a memory call standing (nothing matched it, which
         // cannot happen while ids come from the same turn), fall through
         // to the legacy continuation attempt rather than stranding it.
-        if provider != "anthropic" && count_non_memory_calls(&current_response, memory.provider) > 0
-        {
-            let spliced = splice_memory_results_as_text(&mut current_response, &results, provider);
-            let standing = memory
-                .handler
-                .has_memory_tool_calls(&current_response, memory.provider);
-            tracing::info!(
-                request_id = %request_id,
-                event = "memory_mixed_turn_answered_in_place",
-                round = rounds + 1,
-                memory_calls = results.len(),
-                spliced,
-                standing,
-                "memory: turn also calls client tools; answering in place instead of continuing"
-            );
-            if !standing {
-                break;
-            }
+        if answered_mixed_turn_in_place(
+            memory,
+            &mut current_response,
+            &results,
+            provider,
+            request_id,
+            rounds,
+        ) {
+            break;
         }
 
         // `handle_memory_tool_calls` returns provider-shaped tool results
@@ -1037,36 +1038,23 @@ pub(crate) async fn handle_memory_response(
         // and every later alternation pass would re-send the same bytes
         // (measured 2026-09-24 as four identical rejections per turn).
         // Skip the send, retire the calls, and say so once.
-        if let Ok(built) = serde_json::from_slice::<serde_json::Value>(&continuation_body) {
-            let dangling = continuation_dangling_calls(&built, provider);
-            if !dangling.is_empty() {
-                tracing::warn!(
-                    event = "memory_continuation_doomed",
-                    request_id = %request_id,
-                    round = rounds + 1,
-                    dangling = ?dangling,
-                    tail = %super::forward::continuation_tail_summary(&built, items_field),
-                    "memory: continuation has unanswerable calls; skipping the send"
-                );
-                strand_failed_memory_calls(&mut current_response, provider, request_id);
-                break;
-            }
+        if continuation_is_doomed(
+            &continuation_body,
+            provider,
+            items_field,
+            request_id,
+            rounds,
+        ) {
+            strand_failed_memory_calls(&mut current_response, provider, request_id);
+            break;
         }
-        tracing::info!(
-            request_id = %request_id,
-            round = rounds + 1,
-            results_count = results.len(),
-            "memory: sending continuation request"
+        note_continuation_send(
+            &current_request,
+            base_hash.as_ref().zip(base_kind),
+            results.len(),
+            request_id,
+            rounds,
         );
-        if let (Some(base), Some(kind)) = (base_hash.as_ref(), base_kind) {
-            crate::cache_stabilization::drift_detector::check_continuation_prefix(
-                base,
-                &current_request,
-                kind,
-                request_id,
-                rounds + 1,
-            );
-        }
         // A deterministically-failed continuation retires its memory calls
         // (excised with one notice) instead of leaving them standing for
         // the next pass to re-send; transport blips and 429/5xx keep their
@@ -1119,6 +1107,120 @@ pub(crate) async fn handle_memory_response(
     match serde_json::to_vec(&current_response) {
         Ok(bytes) => (bytes::Bytes::from(bytes), round_usage),
         Err(_) => (body_bytes.clone(), round_usage),
+    }
+}
+
+/// Parse the response and the forwarded request, or `None` when memory is
+/// not in play for this turn. Extracted from `handle_memory_response`
+/// without behavior change.
+fn parse_memory_turn(
+    body_bytes: &bytes::Bytes,
+    forwarded_request: &bytes::Bytes,
+    memory: &MemoryToolContext,
+    request_id: &str,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let response = serde_json::from_slice::<serde_json::Value>(body_bytes).ok()?;
+    let handler = memory.handler.as_ref();
+    if !handler.is_initialized() || !handler.has_memory_tool_calls(&response, memory.provider) {
+        return None;
+    }
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(forwarded_request) else {
+        tracing::warn!(
+            event = "memory_request_unparseable",
+            request_id = %request_id,
+            "memory: failed to parse original request; skipping tool handling"
+        );
+        return None;
+    };
+    Some((response, request))
+}
+
+/// Answer the memory calls in place when the turn also calls client tools on
+/// a shape without deferral (every shape but Anthropic). True when that
+/// resolved the turn and the round loop should stop. Extracted from
+/// `handle_memory_response` without behavior change.
+fn answered_mixed_turn_in_place(
+    memory: &MemoryToolContext,
+    current_response: &mut serde_json::Value,
+    results: &[serde_json::Value],
+    provider: &str,
+    request_id: &str,
+    rounds: usize,
+) -> bool {
+    if provider == "anthropic" || count_non_memory_calls(current_response, memory.provider) == 0 {
+        return false;
+    }
+    let spliced = splice_memory_results_as_text(current_response, results, provider);
+    let standing = memory
+        .handler
+        .has_memory_tool_calls(current_response, memory.provider);
+    tracing::info!(
+        request_id = %request_id,
+        event = "memory_mixed_turn_answered_in_place",
+        round = rounds + 1,
+        memory_calls = results.len(),
+        spliced,
+        standing,
+        "memory: turn also calls client tools; answering in place instead of continuing"
+    );
+    !standing
+}
+
+/// True when the built continuation carries a call upstream will refuse;
+/// logs what dangles. Extracted from `handle_memory_response` without
+/// behavior change.
+fn continuation_is_doomed(
+    continuation_body: &[u8],
+    provider: &str,
+    items_field: &str,
+    request_id: &str,
+    rounds: usize,
+) -> bool {
+    let Ok(built) = serde_json::from_slice::<serde_json::Value>(continuation_body) else {
+        return false;
+    };
+    let dangling = continuation_dangling_calls(&built, provider);
+    if dangling.is_empty() {
+        return false;
+    }
+    tracing::warn!(
+        event = "memory_continuation_doomed",
+        request_id = %request_id,
+        round = rounds + 1,
+        dangling = ?dangling,
+        tail = %super::forward::continuation_tail_summary(&built, items_field),
+        "memory: continuation has unanswerable calls; skipping the send"
+    );
+    true
+}
+
+/// Log the send and check the continuation still extends the first round's
+/// cached prefix. Extracted from `handle_memory_response` without behavior
+/// change.
+fn note_continuation_send(
+    current_request: &serde_json::Value,
+    base: Option<(
+        &crate::cache_stabilization::drift_detector::StructuralHash,
+        crate::cache_stabilization::drift_detector::ApiKind,
+    )>,
+    results_count: usize,
+    request_id: &str,
+    rounds: usize,
+) {
+    tracing::info!(
+        request_id = %request_id,
+        round = rounds + 1,
+        results_count,
+        "memory: sending continuation request"
+    );
+    if let Some((base, kind)) = base {
+        crate::cache_stabilization::drift_detector::check_continuation_prefix(
+            base,
+            current_request,
+            kind,
+            request_id,
+            rounds + 1,
+        );
     }
 }
 
