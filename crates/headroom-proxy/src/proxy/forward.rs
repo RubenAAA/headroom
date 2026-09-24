@@ -1810,6 +1810,7 @@ pub(crate) fn log_ctx_offload_accounting(
     state: &AppState,
     request_id: &str,
     request_lane_key: &str,
+    session_key: &str,
     rebuild_boundary: bool,
     history_rewritten: bool,
 ) {
@@ -1818,9 +1819,19 @@ pub(crate) fn log_ctx_offload_accounting(
         // offload-store worker after both CCR and FTS writes
         // succeed, not here —
         // see ctx/offload_store.rs.
+        // Bounded hash list: first 8 offloaded hashes, so the log joins
+        // offload to later retrieval (same request_id or session key)
+        // without unbounded log growth on huge turns.
+        let hashes: Vec<&str> = out
+            .records
+            .iter()
+            .take(8)
+            .map(|r| r.hash.as_str())
+            .collect();
         tracing::info!(
             event = "ctx_offload_accounting",
             request_id = %request_id,
+            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(session_key),
             blocks_offloaded = out.blocks_offloaded,
             blocks_deferred = out.blocks_deferred,
             bytes_deferred = out.bytes_deferred,
@@ -1840,6 +1851,7 @@ pub(crate) fn log_ctx_offload_accounting(
                 .map_or(-1, |t| t as i64),
             window_offloads = out.window_offloads,
             tokens_saved = out.tokens_saved,
+            offloaded_hashes = ?hashes,
             rebuild_boundary,
             history_rewritten,
             "ctx_offload considered tool_result blocks"
@@ -1983,6 +1995,7 @@ pub(crate) fn run_ctx_offload_records<'a>(
                 state,
                 request_id,
                 request_lane_key,
+                session_key,
                 rebuild_boundary,
                 history_rewritten,
             );
@@ -4192,8 +4205,17 @@ pub(crate) fn inject_memory_tool_definitions(
 ///
 /// Extracted from `send_memory_continuation` without behavior change.
 pub(crate) enum MemorySendOutcome {
-    Done(Option<reqwest::Response>),
+    Done(MemorySendDone),
     Next(u32),
+}
+
+/// What a finished send attempt means for the rounds loop: a response to
+/// fold, a deterministic rejection (the body will never pass — stop
+/// sending it), or a transport failure (also stop; nothing was decided).
+pub(crate) enum MemorySendDone {
+    Sent(reqwest::Response),
+    Rejected,
+    Failed,
 }
 
 /// Builds and sends one memory-continuation request: fresh Zen request id per
@@ -4352,9 +4374,9 @@ pub(crate) async fn classify_memory_send(
                 timeout_secs = CCR_CONTINUATION_SEND_TIMEOUT.as_secs(),
                 "memory: continuation timed out waiting for response headers"
             );
-            MemorySendOutcome::Done(None)
+            MemorySendOutcome::Done(MemorySendDone::Failed)
         }
-        Ok(Ok(r)) if r.status().is_success() => MemorySendOutcome::Done(Some(r)),
+        Ok(Ok(r)) if r.status().is_success() => MemorySendOutcome::Done(MemorySendDone::Sent(r)),
         Ok(Ok(r)) => {
             let status = r.status();
             let retryable = memory_status_is_retryable(status, zen_route);
@@ -4365,7 +4387,7 @@ pub(crate) async fn classify_memory_send(
             }
             log_memory_send_rejection(r, request_id, attempt, round, items_field, current_request)
                 .await;
-            MemorySendOutcome::Done(None)
+            MemorySendOutcome::Done(MemorySendDone::Rejected)
         }
         Ok(Err(e)) => {
             if attempt < MEMORY_CONTINUATION_RETRIES && is_retryable_transport_error(&e) {
@@ -4381,7 +4403,7 @@ pub(crate) async fn classify_memory_send(
                 error = %e,
                 "memory: upstream request failed during continuation"
             );
-            MemorySendOutcome::Done(None)
+            MemorySendOutcome::Done(MemorySendDone::Failed)
         }
     }
 }

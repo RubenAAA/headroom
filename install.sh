@@ -314,20 +314,12 @@ else
 fi
 # The wrapper finds its helper scripts (cache health, codex limits, cache
 # perf) next to itself in contrib/, so the checkout has to stay where it is.
-if [ "$LINK" = 1 ]; then
-    [ -e "$CLAUDE_DIR/statusline-with-cache.sh" ] && [ ! -L "$CLAUDE_DIR/statusline-with-cache.sh" ] \
-        && mv "$CLAUDE_DIR/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh.bak"
-    ln -sfn "$CONTRIB/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh"
-else
-    # `>` through a symlink truncates the target: on 2026-09-23
-    # ~/.claude/statusline-with-cache.sh symlinked into contrib/ and this
-    # redirect emptied the checkout file itself (the shell truncates before
-    # sed reads). Drop any symlink first so the redirect creates a real file.
-    rm -f "$CLAUDE_DIR/statusline-with-cache.sh"
-    sed "s|\${HEADROOM_REPO:-\$HOME/headroom}|$REPO_DIR|g" \
-        "$CONTRIB/statusline-with-cache.sh" > "$CLAUDE_DIR/statusline-with-cache.sh"
-    chmod 755 "$CLAUDE_DIR/statusline-with-cache.sh"
+# Always a symlink (2026-09-24: a copied file rotted when a worktree moved,
+# hardcoding a dead contrib path and silently killing three segments).
+if [ -e "$CLAUDE_DIR/statusline-with-cache.sh" ] && [ ! -L "$CLAUDE_DIR/statusline-with-cache.sh" ]; then
+    mv "$CLAUDE_DIR/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh.bak"
 fi
+ln -sfn "$CONTRIB/statusline-with-cache.sh" "$CLAUDE_DIR/statusline-with-cache.sh"
 
 if command -v node >/dev/null 2>&1; then
     [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.bak"

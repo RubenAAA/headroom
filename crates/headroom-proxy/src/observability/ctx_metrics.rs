@@ -308,6 +308,24 @@ fn retrieval_misses_counter(registry: &Registry) -> &'static IntCounter {
     })
 }
 
+fn retrieval_bytes_counter(registry: &Registry) -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let c = IntCounterVec::new(
+            Opts::new(
+                METRIC_CTX_RETRIEVAL_BYTES_TOTAL,
+                METRIC_CTX_RETRIEVAL_BYTES_TOTAL_HELP,
+            ),
+            &["path"],
+        )
+        .expect("ctx_retrieval_bytes_total descriptor is well-formed");
+        registry
+            .register(Box::new(c.clone()))
+            .expect("ctx_retrieval_bytes_total registers exactly once");
+        c
+    })
+}
+
 // ── Emit helpers (called by CTX-3/4/5 code paths) ──
 
 /// Record bytes offloaded on the request path. Called from `ctx_offload.rs`.
@@ -424,6 +442,16 @@ pub fn observe_retrieval(hit: bool) {
     }
 }
 
+/// Record bytes of offloaded content handed back to the model on one
+/// retrieval path. `path` is one of `hash` (marker-hash store fetch),
+/// `query` (keyword search), or `api` (`/ctx/get`). Labelled by path, not
+/// by hash: hash cardinality is unbounded, so it stays in structured logs.
+pub fn observe_retrieval_bytes(path: &str, bytes: u64) {
+    retrieval_bytes_counter(super::prometheus::registry())
+        .with_label_values(&[path])
+        .inc_by(bytes);
+}
+
 // ── Getter helpers (called by /ctx/stats endpoint) ──
 
 pub fn offloaded_bytes_get(registry: &Registry) -> u64 {
@@ -468,6 +496,12 @@ pub fn retrieval_hits_get(registry: &Registry) -> u64 {
 
 pub fn retrieval_misses_get(registry: &Registry) -> u64 {
     retrieval_misses_counter(registry).get()
+}
+
+pub fn retrieval_bytes_get(registry: &Registry, path: &str) -> u64 {
+    retrieval_bytes_counter(registry)
+        .with_label_values(&[path])
+        .get()
 }
 
 #[cfg(test)]
@@ -521,5 +555,9 @@ mod tests {
         observe_retrieval(false);
         assert_eq!(retrieval_hits_get(reg), before_hits + 1);
         assert_eq!(retrieval_misses_get(reg), before_misses + 1);
+
+        let before_hash = retrieval_bytes_get(reg, "hash");
+        observe_retrieval_bytes("hash", 100);
+        assert_eq!(retrieval_bytes_get(reg, "hash"), before_hash + 100);
     }
 }

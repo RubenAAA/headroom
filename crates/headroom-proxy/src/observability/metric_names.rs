@@ -351,6 +351,15 @@ pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL_HELP: &str =
      store (expired, evicted, or never offloaded). A rising rate flags an \
      information-loss risk — see docs/notes/realignment/13 §8.";
 
+// ---------- ctx_retrieval_bytes_total ----------
+
+pub const METRIC_CTX_RETRIEVAL_BYTES_TOTAL: &str = "ctx_retrieval_bytes_total";
+pub const METRIC_CTX_RETRIEVAL_BYTES_TOTAL_HELP: &str =
+    "Bytes of offloaded content handed back to the model via retrieval, \
+     labelled by path (hash = marker-hash fetch, query = keyword search, \
+     api = /ctx/get). The counterweight to ctx_offloaded_bytes_total: \
+     offload saves only the bytes the model never re-fetches.";
+
 // ---------- ctx_search_queries_total ----------
 
 pub const METRIC_CTX_SEARCH_QUERIES_TOTAL: &str = "ctx_search_queries_total";

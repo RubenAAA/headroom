@@ -449,6 +449,12 @@ pub struct TurnRecord {
     /// (A second divergence the same minute recovered immediately, so this is
     /// an aftershock that happens, not one that always happens.)
     pub diverged: bool,
+    /// The previous turn ran hidden CCR continuation rounds: its provider
+    /// write committed a prefix with proxy-private retrieval messages
+    /// appended, so the next replayed client-baseline prefix cannot match.
+    /// Carried forward one turn so the aftershock can be named instead of
+    /// landing in the residual bucket.
+    pub had_continuation: bool,
     /// `cache_read + cache_creation` of the turn this one continued, when it
     /// continued one. Carried one turn so a miss can be placed against *two*
     /// earlier boundaries, not one — see [`CacheLanding`].
@@ -967,6 +973,7 @@ struct StreamMatch {
     idle_gap: Duration,
     previous_forwarded_request_bytes: Option<u64>,
     previous_turn_diverged: bool,
+    previous_turn_had_continuation: bool,
     previous_cache_read: u64,
     previous_previous_boundary: Option<u64>,
     head_changed: bool,
@@ -1247,6 +1254,7 @@ fn recache_attribution<'a>(
     replay_skip: Option<ReplaySkipEvidence>,
     replay_applied: Option<ReplayAppliedEvidence>,
     previous_turn_diverged: bool,
+    previous_turn_had_continuation: bool,
     concurrent_with_in_flight: bool,
 ) -> RecacheAttribution<'a> {
     let absorbed = client_edit_was_absorbed(drift_dims, outbound_drift_dims);
@@ -1452,6 +1460,20 @@ fn recache_attribution<'a>(
         if previous_turn_diverged {
             return RecacheAttribution {
                 reason: Some("aftershock_of_diverged_prefix"),
+                origin: Some("previous_turn"),
+                scope: Some("replayed_prefix"),
+                counts_as_waste: true,
+            };
+        }
+        // The previous turn ran hidden CCR continuation rounds: its cache
+        // write committed a prefix with proxy-private retrieval messages
+        // appended, so this turn's replayed client-baseline prefix cannot
+        // match the provider's newest write. Measured 2026-09-24: 135 of
+        // 140 unexplained recaches had a continuation on the previous turn
+        // (1% base rate). Named, still waste — the rewrite is real.
+        if previous_turn_had_continuation {
+            return RecacheAttribution {
+                reason: Some("aftershock_of_continuation"),
                 origin: Some("previous_turn"),
                 scope: Some("replayed_prefix"),
                 counts_as_waste: true,
@@ -3197,6 +3219,7 @@ impl UsageObserver {
             pending.replay_skip,
             pending.replay_applied,
             m.previous_turn_diverged,
+            m.previous_turn_had_continuation,
             pending.concurrent_with_in_flight,
         );
         // Where the provider's read landed against the two previous
@@ -3406,6 +3429,7 @@ impl UsageObserver {
                 Duration::ZERO,
                 None,
                 false,
+                false,
                 0,
                 None,
                 false,
@@ -3436,6 +3460,7 @@ impl UsageObserver {
                     usage.now.duration_since(prev.at).unwrap_or(Duration::ZERO),
                     prev.forwarded_request_bytes,
                     prev.diverged,
+                    prev.had_continuation,
                     prev.cache_read_input_tokens,
                     prev.previous_boundary,
                     moves.head,
@@ -3462,6 +3487,10 @@ impl UsageObserver {
                 .replay_skip
                 .as_ref()
                 .is_some_and(|e| e.reason.as_str() == "prefix_content_diverged"),
+            // Whether this turn ran hidden CCR continuation rounds. The
+            // billed_totals note lands before complete() on the response
+            // path, so by the time this record is stored the flag is set.
+            had_continuation: pending.billed_totals.is_some(),
             previous_boundary: matched.map(|i| {
                 streams[i]
                     .cache_read_input_tokens
@@ -3507,6 +3536,7 @@ impl UsageObserver {
             gap,
             bytes,
             diverged,
+            had_continuation,
             prev_read,
             prevprev_boundary,
             head_moved,
@@ -3523,6 +3553,7 @@ impl UsageObserver {
             idle_gap: gap,
             previous_forwarded_request_bytes: bytes,
             previous_turn_diverged: diverged,
+            previous_turn_had_continuation: had_continuation,
             previous_cache_read: prev_read,
             previous_previous_boundary: prevprev_boundary,
             head_changed: head_moved,
@@ -4489,8 +4520,27 @@ mod tests {
             Some(applied_evidence()),
             true,
             false,
+            false,
         );
         assert_eq!(a.reason, Some("aftershock_of_diverged_prefix"));
+        assert_eq!(a.origin, Some("previous_turn"));
+        assert!(a.counts_as_waste, "the rewrite is still real waste");
+    }
+
+    #[test]
+    fn a_turn_after_a_continuation_names_the_previous_turn() {
+        let a = recache_attribution(
+            None,
+            false,
+            false,
+            None,
+            None,
+            Some(applied_evidence()),
+            false,
+            true,
+            false,
+        );
+        assert_eq!(a.reason, Some("aftershock_of_continuation"));
         assert_eq!(a.origin, Some("previous_turn"));
         assert!(a.counts_as_waste, "the rewrite is still real waste");
     }
@@ -4506,6 +4556,7 @@ mod tests {
             None,
             None,
             Some(applied_evidence()),
+            false,
             false,
             false,
         );
@@ -4613,6 +4664,7 @@ mod tests {
             None,
             Some(applied_evidence()),
             false,
+            false,
             true,
         );
         assert_eq!(a.reason, Some("concurrent_turn_in_flight"));
@@ -4636,6 +4688,7 @@ mod tests {
             None,
             Some(applied_evidence()),
             false,
+            false,
             true,
         );
         assert_eq!(a.reason, Some("system"));
@@ -4656,6 +4709,7 @@ mod tests {
             None,
             Some(applied_evidence()),
             false,
+            false,
             true,
         );
         assert_eq!(a.reason, Some("prefix_head_changed"));
@@ -4672,7 +4726,7 @@ mod tests {
     /// structural client evidence above.
     #[test]
     fn a_rotated_beta_header_is_a_named_client_cause() {
-        let a = recache_attribution(None, false, true, None, None, None, false, false);
+        let a = recache_attribution(None, false, true, None, None, None, false, false, false);
         assert_eq!(a.reason, Some("forwarded_beta_rotated"));
         assert_eq!(a.origin, Some("client"));
         assert_eq!(a.scope, Some("cache_key"));
@@ -4686,16 +4740,36 @@ mod tests {
     #[test]
     fn beta_yields_to_structural_client_evidence_but_beats_proxy_and_timing() {
         // Head wins.
-        let a = recache_attribution(None, true, true, None, None, None, false, false);
+        let a = recache_attribution(None, true, true, None, None, None, false, false, false);
         assert_eq!(a.reason, Some("prefix_head_changed"));
         // Inbound drift wins.
-        let a = recache_attribution(Some("tools"), false, true, None, None, None, false, false);
+        let a = recache_attribution(
+            Some("tools"),
+            false,
+            true,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         assert_eq!(a.reason, Some("tools"));
         // Proxy outbound loses to client beta.
-        let a = recache_attribution(None, false, true, Some("tools"), None, None, false, false);
+        let a = recache_attribution(
+            None,
+            false,
+            true,
+            Some("tools"),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         assert_eq!(a.reason, Some("forwarded_beta_rotated"));
         // Commit race loses to measured evidence.
-        let a = recache_attribution(None, false, true, None, None, None, false, true);
+        let a = recache_attribution(None, false, true, None, None, None, false, false, true);
         assert_eq!(a.reason, Some("forwarded_beta_rotated"));
     }
 
@@ -4717,7 +4791,17 @@ mod tests {
             Some(&prior),
             &current,
         );
-        let a = recache_attribution(None, false, true, None, Some(skip), None, false, false);
+        let a = recache_attribution(
+            None,
+            false,
+            true,
+            None,
+            Some(skip),
+            None,
+            false,
+            false,
+            false,
+        );
         assert_eq!(a.reason, Some("prefix_content_diverged"));
     }
 
@@ -4754,6 +4838,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         );
         assert_eq!(a.reason, Some("prefix_content_diverged"));
         assert_eq!(a.origin, Some("client"));
@@ -4774,6 +4859,7 @@ mod tests {
             Some(applied_evidence()),
             false,
             false,
+            false,
         );
         assert_eq!(a.reason, Some("tools,messages[0]"));
         assert_eq!(a.origin, Some("proxy"));
@@ -4792,6 +4878,7 @@ mod tests {
             Some("system,tools"),
             None,
             Some(applied_evidence()),
+            false,
             false,
             false,
         );
@@ -4819,6 +4906,7 @@ mod tests {
             Some(applied_evidence()),
             false,
             false,
+            false,
         );
         assert_eq!(a.reason, Some("early_messages"));
         assert_eq!(a.origin, Some("proxy"));
@@ -4831,7 +4919,17 @@ mod tests {
         // `None` is not absorption: the lane reads `None` both when nothing
         // drifted and when the forwarding path never ran. Discarding the
         // inbound dims on that would throw away the one cause the turn has.
-        let a = recache_attribution(Some("tools"), false, false, None, None, None, false, false);
+        let a = recache_attribution(
+            Some("tools"),
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         assert_eq!(a.reason, Some("tools"));
         assert_eq!(a.origin, Some("client"));
         assert_eq!(a.scope, Some("hot_zone"));
@@ -4852,6 +4950,7 @@ mod tests {
             Some(""),
             None,
             Some(applied_evidence()),
+            false,
             false,
             false,
         );
@@ -4875,6 +4974,7 @@ mod tests {
             Some("system"),
             None,
             Some(applied_evidence()),
+            false,
             false,
             false,
         );
@@ -4909,6 +5009,7 @@ mod tests {
             Some(applied_evidence()),
             true,
             false,
+            false,
         );
         assert_eq!(a.reason, Some("prefix_content_diverged"));
     }
@@ -4932,6 +5033,7 @@ mod tests {
             forwarded_request_bytes: None,
             msgs: None,
             diverged: false,
+            had_continuation: false,
             previous_boundary: None,
             head: None,
             head_model: None,
@@ -5706,6 +5808,7 @@ mod tests {
                     forwarded_request_bytes: None,
                     msgs: None,
                     diverged: false,
+                    had_continuation: false,
                     previous_boundary: None,
                     head: None,
                     head_model: None,
@@ -5754,6 +5857,7 @@ mod tests {
                     forwarded_request_bytes: None,
                     msgs: None,
                     diverged: false,
+                    had_continuation: false,
                     previous_boundary: None,
                     head: None,
                     head_model: None,
@@ -5802,6 +5906,7 @@ mod tests {
                     forwarded_request_bytes: None,
                     msgs: None,
                     diverged: false,
+                    had_continuation: false,
                     previous_boundary: None,
                     head: None,
                     head_model: None,
@@ -6591,6 +6696,7 @@ mod stream_matching_tests {
             forwarded_request_bytes: None,
             msgs,
             diverged: false,
+            had_continuation: false,
             previous_boundary: None,
             head: None,
             head_model: None,
@@ -6847,7 +6953,17 @@ mod stream_matching_tests {
             skip.is_inbound_tail_replacement(),
             "test setup must be a tail replacement"
         );
-        let a = recache_attribution(None, true, false, None, Some(skip), None, false, false);
+        let a = recache_attribution(
+            None,
+            true,
+            false,
+            None,
+            Some(skip),
+            None,
+            false,
+            false,
+            false,
+        );
         assert_eq!(a.reason, Some("prefix_head_changed"));
         assert_eq!(a.origin, Some("client"));
         assert!(a.counts_as_waste, "the head move re-wrote the prefix");
@@ -6884,6 +7000,7 @@ mod stream_matching_tests {
             None,
             Some(skip),
             None,
+            false,
             false,
             false,
         );

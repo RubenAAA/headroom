@@ -95,6 +95,11 @@ enum OpenBlock {
 
 pub(crate) struct StreamTranslator {
     model: String,
+    /// Client-facing alias at construction (`claude-muse-spark-*`,
+    /// `claude-codex-*`). `model` gets overwritten by the upstream name
+    /// from `response.created`; this snapshot survives it, so route-level
+    /// decisions (e.g. Zen never sends quota) stay correct.
+    client_model: String,
     content_block_index: usize,
     started: bool,
     open: Option<OpenBlock>,
@@ -226,7 +231,8 @@ impl StreamTranslator {
 
     fn new(model: String) -> Self {
         Self {
-            model,
+            model: model.clone(),
+            client_model: model,
             content_block_index: 0,
             started: false,
             open: None,
@@ -288,6 +294,21 @@ impl StreamTranslator {
             .as_ref()
             .map(|ctx| ctx.request_id.as_str())
             .unwrap_or("unknown");
+        // Zen never sends quota (no headers, no rate_limits frames): warn
+        // would fire on every routed turn. Debug keeps the signal for
+        // troubleshooting without log noise. Matched on the client alias
+        // snapshot: self.model is the upstream name by now.
+        if self.client_model.starts_with("gpt-5")
+            || self.client_model.starts_with("claude-muse-spark")
+        {
+            tracing::debug!(
+                event = "codex_rate_limits_missing",
+                request_id = %request_id,
+                model = %self.model,
+                "routed Codex stream ended without quota (expected on Zen)"
+            );
+            return;
+        }
         tracing::warn!(
             event = "codex_rate_limits_missing",
             request_id = %request_id,
@@ -1921,7 +1942,8 @@ mod tests {
     fn stream_end_emits_one_joinable_missing_quota_event() {
         use tracing_subscriber::layer::SubscriberExt;
 
-        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        // Non-Zen model: the warn still fires (joinable single event).
+        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna-direct", 0);
         let capture = EventCapture::default();
         let lines = capture.0.clone();
         let subscriber = tracing_subscriber::registry().with(capture);
@@ -1939,6 +1961,34 @@ mod tests {
             .collect();
         assert_eq!(missing.len(), 1, "{joined}");
         assert!(missing[0].contains("request_id=req-test"), "{joined}");
+    }
+
+    #[test]
+    fn zen_model_missing_quota_stays_debug_not_warn() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Zen never sends quota: the event fires at debug so the log
+        // stays clean on every routed turn.
+        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        let capture = EventCapture::default();
+        let lines = capture.0.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut translator =
+                translator.with_codex_limits(crate::codex_rate_limits::CodexRateLimitStore::new());
+            translator.finish_rate_limit_observation();
+        });
+
+        let joined = lines.lock().unwrap().join("\n");
+        let missing: Vec<_> = joined
+            .lines()
+            .filter(|line| line.contains("codex_rate_limits_missing"))
+            .collect();
+        assert_eq!(missing.len(), 1, "{joined}");
+        assert!(
+            missing[0].contains("expected on Zen"),
+            "zen missing-quota must be debug: {joined}"
+        );
     }
 
     #[test]

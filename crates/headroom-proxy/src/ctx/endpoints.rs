@@ -250,6 +250,9 @@ async fn handle_get(
     // PR-J5: retrieval hit/miss counters. A miss is an information-loss
     // signal (expired/evicted offload original) — count before returning 404.
     crate::observability::ctx_metrics::observe_retrieval(content.is_some());
+    if let Some(ref content) = content {
+        crate::observability::ctx_metrics::observe_retrieval_bytes("api", content.len() as u64);
+    }
     let content = content.ok_or(StatusCode::NOT_FOUND)?;
 
     let bytes = content.len();
@@ -391,6 +394,12 @@ struct StatsResponse {
     search_queries: u64,
     retrieval_hits: u64,
     retrieval_misses: u64,
+    /// Bytes of offloaded content handed back to the model, by path
+    /// (hash/query/api). Compare with offloaded_bytes: the saving is
+    /// offloaded minus re-fetched, not the first figure alone.
+    retrieval_bytes_hash: u64,
+    retrieval_bytes_query: u64,
+    retrieval_bytes_api: u64,
     ccr_entries: usize,
     /// Newborn sessions seeded from their lineage's prior session (model
     /// switch, resume). Zero until `--ctx-offload-cross-session-seed` runs
@@ -421,6 +430,12 @@ async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsRespons
     let search_queries = crate::observability::ctx_metrics::search_queries_get(registry);
     let retrieval_hits = crate::observability::ctx_metrics::retrieval_hits_get(registry);
     let retrieval_misses = crate::observability::ctx_metrics::retrieval_misses_get(registry);
+    let retrieval_bytes_hash =
+        crate::observability::ctx_metrics::retrieval_bytes_get(registry, "hash");
+    let retrieval_bytes_query =
+        crate::observability::ctx_metrics::retrieval_bytes_get(registry, "query");
+    let retrieval_bytes_api =
+        crate::observability::ctx_metrics::retrieval_bytes_get(registry, "api");
     let gate_seeded = crate::observability::ctx_metrics::gate_seeded_get(registry);
     let gate_seed_refused = crate::observability::ctx_metrics::gate_seed_refused_get(registry);
 
@@ -434,6 +449,9 @@ async fn handle_stats(State(state): State<AppState>) -> Result<Json<StatsRespons
         search_queries,
         retrieval_hits,
         retrieval_misses,
+        retrieval_bytes_hash,
+        retrieval_bytes_query,
+        retrieval_bytes_api,
         ccr_entries,
         gate_seeded,
         gate_seed_refused,

@@ -101,6 +101,12 @@ pub(super) async fn answer_query_call(
         None => Vec::new(),
     };
     crate::observability::ctx_metrics::observe_retrieval(!hits.is_empty());
+    if !hits.is_empty() {
+        crate::observability::ctx_metrics::observe_retrieval_bytes(
+            "query",
+            hits.iter().map(|h| h.content.len() as u64).sum(),
+        );
+    }
     if hits.is_empty() {
         return CcrToolResult {
             tool_call_id: call.tool_call_id.clone(),
@@ -500,7 +506,18 @@ pub(super) async fn fetch_one_ccr_call(
     // `retrieval_hits` at zero however much the model retrieved.
     crate::observability::ctx_metrics::observe_retrieval(fetched.is_some());
     match fetched {
-        Some(content) => finish_store_hit(call, content, stale_reads, redact, request_id),
+        Some(content) => {
+            // Byte counter for the offload-vs-refetch ledger: the model
+            // pulled this offloaded original back, so the bytes offload
+            // saved are partly spent here. Hash stays in the log line
+            // above; Prometheus gets the aggregate only (hash cardinality
+            // is unbounded).
+            crate::observability::ctx_metrics::observe_retrieval_bytes(
+                "hash",
+                content.len() as u64,
+            );
+            finish_store_hit(call, content, stale_reads, redact, request_id)
+        }
         None => {
             recover_ccr_miss(
                 call,
