@@ -1219,12 +1219,21 @@ async fn the_routed_target_is_tried_again_after_the_cooldown_window() {
     let (_uri, route, mut router) = spark_router_config(&zen);
     router.cooldown = Some(std::time::Duration::from_millis(150));
 
-    let proxy = start_proxy_with(&default.uri(), |cfg| {
-        fast_retries(cfg);
-        cfg.model_routes = vec![route];
-        cfg.model_router = router;
-    })
+    let mut cooldowns = None;
+    let proxy = start_proxy_with_state(
+        &default.uri(),
+        |cfg| {
+            fast_retries(cfg);
+            cfg.model_routes = vec![route];
+            cfg.model_router = router;
+        },
+        |state| {
+            cooldowns = Some(state.model_route_cooldowns.clone());
+            state
+        },
+    )
     .await;
+    let cooldowns = cooldowns.expect("state captured");
 
     let client = common::shared_client();
     let send = |prompt: &'static str| {
@@ -1247,7 +1256,17 @@ async fn the_routed_target_is_tried_again_after_the_cooldown_window() {
     let after_first = zen.received_requests().await.unwrap().len();
     assert_eq!(after_first, 3);
 
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    // Wait for the 150ms window to elapse instead of oversleeping it.
+    // `remaining` is read-only, so polling never disturbs the router;
+    // the key is the post-rewrite alias (see `body_model` in
+    // handlers::local_model).
+    let cooled = common::wait_until(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(5),
+        || cooldowns.remaining("claude-muse-spark-1.3").is_none(),
+    )
+    .await;
+    assert!(cooled, "cooldown window never elapsed");
 
     assert_eq!(send("second").await.status(), 200);
     assert_eq!(
@@ -1463,12 +1482,12 @@ async fn passthrough_route_forwards_verbatim_and_books_usage() {
         .clone()
         .expect("logger captured");
     let mut entries = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         entries = logger.get_recent(10);
         if !entries.is_empty() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert_eq!(
         entries.len(),
@@ -1918,12 +1937,12 @@ async fn anthropic_target_route_streams_sse() {
         .clone()
         .expect("logger captured");
     let mut entries = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         entries = logger.get_recent(10);
         if !entries.is_empty() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert_eq!(
         entries.len(),

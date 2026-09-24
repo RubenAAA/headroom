@@ -215,7 +215,7 @@ jobs:
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
       - name: cargo test simulator-backed proxy e2e
-        run: cargo test -p headroom-proxy --test e2e_simulators
+        run: cargo test -p headroom-proxy --test state
 
   wheels:
     name: wheels (${{ matrix.target }})

@@ -64,15 +64,15 @@ hit() {
 # fresh checkouts without cargo-nextest still work (mirrors Makefile).
 if command -v cargo-nextest >/dev/null 2>&1; then
     UNIT_PROXY_CACHE="cargo nextest run -p headroom-proxy --profile ci -E 'kind(lib) and test(cache_stabilization)'"
-    INT_CACHE="cargo nextest run -p headroom-proxy --profile ci --test cache_key_contract --test integration_tool_roster_pin --test integration_b2_tool_order --test integration_tool_sort --test integration_prefix_replay --test integration_cache_drift --test continuation_cache_prefix --test ctx_cache_stability"
-    INT_ROUTED="cargo nextest run -p headroom-proxy --profile ci --test integration_sidecar --test integration_ccr_routed --test integration_ccr_streaming --test integration_local_model --test sse_framing"
+    INT_CACHE="cargo nextest run -p headroom-proxy --profile ci --test cache --test capture --test ccr"
+    INT_ROUTED="cargo nextest run -p headroom-proxy --profile ci --test routing --test ccr --test integration_local_model --test sse"
     UNIT_PROXY_CONFIG="cargo nextest run -p headroom-proxy --profile ci -E 'kind(lib) and test(config)'"
     UNIT_CORE_COST="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and test(cost_tracker or pricing or savings)'"
     UNIT_CORE_XFORM="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and test(transforms or compression or crusher)'"
 else
     UNIT_PROXY_CACHE="cargo test -p headroom-proxy --lib cache_stabilization"
-    INT_CACHE="cargo test -p headroom-proxy --test cache_key_contract --test integration_tool_roster_pin --test integration_b2_tool_order --test integration_tool_sort --test integration_prefix_replay --test integration_cache_drift --test continuation_cache_prefix --test ctx_cache_stability"
-    INT_ROUTED="cargo test -p headroom-proxy --test integration_sidecar --test integration_ccr_routed --test integration_ccr_streaming --test integration_local_model --test sse_framing"
+    INT_CACHE="cargo test -p headroom-proxy --test cache --test capture --test ccr"
+    INT_ROUTED="cargo test -p headroom-proxy --test routing --test ccr --test integration_local_model --test sse"
     UNIT_PROXY_CONFIG="cargo test -p headroom-proxy --lib config"
     UNIT_CORE_COST="cargo test -p headroom-core --lib cost_tracker"
     UNIT_CORE_XFORM="cargo test -p headroom-core --lib transforms"

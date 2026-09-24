@@ -152,11 +152,11 @@ fn big_response_create_frame() -> String {
 }
 
 async fn wait_for_frames(frames: &Arc<Mutex<Vec<Message>>>, n: usize) {
-    for _ in 0..300 {
+    for _ in 0..600 {
         if frames.lock().unwrap().len() >= n {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!(
         "timed out waiting for {n} upstream frames (got {})",
@@ -398,11 +398,11 @@ async fn client_disconnect_tears_down_upstream() {
 
     drop(ws); // abrupt client disconnect
 
-    for _ in 0..300 {
+    for _ in 0..600 {
         if upstream.peer_gone.load(Ordering::SeqCst) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(
         upstream.peer_gone.load(Ordering::SeqCst),

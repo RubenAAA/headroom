@@ -187,3 +187,78 @@ pub async fn wait_for_upstream_requests(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+// ─── Shared tracing capture: one global subscriber per process ─────────
+//
+// Five suites (cache_control, cache_drift, compression, e3, volatile)
+// assert on emitted log lines. Each used to install its own
+// process-global subscriber into its own buffer — fine as separate
+// binaries, broken merged: the first install wins and the rest read
+// empty buffers. One shared install + one shared buffer instead.
+//
+// Tests that touch the buffer must hold `serial()` across clear + emit
+// + read. Without it, one suite's `clear()` races another's freshly
+// emitted lines (lost lines → presence-flakes), and a concurrent
+// suite's lines leak into negative assertions like volatile's
+// `!contains(detected)` (absence-flakes).
+pub mod tracing_capture {
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CaptureWriter {
+        inner: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Shared capture buffer. INFO (not WARN) so drift's
+    /// `cache_drift_first_request` info lines land too; WARN-only
+    /// readers still see everything they assert on.
+    pub fn buffer() -> &'static Arc<StdMutex<Vec<u8>>> {
+        static BUFFER: OnceLock<Arc<StdMutex<Vec<u8>>>> = OnceLock::new();
+        BUFFER.get_or_init(|| {
+            let buf = Arc::new(StdMutex::new(Vec::new()));
+            let writer = CaptureWriter { inner: buf.clone() };
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_writer(writer)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            // First installer wins; the rest share the buffer (which is
+            // the point — every suite reads the same lines).
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            buf
+        })
+    }
+
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Hold across a capture test's clear + request + read. Serializes
+    /// the capture suites against each other; anything else keeps
+    /// running in parallel.
+    pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+
+    /// Blocking twin for the one sync capture test (`#[test]`, no
+    /// runtime). Never call from async code — it panics there.
+    pub fn serial_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.blocking_lock()
+    }
+}
