@@ -1,0 +1,15 @@
+# Lists a Rust file's top-level items with their line spans, attributes and
+# doc comments included. Used by scripts/split-rust-module.py. Standalone:
+# the empty [workspace] keeps it out of the headroom workspace.
+[package]
+name = "itemspan"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+
+[workspace]

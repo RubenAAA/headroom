@@ -104,7 +104,9 @@ generated from that output. Regenerate it when you add a flag.
   (`state`, `app`, `request_transforms`, `replay`, `continuation`, …). Add
   new code to the module for its area, or start a new one. The pre-push hook
   fails any Rust file that grows past 3000 lines
-  (`scripts/check-file-size.sh`).
+  (`scripts/check-file-size.sh`). To split one, write a plan and run
+  `scripts/split-rust-module.py split`, then `verify`; its docstring has
+  the steps.
 - `crates/headroom-core` holds compression, the context store and memory.
 - `crates/headroom-parity` checks Rust output against Python.
   `crates/headroom-simulators` drives the benchmarks.
