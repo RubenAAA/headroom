@@ -7,4 +7,3 @@ crates/headroom-core/src/transforms/live_zone.rs 5388
 crates/headroom-proxy/src/cache_stabilization/prefix_replay.rs 8624
 crates/headroom-proxy/src/cache_stabilization/usage_observer.rs 8242
 crates/headroom-proxy/src/config.rs *
-crates/headroom-proxy/src/proxy/forward.rs 5306
