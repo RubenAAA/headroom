@@ -65,6 +65,20 @@ async fn mount_anthropic_sse_capture(upstream: &MockServer) -> Arc<Mutex<Vec<Vec
     captured
 }
 
+/// Messages ahead of the big result: the client's ask and the tool call the
+/// result answers. Without the call the result is an orphan, and the proxy
+/// rewrites orphan results to text before it sends them upstream.
+const LEAD: usize = 2;
+
+fn lead() -> [Value; LEAD] {
+    [
+        json!({"role": "user", "content": "read the report"}),
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_replay_test", "name": "Read", "input": {}}
+        ]}),
+    ]
+}
+
 /// The original (client-side) big message: 200 homogeneous dicts in a
 /// `tool_result` — SmartCrusher's bread-and-butter (same fixture shape
 /// as `headroom-core/tests/live_zone_dispatch.rs`), guaranteed to
@@ -91,11 +105,12 @@ fn big_tool_result_message() -> Value {
 }
 
 fn turn1_body(big: &Value) -> Value {
+    let [ask, call] = lead();
     json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "system": "you are a helpful assistant",
-        "messages": [big],
+        "messages": [ask, call, big],
     })
 }
 
@@ -104,11 +119,14 @@ fn turn1_body(big: &Value) -> Value {
 /// so this also exercises moving the marker past the previously cached
 /// message without changing that message's provider cache key.
 fn turn2_body(big: &Value) -> Value {
+    let [ask, call] = lead();
     json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "system": "you are a helpful assistant",
         "messages": [
+            ask,
+            call,
             big,
             {"role": "assistant", "content": "done."},
             {"role": "user", "content": "next step please"},
@@ -120,11 +138,14 @@ fn turn2_body(big: &Value) -> Value {
 /// cache hot-zone change, so the drift detector reports a rebuild boundary and
 /// the prefix the provider had cached no longer exists.
 fn turn3_body_after_drift(big: &Value) -> Value {
+    let [ask, call] = lead();
     json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "system": "you are a terse assistant",
         "messages": [
+            ask,
+            call,
             big,
             {"role": "assistant", "content": "done."},
             {"role": "user", "content": "next step please"},
@@ -200,7 +221,7 @@ async fn replay_preserves_previous_compressed_provider_prefix() {
     // ── turn 1: big tool_result is the live zone → compressed ────────
     post_turn(&client, &proxy.url(), &turn1_body(&big)).await;
     let fwd1 = messages_of(&captured.lock().unwrap()[0]);
-    let fwd1_payload = tool_result_content(&fwd1[0]);
+    let fwd1_payload = tool_result_content(&fwd1[LEAD]);
     assert_ne!(
         fwd1_payload, original_payload,
         "precondition: turn 1 must actually compress the tool_result \
@@ -222,7 +243,7 @@ async fn replay_preserves_previous_compressed_provider_prefix() {
         tokio::time::sleep(Duration::from_millis(10)).await;
         post_turn(&client, &proxy.url(), &turn2).await;
         let got = messages_of(captured.lock().unwrap().last().unwrap());
-        if without_cache_control(&got[0]) == without_cache_control(&fwd1[0]) {
+        if without_cache_control(&got[LEAD]) == without_cache_control(&fwd1[LEAD]) {
             fwd2 = Some(got);
             break;
         }
@@ -237,12 +258,12 @@ async fn replay_preserves_previous_compressed_provider_prefix() {
     // compressed payload, NOT the client's original. The cache directive may
     // move to a newer message and is not itself part of that key.
     assert_eq!(
-        without_cache_control(&fwd2[0]),
-        without_cache_control(&fwd1[0]),
+        without_cache_control(&fwd2[LEAD]),
+        without_cache_control(&fwd1[LEAD]),
         "frozen prefix must preserve its provider cache key"
     );
     assert_ne!(
-        tool_result_content(&fwd2[0]),
+        tool_result_content(&fwd2[LEAD]),
         original_payload,
         "turn 2 forwarded the ORIGINAL big payload — the replay overlay \
          did not run and the prompt cache would bust (prefix_change)"
@@ -250,13 +271,13 @@ async fn replay_preserves_previous_compressed_provider_prefix() {
     // The appended suffix is this turn's fresh content. Every eligible string
     // is wrapped to block form so its shape cannot change when the marker
     // moves on; the available tail slot lands on the newest one.
-    assert_eq!(fwd2.len(), 3);
+    assert_eq!(fwd2.len(), LEAD + 3);
     assert_eq!(
-        fwd2[1]["content"],
+        fwd2[LEAD + 1]["content"],
         json!([{"type": "text", "text": "done."}])
     );
     assert_eq!(
-        fwd2[2]["content"],
+        fwd2[LEAD + 2]["content"],
         json!([{
             "type": "text",
             "text": "next step please",
@@ -288,7 +309,7 @@ async fn a_rebuild_boundary_drops_the_stored_prefix() {
     post_turn(&client, &proxy.url(), &turn1_body(&big)).await;
     let fwd1 = messages_of(&captured.lock().unwrap()[0]);
     assert_ne!(
-        tool_result_content(&fwd1[0]),
+        tool_result_content(&fwd1[LEAD]),
         original_payload,
         "precondition: turn 1 must actually compress the tool_result"
     );
@@ -303,7 +324,7 @@ async fn a_rebuild_boundary_drops_the_stored_prefix() {
         tokio::time::sleep(Duration::from_millis(10)).await;
         post_turn(&client, &proxy.url(), &turn2).await;
         let got = messages_of(captured.lock().unwrap().last().unwrap());
-        if without_cache_control(&got[0]) == without_cache_control(&fwd1[0]) {
+        if without_cache_control(&got[LEAD]) == without_cache_control(&fwd1[LEAD]) {
             replayed = true;
             break;
         }
@@ -321,7 +342,7 @@ async fn a_rebuild_boundary_drops_the_stored_prefix() {
     let fwd3 = messages_of(captured.lock().unwrap().last().unwrap());
 
     assert_eq!(
-        tool_result_content(&fwd3[0]),
+        tool_result_content(&fwd3[LEAD]),
         original_payload,
         "turn 3 replayed the turn-1 compressed prefix across a rebuild \
          boundary — the stored prefix outlived the cache it belonged to"
@@ -353,7 +374,7 @@ async fn without_flag_turn2_forwards_original_bytes_the_bust_this_feature_fixes(
     post_turn(&client, &proxy.url(), &turn1_body(&big)).await;
     let fwd1 = messages_of(&captured.lock().unwrap()[0]);
     assert_ne!(
-        tool_result_content(&fwd1[0]),
+        tool_result_content(&fwd1[LEAD]),
         original_payload,
         "precondition: turn 1 must compress"
     );
@@ -364,7 +385,7 @@ async fn without_flag_turn2_forwards_original_bytes_the_bust_this_feature_fixes(
     post_turn(&client, &proxy.url(), &turn2_body(&big)).await;
     let fwd2 = messages_of(captured.lock().unwrap().last().unwrap());
     assert_eq!(
-        tool_result_content(&fwd2[0]),
+        tool_result_content(&fwd2[LEAD]),
         original_payload,
         "flag off: turn 2 must forward the original bytes (the bust this \
          feature exists to prevent)"
@@ -402,7 +423,7 @@ async fn first_turn_cold_start_only_normalizes_cache_control() {
         marker_count, 1,
         "replay stage must place exactly one message-level cache_control breakpoint"
     );
-    let last_block = fwd1[0]["content"]
+    let last_block = fwd1[LEAD]["content"]
         .as_array()
         .unwrap()
         .last()

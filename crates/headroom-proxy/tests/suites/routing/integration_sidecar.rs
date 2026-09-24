@@ -208,6 +208,20 @@ async fn a_normal_request_is_untouched() {
 // The state test: a sidecar between two real turns must be invisible.
 // ---------------------------------------------------------------------------
 
+/// Messages ahead of the big result: the client's ask and the tool call the
+/// result answers. Without the call the result is an orphan, and the proxy
+/// rewrites orphan results to text before it sends them upstream.
+const LEAD: usize = 2;
+
+fn lead() -> [Value; LEAD] {
+    [
+        json!({"role": "user", "content": "read the report"}),
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_sidecar_test", "name": "Read", "input": {}}
+        ]}),
+    ]
+}
+
 /// 200 homogeneous dicts in a `tool_result` — the fixture the live-zone
 /// dispatcher is guaranteed to compress, borrowed from
 /// `integration_prefix_replay`.
@@ -226,20 +240,24 @@ fn big_tool_result_message() -> Value {
 }
 
 fn turn1_body(big: &Value) -> Value {
+    let [ask, call] = lead();
     json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "system": "you are a helpful assistant",
-        "messages": [big],
+        "messages": [ask, call, big],
     })
 }
 
 fn turn2_body(big: &Value) -> Value {
+    let [ask, call] = lead();
     json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "system": "you are a helpful assistant",
         "messages": [
+            ask,
+            call,
             big,
             {"role": "assistant", "content": "done."},
             {"role": "user", "content": "next step please"},
@@ -249,12 +267,15 @@ fn turn2_body(big: &Value) -> Value {
 
 /// A sidecar built on turn 1's history, the way the client actually sends it.
 fn sidecar_between(big: &Value) -> Value {
+    let [ask, call] = lead();
     json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 64000,
         "system": "you are a helpful assistant",
         "tools": tools(),
         "messages": [
+            ask,
+            call,
             big,
             {"role": "assistant", "content": "done."},
             {"role": "user", "content": [{"type": "text", "text": DESCRIBE}]},
@@ -306,7 +327,7 @@ async fn a_sidecar_between_turns_leaves_the_replay_prefix_alone() {
     post(&client, &proxy.url(), &turn1_body(&big)).await;
     let fwd1 = messages_of(&captured.lock().unwrap()[0]);
     assert_ne!(
-        tool_result_content(&fwd1[0]),
+        tool_result_content(&fwd1[LEAD]),
         original_payload,
         "precondition: turn 1 must actually compress the tool_result"
     );
@@ -333,7 +354,7 @@ async fn a_sidecar_between_turns_leaves_the_replay_prefix_alone() {
         tokio::time::sleep(Duration::from_millis(10)).await;
         post(&client, &proxy.url(), &turn2).await;
         let got = messages_of(captured.lock().unwrap().last().unwrap());
-        if without_cache_control(&got[0]) == without_cache_control(&fwd1[0]) {
+        if without_cache_control(&got[LEAD]) == without_cache_control(&fwd1[LEAD]) {
             replayed = true;
             break;
         }
