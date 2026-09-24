@@ -3,7 +3,6 @@
 crates/headroom-core/src/savings_tracker.rs 3391
 crates/headroom-core/src/transforms/code_compressor.rs 3651
 crates/headroom-core/src/transforms/content_router.rs 4837
-crates/headroom-core/src/transforms/live_zone.rs 5388
 crates/headroom-proxy/src/cache_stabilization/prefix_replay.rs 8624
 crates/headroom-proxy/src/cache_stabilization/usage_observer.rs 8242
 crates/headroom-proxy/src/config.rs *
