@@ -280,3 +280,6 @@ harness = false
 [[bench]]
 name = "memory_search"
 harness = false
+
+[package.metadata.cargo-machete]
+ignored = ["bytes"]

@@ -13,6 +13,9 @@
 #   6. scripts/check-complexity.sh (no new function over clippy's cognitive
 #      complexity threshold)
 #   7. scripts/check-file-size.sh (no Rust file grows past 3000 lines)
+#   8. scripts/check-hygiene.sh (rustdoc links resolve, no unused deps,
+#      touched TOML canonical; needs cargo-machete, taplo-cli, cargo-sort
+#      for the optional legs — each skips gracefully when absent)
 #
 # Idempotent. Bypass per-push with `git push --no-verify`.
 # (Replaces upstream-python/scripts/install-git-hooks.sh for local use;
@@ -99,10 +102,27 @@ bash scripts/check-file-size.sh || {
     echo "   Bypass: git push --no-verify" >&2
     exit 1
 }
+echo "── pre-push (local): hygiene (doc links, unused deps, TOML)"
+if [[ -n "${PUSH_BASE:-}" ]]; then
+    bash scripts/check-hygiene.sh --base "$PUSH_BASE" || {
+        echo "❌ pre-push: hygiene failed." >&2
+        echo "   Bypass: git push --no-verify" >&2
+        exit 1
+    }
+else
+    bash scripts/check-hygiene.sh || {
+        echo "❌ pre-push: hygiene failed." >&2
+        echo "   Bypass: git push --no-verify" >&2
+        exit 1
+    }
+fi
 echo "✅ pre-push (local): PASSED"
 HOOK_EOF
 
 chmod +x "$HOOK"
 echo "✅ installed: $HOOK"
-echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity + check-file-size."
+echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity + check-file-size + check-hygiene."
+echo "   Hygiene needs cargo-machete, taplo-cli, cargo-sort for its optional legs:"
+echo "     cargo install cargo-machete taplo-cli cargo-sort --locked"
+echo "   Each leg skips gracefully when its tool is absent."
 echo "   Bypass: git push --no-verify"

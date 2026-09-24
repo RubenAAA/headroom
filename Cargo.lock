@@ -2210,7 +2210,6 @@ dependencies = [
  "headroom-core",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2268,7 +2267,6 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tower",
- "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -2299,7 +2297,6 @@ dependencies = [
  "clap",
  "crc32fast",
  "http 1.5.0",
- "http-body-util",
  "reqwest",
  "serde",
  "serde_json",
@@ -4210,7 +4207,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http 0.6.11",
+ "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -5222,25 +5219,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "url",
-]
-
-[[package]]
-name = "tower-http"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
-dependencies = [
- "bitflags",
- "bytes",
- "http 1.5.0",
- "http-body 1.0.1",
- "percent-encoding",
- "pin-project-lite",
- "tower",
- "tower-layer",
- "tower-service",
- "tracing",
- "uuid",
 ]
 
 [[package]]

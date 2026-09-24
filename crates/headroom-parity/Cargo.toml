@@ -20,7 +20,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-thiserror = { workspace = true }
 headroom-core = { path = "../headroom-core" }
 # NOTE: Phase 0 does not invoke Python from Rust. Phase 1 adds `pyo3` with
 # `auto-initialize` here so comparators can call into the installed

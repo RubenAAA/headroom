@@ -27,6 +27,11 @@ runner; what CI shards run) and `sccache` (compiler cache, opt in with
 `export RUSTC_WRAPPER=sccache`). `install.sh` offers both; without them
 the Makefile falls back to plain `cargo test`.
 
+Optional for the pre-push hygiene gate: `cargo-machete` (unused-dep
+check), `taplo-cli` (TOML formatting), `cargo-sort` (dep ordering).
+Each gate leg skips gracefully when its tool is absent; install with
+`cargo install cargo-machete taplo-cli cargo-sort --locked`.
+
 ```bash
 git clone https://github.com/RubenAAA/headroom.git ~/headroom
 cd ~/headroom
@@ -163,6 +168,17 @@ Before pushing:
 ```bash
 make ci-precheck   # fmt, clippy, tests; the same gate CI runs
 ```
+
+`make install-local-hooks` registers the pre-push gate (same checks,
+plus the touched-area suites and the ratchets below — no CI, no
+network). It runs `cargo fmt --check`, `cargo clippy -- -D warnings`,
+`scripts/what-to-run.sh --run`, `check-drift`, `check-log-events`,
+`check-complexity`, `check-file-size`, and `check-hygiene` (rustdoc
+links, unused deps via `cargo-machete`, TOML format via `taplo` +
+`cargo sort`). The hygiene legs need
+`cargo install cargo-machete taplo-cli cargo-sort --locked`; each
+skips gracefully when its tool is absent. Bypass per-push with
+`git push --no-verify`.
 
 `rust-toolchain.toml` pins 1.95.0 so a clippy lint from a newer stable cannot
 break CI without firing locally. Do not bump it casually. Code must pass

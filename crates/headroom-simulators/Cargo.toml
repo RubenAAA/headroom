@@ -32,4 +32,3 @@ crc32fast = { workspace = true }
 [dev-dependencies]
 reqwest = { workspace = true, features = ["stream"] }
 tower = { workspace = true, features = ["util"] }
-http-body-util = { workspace = true }
