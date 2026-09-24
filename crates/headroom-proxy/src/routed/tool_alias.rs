@@ -37,19 +37,12 @@ pub(crate) struct ToolAlias {
 
 /// The core tool names Zen's free-tier gate looks for (probed live
 /// 2026-09-17: this exact set passes, subsets missing any of
-/// `bash`/`grep`/`read` or dropping below nine tools 403). Shadow
-/// copies of the missing ones top up tool-poor turns below.
-pub(crate) const ZEN_GATE_CORE_TOOLS: [&str; 9] = [
-    "bash",
-    "clear_goal",
-    "create_goal",
-    "edit",
-    "get_goal",
-    "get_goal_history",
-    "glob",
-    "grep",
-    "read",
-];
+/// `bash`/`grep`/`read` or dropping below nine tools 403; re-probed
+/// 2026-09-24 against the same gate with the proxy's own headers and a
+/// real session — the five code tools pass, and so does the bare
+/// `bash`/`grep`/`read` trio, so the four goal names below were dropped.
+/// Shadow copies of the missing ones top up tool-poor turns below.
+pub(crate) const ZEN_GATE_CORE_TOOLS: [&str; 5] = ["bash", "edit", "glob", "grep", "read"];
 
 /// Plain functional descriptions for the shadow copies. Deliberately
 /// boring and marker-free: probed live 2026-09-18, meta language here
@@ -60,11 +53,7 @@ pub(crate) const ZEN_GATE_CORE_TOOLS: [&str; 9] = [
 fn shadow_description(name: &str) -> &'static str {
     match name {
         "bash" => "Executes a shell command in a persistent session and returns its output.",
-        "clear_goal" => "Clears the current session goal and its tracked tasks.",
-        "create_goal" => "Creates a session goal to track multi-step work against.",
         "edit" => "Edits a file by replacing an exact string with new text.",
-        "get_goal" => "Reads back the current session goal and its progress.",
-        "get_goal_history" => "Lists past session goals and their outcomes.",
         "glob" => "Finds files by glob pattern.",
         "grep" => "Searches file contents for a regex pattern.",
         "read" => "Reads a file or directory listing from the filesystem.",
@@ -386,9 +375,9 @@ mod tests {
     #[test]
     fn ensure_tops_up_a_toolless_body_to_the_core_set() {
         let mut body = json!({"model": "m", "input": []});
-        assert_eq!(ensure_gate_tools(&mut body), 9);
+        assert_eq!(ensure_gate_tools(&mut body), 5);
         let names = tool_names(&body);
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 5);
         for core in ZEN_GATE_CORE_TOOLS {
             assert!(names.contains(&core.to_string()), "missing {core}");
         }
@@ -426,11 +415,11 @@ mod tests {
         let alias = ToolAlias::derive(Some(&client));
         alias.forward_body(&mut body);
         // read/Read collide case-insensitively (forward left both alone),
-        // so the exact-match dedup still lands a `bash` shadow next to the
-        // client's `Bash`: eight shadows total.
-        assert_eq!(ensure_gate_tools(&mut body), 8);
+        // so the exact-match dedup still lands `bash`, `edit`, `glob` and
+        // `grep` shadows next to the client's tools: four shadows total.
+        assert_eq!(ensure_gate_tools(&mut body), 4);
         let names = tool_names(&body);
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 9);
         for core in ZEN_GATE_CORE_TOOLS {
             assert!(names.contains(&core.to_string()), "missing {core}");
         }
@@ -444,6 +433,43 @@ mod tests {
             .collect();
         let mut body = json!({"model": "m", "tools": tools});
         assert_eq!(ensure_gate_tools(&mut body), 0);
-        assert_eq!(tool_names(&body).len(), 9);
+        assert_eq!(tool_names(&body).len(), 5);
+    }
+
+    /// Regression for the 2026-09-24 `create_goal` incident: a Claude
+    /// Code-shaped tool list (capitalized core tools, extras, MCP tools,
+    /// no goal-plugin tools) must leave the gate filler with nothing to
+    /// add. Before the core set shrank to code tools, every such turn
+    /// carried four goal shadows the model could — and once did — call.
+    #[test]
+    fn claude_code_turns_need_no_gate_shadows() {
+        let mut body = json!({
+            "model": "m",
+            "tools": [
+                {"type": "function", "name": "Task"},
+                {"type": "function", "name": "Bash"},
+                {"type": "function", "name": "Glob"},
+                {"type": "function", "name": "Grep"},
+                {"type": "function", "name": "Read"},
+                {"type": "function", "name": "Edit"},
+                {"type": "function", "name": "Write"},
+                {"type": "function", "name": "TodoWrite"},
+                {"type": "function", "name": "WebFetch"},
+                {"type": "function", "name": "mcp__plugin_perplexity_perplexity__chat"},
+            ],
+        });
+        let client = body["tools"].as_array().cloned().unwrap_or_default();
+        let alias = ToolAlias::derive(Some(&client));
+        assert!(alias.active());
+        alias.forward_body(&mut body);
+        assert_eq!(ensure_gate_tools(&mut body), 0);
+        let names = tool_names(&body);
+        assert_eq!(names.len(), 10);
+        for banned in ["create_goal", "clear_goal", "get_goal", "get_goal_history"] {
+            assert!(
+                !names.contains(&banned.to_string()),
+                "goal shadow leaked upstream: {names:?}"
+            );
+        }
     }
 }

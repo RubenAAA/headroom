@@ -520,10 +520,11 @@ mod tests {
         )
         .expect("translates");
         // Client names lowered, plus shadow copies of the missing core
-        // names (two client tools only — the gate needs nine).
+        // names (two client tools only — the gate needs the five code
+        // tools, re-probed 2026-09-24).
         let names = tool_names(&out);
         assert_eq!(&names[..2], ["read", "bash"]);
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 5);
         assert_eq!(history_names(&out), vec!["read"]);
 
         // Same turn on a generic upstream: names verbatim.
@@ -543,11 +544,13 @@ mod tests {
     }
 
     /// The Zen turn the client actually receives back: renamed calls are
-    /// restored to client names, and every shadow the gate needed is gone —
-    /// a shadow the model called would otherwise arrive as a tool the
-    /// client never declared.
+    /// restored to client names, while a call to a shadow the client never
+    /// declared passes through visibly — and the client rejects it. (That
+    /// is the 2026-09-24 `create_goal` incident; the gate filler no longer
+    /// emits goal shadows, but code-tool shadows on tool-poor turns keep
+    /// this behavior.)
     #[test]
-    fn zen_response_restores_names_and_drops_gate_shadows() {
+    fn zen_response_restores_names_but_leaves_undeclared_shadow_calls_visible() {
         use crate::routed::tool_alias::ToolAlias;
         let parsed = json!({
             "model": "claude-muse-spark-1.3",
@@ -569,7 +572,7 @@ mod tests {
             "req-zen-shadows",
         )
         .expect("translates");
-        // Nine names went out (2 renamed + 7 shadows); the alias map derives
+        // Five names went out (2 renamed + 3 shadows); the alias map derives
         // from the client's two.
         let alias = ToolAlias::derive(parsed.get("tools").and_then(|t| t.as_array()));
         assert!(alias.active());
@@ -579,7 +582,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap_or("").to_string())
             .collect();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 5);
 
         // The model answers with upstream names, including a call to a
         // shadow the client never declared.

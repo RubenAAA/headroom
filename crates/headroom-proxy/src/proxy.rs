@@ -9599,12 +9599,15 @@ async fn defer_mixed_memory_turn(
 }
 
 /// Send one memory continuation with retry: transport blips and 429/5xx
-/// get another attempt; anything else is a body we built wrong, so the
-/// caller keeps what upstream objected to instead of dropping it.
-/// A failed continuation takes the memory call down with it: the block
-/// is already suppressed, so the tool the model asked for never runs and
-/// the turn reaches the client short one tool call.
+/// get another attempt; anything else is a body we built wrong, and the
+/// caller retires its calls (excised with one notice) instead of leaving
+/// them standing for the next pass to re-send.
 /// Extracted from `handle_memory_response` without behavior change.
+///
+/// Returns how the send ended: `Sent` carries the response to fold,
+/// `Rejected` means upstream refused the body deterministically (a 400
+/// names what it disliked — resending the same bytes can only fail the
+/// same way), `Failed` covers timeouts and transport errors.
 #[allow(clippy::too_many_arguments)]
 async fn send_memory_continuation(
     client: &reqwest::Client,
@@ -9615,7 +9618,7 @@ async fn send_memory_continuation(
     round: usize,
     items_field: &str,
     current_request: &serde_json::Value,
-) -> Option<reqwest::Response> {
+) -> forward::MemorySendDone {
     let mut attempt: u32 = 0;
     // Same presence gate `refresh_zen_request_id` uses: the header is on
     // the map iff this continuation is a Zen-route send.
@@ -9639,7 +9642,7 @@ async fn send_memory_continuation(
         )
         .await
         {
-            forward::MemorySendOutcome::Done(resp) => break resp,
+            forward::MemorySendOutcome::Done(done) => break done,
             forward::MemorySendOutcome::Next(next) => {
                 attempt = next;
                 continue;
@@ -9920,6 +9923,395 @@ fn splice_memory_trace(provider: &str, trace: &[String], current_response: &mut 
     }
 }
 
+/// Calls in a built continuation body that upstream is certain to refuse.
+///
+/// A memory continuation replays the turn's assistant message plus the
+/// freshly-run answers. Any call in that body without a matching answer —
+/// a client call sharing the turn (its result arrives next request), a
+/// history pair the client left dangling, a second memory call that
+/// produced no result — fails the whole send with a 400, and resending
+/// the same bytes fails the same way (measured 2026-09-24: every
+/// rejection re-sent up to `MAX_RESOLVER_ALTERNATIONS` times). Returns
+/// human-readable descriptions; empty means the body is sendable.
+///
+/// This is a shape check, not a verdict on the model: history pairs that
+/// already served are untouched, only unpaired calls are named.
+fn continuation_dangling_calls(body: &serde_json::Value, provider: &str) -> Vec<String> {
+    use serde_json::Value;
+    let mut dangling = Vec::new();
+    match provider {
+        "openai_responses" => {
+            let empty = Vec::new();
+            let items = body
+                .get("input")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty);
+            let mut calls = Vec::new();
+            let mut outputs = std::collections::HashSet::new();
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => match item.get("call_id").and_then(Value::as_str) {
+                        Some(id) => calls.push(id.to_string()),
+                        None => dangling.push("function_call without call_id".to_string()),
+                    },
+                    Some("function_call_output") => {
+                        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                            outputs.insert(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for call in calls {
+                if !outputs.contains(&call) {
+                    dangling.push(format!("function_call {call} has no output"));
+                }
+            }
+        }
+        "anthropic" => {
+            let empty = Vec::new();
+            let messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty);
+            if messages.is_empty() {
+                dangling.push("no messages".to_string());
+                return dangling;
+            }
+            for pair in messages.windows(2) {
+                let (msg, next) = (&pair[0], &pair[1]);
+                if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                let blocks = msg
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut seen_in_turn = std::collections::HashSet::new();
+                for b in &blocks {
+                    let btype = b.get("type").and_then(Value::as_str).unwrap_or("");
+                    if btype != "tool_use" && btype != "server_tool_use" {
+                        continue;
+                    }
+                    let Some(id) = b.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !seen_in_turn.insert((btype, id)) {
+                        dangling.push(format!("duplicate {btype} {id} in one assistant message"));
+                    }
+                }
+                let next_blocks = next
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let answered: std::collections::HashSet<&str> = next_blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                    .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
+                    .collect();
+                // Server-run tools answer themselves; only client-style
+                // `tool_use` blocks need a result in the next message.
+                // (Anthropic rejects a turn whose tool_use has no
+                // `tool_result` immediately after it.)
+                if next.get("role").and_then(Value::as_str) != Some("user") {
+                    for b in &blocks {
+                        if b.get("type").and_then(Value::as_str) == Some("tool_use")
+                            && b.get("id").and_then(Value::as_str).is_some()
+                        {
+                            dangling.push(
+                                "assistant message not followed by a user message".to_string(),
+                            );
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                for b in &blocks {
+                    if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    if let Some(id) = b.get("id").and_then(Value::as_str) {
+                        if !answered.contains(id) {
+                            dangling.push(format!("tool_use {id} has no tool_result after it"));
+                        }
+                    }
+                }
+            }
+            if messages
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+            {
+                dangling.push("conversation ends with an assistant message".to_string());
+            }
+        }
+        _ => {
+            // Chat completions: every tool call id must be covered by a
+            // later tool message. Order-insensitive: history pairs served
+            // long ago stay quiet, only uncovered calls are named.
+            let empty = Vec::new();
+            let messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty);
+            let mut calls = Vec::new();
+            let mut results = std::collections::HashSet::new();
+            for msg in messages {
+                match msg.get("role").and_then(Value::as_str) {
+                    Some("assistant") => {
+                        if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+                            for tc in tcs {
+                                if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                                    calls.push(id.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Some("tool") => {
+                        if let Some(id) = msg.get("tool_call_id").and_then(Value::as_str) {
+                            results.insert(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for call in calls {
+                if !results.contains(&call) {
+                    dangling.push(format!("tool_call {call} has no tool message"));
+                }
+            }
+        }
+    }
+    dangling
+}
+
+/// Name of a proxy-owned memory call in any turn shape, for retiring calls
+/// whose continuation deterministically failed. Mirrors the name half of
+/// `pending_memory_call_names` (flat `name`, or Chat's nested
+/// `function.name`); anything else is someone else's call and stays.
+fn stranded_memory_call_name(block: &serde_json::Value) -> Option<String> {
+    let name = block.get("name").and_then(|v| v.as_str()).or_else(|| {
+        block
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+    })?;
+    crate::memory::tool_adapter::MEMORY_TOOL_NAMES
+        .contains(&name)
+        .then(|| name.to_string())
+}
+
+/// Remove the turn's proxy-owned memory calls after a deterministic
+/// continuation failure, returning the removed names.
+///
+/// Leaving them standing re-sends the same doomed body on every
+/// alternation pass (measured 2026-09-24: four identical 400s per turn)
+/// and leaks the call to clients that never declared it on paths without
+/// a stream splice. Client and already-answered calls are untouched.
+fn excise_failed_memory_calls(response: &mut serde_json::Value, provider: &str) -> Vec<String> {
+    use serde_json::Value;
+    let mut removed = Vec::new();
+    match provider {
+        "anthropic" => {
+            if let Some(content) = response.get_mut("content").and_then(Value::as_array_mut) {
+                let mut kept = Vec::with_capacity(content.len());
+                for block in content.drain(..) {
+                    let is_memory = block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && stranded_memory_call_name(&block).is_some();
+                    if is_memory {
+                        if let Some(name) = stranded_memory_call_name(&block) {
+                            removed.push(name);
+                        }
+                    } else {
+                        kept.push(block);
+                    }
+                }
+                *content = kept;
+            }
+        }
+        "openai_responses" => {
+            if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+                let mut kept = Vec::with_capacity(output.len());
+                for item in output.drain(..) {
+                    let is_memory = item.get("type").and_then(Value::as_str)
+                        == Some("function_call")
+                        && stranded_memory_call_name(&item).is_some();
+                    if is_memory {
+                        if let Some(name) = stranded_memory_call_name(&item) {
+                            removed.push(name);
+                        }
+                    } else {
+                        kept.push(item);
+                    }
+                }
+                *output = kept;
+            }
+        }
+        _ => {
+            if let Some(calls) = response
+                .get_mut("choices")
+                .and_then(Value::as_array_mut)
+                .and_then(|c| c.first_mut())
+                .and_then(|c| c.get_mut("message"))
+                .and_then(|m| m.get_mut("tool_calls"))
+                .and_then(Value::as_array_mut)
+            {
+                let mut kept = Vec::with_capacity(calls.len());
+                for call in calls.drain(..) {
+                    if let Some(name) = stranded_memory_call_name(&call) {
+                        removed.push(name);
+                    } else {
+                        kept.push(call);
+                    }
+                }
+                *calls = kept;
+            }
+        }
+    }
+    removed
+}
+
+/// Whether the turn carries visible text (thinking does not count): picks
+/// the stranded-notice wording. Turn-local only — text already streamed
+/// past the resolver is invisible here, so streaming turns that spoke
+/// still read as empty. The marker below does the real work either way.
+fn turn_has_visible_text(response: &serde_json::Value, provider: &str) -> bool {
+    use serde_json::Value;
+    fn anthropic_texts(response: &Value) -> Vec<String> {
+        response
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn responses_texts(response: &Value) -> Vec<String> {
+        response
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|i| i.get("type").and_then(Value::as_str) == Some("message"))
+                    .flat_map(|i| {
+                        i.get("content")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .filter_map(|p| p.get("text").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let texts: Vec<String> = match provider {
+        "anthropic" => anthropic_texts(response),
+        "openai_responses" => responses_texts(response),
+        _ => response
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+    };
+    texts.iter().any(|t| !t.trim().is_empty())
+}
+
+/// Append the stranded-call notice in the turn's own shape. Same wording
+/// the stream splice uses (including the Stop-hook marker), so whichever
+/// path owns the turn the client hears it once. Idempotent: a turn that
+/// already carries the marker keeps it exactly once, which is also what
+/// stops later alternation passes from stacking notices.
+fn append_stranded_notice(response: &mut serde_json::Value, provider: &str, text: &str) {
+    use serde_json::{json, Value};
+    if serde_json::to_string(response)
+        .is_ok_and(|s| s.contains(crate::sse::ccr_stream::RETRIEVAL_DROPPED_MARKER))
+    {
+        return;
+    }
+
+    match provider {
+        "anthropic" => {
+            let block = json!({"type": "text", "text": text});
+            match response.get_mut("content").and_then(Value::as_array_mut) {
+                Some(content) => content.push(block),
+                None => response["content"] = Value::Array(vec![block]),
+            }
+        }
+        "openai_responses" => {
+            let item = json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            });
+            match response.get_mut("output").and_then(Value::as_array_mut) {
+                Some(output) => output.push(item),
+                None => response["output"] = Value::Array(vec![item]),
+            }
+        }
+        _ => {
+            if let Some(message) = response
+                .get_mut("choices")
+                .and_then(Value::as_array_mut)
+                .and_then(|c| c.first_mut())
+                .and_then(|c| c.get_mut("message"))
+            {
+                match message.get("content").and_then(Value::as_str) {
+                    Some(prev) if !prev.trim().is_empty() => {
+                        message["content"] = Value::String(format!("{prev}\n{text}"));
+                    }
+                    _ => message["content"] = Value::String(text.to_string()),
+                }
+            }
+        }
+    }
+}
+
+/// Retire memory calls after a deterministic continuation failure: excise
+/// the unanswerable calls and leave one hook-matchable notice.
+///
+/// A rejected (or provably-doomed, see `continuation_dangling_calls`)
+/// continuation leaves its calls standing, and every later alternation
+/// pass re-sends the same bytes — measured 2026-09-24 as four identical
+/// 400s per turn — while buffered paths without a stream splice hand the
+/// client a tool it never declared. Excising ends both: later passes find
+/// no calls and return the turn unchanged, and the notice (same wording
+/// and marker the stream splice uses) tells the client once.
+fn strand_failed_memory_calls(
+    current_response: &mut serde_json::Value,
+    provider: &str,
+    request_id: &str,
+) {
+    let names = excise_failed_memory_calls(current_response, provider);
+    if names.is_empty() {
+        return;
+    }
+    let first = names.first().cloned();
+    let text = if turn_has_visible_text(current_response, provider) {
+        crate::sse::ccr_stream::dropped_call_text(first.as_deref())
+    } else {
+        crate::sse::ccr_stream::empty_turn_text(first.as_deref())
+    };
+    append_stranded_notice(current_response, provider, &text);
+    tracing::warn!(
+        event = "memory_calls_stranded",
+        request_id = %request_id,
+        tools = ?names,
+        "memory: continuation deterministically failed; retired the calls with one notice"
+    );
+}
+
 /// Execute `memory_*` tool calls the model made, and continue the turn.
 ///
 /// The proxy injects these tools (see the injection site in `forward_http`),
@@ -10058,6 +10450,26 @@ pub(crate) async fn handle_memory_response(
         ) else {
             break;
         };
+        // Never send a continuation we can see will fail: a call in the
+        // body without a matching answer fails the whole send with a 400,
+        // and every later alternation pass would re-send the same bytes
+        // (measured 2026-09-24 as four identical rejections per turn).
+        // Skip the send, retire the calls, and say so once.
+        if let Ok(built) = serde_json::from_slice::<serde_json::Value>(&continuation_body) {
+            let dangling = continuation_dangling_calls(&built, provider);
+            if !dangling.is_empty() {
+                tracing::warn!(
+                    event = "memory_continuation_doomed",
+                    request_id = %request_id,
+                    round = rounds + 1,
+                    dangling = ?dangling,
+                    tail = %forward::continuation_tail_summary(&built, items_field),
+                    "memory: continuation has unanswerable calls; skipping the send"
+                );
+                strand_failed_memory_calls(&mut current_response, provider, request_id);
+                break;
+            }
+        }
         tracing::info!(
             request_id = %request_id,
             round = rounds + 1,
@@ -10073,12 +10485,12 @@ pub(crate) async fn handle_memory_response(
                 rounds + 1,
             );
         }
-        // A failed continuation takes the memory call down with it: the block
-        // is already suppressed, so the tool the model asked for never runs and
-        // the turn reaches the client short one tool call. Transport blips and
-        // 429/5xx get another attempt; anything else is a body we built wrong,
-        // so keep what upstream objected to instead of dropping it.
-        let resp = send_memory_continuation(
+        // A deterministically-failed continuation retires its memory calls
+        // (excised with one notice) instead of leaving them standing for
+        // the next pass to re-send; transport blips and 429/5xx keep their
+        // retries, and transport failures keep the old leave-standing
+        // behavior.
+        match send_memory_continuation(
             client,
             upstream_url,
             outgoing_headers,
@@ -10088,16 +10500,26 @@ pub(crate) async fn handle_memory_response(
             items_field,
             &current_request,
         )
-        .await;
-        let Some(resp) = resp else { break };
-        round_usage.add_response(&current_response);
-        match read_memory_round_body(resp, provider, &mut mem_cut_attempts, request_id).await {
-            MemoryRoundRead::Advance(next) => {
-                current_response = next;
-                rounds += 1;
+        .await
+        {
+            forward::MemorySendDone::Sent(resp) => {
+                round_usage.add_response(&current_response);
+                match read_memory_round_body(resp, provider, &mut mem_cut_attempts, request_id)
+                    .await
+                {
+                    MemoryRoundRead::Advance(next) => {
+                        current_response = next;
+                        rounds += 1;
+                    }
+                    MemoryRoundRead::Retry => continue,
+                    MemoryRoundRead::Done => break,
+                }
             }
-            MemoryRoundRead::Retry => continue,
-            MemoryRoundRead::Done => break,
+            forward::MemorySendDone::Rejected => {
+                strand_failed_memory_calls(&mut current_response, provider, request_id);
+                break;
+            }
+            forward::MemorySendDone::Failed => break,
         }
     }
 
@@ -11917,6 +12339,124 @@ mod tests {
             chat["_memory_tool_results"][0]["role"], "tool",
             "Chat provider keeps the Chat shape"
         );
+    }
+
+    #[test]
+    fn continuation_validation_passes_paired_bodies() {
+        let responses = serde_json::json!({"input": [
+            {"type": "function_call", "call_id": "c1", "name": "memory_search"},
+            {"type": "function_call_output", "call_id": "c1", "output": "x"},
+        ]});
+        assert!(continuation_dangling_calls(&responses, "openai_responses").is_empty());
+
+        let anthropic = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "memory_search"},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x"},
+            ]},
+        ]});
+        assert!(continuation_dangling_calls(&anthropic, "anthropic").is_empty());
+
+        let chat = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "x"},
+        ]});
+        assert!(continuation_dangling_calls(&chat, "openai").is_empty());
+    }
+
+    #[test]
+    fn continuation_validation_names_dangling_calls() {
+        // The 2026-09-24 Zen shape: a call with no output.
+        let responses = serde_json::json!({"input": [
+            {"type": "function_call", "call_id": "call_01abad", "name": "memory_search"},
+        ]});
+        let d = continuation_dangling_calls(&responses, "openai_responses");
+        assert_eq!(d, vec!["function_call call_01abad has no output"], "{d:?}");
+
+        // A client call replayed without its result (the toolu_ class).
+        let anthropic = serde_json::json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash"},
+            ]},
+            {"role": "user", "content": "oops"},
+        ]});
+        let d = continuation_dangling_calls(&anthropic, "anthropic");
+        assert!(d.iter().any(|s| s.contains("toolu_1")), "{d:?}");
+
+        // Server-run tools answer themselves: no result required.
+        let server = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search"},
+            ]},
+            {"role": "user", "content": "done"},
+        ]});
+        assert!(continuation_dangling_calls(&server, "anthropic").is_empty());
+
+        // Duplicate server ids in one turn are refused upstream.
+        let dup = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search"},
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search"},
+            ]},
+            {"role": "user", "content": "done"},
+        ]});
+        let d = continuation_dangling_calls(&dup, "anthropic");
+        assert!(d.iter().any(|s| s.contains("duplicate")), "{d:?}");
+
+        // The Opus prefill class: nothing may trail the result.
+        let prefill = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "prefill"},
+        ]});
+        let d = continuation_dangling_calls(&prefill, "anthropic");
+        assert!(d.iter().any(|s| s.contains("assistant")), "{d:?}");
+    }
+
+    #[test]
+    fn stranded_retirement_removes_only_memory_calls_and_notes_once() {
+        let mut turn = serde_json::json!({"output": [
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "I'll search."}]},
+            {"type": "function_call", "call_id": "c1", "name": "memory_search",
+             "arguments": "{}"},
+            {"type": "function_call", "call_id": "c2", "name": "Bash",
+             "arguments": "{}"},
+        ]});
+        let removed = excise_failed_memory_calls(&mut turn, "openai_responses");
+        assert_eq!(removed, vec!["memory_search"]);
+        let items = turn["output"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "client call and text survive: {turn}");
+        assert!(turn_has_visible_text(&turn, "openai_responses"));
+
+        append_stranded_notice(
+            &mut turn,
+            "openai_responses",
+            &crate::sse::ccr_stream::dropped_call_text(Some("memory_search")),
+        );
+        append_stranded_notice(
+            &mut turn,
+            "openai_responses",
+            &crate::sse::ccr_stream::dropped_call_text(Some("memory_search")),
+        );
+        let texts: Vec<&str> = turn["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i.get("content").and_then(|c| c.as_array()))
+            .flat_map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            })
+            .filter(|t| t.contains("did NOT run"))
+            .collect();
+        assert_eq!(texts.len(), 1, "notices must not stack: {turn}");
     }
 
     #[test]

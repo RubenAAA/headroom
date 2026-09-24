@@ -518,13 +518,16 @@ impl DropReason {
 /// turns did nothing wrong. So the message names the tool that was actually
 /// dropped, and says nothing about retrieval when no retrieval was dropped.
 /// Marker the Stop hook matches to continue a retrieval-ended turn.
+/// Shared with `proxy.rs`, which retires deterministically-failed memory
+/// calls with the same marker so the hook fires whichever path owns the
+/// turn.
 ///
 /// The hook (`retry-dropped-turn.sh`) greps the transcript tail for this
 /// literal string, the same way it matches TRUNCATION_MARKER. Plain prose —
 /// including the apology above — cannot serve: this session proved a reply
 /// quoting the apology re-arms the hook and blocks the next stop. The marker
 /// is bracketed and names headroom so ordinary prose never contains it.
-const RETRIEVAL_DROPPED_MARKER: &str =
+pub(crate) const RETRIEVAL_DROPPED_MARKER: &str =
     "[headroom: a proxy tool call was dropped and did NOT run; re-issue it]";
 
 /// Client-visible prose for a turn whose continuation came back carrying
@@ -552,7 +555,9 @@ fn lost_answer_text(tool: Option<&str>) -> String {
 /// Client-visible prose for a dropped tool call on a turn that did carry other
 /// text. [`empty_turn_text`] says the turn "came back empty", which is false
 /// here and contradicts the model's own words sitting right above it.
-fn dropped_call_text(unresolved_tool: Option<&str>) -> String {
+/// Shared with `proxy.rs`, which retires deterministically-failed memory
+/// calls with the same wording (one notice, whichever path owns the turn).
+pub(crate) fn dropped_call_text(unresolved_tool: Option<&str>) -> String {
     match unresolved_tool {
         Some(name) => format!(
             "The proxy could not run `{name}` for this turn, so its answer is \
@@ -567,7 +572,7 @@ fn dropped_call_text(unresolved_tool: Option<&str>) -> String {
     }
 }
 
-fn empty_turn_text(unresolved_tool: Option<&str>) -> String {
+pub(crate) fn empty_turn_text(unresolved_tool: Option<&str>) -> String {
     match unresolved_tool {
         Some(name) => format!(
             "The proxy could not run `{name}` for this turn, so the turn came \

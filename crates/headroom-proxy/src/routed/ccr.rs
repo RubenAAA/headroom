@@ -425,6 +425,285 @@ mod resolver_alternation_tests {
         );
     }
 
+    /// Regression for the 2026-09-24 Zen 400s (`No tool output found for
+    /// function call call_…`): a Responses memory continuation must pair
+    /// every `function_call` in `input[]` with a `function_call_output`.
+    /// Drives the real pipeline — rebuilt streaming turn converted by
+    /// `anthropic_turn_as_responses_output`, exactly as the streaming
+    /// path hands it over — and inspects what would have gone upstream.
+    #[tokio::test]
+    async fn responses_memory_continuation_pairs_calls_with_outputs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }],
+                "status": "completed",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            })))
+            .mount(&server)
+            .await;
+
+        let rebuilt = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "I'll search memory for that."},
+                {"type": "tool_use", "id": "call_01a0pair", "name": "memory_search",
+                 "input": {"query": "deploy key"}},
+            ],
+        });
+        let opening = crate::sse::ccr_stream::anthropic_turn_as_responses_output(&rebuilt);
+
+        let ccr = RoutedCcr {
+            stores: None,
+            store: Arc::new(InMemoryCcrStore::new()),
+            memory: Some(memory_ctx()),
+            client: reqwest::Client::new(),
+            upstream_url: format!("{}/v1/responses", server.uri()),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "muse-spark-1.3-contributor-free",
+                    "input": [{"type": "message", "role": "user", "content": "hi"}],
+                    "tools": [{
+                        "type": "function",
+                        "name": "memory_search",
+                        "description": "search memory",
+                        "parameters": {"type": "object"},
+                        "strict": false,
+                    }],
+                }))
+                .unwrap(),
+            ),
+            config: Arc::new(crate::config::Config::for_test(
+                server.uri().parse().unwrap(),
+            )),
+            request_id: "req-resp-pair".to_string(),
+            responses_shape: true,
+            redact: None,
+        };
+
+        let (_resolved, _rounds) = resolve_routed_memory(&opening, &ccr).await;
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(
+            !received.is_empty(),
+            "no continuation was ever sent upstream"
+        );
+        for req in &received {
+            let body: Value = serde_json::from_slice(&req.body).expect("continuation is json");
+            let input = body
+                .get("input")
+                .and_then(|v| v.as_array())
+                .expect("Responses continuation carries input[]");
+            let calls: Vec<&str> = input
+                .iter()
+                .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+                .filter_map(|i| i.get("call_id").and_then(|c| c.as_str()))
+                .collect();
+            let outputs: Vec<&str> = input
+                .iter()
+                .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call_output"))
+                .filter_map(|i| i.get("call_id").and_then(|c| c.as_str()))
+                .collect();
+            assert!(!calls.is_empty(), "continuation lost the call: {body}");
+            for call in &calls {
+                assert!(
+                    outputs.contains(call),
+                    "call {call} has no output in {body}"
+                );
+            }
+        }
+    }
+
+    /// Field replica of the 2026-09-24 Zen 400s: the turn carries a
+    /// `headroom_retrieve` call (answered in place as text) next to the
+    /// `memory_search` call, exactly the mixed shape production sent.
+    /// The memory continuation must still pair every surviving call.
+    #[tokio::test]
+    async fn responses_mixed_turn_continuation_pairs_surviving_calls() {
+        const HASH: &str = "0123456789abcdef01234567";
+        const CONTENT: &str = "the offloaded original";
+        let store = InMemoryCcrStore::new();
+        headroom_core::ccr::CcrStore::put(&store, HASH, CONTENT);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }],
+                "status": "completed",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            })))
+            .mount(&server)
+            .await;
+
+        let rebuilt = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Let me pull that back."},
+                {"type": "tool_use", "id": "call_01aretrieve", "name": "headroom_retrieve",
+                 "input": {"hash": HASH}},
+                {"type": "tool_use", "id": "call_01amemory", "name": "memory_search",
+                 "input": {"query": "deploy key"}},
+            ],
+        });
+        let opening = crate::sse::ccr_stream::anthropic_turn_as_responses_output(&rebuilt);
+
+        let ccr = RoutedCcr {
+            stores: None,
+            store: Arc::new(store),
+            memory: Some(memory_ctx()),
+            client: reqwest::Client::new(),
+            upstream_url: format!("{}/v1/responses", server.uri()),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "muse-spark-1.3-contributor-free",
+                    "input": [{"type": "message", "role": "user", "content": "hi"}],
+                    "tools": [
+                        {"type": "function", "name": "memory_search",
+                         "description": "m", "parameters": {"type": "object"}, "strict": false},
+                        {"type": "function", "name": "headroom_retrieve",
+                         "description": "r", "parameters": {"type": "object"}, "strict": false},
+                    ],
+                }))
+                .unwrap(),
+            ),
+            config: Arc::new(crate::config::Config::for_test(
+                server.uri().parse().unwrap(),
+            )),
+            request_id: "req-resp-mixed".to_string(),
+            responses_shape: true,
+            redact: None,
+        };
+
+        let (_resolved, _rounds) = resolve_routed_proxy_tools(&opening, &ccr).await;
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(
+            !received.is_empty(),
+            "no continuation was ever sent upstream"
+        );
+        for req in &received {
+            let body: Value = serde_json::from_slice(&req.body).expect("continuation is json");
+            let input = body
+                .get("input")
+                .and_then(|v| v.as_array())
+                .expect("Responses continuation carries input[]");
+            let calls: Vec<&str> = input
+                .iter()
+                .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+                .filter_map(|i| i.get("call_id").and_then(|c| c.as_str()))
+                .collect();
+            let outputs: Vec<&str> = input
+                .iter()
+                .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call_output"))
+                .filter_map(|i| i.get("call_id").and_then(|c| c.as_str()))
+                .collect();
+            for call in &calls {
+                assert!(
+                    outputs.contains(call),
+                    "call {call} has no output in {body}"
+                );
+            }
+        }
+    }
+
+    /// The chase: a deterministically-failing continuation must cost one
+    /// send, not one per alternation pass. Before the retire-on-rejection
+    /// change this turn burned up to four identical 400s (measured
+    /// 2026-09-24); now the first rejection excises the call with one
+    /// notice and later passes find nothing to send.
+    #[tokio::test]
+    async fn deterministic_rejection_costs_one_send_not_four() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "No tool output found for function call call_01adoomed"}
+            })))
+            .mount(&server)
+            .await;
+
+        let rebuilt = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "I'll search memory for that."},
+                {"type": "tool_use", "id": "call_01adoomed", "name": "memory_search",
+                 "input": {"query": "deploy key"}},
+            ],
+        });
+        let opening = crate::sse::ccr_stream::anthropic_turn_as_responses_output(&rebuilt);
+
+        let ccr = RoutedCcr {
+            stores: None,
+            store: Arc::new(InMemoryCcrStore::new()),
+            memory: Some(memory_ctx()),
+            client: reqwest::Client::new(),
+            upstream_url: format!("{}/v1/responses", server.uri()),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "muse-spark-1.3-contributor-free",
+                    "input": [{"type": "message", "role": "user", "content": "hi"}],
+                    "tools": [{
+                        "type": "function",
+                        "name": "memory_search",
+                        "description": "m",
+                        "parameters": {"type": "object"},
+                        "strict": false,
+                    }],
+                }))
+                .unwrap(),
+            ),
+            config: Arc::new(crate::config::Config::for_test(
+                server.uri().parse().unwrap(),
+            )),
+            request_id: "req-resp-doomed".to_string(),
+            responses_shape: true,
+            redact: None,
+        };
+
+        let (resolved, _rounds) = resolve_routed_proxy_tools(&opening, &ccr).await;
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            received.len(),
+            1,
+            "a doomed continuation was re-sent: {} upstream POSTs",
+            received.len()
+        );
+        // The retired call is gone, exactly one notice names it, and the
+        // Stop hook can match the marker.
+        let output = resolved
+            .get("output")
+            .and_then(|o| o.as_array())
+            .expect("Responses turn keeps output[]");
+        assert!(
+            !output
+                .iter()
+                .any(|i| i.get("call_id").and_then(|c| c.as_str()) == Some("call_01adoomed")),
+            "retired call still standing: {resolved}"
+        );
+        let notices: Vec<&str> = output
+            .iter()
+            .filter_map(|i| i.get("content").and_then(|c| c.as_array()))
+            .flat_map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            })
+            .filter(|t| t.contains("did NOT run"))
+            .collect();
+        assert_eq!(notices.len(), 1, "expected one notice: {resolved}");
+    }
+
     /// A memory answer fetched mid-turn is upstream-bound content: the
     /// continuation must carry the placeholder, never the secret — even when
     /// the outbound prompt was clean and only the flag armed the turn.
