@@ -43,26 +43,40 @@ or switched into service. The follow-up below was run after a cooldown.
 - The Rust relay now returns a canonical unspecified IPv4 bound address to
   local SOCKS clients while preserving the upstream reply code. Trace mode logs
   only the reply code, reserved byte, address type, and address length.
+- A shadow startup after that change, but before the candidate-probe fix below,
+  found only 7 distinct exits (8 required) and exited before publishing any
+  listeners. Its private log is at
+  `/tmp/headroom-nord-rust-postfix-20260924-1208/relay.log` (mode 0600), so no
+  curl/Reqwest comparison ran. The Python pool and Headroom proxy stayed up.
+- Reviewing that failure showed startup verification still used Reqwest
+  directly against Nord, bypassing the relay's normalized SOCKS response. The
+  candidate verifier now probes through a temporary instance of the same Rust
+  lane code; startup and rotation logs label DNS versus egress-probe failures.
 - A loopback regression test exercises Reqwest against an upstream success
-  reply with an empty domain `BND.ADDR`. All 14 helper unit tests pass;
-  `cargo fmt --check` and a debug build pass.
-- The updated binary has **not** had a post-fix live Nord verification. Keep
-  the Python pool active; do not install or switch pools until that shadow
-  check passes after a later cooldown.
+  reply with an empty domain `BND.ADDR` through the candidate-probe path. All 14
+  helper unit tests pass; `cargo fmt --check` and Clippy on the helper binary
+  pass. The full `--tests` Clippy command still hits existing warnings in
+  unrelated targets.
+- The final candidate-probe change has **not** had a live Nord verification.
+  Keep the Python pool active; do not install or switch pools until the final
+  shadow check passes after a cooldown.
 
 Remaining before approving the live behavior:
 
-1. Let provider/session limits cool down again; avoid repeated full startup and
-   pool-test loops.
-2. Run one post-fix isolated Rust shadow test on alternate local ports/state
-   with `HEADROOM_NORD_SOCKS_TRACE=1`. Preserve the private relay log.
-3. Compare one sequential `curl` probe with the helper's `test` probe. Confirm
-   the Reqwest probe now passes; if it does not, use the safe reply metadata to
-   identify the remaining stage. Do not print or record credentials.
+1. Let provider/session limits cool down again and wait for the active proxy's
+   in-flight count to reach zero before any cutover. Avoid repeated full
+   startup and pool-test loops.
+2. Run one final isolated Rust shadow test on alternate local ports/state with
+   `HEADROOM_NORD_SOCKS_TRACE=1`. Preserve the private relay log. If startup
+   cannot find eight exits, stop there and record the candidate stages.
+3. If startup succeeds, compare one sequential `curl` probe with the helper's
+   `test` probe. Confirm the Reqwest probe passes; if it does not, use the safe
+   reply metadata to identify the remaining stage. Do not print or record
+   credentials.
 4. If Nord rejects the upstream session, record that evidence separately
    rather than treating it as a Rust pass.
-5. Only after the post-fix Rust path passes should the relay be installed or
-   the active pool be drained and switched.
+5. Only after the final Rust shadow test passes and in-flight requests drain,
+   install the helper and switch the active pool.
 
 ## Git/worktree state at snapshot
 

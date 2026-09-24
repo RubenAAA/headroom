@@ -12,8 +12,11 @@
   trigger is unconfirmed.
 - **Fix:** return a canonical unspecified IPv4 `BND.ADDR` to local SOCKS
   clients, preserving the upstream reply code. SOCKS CONNECT clients do not
-  use the bound address. Trace mode records only the reply code, reserved byte,
-  address type, and address length.
+  use the bound address. Startup candidate verification now goes through the
+  same local lane code, so it gets the same normalization. Trace mode records
+  only reply metadata, not the bound address or credentials.
 - **Status:** all 14 local helper tests pass, and the updated helper builds.
-  The post-fix Rust binary has not yet passed a live Nord shadow check. Keep
-  the Python pool active until that check passes after a provider cooldown.
+  A live startup after the first normalization change found only 7 distinct
+  exits and stopped before the candidate-probe path was refactored. The final
+  code has not had a live shadow check; keep the Python pool active until it
+  passes after a provider cooldown.

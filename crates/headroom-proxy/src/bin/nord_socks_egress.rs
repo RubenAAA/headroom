@@ -276,33 +276,67 @@ fn resolve_server(host: &str) -> Result<String, String> {
         .ok_or_else(|| "Nord SOCKS server has no IPv4 address".to_string())
 }
 
-fn socks_proxy_url(address: &str, credentials: &Credentials) -> Result<Url, String> {
-    let mut url = Url::parse(&format!("socks5h://{address}:{UPSTREAM_PORT}"))
-        .map_err(|_| "invalid Nord SOCKS endpoint".to_string())?;
-    let username = std::str::from_utf8(&credentials.username)
-        .map_err(|_| "Nord SOCKS credentials must be UTF-8")?;
-    let password = std::str::from_utf8(&credentials.password)
-        .map_err(|_| "Nord SOCKS credentials must be UTF-8")?;
-    url.set_username(username)
-        .map_err(|_| "invalid Nord SOCKS username")?;
-    url.set_password(Some(password))
-        .map_err(|_| "invalid Nord SOCKS password")?;
-    Ok(url)
+fn probe_exit(
+    upstream_index: usize,
+    address: &str,
+    credentials: &Credentials,
+) -> Result<String, String> {
+    probe_exit_via_local_lane(
+        upstream_index,
+        address,
+        UPSTREAM_PORT,
+        credentials,
+        "https://api.ipify.org",
+    )
 }
 
-fn probe_exit(address: &str, credentials: &Credentials) -> Result<String, String> {
-    let proxy_url = socks_proxy_url(address, credentials)?;
+fn probe_exit_via_local_lane(
+    upstream_index: usize,
+    address: &str,
+    upstream_port: u16,
+    credentials: &Credentials,
+    probe_url: &str,
+) -> Result<String, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|_| "could not bind local SOCKS probe listener")?;
+    let local_address = listener
+        .local_addr()
+        .map_err(|_| "could not inspect local SOCKS probe listener")?;
     let client = socks_http_client(
-        proxy_url.as_str(),
+        &format!("socks5h://{local_address}"),
         EGRESS_PROBE_TIMEOUT,
         EGRESS_PROBE_TIMEOUT,
     )?;
-    read_ipify(
-        client
-            .get("https://api.ipify.org")
-            .send()
-            .map_err(|_| "Nord SOCKS endpoint failed the public egress probe".to_string())?,
-    )
+    let lane = Arc::new(Lane::new(
+        0,
+        upstream_port,
+        upstream_index,
+        address.to_string(),
+        String::new(),
+        credentials.clone(),
+    ));
+    let worker_lane = lane.clone();
+    let worker = thread::Builder::new()
+        .name("nord-socks-probe-lane".to_string())
+        .spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                worker_lane.handle(stream);
+            }
+        })
+        .map_err(|_| "could not start local SOCKS probe worker")?;
+
+    let result = client
+        .get(probe_url)
+        .send()
+        .map_err(|_| "Nord SOCKS endpoint failed the public egress probe".to_string())
+        .and_then(read_ipify);
+    drop(client);
+    let worker_result = worker.join();
+    match (result, worker_result) {
+        (Ok(ip), Ok(())) => Ok(ip),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(_)) => Err("local SOCKS probe worker failed".to_string()),
+    }
 }
 
 fn read_ipify(mut response: Response) -> Result<String, String> {
@@ -888,20 +922,20 @@ impl Manager {
             let host = SOCKS_SERVERS[next_index];
             let address = match resolve_server(host) {
                 Ok(address) => address,
-                Err(_) => {
+                Err(reason) => {
                     eprintln!(
-                        "rotation candidate unavailable lane={} host={host}",
-                        lane.slot
+                        "rotation candidate unavailable lane={} stage=dns host={host} reason={reason}",
+                        lane.slot,
                     );
                     continue;
                 }
             };
-            let candidate_ip = match probe_exit(&address, &credentials) {
+            let candidate_ip = match probe_exit(next_index, &address, &credentials) {
                 Ok(ip) => ip,
-                Err(_) => {
+                Err(reason) => {
                     eprintln!(
-                        "rotation candidate unavailable lane={} host={host}",
-                        lane.slot
+                        "rotation candidate unavailable lane={} stage=public-egress-probe host={host} reason={reason}",
+                        lane.slot,
                     );
                     continue;
                 }
@@ -984,15 +1018,19 @@ impl Manager {
             }
             let address = match resolve_server(host) {
                 Ok(address) => address,
-                Err(_) => {
-                    eprintln!("startup candidate unavailable host={host}");
+                Err(reason) => {
+                    eprintln!(
+                        "startup candidate unavailable stage=dns host={host} reason={reason}"
+                    );
                     continue;
                 }
             };
-            let exit_ip = match probe_exit(&address, &credentials) {
+            let exit_ip = match probe_exit(index, &address, &credentials) {
                 Ok(ip) => ip,
-                Err(_) => {
-                    eprintln!("startup candidate unavailable host={host}");
+                Err(reason) => {
+                    eprintln!(
+                        "startup candidate unavailable stage=public-egress-probe host={host} reason={reason}"
+                    );
                     continue;
                 }
             };
@@ -1823,31 +1861,19 @@ mod tests {
             stream.write_all(body).unwrap();
         });
 
-        let lane_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let lane_address = lane_listener.local_addr().unwrap();
-        let lane = Arc::new(Lane::new(
+        let credentials = Credentials {
+            username: b"user".to_vec(),
+            password: b"pass".to_vec(),
+        };
+        let exit_ip = probe_exit_via_local_lane(
             0,
+            "127.0.0.1",
             upstream_port,
-            0,
-            "127.0.0.1".to_string(),
-            "198.51.100.1".to_string(),
-            Credentials {
-                username: b"user".to_vec(),
-                password: b"pass".to_vec(),
-            },
-        ));
-        let worker_lane = lane.clone();
-        let worker = thread::spawn(move || {
-            let (stream, _) = lane_listener.accept().unwrap();
-            worker_lane.handle(stream);
-        });
-
-        let proxy_url = format!("socks5h://{}", lane_address);
-        let client =
-            socks_http_client(&proxy_url, Duration::from_secs(2), Duration::from_secs(3)).unwrap();
-        let response = client.get("http://api.ipify.org/").send().unwrap();
-        assert_eq!(read_ipify(response).unwrap(), "198.51.100.9");
-        worker.join().unwrap();
+            &credentials,
+            "http://api.ipify.org/",
+        )
+        .unwrap();
+        assert_eq!(exit_ip, "198.51.100.9");
         upstream.join().unwrap();
     }
 }
