@@ -80,14 +80,18 @@ or switched into service. The follow-up below was run after a cooldown.
   `/debug/zen-egresses` reports `pool_enabled: true` with 8 IDs. The helper
   reports 8 unique exit fingerprints on `19300`–`19307`; the Python fallback
   remains listening on `18600`–`18607`.
+- Two pre-existing rotation watchers were in legacy device-wide mode with no
+  per-egress settings. They were stopped, and one watcher was started with
+  `HEADROOM_ZEN_EGRESS_MODE=1` and the Rust helper. Its startup log confirms
+  `mode=per-egress`; the VPN connection itself was left up.
 - At the immediate post-restart check, `egress_in_flight` showed a new request
   assigned to lane 0, confirming the proxy is using the Rust pool. The user
   authorized truncating the prior active stream, so the restart used
   `--force`. `cache-health` had no completed samples yet; use the next finished
   model turn to assess cache counters. The request later received HTTP 200
   response headers from `opencode.ai` on attempt 1 after 13.59 seconds; the
-  stream was still active at the last check. This is one observation, not a
-  before/after latency comparison.
+  stream was still active at the last check. The relay had recorded 2 SOCKS
+  connects. This is one observation, not a before/after latency comparison.
 
 Live behavior approval:
 

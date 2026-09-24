@@ -29,8 +29,11 @@
   corrected live cutover is active: the installed binary matches the worktree
   release, `/healthz` succeeds, and `/debug/zen-egresses` reports all 8 lanes.
   The helper reports 8 distinct live exit fingerprints, while the Python relay
-  remains available on its original ports. The first post-restart request was
-  assigned to lane 0 and received HTTP 200 response headers from `opencode.ai`
-  on attempt 1 after 13.59 seconds. Its stream was still active and cache-health
-  response samples remained zero, so this is not a before/after latency
-  comparison; use a completed turn for cache counters and broader timing.
+  remains available on its original ports. Two old device-wide rotation
+  watchers were replaced by one `mode=per-egress` watcher; the VPN connection
+  was left up. The first post-restart request was assigned to lane 0 and
+  received HTTP 200 response headers from `opencode.ai` on attempt 1 after
+  13.59 seconds. The relay had recorded 2 SOCKS connects. Its stream was still
+  active and cache-health response samples remained zero, so this is not a
+  before/after latency comparison; use a completed turn for cache counters and
+  broader timing.
