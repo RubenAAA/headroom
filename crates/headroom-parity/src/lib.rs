@@ -43,6 +43,12 @@ pub trait TransformComparator {
         input: &serde_json::Value,
         config: &serde_json::Value,
     ) -> Result<serde_json::Value>;
+
+    /// Applied to both the fixture output and the comparator output before
+    /// they are compared, for parts Rust has deliberately moved away from.
+    fn project(&self, value: serde_json::Value) -> serde_json::Value {
+        value
+    }
 }
 
 /// Compare a single fixture against a comparator and return an outcome.
@@ -67,14 +73,16 @@ pub fn compare_fixture(
             });
         }
     };
-    let actual_normalized: serde_json::Value =
+    let actual_normalized: serde_json::Value = comparator.project(
         serde_json::from_str(&serde_json::to_string(&actual)?)
-            .context("re-parsing comparator output through serde_json (f64 normalization)")?;
-    if actual_normalized == fixture.output {
+            .context("re-parsing comparator output through serde_json (f64 normalization)")?,
+    );
+    let expected = comparator.project(fixture.output.clone());
+    if actual_normalized == expected {
         Ok(ComparisonOutcome::Match)
     } else {
         Ok(ComparisonOutcome::Diff {
-            expected: serde_json::to_string_pretty(&fixture.output)?,
+            expected: serde_json::to_string_pretty(&expected)?,
             actual: serde_json::to_string_pretty(&actual_normalized)?,
         })
     }
@@ -294,6 +302,26 @@ impl TransformComparator for CcrComparator {
         let mut updated = tools;
         updated.push(ccr_tool);
         Ok(serde_json::json!([updated, true]))
+    }
+
+    /// Since a6e8f6d0 the Rust `headroom_retrieve` definition has its own
+    /// wording and an optional `query` next to `hash`, with no `required`;
+    /// Python has neither. Keep the injection contract (whether the tool is
+    /// added, where, and the duplicate skip) and compare the retrieve tool by
+    /// name only.
+    fn project(&self, mut value: serde_json::Value) -> serde_json::Value {
+        use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
+        let Some(tools) = value.get_mut(0).and_then(|t| t.as_array_mut()) else {
+            return value;
+        };
+        for tool in tools {
+            let is_retrieve = tool.get("name").and_then(|v| v.as_str()) == Some(CCR_TOOL_NAME)
+                || tool.pointer("/function/name").and_then(|v| v.as_str()) == Some(CCR_TOOL_NAME);
+            if is_retrieve {
+                *tool = serde_json::json!({ "name": CCR_TOOL_NAME });
+            }
+        }
+        value
     }
 }
 
