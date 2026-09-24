@@ -40,7 +40,6 @@ for arg in "$@"; do
   esac
 done
 
-NEW_BIN="${HEADROOM_REPO:-$HOME/headroom}/target/release/headroom-proxy"
 LIVE_BIN="$HOME/.local/bin/headroom-proxy"
 BACKUP="$HOME/.local/bin/headroom-proxy.prev"
 WORKDIR="$HOME/meta"
@@ -53,6 +52,11 @@ FLAGS_FILE="$HOME/.headroom-flags.sh"
 # It does not exist on Linux, where they are already the system versions.
 # shellcheck source=/dev/null
 [ -r "$HOME/.headroom-paths.sh" ] && source "$HOME/.headroom-paths.sh"
+
+# Resolve the candidate only after loading the installed checkout path. The
+# installer writes HEADROOM_REPO to this file, and a worktree install must not
+# silently restart from the main checkout's target directory.
+NEW_BIN="${HEADROOM_REPO:-$HOME/headroom}/target/release/headroom-proxy"
 
 # Abort rather than start a proxy on defaults. A bare proxy serves traffic
 # perfectly well and costs more, so the failure would be silent.

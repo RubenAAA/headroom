@@ -2,10 +2,11 @@
 
 Snapshot recorded 2026-09-24 for `codex/muse-egress-lanes`.
 
-## Rust Nord SOCKS relay: live verification still required
+## Rust Nord SOCKS relay: final shadow verification passed
 
-Do not treat the Rust relay as ready for installation or production cutover
-until the post-fix live shadow verification below passes.
+The final candidate-probe fix passed isolated live shadow verification. The
+production relay is installed and running on separate ports; keep final proxy
+cutover pending until the worktree release binary is confirmed on port 8787.
 
 Evidence so far:
 
@@ -57,26 +58,32 @@ or switched into service. The follow-up below was run after a cooldown.
   helper unit tests pass; `cargo fmt --check` and Clippy on the helper binary
   pass. The full `--tests` Clippy command still hits existing warnings in
   unrelated targets.
-- The final candidate-probe change has **not** had a live Nord verification.
-  Keep the Python pool active; do not install or switch pools until the final
-  shadow check passes after a cooldown.
+- After a cooldown, one final isolated shadow startup on ports `19200`–`19209`
+  verified 8 exits. A sequential `curl` through lane 0 succeeded, and the
+  helper's `test` passed on all 8 lanes with 8 unique fingerprints. The helper
+  exited successfully. Its private trace is at
+  `/tmp/headroom-nord-rust-final-20260924-1230/relay.log` (mode 0600); it records
+  successful reply metadata without credentials. One additional candidate was
+  unavailable, but the required eight exits passed.
+- The installed helper then started a production Rust relay on ports
+  `19300`–`19307` and verified 8 exits. The original Python relay remains
+  available on `18600`–`18607` for rollback.
+- The first proxy restart drained the prior request to zero, but selected the
+  main checkout's release binary: `restart-headroom.sh` computed `NEW_BIN`
+  before loading `~/.headroom-paths.sh`. The worktree script now loads the path
+  first, and the installed script has that fix. The running proxy still needs
+  a drain-safe restart onto the worktree release binary; its current in-flight
+  count was 1 at the last check. The main binary returned 404 for
+  `/debug/zen-egresses`, confirming it is not the intended feature build.
 
 Remaining before approving the live behavior:
 
-1. Let provider/session limits cool down again and wait for the active proxy's
-   in-flight count to reach zero before any cutover. Avoid repeated full
-   startup and pool-test loops.
-2. Run one final isolated Rust shadow test on alternate local ports/state with
-   `HEADROOM_NORD_SOCKS_TRACE=1`. Preserve the private relay log. If startup
-   cannot find eight exits, stop there and record the candidate stages.
-3. If startup succeeds, compare one sequential `curl` probe with the helper's
-   `test` probe. Confirm the Reqwest probe passes; if it does not, use the safe
-   reply metadata to identify the remaining stage. Do not print or record
-   credentials.
-4. If Nord rejects the upstream session, record that evidence separately
-   rather than treating it as a Rust pass.
-5. Only after the final Rust shadow test passes and in-flight requests drain,
-   install the helper and switch the active pool.
+1. Wait for the current proxy's in-flight count to reach zero.
+2. Restart with the worktree release binary and the existing Rust pool
+   environment. Confirm `/healthz` succeeds and `/debug/zen-egresses` reports
+   the eight configured lanes. Do not stop the Python relay during this check.
+3. Record the successful live cutover here, then review this worktree against
+   the separate main-worktree changes before any merge.
 
 ## Git/worktree state at snapshot
 
