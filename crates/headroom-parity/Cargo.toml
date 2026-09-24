@@ -3,6 +3,7 @@ name = "headroom-parity"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 license.workspace = true
 repository.workspace = true
 description = "Rust-vs-Python parity harness for the Headroom port."

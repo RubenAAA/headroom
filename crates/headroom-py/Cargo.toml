@@ -3,6 +3,7 @@ name = "headroom-py"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 license.workspace = true
 repository.workspace = true
 description = "PyO3 bindings exposing headroom-core to Python as headroom._core."

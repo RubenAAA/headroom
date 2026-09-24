@@ -8,7 +8,7 @@ PYTHON ?= python3
 FIXTURES ?= upstream-python/tests/parity/fixtures
 PREFIX ?= $(HOME)/.local
 
-.PHONY: help test test-unit test-int test-ml test-nextest test-nextest-unit test-nextest-int test-nextest-shard test-parity bench build-proxy install-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks install-local-hooks what-to-run check-drift check-log-events check-complexity check-file-size scan-log test-touched verify-rust-core
+.PHONY: help test test-unit test-int test-ml test-nextest test-nextest-unit test-nextest-int test-nextest-shard test-parity bench build-proxy install-proxy build-wheel fmt fmt-check lint clippy clean gc gc-check ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks install-local-hooks what-to-run check-drift check-log-events check-complexity check-file-size deny scan-log test-touched verify-rust-core
 
 help:
 	@echo "Headroom Rust targets:"
@@ -52,6 +52,7 @@ help:
 	@echo "  make check-log-events - new warn!/error! without event field fails"
 	@echo "  make check-complexity - new function over cognitive complexity 25 fails"
 	@echo "  make check-file-size  - a Rust file growing past 3000 lines fails"
+	@echo "  make deny             - cargo deny check: advisories, licenses, bans, sources"
 	@echo "  make scan-log     - anomaly scan over ~/headroom-proxy.log"
 
 test:
@@ -288,6 +289,10 @@ check-complexity:
 
 check-file-size:
 	@bash scripts/check-file-size.sh
+
+deny:
+	@command -v cargo-deny >/dev/null || { echo "cargo-deny missing: cargo install --locked cargo-deny"; exit 1; }
+	cargo deny check
 
 scan-log:
 	@bash scripts/scan-log.sh

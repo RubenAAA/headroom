@@ -3,6 +3,7 @@ name = "headroom-proxy"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 license.workspace = true
 repository.workspace = true
 description = "Headroom transparent reverse proxy (Rust, axum). Phase 1: drop-in passthrough in front of the Python proxy."
@@ -32,27 +33,27 @@ tower-http = { version = "0.7", features = ["trace", "request-id", "util"] }
 # JSON parse it stands in front of. See `crate::sidecar`.
 memchr = "2"
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "blocking", "json", "rustls-tls", "http2", "socks"] }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt"] }
+reqwest = { workspace = true, features = ["stream", "blocking", "http2", "socks"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }
 hex = "0.4"
-chrono = "0.4"
+chrono = { workspace = true, features = ["default"] }
 bytes = { workspace = true }
 futures = "0.3"
-futures-util = "0.3"
+futures-util = { workspace = true }
 pin-project-lite = "0.2"
-http = "1"
-http-body-util = "0.1"
-hyper = "1"
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
 url = "2"
 humantime = "2"
 bytesize = "2"
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
 tokio-util = { version = "0.7" }
 # `default-features = false` so the proxy's own `ml` feature is what decides
 # whether ONNX Runtime is linked; see `[features]` below.
@@ -70,7 +71,7 @@ aws-smithy-runtime-api = { workspace = true }
 # `crc32fast` is the standard IEEE 802.3 implementation already
 # transitively pulled in by `aws-smithy-*` (so this is not an
 # additional cold dep — promoting to a direct one for clarity).
-crc32fast = "1"
+crc32fast = { workspace = true }
 # Phase D PR-D3: Prometheus metrics for Bedrock observability. The
 # `prometheus` crate's default-features pull in `protobuf`, which we
 # don't need (we serve text-format scrapes only), so we disable
@@ -92,14 +93,14 @@ prometheus = { version = "=0.14.0", default-features = false }
 # `aws-smithy-runtime-api`); promoted here to a direct, normal-build
 # dependency so the drift detector compiles outside `cfg(test)`. Also
 # used by PR-E4 for `prompt_cache_key` derivation.
-sha2 = "0.11"
+sha2 = { workspace = true }
 libc = "0.2"
 # PR-E6: bounded session-scoped cache of structural hashes. The
 # detector evicts the oldest session at 1000 entries — we never want
 # unbounded memory growth from a flood of unique session keys. `lru`
 # is the de-facto Rust LRU crate; minimal surface, no dependencies of
 # our own beyond `hashbrown` (which we already pull transitively).
-lru = "0.18"
+lru = { workspace = true }
 # PR-D4: GCP Application Default Credentials → bearer token for
 # Vertex `:rawPredict` / `:streamRawPredict`. See workspace
 # Cargo.toml for rationale.
@@ -111,7 +112,7 @@ async-trait = "0.1"
 # ordering — never persisted, never compared cross-host. Same crate
 # the core uses for the CCR cache_key, so no additional hash backend
 # enters the dep tree.
-md-5 = "0.11"
+md-5 = { workspace = true }
 # headroom CLI: URL-encoding for query params.
 urlencoding = "2"
 # CTX-5: HTML→markdown conversion for ctx fetch (port of Turndown used by
@@ -121,19 +122,19 @@ htmd = "0.1"
 # (`fetch-pages.db`) beside the FTS content DB. Same crate + version +
 # `bundled` feature as headroom-core's CtxStore, so no new SQLite backend
 # enters the dep tree.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { workspace = true }
 # CTX-2: lightweight regex for env-command sanitization in extract.rs.
 regex-lite = "0.1"
 # Phase 0 (body.rs): inbound request-body decompression for byte-faithful
 # forwarding. Ports Python `_read_request_body_bytes` which supports
 # gzip/deflate (flate2), zstd, and brotli (br) Content-Encodings.
-flate2 = "1"
+flate2 = { workspace = true }
 zstd = "0.13"
 brotli = "7"
 # Runtime ast-grep interceptor writes tool output to a temporary file before
 # invoking ast-grep. This is used outside tests, so tempfile must be a normal
 # dependency, not only a dev-dependency.
-tempfile = "3"
+tempfile = { workspace = true }
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
@@ -158,20 +159,9 @@ redis = ["headroom-core/redis"]
 # sessions DB in a temp dir.
 tower = { workspace = true, features = ["util"] }
 wiremock = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-futures-util = "0.3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "test-util", "process"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
-http-body-util = "0.1"
-tokio-stream = "0.1"
-# PR-A1 cache-safety tests assert SHA-256 byte-equality between the
-# inbound and upstream-received bodies. The hash is the only sound
-# way to gate "the proxy did not perturb the request" because JSON
-# value-equality misses whitespace, key order, and Unicode escape
-# differences that all bust the prompt cache.
-sha2 = "0.11"
 # PR-C1: property tests for the byte-level SSE parser. The parser
 # must never panic on arbitrary input bytes (TCP can hand us anything,
 # including malformed UTF-8 split mid-codepoint or fuzz-generated
@@ -183,6 +173,6 @@ sha2 = "0.11"
 # Gating it behind a feature would break `cargo test` for the files that do;
 # instead the case count is cut centrally (PROPTEST_CASES=32 in
 # .config/nextest.toml + CI env) — same invariant signal, ~8x less runtime.
-proptest = "1"
+proptest = { workspace = true }
 headroom-simulators = { path = "../headroom-simulators" }
 filetime = "0.2"

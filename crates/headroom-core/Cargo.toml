@@ -3,6 +3,7 @@ name = "headroom-core"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 license.workspace = true
 repository.workspace = true
 description = "Core Headroom types and compression transform traits (Rust)."
@@ -27,13 +28,13 @@ hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustl
 # Rust replacement for Python helpers.py SessionBetaTracker/SessionToolTracker/
 # SessionCcrTracker OrderedDict LRUs. Already in the lock tree transitively;
 # promoted to a direct dep for the `LruCache` used behind a `Mutex`.
-lru = "0.18"
+lru = { workspace = true }
 # `md5` for the CCR cache_key. Python's compression_store hashes the original
 # diff with MD5 truncated to 24 hex chars; we must match byte-for-byte.
-md-5 = "0.11"
+md-5 = { workspace = true }
 # `sha2` for `_hash_field_name` in smart_crusher (SHA256 truncated to 16
 # hex chars). Python uses `hashlib.sha256` so we need byte-exact parity.
-sha2 = "0.11"
+sha2 = { workspace = true }
 # `hex` for SHA-256 hash encoding in read_lifecycle/read_maturation.
 # Matches Python's `hashlib.sha256().hexdigest()[:24]` byte-for-byte.
 hex = { workspace = true }
@@ -69,7 +70,7 @@ icu_segmenter = { version = "2.2", features = ["compiled_data"] }
 # >15% ratio divergence so small per-byte differences don't change the
 # outcome — but if a parity fixture flakes here, swap to
 # `features = ["zlib"]` to link against system libz for byte-equal output.
-flate2 = "1"
+flate2 = { workspace = true }
 # `fastembed` is the Rust port of the Python fastembed library. Used by
 # `relevance::EmbeddingScorer` for sentence embeddings in semantic relevance
 # scoring. Default features pull in `ort` (ONNX Runtime) with auto-download
@@ -133,7 +134,7 @@ blake3 = "1"
 # image may lag behind. Sub-1 MB binary cost. WAL is enabled at
 # connection-open time (see `ccr/backends/sqlite.rs`); no extra feature
 # flags required.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { workspace = true }
 # `redis` for the optional multi-worker CCR backend. Cfg-gated behind
 # the `redis` feature so deploys that don't need it pay no compile
 # cost. Default features include the sync `Connection` API used in
@@ -144,7 +145,7 @@ redis = { version = "1.6", optional = true, default-features = false }
 # crate already depends on this — pulling it into core lets the
 # classifier live with the other Phase B/F policy primitives without
 # cycling through the proxy crate. Tiny crate (no I/O, just types).
-http = "1"
+http = { workspace = true }
 # tree-sitter + per-language grammars for the CodeCompressor AST port.
 # Versions are pinned to EXACTLY match the Python reference grammars
 # (`tree-sitter-<lang>` PyPI wheels) so the Rust and Python parsers emit
@@ -173,9 +174,9 @@ ts-parser-perl = "=1.2.1"
 # subscription + savings-ledger ports. Python persists timezone-aware UTC
 # datetimes rendered with a `Z` suffix; chrono round-trips the same bytes so
 # the state/ledger files stay cross-compatible with the Python implementation.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono = { workspace = true, features = ["clock", "std", "serde"] }
 # `uuid` for memory model IDs (matches Python's `uuid.uuid4()`).
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }
 # `calamine` reads `.xlsx` for `transforms/spreadsheet_ingest` — the Rust
 # equivalent of Python's openpyxl `read_only=True, data_only=True`: both
 # return the cached formula VALUES stored in the file, never formula
@@ -257,12 +258,12 @@ redis = ["dep:redis"]
 # so unit/integration binaries never run it) and `proptest` case counts are
 # cut centrally via PROPTEST_CASES=32 (.config/nextest.toml + CI env).
 # Keep it that way: new heavy dev-deps land here only if a test needs them.
-proptest = "1"
+proptest = { workspace = true }
 criterion = { version = "0.8", features = ["html_reports"] }
-tempfile = "3"
+tempfile = { workspace = true }
 # Failure accounting (item 6) is a log line and nothing else, so the only test
 # that can prove it works has to read the emitted event.
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [[bench]]
 name = "tokenizer"

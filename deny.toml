@@ -1,8 +1,16 @@
-# cargo-deny configuration for the Rust workspace. Intentionally permissive
-# during Phase 0 — tighten before Phase 2 goes to production.
+# cargo-deny configuration for the Rust workspace. Run locally with
+# `make deny` (the pre-push hook does too); nothing runs it on GitHub.
 
 [graph]
-all-features = false
+all-features = true
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained with no successor release. It is a proc-macro
+    # pulled in by fastembed and image (ml feature), so nothing of it ships
+    # at runtime.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time only, via fastembed/image" },
+]
 
 [licenses]
 version = 2
@@ -12,9 +20,11 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
     "ISC",
+    "NCSA",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "CC0-1.0",
     "Zlib",
     "0BSD",
@@ -24,9 +34,13 @@ confidence-threshold = 0.8
 exceptions = []
 
 [bans]
-multiple-versions = "allow"
-wildcards = "allow"
+# Duplicates we cannot remove yet: axum 0.8 pins tokio-tungstenite 0.29,
+# reqwest pins tower-http 0.6, and the AWS SSO clients still use http 0.2.
+multiple-versions = "warn"
+wildcards = "deny"
+# The crates are publish = false, so path dependencies need no version.
+allow-wildcard-paths = true
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"

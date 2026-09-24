@@ -61,6 +61,23 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.8"
 tower = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Shared by two or more crates; members add their own features.
+chrono = { version = "0.4", default-features = false }
+crc32fast = "1"
+flate2 = "1"
+futures-util = "0.3"
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+lru = "0.18"
+md-5 = "0.11"
+proptest = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.11"
+tempfile = "3"
+tokio-stream = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
 # Forwards Rust `log` records (incl. tracing events via the `log` compat
 # feature above) into Python's `logging` inside the _core extension module.
