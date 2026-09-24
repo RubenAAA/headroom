@@ -138,7 +138,7 @@ also emit `event="unified_utilization_sample"` at INFO.
 
 | Name | Type | Labels | Purpose |
 |------|------|--------|---------|
-| `proxy_upstream_retries_total` | Counter | `path`, `reason` | Requests re-sent after a transient upstream failure. `path` is `anthropic` or `local_model`; `reason` is `status_429`, `status_529`, `status_5xx`, `transport` or `in_band_sse`. One increment per re-send. |
+| `proxy_upstream_retries_total` | Counter | `path`, `reason` | Requests re-sent after a transient upstream failure. `path` is `anthropic` or `routed`; `reason` is `status_429`, `status_529`, `status_5xx`, `transport` or `in_band_sse`. One increment per re-send. |
 | `proxy_upstream_retries_exhausted_total` | Counter | `path`, `reason` | Turns the retry loop gave up on. Same labels as above, so the two divide: retries say it happened, exhausted says whether the budget covered the outage. Every count here is a whole turn lost. |
 | `proxy_stream_incomplete_total` | Counter | `provider` | SSE streams that ended without their terminal event. |
 
@@ -204,6 +204,13 @@ served as plain values on `/ctx/stats`.
 |------|------|--------|---------|
 | `ctx_offloaded_bytes_total` | Counter | _none_ | Bytes offloaded from `tool_result` blocks into the CCR store. |
 | `ctx_offloaded_blocks_total` | Counter | _none_ | Blocks offloaded (replaced with a digest). |
+| `ctx_offload_index_pending_jobs` | Gauge | _none_ | Durable CTX-3 FTS jobs waiting for completion. |
+| `ctx_offload_index_pending_bytes` | Gauge | _none_ | Original-content bytes held by the durable CTX-3 index outbox. |
+| `ctx_offload_index_oldest_age_seconds` | Gauge | _none_ | Age of the oldest pending CTX-3 index job. |
+| `ctx_offload_index_batches_total` | Counter | _none_ | Per-project FTS batch attempts by the background index worker. |
+| `ctx_offload_index_batch_duration_seconds` | Histogram | _none_ | Time spent attempting one per-project CTX-3 index batch. |
+| `ctx_offload_index_retries_total` | Counter | _none_ | Batches deferred for retry after an index write failure. |
+| `ctx_offload_index_backpressure_total` | Counter | _none_ | Requests refused by the bounded index outbox. |
 | `ctx_offloaded_blocks_by_tool_total` | Counter | `tool` | Offloaded blocks by producing tool (`Read`, `Grep`, `Glob`, `Write`, `Edit`, `WebSearch`, `WebFetch`, `Bash`, else `other`). Answers whether file/search results convert or only Bash output does. |
 | `ctx_recall_injections_total` | Counter | _none_ | Recall/resume blocks injected into the first user message (CTX-4 engine). |
 | `offload_gate_seeded_total` | Counter | _none_ | Newborn sessions seeded from the same conversation's prior session (model switch, resume). Seeded sessions convert known blocks on first sight instead of stalling Deferred. |
@@ -264,8 +271,8 @@ Unlabelled counters:
 |------|---------|
 | `headroom_requests_total` | All proxied requests. |
 | `headroom_requests_cached_total` | Requests served cached. |
-| `headroom_requests_rate_limited_total` | Rate-limited requests. |
-| `headroom_requests_failed_total` | Failed requests. |
+| `headroom_requests_rate_limited_total{source}` | Rate-limited requests. `source="headroom"` is our own limiter (raise the cap); `source="upstream"` is the provider refusing (back off or shard keys). |
+| `headroom_requests_failed_total{provider}` | Failed requests, by provider. |
 | `headroom_conversation_concurrency_sheds_total` | Turns shed by the per-conversation concurrency cap before forwarding (client retries against a committed prefix — costs nothing, unlike a rate limit). |
 | `headroom_tokens_input_total` / `headroom_tokens_output_total` / `headroom_tokens_saved_total` | Input / output / saved token totals. |
 | `headroom_cache_bust_total` / `headroom_cache_bust_tokens_lost_total` | Requests that lost cache efficiency to compression, and the tokens it cost. |

@@ -1,29 +1,32 @@
 //! CTX-3 — offload persistence sink.
 //!
 //! When [`crate::compression::ctx_offload`] replaces an oversized `tool_result`
-//! with a digest on the request path, the original bytes are handed here to be
-//! persisted **off** that path — never blocking or slowing the live request.
-//! Two stores are written:
+//! with a digest on the request path, the original bytes are kept in CCR and a
+//! durable, bounded outbox until their project FTS index write succeeds. Two
+//! stores are written:
 //!
 //! - the **CCR store** (`<store_dir>/ccr.db`, sqlite), keyed by the block's
 //!   `blake3` hash, so `headroom ctx get <hash>` (CTX-5) can serve the original
 //!   back with a long TTL;
 //! - the **FTS content index** (CTX-1 [`CtxStore`]), so the offloaded output is
-//!   searchable, with the paired `tool_use` command as the chunk title.
+//!   searchable under a stable, hash-unique source label.
 //!
-//! Storage is best-effort and decoupled from cache-safety: the digest on the
-//! wire is recomputable from the block's own bytes (invariant I1/I2), so a
-//! store miss/TTL-expiry affects only *retrieval*, never the wire bytes. Every
-//! failure is logged loudly (no silent fallbacks) and swallowed.
+//! The index worker batches each project's records into one SQLite transaction
+//! and retries failures from the outbox. At capacity, the Anthropic forwarding
+//! path skips offloading; the routed path keeps CCR retrieval and reports that
+//! the index is degraded.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use headroom_core::ccr::{from_config, CcrBackendConfig, CcrStore};
 use headroom_core::ctx::{CtxStore, IndexOpts};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::projects::ProjectStores;
 use crate::compression::ctx_offload::OffloadRecord;
@@ -32,12 +35,11 @@ use crate::compression::ctx_offload::OffloadRecord;
 /// an `Arc` in `AppState`. Dropping the last handle closes the channel and the
 /// worker exits.
 pub struct OffloadStore {
-    tx: Sender<Batch>,
-    /// Bytes of parked originals the worker has not taken yet.
-    queued_bytes: Arc<AtomicU64>,
-    /// Batches shed because the queue was already at its budget.
-    shed: AtomicU64,
-    /// The budget itself, so a test can set one it can exhaust.
+    wake_worker: SyncSender<()>,
+    outbox: Arc<IndexOutbox>,
+    /// Batches refused because the durable queue was full.
+    queue_full_batches: AtomicU64,
+    /// The pending-byte budget, so the existing deterministic unit fixture can exhaust it.
     budget: u64,
     /// Shared reference to the CCR store — used by CTX-5 `/ctx/get`.
     ccr: Arc<dyn CcrStore>,
@@ -46,26 +48,42 @@ pub struct OffloadStore {
     stores: Arc<ProjectStores>,
 }
 
-/// How many bytes of parked originals the FTS queue may hold before it sheds
-/// rather than grows. Each record carries a full copy of the tool output it
-/// replaced, and the worker chunks and indexes them one at a time while the
-/// request path keeps handing it more — the queue was measured minutes deep on
-/// live traffic (see `persist`). On 2026-09-10 that unbounded backlog was the
-/// likeliest of two paths by which a proxy reached 26 GB RSS and the OOM
-/// killer took the WSL VM with it.
-const MAX_QUEUED_BYTES: u64 = 128 * 1024 * 1024;
+/// Bound disk growth as well as worker state. At the cap, paths use their
+/// explicit passthrough/degraded behavior instead of dropping RAM-queued work.
+const MAX_PENDING_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_PENDING_JOBS: i64 = 100_000;
+const INDEX_BATCH_SIZE: i64 = 32;
+const INDEX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+const OUTBOX_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_RETRY_DELAY_MS: u64 = 30_000;
 
-/// A batch of originals plus the project whose index they belong in.
-struct Batch {
-    records: Vec<OffloadRecord>,
-    project_dir: String,
-    /// Bytes of originals in this batch, charged against `MAX_QUEUED_BYTES`
-    /// while it waits and refunded when the worker takes it.
+struct IndexOutbox {
+    conn: Mutex<Connection>,
+}
+
+#[derive(Clone)]
+struct PendingRecord {
+    id: i64,
+    hash: String,
+    original: String,
+    attempts: u32,
+    enqueued_at_ms: u64,
+}
+
+struct QueueStats {
+    jobs: u64,
     bytes: u64,
+    oldest_age_ms: u64,
+}
+
+enum EnqueueError {
+    Full { jobs: u64, bytes: u64 },
+    Database(rusqlite::Error),
 }
 
 impl OffloadStore {
-    /// Open the CCR store under `store_dir` and spawn the worker.
+    /// Open the CCR store and durable index outbox under `store_dir`.
     ///
     /// - CCR: `<store_dir>/ccr.db`, sqlite, TTL `ttl_seconds` (long by design).
     ///   Content-addressed by `blake3` hash and shared across projects on
@@ -90,38 +108,40 @@ impl OffloadStore {
             .map_err(std::io::Error::other)?,
         );
 
-        let (tx, rx) = mpsc::channel::<Batch>();
-        let queued_bytes = Arc::new(AtomicU64::new(0));
+        let outbox = Arc::new(IndexOutbox::open(&store_dir.join("ctx-offload-index.db"))?);
+        if let Ok(stats) = outbox.stats() {
+            crate::observability::ctx_metrics::observe_offload_index_backlog(
+                stats.jobs,
+                stats.bytes,
+                stats.oldest_age_ms,
+            );
+            if stats.jobs > 0 {
+                tracing::info!(
+                    event = "ctx_offload_index_outbox_recovered",
+                    pending_jobs = stats.jobs,
+                    pending_bytes = stats.bytes,
+                    oldest_age_ms = stats.oldest_age_ms,
+                    "resuming pending CTX-3 index jobs from disk"
+                );
+            }
+        }
+
+        let (wake_worker, rx) = mpsc::sync_channel::<()>(1);
         // Clone Arcs for the background thread — cheap (atomic refcount).
         let ccr_bg = Arc::clone(&ccr);
         let stores_bg = Arc::clone(&stores);
-        let queued_bg = Arc::clone(&queued_bytes);
+        let outbox_bg = Arc::clone(&outbox);
         thread::Builder::new()
             .name("ctx-offload-store".to_string())
             .spawn(move || {
-                for batch in rx {
-                    // Refund on receipt: the batch is off the queue, and what
-                    // it still holds is one batch, not a backlog.
-                    queued_bg.fetch_sub(batch.bytes, Ordering::Relaxed);
-                    let Some(content) = stores_bg.content(&batch.project_dir) else {
-                        // The registry logged why. Persistence is best-effort
-                        // and the wire bytes are already correct.
-                        continue;
-                    };
-                    for record in batch.records {
-                        let bytes = record.original.len() as u64;
-                        if persist_one(ccr_bg.as_ref(), &content, &record) {
-                            crate::observability::ctx_metrics::observe_offloaded(bytes);
-                        }
-                    }
-                }
+                index_worker_loop(&rx, outbox_bg, ccr_bg, stores_bg);
             })?;
 
         Ok(Self {
-            tx,
-            queued_bytes,
-            shed: AtomicU64::new(0),
-            budget: MAX_QUEUED_BYTES,
+            wake_worker,
+            outbox,
+            queue_full_batches: AtomicU64::new(0),
+            budget: MAX_PENDING_BYTES,
             ccr,
             stores,
         })
@@ -146,37 +166,71 @@ impl OffloadStore {
         Arc::clone(&self.stores)
     }
 
-    /// Store offloaded originals: CCR inline, FTS index on the worker.
-    ///
-    /// The CCR put has to happen before this returns. Both halves used to run
-    /// on the worker, and the worker also does the FTS indexing, which chunks
-    /// each block and writes two full-text tables plus vocabulary. On live
-    /// traffic that queue ran minutes deep: measured against each request's own
-    /// offload event, the model asked for a block a median of 2s later while
-    /// the CCR row landed a median of 589s later. Every retrieval of a block
-    /// offloaded in the same turn therefore missed a store that was about to
-    /// hold it — 28 of the 29 misses in a day of logs, and none of them an
-    /// expiry. The put is a keyed upsert benchmarked at ~2µs, so it is
-    /// affordable here; the indexing is what has to stay off the request path.
-    ///
-    /// A failed put is logged by the backend (`ccr_sqlite_put_failed`) and the
-    /// record is enqueued regardless, so the worker's own put retries it. The
-    /// request never fails for this: the wire bytes are already correct and a
-    /// lost original costs retrieval, not correctness.
-    pub fn persist(&self, records: Vec<OffloadRecord>, project_dir: &str) {
+    /// Store originals in CCR and atomically add their FTS jobs to the durable
+    /// outbox. `false` means the FTS job was not queued; the caller must apply
+    /// its path's passthrough or degraded-index behavior.
+    pub fn persist(&self, records: &[OffloadRecord], project_dir: &str) -> bool {
         if records.is_empty() {
-            return;
+            return true;
         }
-        self.put_originals_inline(&records);
-        self.enqueue_for_indexing(records, project_dir);
+
+        self.put_originals_inline(records);
+        match self.outbox.enqueue(records, project_dir, self.budget) {
+            Ok(stats) => {
+                crate::observability::ctx_metrics::observe_offload_index_backlog(
+                    stats.jobs,
+                    stats.bytes,
+                    stats.oldest_age_ms,
+                );
+                match self.wake_worker.try_send(()) {
+                    Ok(()) | Err(TrySendError::Full(())) => {}
+                    Err(TrySendError::Disconnected(())) => tracing::warn!(
+                        event = "ctx_offload_store_worker_gone",
+                        "CTX-3 jobs are durable but the indexing worker stopped"
+                    ),
+                }
+                tracing::debug!(
+                    event = "ctx_offload_index_outbox_enqueued",
+                    records = records.len(),
+                    pending_jobs = stats.jobs,
+                    pending_bytes = stats.bytes,
+                    oldest_age_ms = stats.oldest_age_ms,
+                    "durably queued CTX-3 index jobs"
+                );
+                true
+            }
+            Err(EnqueueError::Full { jobs, bytes }) => {
+                let n = self.queue_full_batches.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::observability::ctx_metrics::observe_offload_index_backpressure();
+                publish_outbox_stats(&self.outbox);
+                if should_report(n) {
+                    tracing::warn!(
+                        event = "ctx_offload_index_queue_full",
+                        backpressured = n,
+                        pending_jobs = jobs,
+                        pending_bytes = bytes,
+                        max_pending_jobs = MAX_PENDING_JOBS,
+                        max_pending_bytes = self.budget,
+                        "CTX-3 durable index queue is full; the index job was refused and the caller applies its provider-specific behavior"
+                    );
+                }
+                false
+            }
+            Err(EnqueueError::Database(error)) => {
+                publish_outbox_stats(&self.outbox);
+                tracing::warn!(
+                    event = "ctx_offload_index_outbox_write_failed",
+                    error = %error,
+                    "could not persist CTX-3 index jobs; this batch may be absent from search"
+                );
+                false
+            }
+        }
     }
 
     /// Store CCR originals synchronously on the request path and time it.
-    /// A failed put is logged by the backend (`ccr_sqlite_put_failed`) and the
-    /// record is enqueued regardless, so the worker's own put retries it. The
-    /// request never fails for this: the wire bytes are already correct and a
-    /// lost original costs retrieval, not correctness.
-    /// Extracted from `persist` without behavior change.
+    /// The durable outbox also retains the original until both CCR and FTS
+    /// writes succeed, so a failed worker write survives restarts and TTLs.
     fn put_originals_inline(&self, records: &[OffloadRecord]) {
         let started = std::time::Instant::now();
         let mut failed = 0usize;
@@ -194,70 +248,461 @@ impl OffloadStore {
         );
     }
 
-    /// Queue the batch for background FTS indexing, shedding first when the
-    /// worker is already `MAX_QUEUED_BYTES` behind. What is lost is the FTS
-    /// index entry, not the original: the CCR put above already happened on
-    /// this path, so `headroom ctx get` still serves every one of these
-    /// blocks by hash. Search misses them until they are re-indexed.
-    /// Extracted from `persist` without behavior change.
-    fn enqueue_for_indexing(&self, records: Vec<OffloadRecord>, project_dir: &str) {
-        // Shed rather than queue when the worker is already `MAX_QUEUED_BYTES`
-        // behind.
-        // Charge first, refund if that broke the budget — see the same guard in
-        // `ctx::observer`: a read-then-add lets a burst of threads past a check
-        // none of them would pass together.
-        let bytes: u64 = records.iter().map(|r| r.original.len() as u64).sum();
-        if self.queued_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes > self.budget {
-            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            let n = self.shed.fetch_add(1, Ordering::Relaxed) + 1;
-            if should_report(n) {
-                tracing::warn!(
-                    event = "ctx_offload_index_queue_full",
-                    shed = n,
-                    queued_bytes = self.queued_bytes.load(Ordering::Relaxed),
-                    max_queued_bytes = self.budget,
-                    "CTX-3 index queue at its byte budget; these originals stay retrievable by hash but unindexed"
-                );
-            }
-            return;
-        }
-
-        let batch = Batch {
-            records,
-            project_dir: project_dir.to_string(),
-            bytes,
-        };
-        if self.tx.send(batch).is_err() {
-            self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            tracing::warn!(
-                event = "ctx_offload_store_worker_gone",
-                "CTX-3 offload-store worker unavailable; dropping persistence"
-            );
-        }
-    }
-
-    /// Set the queue's byte budget. Tests only: a real backlog depends on
-    /// losing a race with a worker that drains in microseconds, so the shed
-    /// path is deterministic only when nothing fits.
+    /// Set the pending-byte budget. Tests only: this makes the backpressure
+    /// path deterministic without requiring an actual disk backlog.
     #[cfg(test)]
     fn with_budget(mut self, bytes: u64) -> Self {
         self.budget = bytes;
         self
     }
 
-    /// Batches shed because the index queue was at its byte budget.
+    /// Number of index batches refused because the bounded durable outbox was full.
     pub fn shed_batches(&self) -> u64 {
-        self.shed.load(Ordering::Relaxed)
+        self.queue_full_batches.load(Ordering::Relaxed)
     }
 
-    /// Bytes of parked originals waiting on the index worker.
+    /// Bytes retained in the durable index outbox.
     pub fn queued_bytes(&self) -> u64 {
-        self.queued_bytes.load(Ordering::Relaxed)
+        self.outbox.stats().map(|stats| stats.bytes).unwrap_or(0)
     }
 }
 
-/// Report the first shed, then only at powers of ten — a full queue repeats
-/// per request, and the count on each line carries what the repeats would.
+impl IndexOutbox {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let conn = Connection::open(path).map_err(std::io::Error::other)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(std::io::Error::other)?;
+        // The queue is the only retained copy after a CCR TTL or restart, so
+        // make each committed enqueue survive a host crash as well as a process restart.
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(std::io::Error::other)?;
+        conn.busy_timeout(OUTBOX_BUSY_TIMEOUT)
+            .map_err(std::io::Error::other)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ctx_offload_index_outbox (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 hash TEXT NOT NULL,
+                 project_dir TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 original TEXT NOT NULL,
+                 bytes INTEGER NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 enqueued_at_ms INTEGER NOT NULL,
+                 next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE(project_dir, hash)
+             );
+             CREATE INDEX IF NOT EXISTS idx_ctx_offload_outbox_ready
+                 ON ctx_offload_index_outbox(next_attempt_at_ms, id);
+             CREATE INDEX IF NOT EXISTS idx_ctx_offload_outbox_project_ready
+                 ON ctx_offload_index_outbox(project_dir, next_attempt_at_ms, id);",
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn enqueue(
+        &self,
+        records: &[OffloadRecord],
+        project_dir: &str,
+        max_bytes: u64,
+    ) -> Result<QueueStats, EnqueueError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(EnqueueError::Database)?;
+        let now = now_ms();
+        let (job_count, byte_count, oldest): (i64, i64, Option<i64>) = tx
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(bytes), 0), MIN(enqueued_at_ms)
+                 FROM ctx_offload_index_outbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(EnqueueError::Database)?;
+        let mut jobs = job_count.max(0) as u64;
+        let mut bytes = byte_count.max(0) as u64;
+        let mut seen = HashSet::new();
+        for record in records {
+            if !seen.insert(record.hash.as_str()) {
+                continue;
+            }
+            let previous_bytes: Option<i64> = tx
+                .query_row(
+                    "SELECT bytes FROM ctx_offload_index_outbox
+                     WHERE project_dir = ?1 AND hash = ?2",
+                    params![project_dir, record.hash],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(EnqueueError::Database)?;
+            let record_bytes = record.original.len() as u64;
+            match previous_bytes {
+                Some(previous) => {
+                    let previous = previous.max(0) as u64;
+                    bytes = bytes.saturating_sub(previous).saturating_add(record_bytes)
+                }
+                None => {
+                    jobs = jobs.saturating_add(1);
+                    bytes = bytes.saturating_add(record_bytes);
+                }
+            }
+        }
+        if jobs > MAX_PENDING_JOBS as u64 || bytes > max_bytes {
+            return Err(EnqueueError::Full { jobs, bytes });
+        }
+
+        seen.clear();
+        for record in records {
+            if !seen.insert(record.hash.as_str()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO ctx_offload_index_outbox
+                    (hash, project_dir, title, original, bytes, enqueued_at_ms, next_attempt_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+                 ON CONFLICT(project_dir, hash) DO UPDATE SET
+                    title = excluded.title,
+                    original = excluded.original,
+                    bytes = excluded.bytes,
+                    next_attempt_at_ms = 0",
+                params![
+                    record.hash,
+                    project_dir,
+                    record.title,
+                    record.original,
+                    record.original.len() as i64,
+                    now as i64
+                ],
+            )
+            .map_err(EnqueueError::Database)?;
+        }
+        tx.commit().map_err(EnqueueError::Database)?;
+        Ok(QueueStats {
+            jobs,
+            bytes,
+            oldest_age_ms: oldest
+                .map(|time| now.saturating_sub(time.max(0) as u64))
+                .unwrap_or(0),
+        })
+    }
+
+    fn stats(&self) -> rusqlite::Result<QueueStats> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = now_ms();
+        let (jobs, bytes, oldest): (i64, i64, Option<i64>) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0), MIN(enqueued_at_ms)
+             FROM ctx_offload_index_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(QueueStats {
+            jobs: jobs.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+            oldest_age_ms: oldest
+                .map(|time| now.saturating_sub(time.max(0) as u64))
+                .unwrap_or(0),
+        })
+    }
+
+    fn take_ready_batch(&self) -> rusqlite::Result<Option<(String, Vec<PendingRecord>)>> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = now_ms() as i64;
+        let project: Option<String> = conn
+            .query_row(
+                "SELECT project_dir FROM ctx_offload_index_outbox
+                 WHERE next_attempt_at_ms <= ?1
+                 GROUP BY project_dir ORDER BY MIN(id) LIMIT 1",
+                [now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(project) = project else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT id, hash, original, attempts, enqueued_at_ms, bytes
+             FROM ctx_offload_index_outbox
+             WHERE project_dir = ?1 AND next_attempt_at_ms <= ?2
+             ORDER BY id LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![project, now, INDEX_BATCH_SIZE])?;
+        let mut records = Vec::new();
+        let mut loaded_bytes = 0u64;
+        while let Some(row) = rows.next()? {
+            let bytes = row.get::<_, i64>(5)?.max(0) as u64;
+            if !records.is_empty() && loaded_bytes.saturating_add(bytes) > INDEX_BATCH_BYTES {
+                break;
+            }
+            loaded_bytes = loaded_bytes.saturating_add(bytes);
+            records.push(PendingRecord {
+                id: row.get(0)?,
+                hash: row.get(1)?,
+                original: row.get(2)?,
+                attempts: row.get::<_, i64>(3)?.max(0) as u32,
+                enqueued_at_ms: row.get::<_, i64>(4)?.max(0) as u64,
+            });
+        }
+        Ok(Some((project, records)))
+    }
+
+    fn acknowledge(&self, ids: &[i64]) -> rusqlite::Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn.transaction()?;
+        for id in ids {
+            tx.execute("DELETE FROM ctx_offload_index_outbox WHERE id = ?1", [id])?;
+        }
+        tx.commit()
+    }
+
+    fn retry(&self, records: &[PendingRecord]) -> rusqlite::Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn.transaction()?;
+        let now = now_ms();
+        for record in records {
+            let attempts = record.attempts.saturating_add(1);
+            let delay = retry_delay_ms(attempts);
+            tx.execute(
+                "UPDATE ctx_offload_index_outbox
+                 SET attempts = ?2, next_attempt_at_ms = ?3
+                 WHERE id = ?1",
+                params![record.id, attempts, now.saturating_add(delay) as i64],
+            )?;
+        }
+        tx.commit()
+    }
+}
+
+fn index_worker_loop(
+    wake: &Receiver<()>,
+    outbox: Arc<IndexOutbox>,
+    ccr: Arc<dyn CcrStore>,
+    stores: Arc<ProjectStores>,
+) {
+    loop {
+        match outbox.take_ready_batch() {
+            Ok(Some((project_dir, records))) if !records.is_empty() => {
+                process_batch(
+                    &outbox,
+                    ccr.as_ref(),
+                    stores.as_ref(),
+                    &project_dir,
+                    &records,
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    event = "ctx_offload_index_outbox_read_failed",
+                    error = %error,
+                    "could not read CTX-3 index outbox"
+                );
+                thread::sleep(WORKER_POLL_INTERVAL);
+            }
+        }
+        match wake.recv_timeout(WORKER_POLL_INTERVAL) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn process_batch(
+    outbox: &IndexOutbox,
+    ccr: &dyn CcrStore,
+    stores: &ProjectStores,
+    project_dir: &str,
+    records: &[PendingRecord],
+) {
+    let Some(content) = stores.content(project_dir) else {
+        retry_batch(outbox, records, "project_store_unavailable", false);
+        return;
+    };
+
+    let ccr_ok: Vec<bool> = records
+        .iter()
+        .map(|record| ccr.put(&record.hash, &record.original))
+        .collect();
+    let labels: Vec<String> = records
+        .iter()
+        .map(|record| format!("tool_result:{}", record.hash))
+        .collect();
+    let opts: Vec<IndexOpts> = records
+        .iter()
+        .map(|record| IndexOpts {
+            content_hash: Some(record.hash.clone()),
+            plain_text_lines: Some(50),
+            ..Default::default()
+        })
+        .collect();
+    let items: Vec<(&str, &str, &IndexOpts)> = records
+        .iter()
+        .zip(&labels)
+        .zip(&opts)
+        .map(|((record, label), opts)| (label.as_str(), record.original.as_str(), opts))
+        .collect();
+
+    let started = std::time::Instant::now();
+    match content.index_content_batch(&items) {
+        Ok(_) => {
+            crate::observability::ctx_metrics::observe_offload_index_batch(started.elapsed());
+            let successful_ids: Vec<i64> = records
+                .iter()
+                .zip(&ccr_ok)
+                .filter_map(|(record, ccr_ok)| (*ccr_ok).then_some(record.id))
+                .collect();
+            let successful_bytes: Vec<u64> = records
+                .iter()
+                .zip(&ccr_ok)
+                .filter_map(|(record, ccr_ok)| (*ccr_ok).then_some(record.original.len() as u64))
+                .collect();
+            for (record, ccr_ok) in records.iter().zip(&ccr_ok) {
+                if !*ccr_ok {
+                    tracing::warn!(
+                        event = "ctx_offload_persist_partial",
+                        index_ok = true,
+                        ccr_ok = false,
+                        hash = %record.hash,
+                        bytes = record.original.len(),
+                        "CTX-3 offload indexed but not stored; retaining it in the index outbox for retry"
+                    );
+                }
+            }
+            if let Err(error) = outbox.acknowledge(&successful_ids) {
+                tracing::warn!(
+                    event = "ctx_offload_index_outbox_ack_failed",
+                    records = successful_ids.len(),
+                    error = %error,
+                    "indexed CTX-3 jobs remain in the outbox and will be replayed idempotently"
+                );
+                retry_batch(outbox, records, "ack_failed", is_database_busy(&error));
+                return;
+            }
+            publish_outbox_stats(outbox);
+            for bytes in successful_bytes {
+                crate::observability::ctx_metrics::observe_offloaded(bytes);
+            }
+            let stats = outbox.stats().ok();
+            tracing::debug!(
+                event = "ctx_offload_index_batch_complete",
+                records = records.len(),
+                index_batch_ms = started.elapsed().as_millis() as u64,
+                oldest_job_age_ms = records
+                    .iter()
+                    .map(|record| now_ms().saturating_sub(record.enqueued_at_ms))
+                    .max()
+                    .unwrap_or(0),
+                pending_jobs = stats.as_ref().map(|stats| stats.jobs).unwrap_or(0),
+                pending_bytes = stats.as_ref().map(|stats| stats.bytes).unwrap_or(0),
+                "indexed CTX-3 outbox batch"
+            );
+            let failed_ccr: Vec<PendingRecord> = records
+                .iter()
+                .zip(&ccr_ok)
+                .filter_map(|(record, ccr_ok)| (!*ccr_ok).then_some(record))
+                .cloned()
+                .collect();
+            if !failed_ccr.is_empty() {
+                retry_batch(outbox, &failed_ccr, "ccr_put_failed", false);
+            }
+        }
+        Err(error) => {
+            crate::observability::ctx_metrics::observe_offload_index_batch(started.elapsed());
+            let transient = is_database_busy(&error);
+            tracing::warn!(
+                event = "ctx_offload_index_retry",
+                records = records.len(),
+                transient = transient,
+                index_batch_ms = started.elapsed().as_millis() as u64,
+                error = %error,
+                "CTX-3 batch index write failed; retaining jobs for retry"
+            );
+            retry_batch(outbox, records, "index_failed", transient);
+        }
+    }
+}
+
+fn retry_batch(outbox: &IndexOutbox, records: &[PendingRecord], reason: &str, transient: bool) {
+    match outbox.retry(records) {
+        Ok(()) => {
+            crate::observability::ctx_metrics::observe_offload_index_retry();
+            publish_outbox_stats(outbox);
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "ctx_offload_index_retry_schedule_failed",
+                reason,
+                error = %error,
+                "could not schedule CTX-3 retry; jobs remain durable and will be retried after restart"
+            );
+            thread::sleep(WORKER_POLL_INTERVAL);
+        }
+    }
+    let backoff_ms = records
+        .iter()
+        .map(|record| retry_delay_ms(record.attempts.saturating_add(1)))
+        .max()
+        .unwrap_or(0);
+    tracing::debug!(
+        event = "ctx_offload_index_retry_scheduled",
+        records = records.len(),
+        reason,
+        transient,
+        backoff_ms,
+        "deferred CTX-3 index batch"
+    );
+}
+
+fn publish_outbox_stats(outbox: &IndexOutbox) {
+    if let Ok(stats) = outbox.stats() {
+        crate::observability::ctx_metrics::observe_offload_index_backlog(
+            stats.jobs,
+            stats.bytes,
+            stats.oldest_age_ms,
+        );
+    }
+}
+
+fn is_database_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(failure.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+fn retry_delay_ms(attempt: u32) -> u64 {
+    100u64
+        .saturating_mul(1u64.checked_shl(attempt.min(16)).unwrap_or(u64::MAX))
+        .min(MAX_RETRY_DELAY_MS)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Report the first backpressure event, then only at powers of ten.
 fn should_report(n: u64) -> bool {
     let mut threshold = 1u64;
     while threshold < n {
@@ -269,62 +714,8 @@ fn should_report(n: u64) -> bool {
     threshold == n
 }
 
-/// Store one record in both backends. Off the request path; failures are
-/// logged and swallowed so persistence never crashes the worker. Returns
-/// `true` only if the record is durably recoverable via `/ctx/get` and
-/// `/ctx/search` — the offload metrics (CTX-6) count on this, not on the
-/// request-path transform, so `ctx_offloaded_bytes_total` reflects bytes
-/// actually persisted rather than bytes merely enqueued.
-fn persist_one(ccr: &dyn CcrStore, content: &CtxStore, record: &OffloadRecord) -> bool {
-    // CCR: idempotent put keyed by the hash embedded in the wire digest.
-    // `headroom ctx get` reads only from here, so a failed put means the
-    // record isn't retrievable even if the FTS index write below succeeds.
-    let ccr_ok = ccr.put(&record.hash, &record.original);
-
-    // FTS index: title = paired tool_use command (deterministic); tie the
-    // source to the hash via `content_hash` so re-indexing the same block is a
-    // no-op dedup (index_content replaces by label). Use the plain-text chunker
-    // since tool output is not markdown.
-    let label = if record.title.is_empty() {
-        format!("tool_result:{}", record.hash)
-    } else {
-        record.title.clone()
-    };
-    let opts = IndexOpts {
-        content_hash: Some(record.hash.clone()),
-        plain_text_lines: Some(50),
-        ..Default::default()
-    };
-    if let Err(e) = content.index_content(&label, &record.original, &opts) {
-        tracing::warn!(
-            event = "ctx_offload_persist_partial",
-            index_ok = false,
-            ccr_ok,
-            event_detail = "index_failed",
-            hash = %record.hash,
-            error = %e,
-            "CTX-3 offload FTS index failed"
-        );
-        return false;
-    }
-    // The half-failure item 12.3 names: the index write landed, the CCR put did
-    // not. `/ctx/search` will find this record and `/ctx/get` will not return
-    // it, and until now the two halves shared one return value with no line
-    // saying which one broke. Only the anomaly is logged — a record that
-    // persisted correctly is the common case and would be one line per
-    // offloaded block in a log that is never rotated.
-    if !ccr_ok {
-        tracing::warn!(
-            event = "ctx_offload_persist_partial",
-            index_ok = true,
-            ccr_ok = false,
-            hash = %record.hash,
-            bytes = record.original.len(),
-            "CTX-3 offload indexed but not stored: searchable, not retrievable"
-        );
-    }
-    ccr_ok
-}
+// Outbox rows are acknowledged only after both CCR and project-index writes
+// succeed. Replays are safe because source labels include the content hash.
 
 #[cfg(test)]
 mod tests {
@@ -348,8 +739,21 @@ mod tests {
             hash: "abc123abc123abc123abc123".to_string(),
             original: "ERROR: disk full\nfailed to write\n".repeat(20),
             title: "cat big.log".to_string(),
+            gate_rollback: None,
         };
-        persist_one(ccr.as_ref(), &content, &record);
+        assert!(ccr.put(&record.hash, &record.original));
+        let opts = IndexOpts {
+            content_hash: Some(record.hash.clone()),
+            plain_text_lines: Some(50),
+            ..Default::default()
+        };
+        content
+            .index_content(
+                &format!("tool_result:{}", record.hash),
+                &record.original,
+                &opts,
+            )
+            .unwrap();
 
         // CCR round-trips the original by hash.
         assert_eq!(
@@ -380,8 +784,9 @@ mod tests {
             hash: "0123456789abcdef01234567".to_string(),
             original: "the original the model is about to ask for".to_string(),
             title: "cargo test".to_string(),
+            gate_rollback: None,
         };
-        store.persist(vec![record.clone()], "/home/dev/alpha");
+        store.persist(&[record.clone()], "/home/dev/alpha");
 
         assert_eq!(
             store.ccr().get(&record.hash).as_deref(),
@@ -407,8 +812,9 @@ mod tests {
             hash: "fedcba9876543210fedcba98".to_string(),
             original: "output the index will not see".to_string(),
             title: "rg needle".to_string(),
+            gate_rollback: None,
         };
-        store.persist(vec![record.clone()], "/home/dev/alpha");
+        store.persist(&[record.clone()], "/home/dev/alpha");
 
         assert_eq!(store.shed_batches(), 1, "the batch should be shed");
         assert_eq!(store.queued_bytes(), 0, "a shed batch charges nothing");

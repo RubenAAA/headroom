@@ -154,6 +154,7 @@ pub(crate) fn check_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<
     if result.allowed {
         None
     } else {
+        crate::observability::proxy_counters::record_rate_limited("headroom");
         let wait = std::time::Duration::from_secs_f64(result.wait_seconds);
         Some(
             Response::builder()

@@ -4,8 +4,9 @@
 //! functions for call sites, `*_get` functions for the `/ctx/stats` endpoint.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
-use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 
 use super::metric_names::*;
 
@@ -38,6 +39,111 @@ fn offloaded_blocks_counter(registry: &Registry) -> &'static IntCounter {
             .register(Box::new(c.clone()))
             .expect("ctx_offloaded_blocks_total registers exactly once");
         c
+    })
+}
+
+fn offload_index_pending_jobs_gauge(registry: &Registry) -> &'static IntGauge {
+    static GAUGE: OnceLock<IntGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        let gauge = IntGauge::new(
+            METRIC_CTX_OFFLOAD_INDEX_PENDING_JOBS,
+            METRIC_CTX_OFFLOAD_INDEX_PENDING_JOBS_HELP,
+        )
+        .expect("ctx_offload_index_pending_jobs descriptor is well-formed");
+        registry
+            .register(Box::new(gauge.clone()))
+            .expect("ctx_offload_index_pending_jobs registers exactly once");
+        gauge
+    })
+}
+
+fn offload_index_pending_bytes_gauge(registry: &Registry) -> &'static IntGauge {
+    static GAUGE: OnceLock<IntGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        let gauge = IntGauge::new(
+            METRIC_CTX_OFFLOAD_INDEX_PENDING_BYTES,
+            METRIC_CTX_OFFLOAD_INDEX_PENDING_BYTES_HELP,
+        )
+        .expect("ctx_offload_index_pending_bytes descriptor is well-formed");
+        registry
+            .register(Box::new(gauge.clone()))
+            .expect("ctx_offload_index_pending_bytes registers exactly once");
+        gauge
+    })
+}
+
+fn offload_index_oldest_age_gauge(registry: &Registry) -> &'static IntGauge {
+    static GAUGE: OnceLock<IntGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        let gauge = IntGauge::new(
+            METRIC_CTX_OFFLOAD_INDEX_OLDEST_AGE_SECONDS,
+            METRIC_CTX_OFFLOAD_INDEX_OLDEST_AGE_SECONDS_HELP,
+        )
+        .expect("ctx_offload_index_oldest_age_seconds descriptor is well-formed");
+        registry
+            .register(Box::new(gauge.clone()))
+            .expect("ctx_offload_index_oldest_age_seconds registers exactly once");
+        gauge
+    })
+}
+
+fn offload_index_batches_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let counter = IntCounter::new(
+            METRIC_CTX_OFFLOAD_INDEX_BATCHES_TOTAL,
+            METRIC_CTX_OFFLOAD_INDEX_BATCHES_TOTAL_HELP,
+        )
+        .expect("ctx_offload_index_batches_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("ctx_offload_index_batches_total registers exactly once");
+        counter
+    })
+}
+
+fn offload_index_retries_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let counter = IntCounter::new(
+            METRIC_CTX_OFFLOAD_INDEX_RETRIES_TOTAL,
+            METRIC_CTX_OFFLOAD_INDEX_RETRIES_TOTAL_HELP,
+        )
+        .expect("ctx_offload_index_retries_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("ctx_offload_index_retries_total registers exactly once");
+        counter
+    })
+}
+
+fn offload_index_backpressure_counter(registry: &Registry) -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let counter = IntCounter::new(
+            METRIC_CTX_OFFLOAD_INDEX_BACKPRESSURE_TOTAL,
+            METRIC_CTX_OFFLOAD_INDEX_BACKPRESSURE_TOTAL_HELP,
+        )
+        .expect("ctx_offload_index_backpressure_total descriptor is well-formed");
+        registry
+            .register(Box::new(counter.clone()))
+            .expect("ctx_offload_index_backpressure_total registers exactly once");
+        counter
+    })
+}
+
+fn offload_index_batch_duration(registry: &Registry) -> &'static Histogram {
+    static HISTOGRAM: OnceLock<Histogram> = OnceLock::new();
+    HISTOGRAM.get_or_init(|| {
+        let histogram = Histogram::with_opts(HistogramOpts::new(
+            METRIC_CTX_OFFLOAD_INDEX_BATCH_DURATION_SECONDS,
+            METRIC_CTX_OFFLOAD_INDEX_BATCH_DURATION_SECONDS_HELP,
+        ))
+        .expect("ctx_offload_index_batch_duration_seconds descriptor is well-formed");
+        registry
+            .register(Box::new(histogram.clone()))
+            .expect("ctx_offload_index_batch_duration_seconds registers exactly once");
+        histogram
     })
 }
 
@@ -209,6 +315,33 @@ pub fn observe_offloaded(bytes: u64) {
     let reg = super::prometheus::registry();
     offloaded_bytes_counter(reg).inc_by(bytes);
     offloaded_blocks_counter(reg).inc();
+}
+
+/// Publish the durable CTX-3 index backlog. These gauges are refreshed at
+/// startup, on enqueue, and after a batch is acknowledged or deferred.
+pub fn observe_offload_index_backlog(jobs: u64, bytes: u64, oldest_age_ms: u64) {
+    let registry = super::prometheus::registry();
+    offload_index_pending_jobs_gauge(registry).set(jobs.min(i64::MAX as u64) as i64);
+    offload_index_pending_bytes_gauge(registry).set(bytes.min(i64::MAX as u64) as i64);
+    offload_index_oldest_age_gauge(registry)
+        .set((oldest_age_ms / 1000).min(i64::MAX as u64) as i64);
+}
+
+/// Record one background FTS batch attempt and its duration.
+pub fn observe_offload_index_batch(duration: Duration) {
+    let registry = super::prometheus::registry();
+    offload_index_batches_counter(registry).inc();
+    offload_index_batch_duration(registry).observe(duration.as_secs_f64());
+}
+
+/// Record one index batch deferred for retry.
+pub fn observe_offload_index_retry() {
+    offload_index_retries_counter(super::prometheus::registry()).inc();
+}
+
+/// Record a request whose FTS jobs were refused at the durable outbox cap.
+pub fn observe_offload_index_backpressure() {
+    offload_index_backpressure_counter(super::prometheus::registry()).inc();
 }
 
 /// Record bytes put *back* into the request by CCR proactive expansion.

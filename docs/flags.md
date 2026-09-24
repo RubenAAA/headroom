@@ -774,12 +774,12 @@ Options:
           [default: 0]
 
       --retry-zen-max-inflight <RETRY_ZEN_MAX_INFLIGHT>
-          Max concurrent Zen (opencode.ai) sends. Default `4`. `0` disables.
+          Max concurrent Zen (opencode.ai) sends. Default `10`. `0` disables.
           
           Zen 429s arrive in herds: 2026-09-14 saw 40 parallel 429s in one hour and a 7-wide subagent burst that truncated every turn in the same millisecond. Turns past the cap wait (bounded by `--retry-max-delay-ms`, then proceed without a slot) instead of firing into an upstream that is already shedding load.
           
           [env: HEADROOM_RETRY_ZEN_MAX_INFLIGHT=]
-          [default: 4]
+          [default: 10]
 
       --retry-overload-max-attempts <RETRY_OVERLOAD_MAX_ATTEMPTS>
           Attempts for a 200 response whose SSE body opens with an error event. Default `6`.

@@ -755,6 +755,11 @@ pub struct ContentRouterConfig {
     // Search grouping
     pub search_group_by_file: bool,
 
+    /// Last-resort fallback for blocks no compressor could shrink: elide the
+    /// middle of long, whitespace-free lines (minified JS/CSS, base64, RSC
+    /// payloads). See [`super::dense_line_elider`].
+    pub enable_dense_line_elision: bool,
+
     // Savings profile / target ratio
     /// Target compression ratio for Kompress (0.0 = auto). Lower = more aggressive.
     pub target_ratio: Option<f64>,
@@ -798,6 +803,7 @@ impl Default for ContentRouterConfig {
             enable_tabular_compressor: true,
             enable_html_extractor: true,
             enable_image_optimizer: true,
+            enable_dense_line_elision: true,
             // Route code to CodeAware over Kompress for higher, syntax-safe
             // compression.
             prefer_code_aware_for_code: true,
@@ -1837,6 +1843,60 @@ pub fn apply_strategy(
 /// returns whether the entry was persisted, and is only ever called for an
 /// external compressor's recovery map.
 ///
+/// Strategies whose result is still plain text, so dense-line elision can
+/// run on top of them. SmartCrusher, tabular, config, and diff emit their own
+/// structured (and CCR-marked) forms; Kompress is lossy with its own marker.
+/// Eliding inside those would corrupt output another compressor owns.
+fn dense_elide_after(strategy: CompressionStrategy) -> bool {
+    matches!(
+        strategy,
+        CompressionStrategy::Html
+            | CompressionStrategy::Log
+            | CompressionStrategy::Text
+            | CompressionStrategy::Search
+    )
+}
+
+/// Dense-line elision with a CCR retrieval marker; `None` when no line is dense.
+///
+/// The elided middle is lossy, so the pre-elision block is stored via
+/// `store_recoverable` and a `Retrieve original: hash=` marker is appended —
+/// the same contract Kompress honours: the messages path discards a lossy
+/// result that carries no marker, and the agent can get the exact bytes back.
+/// Never in lossless mode, where nothing may be dropped.
+#[allow(clippy::too_many_arguments)]
+fn elide_dense(
+    text: &str,
+    context: &str,
+    config: &ContentRouterConfig,
+    store_recoverable: &dyn Fn(&str, &str, &str) -> bool,
+) -> Option<(String, usize)> {
+    if config.lossless {
+        return None;
+    }
+    let (elided, n_dense) = super::dense_line_elider::elide_dense_lines(text);
+    if n_dense == 0 {
+        return None;
+    }
+    let mut out = elided;
+    if config.ccr_inject_marker {
+        let hash = crate::ccr::compute_key(text.as_bytes());
+        if store_recoverable(&hash, text, "dense_elide") {
+            out.push_str(&format!("\n{}", crate::ccr::marker_for(&hash)));
+        }
+    }
+    let _ = context;
+    // Char-length gate, not the word-count estimator: a whitespace-free
+    // dump counts ~nothing in words, so the estimator cannot see the win
+    // (and the marker words would read as a loss). Upstream gates the same
+    // way (chars halved on its web-research replay).
+    if out.len() >= text.len() {
+        return None;
+    }
+    let tokens = out.split_whitespace().count();
+    Some((out, tokens))
+}
+
 /// With an empty [`ContentRouterConfig::active_external_compressors`] this is
 /// exactly [`apply_strategy`].
 #[allow(clippy::too_many_arguments)]
@@ -1890,8 +1950,13 @@ pub fn apply_strategy_with_registry(
             && config.enable_kompress;
         if lossy_after_fold {
             let fold_tokens = ll_content.split_whitespace().count();
-            let (komp, komp_tokens, _chain) =
-                try_kompress(&ll_content, config, context, &["kompress".to_string()]);
+            let (komp, komp_tokens, _chain) = try_kompress(
+                &ll_content,
+                config,
+                context,
+                &["kompress".to_string()],
+                store_recoverable,
+            );
             if (komp_tokens as f64) <= fold_tokens as f64 * (1.0 - config.lossy_min_extra_savings)
                 && komp.len() < ll_content.len()
             {
@@ -1899,6 +1964,21 @@ pub fn apply_strategy_with_registry(
                     komp,
                     komp_tokens,
                     vec![label, CompressionStrategy::Kompress.as_str().to_string()],
+                );
+            }
+        }
+        // Dense-line elision gets first refusal on the stage-0 floor:
+        // a repetition fold on a bundle dump keeps the dense lines whole,
+        // and returning here would bypass the match-path hook below.
+        if config.enable_dense_line_elision {
+            // elide_dense char-gates internally; Some means shorter.
+            if let Some((elided, elided_tokens)) =
+                elide_dense(&ll_content, context, config, store_recoverable)
+            {
+                return (
+                    elided,
+                    elided_tokens,
+                    vec![label, "dense_elide".to_string()],
                 );
             }
         }
@@ -1922,7 +2002,7 @@ pub fn apply_strategy_with_registry(
         return external;
     }
 
-    match strategy {
+    let strategy_result = match strategy {
         CompressionStrategy::SmartCrusher if config.enable_smart_crusher => {
             let crusher = super::smart_crusher::SmartCrusher::new(Default::default());
             let result = crusher.crush(content, context, bias);
@@ -1936,6 +2016,7 @@ pub fn apply_strategy_with_registry(
                         config,
                         context,
                         &["smart_crusher".into(), "kompress".into()],
+                        store_recoverable,
                     );
                     if k_tok < tokens {
                         return (k_comp, k_tok, k_chain);
@@ -1988,7 +2069,7 @@ pub fn apply_strategy_with_registry(
             // Fallback: if CodeAware saved nothing, try Kompress
             if tokens >= original_tokens && config.enable_kompress {
                 let chain = vec!["code_aware".to_string(), "kompress".to_string()];
-                return try_kompress(content, config, context, &chain);
+                return try_kompress(content, config, context, &chain, store_recoverable);
             }
             (compressed, tokens, vec!["code_aware".to_string()])
         }
@@ -2012,22 +2093,77 @@ pub fn apply_strategy_with_registry(
             )
         }
         CompressionStrategy::Kompress | CompressionStrategy::Text if config.enable_kompress => {
-            try_kompress(content, config, context, &["kompress".to_string()])
+            try_kompress(
+                content,
+                config,
+                context,
+                &["kompress".to_string()],
+                store_recoverable,
+            )
         }
-        CompressionStrategy::Passthrough => (
-            content.to_string(),
-            original_tokens,
-            vec!["passthrough".to_string()],
-        ),
-        _ => {
-            // Strategy not enabled or unknown — passthrough
+        CompressionStrategy::Passthrough => {
+            if config.enable_dense_line_elision {
+                // elide_dense char-gates internally; Some means shorter.
+                if let Some((elided, elided_tokens)) =
+                    elide_dense(content, context, config, store_recoverable)
+                {
+                    return (
+                        elided,
+                        elided_tokens,
+                        vec!["passthrough".to_string(), "dense_elide".to_string()],
+                    );
+                }
+            }
             (
                 content.to_string(),
                 original_tokens,
                 vec!["passthrough".to_string()],
             )
         }
+        _ => {
+            // Strategy not enabled or unknown — passthrough, with dense-line
+            // elision as the last resort (mirrors the try_kompress tail).
+            if config.enable_dense_line_elision {
+                // elide_dense char-gates internally; Some means shorter.
+                if let Some((elided, elided_tokens)) =
+                    elide_dense(content, context, config, store_recoverable)
+                {
+                    return (
+                        elided,
+                        elided_tokens,
+                        vec!["passthrough".to_string(), "dense_elide".to_string()],
+                    );
+                }
+            }
+            (
+                content.to_string(),
+                original_tokens,
+                vec!["passthrough".to_string()],
+            )
+        }
+    };
+
+    // Dense-line elision on the RESULT: whatever survived the chain, long
+    // whitespace-free lines are still in it. Only after strategies that hand
+    // back plain text — SmartCrusher, tabular, config, and diff emit their
+    // own structured (and CCR-marked) forms; Kompress is lossy with its own
+    // marker. Eliding inside those would corrupt output another owns.
+    // Runs only when the strategy actually ran (chain names it), matching
+    // the Python `_DENSE_ELIDE_AFTER` gate.
+    let (compressed_out, tokens_out, mut chain_out) = strategy_result;
+    if config.enable_dense_line_elision
+        && dense_elide_after(strategy)
+        && chain_out.iter().any(|c| c == strategy.as_str())
+    {
+        // elide_dense char-gates internally; Some means shorter.
+        if let Some((elided, elided_tokens)) =
+            elide_dense(&compressed_out, context, config, store_recoverable)
+        {
+            chain_out.push("dense_elide".to_string());
+            return (elided, elided_tokens, chain_out);
+        }
     }
+    (compressed_out, tokens_out, chain_out)
 }
 
 /// Try Kompress ML compression. Returns (compressed, tokens, chain).
@@ -2066,9 +2202,10 @@ pub fn kompress_size_gate_exceeded(content: &str) -> bool {
 
 fn try_kompress(
     content: &str,
-    _config: &ContentRouterConfig,
+    config: &ContentRouterConfig,
     context: &str,
     chain: &[String],
+    store_recoverable: &dyn Fn(&str, &str, &str) -> bool,
 ) -> (String, usize, Vec<String>) {
     let original_tokens = content.split_whitespace().count();
 
@@ -2123,6 +2260,20 @@ fn try_kompress(
             }
         }
         Err(_) => {} // Load failed — fall through
+    }
+
+    // Kompress not available or didn't help — dense-line elision as the
+    // last resort before passthrough (minified bundles, base64, RSC
+    // payloads: no structural compressor understands them).
+    // elide_dense char-gates internally; Some means shorter.
+    if config.enable_dense_line_elision {
+        if let Some((elided, elided_tokens)) =
+            elide_dense(content, context, config, store_recoverable)
+        {
+            let mut full_chain = chain.to_vec();
+            full_chain.push("dense_elide".to_string());
+            return (elided, elided_tokens, full_chain);
+        }
     }
 
     // Kompress not available or didn't help — passthrough
@@ -4580,7 +4731,13 @@ mod kompress_size_gate_tests {
 
         let content = "the quick brown fox jumps over the lazy dog. ".repeat(40);
         let config = ContentRouterConfig::default();
-        let (_out, _tokens, chain) = try_kompress(&content, &config, "", &["kompress".to_string()]);
+        let (_out, _tokens, chain) = try_kompress(
+            &content,
+            &config,
+            "",
+            &["kompress".to_string()],
+            &|_, _, _| true,
+        );
 
         assert!(
             chain.contains(&"kompress_size_gate".to_string()),
@@ -4595,8 +4752,13 @@ mod kompress_size_gate_tests {
         let _guard = CeilingGuard::set(Some("50000"));
 
         let config = ContentRouterConfig::default();
-        let (_out, _tokens, chain) =
-            try_kompress("short text", &config, "", &["kompress".to_string()]);
+        let (_out, _tokens, chain) = try_kompress(
+            "short text",
+            &config,
+            "",
+            &["kompress".to_string()],
+            &|_, _, _| true,
+        );
 
         assert!(!chain.contains(&"kompress_size_gate".to_string()));
     }
@@ -4619,6 +4781,46 @@ mod kompress_size_gate_tests {
             "image priced at {counted} tokens; base64 payload leaked into the count"
         );
         assert!(counted >= crate::tokenizer::IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn dense_elide_fires_on_passthrough_bundle_dump() {
+        // A minified-bundle dump: no structural compressor understands it.
+        // Elision must fire on the passthrough path with the strategy named.
+        let mut config = ContentRouterConfig::default();
+        config.enable_kompress = false;
+        // A minified-bundle dump with prose around it: no structural
+        // compressor understands the dense lines, so elision fires on the
+        // passthrough path with the strategy named.
+        let dump = format!(
+            "Script completed\n{}\nSome prose with plenty of spaces to separate the dumps.\n{}",
+            "a".repeat(3000),
+            "b".repeat(3000)
+        );
+        let (out, tokens, chain) =
+            apply_strategy(&dump, CompressionStrategy::Text, &config, "", None, 1.0);
+        assert!(chain.contains(&"dense_elide".to_string()), "{chain:?}");
+        assert!(tokens < dump.len() / 4);
+        assert!(out.contains("chars of dense machine-generated content elided"));
+    }
+
+    #[test]
+    fn dense_elide_stays_off_without_flag_or_in_lossless() {
+        let dump = format!(
+            "Script completed\n{}\nSome prose with plenty of spaces.\n{}",
+            "a".repeat(3000),
+            "b".repeat(3000)
+        );
+        let mut off = ContentRouterConfig::default();
+        off.enable_dense_line_elision = false;
+        let (_, _, chain) = apply_strategy(&dump, CompressionStrategy::Log, &off, "", None, 1.0);
+        assert!(!chain.contains(&"dense_elide".to_string()));
+
+        let mut lossless = ContentRouterConfig::default();
+        lossless.lossless = true;
+        let (_, _, chain) =
+            apply_strategy(&dump, CompressionStrategy::Log, &lossless, "", None, 1.0);
+        assert!(!chain.contains(&"dense_elide".to_string()));
     }
 
     #[test]

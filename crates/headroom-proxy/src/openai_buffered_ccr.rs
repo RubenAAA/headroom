@@ -73,17 +73,28 @@ pub(crate) fn has_headroom_retrieve_tool_responses(tools: &Value) -> bool {
 /// Responses turn that offers the retrieve tool must go buffered so the
 /// buffered arm can resolve it. ChatGPT-OAuth (Codex subscription) sessions
 /// stay streaming — their server-side session owns the transcript and a
-/// forced non-streaming call breaks it.
+/// forced non-streaming call breaks it. OpenCode Zen stays streaming too:
+/// Zen validates OpenCode-client attribution on the wire and rejects
+/// requests reshaped to `stream: false` with `403 FreeTierError` (#3656).
 pub(crate) fn should_buffer_openai_responses_stream_ccr(
     stream: bool,
     ccr_response_handler_enabled: bool,
     tools: Option<&Value>,
     is_chatgpt_auth: bool,
+    is_opencode_zen_upstream: bool,
 ) -> bool {
     stream
         && ccr_response_handler_enabled
         && !is_chatgpt_auth
+        && !is_opencode_zen_upstream
         && tools.is_some_and(has_headroom_retrieve_tool_responses)
+}
+
+/// Port of `is_opencode_zen_base` (`passthrough.py`): the upstream base
+/// targets the OpenCode Zen gateway, whose wire-attribution check rejects
+/// reshaped requests even though the caller *is* the OpenCode client.
+pub(crate) fn is_opencode_zen_base(base: &url::Url) -> bool {
+    matches!(base.host_str(), Some("opencode.ai" | "www.opencode.ai"))
 }
 
 /// Read-only port of the `resolve_codex_routing` ChatGPT sniff
@@ -397,6 +408,7 @@ mod tests {
             true,
             Some(&json!([ccr_tool()])),
             false,
+            false,
         ));
     }
 
@@ -407,6 +419,7 @@ mod tests {
             true,
             Some(&json!([ccr_tool()])),
             true,
+            false,
         ));
     }
 
@@ -416,6 +429,7 @@ mod tests {
             true,
             true,
             Some(&json!([unrelated_tool()])),
+            false,
             false,
         ));
     }
@@ -427,16 +441,39 @@ mod tests {
             true,
             Some(&json!([ccr_tool()])),
             false,
+            false,
         ));
         assert!(!should_buffer_openai_responses_stream_ccr(
             true,
             false,
             Some(&json!([ccr_tool()])),
             false,
+            false,
         ));
         assert!(!should_buffer_openai_responses_stream_ccr(
-            true, true, None, false,
+            true, true, None, false, false,
         ));
+    }
+
+    #[test]
+    fn keeps_opencode_zen_requests_streaming() {
+        assert!(!should_buffer_openai_responses_stream_ccr(
+            true,
+            true,
+            Some(&json!([ccr_tool()])),
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn opencode_zen_base_matches_gateway_hosts() {
+        for host in ["opencode.ai", "www.opencode.ai"] {
+            let base: url::Url = format!("https://{host}/zen/v1").parse().unwrap();
+            assert!(is_opencode_zen_base(&base), "{host}");
+        }
+        let other: url::Url = "https://api.openai.com/v1".parse().unwrap();
+        assert!(!is_opencode_zen_base(&other));
     }
 
     #[test]

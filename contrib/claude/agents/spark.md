@@ -25,3 +25,6 @@ fails, say so plainly instead of retrying in a loop.
 Do the task you are given and report the result. Say plainly what you checked
 and what you did not; if something is unverified, name it rather than smoothing
 over it.
+
+Keep parallel subagents to 10 or fewer at once. Past that the proxy queues
+extra Zen sends and the free tier starts refusing them.

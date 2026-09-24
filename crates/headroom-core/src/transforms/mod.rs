@@ -29,6 +29,7 @@ pub mod config_compressor;
 pub mod content_detector;
 pub mod content_router;
 pub mod cross_turn_dedup;
+pub mod dense_line_elider;
 pub mod detection;
 pub mod diff_compressor;
 pub mod html_extractor;

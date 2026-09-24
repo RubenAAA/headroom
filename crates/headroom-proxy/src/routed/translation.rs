@@ -198,7 +198,7 @@ fn translate_shaped_body(
         }
         Err(e) => {
             tracing::warn!(
-                event = "local_model_translate_error",
+                event = "routed_translate_error",
                 error = %e,
                 "failed to translate Anthropic request to OpenAI format"
             );
@@ -540,6 +540,64 @@ mod tests {
         .expect("translates");
         assert_eq!(tool_names(&out), vec!["Read", "Bash"]);
         assert_eq!(history_names(&out), vec!["Read"]);
+    }
+
+    /// The Zen turn the client actually receives back: renamed calls are
+    /// restored to client names, and every shadow the gate needed is gone —
+    /// a shadow the model called would otherwise arrive as a tool the
+    /// client never declared.
+    #[test]
+    fn zen_response_restores_names_and_drops_gate_shadows() {
+        use crate::routed::tool_alias::ToolAlias;
+        let parsed = json!({
+            "model": "claude-muse-spark-1.3",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+            ],
+        });
+        let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("muse-spark-1.3-contributor-free"),
+            &zen,
+            false,
+            "claude-muse-spark-1.3",
+            "req-zen-shadows",
+        )
+        .expect("translates");
+        // Nine names went out (2 renamed + 7 shadows); the alias map derives
+        // from the client's two.
+        let alias = ToolAlias::derive(parsed.get("tools").and_then(|t| t.as_array()));
+        assert!(alias.active());
+        let names: Vec<String> = out.openai_body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(names.len(), 9);
+
+        // The model answers with upstream names, including a call to a
+        // shadow the client never declared.
+        let mut turn = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "c1", "name": "read", "input": {}},
+                {"type": "tool_use", "id": "c2", "name": "grep", "input": {}},
+                {"type": "text", "text": "done"},
+            ],
+        });
+        let restored = alias.reverse_turn(&mut turn);
+        // Only the real client tool is restored; the shadow call passes
+        // through visibly so the client sees (and rejects) it instead of
+        // it silently executing somewhere.
+        assert_eq!(restored, 1);
+        assert_eq!(turn["content"][0]["name"], json!("Read"));
+        assert_eq!(turn["content"][1]["name"], json!("grep"));
+        assert_eq!(turn["content"][2]["type"], json!("text"));
     }
 
     /// Retroactive lock: Responses shape forces upstream streaming while

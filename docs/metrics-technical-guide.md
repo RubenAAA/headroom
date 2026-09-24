@@ -199,8 +199,8 @@ this panel explains.
 | `headroom_requests_total` | Requests handled. Unlabelled. |
 | `headroom_requests_by_provider{provider}` | Traffic split by provider. |
 | `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct values; overflow lands in `model="other"`. |
-| `headroom_requests_failed_total` | Upstream 5xx errors. |
-| `headroom_requests_rate_limited_total` | Requests **Headroom** rejected via its own rate limiter (not upstream 429s). |
+| `headroom_requests_failed_total{provider}` | Rejected turns (`>= 400`), by provider. |
+| `headroom_requests_rate_limited_total{source}` | 429s. `source="headroom"` is our own limiter; `source="upstream"` is the provider refusing. |
 | `headroom_conversation_concurrency_sheds_total` | Turns shed by the per-conversation fan-out cap before anything was forwarded. These cost nothing — the client retries against a committed prefix. Zero until the cap is configured and tripped. |
 | `headroom_compression_failed_total{reason}` | Fail-open compression failures — `timeout` or `error`. Traffic keeps flowing but savings quietly stop. **Worth an alert.** |
 | `headroom_compression_quarantine_total{event}` | **Always zero on Rust, by design.** Quarantine is a workaround for a thread-pool constraint this runtime does not have (see `compression_quarantine.rs`); the family is registered for scrape-shape parity only. Alert on `headroom_compression_failed_total` instead. |

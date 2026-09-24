@@ -1095,12 +1095,23 @@ where
             // measured 2026-09-22 on Spark over Zen, where that is the common
             // case rather than the corner one. Only the wording depends on
             // whether anything else arrived.
-            let notice = if turn_lacks_visible_text(&emit, rw.client_saw_visible_text) {
+            // ... except when nothing was actually dropped. An in-place
+            // answer (e.g. a retrieval miss served from the failure text)
+            // leaves no unresolved proxy tool; pushing the notice then claims
+            // a drop that never happened and arms the retry hook on an
+            // already-complete turn. Only an unresolved proxy tool is a fault.
+            let nothing_dropped = dropped[DropReason::UnresolvedProxyTool as usize] == 0;
+            let notice = if nothing_dropped && !emit.is_empty() {
+                // Answered in place with visible text: nothing to say.
+                String::new()
+            } else if turn_lacks_visible_text(&emit, rw.client_saw_visible_text) {
                 empty_turn_text(unresolved_tool.as_deref())
             } else {
                 dropped_call_text(unresolved_tool.as_deref())
             };
-            emit.push(json!({"type": "text", "text": notice}));
+            if !notice.is_empty() {
+                emit.push(json!({"type": "text", "text": notice}));
+            }
         }
 
         // Nothing to add. When the client has had blocks already, that is the

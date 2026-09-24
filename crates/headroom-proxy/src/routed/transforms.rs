@@ -356,6 +356,7 @@ fn offload_tool_results(
             Some(&policy),
         );
         if out.changed() {
+            let index_queued = runtime.store.persist(&out.records, ctx_project);
             report.transforms_applied.push("ctx_offload".to_string());
             report.tokens_saved += out.tokens_saved;
             tracing::debug!(
@@ -369,30 +370,43 @@ fn offload_tool_results(
             // Record what was offloaded against the workspace so a later turn's
             // proactive expansion can find it. Without this the expansion above
             // has an empty index to consult and can never fire.
-            if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
-                crate::proxy::track_ccr_context_records(
-                    state,
-                    &out.records,
-                    workspace_key,
-                    user_query,
-                    turn_number,
-                    request_id,
-                );
+            if index_queued {
+                if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
+                    crate::proxy::track_ccr_context_records(
+                        state,
+                        &out.records,
+                        workspace_key,
+                        user_query,
+                        turn_number,
+                        request_id,
+                    );
+                } else if state.ccr_context_tracker.is_some() {
+                    tracing::info!(
+                        event = "codex_ccr_workspace_unresolved",
+                        records_skipped = out.records.len(),
+                        bytes_skipped = out
+                            .records
+                            .iter()
+                            .map(|r| r.original.len() as u64)
+                            .sum::<u64>(),
+                        "CCR: workspace unresolved; skipping compression tracking"
+                    );
+                }
             } else if state.ccr_context_tracker.is_some() {
-                // Volume the fallback would have to absorb: records and bytes
-                // that entered the store but no tracker index.
-                tracing::info!(
-                    event = "codex_ccr_workspace_unresolved",
-                    records_skipped = out.records.len(),
-                    bytes_skipped = out
-                        .records
-                        .iter()
-                        .map(|r| r.original.len() as u64)
-                        .sum::<u64>(),
-                    "CCR: workspace unresolved; skipping compression tracking"
+                tracing::warn!(
+                    event = "ctx_offload_context_tracking_skipped",
+                    request_id = %request_id,
+                    "offload index unavailable; skipping routed context tracking"
                 );
             }
-            runtime.store.persist(out.records, ctx_project);
+            if !index_queued {
+                tracing::warn!(
+                    event = "ctx_offload_index_degraded",
+                    request_id = %request_id,
+                    records = out.records.len(),
+                    "routed request keeps CCR digests, but project search and recall will miss these records"
+                );
+            }
         }
     }
 }

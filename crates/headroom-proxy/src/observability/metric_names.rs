@@ -209,7 +209,7 @@ pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str =
 pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL: &str = "proxy_upstream_retries_total";
 pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP: &str =
     "Count of upstream requests re-sent after a transient failure, labelled \
-     by forward path (anthropic, local_model) and reason (status_429, \
+     by forward path (anthropic, routed) and reason (status_429, \
      status_529, status_5xx, transport). One increment per re-send, so a \
      request that succeeds on its third try contributes 2. Retries cost \
      latency and re-bill the input tokens, and until this counter existed \
@@ -256,9 +256,8 @@ pub const METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP: &str =
 
 pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL: &str = "ctx_offloaded_bytes_total";
 pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL_HELP: &str =
-    "CTX-5/6: cumulative bytes offloaded from tool_result blocks into the \
-     CCR store. Incremented on the request path when ctx_offload replaces \
-     a block with a digest.";
+    "CTX-5/6: cumulative bytes whose tool_result originals are stored in CCR \
+     and searchable in the project FTS index.";
 
 // ---------- ctx_offloaded_blocks_total ----------
 
@@ -266,6 +265,33 @@ pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL: &str = "ctx_offloaded_blocks_total"
 pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL_HELP: &str =
     "CTX-5/6: count of tool_result blocks offloaded (replaced with a \
      deterministic digest) across all requests.";
+
+// ---------- CTX-3 index outbox ----------
+
+pub const METRIC_CTX_OFFLOAD_INDEX_PENDING_JOBS: &str = "ctx_offload_index_pending_jobs";
+pub const METRIC_CTX_OFFLOAD_INDEX_PENDING_JOBS_HELP: &str =
+    "Current number of durable CTX-3 FTS index jobs waiting for completion.";
+pub const METRIC_CTX_OFFLOAD_INDEX_PENDING_BYTES: &str = "ctx_offload_index_pending_bytes";
+pub const METRIC_CTX_OFFLOAD_INDEX_PENDING_BYTES_HELP: &str =
+    "Original-content bytes held by the durable CTX-3 FTS index outbox.";
+pub const METRIC_CTX_OFFLOAD_INDEX_OLDEST_AGE_SECONDS: &str =
+    "ctx_offload_index_oldest_age_seconds";
+pub const METRIC_CTX_OFFLOAD_INDEX_OLDEST_AGE_SECONDS_HELP: &str =
+    "Age of the oldest durable CTX-3 FTS index job, in seconds.";
+pub const METRIC_CTX_OFFLOAD_INDEX_BATCHES_TOTAL: &str = "ctx_offload_index_batches_total";
+pub const METRIC_CTX_OFFLOAD_INDEX_BATCHES_TOTAL_HELP: &str =
+    "CTX-3 project batches attempted by the background FTS index worker.";
+pub const METRIC_CTX_OFFLOAD_INDEX_RETRIES_TOTAL: &str = "ctx_offload_index_retries_total";
+pub const METRIC_CTX_OFFLOAD_INDEX_RETRIES_TOTAL_HELP: &str =
+    "CTX-3 FTS index batches deferred for retry after a write failure.";
+pub const METRIC_CTX_OFFLOAD_INDEX_BACKPRESSURE_TOTAL: &str =
+    "ctx_offload_index_backpressure_total";
+pub const METRIC_CTX_OFFLOAD_INDEX_BACKPRESSURE_TOTAL_HELP: &str =
+    "Requests whose CTX-3 index jobs were refused because the bounded outbox was full.";
+pub const METRIC_CTX_OFFLOAD_INDEX_BATCH_DURATION_SECONDS: &str =
+    "ctx_offload_index_batch_duration_seconds";
+pub const METRIC_CTX_OFFLOAD_INDEX_BATCH_DURATION_SECONDS_HELP: &str =
+    "Time spent attempting one CTX-3 per-project FTS index batch.";
 
 // ---------- ctx_offloaded_blocks_by_tool_total ----------
 

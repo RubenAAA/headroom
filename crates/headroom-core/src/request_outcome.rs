@@ -173,7 +173,19 @@ impl RequestOutcome {
     /// the removed tokens are priced at the cache-read rate. This deliberately
     /// favours the proxy at the boundary: a span that fits in the fresh region
     /// is wholly called fresh, even if some selected blocks came from earlier.
+    ///
+    /// Binary by construction: one class per turn. A turn straddling
+    /// cached/fresh tokens is priced wholly at one rate — see
+    /// `compression_savings_cost_usd_for` for the proportional refinement.
+    ///
+    /// Zero-rate models (free tiers such as Muse Spark) report `"free"`:
+    /// their counterfactual dollars are 0.0 not because nothing was saved
+    /// but because the model costs nothing, so the row must not be read
+    /// against priced rows. See `compression_savings_cost_usd_for`.
     pub fn compression_savings_cost_basis(&self) -> &'static str {
+        if crate::pricing::lookup(&self.model).is_some_and(|p| p.input_cost_per_token == 0.0) {
+            return "free";
+        }
         let fresh_region = self
             .cache_write_tokens
             .max(0)
@@ -195,20 +207,63 @@ impl RequestOutcome {
     /// booking headline totals (message savings plus additive legs such as
     /// tool-schema deferral, which the message count never saw) price the
     /// count they book, keeping the token and dollar columns on one basis.
-    /// The cache-aware rate selection is unchanged.
+    ///
+    /// Proportional across the observed cache mix: the removed tokens are
+    /// apportioned read-first (a prefix-cache prefix is reads before it is
+    /// anything else), then writes split 5m/1h by their reported share, the
+    /// rest at list. An inferred OpenAI write is dropped — it is the same
+    /// tokens as `uncached`, so counting it would both double them and apply
+    /// a premium OpenAI never charges. No usable mix prices at list and says
+    /// so via the basis (`"no-mix"`), rather than inventing one.
+    ///
+    /// `tokens_saved` here is the LIVE-ZONE figure: handlers freeze the
+    /// cached prefix and compress only the appended delta, so the removed
+    /// tokens could never have been billed as cache reads. The read bucket
+    /// is excluded outright — the whole-request mix would value a warm
+    /// turn's compression at ~0.1x, an order of magnitude under what the
+    /// provider would have charged.
+    ///
+    /// A zero input rate (free tier) prices to 0.0 through the normal mix
+    /// math, and pairs with the `"free"` basis above — not a missing price.
     pub fn compression_savings_cost_usd_for(&self, tokens_saved: i64) -> f64 {
         if tokens_saved <= 0 {
             return 0.0;
         }
         let fallback = crate::savings_ledger::DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN;
-        let rate = match crate::pricing::lookup(&self.model) {
-            Some(pricing) if self.compression_savings_cost_basis() == "cache_read" => pricing
-                .cache_read_cost_per_token
-                .unwrap_or(pricing.input_cost_per_token),
-            Some(pricing) => pricing.input_cost_per_token,
-            None => fallback,
+        let Some(pricing) = crate::pricing::lookup(&self.model) else {
+            return tokens_saved as f64 * fallback;
         };
-        tokens_saved as f64 * rate
+        let long = crate::pricing::is_long_context(
+            self.uncached_input_tokens
+                .max(0)
+                .saturating_add(self.cache_read_tokens.max(0))
+                .saturating_add(self.cache_write_tokens.max(0)),
+        );
+        let write_rate = pricing
+            .cache_write_rate(long)
+            .unwrap_or_else(|| pricing.input_rate(long));
+        let write_1h_rate = pricing.cache_write_1h_rate(long).unwrap_or(write_rate);
+        let list_rate = pricing.input_rate(long);
+        // An inferred write duplicates `uncached`: drop it, keep the tokens.
+        let (write_5m, write_1h) = if self.cache_inferred {
+            (0.0, 0.0)
+        } else {
+            let write_1h = (self.cache_write_1h_tokens.max(0) as f64)
+                .min(self.cache_write_tokens.max(0) as f64);
+            (self.cache_write_tokens.max(0) as f64 - write_1h, write_1h)
+        };
+        let uncached = self.uncached_input_tokens.max(0) as f64;
+        let tokens = tokens_saved.max(0) as f64;
+        let denom = write_5m + write_1h + uncached;
+        if denom <= 0.0 {
+            return tokens * list_rate;
+        }
+        let w5 = tokens * write_5m / denom;
+        let w1 = tokens * write_1h / denom;
+        // Subtract so the parts sum to `tokens` exactly, no float drift
+        // accumulating over a long session.
+        let unc = tokens - w5 - w1;
+        w5 * write_rate + w1 * write_1h_rate + unc * list_rate
     }
 
     /// Tokens the forwarded request grew by, if it ended up larger.
@@ -461,10 +516,15 @@ pub trait OutcomeSink {
     /// on `transforms_applied`. Called before step 1, matching Python.
     fn record_output_savings(&self, _transforms: &[String], _output_tokens: i64) {}
     /// Record a failed request. Invoked (instead of the success funnel) for a
-    /// generic upstream `status_code >= 500`, or when a caller explicitly
+    /// rejected upstream `status_code >= 400`, or when a caller explicitly
     /// identifies a forwarded upstream rejection. Default no-op so sinks
     /// without a metrics surface (e.g. tests) opt out.
     fn record_failed(&self, _outcome: &RequestOutcome) {}
+    /// Record an upstream rate limit. Invoked (instead of `record_failed`)
+    /// for a rejected upstream `status_code == 429`: a 429 is the one 4xx a
+    /// user is expected to act on (back off, raise a cap), and folding it
+    /// into a generic failure count hides exactly that. Default no-op.
+    fn record_rate_limited(&self, _outcome: &RequestOutcome) {}
     /// Append to the durable savings ledger that backs `headroom savings`.
     /// Called only when the request actually saved tokens. Separate from
     /// [`OutcomeSink::record_request`] (which feeds the in-memory savings
@@ -489,8 +549,17 @@ pub trait OutcomeSink {
 /// arbitrary generic 4xx `RequestOutcome` can still describe a normal client
 /// error. Keeping the shared logging here also guarantees one failure record
 /// and no success/PERF/savings side effects.
+///
+/// A 429 routes to `record_rate_limited` rather than `record_failed`: an
+/// upstream rate limit is the one 4xx a user is expected to act on (back
+/// off, raise a cap), and folding it into a generic failure count hides
+/// exactly that.
 pub fn emit_failed_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &RequestOutcome) {
-    sink.record_failed(outcome);
+    if outcome.status_code == 429 {
+        sink.record_rate_limited(outcome);
+    } else {
+        sink.record_failed(outcome);
+    }
     tracing::warn!(
         target: "headroom.proxy",
         event = "request_failed_accounting",
@@ -521,11 +590,18 @@ pub fn emit_failed_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &
 /// Single funnel for per-request bookkeeping. Preserves Python's ordering:
 /// output-shaper hook → metrics → cost tracker → request log → PERF trace line.
 pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &RequestOutcome) {
-    // Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
-    // exhaustion) must not feed the savings/cost/log success stats; that would
-    // let a failed request inflate the save-rate. Record it as failed and stop.
-    // 4xx stay on the normal funnel: they are client errors the proxy served.
-    if outcome.status_code >= 500 {
+    // A rejected turn (>= 400, e.g. a 429 rate limit or a 529 Overloaded
+    // surfaced after retry exhaustion) must not feed the savings/cost/log
+    // success stats; that would let a request the provider never billed
+    // inflate the save-rate. Record it under the counter that names what
+    // happened, and stop.
+    //
+    // This covers 4xx as well as 5xx. A 4xx is an error the PROXY served but
+    // the PROVIDER did not: nothing was generated, so nothing was billed, so
+    // compression on that turn saved exactly nothing. 429 goes to
+    // `record_rate_limited` rather than `record_failed`; the rest go to
+    // `record_failed`. Neither feeds savings.
+    if outcome.status_code >= 400 {
         emit_failed_request_outcome(sink, outcome);
         return;
     }
@@ -664,8 +740,12 @@ mod tests {
         };
 
         assert_eq!(outcome.compression_savings_cost_basis(), "cache_read");
-        // 1,000 saved tokens at Opus 5's cache-read rate of $0.50/MTok.
-        assert!((outcome.compression_savings_cost_usd() - 0.0005).abs() < 1e-12);
+        // 1,000 live-zone tokens on a warm turn: the mix is ~480k reads, so
+        // almost all of the removed delta prices at the 5m-write rate
+        // ($6.25/MTok), the 2 uncached tokens at list.
+        let expected =
+            (1_000.0 * 1_013.0 / 1_015.0) * 6.25 / 1e6 + (1_000.0 * 2.0 / 1_015.0) * 5.0 / 1e6;
+        assert!((outcome.compression_savings_cost_usd() - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -681,8 +761,11 @@ mod tests {
         };
 
         assert_eq!(outcome.compression_savings_cost_basis(), "fresh_input");
-        // 1,000 saved tokens at Opus 5's fresh-input rate of $5/MTok.
-        assert!((outcome.compression_savings_cost_usd() - 0.005).abs() < 1e-12);
+        // 1,000 live-zone tokens against a 4,000-write / 2-uncached mix:
+        // pro-rata at the 5m-write rate ($6.25/MTok) and list ($5/MTok).
+        let expected =
+            (1_000.0 * 4_000.0 / 4_002.0) * 6.25 / 1e6 + (1_000.0 * 2.0 / 4_002.0) * 5.0 / 1e6;
+        assert!((outcome.compression_savings_cost_usd() - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -697,12 +780,54 @@ mod tests {
             ..Default::default()
         };
 
-        // Headline count (message savings + deferral leg) priced at the same
-        // cache-read basis: 50,000 tokens at $0.50/MTok.
-        assert!((outcome.compression_savings_cost_usd_for(50_000) - 0.025).abs() < 1e-12);
+        // Headline count (message savings + deferral leg) priced on the same
+        // live-zone mix: 50,000 tokens pro-rata across the 1,013-write /
+        // 2-uncached mix at $6.25/$5 per MTok.
+        let expected =
+            (50_000.0 * 1_013.0 / 1_015.0) * 6.25 / 1e6 + (50_000.0 * 2.0 / 1_015.0) * 5.0 / 1e6;
+        assert!((outcome.compression_savings_cost_usd_for(50_000) - expected).abs() < 1e-12);
         // Non-positive counts price to zero, matching the message path.
         assert_eq!(outcome.compression_savings_cost_usd_for(0), 0.0);
         assert_eq!(outcome.compression_savings_cost_usd_for(-5), 0.0);
+    }
+
+    #[test]
+    fn compression_savings_cold_turn_prices_at_list() {
+        // No usable mix (nothing reported): honest list price, not a guess.
+        let outcome = RequestOutcome {
+            model: "claude-opus-5".into(),
+            tokens_saved: 1_000,
+            ..Default::default()
+        };
+        assert!((outcome.compression_savings_cost_usd() - 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn free_tier_basis_is_free_not_cache_read() {
+        // A zero-rate tier saves real tokens at $0: the basis must say so,
+        // or the row reads as a priced turn that saved nothing in dollars.
+        let outcome = RequestOutcome {
+            model: "claude-muse-spark-1.3".into(),
+            tokens_saved: 1_000,
+            optimized_tokens: 2_176,
+            cache_read_tokens: 480_000,
+            cache_write_tokens: 1_013,
+            uncached_input_tokens: 2,
+            ..Default::default()
+        };
+        assert_eq!(outcome.compression_savings_cost_basis(), "free");
+        assert_eq!(outcome.compression_savings_cost_usd(), 0.0);
+        // Priced models are unaffected by the free-tier short-circuit.
+        let priced = RequestOutcome {
+            model: "claude-opus-5".into(),
+            tokens_saved: 1_000,
+            optimized_tokens: 2_176,
+            cache_read_tokens: 480_000,
+            cache_write_tokens: 1_013,
+            uncached_input_tokens: 2,
+            ..Default::default()
+        };
+        assert_eq!(priced.compression_savings_cost_basis(), "cache_read");
     }
 
     #[test]
@@ -833,6 +958,9 @@ mod tests {
         fn record_failed(&self, _o: &RequestOutcome) {
             self.calls.borrow_mut().push("record_failed".into());
         }
+        fn record_rate_limited(&self, _o: &RequestOutcome) {
+            self.calls.borrow_mut().push("record_rate_limited".into());
+        }
         fn record_savings_ledger(&self, _o: &RequestOutcome) {
             self.calls.borrow_mut().push("record_savings_ledger".into());
         }
@@ -886,6 +1014,19 @@ mod tests {
 
     #[test]
     fn emit_5xx_records_failed_and_skips_success_funnel() {
+        // 4xx are rejections the provider never billed: they must not feed
+        // the success funnel either. A 429 names what happened instead of
+        // folding into generic failures.
+        for status in [400, 401, 403, 404, 422] {
+            let sink = RecordingSink::default();
+            let o = RequestOutcome {
+                status_code: status,
+                ..Default::default()
+            };
+            emit_request_outcome(&sink, &o);
+            // Only the failure path fires; the success funnel is skipped.
+            assert_eq!(*sink.calls.borrow(), vec!["record_failed"]);
+        }
         for status in [500, 503, 529] {
             let sink = RecordingSink::default();
             let o = RequestOutcome {
@@ -896,6 +1037,14 @@ mod tests {
             // Only the failure path fires; the success funnel is skipped.
             assert_eq!(*sink.calls.borrow(), vec!["record_failed"]);
         }
+        // A 429 names what happened instead of folding into generic failures.
+        let sink = RecordingSink::default();
+        let o = RequestOutcome {
+            status_code: 429,
+            ..Default::default()
+        };
+        emit_request_outcome(&sink, &o);
+        assert_eq!(*sink.calls.borrow(), vec!["record_rate_limited"]);
     }
 
     // A sink that records the `tokens_saved` figure each funnel call saw.
@@ -967,7 +1116,7 @@ mod tests {
 
     #[test]
     fn explicit_forwarded_rejections_record_4xx_and_5xx_once() {
-        for status in [401, 429, 503] {
+        for status in [401, 503] {
             let sink = RecordingSink::default();
             let outcome = RequestOutcome {
                 status_code: status,
@@ -980,6 +1129,18 @@ mod tests {
                 "status {status} must reach only the failed-work sink"
             );
         }
+        // A 429 names what happened instead of folding into generic failures.
+        let sink = RecordingSink::default();
+        let outcome = RequestOutcome {
+            status_code: 429,
+            ..Default::default()
+        };
+        emit_failed_request_outcome(&sink, &outcome);
+        assert_eq!(
+            *sink.calls.borrow(),
+            vec!["record_rate_limited"],
+            "status 429 must reach only the rate-limited sink"
+        );
     }
 
     /// Make every callsite in this binary emit, whichever test reaches it
@@ -1080,16 +1241,15 @@ mod tests {
 
     #[test]
     fn generic_4xx_outcome_stays_on_success_funnel() {
+        // A 429 is a rejection the provider never billed: it routes to the
+        // rate-limited counter, not the success funnel.
         let sink = RecordingSink::default();
         let o = RequestOutcome {
             status_code: 429,
             ..Default::default()
         };
         emit_request_outcome(&sink, &o);
-        assert_eq!(
-            *sink.calls.borrow(),
-            vec!["record_request", "record_tokens", "log_request"]
-        );
+        assert_eq!(*sink.calls.borrow(), vec!["record_rate_limited"]);
     }
 
     #[test]

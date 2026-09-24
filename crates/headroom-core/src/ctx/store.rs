@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
 // ─────────────────────────────────────────────────────────
@@ -213,6 +213,16 @@ struct Chunk {
     has_code: bool,
 }
 
+struct PreparedIndex<'a> {
+    label: &'a str,
+    content: &'a str,
+    opts: &'a IndexOpts,
+    chunks: Vec<Chunk>,
+    code_chunks: usize,
+    session_id: String,
+    event_id: String,
+}
+
 // ─────────────────────────────────────────────────────────
 // The store
 // ─────────────────────────────────────────────────────────
@@ -337,6 +347,10 @@ impl CtxStore {
         // row costs at most one search miss (same rationale as ccr/sqlite.rs).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Another proxy instance can briefly own the project's single SQLite
+        // writer. Wait for that transaction before returning a lock error; the
+        // CTX-3 outbox retries any lock that outlasts this bound.
+        conn.busy_timeout(std::time::Duration::from_secs(3))?;
         tune_connection(&conn);
 
         Self::init_schema(&conn)?;
@@ -548,13 +562,40 @@ impl CtxStore {
         content: &str,
         opts: &IndexOpts,
     ) -> rusqlite::Result<IndexSummary> {
-        let chunks = match opts.plain_text_lines {
-            Some(lines) => chunk_plain_text(content, lines, MAX_CHUNK_BYTES),
-            None => chunk_markdown(content, MAX_CHUNK_BYTES),
-        };
-        let code_chunks = chunks.iter().filter(|c| c.has_code).count();
-        let session_id = opts.session_id.clone().unwrap_or_default();
-        let event_id = opts.event_id.clone().unwrap_or_default();
+        let batch = [(label, content, opts)];
+        self.index_content_batch(&batch)
+            .map(|mut summaries| summaries.remove(0))
+    }
+
+    /// Index several sources for the same project in one SQLite transaction.
+    /// Chunking happens before the writer lock is taken; a failed batch rolls
+    /// back every source so callers can safely retry the whole batch.
+    pub fn index_content_batch(
+        &self,
+        items: &[(&str, &str, &IndexOpts)],
+    ) -> rusqlite::Result<Vec<IndexSummary>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let prepared: Vec<PreparedIndex<'_>> = items
+            .iter()
+            .map(|&(label, content, opts)| {
+                let chunks = match opts.plain_text_lines {
+                    Some(lines) => chunk_plain_text(content, lines, MAX_CHUNK_BYTES),
+                    None => chunk_markdown(content, MAX_CHUNK_BYTES),
+                };
+                PreparedIndex {
+                    label,
+                    content,
+                    opts,
+                    code_chunks: chunks.iter().filter(|chunk| chunk.has_code).count(),
+                    chunks,
+                    session_id: opts.session_id.clone().unwrap_or_default(),
+                    event_id: opts.event_id.clone().unwrap_or_default(),
+                }
+            })
+            .collect();
 
         let mut conn = self.conn();
 
@@ -567,91 +608,13 @@ impl CtxStore {
             })?;
 
         let tx = conn.transaction()?;
-
-        // Atomic dedup: drop the prior source with this label from both FTS
-        // tables and the sources table before re-inserting.
-        tx.execute(
-            "DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE label = ?1)",
-            params![label],
-        )?;
-        tx.execute(
-            "DELETE FROM chunks_trigram WHERE source_id IN (SELECT id FROM sources WHERE label = ?1)",
-            params![label],
-        )?;
-        tx.execute("DELETE FROM sources WHERE label = ?1", params![label])?;
-
-        let source_id: i64 = if chunks.is_empty() {
-            tx.execute(
-                "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash)
-                 VALUES (?1, 0, 0, ?2, ?3)",
-                params![label, opts.file_path, opts.content_hash],
-            )?;
-            tx.last_insert_rowid()
-        } else {
-            tx.execute(
-                "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    label,
-                    chunks.len() as i64,
-                    code_chunks as i64,
-                    opts.file_path,
-                    opts.content_hash
-                ],
-            )?;
-            let source_id = tx.last_insert_rowid();
-
-            {
-                let mut ins_porter = tx.prepare(
-                    "INSERT INTO chunks (title, content, source_id, content_type, source_category, session_id, event_id, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-                )?;
-                let mut ins_trigram = tx.prepare(
-                    "INSERT INTO chunks_trigram (title, content, source_id, content_type, source_category, session_id, event_id, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-                )?;
-                for chunk in &chunks {
-                    let ct = if chunk.has_code { "code" } else { "prose" };
-                    ins_porter.execute(params![
-                        chunk.title,
-                        chunk.content,
-                        source_id,
-                        ct,
-                        session_id,
-                        event_id,
-                        now
-                    ])?;
-                    ins_trigram.execute(params![
-                        chunk.title,
-                        chunk.content,
-                        source_id,
-                        ct,
-                        session_id,
-                        event_id,
-                        now
-                    ])?;
-                }
-            }
-            source_id
-        };
-
-        // Vocabulary extraction from the raw text (store.ts:1622).
-        {
-            let mut ins_vocab =
-                tx.prepare("INSERT OR IGNORE INTO vocabulary (word) VALUES (?1)")?;
-            for word in extract_vocabulary(content) {
-                ins_vocab.execute(params![word])?;
-            }
+        let mut summaries = Vec::with_capacity(prepared.len());
+        for item in &prepared {
+            summaries.push(index_content_in_transaction(&tx, item, &now)?);
         }
 
         tx.commit()?;
-
-        Ok(IndexSummary {
-            source_id,
-            label: label.to_string(),
-            total_chunks: chunks.len(),
-            code_chunks,
-        })
+        Ok(summaries)
     }
 
     // ── Search ──
@@ -745,6 +708,94 @@ impl CtxStore {
         }
         Ok((results, timings))
     }
+}
+
+fn index_content_in_transaction(
+    tx: &Transaction<'_>,
+    item: &PreparedIndex<'_>,
+    now: &str,
+) -> rusqlite::Result<IndexSummary> {
+    // Atomic dedup: drop the prior source with this label from both FTS
+    // tables and the sources table before re-inserting.
+    tx.execute(
+        "DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE label = ?1)",
+        params![item.label],
+    )?;
+    tx.execute(
+        "DELETE FROM chunks_trigram WHERE source_id IN (SELECT id FROM sources WHERE label = ?1)",
+        params![item.label],
+    )?;
+    tx.execute("DELETE FROM sources WHERE label = ?1", params![item.label])?;
+
+    let source_id: i64 = if item.chunks.is_empty() {
+        tx.execute(
+            "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash)
+             VALUES (?1, 0, 0, ?2, ?3)",
+            params![item.label, item.opts.file_path, item.opts.content_hash],
+        )?;
+        tx.last_insert_rowid()
+    } else {
+        tx.execute(
+            "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                item.label,
+                item.chunks.len() as i64,
+                item.code_chunks as i64,
+                item.opts.file_path,
+                item.opts.content_hash
+            ],
+        )?;
+        let source_id = tx.last_insert_rowid();
+
+        {
+            let mut ins_porter = tx.prepare(
+                "INSERT INTO chunks (title, content, source_id, content_type, source_category, session_id, event_id, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            )?;
+            let mut ins_trigram = tx.prepare(
+                "INSERT INTO chunks_trigram (title, content, source_id, content_type, source_category, session_id, event_id, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            )?;
+            for chunk in &item.chunks {
+                let content_type = if chunk.has_code { "code" } else { "prose" };
+                ins_porter.execute(params![
+                    chunk.title,
+                    chunk.content,
+                    source_id,
+                    content_type,
+                    item.session_id,
+                    item.event_id,
+                    now
+                ])?;
+                ins_trigram.execute(params![
+                    chunk.title,
+                    chunk.content,
+                    source_id,
+                    content_type,
+                    item.session_id,
+                    item.event_id,
+                    now
+                ])?;
+            }
+        }
+        source_id
+    };
+
+    // Vocabulary extraction from the raw text (store.ts:1622).
+    {
+        let mut ins_vocab = tx.prepare("INSERT OR IGNORE INTO vocabulary (word) VALUES (?1)")?;
+        for word in extract_vocabulary(item.content) {
+            ins_vocab.execute(params![word])?;
+        }
+    }
+
+    Ok(IndexSummary {
+        source_id,
+        label: item.label.to_string(),
+        total_chunks: item.chunks.len(),
+        code_chunks: item.code_chunks,
+    })
 }
 
 // ─────────────────────────────────────────────────────────

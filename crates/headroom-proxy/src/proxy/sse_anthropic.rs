@@ -442,6 +442,20 @@ pub(super) fn emit_anthropic_outcome(close: &AnthropicClose<'_>) {
     }
     let attempted_input = close.state.usage.input_tokens as i64 + close.ccr_rounds.input_tokens;
     if let (Some(ref ctx), true) = (close.outcome_ctx, close.stream_completed()) {
+        // Search round-trip counts joined to the same outcome row as the
+        // deferral tags: how often the model reached for the search tool this
+        // turn. Zero on turns without server tools (inventory is empty, not
+        // missing). The inventory ids stay log-only; only totals join here.
+        let search_inv = close.state.server_tool_inventory();
+        let mut tags = ctx.tags.clone();
+        tags.insert(
+            "tool_search_calls".to_string(),
+            search_inv.calls_total.to_string(),
+        );
+        tags.insert(
+            "tool_search_results".to_string(),
+            search_inv.results_total.to_string(),
+        );
         let outcome = headroom_core::request_outcome::RequestOutcome {
             request_id: close.request_id.to_string(),
             provider: ctx.provider.clone(),
@@ -471,7 +485,7 @@ pub(super) fn emit_anthropic_outcome(close: &AnthropicClose<'_>) {
             ttfb_ms: close.ttfb_ms,
             transforms_applied: ctx.transforms_applied.clone(),
             num_messages: ctx.num_messages,
-            tags: ctx.tags.clone(),
+            tags,
             client: ctx.client.clone(),
             project: ctx.project.clone(),
             // Upstream 4949cd55: stamp the real HTTP status so a

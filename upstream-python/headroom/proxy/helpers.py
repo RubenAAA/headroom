@@ -3315,10 +3315,14 @@ def anthropic_model_is_first_party(model_name: str) -> bool:
     Gateway callers name those deployments in the model id instead:
     ``bedrock/anthropic.claude-…``, ``anthropic.claude-…-v2:0``,
     ``vertex_ai/claude-…``, ``claude-sonnet-4@20250514``. A LiteLLM-style
-    ``anthropic/claude-…`` prefix is first-party and stays eligible.
+    ``anthropic/claude-…`` prefix is first-party and stays eligible. Raw
+    Bedrock ARNs (``arn:aws:bedrock:…``) are never first-party, including
+    inference-profile ARNs that carry no ``-vN`` version suffix.
     """
     lowered = (model_name or "").strip().lower()
     if not lowered:
+        return False
+    if lowered.startswith("arn:"):
         return False
     if lowered.startswith(_NON_FIRST_PARTY_MODEL_PREFIXES):
         return False
@@ -3562,7 +3566,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
     )
 
     out: list[Any] = []
-    removed = 0
+    repaired_count = 0
     changed = False
     for message in messages:
         content = message.get("content") if isinstance(message, dict) else None
@@ -3597,7 +3601,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             continue
 
         changed = True
-        removed += len(neutralize_indexes)
+        repaired_count += len(neutralize_indexes)
         repaired = dict(message)
         repaired["content"] = [
             dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
@@ -3605,7 +3609,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
         ]
         out.append(repaired)
 
-    return (out, removed) if changed else (messages, 0)
+    return (out, repaired_count) if changed else (messages, 0)
 
 
 def _ccr_result_as_text(block: dict[str, Any]) -> str:

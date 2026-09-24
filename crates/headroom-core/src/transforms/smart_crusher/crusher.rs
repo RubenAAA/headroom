@@ -483,10 +483,24 @@ impl SmartCrusher {
         let (crushed, info) =
             self.process_value_with_hook(&parsed, 0, query_context, bias, prose_hook);
 
+        // When an object and its descendants were left unchanged, keep
+        // the original bytes. Re-serializing would rewrite Unicode
+        // escapes and numeric lexical forms, then advertise a false
+        // compression. Spaced JSON without a nested strategy is
+        // compact-serialized for historical crush() / parity fixtures.
+        if crushed == parsed
+            && info.is_empty()
+            && matches!(parsed, Value::Object(_))
+            && !has_json_insignificant_whitespace(content)
+        {
+            return (content.to_string(), false, String::new());
+        }
+
         // Re-serialize with Python `safe_json_dumps` formatting:
         // compact `(",", ":")` separators + `ensure_ascii=False`,
         // preserving object-key insertion order. Matches the Python
-        // SmartCrusher output bytes the proxy writes.
+        // SmartCrusher output bytes the proxy writes. When descendants
+        // actually change, this path keeps strategy attribution.
         let result = crate::transforms::anchor_selector::python_safe_json_dumps(&crushed);
         let was_modified = result != content.trim();
 
@@ -1413,6 +1427,36 @@ fn estimate_array_bytes(item_strings: &[String]) -> usize {
 /// requires. Used by both the hash (input) and the store payload (write).
 fn canonical_array_json(items: &[Value]) -> String {
     serde_json::to_string(items).unwrap_or_default()
+}
+
+/// True when `s` has JSON whitespace outside of string literals
+/// (spaces after `:` / `,`, pretty-print newlines, etc.). Used to
+/// keep compact unchanged objects on the original-bytes path while
+/// still compact-serializing spaced inputs for historical crush()
+/// output.
+fn has_json_insignificant_whitespace(s: &str) -> bool {
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in s.trim().chars() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            continue;
+        }
+        if ch.is_whitespace() {
+            return true;
+        }
+    }
+    false
 }
 
 /// 12-char SHA-256 hex prefix of an already-serialized canonical JSON

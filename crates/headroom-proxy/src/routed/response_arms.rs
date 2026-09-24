@@ -87,13 +87,15 @@ pub(crate) async fn handle_routed_error_response(
     // attachments that were never there.
     let outbound_bytes = outcome.as_ref().map(|ctx| ctx.outbound_bytes);
     tracing::warn!(
-        event = "local_model_upstream_error",
+        event = "routed_upstream_error",
+        request_id = outcome.as_ref().map(|ctx| ctx.request_id.as_str()).unwrap_or_default(),
+        model = outcome.as_ref().map(|ctx| ctx.model.as_str()).unwrap_or_default(),
         status = upstream_status.as_u16(),
         body = %body_text.chars().take(200).collect::<String>(),
         body_len = body_text.len(),
         retry_after_preserved = retry_after.is_some(),
         outbound_bytes = outbound_bytes.unwrap_or(0),
-        "local model upstream returned error"
+        "routed upstream returned error"
     );
     if upstream_status == StatusCode::PAYLOAD_TOO_LARGE {
         let bytes = outbound_bytes.unwrap_or(0);
@@ -159,12 +161,14 @@ pub(crate) async fn read_routed_body(
         // `handle_routed_error_response`.
         let outbound_bytes = outcome.map(|ctx| ctx.outbound_bytes).unwrap_or(0);
         tracing::warn!(
-            event = "local_model_upstream_error",
+            event = "routed_upstream_error",
+            request_id = outcome.map(|ctx| ctx.request_id.as_str()).unwrap_or_default(),
+            model = outcome.map(|ctx| ctx.model.as_str()).unwrap_or_default(),
             status = status.as_u16(),
             body = %body_text.chars().take(200).collect::<String>(),
             body_len = body_text.len(),
             outbound_bytes,
-            "local model upstream returned error"
+            "routed upstream returned error"
         );
         if status == StatusCode::PAYLOAD_TOO_LARGE {
             let body = serde_json::json!({
@@ -193,7 +197,7 @@ pub(crate) async fn read_routed_body(
 
     upstream_resp.text().await.map_err(|e| {
         tracing::warn!(
-            event = "local_model_response_parse_error",
+            event = "routed_response_parse_error",
             error = %e,
             "failed to read upstream response body"
         );
@@ -256,7 +260,7 @@ fn parse_buffered_turn(body_text: &str, is_responses: bool) -> Result<(Value, i6
             Ok(v) => Ok((v, 0)),
             Err(e) => {
                 tracing::warn!(
-                    event = "local_model_response_parse_error",
+                    event = "routed_response_parse_error",
                     error = %e,
                     "failed to parse OpenAI response JSON"
                 );
@@ -283,13 +287,13 @@ fn serialize_anthropic_turn(
             // Log text stays per-shape so log bytes are unchanged by the merge.
             if is_responses {
                 tracing::warn!(
-                    event = "local_model_serialize_error",
+                    event = "routed_serialize_error",
                     error = %e,
                     "failed to serialize Anthropic responses translation"
                 );
             } else {
                 tracing::warn!(
-                    event = "local_model_serialize_error",
+                    event = "routed_serialize_error",
                     error = %e,
                     "failed to serialize Anthropic response"
                 );
@@ -467,6 +471,7 @@ pub(crate) async fn handle_streaming_response(
     codex_limits: crate::codex_rate_limits::CodexRateLimitStore,
     outcome: Option<RoutedOutcomeContext>,
     ccr: Option<RoutedCcr>,
+    slow_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
 ) -> Response {
     let original_model = original
         .get("model")
@@ -479,7 +484,10 @@ pub(crate) async fn handle_streaming_response(
     let quota_seen_in_headers =
         codex_limits.record_headers(&original_model, upstream_resp.headers());
 
-    let stream = upstream_resp.bytes_stream();
+    let stream = crate::upstream_route_probe::cancel_on_first_chunk(
+        Box::pin(upstream_resp.bytes_stream()),
+        slow_probe,
+    );
     // Snapshot before `outcome` moves into the translator below.
     let request_id = outcome
         .as_ref()

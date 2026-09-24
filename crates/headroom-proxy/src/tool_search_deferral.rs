@@ -64,6 +64,12 @@ pub const CORE_TOOLS: &[&str] = &[
 /// operators can flip it without a restart.
 pub const TOOL_SEARCH_ENV: &str = "HEADROOM_TOOL_SEARCH";
 
+/// Env var overriding which tools stay resident. Unset → [`CORE_TOOLS`];
+/// set-but-empty → defer everything non-typed; otherwise a comma-separated
+/// list normalized via [`resident_key`]. Read per request, no restart needed.
+/// `toolsearch` is always resident regardless (see [`CORE_TOOLS`]).
+pub const CORE_TOOLS_ENV: &str = "HEADROOM_TOOL_SEARCH_CORE_TOOLS";
+
 /// Normalize a client tool name for resident-tool membership checks.
 ///
 /// Clients disagree on casing and leading namespace markers for the same
@@ -85,6 +91,40 @@ pub fn tool_search_enabled_in(raw: Option<&str>) -> bool {
 /// Whether deferral injection is enabled (reads [`TOOL_SEARCH_ENV`]).
 pub fn tool_search_enabled() -> bool {
     tool_search_enabled_in(std::env::var(TOOL_SEARCH_ENV).ok().as_deref())
+}
+
+/// Tools that stay resident, with a deployment override.
+///
+/// Pure over the env value so tests don't mutate the process environment.
+pub fn resolved_core_tools_in(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        None => CORE_TOOLS.iter().map(|s| s.to_string()).collect(),
+        Some(raw) => {
+            let mut out: Vec<String> = raw
+                .split(',')
+                .filter_map(|part| {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        None
+                    } else {
+                        Some(resident_key(part))
+                    }
+                })
+                .collect();
+            // The client's own tool-search/schema-fetch tool resolves tools
+            // the client keeps in its local registry and never puts in the
+            // request body; deferring it orphans them (see [`CORE_TOOLS`]).
+            if !out.iter().any(|t| t == "toolsearch") {
+                out.push("toolsearch".to_string());
+            }
+            out
+        }
+    }
+}
+
+/// Tools that stay resident (reads [`CORE_TOOLS_ENV`]).
+pub fn resolved_core_tools() -> Vec<String> {
+    resolved_core_tools_in(std::env::var(CORE_TOOLS_ENV).ok().as_deref())
 }
 
 /// Best-effort host extraction for the custom-upstream gate view.
@@ -127,7 +167,11 @@ pub fn is_custom_anthropic_base_url(value: Option<&str>) -> bool {
 
 /// Whether `tools` already carries a tool-search mechanism (typed or
 /// name-prefixed): the client defers on its own, so leave it alone.
-fn client_uses_tool_search(tools: &[Value]) -> bool {
+///
+/// Visible crate-wide so the forward path can tag `tool_search_mode`:
+/// `client` when the client already defers (stand-down, book nothing),
+/// `headroom` only when we actually deferred something.
+pub(crate) fn client_uses_tool_search(tools: &[Value]) -> bool {
     tools.iter().any(|t| {
         t.get("type")
             .and_then(Value::as_str)
@@ -157,29 +201,51 @@ pub struct StripOutcome {
     pub tools: Vec<Value>,
     /// Number of entries removed. Zero means unchanged.
     pub removed: usize,
+    /// Number of surviving tools that had `defer_loading` cleared.
+    pub undeferred: usize,
 }
 
 /// Remove first-party tool-search tools for a third-party upstream.
+///
+/// `defer_loading` is cleared at the same time, and that half is
+/// load-bearing: removing only the search tool leaves every other tool
+/// marked deferred with nothing left that can resolve it — the model has
+/// no mechanism to load them, and a `tool_reference` naming one is a
+/// documented 400. The tools go out eager instead.
 ///
 /// Returns the input unchanged (`removed == 0`) when no typed search tool
 /// is present — callers rely on the count to skip the write-back.
 pub fn strip_for_third_party_upstream(tools: Vec<Value>) -> StripOutcome {
     if !has_typed_search_tool(&tools) {
-        return StripOutcome { tools, removed: 0 };
+        return StripOutcome {
+            tools,
+            removed: 0,
+            undeferred: 0,
+        };
     }
     let before = tools.len();
-    let kept: Vec<Value> = tools
-        .into_iter()
-        .filter(|t| {
-            !t.get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|ty| ty.starts_with(TOOL_SEARCH_TYPE_PREFIX))
-        })
-        .collect();
+    let mut undeferred = 0usize;
+    let mut kept: Vec<Value> = Vec::with_capacity(before);
+    for mut t in tools {
+        if t.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|ty| ty.starts_with(TOOL_SEARCH_TYPE_PREFIX))
+        {
+            continue;
+        }
+        if t.get("defer_loading").and_then(Value::as_bool) == Some(true) {
+            if let Some(obj) = t.as_object_mut() {
+                obj.remove("defer_loading");
+                undeferred += 1;
+            }
+        }
+        kept.push(t);
+    }
     let removed = before - kept.len();
     StripOutcome {
         tools: kept,
         removed,
+        undeferred,
     }
 }
 
@@ -194,6 +260,11 @@ pub struct InjectOutcome {
     /// Deferred tools, serializable for token counting. Empty unless
     /// `changed`.
     pub deferred: Vec<Value>,
+    /// Deferred tools resolved as core under the active core set
+    /// ([`resolved_core_tools`]). Disjoint slice of `deferred`: with a custom
+    /// core set, deferring a core tool means the override put it outside the
+    /// resident set. Empty unless `changed`.
+    pub core_deferred: Vec<Value>,
 }
 
 /// Defer non-core tool schemas behind an injected search tool.
@@ -211,10 +282,17 @@ pub struct InjectOutcome {
 /// moved marker itself is preserved, not replaced with a bare ephemeral:
 /// re-placing a bare marker would downgrade a 1h breakpoint to 5m.
 pub fn inject_deferral(tools: Vec<Value>) -> InjectOutcome {
+    inject_deferral_with_core(tools, &resolved_core_tools())
+}
+
+/// [`inject_deferral`] with an explicit core set. Pure so tests can pass a
+/// custom set without mutating the process environment.
+pub fn inject_deferral_with_core(tools: Vec<Value>, core_tools: &[String]) -> InjectOutcome {
     let unchanged = |tools: Vec<Value>| InjectOutcome {
         tools,
         changed: false,
         deferred: Vec::new(),
+        core_deferred: Vec::new(),
     };
     if tools.len() < MIN_TOOLS || client_uses_tool_search(&tools) {
         return unchanged(tools);
@@ -222,7 +300,10 @@ pub fn inject_deferral(tools: Vec<Value>) -> InjectOutcome {
 
     let is_core = |tool: &Value| {
         let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-        CORE_TOOLS.contains(&resident_key(name).as_str())
+        let key = resident_key(name);
+        // Hard-exempt: resolves client-local tools never in the body;
+        // deferring it orphans them (see [`CORE_TOOLS`]).
+        key == "toolsearch" || core_tools.iter().any(|c| c == &key)
     };
 
     let mut out: Vec<Value> = Vec::with_capacity(tools.len() + 1);
@@ -289,10 +370,24 @@ pub fn inject_deferral(tools: Vec<Value>) -> InjectOutcome {
         })
         .cloned()
         .collect();
+    // Core-vs-noncore split of the same deferred total: a deferred tool
+    // counts as core when the DEFAULT set calls it core, so the experiment
+    // override shows up as core savings against the default baseline.
+    // Disjoint from the non-core remainder; never added to the headline
+    // alongside `deferred` (see `tool_schema_savings`).
+    let core_deferred: Vec<Value> = deferred_tools
+        .iter()
+        .filter(|t| {
+            let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+            CORE_TOOLS.contains(&resident_key(name).as_str())
+        })
+        .cloned()
+        .collect();
     InjectOutcome {
         tools: out,
         changed: true,
         deferred: deferred_tools,
+        core_deferred,
     }
 }
 
@@ -831,7 +926,27 @@ mod tests {
         let before = tools.clone();
         let out = strip_for_third_party_upstream(tools);
         assert_eq!(out.removed, 0);
+        assert_eq!(out.undeferred, 0);
         assert_eq!(out.tools, before);
+    }
+
+    #[test]
+    fn strip_clears_defer_loading_on_survivors() {
+        // The orphan shape: client sent the deferred form (ENABLE_TOOL_SEARCH
+        // workaround), the search tool is stripped, and every other tool is
+        // still marked deferred with nothing left that can resolve it.
+        let mut deferred = tool("read");
+        deferred["defer_loading"] = json!(true);
+        let tools = vec![
+            deferred,
+            json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH_NAME}),
+            tool("write"),
+        ];
+        let out = strip_for_third_party_upstream(tools);
+        assert_eq!(out.removed, 1);
+        assert_eq!(out.undeferred, 1);
+        assert_eq!(out.tools.len(), 2);
+        assert!(out.tools.iter().all(|t| t.get("defer_loading").is_none()));
     }
 
     // ── history repair ──
@@ -1227,5 +1342,92 @@ mod tests {
         let out = strip_unsupported_blocks(messages, &many_tools(&["read"]));
         assert_eq!(out.neutralized, 0);
         assert_eq!(out.messages, before);
+    }
+
+    // ── core-tools env override ──
+
+    #[test]
+    fn unresolved_env_returns_defaults() {
+        let core = resolved_core_tools_in(None);
+        assert_eq!(core.len(), CORE_TOOLS.len());
+        for t in CORE_TOOLS {
+            assert!(core.iter().any(|c| c == t), "{t}");
+        }
+    }
+
+    #[test]
+    fn empty_env_defers_everything_non_typed() {
+        let core = resolved_core_tools_in(Some(""));
+        assert!(core.contains(&"toolsearch".to_string()));
+        // With an empty set, a default-core tool is no longer resident.
+        let tools = many_tools(&[
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Task",
+            "WebFetch",
+            "Skill",
+            "TodoWrite",
+            "Extra_a",
+            "Extra_b",
+        ]);
+        let out = inject_deferral_with_core(tools, &core);
+        assert!(out.changed);
+        let names: Vec<&str> = out
+            .deferred
+            .iter()
+            .map(|t| t.get("name").and_then(Value::as_str).unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"Bash"), "{names:?}");
+    }
+
+    #[test]
+    fn custom_list_normalizes_entries() {
+        let core = resolved_core_tools_in(Some(" Bash , _READ,,"));
+        assert!(core.contains(&"bash".to_string()));
+        assert!(core.contains(&"read".to_string()));
+        assert!(core.contains(&"toolsearch".to_string()));
+    }
+
+    #[test]
+    fn toolsearch_stays_resident_under_any_override() {
+        for raw in [Some(""), Some("bash,read"), Some("toolsearch")] {
+            let core = resolved_core_tools_in(raw);
+            let tools = many_tools(&[
+                "ToolSearch",
+                "Bash",
+                "Read",
+                "Write",
+                "Edit",
+                "Glob",
+                "Grep",
+                "Task",
+                "WebFetch",
+                "Skill",
+                "TodoWrite",
+                "Extra_a",
+            ]);
+            assert!(tools.len() >= MIN_TOOLS);
+            let out = inject_deferral_with_core(tools, &core);
+            let deferred: Vec<&str> = out
+                .deferred
+                .iter()
+                .map(|t| t.get("name").and_then(Value::as_str).unwrap_or(""))
+                .collect();
+            assert!(
+                !deferred.iter().any(|n| resident_key(n) == "toolsearch"),
+                "toolsearch deferred under {raw:?}: {deferred:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_run_books_no_core_deferral() {
+        let out = inject_deferral(mixed_tools());
+        assert!(out.changed);
+        assert!(out.core_deferred.is_empty());
     }
 }

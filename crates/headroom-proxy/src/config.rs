@@ -1546,7 +1546,7 @@ pub struct CliArgs {
     )]
     pub retry_zen_hold_budget_ms: u32,
 
-    /// Max concurrent Zen (opencode.ai) sends. Default `4`. `0` disables.
+    /// Max concurrent Zen (opencode.ai) sends. Default `10`. `0` disables.
     ///
     /// Zen 429s arrive in herds: 2026-09-14 saw 40 parallel 429s in one hour
     /// and a 7-wide subagent burst that truncated every turn in the same
@@ -1556,7 +1556,7 @@ pub struct CliArgs {
     #[arg(
         long = "retry-zen-max-inflight",
         env = "HEADROOM_RETRY_ZEN_MAX_INFLIGHT",
-        default_value_t = 4
+        default_value_t = 10
     )]
     pub retry_zen_max_inflight: usize,
 
@@ -3083,7 +3083,7 @@ impl Config {
             retry_max_attempts: 3,
             retry_zen_hold_enabled: true,
             retry_zen_hold_budget_ms: 0,
-            retry_zen_max_inflight: 4,
+            retry_zen_max_inflight: 10,
             retry_overload_max_attempts: 6,
             retry_stream_hold_bytes: 2048,
             retry_base_delay_ms: 1000,

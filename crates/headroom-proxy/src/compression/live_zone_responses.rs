@@ -576,6 +576,33 @@ fn log_item_telemetry(parsed: &serde_json::Value, request_id: &str) {
     };
 
     let by_type = tally_item_types(&classified, request_id);
+    // TEMP-CAPTURE (slot sizing for responses-instructions-call-input-slots):
+    // per-item byte totals + top-level `instructions` bytes, one line per
+    // turn. Remove after measurement.
+    {
+        let mut bytes_by_type: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for c in classified.iter() {
+            *bytes_by_type.entry(c.type_tag).or_insert(0) += c.raw.get().len();
+        }
+        let instructions_bytes = parsed
+            .get("instructions")
+            .map(|v| {
+                if v.is_string() {
+                    v.as_str().unwrap_or("").len()
+                } else {
+                    v.to_string().len()
+                }
+            })
+            .unwrap_or(0);
+        tracing::info!(
+            event = "responses_slot_bytes",
+            request_id = %request_id,
+            instructions_bytes,
+            bytes_by_type = ?bytes_by_type,
+            "TEMP responses slot byte breakdown",
+        );
+    }
     tracing::info!(
         event = "responses_item_summary",
         request_id = %request_id,

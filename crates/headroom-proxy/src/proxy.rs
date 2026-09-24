@@ -1543,9 +1543,10 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
     }
 
     fn record_failed(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
-        crate::observability::proxy_counters::record_failed();
+        crate::observability::proxy_counters::record_failed(&outcome.provider);
         self.savings_tracker.record_failed_work(
             &headroom_core::savings_tracker::FailedWorkRecord {
+                provider: Some(outcome.provider.clone()),
                 status_code: outcome.status_code,
                 upstream_attempts: outcome.upstream_attempts,
                 forwarded_tokens: outcome.optimized_tokens,
@@ -1554,6 +1555,18 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
                 timestamp: None,
             },
         );
+    }
+
+    fn record_rate_limited(&self, outcome: &headroom_core::request_outcome::RequestOutcome) {
+        // source="upstream": this funnel only ever sees a 429 the provider
+        // returned. Our own limiter rejects before a request is ever sent
+        // and records source="headroom" from its own call site.
+        crate::observability::proxy_counters::record_rate_limited("upstream");
+        self.savings_tracker
+            .record_rate_limited(Some(outcome.provider.as_str()));
+        // A 429 is failed work too: it reached the failure bucket, not the
+        // success funnel, and the ledger must see the wasted tokens.
+        self.record_failed(outcome);
     }
 
     fn record_cache_outcome(&self, provider: &str, reason: &str, wasted_tokens: i64) {
@@ -1582,6 +1595,10 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // the ledger's token and dollar columns share one basis. The
         // cache-aware rate selection is unchanged.
         let priced_cost = outcome.compression_savings_cost_usd_for(saved);
+        // `"free"` (zero-rate tier) makes the basis self-describing: the
+        // counterfactual dollars below are 0.0 because the model costs
+        // nothing, not because nothing was saved — do not read them
+        // against priced rows.
         let priced_basis = outcome.compression_savings_cost_basis().to_string();
         let pricing = headroom_core::pricing::lookup(&model);
         let fresh_rate = pricing
@@ -3037,11 +3054,20 @@ pub(crate) fn maybe_prune_tools(
     }
 }
 
-/// Attribution recorded when the tool-search stage rewrote `tools[]`.
+/// Attribution recorded when the tool-search stage ran on `tools[]`.
+///
+/// `mode` names who deferred: `client` when the client already sent the
+/// server-side shape (stand-down — the deferral is real but not ours to
+/// book, so a stand-down must not read as the feature being off),
+/// `headroom` only when we actually deferred something, `none` otherwise.
 pub(crate) struct ToolSearchAttribution {
     pub deferred_tools: usize,
     pub deferred_tokens: i64,
+    /// Tokens of deferred tools that are core under the default set
+    /// (disjoint slice of `deferred_tokens`, not additive to it).
+    pub core_deferred_tokens: i64,
     pub stripped_third_party: usize,
+    pub mode: &'static str,
 }
 
 /// Server-side tool-search deferral (+ third-party search-tool strip) for
@@ -3078,6 +3104,7 @@ pub(crate) fn maybe_inject_tool_search(
     // Third-party routes reject the first-party search shape: strip
     // client-originated search tools. Not env-gated — a poisoned transcript
     // must recover even with injection off.
+    let client_defers = tsd::client_uses_tool_search(&tools);
     let mut tools_vec = tools;
     let mut stripped_third_party = 0usize;
     if custom {
@@ -3090,25 +3117,40 @@ pub(crate) fn maybe_inject_tool_search(
     // handed back unchanged when injection doesn't apply.
     let mut deferred_tools = 0usize;
     let mut deferred_tokens = 0i64;
+    let mut core_deferred_tokens = 0i64;
     if !custom && enabled {
         let inject = tsd::inject_deferral(tools_vec);
         if inject.changed {
             deferred_tools = inject.deferred.len();
+            let tokenizer = headroom_core::tokenizer::get_tokenizer(model);
             let deferred_json = serde_json::to_string(&inject.deferred).unwrap_or_default();
-            deferred_tokens =
-                headroom_core::tokenizer::get_tokenizer(model).count_text(&deferred_json) as i64;
+            deferred_tokens = tokenizer.count_text(&deferred_json) as i64;
+            let core_json = serde_json::to_string(&inject.core_deferred).unwrap_or_default();
+            core_deferred_tokens = tokenizer.count_text(&core_json) as i64;
             tracing::info!(
                 event = "tool_search_deferral",
                 request_id = %request_id,
                 deferred_tools = deferred_tools,
                 deferred_tokens = deferred_tokens,
+                core_deferred_tokens = core_deferred_tokens,
                 "deferred non-core tool schemas behind the search tool"
             );
         }
         tools_vec = inject.tools;
     }
 
-    if stripped_third_party == 0 && deferred_tools == 0 {
+    // "headroom" only when we actually deferred something: injection also
+    // declines on a small tool surface or when nothing is deferrable, and
+    // calling that "headroom" would overstate our role exactly where we did
+    // nothing.
+    let mode = if client_defers {
+        "client"
+    } else if deferred_tools > 0 {
+        "headroom"
+    } else {
+        "none"
+    };
+    if stripped_third_party == 0 && deferred_tools == 0 && !client_defers {
         return (body, None);
     }
     value["tools"] = serde_json::Value::Array(tools_vec);
@@ -3118,7 +3160,9 @@ pub(crate) fn maybe_inject_tool_search(
             Some(ToolSearchAttribution {
                 deferred_tools,
                 deferred_tokens,
+                core_deferred_tokens,
                 stripped_third_party,
+                mode,
             }),
         ),
         Err(_) => (body, None),
@@ -4105,6 +4149,8 @@ pub struct UpstreamOverride(pub url::Url);
 struct SelectedUpstream {
     base: url::Url,
     client: reqwest::Client,
+    configured_http_proxy: bool,
+    allow_slow_path_probe: bool,
 }
 
 /// Resolve a per-request upstream override from the `x-headroom-base-url`
@@ -4375,6 +4421,8 @@ pub(crate) async fn forward_http(
     let selected_upstream =
         forward::resolve_selected_upstream(req.extensions(), req.headers(), &state).await?;
     let upstream_url = build_upstream_url(&selected_upstream.base, &uri)?;
+    let configured_http_proxy = selected_upstream.configured_http_proxy;
+    let allow_slow_path_probe = selected_upstream.allow_slow_path_probe;
     let upstream_client = selected_upstream.client;
 
     // Forwarded-Host: prefer client's Host. Forwarded-Proto: assume http for
@@ -4536,6 +4584,7 @@ pub(crate) async fn forward_http(
         String,
         Option<cache_stabilization::prefix_stampede::LeaderToken>,
     )> = None;
+    let mut slow_upstream_probe = None;
     let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
         let max = state.config.compression_max_body_bytes as usize;
@@ -4631,6 +4680,7 @@ pub(crate) async fn forward_http(
             state.config.ccr_handle_responses,
             &request_id,
             &mut buffered_responses_ccr,
+            &selected_upstream.base,
         );
 
         // PR-E5 + PR-E6: cache-stabilization observability hooks.
@@ -5048,6 +5098,15 @@ pub(crate) async fn forward_http(
         )
         .await;
 
+        if allow_slow_path_probe {
+            slow_upstream_probe = crate::upstream_route_probe::SlowUpstreamProbe::arm(
+                upstream_client.clone(),
+                &upstream_url,
+                &request_id,
+                configured_http_proxy,
+            );
+        }
+
         // Forward the request with retry on transient errors (429, 529, 5xx).
         forward::send_buffered_with_retry(
             &state,
@@ -5070,6 +5129,14 @@ pub(crate) async fn forward_http(
         let body_stream =
             TryStreamExt::map_err(req.into_body().into_data_stream(), std::io::Error::other);
         let reqwest_body = reqwest::Body::wrap_stream(body_stream);
+        if allow_slow_path_probe {
+            slow_upstream_probe = crate::upstream_route_probe::SlowUpstreamProbe::arm(
+                upstream_client.clone(),
+                &upstream_url,
+                &request_id,
+                configured_http_proxy,
+            );
+        }
         (
             upstream_client
                 .request(reqwest_method.clone(), upstream_url.clone())
@@ -5098,6 +5165,7 @@ pub(crate) async fn forward_http(
         &path_for_log,
         &request_id,
         state.config.enable_responses_streaming,
+        configured_http_proxy,
     );
 
     let (upstream_body, is_sse, sse_kind, ccr_round_usage, continuation_base) =
@@ -5109,6 +5177,7 @@ pub(crate) async fn forward_http(
                 state: &state,
                 request_id: &request_id,
                 path_for_log: &path_for_log,
+                slow_upstream_probe,
                 status,
                 is_sse,
                 sse_kind,
@@ -5466,13 +5535,16 @@ fn assemble_upstream_body(
     is_sse: bool,
     status: StatusCode,
     retry: UpstreamBodyRetry,
+    slow_upstream_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
 ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>> {
     let upstream_body = {
         let rest = upstream_resp.bytes_stream();
         let head =
             futures_util::stream::iter((!sse_prefix.is_empty()).then(|| Ok(sse_prefix.clone())));
-        head.chain(rest)
+        Box::pin(head.chain(rest))
     };
+    let upstream_body =
+        crate::upstream_route_probe::cancel_on_first_chunk(upstream_body, slow_upstream_probe);
     if let Some(body) = retry_body.filter(|_| {
         is_sse
             && status.is_success()
@@ -6770,6 +6842,8 @@ mod tool_search_wiring_tests {
         let attr = attr.expect("14 first-party tools must defer");
         assert_eq!(attr.deferred_tools, 6);
         assert!(attr.deferred_tokens > 0);
+        assert_eq!(attr.core_deferred_tokens, 0);
+        assert_eq!(attr.mode, "headroom");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(tools[0]["name"], json!("tool_search_tool_regex"));
@@ -6788,6 +6862,53 @@ mod tool_search_wiring_tests {
         );
         assert!(attr.is_none());
         assert_eq!(out, body);
+    }
+
+    #[test]
+    fn tool_search_mode_names_who_deferred() {
+        // headroom: we deferred.
+        let body = body_with(fourteen_tools(), json!([{"role": "user", "content": "hi"}]));
+        let (_, attr) = maybe_inject_tool_search(
+            body,
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            "req",
+            true,
+        );
+        assert_eq!(attr.expect("must defer").mode, "headroom");
+
+        // client: the array already carries the server-side shape —
+        // stand down and name it, rather than reading as feature-off.
+        let mut tools = fourteen_tools();
+        tools.push(
+            json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
+        );
+        let body = body_with(tools, json!([{"role": "user", "content": "hi"}]));
+        let (out, attr) = maybe_inject_tool_search(
+            body.clone(),
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            "req",
+            true,
+        );
+        let attr = attr.expect("client stand-down must still report");
+        assert_eq!(attr.mode, "client");
+        assert_eq!(attr.deferred_tools, 0);
+        assert_eq!(out, body, "stand-down must not rewrite the array");
+
+        // none: too few tools to defer, client not deferring either.
+        let body = body_with(
+            vec![tool("read"), tool("write")],
+            json!([{"role": "user", "content": "hi"}]),
+        );
+        let (_, attr) = maybe_inject_tool_search(
+            body,
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            "req",
+            true,
+        );
+        assert!(attr.is_none(), "nothing happened, nothing to report");
     }
 
     #[test]

@@ -67,6 +67,7 @@ pub use headroom_core::tool_schema_savings;
 pub mod tool_search_deferral;
 pub mod turn_hooks;
 pub mod upstream_guard;
+pub(crate) mod upstream_route_probe;
 pub mod verbosity_controller;
 pub mod vertex;
 pub mod warmup;

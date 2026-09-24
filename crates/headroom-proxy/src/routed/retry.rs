@@ -13,6 +13,46 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
 
+/// Short classification for a routed upstream transport failure.
+pub(crate) fn transport_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_builder() {
+        "builder"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "unknown"
+    }
+}
+
+/// reqwest's Display omits the transport cause, so retain the source chain in
+/// the log. Cap the depth and length because some transport implementations
+/// include verbose diagnostic text.
+pub(crate) fn transport_error_chain(error: &reqwest::Error) -> String {
+    use std::error::Error;
+
+    let mut parts = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        if parts.len() >= 4 {
+            break;
+        }
+        source = cause.source();
+    }
+    if parts.is_empty() {
+        return "no underlying source".to_string();
+    }
+    parts.join(" <- ").chars().take(500).collect()
+}
+
 /// The transcript array on the translated wire shape: `messages` on Chat
 /// Completions, `input` on Responses. Translation drops the Anthropic
 /// `cache_control` markers (neither translator carries them), so replay
@@ -80,6 +120,9 @@ pub(crate) struct UpstreamSend {
     /// `outbound_bytes` from this so the measured diagnosis reports the
     /// bytes actually refused, not the first attempt's.
     pub retried_without_replay: Option<u64>,
+    /// Remains armed through the first upstream body bytes for slow routed
+    /// turns, so its bodyless path probe covers routed model aliases too.
+    pub slow_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
 }
 
 /// Send with retry. `Err` is the 502 to return when the transport itself
@@ -162,8 +205,18 @@ pub(crate) async fn send_with_retry(
         None
     };
     wait_behind_parked_host(upstream_url, &egress_gate_key, max_delay_ms, request_id).await;
+    let mut slow_probe = None;
     let upstream_resp = loop {
         attempt += 1;
+        let attempt_started = std::time::Instant::now();
+        let probe = url::Url::parse(upstream_url).ok().and_then(|url| {
+            crate::upstream_route_probe::SlowUpstreamProbe::arm(
+                upstream_client.clone(),
+                &url,
+                request_id,
+                state.config.http_proxy.is_some(),
+            )
+        });
         let result = upstream_client
             .post(upstream_url)
             .headers(headers.clone())
@@ -174,6 +227,19 @@ pub(crate) async fn send_with_retry(
         match result {
             Ok(r) => {
                 let status = r.status();
+                tracing::info!(
+                    target: "headroom.proxy",
+                    event = "routed_upstream_response_headers",
+                    request_id = %request_id,
+                    upstream_host = %upstream_host,
+                    upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
+                    configured_http_proxy = state.config.http_proxy.is_some(),
+                    upstream_peer = ?r.remote_addr(),
+                    upstream_http_version = ?r.version(),
+                    upstream_status = status.as_u16(),
+                    attempt,
+                    "routed upstream response headers became available"
+                );
                 if is_zen && status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     tracing::warn!(
                         event = "zen_egress_rate_limited",
@@ -185,6 +251,7 @@ pub(crate) async fn send_with_retry(
                     );
                 }
                 if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed && is_chatgpt_auth {
+                    drop(probe);
                     let Some(r) = try_codex_token_refresh(
                         state,
                         upstream_client,
@@ -214,7 +281,10 @@ pub(crate) async fn send_with_retry(
                     .await
                     {
                         StatusRetry::Waited => continue,
-                        StatusRetry::Break(r) => break r,
+                        StatusRetry::Break(r) => {
+                            slow_probe = probe;
+                            break r;
+                        }
                     }
                 }
                 // Zen rate-limit hold: the fast budget above spent itself
@@ -232,7 +302,9 @@ pub(crate) async fn send_with_retry(
                 // still books the outcome once.
                 if status.as_u16() == 413 && prepared_replay_applies(&body) {
                     drop(r);
+                    drop(probe);
                     return try_replay_stripped_resend(
+                        state,
                         upstream_client,
                         upstream_url,
                         &headers,
@@ -248,11 +320,6 @@ pub(crate) async fn send_with_retry(
                     });
                 }
                 if status.as_u16() == 429 && is_zen && state.config.retry_zen_hold_enabled {
-                    let retry_after_ms = r
-                        .headers()
-                        .get(http::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(headroom_core::retry::retry_after_ms_uncapped);
                     drop(r);
                     match try_zen_hold(
                         state,
@@ -265,17 +332,32 @@ pub(crate) async fn send_with_retry(
                         &mut attempt,
                         &mut zen_slot,
                         request_id,
-                        retry_after_ms,
                     )
                     .await
                     {
-                        Ok(r) => break r,
+                        Ok(r) => {
+                            slow_probe = probe;
+                            break r;
+                        }
                         Err(resp) => return Err(resp),
                     }
                 }
+                slow_probe = probe;
                 break r;
             }
             Err(e) => {
+                tracing::warn!(
+                    target: "headroom.proxy",
+                    event = "routed_upstream_send_failed",
+                    request_id = %request_id,
+                    upstream_host = %upstream_host,
+                    upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
+                    configured_http_proxy = state.config.http_proxy.is_some(),
+                    error_kind = transport_error_kind(&e),
+                    attempt,
+                    "routed upstream send failed"
+                );
+                drop(probe);
                 // Same filter the Claude path uses: a decode or builder error
                 // is not transient and gets no retry, only the transport-level
                 // ones do.
@@ -299,6 +381,7 @@ pub(crate) async fn send_with_retry(
         resp: crate::proxy::attach_egress_guard(upstream_resp, egress_guard),
         headers,
         attempts: attempt,
+        slow_probe,
         retried_without_replay: None,
     })
 }
@@ -409,7 +492,7 @@ async fn backoff_retryable_status(
     if !zen_hold_owns_this && retry_after_uncapped.is_some_and(|delay| delay > max_delay_ms as f64)
     {
         tracing::warn!(
-            event = "local_model_retry_after_exceeds_cap",
+            event = "routed_retry_after_exceeds_cap",
             status = status.as_u16(),
             attempt,
             max_attempts,
@@ -436,7 +519,7 @@ async fn backoff_retryable_status(
     ))
     .min(std::time::Duration::from_millis(max_delay_ms));
     tracing::warn!(
-        event = "local_model_upstream_retry",
+        event = "routed_upstream_retry",
         status = status.as_u16(),
         attempt,
         backoff_ms = backoff.as_millis() as u64,
@@ -448,7 +531,7 @@ async fn backoff_retryable_status(
         "retrying transient upstream error"
     );
     crate::observability::record_upstream_retry(
-        "local_model",
+        "routed",
         crate::observability::retry_reason::from_status(status.as_u16()),
     );
     // Share the pain only within this egress: parallel turns behind the
@@ -471,6 +554,7 @@ async fn backoff_retryable_status(
 /// Extracted from `send_with_retry` without behavior change.
 #[allow(clippy::too_many_arguments)]
 async fn try_replay_stripped_resend(
+    state: &AppState,
     client: &reqwest::Client,
     upstream_url: &str,
     headers: &HeaderMap,
@@ -479,7 +563,18 @@ async fn try_replay_stripped_resend(
     request_id: &str,
     session_key: Option<&str>,
 ) -> Result<UpstreamSend, Response> {
+    let upstream_host = crate::routed::upstream_gate::upstream_host(upstream_url)
+        .unwrap_or_else(|| "unknown".to_string());
     let stripped = strip_replay_prefix(body);
+    let attempt_started = std::time::Instant::now();
+    let slow_probe = url::Url::parse(upstream_url).ok().and_then(|url| {
+        crate::upstream_route_probe::SlowUpstreamProbe::arm(
+            client.clone(),
+            &url,
+            request_id,
+            state.config.http_proxy.is_some(),
+        )
+    });
     match client
         .post(upstream_url)
         .headers(headers.clone())
@@ -488,8 +583,21 @@ async fn try_replay_stripped_resend(
         .await
     {
         Ok(r) => {
+            tracing::info!(
+                target: "headroom.proxy",
+                event = "routed_upstream_response_headers",
+                request_id = %request_id,
+                upstream_host = %upstream_host,
+                upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
+                configured_http_proxy = state.config.http_proxy.is_some(),
+                upstream_peer = ?r.remote_addr(),
+                upstream_http_version = ?r.version(),
+                upstream_status = r.status().as_u16(),
+                attempt = attempt + 1,
+                "routed upstream response headers became available after replay retry"
+            );
             tracing::warn!(
-                event = "local_model_413_replay_stripped",
+                event = "routed_413_replay_stripped",
                 request_id = %request_id,
                 session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
                 stripped_bytes = stripped.len() as u64,
@@ -501,11 +609,24 @@ async fn try_replay_stripped_resend(
                 headers: headers.clone(),
                 attempts: attempt + 1,
                 retried_without_replay: Some(stripped.len() as u64),
+                slow_probe,
             })
         }
-        Err(e) => Err(crate::error::transient_response(format!(
-            "local upstream error: {e}"
-        ))),
+        Err(e) => {
+            tracing::warn!(
+                event = "routed_upstream_error",
+                error = %e,
+                error_kind = transport_error_kind(&e),
+                cause_chain = %transport_error_chain(&e),
+                attempts = attempt + 1,
+                upstream_host = %upstream_host,
+                request_id = %request_id,
+                "routed upstream connection failed after replay-prefix retry"
+            );
+            Err(crate::error::transient_response(format!(
+                "routed upstream error: {e}"
+            )))
+        }
     }
 }
 
@@ -526,7 +647,6 @@ async fn try_zen_hold(
     attempt: &mut u32,
     zen_slot: &mut Option<crate::routed::upstream_gate::ZenSlot>,
     request_id: &str,
-    retry_after_ms: Option<f64>,
 ) -> Result<reqwest::Response, Response> {
     // A hold sleeps for up to the hold budget (187 s seen
     // 2026-09-14) with nothing in flight. Holding the Zen
@@ -539,6 +659,8 @@ async fn try_zen_hold(
     // Same for the egress count: a parked turn is waiting on this egress's
     // rotation, so it must not hold the drain. Each probe re-takes it.
     egress_guard.take();
+    let upstream_host = crate::routed::upstream_gate::upstream_host(upstream_url)
+        .unwrap_or_else(|| "unknown".to_string());
     match crate::routed::zen_hold::hold_for_rotation(
         state,
         client,
@@ -548,7 +670,6 @@ async fn try_zen_hold(
         body.clone(),
         *attempt,
         request_id,
-        retry_after_ms,
     )
     .await
     {
@@ -575,9 +696,21 @@ async fn try_zen_hold(
                 .await
             {
                 Ok(r) => Ok(crate::proxy::attach_egress_guard(r, guard)),
-                Err(e) => Err(crate::error::transient_response(format!(
-                    "local upstream error: {e}"
-                ))),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "routed_upstream_error",
+                        error = %e,
+                        error_kind = transport_error_kind(&e),
+                        cause_chain = %transport_error_chain(&e),
+                        attempts = *attempt + 1,
+                        upstream_host = %upstream_host,
+                        request_id = %request_id,
+                        "routed upstream connection failed after Zen rate-limit hold"
+                    );
+                    Err(crate::error::transient_response(format!(
+                        "routed upstream error: {e}"
+                    )))
+                }
             }
         }
     }
@@ -614,8 +747,10 @@ async fn handle_transport_error(
         let backoff =
             std::time::Duration::from_millis(crate::proxy::backoff_ms(state, attempt - 1));
         tracing::warn!(
-            event = "local_model_upstream_retry",
+            event = "routed_upstream_retry",
             error = %e,
+            error_kind = transport_error_kind(&e),
+            cause_chain = %transport_error_chain(&e),
             attempt,
             backoff_ms = backoff.as_millis() as u64,
             delay_source = "transport_backoff",
@@ -623,7 +758,7 @@ async fn handle_transport_error(
             "retrying failed upstream connection"
         );
         crate::observability::record_upstream_retry(
-            "local_model",
+            "routed",
             crate::observability::retry_reason::TRANSPORT,
         );
         tokio::time::sleep(backoff).await;
@@ -631,16 +766,18 @@ async fn handle_transport_error(
     }
     if is_retryable {
         crate::observability::record_upstream_retry_exhausted(
-            "local_model",
+            "routed",
             crate::observability::retry_reason::TRANSPORT,
         );
         tracing::warn!(
-            event = "local_model_upstream_error",
+            event = "routed_upstream_error",
             error = %e,
+            error_kind = transport_error_kind(&e),
+            cause_chain = %transport_error_chain(&e),
             retryable = is_retryable,
             attempts = attempt,
             upstream = %upstream_url,
-            "failed to connect to local model upstream"
+            "failed to connect to routed upstream"
         );
         // Transient (rotation RST, wifi flap, corpse-pool
         // first-write miss): 503 + Retry-After so the client
@@ -648,21 +785,23 @@ async fn handle_transport_error(
         // upholds in `crate::error`. A bare 502 here would stall
         // the session until a human nudges it.
         return TransportOutcome::Fail(crate::error::transient_response(format!(
-            "local upstream error: {e}"
+            "routed upstream error: {e}"
         )));
     }
     tracing::warn!(
-        event = "local_model_upstream_error",
+        event = "routed_upstream_error",
         error = %e,
+        error_kind = transport_error_kind(&e),
+        cause_chain = %transport_error_chain(&e),
         retryable = is_retryable,
         attempts = attempt,
         upstream = %upstream_url,
-        "failed to connect to local model upstream"
+        "failed to connect to routed upstream"
     );
     TransportOutcome::Fail(
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from(format!("local upstream error: {e}")))
+            .body(Body::from(format!("routed upstream error: {e}")))
             .expect("static response"),
     )
 }
@@ -839,10 +978,11 @@ mod tests {
         assert_eq!(count(), 0);
     }
 
-    /// A sane Retry-After on the last fast-loop 429 controls the first hold
-    /// probe. A real provider wait reduces re-collisions on this egress.
+    /// A Zen 429 carrying even a within-cap Retry-After still ignores it.
+    /// Zen's header is a constant, not a wait, so no value of it may guide
+    /// the hold probes — only the capped backoff sets the pace.
     #[tokio::test]
-    async fn zen_hold_honors_within_cap_retry_after() {
+    async fn zen_hold_ignores_within_cap_retry_after() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -888,8 +1028,8 @@ mod tests {
         assert_eq!(send.resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "one 429 then recovery");
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(45),
-            "the within-cap Retry-After should guide the first hold probe"
+            started.elapsed() < std::time::Duration::from_millis(45),
+            "the within-cap Retry-After must not guide the first hold probe"
         );
     }
 

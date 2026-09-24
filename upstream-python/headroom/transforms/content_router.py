@@ -5168,8 +5168,10 @@ class ContentRouter(Transform):
         # Detect the producing command by walking back to that assistant turn and
         # mark the observation's message index so it is passed verbatim — so
         # cat/sed/head code reads are protected on ANY model/harness, not just
-        # those that emit tool-call/tool_result blocks.
-        self._protect_read_msg_indices: set[int] = set()
+        # those that emit tool-call/tool_result blocks. Accumulate locally
+        # and assign once: never mutate the property's set in place via the
+        # getter, so no path can touch the shared default state object.
+        _protect_read_msg_indices: set[int] = set()
         if read_protection_enabled():
             for _idx, _m in enumerate(messages):
                 if _m.get("role") != "user":
@@ -5183,7 +5185,8 @@ class ContentRouter(Transform):
                     if _rj == "user":
                         break
                 if _cmd and _is_read_command(_cmd):
-                    self._protect_read_msg_indices.add(_idx)
+                    _protect_read_msg_indices.add(_idx)
+        self._protect_read_msg_indices = _protect_read_msg_indices
 
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)

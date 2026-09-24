@@ -845,6 +845,26 @@ mod tests {
     }
 
     #[test]
+    fn search_round_trip_totals_joinable_as_outcome_tags() {
+        // The deferral experiment books search usage on the same outcome
+        // row as the deferral tags (see `emit_anthropic_outcome`): totals
+        // join, id detail stays log-only. Zero when no server tools ran.
+        let mut state = AnthropicStreamState::default();
+        state
+            .blocks
+            .insert(0, server_call_block("tool_search_tool_regex", "srv_1"));
+        state
+            .blocks
+            .insert(1, server_result_block("web_search_tool_result", "srv_1"));
+        let inv = state.server_tool_inventory();
+        assert_eq!(inv.calls_total, 1);
+        assert_eq!(inv.results_total, 1);
+        let empty = AnthropicStreamState::default().server_tool_inventory();
+        assert_eq!(empty.calls_total, 0);
+        assert_eq!(empty.results_total, 0);
+    }
+
+    #[test]
     fn inventory_caps_ids_but_keeps_totals() {
         let mut state = AnthropicStreamState::default();
         for i in 0..MAX_INVENTORY_IDS + 3 {

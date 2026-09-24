@@ -30,10 +30,12 @@ prompt, so its percentage is not a share of all provider input. The CLI labels
 the denominator as `selected tokens` for that reason.
 
 Its dollar value is an estimate at the saved tokens' measured cache placement.
-New proxy ledger rows record `cost_basis` as `fresh_input` or `cache_read`;
-legacy rows without that field used the fresh-input rate and can overstate the
-historical aggregate. They cannot be repriced after the fact because their
-placement was not recorded.
+New proxy ledger rows record `cost_basis` as `fresh_input`, `cache_read`, or
+`free` (zero-rate tiers such as Muse Spark: $0 because the model costs
+nothing, not because nothing was saved — never sum `free` rows against
+priced ones); legacy rows without that field used the fresh-input rate and
+can overstate the historical aggregate. They cannot be repriced after the
+fact because their placement was not recorded.
 
 ## The one number
 

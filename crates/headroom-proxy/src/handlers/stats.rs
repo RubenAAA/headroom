@@ -119,10 +119,13 @@ pub async fn handle_stats(
         "by_provider": by_provider,
         // Tool-definition tokens kept out of context by schema deferral,
         // over the recent window. Counted only when Headroom performed the
-        // deferral.
+        // deferral. Estimated, not realized: the figure is what we asked
+        // the provider to defer, unverifiable in `usage` — an intermediary
+        // that rebuilds `tools[]` drops `defer_loading` silently.
         "tool_search": serde_json::json!({
             "tokens": tool_schema_tokens,
             "tokens_saved": tool_schema_tokens,
+            "estimated": true,
             "requests": tool_schema_requests,
             "window": window.len(),
         }),

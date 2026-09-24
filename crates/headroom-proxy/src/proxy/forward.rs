@@ -394,6 +394,7 @@ pub(crate) fn apply_buffered_body_transforms(
     ccr_handle_responses: bool,
     request_id: &str,
     buffered_responses_ccr: &mut bool,
+    upstream_base: &url::Url,
 ) -> bytes::Bytes {
     let buffered = match endpoint {
         compression::CompressibleEndpoint::AnthropicMessages => {
@@ -441,6 +442,7 @@ pub(crate) fn apply_buffered_body_transforms(
                 true,
                 parsed.get("tools"),
                 is_chatgpt,
+                crate::openai_buffered_ccr::is_opencode_zen_base(upstream_base),
             ) {
                 let mut flipped = parsed.clone();
                 flipped["stream"] = serde_json::Value::Bool(false);
@@ -552,6 +554,7 @@ pub(crate) fn observe_upstream_head(
     path_for_log: &str,
     request_id: &str,
     enable_responses_streaming: bool,
+    configured_http_proxy: bool,
 ) -> (
     StatusCode,
     HeaderMap,
@@ -570,19 +573,31 @@ pub(crate) fn observe_upstream_head(
     }
     // Response headers are in hand. Whatever is left after `pre_forward` is
     // the provider's own time, including retries and backoff.
-    {
-        let pre_forward = stage_timer
-            .summary()
-            .get("pre_forward")
-            .copied()
-            .unwrap_or(0.0);
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        stage_timer.record("upstream", (elapsed - pre_forward).max(0.0));
-    }
+    let pre_forward = stage_timer
+        .summary()
+        .get("pre_forward")
+        .copied()
+        .unwrap_or(0.0);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    let upstream_wait_ms = (elapsed - pre_forward).max(0.0);
+    stage_timer.record("upstream", upstream_wait_ms);
 
     let upstream_status = upstream_resp.status();
 
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    tracing::info!(
+        target: "headroom.proxy",
+        event = "upstream_response_ready",
+        request_id = %request_id,
+        path = %path_for_log,
+        upstream_wait_ms,
+        configured_http_proxy,
+        upstream_peer = ?upstream_resp.remote_addr(),
+        upstream_http_version = ?upstream_resp.version(),
+        upstream_status = upstream_status.as_u16(),
+        "upstream response became available"
+    );
 
     let (upstream_request_id_anthropic, upstream_request_id_openai, upstream_request_id) =
         capture_upstream_request_ids(upstream_resp.headers());
@@ -669,6 +684,10 @@ pub(crate) fn rewrite_anthropic_body(
         );
         if let Some(attr) = attribution {
             if let Some(ctx) = outcome_ctx.as_mut() {
+                // Always tag the mode: a client stand-down must not read as
+                // the feature being off, and "none" must not read as "headroom".
+                ctx.tags
+                    .insert("tool_search_mode".to_string(), attr.mode.to_string());
                 if attr.deferred_tools > 0 {
                     ctx.tags.insert(
                         "tool_search_deferred_tools".to_string(),
@@ -678,6 +697,15 @@ pub(crate) fn rewrite_anthropic_body(
                         "tool_search_deferred_tokens".to_string(),
                         attr.deferred_tokens.to_string(),
                     );
+                    // Disjoint slice of `tool_search_deferred_tokens`, tagged
+                    // only when nonzero; the experiment dashboard divides the
+                    // two instead of summing them.
+                    if attr.core_deferred_tokens > 0 {
+                        ctx.tags.insert(
+                            "core_deferred_tokens".to_string(),
+                            attr.core_deferred_tokens.to_string(),
+                        );
+                    }
                     ctx.transforms_applied.push(format!(
                         "router:tool_search_deferral:{}tools:{}tok",
                         attr.deferred_tools, attr.deferred_tokens
@@ -1787,8 +1815,8 @@ pub(crate) fn log_ctx_offload_accounting(
 ) {
     if out.blocks_offloaded > 0 || out.blocks_deferred > 0 {
         // CTX-6: offload metrics are recorded by the
-        // offload-store worker after persist_one confirms
-        // the record is durably recoverable, not here —
+        // offload-store worker after both CCR and FTS writes
+        // succeed, not here —
         // see ctx/offload_store.rs.
         tracing::info!(
             event = "ctx_offload_accounting",
@@ -2922,6 +2950,7 @@ pub(crate) struct ResponseStreamCtx<'a> {
     pub(crate) state: &'a AppState,
     pub(crate) request_id: &'a str,
     pub(crate) path_for_log: &'a str,
+    pub(crate) slow_upstream_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
     pub(crate) status: StatusCode,
     pub(crate) is_sse: bool,
     pub(crate) sse_kind: SseStreamKind,
@@ -2950,6 +2979,7 @@ pub(crate) async fn assemble_response_stream(
         state,
         request_id,
         path_for_log,
+        slow_upstream_probe,
         status,
         is_sse,
         sse_kind,
@@ -2989,6 +3019,7 @@ pub(crate) async fn assemble_response_stream(
             base_delay_ms: state.config.retry_base_delay_ms,
             max_delay_ms: state.config.retry_max_delay_ms,
         },
+        slow_upstream_probe,
     );
     let (upstream_body, is_sse, sse_kind) = reframe_buffered_responses_sse(
         upstream_body,
@@ -4599,6 +4630,15 @@ pub(crate) fn finalize_ctx_transformed_body(
         match serde_json::to_vec(&value) {
             Ok(bytes) => {
                 if let Some((runtime, records)) = offload_records {
+                    if !runtime.store.persist(&records, &ctx_project) {
+                        runtime.gate.rollback_unstored_records(&records);
+                        tracing::warn!(
+                            event = "ctx_offload_backpressure_passthrough",
+                            request_id = %request_id,
+                            "forwarding the original request because CTX-3 index work could not be queued"
+                        );
+                        return buffered;
+                    }
                     if let Some((workspace_key, _)) = ccr_workspace.as_ref() {
                         track_ccr_context_records(
                             state,
@@ -4614,11 +4654,13 @@ pub(crate) fn finalize_ctx_transformed_body(
                             "CCR Phase 4: workspace unresolved; skipping compression tracking"
                         );
                     }
-                    runtime.store.persist(records, &ctx_project);
                 }
                 axum::body::Bytes::from(bytes)
             }
             Err(e) => {
+                if let Some((runtime, records)) = offload_records {
+                    runtime.gate.rollback_unstored_records(&records);
+                }
                 tracing::warn!(
                     event = "ctx_transform_reserialize_failed",
                     request_id = %request_id,
@@ -4918,15 +4960,21 @@ pub(crate) async fn resolve_selected_upstream(
         Some(o) => SelectedUpstream {
             base: o.0.clone(),
             client: state.client.clone(),
+            configured_http_proxy: state.config.http_proxy.is_some(),
+            allow_slow_path_probe: true,
         },
         None => match header_upstream_override(headers).await {
             Some(resolved) => SelectedUpstream {
                 client: caller_upstream_client(state, &resolved)?,
                 base: resolved.url().clone(),
+                configured_http_proxy: false,
+                allow_slow_path_probe: false,
             },
             None => SelectedUpstream {
                 base: state.effective_upstream().await,
                 client: state.client.clone(),
+                configured_http_proxy: state.config.http_proxy.is_some(),
+                allow_slow_path_probe: true,
             },
         },
     })

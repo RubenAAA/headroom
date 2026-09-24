@@ -587,6 +587,7 @@ pub struct RequestRecord<'a> {
 /// reported by the upstream.
 #[derive(Default)]
 pub struct FailedWorkRecord {
+    pub provider: Option<String>,
     pub status_code: i64,
     pub upstream_attempts: i64,
     pub forwarded_tokens: i64,
@@ -887,6 +888,14 @@ impl SavingsTracker {
 
     /// Persist one failed client turn in a bucket excluded from every
     /// successful savings/session/project denominator.
+    /// Book a rate-limited request in the persistent ledger, broken down
+    /// by provider (mirrors the Prometheus
+    /// `headroom_requests_rate_limited_total{source}` split).
+    pub fn record_rate_limited(&self, provider: Option<&str>) {
+        let mut st = self.state.lock().unwrap();
+        st.metrics.record_rate_limited(provider, None);
+    }
+
     pub fn record_failed_work(&self, rec: &FailedWorkRecord) {
         let attempts = rec.upstream_attempts.max(1);
         let forwarded = coerce_int(rec.forwarded_tokens);
@@ -894,7 +903,7 @@ impl SavingsTracker {
         let ts = rec.timestamp.unwrap_or_else(utc_now);
 
         let mut st = self.state.lock().unwrap();
-        st.metrics.record_failed(None, None);
+        st.metrics.record_failed(rec.provider.as_deref(), None);
         let failed = &mut st.failed_work;
         failed.requests = failed.requests.saturating_add(1);
         failed.upstream_attempts = failed.upstream_attempts.saturating_add(attempts);

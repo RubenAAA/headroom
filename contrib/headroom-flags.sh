@@ -709,7 +709,7 @@ HEADROOM_FLAGS=(
   # 7-wide subagent burst that truncated every turn the same millisecond.
   # Past the cap turns wait (bounded by --retry-max-delay-ms) instead of
   # firing into a shedding upstream. 0 disables.
-  --retry-zen-max-inflight 4
+  --retry-zen-max-inflight 10
   --upstream-timeout 600s
   --upstream-connect-timeout 10s
   # Idle keepalive pool TTL. Short for rotation safety: a VPN exit change

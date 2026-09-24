@@ -184,9 +184,12 @@ pub struct OffloadRecord {
     pub hash: String,
     /// The original block content bytes (what the client sent).
     pub original: String,
-    /// Deterministic chunk title for the FTS index: the paired `tool_use`'s
-    /// command/tool name. Empty when no pairing was found.
+    /// Paired `tool_use` command/tool name, retained with the durable index
+    /// job for diagnostics. Empty when no pairing was found.
     pub title: String,
+    /// Gate entry added by this request. If the durable index outbox refuses
+    /// the request, callers remove this new entry before forwarding raw bytes.
+    pub gate_rollback: Option<(String, String)>,
 }
 
 /// Result of running the transform over one request body.
@@ -615,6 +618,28 @@ impl OffloadGate {
         };
         if let (Some(dir), Some(set)) = (self.persist_dir.as_deref(), snapshot) {
             self.persist(dir, session, set);
+        }
+    }
+
+    /// Undo new conversion entries when the caller had to forward the raw
+    /// request because persistence was unavailable. Existing entries are not
+    /// included in `gate_rollback` and remain untouched.
+    pub fn rollback_unstored_records(&self, records: &[OffloadRecord]) {
+        for record in records {
+            let Some((session, key)) = record.gate_rollback.as_ref() else {
+                continue;
+            };
+            let _serialized = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let snapshot = {
+                let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(set) = sessions.get_mut(session) {
+                    set.remove(key);
+                }
+                sessions.get(session).cloned()
+            };
+            if let (Some(dir), Some(set)) = (self.persist_dir.as_deref(), snapshot) {
+                self.persist(dir, session, set);
+            }
         }
     }
 
@@ -1257,6 +1282,9 @@ fn offload_tool_result(
             hash,
             original,
             title: title.to_string(),
+            gate_rollback: policy
+                .filter(|_| !prior)
+                .map(|policy| (policy.session_key.to_string(), gate_key.clone())),
         },
         prior,
         tokens_saved,
@@ -1363,6 +1391,8 @@ pub fn offload_tool_use_inputs(
                     hash,
                     original: original.clone(),
                     title: tool_name.clone(),
+                    gate_rollback: (!prior)
+                        .then(|| (policy.session_key.to_string(), gate_key.clone())),
                 };
                 if !prior && !put(&record) {
                     tracing::warn!(

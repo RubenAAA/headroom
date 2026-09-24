@@ -326,12 +326,13 @@ pub async fn handle_messages(
         is_zen,
     )
     .await;
-    let (upstream_resp, upstream_headers, attempt, replay_stripped_bytes) = match send {
+    let (upstream_resp, upstream_headers, attempt, replay_stripped_bytes, slow_probe) = match send {
         Ok(send) => (
             send.resp,
             send.headers,
             send.attempts,
             send.retried_without_replay,
+            send.slow_probe,
         ),
         Err(resp) => return resp,
     };
@@ -371,6 +372,7 @@ pub async fn handle_messages(
         is_responses,
         outcome_ctx,
         ccr,
+        slow_probe,
         &request_id,
     )
     .await
@@ -710,6 +712,7 @@ async fn dispatch_upstream_answer(
     is_responses: bool,
     outcome_ctx: Option<crate::routed::outcome::RoutedOutcomeContext>,
     ccr: Option<RoutedCcr>,
+    slow_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
     request_id: &str,
 ) -> Response {
     if upstream_status != StatusCode::OK {
@@ -746,6 +749,7 @@ async fn dispatch_upstream_answer(
             state.codex_rate_limits.clone(),
             outcome_ctx,
             ccr,
+            slow_probe,
         )
         .await
     } else {

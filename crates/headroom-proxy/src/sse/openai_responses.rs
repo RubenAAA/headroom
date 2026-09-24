@@ -147,6 +147,20 @@ impl ResponseState {
             return Ok(());
         };
 
+        // OpenAI-compatible gateways may send a `ping` heartbeat between
+        // Responses events. It carries no response state, but is still
+        // forwarded by the stream path. Keep it out of the unknown-event
+        // warnings while leaving a distinct breadcrumb available at debug.
+        if name == "ping" {
+            tracing::debug!(
+                event = "sse_heartbeat",
+                provider = "openai_responses",
+                event_name = name,
+                "received OpenAI Responses heartbeat"
+            );
+            return Ok(());
+        }
+
         let v: Value = parse_json(&event.data)?;
         match name {
             "response.created" => self.on_response_created(&v),

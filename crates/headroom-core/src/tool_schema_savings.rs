@@ -29,10 +29,24 @@ use std::collections::HashMap;
 /// Per-request tags whose values are tool-definition tokens Headroom kept out
 /// of context by deferring schemas. Counted only when Headroom performed the
 /// deferral — not when the client already had tool search enabled.
+///
+/// Estimated, NOT realized: the figure is our serialization of what we asked
+/// the provider to defer, not a measurement of what it excluded — and it
+/// cannot be verified (`usage` carries no deferral field, and `count_tokens`
+/// rejects requests containing a search tool). An intermediary that rebuilds
+/// the tools array drops `defer_loading` silently and returns 200, so on
+/// those routes the number can be pure fiction. Consumers that must
+/// distinguish (ledger, `/stats`) should label it estimated.
 pub const TOOL_SCHEMA_SAVINGS_TAGS: &[&str] = &[
     "tool_search_deferred_tokens",
     "turn_hook_tools_saved_tokens",
 ];
+
+/// Core-vs-noncore split of `tool_search_deferred_tokens`: tokens of deferred
+/// tools that are core under the default set. Deliberately NOT in
+/// [`TOOL_SCHEMA_SAVINGS_TAGS`] — it is a disjoint slice of the deferred total,
+/// so summing it alongside would double-count. Dashboards divide the two.
+pub const CORE_DEFERRED_TOKENS_TAG: &str = "core_deferred_tokens";
 
 /// Tool-definition tokens Headroom kept out of context for one request.
 ///
@@ -111,5 +125,15 @@ mod tests {
         assert_eq!(headline_tokens_saved(0, &HashMap::new()), 0);
         // Negative totals are counting artifacts, never real savings.
         assert_eq!(headline_tokens_saved(-500, &HashMap::new()), 0);
+    }
+
+    #[test]
+    fn core_slice_does_not_double_count() {
+        let t = tags(&[
+            ("tool_search_deferred_tokens", "200"),
+            (CORE_DEFERRED_TOKENS_TAG, "80"),
+        ]);
+        assert_eq!(tool_schema_saved_from_tags(&t), 200);
+        assert_eq!(headline_tokens_saved(1000, &t), 1200);
     }
 }

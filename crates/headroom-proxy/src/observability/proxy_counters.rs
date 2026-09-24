@@ -86,12 +86,15 @@ fn requests_cached() -> &'static IntCounter {
     })
 }
 
-fn requests_rate_limited() -> &'static IntCounter {
-    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+fn requests_rate_limited() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
-        let c = IntCounter::new(
-            "headroom_requests_rate_limited_total",
-            "Rate limited requests",
+        let c = IntCounterVec::new(
+            Opts::new(
+                "headroom_requests_rate_limited_total",
+                "Rate limited requests, by source",
+            ),
+            &["source"],
         )
         .expect("headroom_requests_rate_limited_total is well-formed");
         registry()
@@ -101,11 +104,17 @@ fn requests_rate_limited() -> &'static IntCounter {
     })
 }
 
-fn requests_failed() -> &'static IntCounter {
-    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+fn requests_failed() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
-        let c = IntCounter::new("headroom_requests_failed_total", "Failed requests")
-            .expect("headroom_requests_failed_total is well-formed");
+        let c = IntCounterVec::new(
+            Opts::new(
+                "headroom_requests_failed_total",
+                "Failed requests, by provider",
+            ),
+            &["provider"],
+        )
+        .expect("headroom_requests_failed_total is well-formed");
         registry()
             .register(Box::new(c.clone()))
             .expect("headroom_requests_failed_total registers once");
@@ -570,8 +579,13 @@ pub fn record_compression(strategy: &str, original_tokens: u64, compressed_token
 }
 
 /// Record a rate-limited request.
-pub fn record_rate_limited() {
-    requests_rate_limited().inc();
+///
+/// `source` is `"headroom"` when our own limiter refused the request (raise
+/// the cap) and `"upstream"` when the provider refused it (back off or shard
+/// keys). The two mean opposite things to an operator, so they stay
+/// separable. Closed set — bounded cardinality.
+pub fn record_rate_limited(source: &str) {
+    requests_rate_limited().with_label_values(&[source]).inc();
 }
 
 /// Record a turn shed by the conversation-concurrency cap before anything
@@ -581,9 +595,14 @@ pub fn record_concurrency_shed() {
     conversation_concurrency_sheds().inc();
 }
 
-/// Record a failed request.
-pub fn record_failed() {
-    requests_failed().inc();
+/// Record a failed request, labelled by provider (`"unknown"` when none).
+pub fn record_failed(provider: &str) {
+    let provider = if provider.is_empty() {
+        "unknown"
+    } else {
+        provider
+    };
+    requests_failed().with_label_values(&[provider]).inc();
 }
 
 /// Record cache read/write tokens for a provider.
@@ -1206,8 +1225,13 @@ pub fn force_register_all(reg: &Registry) {
     requests_by_provider().with_label_values(&[INIT]).inc_by(0);
     requests_by_model().with_label_values(&[INIT]).inc_by(0);
     requests_cached().inc_by(0);
-    requests_rate_limited().inc_by(0);
-    requests_failed().inc_by(0);
+    requests_rate_limited()
+        .with_label_values(&["headroom"])
+        .inc_by(0);
+    requests_rate_limited()
+        .with_label_values(&["upstream"])
+        .inc_by(0);
+    requests_failed().with_label_values(&["unknown"]).inc_by(0);
     conversation_concurrency_sheds().inc_by(0);
 
     tokens_input().inc_by(0);
@@ -1331,6 +1355,14 @@ mod tests {
         // Models already admitted keep counting under their own label.
         assert!(admit_model(&mut admitted, "a", 2));
         assert_eq!(admitted.len(), 2);
+    }
+
+    #[test]
+    fn labelled_failure_counters_do_not_panic() {
+        record_rate_limited("headroom");
+        record_rate_limited("upstream");
+        record_failed("anthropic");
+        record_failed("");
     }
 
     #[test]

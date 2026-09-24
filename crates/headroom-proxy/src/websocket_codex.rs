@@ -787,9 +787,10 @@ impl OutcomeSink for CodexWsOutcomeSink {
     }
 
     fn record_failed(&self, outcome: &RequestOutcome) {
-        crate::observability::proxy_counters::record_failed();
+        crate::observability::proxy_counters::record_failed(&outcome.provider);
         self.savings_tracker.record_failed_work(
             &headroom_core::savings_tracker::FailedWorkRecord {
+                provider: Some(outcome.provider.clone()),
                 status_code: outcome.status_code,
                 upstream_attempts: outcome.upstream_attempts,
                 forwarded_tokens: outcome.optimized_tokens,
@@ -798,6 +799,15 @@ impl OutcomeSink for CodexWsOutcomeSink {
                 timestamp: None,
             },
         );
+    }
+
+    fn record_rate_limited(&self, outcome: &RequestOutcome) {
+        crate::observability::proxy_counters::record_rate_limited("upstream");
+        self.savings_tracker
+            .record_rate_limited(Some(outcome.provider.as_str()));
+        // A 429 is failed work too: it reached the failure bucket, not the
+        // success funnel, and the ledger must see the wasted tokens.
+        self.record_failed(outcome);
     }
 
     fn record_savings_ledger(&self, outcome: &RequestOutcome) {
