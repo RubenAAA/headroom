@@ -19,7 +19,7 @@
 //!      the upstream bytes BYTE-EQUAL.
 //!    - `Accept: text/event-stream` (default) → translate each
 //!      `chunk` message's payload into an SSE frame; tee the SSE
-//!      frames into [`AnthropicStreamState`] for telemetry.
+//!      frames into [`AnthropicStreamState`](crate::sse::anthropic::AnthropicStreamState) for telemetry.
 //!
 //! # Cache safety
 //!

@@ -8,15 +8,14 @@
 # integration binaries. TOML drift (unsorted deps, unformatted files)
 # is review noise.
 #
-# Status 2026-09-25: `cargo doc` has 94 pre-existing errors on main
-# (unresolved links, private-item links, invalid HTML). The doc leg
-# therefore WARNS but does not fail until the backlog is cleared —
-# flip DOC_WARN_ONLY to 0 once `cargo doc` is green. The machete and
-# TOML legs fail hard (their baselines start clean).
+# All three legs fail hard. The doc leg documents private items and every
+# feature, so links into private modules and into `ml`/`redis` code are
+# checked too; the workspace allows rustdoc's private_intra_doc_links.
 #
 # Three checks, each skipped gracefully when its tool is absent (same
 # policy as sccache: check, don't require):
-#   1. cargo doc --workspace --no-deps — always runs (ships with cargo).
+#   1. cargo doc --workspace --no-deps --document-private-items
+#      --all-features — always runs (ships with cargo).
 #      -D warnings turns broken intra-doc links into failures.
 #   2. cargo machete — needs `cargo install cargo-machete --locked`.
 #   3. taplo fmt --check + cargo sort --check — need `cargo install
@@ -33,19 +32,12 @@ cd "$ROOT"
 
 fail=0
 
-# Set to 0 once `cargo doc --workspace --no-deps` is green on main.
-DOC_WARN_ONLY=1
-
 echo "── hygiene: cargo doc (intra-doc links)"
 # RUSTDOCFLAGS persists -D warnings for the whole workspace build; a
 # trailing -- -D warnings would only apply to the top-level crate.
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps || {
-    if [[ "$DOC_WARN_ONLY" == "1" ]]; then
-        echo "⚠️ hygiene: cargo doc has errors (pre-existing backlog; warn-only until cleared)." >&2
-    else
-        echo "❌ hygiene: broken rustdoc links. Run 'cargo doc --workspace --no-deps'." >&2
-        fail=1
-    fi
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --all-features || {
+    echo "❌ hygiene: broken rustdoc links. Run 'cargo doc --workspace --no-deps --document-private-items --all-features'." >&2
+    fail=1
 }
 
 if command -v cargo-machete >/dev/null 2>&1; then

@@ -106,8 +106,8 @@ pub(crate) fn count_tools_tokens(body: &Value) -> i64 {
     .count_text(&text) as i64
 }
 
-/// Metadata threaded into [`StreamTranslator`] so a completed routed turn books
-/// the same [`RequestOutcome`] a Claude turn does.
+/// Metadata threaded into [`StreamTranslator`](crate::openai::stream::StreamTranslator) so a completed routed turn books
+/// the same [`RequestOutcome`](headroom_core::request_outcome::RequestOutcome) a Claude turn does.
 ///
 /// Without this the translate path never touches the cost tracker, savings
 /// tracker, or request logger, so codex traffic is absent from `/stats`,

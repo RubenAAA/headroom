@@ -839,7 +839,7 @@ pub(super) fn hold_working_directory_value(
 
 /// Hold this conversation's opening role sentence still.
 ///
-/// Byte-equal passthrough on the same terms as [`hold_working_directory`]:
+/// Byte-equal passthrough on the same terms as [`hold_working_directory_value`]:
 /// not JSON, no such sentence, first sight, or already matching the pin. See
 /// [`cache_stabilization::role_sentence`].
 /// The hold itself. Returns whether `value` was rewritten.

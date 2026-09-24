@@ -43,7 +43,7 @@ use crate::transforms::anchor_selector::compute_item_hash;
 /// given content fingerprint. Subsequent matches drop. Out-of-bounds
 /// indices skip.
 ///
-/// `compute_item_hash` returns the same MD5[:16] string Python computes
+/// `compute_item_hash` returns the same `MD5[:16]` string Python computes
 /// (via `anchor_selector::python_json_dumps_sort_keys`), so the dedup
 /// outcome is byte-equal across languages.
 pub fn deduplicate_indices_by_content(
@@ -285,7 +285,7 @@ fn is_numeric_field_with_variance(stats: &FieldStats) -> bool {
 /// Hash function used by all three orchestration helpers.
 ///
 /// Wraps `compute_item_hash` (which does Python-compatible
-/// json.dumps + md5[:16]) with a fail-safe fallback: if the item is
+/// json.dumps + `md5[:16]`) with a fail-safe fallback: if the item is
 /// not a JSON object, fall back to `__idx_<i>__` so the index is
 /// effectively a unique key. Mirrors Python's
 /// `try/except (TypeError, ValueError, RecursionError)` block which

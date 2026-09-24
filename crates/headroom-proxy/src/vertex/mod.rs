@@ -161,7 +161,7 @@ fn note_vertex_streaming(attach_sse_tee: bool, request_id: &str, method: &Method
 /// `/v1beta1/projects/{project}/locations/{location}/publishers/anthropic/models/{model_action}`
 /// path. The trailing `model_action` segment carries `<model>:<verb>`
 /// (the verb is the colon-suffix Vertex appends). We split on the
-/// last `:` and dispatch to either [`raw_predict::handle_raw_predict`]
+/// last `:` and dispatch to either [`raw_predict::forward_vertex_request`]
 /// (logically) or [`stream_raw_predict::handle_stream_raw_predict`].
 ///
 /// The two sub-handlers share most of their logic — see

@@ -18,7 +18,7 @@
 //! ```
 //!
 //! That format matches what direct-Anthropic `/v1/messages` emits and
-//! lets the existing [`AnthropicStreamState`] from PR-C1 read the
+//! lets the existing [`AnthropicStreamState`](crate::sse::anthropic::AnthropicStreamState) from PR-C1 read the
 //! translated stream for telemetry without modification.
 //!
 //! # Output mode selection
@@ -26,7 +26,7 @@
 //! Configurable. Default behaviour:
 //!
 //! - `Accept: application/vnd.amazon.eventstream` (or any value
-//!   listed in [`OutputMode::eventstream_accept_values`]) → passthrough.
+//!   listed in [`OutputMode::default_eventstream_accept_values`]) → passthrough.
 //! - `Accept: text/event-stream`, `Accept: */*`, or absent → translate.
 //!
 //! Operators override the recognised Accept values via the

@@ -20,8 +20,8 @@
 //! token-efficient `[N]{cols}:` declaration + JSON schema header + CSV
 //! rows that LLMs read reliably.
 //!
-//! [`JsonFormatter`]: format_json::JsonFormatter
-//! [`CsvSchemaFormatter`]: format_csv_schema::CsvSchemaFormatter
+//! [`JsonFormatter`]: formatter::JsonFormatter
+//! [`CsvSchemaFormatter`]: formatter::CsvSchemaFormatter
 
 pub mod classifier;
 pub mod compactor;

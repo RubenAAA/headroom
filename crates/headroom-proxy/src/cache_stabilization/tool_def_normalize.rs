@@ -20,7 +20,7 @@
 //! 1. **PAYG auth mode.** OAuth and Subscription clients are
 //!    passthrough-prefer; reordering bytes for a subscription client
 //!    can look like cache-evasion to the upstream and trigger
-//!    revocation. The caller gates with [`AuthMode::Payg`].
+//!    revocation. The caller gates with [`AuthMode::Payg`](headroom_core::auth_mode::AuthMode::Payg).
 //! 2. **No `cache_control` marker on any tool.** When the customer has
 //!    explicitly placed a marker on a tool object, reordering the
 //!    array shifts what is "before" their marker and silently changes

@@ -1,10 +1,13 @@
 //! `headroom` CLI — thin HTTP client for the context-mode endpoints.
 //!
 //! Usage:
-//!   headroom ctx search "<query>" [--sort timeline] [--source S] [--type code|prose]
-//!   headroom ctx get <hash>
-//!   headroom ctx index <path>
-//!   headroom ctx stats
+//!
+//! ```text
+//! headroom ctx search "<query>" [--sort timeline] [--source S] [--type code|prose]
+//! headroom ctx get <hash>
+//! headroom ctx index <path>
+//! headroom ctx stats
+//! ```
 //!
 //! Requires the headroom-proxy to be running with `--ctx-offload`.
 //! Proxy URL defaults to `http://127.0.0.1:8787`, overridable via

@@ -1,6 +1,6 @@
 //! cc-switch reconciler: keep Headroom in the request path without fighting cc-switch.
 //!
-//! cc-switch (https://github.com/farion1231/cc-switch) overwrites
+//! cc-switch (<https://github.com/farion1231/cc-switch>) overwrites
 //! `~/.claude/settings.json` on every provider switch, blowing away
 //! `ANTHROPIC_BASE_URL`. This watcher detects the overwrite, captures
 //! the real provider endpoint, and rewrites the URL back to Headroom.

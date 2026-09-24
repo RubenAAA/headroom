@@ -42,8 +42,8 @@ use serde_json::Value;
 /// regardless of saliency score or token budget.
 ///
 /// Constraints stack — the must-keep set is the union of every
-/// constraint's `must_keep` output. OSS ships [`KeepErrorsConstraint`]
-/// and [`KeepStructuralOutliersConstraint`] (wrappers around the
+/// constraint's `must_keep` output. OSS ships [`KeepErrorsConstraint`](super::constraints::KeepErrorsConstraint)
+/// and [`KeepStructuralOutliersConstraint`](super::constraints::KeepStructuralOutliersConstraint) (wrappers around the
 /// existing detection functions); Enterprise crates can add
 /// `BusinessRuleConstraint("amount > 10000")`,
 /// `RegulatoryConstraint::HIPAA`, and so on.

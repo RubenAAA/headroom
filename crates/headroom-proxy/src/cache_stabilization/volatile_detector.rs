@@ -111,7 +111,7 @@ pub struct VolatileFinding {
 }
 
 /// Which provider's body shape to walk. Selected by the caller
-/// from the request path — see [`from_endpoint`].
+/// from the request path — see [`ApiKind::from_endpoint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKind {
     /// Anthropic `/v1/messages` shape: top-level `system` (string

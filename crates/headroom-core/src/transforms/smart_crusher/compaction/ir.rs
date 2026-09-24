@@ -1,7 +1,7 @@
 //! Compaction IR — recursive tree representation for lossless / row-lossy
 //! compaction of JSON arrays.
 //!
-//! The IR is the boundary between [`TabularCompactor`] (which produces it)
+//! The IR is the boundary between [`compact`] (which produces it)
 //! and [`Formatter`] implementations (which consume it). Renderer-agnostic.
 //!
 //! # Recursive structure
@@ -12,7 +12,7 @@
 //! into a sub-table; an opaque blob gets CCR-substituted; a heterogeneous
 //! array gets bucketed by discriminator.
 //!
-//! [`TabularCompactor`]: super::compactor::TabularCompactor
+//! [`compact`]: super::compactor::compact
 //! [`Formatter`]: super::formatter::Formatter
 
 use serde_json::Value;

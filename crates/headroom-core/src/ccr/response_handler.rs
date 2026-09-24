@@ -278,7 +278,7 @@ impl CCRResponseHandler {
     /// Classify why (if at all) CCR tool calls remain in a handled response.
     ///
     /// Stateless and provider-generic, derived from the same parsing
-    /// [`Self::handle_response`] uses, so it stays correct under concurrency and
+    /// [`Self::extract_tool_calls`] uses, so it stays correct under concurrency and
     /// behaves identically for every provider/harness.
     ///
     /// The distinction that matters: a residual `headroom_retrieve` alongside a

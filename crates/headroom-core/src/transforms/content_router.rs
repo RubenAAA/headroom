@@ -159,7 +159,7 @@ impl SavingsProfile {
 /// Two tools with the same field structure will have the same signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSignature {
-    /// SHA-256[:24] of sorted field names + types.
+    /// `SHA-256[:24]` of sorted field names + types.
     pub structure_hash: String,
     /// Number of top-level fields (0 for non-JSON).
     pub field_count: usize,
@@ -364,7 +364,7 @@ impl ToolSignature {
         }
     }
 
-    /// SHA-256[:24] of the sorted (field, type) pairs.
+    /// `SHA-256[:24]` of the sorted (field, type) pairs.
     fn hash_field_info(sorted_field_info: &[(String, String)]) -> String {
         let hash_input = serde_json::to_string(sorted_field_info).unwrap_or_default();
         use sha2::{Digest, Sha256};

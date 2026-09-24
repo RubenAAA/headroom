@@ -559,7 +559,7 @@ pub fn map_to_anchor_pattern(strategy: CompressionStrategy) -> DataPattern {
 /// Check if any of an item's preserve_field values matches the query.
 ///
 /// Direct port of `_item_has_preserve_field_match` (Python line 289-315).
-/// `preserve_field_hashes` are SHA256[:8] hashes — match against
+/// `preserve_field_hashes` are `SHA256[:8]` hashes — match against
 /// `hash_field_name(item_field_name)`.
 pub fn item_has_preserve_field_match(
     item: &Value,

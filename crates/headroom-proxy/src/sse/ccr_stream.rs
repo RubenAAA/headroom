@@ -434,7 +434,7 @@ pub(crate) fn anthropic_stream_to_turn(body: &[u8]) -> Option<Value> {
 /// Every tool this proxy injects and therefore has to answer itself.
 ///
 /// This is the whole invariant in one list: a name here must have a resolver
-/// in [`resolve_proxy_tools`], and a tool injected into a request must appear
+/// in [`resolve_routed_proxy_tools`](crate::routed::ccr::resolve_routed_proxy_tools), and a tool injected into a request must appear
 /// here. Advertising a tool the client cannot run is the bug both halves
 /// exist to prevent.
 fn proxy_owned_tool(block: &Value, memory_enabled: bool) -> bool {

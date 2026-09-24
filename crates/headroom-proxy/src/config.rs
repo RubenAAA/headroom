@@ -1398,6 +1398,9 @@ pub struct CliArgs {
     ///   --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra"
     ///   --extra-model-route "claude-grok-4.6=https://api.x.ai/v1:openai:grok-4.6:auth=XAI_API_KEY"
     ///   --extra-model-route "claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none"
+    // The doc comment is also `--help` text (and docs/flags.md), so its
+    // example URLs stay bare rather than wrapped in rustdoc's `<...>`.
+    #[allow(rustdoc::bare_urls)]
     #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
     pub extra_model_routes: Vec<String>,
 

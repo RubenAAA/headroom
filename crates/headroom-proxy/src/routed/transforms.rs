@@ -721,7 +721,7 @@ pub(crate) struct CompressionReport {
     pub(crate) transforms_applied: Vec<String>,
     pub(crate) tokens_saved: i64,
     /// Set when the prefix-replay stage parked this turn, so the response side
-    /// knows to feed cache tokens back with [`SessionReplayStore::complete`].
+    /// knows to feed cache tokens back with [`SessionReplayStore::complete`](crate::cache_stabilization::prefix_replay::SessionReplayStore::complete).
     pub(crate) replay_parked: bool,
 }
 

@@ -4,7 +4,7 @@
 //! together and resolved by size:
 //!
 //! * **Tier 1** — reversible run/stanza folding via
-//!   [`compact_lossless`](super::lossless_compaction::compact_lossless) with the
+//!   [`compact_lossless`] with the
 //!   `config` kind. Self-verifying: it round-trips or returns the input.
 //! * **Tier 2** — whole-line comment/blank elision behind a CCR marker. Lossy,
 //!   so it only runs when the original can be stored for retrieval.

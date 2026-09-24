@@ -11,7 +11,7 @@
 //! check a container that binds a non-loopback interface.
 //!
 //! One gate covers both transports. A WebSocket upgrade reaches
-//! [`crate::proxy::catch_all`] as an ordinary HTTP GET and only becomes a
+//! `proxy::app::catch_all` as an ordinary HTTP GET and only becomes a
 //! socket once `WebSocketUpgrade::from_request_parts` succeeds, so a router
 //! layer sees the handshake like any other request. The Python proxy needed a
 //! second, separate middleware here, because Starlette's `BaseHTTPMiddleware`

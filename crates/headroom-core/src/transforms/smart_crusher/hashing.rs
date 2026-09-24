@@ -2,7 +2,7 @@
 //!
 //! Direct port of `_hash_field_name` (Python `smart_crusher.py:171-177`).
 //! Used to look up TOIN-anonymized `preserve_fields` — TOIN stores
-//! field names as **SHA-256[:8]** for privacy (per Python doc-comment
+//! field names as **`SHA-256[:8]`** for privacy (per Python doc-comment
 //! at `smart_crusher.py:174-175`), so cache lookups will silently miss
 //! if the truncation length drifts.
 //!

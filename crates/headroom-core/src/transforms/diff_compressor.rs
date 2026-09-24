@@ -374,7 +374,7 @@ impl DiffCompressor {
         }
     }
 
-    /// CCR layer: hash original with MD5[:24], append retrieval marker
+    /// CCR layer: hash original with `MD5[:24]`, append retrieval marker
     /// *only* if compression met `min_compression_ratio_for_ccr`. Python
     /// hardcodes 0.8 (>20% savings); we expose it as a config knob with
     /// the same default. Returns the emitted cache key, if any.

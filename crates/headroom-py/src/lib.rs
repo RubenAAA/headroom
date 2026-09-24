@@ -69,7 +69,7 @@ fn type_name(v: &serde_json::Value) -> &'static str {
 /// Build the dict returned by `SmartCrusher.crush_array_json`. Kept
 /// outside `#[pymethods]` so we can `unwrap()` `set_item` (it cannot
 /// fail when keys are static str literals and values are owned String /
-/// Option<String> / Option<&'static str>) without tripping the
+/// `Option<String>` / `Option<&'static str>`) without tripping the
 /// `clippy::useless_conversion` false positive that fires inside the
 /// pyo3 0.22 method-attribute macro.
 fn build_crush_array_dict<'py>(

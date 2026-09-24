@@ -3,7 +3,7 @@
 //! # Why this module exists
 //!
 //! Pre-PR-B5, the live-zone dispatcher could call back into Python's
-//! TOIN per request to get a [`CompressionHint`]. That coupling made
+//! TOIN per request to get a `CompressionHint`. That coupling made
 //! per-request output non-deterministic — same input could compress
 //! differently across runs depending on TOIN's mutable state — which
 //! broke prompt caching (P2-27, P5-56). PR-B5 retired the request-time
@@ -12,7 +12,7 @@
 //! 1. The Python `headroom.cli.toin_publish` CLI walks the on-disk TOIN
 //!    store and emits `recommendations.toml`.
 //! 2. The deploy pipeline ships that TOML alongside the Rust binary.
-//! 3. At startup, [`RecommendationStore::load_default`] reads the file
+//! 3. At startup, [`load_default`] reads the file
 //!    once and exposes the recommendations via a process-wide
 //!    [`OnceLock`].
 //! 4. [`get`] / [`RecommendationStore::lookup`] return the row matching

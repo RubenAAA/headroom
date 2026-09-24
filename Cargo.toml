@@ -39,6 +39,11 @@ undocumented_unsafe_blocks = "warn"
 dbg_macro = "warn"
 todo = "warn"
 
+[workspace.lints.rustdoc]
+# Nothing here is published; docs are built with --document-private-items,
+# where links to private items resolve and render.
+private_intra_doc_links = "allow"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` makes `serde_json::Value::Object` use IndexMap so JSON

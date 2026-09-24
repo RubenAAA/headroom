@@ -44,7 +44,7 @@ pub struct WSSessionHandle {
     pub started_at: Instant,
     pub last_activity_at: Instant,
     pub relay_task_count: usize,
-    /// Names of active relay tasks (e.g. "codex-ws-c2u-<sid>").
+    /// Names of active relay tasks (e.g. `"codex-ws-c2u-<sid>"`).
     /// Matches Python's `relay_tasks: list[_TaskLike]` → `[t.get_name() ...]`.
     pub relay_task_names: Vec<String>,
     pub termination_cause: Option<TerminationCause>,

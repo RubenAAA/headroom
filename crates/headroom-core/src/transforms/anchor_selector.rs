@@ -15,10 +15,10 @@
 //!    time series want both ends; generic spreads evenly.
 //! 2. **Query keywords**: "latest" / "recent" → shift toward back;
 //!    "first" / "earliest" → shift toward front.
-//! 3. **Information density** (middle region only): compute a [0,1]
+//! 3. **Information density** (middle region only): compute a \[0,1\]
 //!    score per candidate based on field-value uniqueness, content
 //!    length, and structural uniqueness.
-//! 4. **Dedup**: identical items hash to the same MD5[:16]; duplicates
+//! 4. **Dedup**: identical items hash to the same `MD5[:16]`; duplicates
 //!    are skipped so we don't waste slots.
 //!
 //! # Hash parity with Python

@@ -48,7 +48,7 @@ impl CompressionStrategy {
 /// Statistics for a single field across array items.
 ///
 /// Mirrors the `FieldStats` dataclass at `smart_crusher.py:864-885`.
-/// Field naming and Optional<T> shape match Python exactly so the PyO3
+/// Field naming and `Optional<T>` shape match Python exactly so the PyO3
 /// bridge can `from_dict`-reconstruct the Python dataclass.
 #[derive(Debug, Clone)]
 pub struct FieldStats {

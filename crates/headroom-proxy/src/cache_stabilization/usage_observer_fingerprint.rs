@@ -9,7 +9,7 @@
 /// - **Real thrash** — two concurrent streams on one conversation genuinely
 ///   send different bytes past the tools block, so each one's prefix misses.
 ///   Real money, roughly 90K tokens per turn on the observed conversation.
-/// - **Artefact** — [`conversation_key`] is too coarse and merged two separate
+/// - **Artefact** — [`conversation_key`](super::keys::conversation_key) is too coarse and merged two separate
 ///   conversations, so ordinary alternation only *looks* like drift.
 ///
 /// Logging these two hashes next to the key decides it. For two alternating
