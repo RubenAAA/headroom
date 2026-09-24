@@ -12,6 +12,7 @@
 #   5. scripts/check-log-events.sh (warn!/error! must carry an event)
 #   6. scripts/check-complexity.sh (no new function over clippy's cognitive
 #      complexity threshold)
+#   7. scripts/check-file-size.sh (no Rust file grows past 3000 lines)
 #
 # Idempotent. Bypass per-push with `git push --no-verify`.
 # (Replaces upstream-python/scripts/install-git-hooks.sh for local use;
@@ -92,10 +93,16 @@ bash scripts/check-complexity.sh || {
     echo "   Bypass: git push --no-verify" >&2
     exit 1
 }
+echo "── pre-push (local): file-size ratchet"
+bash scripts/check-file-size.sh || {
+    echo "❌ pre-push: a Rust file grew past its line limit." >&2
+    echo "   Bypass: git push --no-verify" >&2
+    exit 1
+}
 echo "✅ pre-push (local): PASSED"
 HOOK_EOF
 
 chmod +x "$HOOK"
 echo "✅ installed: $HOOK"
-echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity."
+echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity + check-file-size."
 echo "   Bypass: git push --no-verify"

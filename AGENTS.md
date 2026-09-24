@@ -99,7 +99,12 @@ generated from that output. Regenerate it when you add a flag.
 ## Layout for editing
 
 - `crates/headroom-proxy` is the product: the proxy binary, the `headroom` CLI,
-  request handlers, and the cache stabilizers.
+  request handlers, and the cache stabilizers. `proxy.rs` holds only
+  module wiring and small shared helpers. Its code lives in `proxy/<area>.rs`
+  (`state`, `app`, `request_transforms`, `replay`, `continuation`, …). Add
+  new code to the module for its area, or start a new one. The pre-push hook
+  fails any Rust file that grows past 3000 lines
+  (`scripts/check-file-size.sh`).
 - `crates/headroom-core` holds compression, the context store and memory.
 - `crates/headroom-parity` checks Rust output against Python.
   `crates/headroom-simulators` drives the benchmarks.
