@@ -889,6 +889,8 @@ mod tests {
     /// serves, classified once, addressing and headering exactly as the
     /// scattered branches did before. A new provider adds a row here.
     #[test]
+    // A flat table of asserts: each one scores as a branch, none nests.
+    #[allow(clippy::cognitive_complexity)]
     fn provider_quirks_matrix() {
         // Resolving Zen headers must not shell out from inside a unit
         // test: hold the mint guard so the fallback path can't spawn a

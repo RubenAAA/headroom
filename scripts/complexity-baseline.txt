@@ -1,0 +1,5 @@
+# Functions allowed over the cognitive complexity threshold until refactored.
+# Read by scripts/check-complexity.sh. Only remove entries; do not add new ones.
+crates/headroom-proxy/src/proxy.rs::handle_memory_response
+crates/headroom-proxy/src/proxy.rs::continuation_dangling_calls
+crates/headroom-proxy/src/proxy/forward.rs::finalize_ctx_transformed_body

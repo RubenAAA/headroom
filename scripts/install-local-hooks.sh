@@ -9,6 +9,9 @@
 #   4. scripts/check-drift.sh (flags.md freshness, shellcheck, var coverage;
 #      runs inside what-to-run when config/scripts changed, plus once here
 #      unconditionally because it is seconds-cheap)
+#   5. scripts/check-log-events.sh (warn!/error! must carry an event)
+#   6. scripts/check-complexity.sh (no new function over clippy's cognitive
+#      complexity threshold)
 #
 # Idempotent. Bypass per-push with `git push --no-verify`.
 # (Replaces upstream-python/scripts/install-git-hooks.sh for local use;
@@ -83,10 +86,16 @@ bash scripts/check-log-events.sh || {
     echo "   Bypass: git push --no-verify" >&2
     exit 1
 }
+echo "── pre-push (local): complexity ratchet"
+bash scripts/check-complexity.sh || {
+    echo "❌ pre-push: function over the cognitive complexity threshold." >&2
+    echo "   Bypass: git push --no-verify" >&2
+    exit 1
+}
 echo "✅ pre-push (local): PASSED"
 HOOK_EOF
 
 chmod +x "$HOOK"
 echo "✅ installed: $HOOK"
-echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events."
+echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity."
 echo "   Bypass: git push --no-verify"

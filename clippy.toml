@@ -9,6 +9,7 @@
 # To measure (local only, never in CI):
 #   cargo clippy -p headroom-proxy -p headroom-core --lib --tests -- \
 #     -W clippy::cognitive_complexity
+# The local pre-push hook enforces it via scripts/check-complexity.sh.
 #
 # Deliberately NOT wired into CI (.github/workflows) — no CI spend.
 cognitive-complexity-threshold = 25

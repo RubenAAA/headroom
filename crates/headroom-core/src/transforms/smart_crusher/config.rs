@@ -191,6 +191,8 @@ mod tests {
     use super::*;
 
     #[test]
+    // A flat table of asserts: each one scores as a branch, none nests.
+    #[allow(clippy::cognitive_complexity)]
     fn defaults_match_python() {
         // Pin every default. Each field is consulted by some compression
         // path and a drift would break parity. If Python ever changes a

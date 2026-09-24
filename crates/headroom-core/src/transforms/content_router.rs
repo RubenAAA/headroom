@@ -3319,6 +3319,8 @@ mod tests {
     // --- ContentRouterConfig ---
 
     #[test]
+    // A flat table of asserts: each one scores as a branch, none nests.
+    #[allow(clippy::cognitive_complexity)]
     fn config_default_values() {
         let config = ContentRouterConfig::default();
         assert!(!config.enable_code_aware);
